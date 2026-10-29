@@ -34,8 +34,10 @@ pub use loader::{
 };
 pub(crate) use resolver::resolve_upstream_modules_with_config;
 pub use resolver::{
-    ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticReport,
-    RefCheckedModuleGraph, ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
+    ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticFailure,
+    ModuleResolutionDiagnosticReport, ModuleResolutionDiagnosticStatus, RefCheckedModuleGraph,
+    ResidualModuleResolutionDiagnostic, ResidualModuleResolutionError,
+    ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
     ResolvedModuleConstraintStatus, resolve_modules, resolve_modules_with_config,
     resolve_modules_with_diagnostics,
 };

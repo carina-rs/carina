@@ -12,8 +12,8 @@ use indexmap::IndexMap;
 use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
-    ForBinding, ModuleCall, ProviderContext, ResourceContext, ResourceRef, ResourceTypePath,
-    SourceSpan, TypeExpr,
+    ForBinding, ModuleCall, ModuleCallId, ProviderContext, ResourceContext, ResourceRef,
+    ResourceTypePath, SourceFileId, SourceSpan, TypeExpr,
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{
@@ -232,15 +232,48 @@ impl<'a> RefSink<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BindingResolutionError {
     Type(TypeError),
+    ValueType(Box<typecheck::TypeExprValueError>),
+    ReferenceType(Box<BindingReferenceTypeError>),
+    DeferredAccess(Box<DeferredAccessTypeError>),
     CustomType(Box<crate::parser::CustomTypeValidationError>),
     Existing(String),
+}
+
+/// Typed incompatibility retained when a bare value binding crosses a sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingReferenceTypeError {
+    expected: String,
+    actual: String,
+    declared: Option<String>,
+    path: ReferencePath,
+}
+
+impl std::fmt::Display for BindingReferenceTypeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Type mismatch: expected {}, got {} ({})",
+            self.expected,
+            self.actual,
+            match &self.declared {
+                Some(declared) => {
+                    format!("from {}, declared {declared}", self.path.to_dot_string())
+                }
+                None => format!("from {}", self.path.to_dot_string()),
+            }
+        )
+    }
 }
 
 impl BindingResolutionError {
     pub fn type_error(&self) -> Option<&TypeError> {
         match self {
             Self::Type(error) => Some(error),
-            Self::CustomType(_) | Self::Existing(_) => None,
+            Self::ValueType(_error) => None,
+            Self::ReferenceType(_error) => None,
+            Self::DeferredAccess(_error) => None,
+            Self::CustomType(_error) => None,
+            Self::Existing(_message) => None,
         }
     }
 }
@@ -249,6 +282,9 @@ impl std::fmt::Display for BindingResolutionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Type(error) => error.fmt(formatter),
+            Self::ValueType(error) => error.fmt(formatter),
+            Self::ReferenceType(error) => error.fmt(formatter),
+            Self::DeferredAccess(error) => error.fmt(formatter),
             Self::CustomType(error) => error.fmt(formatter),
             Self::Existing(message) => formatter.write_str(message),
         }
@@ -395,6 +431,21 @@ impl<E> std::ops::Deref for ResolvedFile<E> {
 impl BindingUseReport {
     pub fn findings(&self) -> &[BindingUseFinding] {
         &self.findings
+    }
+
+    /// Findings whose sink remains owned by resource validation adapters.
+    /// Module-argument findings are consumed by [`check_module_calls`].
+    pub fn resource_findings(&self) -> impl Iterator<Item = &BindingUseFinding> {
+        self.findings.iter().filter(|finding| {
+            matches!(
+                &finding.use_site.owner,
+                crate::parser::BindingUseOwner::Resource(_address)
+            )
+        })
+    }
+
+    pub fn has_resource_findings(&self) -> bool {
+        self.resource_findings().next().is_some()
     }
 
     pub fn into_findings(self) -> Vec<BindingUseFinding> {
@@ -556,12 +607,12 @@ fn reference_value_mismatch(
 ) -> Option<BindingResolutionError> {
     match bindings.ref_type(reference) {
         RefType::Typed(source) => source.is_assignable_to_sink(target).err().map(|mismatch| {
-            BindingResolutionError::Existing(format!(
-                "Type mismatch: expected {}, got {} ({})",
-                target.resolved_type_name(),
-                mismatch.actual_type_name(),
-                mismatch.origin_description(reference),
-            ))
+            BindingResolutionError::ReferenceType(Box::new(BindingReferenceTypeError {
+                expected: target.resolved_type_name(),
+                actual: mismatch.actual_type_name().to_string(),
+                declared: mismatch.declared_type_name().map(str::to_string),
+                path: reference.to_owned(),
+            }))
         }),
         RefType::Unchecked => None,
         RefType::UnknownBinding { binding, attribute } => {
@@ -586,6 +637,7 @@ fn deferred_value_mismatch(
     inference_bindings: &inference::InferenceBindings,
     schemas: &SchemaRegistry,
     bindings: &BindingIndex<'_>,
+    authored_binding: &str,
 ) -> Option<BindingResolutionError> {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
@@ -606,7 +658,29 @@ fn deferred_value_mismatch(
             | DeferredValue::Unknown(_),
         ) => check_deferred_access_type(value, target, inference_bindings, schemas, bindings)
             .err()
-            .map(|error| BindingResolutionError::Existing(error.to_string())),
+            .map(|error| match error {
+                DeferredAccessTypeError::TypeMismatch {
+                    expected,
+                    actual,
+                    origin,
+                } => {
+                    // Inference describes a parser-internal unresolved-module
+                    // placeholder here. The authored binding path is the
+                    // stable source used for the shared diagnostic and dedupe.
+                    drop(origin);
+                    BindingResolutionError::ReferenceType(Box::new(BindingReferenceTypeError {
+                        expected,
+                        actual,
+                        declared: None,
+                        path: ReferencePath::Binding(authored_binding.to_string()),
+                    }))
+                }
+                DeferredAccessTypeError::InvalidAccess { error } => {
+                    BindingResolutionError::DeferredAccess(Box::new(
+                        DeferredAccessTypeError::InvalidAccess { error },
+                    ))
+                }
+            }),
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -623,6 +697,7 @@ fn deferred_value_mismatch(
 }
 
 fn precheck_value_source(
+    use_site: &crate::parser::BareBindingUse,
     value: &Value,
     sink: RefSink<'_>,
     context: &ValidationTypeContext<'_>,
@@ -646,6 +721,7 @@ fn precheck_value_source(
         &context.inference_bindings,
         context.schemas,
         &context.scope_bindings,
+        &use_site.name,
     )
 }
 
@@ -658,7 +734,7 @@ fn resolve_value_source_against_sink(
 ) -> Result<(), BindingResolutionError> {
     let prechecked = declared_type
         .is_none()
-        .then(|| precheck_value_source(value, sink, context))
+        .then(|| precheck_value_source(use_site, value, sink, context))
         .flatten();
 
     if let Some(target) = enum_target_from_sink(sink) {
@@ -712,7 +788,7 @@ fn resolve_value_source_against_sink(
             context.provider_context,
             typecheck::TypecheckInference::Unavailable,
         )
-        .map_err(|error| BindingResolutionError::Existing(error.to_string())),
+        .map_err(|error| BindingResolutionError::ValueType(Box::new(error))),
     }
 }
 
@@ -3483,18 +3559,6 @@ pub(crate) fn check_handle_sink(
     }
 }
 
-/// Public bridge used by editor diagnostics without exposing the parser-only
-/// handle representation. `None` means the argument is a value; `Some` means
-/// the shared handle checker made the complete decision.
-pub fn check_module_argument_handle_sink(
-    argument: &crate::parser::ModuleArgument,
-    resolved_parameter: &ResolvedParameterType,
-) -> Option<Result<(), HandleSinkError>> {
-    argument
-        .handle()
-        .map(|handle| check_handle_sink(handle, resolved_parameter))
-}
-
 /// Resolve and classify a module or function parameter type.
 ///
 /// Callers must not fall back to inspecting the raw [`TypeExpr`] on error:
@@ -3819,103 +3883,897 @@ pub fn validate_provider_config<E>(
     Ok(())
 }
 
-/// Validate module call arguments against module argument types.
-///
-/// `imported_modules` maps each module alias to its resolved boundary signature.
-/// `config` provides custom type validators from providers.
-pub fn validate_module_calls(
-    module_calls: &[ModuleCall],
-    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
-    config: &ProviderContext,
-) -> Result<(), String> {
-    validate_module_calls_inner(module_calls, imported_modules, config, |_, _| false)
+/// Whether a module-call finding blocks the same configuration accepted by
+/// CLI validation or is advisory-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModuleCallFindingClass {
+    Blocking,
+    Advisory,
 }
 
-/// Validate ordinary module-argument values while deferring binding-owned
-/// arguments to [`check_bare_binding_uses`].
-pub fn validate_module_calls_with_binding_uses<E>(
-    file: &crate::parser::File<E>,
-    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
-    config: &ProviderContext,
-    binding_use_report: &BindingUseReport,
-) -> Result<(), String> {
-    validate_module_calls_inner(
-        &file.module_calls,
-        imported_modules,
-        config,
-        |call, argument| {
-            binding_use_authority_owns_module_argument(
-                file,
-                binding_use_report,
-                call.id(),
+/// Stable semantic category used for source-aware deduplication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModuleCallFindingKind {
+    UnknownArgument,
+    MissingRequiredArgument,
+    ValueType,
+    HandleSink,
+    BindingUse,
+    ReferenceType,
+    Constraint,
+}
+
+/// The outermost authored call and the immediate call whose boundary failed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModuleCallFindingOwner {
+    pub root: ModuleCallId,
+    pub immediate: ModuleCallId,
+}
+
+/// Parser-authored location retained without converting it to frontend
+/// coordinates.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModuleCallFindingAnchor {
+    pub source_file: SourceFileId,
+    pub span: SourceSpan,
+}
+
+/// Typed reference-boundary diagnostic shared by authored and expanded calls.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModuleCallReferenceDiagnostic {
+    call_label: String,
+    argument: String,
+    path: ReferencePath,
+    kind: ModuleCallRefErrorKind,
+}
+
+/// The sole message-rendering authority for module-call findings.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModuleCallFindingMessage {
+    UnknownArgument {
+        module: String,
+        argument: String,
+        suggestion: Option<String>,
+    },
+    MissingRequiredArgument {
+        module: String,
+        argument: String,
+    },
+    ValueType {
+        call_label: String,
+        argument: String,
+        error: Box<typecheck::TypeExprValueError>,
+    },
+    HandleSink {
+        call_label: String,
+        argument: String,
+        error: HandleSinkError,
+    },
+    BindingUse(Box<BindingResolutionError>),
+    ReferenceType(Box<ModuleCallReferenceDiagnostic>),
+    Constraint(Box<crate::module_resolver::ModuleConstraintDiagnostic>),
+}
+
+impl ModuleCallFindingMessage {
+    /// Schema enum detail retained for editor code actions without changing
+    /// this message's canonical rendering or diagnostic ownership.
+    pub fn type_error(&self) -> Option<&TypeError> {
+        match self {
+            Self::BindingUse(error) => error.type_error(),
+            Self::UnknownArgument {
+                module: _module,
+                argument: _argument,
+                suggestion: _suggestion,
+            } => None,
+            Self::MissingRequiredArgument {
+                module: _module,
+                argument: _argument,
+            } => None,
+            Self::ValueType {
+                call_label: _call_label,
+                argument: _argument,
+                error: _error,
+            } => None,
+            Self::HandleSink {
+                call_label: _call_label,
+                argument: _argument,
+                error: _error,
+            } => None,
+            Self::ReferenceType(_diagnostic) => None,
+            Self::Constraint(_diagnostic) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ModuleCallFindingMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownArgument {
+                module,
                 argument,
-            )
-        },
-    )
+                suggestion,
+            } => {
+                write!(
+                    formatter,
+                    "Unknown argument '{argument}' for module '{module}'"
+                )?;
+                if let Some(suggestion) = suggestion {
+                    write!(formatter, ". Did you mean '{suggestion}'?")?;
+                }
+                Ok(())
+            }
+            Self::MissingRequiredArgument { module, argument } => write!(
+                formatter,
+                "Missing required argument '{argument}' for module '{module}'"
+            ),
+            Self::ValueType {
+                call_label,
+                argument,
+                error,
+            } => write!(
+                formatter,
+                "module call '{call_label}': argument '{argument}': {error}"
+            ),
+            Self::HandleSink {
+                call_label,
+                argument,
+                error,
+            } => write!(
+                formatter,
+                "module call '{call_label}': argument '{argument}': {error}"
+            ),
+            Self::BindingUse(error) => error.fmt(formatter),
+            Self::ReferenceType(error) => format_module_call_ref_error(
+                formatter,
+                &error.call_label,
+                &error.argument,
+                &error.path,
+                &error.kind,
+            ),
+            Self::Constraint(diagnostic) => diagnostic.fmt(formatter),
+        }
+    }
 }
 
-fn validate_module_calls_inner(
-    module_calls: &[ModuleCall],
-    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
-    config: &ProviderContext,
-    should_skip: impl Fn(&ModuleCall, &str) -> bool,
-) -> Result<(), String> {
-    let mut errors = Vec::new();
+impl std::error::Error for ModuleCallFindingMessage {}
 
-    for call in module_calls {
-        if let Some(signature) = imported_modules.get(&call.module_name) {
-            let module_args = &signature.arguments;
-            let source_file = call.source_file();
-            for authored in call.arguments_with_source_spans() {
-                let arg_name = authored.name();
-                let arg_value = authored.argument();
-                let value_span = authored.value_span();
-                if let Some(arg_param) = module_args.iter().find(|a| a.name == arg_name) {
-                    if should_skip(call, arg_name) {
-                        continue;
-                    }
-                    let line = value_span.start_line();
-                    let context = format!(
-                        "module {} argument '{}' in {} at line {line}",
-                        call.module_name,
-                        arg_name,
-                        source_file.display(),
-                    );
-                    let resolved_parameter =
-                        match resolve_parameter_type_for_check(&arg_param.type_expr, config) {
-                            Ok(Some(resolved)) => resolved,
-                            Ok(None) => continue,
-                            Err(error) => {
-                                errors.push(format!("{context}: {error}"));
-                                continue;
-                            }
-                        };
-                    if let Some(handle) = arg_value.handle() {
-                        if let Err(error) = check_handle_sink(handle, &resolved_parameter) {
-                            errors.push(format!("{context}: {error}"));
-                        }
-                    } else if arg_value.pending_parameter().is_some() {
-                        // A nested call can only classify a forwarded
-                        // parameter after its outermost caller is expanded.
-                        continue;
-                    } else if let Err(error) = typecheck::check_type_expr_value(
-                        &resolved_parameter.as_type_expr(),
-                        arg_value.value().expect("value module argument"),
-                        config,
-                        typecheck::TypecheckInference::Unavailable,
-                    ) {
-                        errors.push(format!("{context}: {error}"));
-                    }
+/// One blocking/advisory module-call result with typed ownership and source.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleCallFinding {
+    kind: ModuleCallFindingKind,
+    class: ModuleCallFindingClass,
+    owner: ModuleCallFindingOwner,
+    anchor: ModuleCallFindingAnchor,
+    message: ModuleCallFindingMessage,
+}
+
+impl ModuleCallFinding {
+    pub fn kind(&self) -> ModuleCallFindingKind {
+        self.kind
+    }
+
+    pub fn class(&self) -> ModuleCallFindingClass {
+        self.class
+    }
+
+    pub fn owner(&self) -> &ModuleCallFindingOwner {
+        &self.owner
+    }
+
+    pub fn anchor(&self) -> &ModuleCallFindingAnchor {
+        &self.anchor
+    }
+
+    pub fn message(&self) -> &ModuleCallFindingMessage {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for ModuleCallFinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} at line {}",
+            self.anchor.source_file.path().display(),
+            self.anchor.span.start_line(),
+        )
+    }
+}
+
+impl std::error::Error for ModuleCallFinding {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.message)
+    }
+}
+
+/// Directory-authoritative values for a source-local module-call check.
+pub enum ModuleCallSemanticView<'a, E> {
+    Available(&'a crate::parser::File<E>),
+    Unavailable,
+}
+
+/// Complete input to the single module-call diagnostic authority.
+pub struct ModuleCallCheckInput<'a, 'bindings, E> {
+    pub authored: &'a crate::parser::File<E>,
+    pub semantic: ModuleCallSemanticView<'a, E>,
+    pub base_dir: Option<&'a std::path::Path>,
+    pub imported_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+    pub provider_context: &'a ProviderContext,
+    pub schemas: &'a SchemaRegistry,
+    pub binding_use_report: &'a BindingUseReport,
+    pub bindings: &'a BindingIndex<'bindings>,
+    pub expanded_compositions: Option<&'a [crate::resource::LiveComposition]>,
+    pub constraint_reports: Option<&'a crate::module_resolver::ModuleCallConstraintReports>,
+}
+
+struct ModuleCallChecker<'a> {
+    provider_context: &'a ProviderContext,
+    schemas: &'a SchemaRegistry,
+    findings: Vec<ModuleCallFinding>,
+    active_modules: HashSet<std::path::PathBuf>,
+}
+
+struct ModuleFileCheckContext<'a, 'bindings, E> {
+    semantic: Option<&'a crate::parser::File<E>>,
+    base_dir: Option<&'a std::path::Path>,
+    signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+    binding_use_report: &'a BindingUseReport,
+    bindings: &'a BindingIndex<'bindings>,
+    root_owner: Option<&'a ModuleCallId>,
+}
+
+struct ModuleBoundaryCheckContext<'a, E> {
+    semantic_call: Option<&'a ModuleCall>,
+    authority_file: &'a crate::parser::File<E>,
+    signature: &'a crate::module_resolver::ResolvedModuleSignature,
+    binding_use_report: &'a BindingUseReport,
+    owner: ModuleCallFindingOwner,
+}
+
+struct ModuleReferenceCheckContext<'a, 'bindings, E> {
+    semantic_call: Option<&'a ModuleCall>,
+    authority_file: &'a crate::parser::File<E>,
+    signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+    binding_use_report: &'a BindingUseReport,
+    bindings: &'a BindingIndex<'bindings>,
+    owner: ModuleCallFindingOwner,
+}
+
+impl ModuleCallChecker<'_> {
+    fn push(
+        &mut self,
+        kind: ModuleCallFindingKind,
+        owner: ModuleCallFindingOwner,
+        anchor: ModuleCallFindingAnchor,
+        message: ModuleCallFindingMessage,
+    ) {
+        if self.findings.iter().any(|existing| {
+            existing.anchor == anchor && existing.kind == kind && existing.message == message
+        }) {
+            return;
+        }
+        self.findings.push(ModuleCallFinding {
+            kind,
+            class: ModuleCallFindingClass::Blocking,
+            owner,
+            anchor,
+            message,
+        });
+    }
+
+    fn check_file<E>(
+        &mut self,
+        authored: &crate::parser::File<E>,
+        context: ModuleFileCheckContext<'_, '_, E>,
+    ) {
+        let ModuleFileCheckContext {
+            semantic,
+            base_dir,
+            signatures,
+            binding_use_report,
+            bindings,
+            root_owner,
+        } = context;
+
+        for authored_call in &authored.module_calls {
+            let semantic_call = semantic.and_then(|semantic| {
+                semantic
+                    .module_calls
+                    .iter()
+                    .find(|candidate| candidate.id() == authored_call.id())
+            });
+            let authority_file = match (semantic, semantic_call) {
+                (Some(semantic), Some(_semantic_call)) => semantic,
+                (Some(_semantic), None) => authored,
+                (None, None) => authored,
+                (None, Some(_semantic_call)) => {
+                    unreachable!("a semantic call requires a semantic file")
                 }
+            };
+            let checked_call = semantic_call.unwrap_or(authored_call);
+            let root = root_owner.unwrap_or_else(|| authored_call.id()).clone();
+            let owner = ModuleCallFindingOwner {
+                root,
+                immediate: authored_call.id().clone(),
+            };
+
+            self.check_binding_use_findings(authored_call, binding_use_report, &owner);
+
+            if let Some(signature) = signatures.get(&authored_call.module_name) {
+                self.check_call(
+                    authored_call,
+                    ModuleBoundaryCheckContext {
+                        semantic_call,
+                        authority_file,
+                        signature,
+                        binding_use_report,
+                        owner: owner.clone(),
+                    },
+                );
+            }
+
+            self.check_reference_types(
+                authored_call,
+                ModuleReferenceCheckContext {
+                    semantic_call,
+                    authority_file,
+                    signatures,
+                    binding_use_report,
+                    bindings,
+                    owner: owner.clone(),
+                },
+            );
+
+            self.check_nested_module(authority_file, checked_call, base_dir, &owner.root);
+        }
+    }
+
+    fn check_binding_use_findings(
+        &mut self,
+        call: &ModuleCall,
+        report: &BindingUseReport,
+        owner: &ModuleCallFindingOwner,
+    ) {
+        for finding in report.findings() {
+            let crate::parser::BindingUseOwner::ModuleArgument {
+                call: finding_call,
+                argument,
+            } = &finding.use_site.owner
+            else {
+                continue;
+            };
+            if finding_call != call.id() {
+                continue;
+            }
+
+            let argument_anchor = call
+                .arguments_with_source_spans()
+                .find(|authored| authored.name() == argument)
+                .map(|authored| module_call_anchor(call.id(), authored.key_span()))
+                .unwrap_or_else(|| ModuleCallFindingAnchor {
+                    source_file: finding.use_site.source_file.clone(),
+                    span: finding.use_site.span,
+                });
+            match &finding.error {
+                BindingResolutionError::ValueType(error) => {
+                    self.push(
+                        ModuleCallFindingKind::ValueType,
+                        owner.clone(),
+                        argument_anchor,
+                        ModuleCallFindingMessage::ValueType {
+                            call_label: module_call_label(call),
+                            argument: argument.clone(),
+                            error: error.clone(),
+                        },
+                    );
+                    continue;
+                }
+                BindingResolutionError::ReferenceType(error) => {
+                    self.push(
+                        ModuleCallFindingKind::ReferenceType,
+                        owner.clone(),
+                        argument_anchor,
+                        ModuleCallFindingMessage::ReferenceType(Box::new(
+                            ModuleCallReferenceDiagnostic {
+                                call_label: module_call_label(call),
+                                argument: argument.clone(),
+                                path: error.path.clone(),
+                                kind: ModuleCallRefErrorKind::TypeMismatch {
+                                    expected: error.expected.clone(),
+                                    actual: error.actual.clone(),
+                                    declared: error.declared.clone(),
+                                },
+                            },
+                        )),
+                    );
+                    continue;
+                }
+                BindingResolutionError::Type(_error) => {}
+                BindingResolutionError::DeferredAccess(_error) => {}
+                BindingResolutionError::CustomType(_error) => {}
+                BindingResolutionError::Existing(_message) => {}
+            }
+
+            let binding_anchor = ModuleCallFindingAnchor {
+                source_file: finding.use_site.source_file.clone(),
+                span: finding.use_site.span,
+            };
+            self.push(
+                ModuleCallFindingKind::BindingUse,
+                owner.clone(),
+                binding_anchor,
+                ModuleCallFindingMessage::BindingUse(Box::new(finding.error.clone())),
+            );
+        }
+    }
+
+    fn check_call<E>(
+        &mut self,
+        authored_call: &ModuleCall,
+        context: ModuleBoundaryCheckContext<'_, E>,
+    ) {
+        let ModuleBoundaryCheckContext {
+            semantic_call,
+            authority_file,
+            signature,
+            binding_use_report,
+            owner,
+        } = context;
+        let inference_bindings = inference::bindings_from_parsed(authority_file);
+        let call_label = module_call_label(authored_call);
+        for authored in authored_call.arguments_with_source_spans() {
+            let argument = authored.name();
+            let Some(parameter) = signature
+                .arguments
+                .iter()
+                .find(|parameter| parameter.name == argument)
+            else {
+                let suggestion = signature
+                    .arguments
+                    .iter()
+                    .find(|parameter| {
+                        parameter.name.contains(argument) || argument.contains(&parameter.name)
+                    })
+                    .map(|parameter| parameter.name.clone());
+                self.push(
+                    ModuleCallFindingKind::UnknownArgument,
+                    owner.clone(),
+                    module_call_anchor(authored_call.id(), authored.key_span()),
+                    ModuleCallFindingMessage::UnknownArgument {
+                        module: authored_call.module_name.clone(),
+                        argument: argument.to_string(),
+                        suggestion,
+                    },
+                );
+                continue;
+            };
+
+            if module_argument_owned_by_binding_use(
+                authority_file,
+                binding_use_report,
+                authored_call.id(),
+                argument,
+            ) {
+                continue;
+            }
+
+            let Ok(Some(resolved_parameter)) =
+                resolve_parameter_type_for_check(&parameter.type_expr, self.provider_context)
+            else {
+                continue;
+            };
+            let semantic_argument = semantic_call.and_then(|call| call.argument(argument));
+            let argument_value = semantic_argument.unwrap_or_else(|| authored.argument());
+            if let Some(handle) = argument_value.handle() {
+                if let Err(error) = check_handle_sink(handle, &resolved_parameter) {
+                    self.push(
+                        ModuleCallFindingKind::HandleSink,
+                        owner.clone(),
+                        module_call_anchor(authored_call.id(), authored.key_span()),
+                        ModuleCallFindingMessage::HandleSink {
+                            call_label: call_label.clone(),
+                            argument: argument.to_string(),
+                            error,
+                        },
+                    );
+                }
+                continue;
+            }
+            if argument_value.pending_parameter().is_some() {
+                continue;
+            }
+            let Some(value) = argument_value.value() else {
+                continue;
+            };
+            if semantic_argument.is_none() && !module_call_value_is_context_free(value) {
+                continue;
+            }
+            let inference = if semantic_argument.is_some() {
+                typecheck::TypecheckInference::Available {
+                    bindings: &inference_bindings,
+                    schemas: self.schemas,
+                }
+            } else {
+                typecheck::TypecheckInference::Unavailable
+            };
+            if let Err(error) = typecheck::check_type_expr_value(
+                &resolved_parameter.as_type_expr(),
+                value,
+                self.provider_context,
+                inference,
+            ) {
+                self.push(
+                    ModuleCallFindingKind::ValueType,
+                    owner.clone(),
+                    module_call_anchor(authored_call.id(), authored.key_span()),
+                    ModuleCallFindingMessage::ValueType {
+                        call_label: call_label.clone(),
+                        argument: argument.to_string(),
+                        error: Box::new(error),
+                    },
+                );
+            }
+        }
+
+        for parameter in &signature.arguments {
+            if parameter.default.is_none()
+                && !authored_call.contains_argument(&parameter.name)
+                && !module_argument_has_pending_binding_use(
+                    authority_file,
+                    authored_call.id(),
+                    &parameter.name,
+                )
+            {
+                self.push(
+                    ModuleCallFindingKind::MissingRequiredArgument,
+                    owner.clone(),
+                    module_call_anchor(authored_call.id(), authored_call.source_span()),
+                    ModuleCallFindingMessage::MissingRequiredArgument {
+                        module: authored_call.module_name.clone(),
+                        argument: parameter.name.clone(),
+                    },
+                );
             }
         }
     }
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("\n"))
+    fn check_reference_types<E>(
+        &mut self,
+        authored_call: &ModuleCall,
+        context: ModuleReferenceCheckContext<'_, '_, E>,
+    ) {
+        let ModuleReferenceCheckContext {
+            semantic_call,
+            authority_file,
+            signatures,
+            binding_use_report,
+            bindings,
+            owner,
+        } = context;
+        let reference_call = semantic_call.unwrap_or(authored_call);
+        for error in validate_module_call_argument_ref_types_with_bindings(
+            std::slice::from_ref(reference_call),
+            signatures,
+            &HashSet::new(),
+            bindings,
+        ) {
+            if signatures
+                .get(&authored_call.module_name)
+                .is_some_and(|signature| {
+                    !signature
+                        .arguments
+                        .iter()
+                        .any(|parameter| parameter.name == error.argument)
+                })
+                || module_argument_owned_by_binding_use(
+                    authority_file,
+                    binding_use_report,
+                    authored_call.id(),
+                    &error.argument,
+                )
+                || reference_call
+                    .argument(&error.argument)
+                    .is_some_and(|argument| argument.handle().is_some())
+            {
+                continue;
+            }
+            let argument_span = authored_call
+                .arguments_with_source_spans()
+                .find(|argument| argument.name() == error.argument)
+                .map(|argument| argument.key_span())
+                .unwrap_or(error.argument_span);
+            self.push(
+                ModuleCallFindingKind::ReferenceType,
+                owner.clone(),
+                module_call_anchor(authored_call.id(), argument_span),
+                ModuleCallFindingMessage::ReferenceType(Box::new(ModuleCallReferenceDiagnostic {
+                    call_label: module_call_label(authored_call),
+                    argument: error.argument,
+                    path: error.path,
+                    kind: error.kind,
+                })),
+            );
+        }
     }
+
+    fn check_nested_module<E>(
+        &mut self,
+        file: &crate::parser::File<E>,
+        call: &ModuleCall,
+        base_dir: Option<&std::path::Path>,
+        root_owner: &ModuleCallId,
+    ) {
+        let Some(base_dir) = base_dir else {
+            return;
+        };
+        let Some(import) = file
+            .uses
+            .iter()
+            .find(|import| import.alias == call.module_name)
+        else {
+            return;
+        };
+        let module_dir = base_dir.join(&import.path);
+        let guard = std::fs::canonicalize(&module_dir).unwrap_or_else(|_error| module_dir.clone());
+        if !self.active_modules.insert(guard.clone()) {
+            return;
+        }
+
+        if let Some(mut module) = crate::module_resolver::load_module(&module_dir) {
+            // Declaration diagnostics are owned by the type-resolution pass;
+            // this call needs only its resolved in-memory type expressions.
+            drop(resolve_file_type_exprs(&mut module, self.provider_context));
+            let signatures = crate::module_resolver::load_resolved_module_signatures(
+                &module,
+                &module_dir,
+                self.provider_context,
+            );
+            let bindings = BindingIndex::from_parsed_with_module_signatures(
+                &module,
+                self.schemas,
+                &signatures,
+            );
+            let binding_use_report = check_bare_binding_uses(
+                &module,
+                &ValidationTypeContext::new(
+                    &module,
+                    self.schemas,
+                    self.provider_context,
+                    &signatures,
+                ),
+            );
+            self.check_file(
+                &module,
+                ModuleFileCheckContext {
+                    semantic: Some(&module),
+                    base_dir: Some(&module_dir),
+                    signatures: &signatures,
+                    binding_use_report: &binding_use_report,
+                    bindings: &bindings,
+                    root_owner: Some(root_owner),
+                },
+            );
+        }
+
+        self.active_modules.remove(&guard);
+    }
+
+    fn check_expanded(
+        &mut self,
+        compositions: &[crate::resource::LiveComposition],
+        bindings: &BindingIndex<'_>,
+    ) {
+        for error in validate_composition_ref_types_with_bindings(compositions, bindings) {
+            let CompositionRefError::ModuleCall(error) = error else {
+                continue;
+            };
+            let root = error.call_path.root();
+            let immediate = error.call_path.immediate();
+            let span = match *error.origin {
+                crate::parser::ArgumentOrigin::Authored {
+                    key_span,
+                    value_span: _value_span,
+                } => key_span,
+                crate::parser::ArgumentOrigin::Defaulted => immediate.id.call_span(),
+            };
+            self.push(
+                ModuleCallFindingKind::ReferenceType,
+                ModuleCallFindingOwner {
+                    root: root.id.clone(),
+                    immediate: immediate.id.clone(),
+                },
+                module_call_anchor(&immediate.id, span),
+                ModuleCallFindingMessage::ReferenceType(Box::new(ModuleCallReferenceDiagnostic {
+                    call_label: match immediate.id.expansion() {
+                        crate::parser::CallExpansion::Direct => {
+                            immediate.binding.clone().unwrap_or_else(|| {
+                                format!("{} (anonymous call)", immediate.module_name)
+                            })
+                        }
+                        crate::parser::CallExpansion::Expanded(_expansion_key) => {
+                            format!("{} (anonymous call)", immediate.module_name)
+                        }
+                    },
+                    argument: error.argument,
+                    path: error.path,
+                    kind: error.kind,
+                })),
+            );
+        }
+    }
+
+    fn check_constraints(
+        &mut self,
+        reports: &crate::module_resolver::ModuleCallConstraintReports,
+        compositions: Option<&[crate::resource::LiveComposition]>,
+    ) {
+        for report in reports.values() {
+            for outcome in &report.outcomes {
+                let crate::module_resolver::ResolvedModuleConstraintStatus::Failed {
+                    diagnostic,
+                    origin,
+                } = &outcome.status
+                else {
+                    continue;
+                };
+                let span = match origin {
+                    crate::module_resolver::ResolvedModuleConstraintOrigin::Argument(
+                        crate::parser::ArgumentOrigin::Authored {
+                            key_span,
+                            value_span: _value_span,
+                        },
+                    ) => *key_span,
+                    crate::module_resolver::ResolvedModuleConstraintOrigin::Argument(
+                        crate::parser::ArgumentOrigin::Defaulted,
+                    )
+                    | crate::module_resolver::ResolvedModuleConstraintOrigin::Call => {
+                        report.source.call_span()
+                    }
+                };
+                let (root, immediate) = compositions
+                    .into_iter()
+                    .flatten()
+                    .find_map(|composition| {
+                        let path = composition.call_path();
+                        (path.immediate().id == report.source.id)
+                            .then(|| (path.root().id.clone(), path.immediate().id.clone()))
+                    })
+                    .unwrap_or_else(|| (report.source.id.clone(), report.source.id.clone()));
+                self.push(
+                    ModuleCallFindingKind::Constraint,
+                    ModuleCallFindingOwner { root, immediate },
+                    ModuleCallFindingAnchor {
+                        source_file: report.source.id.source_file_id().clone(),
+                        span,
+                    },
+                    ModuleCallFindingMessage::Constraint(diagnostic.clone()),
+                );
+            }
+        }
+    }
+}
+
+fn module_call_anchor(call: &ModuleCallId, span: SourceSpan) -> ModuleCallFindingAnchor {
+    ModuleCallFindingAnchor {
+        source_file: call.source_file_id().clone(),
+        span,
+    }
+}
+
+fn module_argument_owned_by_binding_use<E>(
+    file: &crate::parser::File<E>,
+    report: &BindingUseReport,
+    call: &ModuleCallId,
+    argument: &str,
+) -> bool {
+    binding_use_authority_owns_module_argument(file, report, call, argument)
+}
+
+fn module_call_label(call: &ModuleCall) -> String {
+    if matches!(
+        call.id().expansion(),
+        crate::parser::CallExpansion::Expanded(_expansion_key)
+    ) {
+        return format!("{} (anonymous call)", call.module_name);
+    }
+    call.binding_name
+        .clone()
+        .unwrap_or_else(|| format!("{} (anonymous call)", call.module_name))
+}
+
+fn module_call_value_is_context_free(value: &Value) -> bool {
+    match value {
+        Value::Concrete(ConcreteValue::String(_string)) => true,
+        Value::Concrete(ConcreteValue::CanonicalEnum(_canonical)) => true,
+        Value::Concrete(ConcreteValue::Int(_integer)) => true,
+        Value::Concrete(ConcreteValue::Float(_float)) => true,
+        Value::Concrete(ConcreteValue::Bool(_boolean)) => true,
+        Value::Concrete(ConcreteValue::Duration(_duration)) => true,
+        Value::Concrete(ConcreteValue::StringList(_strings)) => true,
+        Value::Concrete(ConcreteValue::EnumIdentifier(_identifier)) => false,
+        Value::Deferred(DeferredValue::ResourceRef { path: _path }) => false,
+        Value::Deferred(DeferredValue::BindingRef { binding: _binding }) => false,
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: _name,
+            args: _args,
+            source_line: _source_line,
+        }) => false,
+        Value::Deferred(DeferredValue::Unavailable {
+            name: _name,
+            args: _args,
+            reason: _reason,
+            source_line: _source_line,
+        }) => false,
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: _function,
+            functions: _functions,
+            args: _args,
+            source_line: _source_line,
+        }) => false,
+        Value::Deferred(DeferredValue::Access(_access)) => false,
+        Value::Deferred(DeferredValue::Unknown(_reason)) => false,
+        Value::Deferred(DeferredValue::RedactedSecret { hash: _hash }) => false,
+        Value::Concrete(ConcreteValue::List(items)) => {
+            items.iter().all(module_call_value_is_context_free)
+        }
+        Value::Concrete(ConcreteValue::Map(entries)) => {
+            entries.values().all(module_call_value_is_context_free)
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().all(|part| {
+            matches!(part, crate::resource::InterpolationPart::Literal(_literal))
+                || matches!(part, crate::resource::InterpolationPart::Expr(value)
+                    if module_call_value_is_context_free(value))
+        }),
+        Value::Deferred(DeferredValue::Secret(inner)) => module_call_value_is_context_free(inner),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            module_call_value_is_context_free(value) && module_call_value_is_context_free(default)
+        }
+    }
+}
+
+/// Collect every module-call finding available from authored, expanded, and
+/// resolver-owned semantic views.
+pub fn check_module_calls<E>(input: ModuleCallCheckInput<'_, '_, E>) -> Vec<ModuleCallFinding> {
+    let ModuleCallCheckInput {
+        authored,
+        semantic,
+        base_dir,
+        imported_signatures,
+        provider_context,
+        schemas,
+        binding_use_report,
+        bindings,
+        expanded_compositions,
+        constraint_reports,
+    } = input;
+    let semantic = match semantic {
+        ModuleCallSemanticView::Available(semantic) => Some(semantic),
+        ModuleCallSemanticView::Unavailable => None,
+    };
+    let mut checker = ModuleCallChecker {
+        provider_context,
+        schemas,
+        findings: Vec::new(),
+        active_modules: HashSet::new(),
+    };
+    checker.check_file(
+        authored,
+        ModuleFileCheckContext {
+            semantic,
+            base_dir,
+            signatures: imported_signatures,
+            binding_use_report,
+            bindings,
+            root_owner: None,
+        },
+    );
+    if let Some(compositions) = expanded_compositions {
+        checker.check_expanded(compositions, bindings);
+    }
+    if let Some(reports) = constraint_reports {
+        checker.check_constraints(reports, expanded_compositions);
+    }
+    checker.findings
 }
 
 /// Export parameters checked against the pre-apply binding view.

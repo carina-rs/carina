@@ -6251,11 +6251,10 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
     assert_eq!(state.identifier.as_deref(), Some("route-123"));
 }
 
-// Smoke test for the module/provider wrappers: empty input exercises
-// each wrapper and pins the `Vec<AppError>` return type. A regression
-// back to `Result` fails to compile here.
+// Smoke test for the provider/composition wrappers and the typed module-call
+// checker on empty input.
 #[test]
-fn module_and_provider_wrappers_return_vec_app_error() {
+fn module_checker_and_provider_wrappers_accept_empty_input() {
     let ctx = WiringContext::new_for_test(vec![], &[]);
     let parsed = ParsedFile::default();
     let provider_ctx = carina_core::parser::ProviderContext::default();
@@ -6273,13 +6272,26 @@ fn module_and_provider_wrappers_return_vec_app_error() {
             &module_signatures,
         ),
     );
-    let errors = validate_module_calls_with_imported(
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_module_signatures(
         &parsed,
+        ctx.schemas(),
         &module_signatures,
-        &provider_ctx,
-        &binding_use_report,
     );
-    assert!(errors.is_empty(), "module_calls: got {errors:?}");
+    let findings = carina_core::validation::check_module_calls(
+        carina_core::validation::ModuleCallCheckInput {
+            authored: &parsed,
+            semantic: carina_core::validation::ModuleCallSemanticView::Available(&parsed),
+            base_dir: Some(std::path::Path::new(".")),
+            imported_signatures: &module_signatures,
+            provider_context: &provider_ctx,
+            schemas: ctx.schemas(),
+            binding_use_report: &binding_use_report,
+            bindings: &bindings,
+            expanded_compositions: None,
+            constraint_reports: None,
+        },
+    );
+    assert!(findings.is_empty(), "module_calls: got {findings:?}");
 
     let errors = validate_composition_ref_types_with_ctx(&ctx, &parsed);
     assert!(errors.is_empty(), "composition_ref_types: got {errors:?}");

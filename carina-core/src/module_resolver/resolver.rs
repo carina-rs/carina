@@ -14,10 +14,10 @@ use crate::parser::{
 use crate::resource::ModuleConstraintId;
 use crate::schema::SchemaRegistry;
 
-use super::error::ModuleError;
+use super::error::{ModuleError, ModuleErrorCallSource};
 use super::expander::instance_prefix_for_call;
 use super::loader::sorted_crn_paths_in;
-use super::validation::ModuleConstraintDiagnostic;
+use super::validation::{ConstraintOrigin, ModuleConstraintDiagnostic};
 
 /// Resolver-owned result of evaluating one authored module constraint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +68,166 @@ pub type ModuleCallConstraintReports = IndexMap<ModuleCallId, ModuleCallConstrai
 /// allocates or clones `constraint_reports`.
 pub struct ModuleResolutionDiagnosticReport {
     pub constraint_reports: ModuleCallConstraintReports,
-    pub error: Option<ModuleError>,
+    pub status: ModuleResolutionDiagnosticStatus,
+}
+
+/// Completion state after resolver-owned diagnostics have claimed their
+/// failures. A constraint failure remains incomplete even though its concrete
+/// diagnostic is carried by `constraint_reports` rather than a residual
+/// [`ModuleError`].
+pub enum ModuleResolutionDiagnosticStatus {
+    Complete,
+    Failed(ModuleResolutionDiagnosticFailure),
+}
+
+pub enum ModuleResolutionDiagnosticFailure {
+    ConstraintReports,
+    SourceFindings,
+    Unowned(ResidualModuleResolutionError),
+}
+
+/// Resolver failure left after typed source diagnostics have claimed every
+/// call-boundary and constraint error they own.
+pub struct ResidualModuleResolutionError(Box<ModuleError>);
+
+/// Source-routing shape of a residual resolver error. Core classifies every
+/// [`ModuleError`] variant; editor adapters only map the resulting location.
+pub enum ResidualModuleResolutionDiagnostic<'a> {
+    Constraint { origin: &'a ConstraintOrigin },
+    ArgumentValueAccess { source_path: &'a str, line: usize },
+    Parse,
+}
+
+impl ResidualModuleResolutionError {
+    fn new(error: ModuleError) -> Self {
+        Self(Box::new(error))
+    }
+
+    pub fn call_source(&self) -> ModuleErrorCallSource<'_> {
+        self.0.call_source()
+    }
+
+    pub fn display_relative_to(&self, root: &Path) -> String {
+        self.0.display_relative_to(root)
+    }
+
+    pub fn diagnostic(&self) -> Option<ResidualModuleResolutionDiagnostic<'_>> {
+        match self.0.root_cause() {
+            ModuleError::Constraint(diagnostic) => {
+                Some(ResidualModuleResolutionDiagnostic::Constraint {
+                    origin: &diagnostic.origin,
+                })
+            }
+            ModuleError::ArgumentValueAccess {
+                module: _module,
+                source_path,
+                line,
+                message: _message,
+            } => Some(ResidualModuleResolutionDiagnostic::ArgumentValueAccess {
+                source_path,
+                line: *line,
+            }),
+            ModuleError::Parse(_error) => Some(ResidualModuleResolutionDiagnostic::Parse),
+            ModuleError::ParseInFile {
+                path: _path,
+                error: _error,
+            } => Some(ResidualModuleResolutionDiagnostic::Parse),
+            ModuleError::NotFound(_module) => None,
+            ModuleError::CircularImport(_module) => None,
+            ModuleError::Io(_error) => None,
+            ModuleError::UnknownModule(_module) => None,
+            ModuleError::ProviderInModule
+            | ModuleError::StateBlockInModule
+            | ModuleError::BackendInModule
+            | ModuleError::UpstreamStateInModule
+            | ModuleError::ExportsInModule => None,
+            ModuleError::NotADirectory { path: _path } => None,
+            ModuleError::OwnedByCalls {
+                calls: _calls,
+                error: _error,
+            } => None,
+            ModuleError::AtCall {
+                call: _call,
+                error: _error,
+            } => None,
+            ModuleError::MissingArgument {
+                module: _module,
+                argument: _argument,
+            } => None,
+            ModuleError::InvalidArgumentType {
+                module: _module,
+                argument: _argument,
+                mismatch: _mismatch,
+            } => None,
+            ModuleError::BareStructuralHandleArgument {
+                module: _module,
+                argument: _argument,
+                source_path: _source_path,
+                line: _line,
+                message: _message,
+            } => None,
+            ModuleError::ReferenceType(_joined) => None,
+            ModuleError::UnknownArgument {
+                module: _module,
+                argument: _argument,
+            } => None,
+        }
+    }
+}
+
+impl ModuleResolutionDiagnosticStatus {
+    pub fn is_complete(&self) -> bool {
+        match self {
+            Self::Complete => true,
+            Self::Failed(_failure) => false,
+        }
+    }
+
+    pub fn unowned_error(&self) -> Option<&ResidualModuleResolutionError> {
+        match self {
+            Self::Complete
+            | Self::Failed(
+                ModuleResolutionDiagnosticFailure::ConstraintReports
+                | ModuleResolutionDiagnosticFailure::SourceFindings,
+            ) => None,
+            Self::Failed(ModuleResolutionDiagnosticFailure::Unowned(error)) => Some(error),
+        }
+    }
+}
+
+fn module_resolution_diagnostic_status(
+    error: Option<ModuleError>,
+    constraint_reports: &ModuleCallConstraintReports,
+) -> ModuleResolutionDiagnosticStatus {
+    let Some(error) = error else {
+        return ModuleResolutionDiagnosticStatus::Complete;
+    };
+    let constraint_report_owns_error =
+        if let ModuleError::Constraint(_diagnostic) = error.root_cause() {
+            constraint_reports.values().any(|report| {
+                report.outcomes.iter().any(|outcome| match &outcome.status {
+                    ResolvedModuleConstraintStatus::Satisfied
+                    | ResolvedModuleConstraintStatus::Pending => false,
+                    ResolvedModuleConstraintStatus::Failed {
+                        diagnostic: _diagnostic,
+                        origin: _origin,
+                    } => true,
+                })
+            })
+        } else {
+            false
+        };
+    if constraint_report_owns_error {
+        ModuleResolutionDiagnosticStatus::Failed(
+            ModuleResolutionDiagnosticFailure::ConstraintReports,
+        )
+    } else if error.is_source_diagnostic_owned() {
+        ModuleResolutionDiagnosticStatus::Failed(ModuleResolutionDiagnosticFailure::SourceFindings)
+    } else {
+        ModuleResolutionDiagnosticStatus::Failed(ModuleResolutionDiagnosticFailure::Unowned(
+            ResidualModuleResolutionError::new(error),
+        ))
+    }
 }
 
 /// Opaque proof that every reachable module definition has passed the shared
@@ -612,9 +771,10 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike> RefCheckedModuleGraph<'pa
             .constraint_reports
             .into_inner()
             .expect("diagnostic resolver always records constraint reports");
+        let status = module_resolution_diagnostic_status(error, &constraint_reports);
         ModuleResolutionDiagnosticReport {
             constraint_reports,
-            error,
+            status,
         }
     }
 }
@@ -697,10 +857,14 @@ pub fn resolve_modules_with_diagnostics<E: crate::parser::ExportParamLike>(
 ) -> ModuleResolutionDiagnosticReport {
     match RefCheckedModuleGraph::check_with_reporting(parsed, base_dir, config, schemas) {
         Ok(checked) => checked.expand_with_diagnostics(),
-        Err(error) => ModuleResolutionDiagnosticReport {
-            constraint_reports: IndexMap::new(),
-            error: Some(error),
-        },
+        Err(error) => {
+            let constraint_reports = IndexMap::new();
+            let status = module_resolution_diagnostic_status(Some(error), &constraint_reports);
+            ModuleResolutionDiagnosticReport {
+                constraint_reports,
+                status,
+            }
+        }
     }
 }
 

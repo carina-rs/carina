@@ -1700,7 +1700,7 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
             unresolved,
         )
         .expect_err("apply bootstrap reload must reject module-output type mismatch");
-        let message = error.to_string();
+        let message = crate::error::format_error_with_source_chain(&error);
         assert!(message.contains("module call 'y'"), "{message}");
         assert!(message.contains("expected Int"), "{message}");
         assert!(message.contains("got String"), "{message}");

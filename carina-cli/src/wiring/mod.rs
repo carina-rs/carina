@@ -3156,20 +3156,6 @@ pub fn validate_provider_region_with_ctx<E>(
     ))
 }
 
-pub(crate) fn validate_module_calls_with_imported<E>(
-    parsed: &carina_core::parser::File<E>,
-    imported_modules: &module_resolver::ResolvedModuleSignatures,
-    config: &carina_core::parser::ProviderContext,
-    binding_use_report: &carina_core::validation::BindingUseReport,
-) -> Vec<AppError> {
-    lift_validation_result(validation::validate_module_calls_with_binding_uses(
-        parsed,
-        imported_modules,
-        config,
-        binding_use_report,
-    ))
-}
-
 /// Preserve source-local module-output diagnostics when module expansion
 /// fails before compositions can be built (for example, on an import cycle).
 ///
@@ -3251,17 +3237,6 @@ pub(crate) fn validate_module_internal_ref_types(
         ) {
             errors.extend(prefixed_validation_messages(&joined, &prefix));
         }
-
-        errors.extend(
-            validation::validate_module_call_argument_ref_types_with_bindings(
-                &parsed.module_calls,
-                &imported,
-                &HashSet::new(),
-                &bindings,
-            )
-            .into_iter()
-            .map(|error| AppError::Validation(format!("{prefix}: {error}"))),
-        );
     }
     errors
 }

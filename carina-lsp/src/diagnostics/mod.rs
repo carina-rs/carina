@@ -44,6 +44,45 @@ fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
     })
 }
 
+fn render_module_call_findings(
+    doc: &Document,
+    current_file: &Path,
+    findings: &[carina_core::validation::ModuleCallFinding],
+) -> Vec<Diagnostic> {
+    findings
+        .iter()
+        .filter_map(|finding| {
+            let span = if finding.anchor().source_file.path() == current_file {
+                finding.anchor().span
+            } else if finding.owner().root.source_file() == current_file {
+                finding.owner().root.call_span()
+            } else {
+                return None;
+            };
+            let severity = match finding.class() {
+                carina_core::validation::ModuleCallFindingClass::Blocking => {
+                    DiagnosticSeverity::ERROR
+                }
+                carina_core::validation::ModuleCallFindingClass::Advisory => {
+                    DiagnosticSeverity::WARNING
+                }
+            };
+            let range = parser_span_range(doc, span)?;
+            let message = finding.message().to_string();
+            if let Some(type_error) = finding.message().type_error()
+                && let Some(mut diagnostic) =
+                    build_enum_diagnostic_from_error(type_error, Some(range))
+            {
+                diagnostic.severity = Some(severity);
+                diagnostic.message = message;
+                Some(diagnostic)
+            } else {
+                Some(carina_diagnostic_range(range, severity, message))
+            }
+        })
+        .collect()
+}
+
 #[derive(Default)]
 pub(super) struct ProviderValidationDeduplicator {
     suspended_inputs: Mutex<HashSet<(String, SuspendedValidationId)>>,
@@ -99,23 +138,6 @@ pub(crate) fn carina_diagnostic(
         message,
         ..Default::default()
     }
-}
-
-fn deduplicate_identical_diagnostics(diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
-    let mut seen = HashSet::new();
-    diagnostics
-        .into_iter()
-        .filter(|diagnostic| {
-            seen.insert((
-                diagnostic.range.start.line,
-                diagnostic.range.start.character,
-                diagnostic.range.end.line,
-                diagnostic.range.end.character,
-                format!("{:?}", diagnostic.severity),
-                diagnostic.message.clone(),
-            ))
-        })
-        .collect()
 }
 
 /// Create a `Diagnostic` with an arbitrary `Range` and the standard "carina" source.
@@ -624,7 +646,7 @@ impl DiagnosticEngine {
                 .uses()
                 .filter(|use_site| {
                     use_site.path.segments().len() == 1
-                        || binding_use_report.findings().iter().any(|finding| {
+                        || binding_use_report.resource_findings().any(|finding| {
                             finding.use_site.source_file == use_site.source_file
                                 && finding.use_site.span == use_site.span
                                 && finding.use_site.name == use_site.name
@@ -650,7 +672,7 @@ impl DiagnosticEngine {
                 })
                 .collect::<HashSet<_>>();
             let diagnostic_file = current_file_path.unwrap_or_else(|| doc.source_file());
-            for finding in binding_use_report.findings() {
+            for finding in binding_use_report.resource_findings() {
                 if finding.use_site.source_file.path() != diagnostic_file {
                     continue;
                 }
@@ -682,63 +704,49 @@ impl DiagnosticEngine {
             let export_value_bindings =
                 carina_core::binding_index::ResolvedBindings::for_validation(binding_input);
             diagnostics.extend(self.check_user_function_ref_types(doc, parsed, &binding_index));
-            let mut module_call_diagnostics = Vec::new();
-            if let Some(base_path) = base_path {
-                module_call_diagnostics.extend(self.check_module_calls(
-                    parsed,
-                    &semantic_view,
-                    &module_signatures,
-                    &inference_bindings,
-                    &binding_use_report,
-                ));
-                let constraint_diagnostics = current_file_path
-                    .zip(merged_result.as_ref())
-                    .map(|(current_file_path, result)| {
-                        self.module_constraint_diagnostics(
-                            current_file_path,
-                            &result.module_constraint_reports,
-                        )
-                    })
-                    .unwrap_or_default();
-                let has_source_owned_constraint_diagnostic = !constraint_diagnostics.is_empty();
-                module_call_diagnostics.extend(constraint_diagnostics);
-                if !has_source_owned_constraint_diagnostic
-                    && let Some(error) = merged_result
-                        .as_ref()
-                        .and_then(|result| result.module_error.as_ref())
-                {
-                    diagnostics.extend(self.module_resolver_error_diagnostics(
-                        doc,
-                        parsed,
-                        error,
-                        base_path,
-                        current_file_path,
-                    ));
-                }
-            }
             let expansion_succeeded = merged_result
                 .as_ref()
-                .is_some_and(|result| result.module_error.is_none());
-            // Successful expansion supplies inferred types for unannotated
-            // forwarded outputs. Declared module outputs were already checked
-            // by the mandatory graph pass; both branches use BindingIndex's
-            // single TypeInSchema relation.
-            if let (Some(_), Some(expanded), true) = (base_path, merged, expansion_succeeded) {
-                module_call_diagnostics.extend(self.check_composition_ref_types(
+                .is_some_and(|result| result.module_resolution_status.is_complete());
+            let semantic = match merged {
+                Some(merged) => carina_core::validation::ModuleCallSemanticView::Available(merged),
+                None => carina_core::validation::ModuleCallSemanticView::Unavailable,
+            };
+            let expanded_compositions = expansion_succeeded
+                .then_some(merged)
+                .flatten()
+                .map(|expanded| expanded.compositions.as_slice());
+            let constraint_reports = merged_result
+                .as_ref()
+                .map(|result| &result.module_constraint_reports);
+            let findings = carina_core::validation::check_module_calls(
+                carina_core::validation::ModuleCallCheckInput {
+                    authored: parsed,
+                    semantic,
+                    base_dir: base_path,
+                    imported_signatures: &module_signatures,
+                    provider_context: &self.provider_context,
+                    schemas: &self.schemas,
+                    binding_use_report: &binding_use_report,
+                    bindings: &binding_index,
+                    expanded_compositions,
+                    constraint_reports,
+                },
+            );
+            diagnostics.extend(render_module_call_findings(doc, diagnostic_file, &findings));
+            if let (Some(base_path), Some(error)) = (
+                base_path,
+                merged_result
+                    .as_ref()
+                    .and_then(|result| result.module_resolution_status.unowned_error()),
+            ) {
+                diagnostics.extend(self.module_resolver_error_diagnostics(
+                    doc,
                     parsed,
-                    &semantic_view,
-                    &expanded.compositions,
-                    &binding_index,
-                ));
-            } else {
-                module_call_diagnostics.extend(self.check_module_call_ref_types(
-                    parsed,
-                    &semantic_view,
-                    &module_signatures,
-                    &binding_index,
+                    error,
+                    base_path,
+                    current_file_path,
                 ));
             }
-            diagnostics.extend(deduplicate_identical_diagnostics(module_call_diagnostics));
             // The document AST intentionally preserves function calls for
             // source-oriented checks. Build a parallel, same-order view with
             // locally resolvable calls evaluated so schema diagnostics see

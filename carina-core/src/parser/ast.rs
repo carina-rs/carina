@@ -1577,6 +1577,10 @@ impl ModuleCallId {
         self.source_file.path()
     }
 
+    pub fn source_file_id(&self) -> &SourceFileId {
+        &self.source_file
+    }
+
     pub fn call_span(&self) -> SourceSpan {
         self.call_span
     }

@@ -42,12 +42,12 @@ use crate::wiring::{
     CanonicalResourcePair, WiringContext, compute_anonymous_identifiers_with_ctx,
     compute_canonical_pair_anonymous_identifiers_with_ctx, resolve_file_names_with_ctx,
     validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
-    validate_module_attribute_refs_after_expansion_failure, validate_module_calls_with_imported,
-    validate_module_internal_ref_types, validate_no_backend_in_modules,
-    validate_no_empty_interpolations, validate_no_exports_in_modules,
-    validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
-    validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
-    validate_resources_with_ctx, validate_wait_bindings_with_ctx,
+    validate_module_attribute_refs_after_expansion_failure, validate_module_internal_ref_types,
+    validate_no_backend_in_modules, validate_no_empty_interpolations,
+    validate_no_exports_in_modules, validate_no_provider_in_modules,
+    validate_no_state_blocks_in_modules, validate_no_upstream_states_in_modules,
+    validate_provider_region_with_ctx, validate_resources_with_ctx,
+    validate_wait_bindings_with_ctx,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -432,10 +432,25 @@ fn extend_binding_use_errors(
 ) {
     errors.extend(
         report
-            .findings()
-            .iter()
+            .resource_findings()
             .cloned()
             .map(|finding| AppError::BindingUse(Box::new(finding))),
+    );
+}
+
+fn extend_module_call_errors(
+    errors: &mut Vec<AppError>,
+    findings: Vec<carina_core::validation::ModuleCallFinding>,
+) {
+    errors.extend(
+        findings
+            .into_iter()
+            .filter_map(|finding| match finding.class() {
+                carina_core::validation::ModuleCallFindingClass::Blocking => {
+                    Some(AppError::ModuleCall(Box::new(finding)))
+                }
+                carina_core::validation::ModuleCallFindingClass::Advisory => None,
+            }),
     );
 }
 
@@ -577,13 +592,14 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         ));
     }
 
-    // Load root module signatures once before expansion for concrete argument,
-    // missing-argument, and unknown-argument validation.
+    // Load root module signatures once. The core module-call checker consumes
+    // them for every authored boundary; expansion retains only defensive
+    // backstops for callers that bypass validation.
     let imported_module_signatures =
         module_resolver::load_resolved_module_signatures(parsed, base_dir, &enriched_context);
 
-    // Consume caller-authored uses before the legacy module-argument checker
-    // or expansion can turn a typed pending slot into a secondary missing-
+    // Consume caller-authored uses before the shared module-call checker or
+    // expansion can turn a typed pending slot into a secondary missing-
     // argument error. This authority is mandatory even for destroy/state
     // recovery paths (`skip_resource_validation`): the flag may skip provider
     // resource checks, but it cannot mint validation readiness.
@@ -616,14 +632,30 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         extend_binding_use_errors(&mut errors, &report);
     }
 
-    // Validate module call arguments before expansion (needs enriched
-    // context for custom type validators).
-    errors.extend(validate_module_calls_with_imported(
-        parsed,
-        &imported_module_signatures,
-        &enriched_context,
-        &binding_use_report,
-    ));
+    let module_call_bindings =
+        carina_core::binding_index::BindingIndex::from_parsed_with_module_signatures(
+            parsed,
+            ctx.schemas(),
+            &imported_module_signatures,
+        );
+    extend_module_call_errors(
+        &mut errors,
+        carina_core::validation::check_module_calls(
+            carina_core::validation::ModuleCallCheckInput {
+                authored: parsed,
+                semantic: carina_core::validation::ModuleCallSemanticView::Available(parsed),
+                base_dir: Some(base_dir),
+                imported_signatures: &imported_module_signatures,
+                provider_context: &enriched_context,
+                schemas: ctx.schemas(),
+                binding_use_report: &binding_use_report,
+                bindings: &module_call_bindings,
+                expanded_compositions: None,
+                constraint_reports: None,
+            },
+        ),
+    );
+    drop(module_call_bindings);
 
     // User-facing checks for root-owned blocks inside modules run on the
     // recursive module walk so validate/plan/apply can collect path-prefixed
@@ -711,7 +743,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         ),
     );
     extend_binding_use_errors(&mut errors, &binding_use_report);
-    if !binding_use_report.is_ready() {
+    if binding_use_report.has_resource_findings() {
         return Err(errors);
     }
 
@@ -786,23 +818,30 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
             &export_value_bindings,
             &enriched_context,
         );
-        let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports(
+        let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures(
             parsed,
             ctx.schemas(),
             &upstream_exports,
+            &imported_module_signatures,
         );
-        // The mandatory pre-expansion graph check has already validated every
-        // declared module-output boundary. Keep the expanded walk for
-        // unannotated forwarded outputs, whose inferred source type exists
-        // only on compositions; it uses the same BindingIndex + TypeInSchema
-        // relation rather than a second assignability authority.
-        errors.extend(
-            carina_core::validation::validate_composition_ref_types_with_bindings(
-                &parsed.compositions,
-                &bindings,
-            )
-            .into_iter()
-            .map(|error| AppError::Validation(error.to_string())),
+        // The same core check incorporates expanded boundaries whose source
+        // type exists only after composition construction.
+        extend_module_call_errors(
+            &mut errors,
+            carina_core::validation::check_module_calls(
+                carina_core::validation::ModuleCallCheckInput {
+                    authored: parsed,
+                    semantic: carina_core::validation::ModuleCallSemanticView::Available(parsed),
+                    base_dir: Some(base_dir),
+                    imported_signatures: &imported_module_signatures,
+                    provider_context: &enriched_context,
+                    schemas: ctx.schemas(),
+                    binding_use_report: &binding_use_report,
+                    bindings: &bindings,
+                    expanded_compositions: Some(&parsed.compositions),
+                    constraint_reports: None,
+                },
+            ),
         );
         if let Err(message) = carina_core::validation::validate_resource_ref_types(
             parsed,

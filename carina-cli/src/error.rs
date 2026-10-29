@@ -687,6 +687,10 @@ pub enum AppError {
     #[error(transparent)]
     BindingUseReport(Box<carina_core::validation::BindingUseReport>),
 
+    /// One core-owned module-call finding at its parser-authored location.
+    #[error(transparent)]
+    ModuleCall(Box<carina_core::validation::ModuleCallFinding>),
+
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]
     Validation(String),

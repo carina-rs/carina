@@ -331,8 +331,8 @@ fn validate_rejects_renamed_legacy_custom_type_name() {
 /// Reproduces carina#3368: a dotted custom type that is not registered
 /// must be rejected instead of silently validating as an untyped string.
 /// This also pins the signature-loader boundary: its best-effort snapshot may
-/// retain the unresolved type, but the caller-side parameter classifier must
-/// resolve it before deciding whether the argument is a handle or a value.
+/// retain the unresolved type, but the module declaration pass must reject it
+/// before expansion can treat the argument as untyped.
 #[test]
 fn validate_rejects_fake_dotted_custom_type() {
     let fixture = write_fixture("list(aws.iam.TotallyFake.Arn)");
@@ -342,7 +342,7 @@ fn validate_rejects_fake_dotted_custom_type() {
 
     assert!(
         diags.iter().any(|d| {
-            d.contains("module inner argument 'bad_arg'")
+            d.contains("argument 'bad_arg'")
                 && d.contains("unknown custom type")
                 && (d.contains("aws.iam.TotallyFake.Arn") || d.contains("TotallyFake"))
         }),

@@ -74,6 +74,31 @@ fn empty_parsed() -> ParsedFile {
     }
 }
 
+fn module_call_findings_for_test(
+    parsed: &ParsedFile,
+    signatures: &crate::module_resolver::ResolvedModuleSignatures,
+    provider_context: &ProviderContext,
+) -> Vec<ModuleCallFinding> {
+    let schemas = SchemaRegistry::new();
+    let binding_use_report = check_bare_binding_uses(
+        parsed,
+        &ValidationTypeContext::new(parsed, &schemas, provider_context, signatures),
+    );
+    let bindings = BindingIndex::from_parsed_with_module_signatures(parsed, &schemas, signatures);
+    check_module_calls(ModuleCallCheckInput {
+        authored: parsed,
+        semantic: ModuleCallSemanticView::Available(parsed),
+        base_dir: Some(std::path::Path::new(".")),
+        imported_signatures: signatures,
+        provider_context,
+        schemas: &schemas,
+        binding_use_report: &binding_use_report,
+        bindings: &bindings,
+        expanded_compositions: None,
+        constraint_reports: None,
+    })
+}
+
 fn authored_binding_view(source: &str) -> crate::config_loader::AuthoredBindingView {
     crate::config_loader::AuthoredBindingView::parse_source(source, &ProviderContext::default())
         .expect("fixture must parse")
@@ -3449,7 +3474,7 @@ fn lifted_simple_vpc_id_accepts_matching_custom_identity() {
 }
 
 #[test]
-fn validate_module_calls_rejects_custom_type() {
+fn check_module_calls_rejects_custom_type() {
     use crate::parser::ArgumentParameter;
 
     let config = context_with_iam_policy_arn_validator();
@@ -3462,7 +3487,8 @@ fn validate_module_calls_rejects_custom_type() {
         )])),
     );
 
-    let module_calls = vec![ModuleCall::test(
+    let mut parsed = empty_parsed();
+    parsed.module_calls = vec![ModuleCall::test(
         "github".to_string(),
         None,
         module_arguments(args),
@@ -3484,16 +3510,22 @@ fn validate_module_calls_rejects_custom_type() {
         },
     );
 
-    let result = validate_module_calls(&module_calls, &imported_modules, &config);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("invalid IAM policy ARN"));
+    let findings = module_call_findings_for_test(&parsed, &imported_modules, &config);
+    assert!(
+        findings.iter().any(|finding| finding
+            .message()
+            .to_string()
+            .contains("invalid IAM policy ARN")),
+        "unexpected findings: {findings:#?}"
+    );
 }
 
 #[test]
-fn validate_module_calls_rejects_literal_union_mismatch() {
+fn check_module_calls_rejects_literal_union_mismatch() {
     use crate::parser::ArgumentParameter;
 
-    let module_calls = vec![ModuleCall::test(
+    let mut parsed = empty_parsed();
+    parsed.module_calls = vec![ModuleCall::test(
         "web_tier".to_string(),
         None,
         module_arguments([(
@@ -3520,21 +3552,20 @@ fn validate_module_calls_rejects_literal_union_mismatch() {
         },
     )]);
 
-    let error = validate_module_calls(
-        &module_calls,
-        &imported_modules,
-        &ProviderContext::default(),
-    )
-    .expect_err("a string outside the literal union must be rejected");
+    let findings =
+        module_call_findings_for_test(&parsed, &imported_modules, &ProviderContext::default());
 
     assert!(
-        error.contains("expected 'dev' | 'stg' | 'prod', got string 'production'"),
-        "unexpected error: {error}"
+        findings.iter().any(|finding| finding
+            .message()
+            .to_string()
+            .contains("expected 'dev' | 'stg' | 'prod', got string 'production'")),
+        "unexpected findings: {findings:#?}"
     );
 }
 
 #[test]
-fn validate_module_calls_uses_original_line_after_heredoc() {
+fn check_module_calls_uses_original_line_after_heredoc() {
     use crate::parser::ArgumentParameter;
 
     let parsed = crate::parser::parse(
@@ -3565,31 +3596,184 @@ let inst = m { n = 'abc' }
         },
     )]);
 
-    let error = validate_module_calls(
-        &parsed.module_calls,
-        &imported_modules,
-        &ProviderContext::default(),
-    )
-    .expect_err("the string argument must be rejected");
+    let findings =
+        module_call_findings_for_test(&parsed, &imported_modules, &ProviderContext::default());
+    let finding = findings
+        .first()
+        .expect("the string argument must be rejected");
 
-    assert!(error.contains("at line 8"), "unexpected error: {error}");
-    assert!(!error.contains("at line 4"), "unexpected error: {error}");
+    assert_eq!(finding.anchor().span.start_line(), 8);
 }
 
 #[test]
-fn validate_module_calls_defers_binding_refs_to_the_binding_index() {
+fn check_module_calls_uses_argument_keys_and_call_span_as_authored_anchors() {
     use crate::parser::ArgumentParameter;
 
-    let module_calls = vec![ModuleCall::test(
-        "inner".to_string(),
-        None,
-        module_arguments([(
-            "name".to_string(),
-            Value::Deferred(DeferredValue::BindingRef {
-                binding: "count".to_string(),
-            }),
-        )]),
-    )];
+    let parsed = crate::parser::parse(
+        r#"let child = use { source = './child' }
+child {
+  surprise = true
+  count = "bad"
+}
+child {}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    let signatures = HashMap::from([(
+        "child".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "count".to_string(),
+                type_expr: TypeExpr::Int,
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+
+    let findings = module_call_findings_for_test(&parsed, &signatures, &ProviderContext::default());
+    let first_call = &parsed.module_calls[0];
+    let second_call = &parsed.module_calls[1];
+    let surprise_span = first_call
+        .arguments_with_source_spans()
+        .find(|argument| argument.name() == "surprise")
+        .expect("surprise argument")
+        .key_span();
+    let count_span = first_call
+        .arguments_with_source_spans()
+        .find(|argument| argument.name() == "count")
+        .expect("count argument")
+        .key_span();
+
+    let anchor_for = |kind| {
+        findings
+            .iter()
+            .find(|finding| finding.kind() == kind)
+            .unwrap_or_else(|| panic!("missing {kind:?}: {findings:#?}"))
+            .anchor()
+    };
+    assert_eq!(
+        anchor_for(ModuleCallFindingKind::UnknownArgument).span,
+        surprise_span,
+    );
+    assert_eq!(
+        anchor_for(ModuleCallFindingKind::ValueType).span,
+        count_span,
+    );
+    assert_eq!(
+        anchor_for(ModuleCallFindingKind::MissingRequiredArgument).span,
+        second_call.source_span(),
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|finding| { finding.anchor().source_file.path() == first_call.source_file() })
+    );
+}
+
+#[test]
+fn check_module_calls_keeps_distinct_for_expansion_payloads() {
+    use crate::parser::ArgumentParameter;
+
+    let parsed = crate::parser::parse(
+        r#"let child = use { source = "./child" }
+for item in ["first", "second"] {
+  child { count = item }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    assert_eq!(parsed.module_calls.len(), 2);
+    let signatures = HashMap::from([(
+        "child".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "count".to_string(),
+                type_expr: TypeExpr::Int,
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+
+    let findings = module_call_findings_for_test(&parsed, &signatures, &ProviderContext::default());
+    let mismatches = findings
+        .iter()
+        .filter(|finding| finding.kind() == ModuleCallFindingKind::ValueType)
+        .collect::<Vec<_>>();
+
+    assert_eq!(mismatches.len(), 2, "distinct payloads: {findings:#?}");
+    assert_eq!(mismatches[0].anchor(), mismatches[1].anchor());
+    let messages = mismatches
+        .iter()
+        .map(|finding| finding.message().to_string())
+        .collect::<Vec<_>>();
+    assert!(messages.iter().any(|message| message.contains("'first'")));
+    assert!(messages.iter().any(|message| message.contains("'second'")));
+}
+
+#[test]
+fn check_module_calls_pending_binding_slot_owns_missing_argument_suppression() {
+    use crate::parser::ArgumentParameter;
+
+    let parsed = crate::parser::parse(
+        r#"let vpc = mock.test.Thing { name = "source" }
+let child = use { source = "./child" }
+child { values = [vpc] }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    let signatures = HashMap::from([(
+        "child".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "values".to_string(),
+                type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+
+    let findings = module_call_findings_for_test(&parsed, &signatures, &ProviderContext::default());
+
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|finding| finding.kind() == ModuleCallFindingKind::BindingUse)
+            .count(),
+        1,
+        "the pending handle must retain its authored binding finding: {findings:#?}",
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|finding| { finding.kind() != ModuleCallFindingKind::MissingRequiredArgument }),
+        "the pending slot must not also become a missing argument: {findings:#?}",
+    );
+}
+
+#[test]
+fn check_module_calls_defers_compatible_binding_refs_to_binding_use_authority() {
+    use crate::parser::ArgumentParameter;
+
+    let parsed = crate::parser::parse(
+        "let name = 'compatible'\nlet inner = use { source = './inner' }\ninner { name = name }\n",
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
     let imported_modules = HashMap::from([(
         "inner".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -3605,12 +3789,12 @@ fn validate_module_calls_defers_binding_refs_to_the_binding_index() {
         },
     )]);
 
-    validate_module_calls(
-        &module_calls,
-        &imported_modules,
-        &ProviderContext::default(),
-    )
-    .expect("reference-valued module arguments are owned by BindingIndex");
+    let findings =
+        module_call_findings_for_test(&parsed, &imported_modules, &ProviderContext::default());
+    assert!(
+        findings.is_empty(),
+        "compatible binding-owned module arguments must not be rechecked: {findings:#?}"
+    );
 }
 
 #[test]
@@ -3657,7 +3841,8 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         ..ProviderContext::default()
     };
     let authored = || Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
-    let module_calls = [ModuleCall::test(
+    let mut module_parsed = empty_parsed();
+    module_parsed.module_calls = vec![ModuleCall::test(
         "child",
         None,
         HashMap::from([("mode".to_string(), ModuleArgument::new(authored()))]),
@@ -3676,8 +3861,10 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
             requires: Vec::new(),
         },
     )]);
-    validate_module_calls(&module_calls, &imported_modules, &config)
-        .expect("module argument must validate");
+    assert!(
+        module_call_findings_for_test(&module_parsed, &imported_modules, &config).is_empty(),
+        "module argument must validate"
+    );
 
     validate_attribute_params(
         &[AttributeParameter::dummy(
@@ -5758,7 +5945,7 @@ fn validate_export_param_ref_types_skips_reported_unknown_index() {
         validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::from([0]));
     assert!(
         result.is_ok(),
-        "the exact Unknown parameter already reported by inference must be skipped, got {:?}",
+        "the exact unknown argument already reported by inference must be skipped, got {:?}",
         result
     );
 }

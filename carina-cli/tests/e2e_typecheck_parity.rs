@@ -184,14 +184,199 @@ fn cli_located_message_multiset(diagnostics: &[String]) -> BTreeMap<String, usiz
         {
             return message;
         }
-        let message = diagnostic
-            .split_once(": ")
-            .map_or(diagnostic.as_str(), |(_, message)| message);
-        match message.rsplit_once(" at line ") {
+        match diagnostic.rsplit_once(" at line ") {
             Some((message, line)) if line.parse::<usize>().is_ok() => message,
-            _ => message,
+            Some((_message, _line)) => diagnostic,
+            None => diagnostic,
         }
     }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalDiagnostic {
+    message: String,
+    severity: &'static str,
+}
+
+fn canonical_error_multiset(
+    messages: impl IntoIterator<Item = String>,
+) -> BTreeMap<CanonicalDiagnostic, usize> {
+    let mut counts = BTreeMap::new();
+    for message in messages {
+        *counts
+            .entry(CanonicalDiagnostic {
+                message,
+                severity: "ERROR",
+            })
+            .or_default() += 1;
+    }
+    counts
+}
+
+fn cli_located_error_multiset(diagnostics: &[String]) -> BTreeMap<CanonicalDiagnostic, usize> {
+    canonical_error_multiset(
+        cli_located_message_multiset(diagnostics)
+            .into_iter()
+            .flat_map(|(message, count)| std::iter::repeat_n(message, count)),
+    )
+}
+
+fn lsp_error_multiset(
+    diagnostics: &[tower_lsp::lsp_types::Diagnostic],
+) -> BTreeMap<CanonicalDiagnostic, usize> {
+    canonical_error_multiset(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+            })
+            .map(|diagnostic| diagnostic.message.clone()),
+    )
+}
+
+struct ModuleCallParityCase {
+    name: &'static str,
+    calls: &'static str,
+    outer_arguments: &'static str,
+    outer_calls: &'static str,
+    expected: &'static [&'static str],
+}
+
+fn module_call_parity_fixture(case: &ModuleCallParityCase) -> TempDir {
+    let fixture = tempfile::tempdir().expect("module-call parity fixture");
+    let outer = fixture.path().join("modules/outer");
+    let inner = fixture.path().join("modules/inner");
+    std::fs::create_dir_all(&outer).expect("create outer module");
+    std::fs::create_dir_all(&inner).expect("create inner module");
+    std::fs::write(
+        fixture.path().join("imports.crn"),
+        r#"provider test {}
+let outer = use { source = "./modules/outer" }
+let inner = use { source = "./modules/inner" }
+"#,
+    )
+    .expect("write imports.crn");
+    std::fs::write(
+        fixture.path().join("bindings.crn"),
+        r#"let source = test.r.Source {
+  name = "source"
+  count = 7
+}
+"#,
+    )
+    .expect("write bindings.crn");
+    std::fs::write(fixture.path().join("calls.crn"), case.calls).expect("write calls.crn");
+    std::fs::write(outer.join("arguments.crn"), case.outer_arguments)
+        .expect("write outer arguments");
+    std::fs::write(
+        outer.join("imports.crn"),
+        "let inner = use { source = \"../inner\" }\n",
+    )
+    .expect("write outer imports");
+    std::fs::write(outer.join("calls.crn"), case.outer_calls).expect("write outer calls");
+    std::fs::write(
+        inner.join("arguments.crn"),
+        "arguments {\n  value: Int\n}\n",
+    )
+    .expect("write inner arguments");
+    fixture
+}
+
+fn module_call_parity_schemas() -> SchemaRegistry {
+    single_schema_map(
+        ResourceSchema::new("r.Source")
+            .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::required("count", AttributeType::int()).build()),
+    )
+}
+
+#[test]
+fn module_call_failures_have_exact_cli_lsp_error_parity_across_directory_files() {
+    let cases = [
+        ModuleCallParityCase {
+            name: "unknown argument",
+            calls: "outer {\n  value = \"ok\"\n  surprise = true\n}\n",
+            outer_arguments: "arguments {\n  value: String\n}\n",
+            outer_calls: "",
+            expected: &["Unknown argument 'surprise' for module 'outer'"],
+        },
+        ModuleCallParityCase {
+            name: "missing required argument",
+            calls: "outer {}\n",
+            outer_arguments: "arguments {\n  value: String\n}\n",
+            outer_calls: "",
+            expected: &["Missing required argument 'value' for module 'outer'"],
+        },
+        ModuleCallParityCase {
+            name: "ordinary type mismatch",
+            calls: "outer {\n  count = \"not-an-int\"\n}\n",
+            outer_arguments: "arguments {\n  count: Int\n}\n",
+            outer_calls: "",
+            expected: &[
+                "module call 'outer (anonymous call)': argument 'count': expected Int, got string 'not-an-int'",
+            ],
+        },
+        ModuleCallParityCase {
+            name: "attribute reference mismatch",
+            calls: "outer {\n  value = source.count\n}\n",
+            outer_arguments: "arguments {\n  value: String\n}\n",
+            outer_calls: "",
+            expected: &[
+                "module call 'outer (anonymous call)': argument 'value': cannot assign Int to 'value': expected String, got Int (from source.count)",
+            ],
+        },
+        ModuleCallParityCase {
+            name: "nested outer to inner mismatch",
+            calls: "outer {\n  value = \"root\"\n}\n",
+            outer_arguments: "arguments {\n  value: String\n}\n",
+            outer_calls: "inner {\n  value = value\n}\n",
+            expected: &[
+                "module call 'inner (anonymous call)': argument 'value': cannot assign String to 'value': expected Int, got String (from value)",
+            ],
+        },
+        ModuleCallParityCase {
+            name: "for-expanded call",
+            calls: r#"for item in ["first", "second"] {
+  outer {
+    count = "not-an-int"
+  }
+}
+"#,
+            outer_arguments: "arguments {\n  count: Int\n}\n",
+            outer_calls: "",
+            expected: &[
+                "module call 'outer (anonymous call)': argument 'count': expected Int, got string 'not-an-int'",
+            ],
+        },
+    ];
+
+    for case in &cases {
+        let schemas = module_call_parity_schemas();
+        let fixture = module_call_parity_fixture(case);
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "calls.crn");
+        let expected =
+            canonical_error_multiset(case.expected.iter().map(|message| message.to_string()));
+
+        assert_eq!(
+            cli_located_error_multiset(&cli),
+            expected,
+            "{}: CLI must expose the exact canonical blocking findings; CLI={cli:#?}",
+            case.name,
+        );
+        assert_eq!(
+            lsp_error_multiset(&lsp),
+            expected,
+            "{}: LSP must expose the exact canonical ERROR findings; LSP={lsp:#?}",
+            case.name,
+        );
+        assert_eq!(
+            cli_located_error_multiset(&cli),
+            lsp_error_multiset(&lsp),
+            "{}: CLI and LSP must preserve the same message multiplicities; CLI={cli:#?}; LSP={lsp:#?}",
+            case.name,
+        );
+    }
 }
 
 #[test]
@@ -295,7 +480,7 @@ inner {
         .iter()
         .filter(|diagnostic| {
             diagnostic.contains(
-                "Type mismatch: expected String, got Int (from (unresolved module argument: count))",
+                "module call 'inner (anonymous call)': argument 'name': cannot assign Int to 'name': expected String, got Int (from count)",
             ) && diagnostic.contains("main.crn")
                 && diagnostic.contains("line 4")
         })
@@ -389,8 +574,7 @@ fn nested_int_argument_to_literal_union_is_rejected_by_cli_and_lsp() {
     let cli = cli_diagnostics(Vec::new(), &fixture);
     assert!(
         cli.iter().any(|message| {
-            message.contains("cannot assign Int to 'env'")
-                && message.contains("expected 'dev' | 'prod', got Int (from n)")
+            message.contains("Type mismatch: expected 'dev' | 'prod', got Int (from n)")
         }),
         "CLI BindingIndex must reject Int forwarded to a literal-string union: {cli:#?}"
     );
@@ -405,10 +589,9 @@ fn nested_int_argument_to_literal_union_is_rejected_by_cli_and_lsp() {
     let lsp = engine_with_schemas(SchemaRegistry::new()).analyze(&outer_doc, Some(&outer_path));
     assert!(
         lsp.iter().any(|diagnostic| {
-            diagnostic.message.contains("cannot assign Int to 'env'")
-                && diagnostic
-                    .message
-                    .contains("expected 'dev' | 'prod', got Int (from n)")
+            diagnostic
+                .message
+                .contains("Type mismatch: expected 'dev' | 'prod', got Int (from n)")
         }),
         "LSP BindingIndex must reject the same nested forwarding: {lsp:#?}"
     );
@@ -444,7 +627,7 @@ inner { x = a }
         .validate()
         .expect("schema fixture must be valid"),
     );
-    let expected = "cannot assign mock.test.resource to 'x': expected Int";
+    let expected = "Type mismatch: expected Int, got mock.test.resource (from a)";
 
     let root_cli = cli_diagnostics(factories_for(&schemas), &fixture);
     assert!(
