@@ -26,10 +26,9 @@ use carina_state::{PublishedExports, StateFile, check_and_migrate};
 use crate::commands::plan::compute_export_diffs;
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
-    LateAnonymousIdentityInputs, LoadedProviderFactory, OverrideAwareBuildMode,
-    OverrideAwareResources, PlanPreparationError, PlanPreprocessor, ProviderLoad,
-    RebuildBindingsInputs, ValidatedConfig, add_deferred_create_effects,
-    reconcile_late_anonymous_identities,
+    LoadedProviderFactory, OverrideAwareBuildMode, OverrideAwareResources, PlanPreparationError,
+    PlanPreprocessor, ProviderLoad, RebuildBindingsInputs, ValidatedConfig,
+    add_deferred_create_effects,
 };
 
 /// Fixture root path relative to the `carina-cli` crate manifest.
@@ -298,12 +297,13 @@ where
         &provider_configs,
         fixture_schemas(),
     );
-    if fixture_pathbuf
-        .file_name()
-        .is_some_and(|name| name == "moved_claims_precede_heuristics")
-    {
-        // This fixture writes moved.to as the literal schema-derived anonymous
-        // hash name, so compute the desired anonymous id before claims resolve.
+    if fixture_pathbuf.file_name().is_some_and(|name| {
+        name == "moved_claims_precede_heuristics"
+            || name == "anonymous_old_identity_name_override"
+            || name == "anonymous_old_identity_update"
+    }) {
+        // These fixtures exercise pre-refresh anonymous reconciliation, so
+        // compute their desired addresses before claims and move detection.
         let errors = validated_config
             .compute_anonymous_identifiers_for_fixture(&provider_configs)
             .unwrap();
@@ -312,9 +312,7 @@ where
     let crate::wiring::StateBlockResolution {
         claims: state_block_claims,
         targets: resolved_state_block_targets,
-    } = validated_config
-        .reconcile_identities_with_state(&mut state_file)
-        .expect("fixture state identities must remain unique");
+    } = validated_config.reconcile_identities_with_state(&state_file);
     let (wiring, canonical_resources) = validated_config.context_and_resources();
     let parsed = canonical_resources.parsed();
 
@@ -331,50 +329,6 @@ where
         wiring.schemas(),
     )
     .expect("fixture deferred-for prelude must resolve");
-    let sorted_resources = expansion_prelude.sorted_resources();
-
-    let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
-    let mut data_source_states: HashMap<ResourceId, State> = HashMap::new();
-    let mut orphans = Orphans::new();
-    if let Some(sf) = state_file.as_ref() {
-        for resource in sorted_resources {
-            let current = sf.build_state_for_resource(&resource.id);
-            managed_current.insert(resource.id.clone(), current);
-        }
-        data_source_states.extend(
-            data_sources
-                .iter()
-                .map(|source| (source.id.clone(), State::not_found(source.id.clone()))),
-        );
-
-        let desired_ids: HashSet<ResourceId> = sorted_resources
-            .iter()
-            .map(|r| r.id.clone())
-            .chain(data_sources.iter().map(|d| d.id.clone()))
-            .collect();
-        orphans = sf.build_orphans(&desired_ids).into_plan_orphans();
-    } else {
-        for resource in sorted_resources {
-            managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
-        }
-        for ds in &data_sources {
-            data_source_states.insert(ds.id.clone(), State::not_found(ds.id.clone()));
-        }
-    }
-    let mut data_source_values =
-        DataSourceValues::from_data_sources(&data_sources, |data_source| {
-            DataSourceValue::read(
-                data_source_states
-                    .get(&data_source.id)
-                    .cloned()
-                    .expect("fixture initialized every data-source state"),
-            )
-        });
-
-    let directives_map = state_file
-        .as_ref()
-        .map(|sf| sf.build_directives())
-        .unwrap_or_default();
 
     // Insert every upstream binding — even when the state file is
     // unreadable — so `resolve_refs_for_plan` knows the binding name
@@ -402,6 +356,54 @@ where
     )
     .expect("fixture provider configs must resolve");
     let raw_provider_configs = resolved_provider_configs.as_provider_configs();
+    let expansion_prelude = expansion_prelude
+        .detect_moves(
+            wiring,
+            &data_sources,
+            raw_provider_configs,
+            &state_block_claims,
+        )
+        .expect("fixture automatic moves must resolve");
+    let sorted_resources = expansion_prelude.sorted_resources();
+
+    let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
+    let mut data_source_states: HashMap<ResourceId, State> = HashMap::new();
+    let mut orphans = Orphans::new();
+    if state_file.is_some() {
+        for resource in sorted_resources {
+            let (loaded_id, current) = expansion_prelude.build_current(&resource.id);
+            managed_current.insert(loaded_id, current);
+        }
+        data_source_states.extend(
+            data_sources
+                .iter()
+                .map(|source| (source.id.clone(), State::not_found(source.id.clone()))),
+        );
+
+        orphans = expansion_prelude
+            .loaded_orphans(
+                data_sources
+                    .iter()
+                    .map(|data_source| data_source.id.clone()),
+            )
+            .into_plan_orphans();
+    } else {
+        for resource in sorted_resources {
+            managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
+        }
+        for ds in &data_sources {
+            data_source_states.insert(ds.id.clone(), State::not_found(ds.id.clone()));
+        }
+    }
+    let mut data_source_values =
+        DataSourceValues::from_data_sources(&data_sources, |data_source| {
+            DataSourceValue::read(
+                data_source_states
+                    .get(&data_source.id)
+                    .cloned()
+                    .expect("fixture initialized every data-source state"),
+            )
+        });
 
     // carina#3248: build unified pre-apply bindings (managed +
     // composition + data sources) so composition-rooted refs in the fixture
@@ -432,10 +434,11 @@ where
         expansion_prelude.wait_aliases(),
     )
     .expect("fixture managed binding stability must resolve");
+    let projected_state = expansion_prelude.projected_state();
     let (mut override_aware_resources, unresolved_override_aware_resources) =
         OverrideAwareResources::build_pair_with_stability(
             canonical_resources,
-            state_file.as_ref(),
+            &projected_state,
             carina_core::binding_index::LivePreApplyInputs {
                 managed: &[],
                 compositions: &parsed.compositions,
@@ -452,7 +455,7 @@ where
         .expect("Failed to build override-aware resources");
     crate::legacy_name_overrides::emit_legacy_override_warnings(
         &override_aware_resources,
-        state_file.as_ref(),
+        &projected_state,
     );
 
     // Resolve data-source input refs for the plan (carina#3181).
@@ -559,18 +562,6 @@ where
             expansion_trace: parsed.expansion_trace.clone(),
         };
     }
-    let resolved_desired_ids = reconcile_late_anonymous_identities(
-        wiring,
-        LateAnonymousIdentityInputs {
-            resources: &mut override_aware_resources,
-            data_sources: &data_sources_for_plan,
-            state_file: state_file.as_ref(),
-            state_block_claims: &state_block_claims,
-            providers: raw_provider_configs,
-        },
-    )
-    .expect("fixture late anonymous identities must resolve uniquely");
-
     let managed_bindings: HashSet<String> = expansion_prelude
         .sorted_resources()
         .iter()
@@ -587,20 +578,20 @@ where
         })
         .cloned()
         .collect::<Vec<_>>();
-    let reconciled_expansion = expansion_prelude
-        .reconcile_addresses(
-            crate::wiring::ReconcileDeferredForExpansionInputs {
-                ctx: wiring,
-                parsed,
-                provider_configs: raw_provider_configs,
-                state_block_claims: &state_block_claims,
-                managed_current,
-                orphans,
-                already_refreshed: HashSet::new(),
-            },
-            crate::wiring::DeferredForWarningPolicy::Print,
-        )
+    let mut reconciled_expansion = expansion_prelude
+        .bind_projected_phase1_state(managed_current, orphans, HashSet::new())
+        .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Print)
         .expect("fixture move routes must match their loaded current states");
+    let resolved_desired_ids = reconciled_expansion
+        .reconcile_late_anonymous_identities(
+            wiring,
+            &mut override_aware_resources,
+            &data_sources_for_plan,
+            state_file.as_ref(),
+            &state_block_claims,
+            raw_provider_configs,
+        )
+        .expect("fixture late anonymous identities must resolve uniquely");
     crate::wiring::validate_plan_time_state_block_collisions(
         &resolved_desired_ids,
         reconciled_expansion.moved_pairs(),
@@ -608,6 +599,9 @@ where
         &state_file,
     )
     .expect("state block collision validation failed");
+    let directives_map = reconciled_expansion
+        .projected_state(state_file.as_ref())
+        .build_directives();
 
     let reconciled_provider_states = provider_states_for(
         reconciled_expansion.managed_current(),
@@ -650,14 +644,17 @@ where
         )
         .expect("fixture deferred-for expansion failed");
     let crate::wiring::PreparedDeferredForExpansionParts {
-        mut managed_current,
+        addressed,
         data_source_values,
+        wait_aliases: _,
+    } = prepared_expansion.into_parts();
+    let crate::wiring::AddressedStateParts {
+        mut managed_current,
         orphans,
         saved_attrs,
         prev_explicit,
-        wait_aliases: _,
         moved_pairs,
-    } = prepared_expansion.into_parts();
+    } = addressed.into_parts();
     let (wiring, expanded_canonical_resources) = validated_expansion.context_and_resources();
     let parsed = expanded_canonical_resources.parsed();
     let deferred_create_targets: Vec<_> = deferred_for_expansion
@@ -780,7 +777,10 @@ fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactor
             Some("plan_image_module_cascade" | "plan_image_reference_layout") => {
                 vec![Box::new(PlanImageFixtureFactory)]
             }
-            Some("replace_create_only") | Some("replace_with_non_forcing_diffs") => {
+            Some("anonymous_create_only_rekey")
+            | Some("anonymous_old_identity_name_override")
+            | Some("replace_create_only")
+            | Some("replace_with_non_forcing_diffs") => {
                 vec![Box::new(ReplaceCreateOnlyFixtureFactory)]
             }
             Some("route53_hosted_zone_name_strip_suffix_no_diff") => {

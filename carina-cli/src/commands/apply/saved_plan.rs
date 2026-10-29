@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
+use carina_core::differ::{Orphan, Orphans, restore_current_move_source};
 use carina_core::parser::{BackendConfig, InferredExportParam, SavedProviderConfigs};
 use carina_core::plan::SavedPlan;
 use carina_core::provider::{AppliedIdentifier, PersistedAttributes, Provider, ReadRequest};
 use carina_core::resource::{
-    Current, DataSource, Resource, ResourceId, SavedComposition, SavedDataSource, SavedResource,
-    State, Value,
+    Current, DataSource, ResolvedResourceId, Resource, ResourceId, SavedComposition,
+    SavedDataSource, SavedResource, State, Value,
 };
+use carina_state::{ResourceState, StateFile};
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
@@ -20,8 +22,8 @@ use crate::error::{
     SavedPlanSchemaMismatchError,
 };
 use crate::wiring::{
-    CheckedSavedPlanInputs, CompleteProviderLoad, ExpandedCanonicalResources, ValidatedConfig,
-    WiringContext,
+    CheckedSavedPlanInputs, CompleteProviderLoad, ExpandedCanonicalResources, SavedPlanReplayMoves,
+    ValidatedConfig, WiringContext,
 };
 
 pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
@@ -438,7 +440,25 @@ pub(super) struct ReloadedPendingPlanFile {
 
 pub(super) struct ExpansionPriorStates {
     pub managed: HashMap<ResourceId, Current>,
+    pub orphans: Orphans,
     pub already_refreshed: HashSet<ResourceId>,
+}
+
+fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
+    match current {
+        Current::Absent(state) => {
+            Orphan::absent(state, row.binding.clone(), row.directives.clone())
+        }
+        Current::Present(present) => {
+            Orphan::present(present, row.binding.clone(), row.directives.clone())
+        }
+        Current::CreateInFlight(pending) => {
+            Orphan::create_in_flight(pending, row.binding.clone(), row.directives.clone())
+        }
+        Current::MissingIdentifier(state) => {
+            Orphan::missing_identifier(state, row.binding.clone(), row.directives.clone())
+        }
+    }
 }
 
 /// Fresh source values whose managed-resource slice is proven to have crossed
@@ -508,24 +528,63 @@ pub(crate) struct SchemaCheckedPendingPlanFile {
 
 impl SchemaCheckedPendingPlanFile {
     /// Reconstruct the minimal plan-time prior-state view needed by
-    /// deferred-`for` expansion. Required sources are cloned from snapshots
-    /// that already crossed the locked in-flight reload boundary; unrelated
-    /// managed snapshots contribute only their refreshed address, avoiding a
-    /// deep clone of every saved state.
+    /// deferred-`for` expansion. Saved snapshots have already crossed address
+    /// reconciliation, so move targets are restored through their plan-minted
+    /// move authority before the current configuration replays those moves.
+    /// Unrelated managed snapshots contribute only their refreshed address,
+    /// avoiding a deep clone of every saved state.
     pub(super) fn expansion_prior_states(
         &self,
         required_managed: &[Resource],
-    ) -> ExpansionPriorStates {
+        replay_moves: &SavedPlanReplayMoves,
+        state_file: &Option<StateFile>,
+    ) -> Result<ExpansionPriorStates, AppError> {
         let required_managed: HashSet<&ResourceId> = required_managed
             .iter()
             .map(|resource| &resource.id)
             .collect();
+        let plan = self.plan_file.plan();
+        let moved_origins = MovedOrigins::from_plan(plan);
         let mut managed = HashMap::new();
+        let mut orphans = Orphans::new();
         let mut already_refreshed = HashSet::new();
         for entry in self.plan_file.current_states() {
             let ReloadedCurrentStateEntry::Managed { id, current } = entry;
-            if required_managed.contains(id) {
-                managed.insert(id.clone(), current.as_ref().clone());
+            let plan_origin = moved_origins.origin_for(id);
+            let replay_origin = if plan_origin != id && replay_moves.replays_origin(plan_origin) {
+                plan_origin
+            } else {
+                id
+            };
+            if !required_managed.contains(id) && !matches!(current.as_ref(), Current::Absent(_)) {
+                // A post-expansion orphan was refreshed before plan recording.
+                // Replaying its move from the restored origin must not make the
+                // child refresh pass read the moved-to address a second time.
+                already_refreshed.insert(id.clone());
+            }
+            if required_managed.contains(id) || plan_origin != id {
+                let current = if replay_origin == id {
+                    current.as_ref().clone()
+                } else {
+                    let authority = plan.move_authority(replay_origin, id).ok_or_else(|| {
+                        AppError::Validation(format!(
+                            "saved plan has no move authority from {replay_origin} to {id}"
+                        ))
+                    })?;
+                    restore_current_move_source(current.as_ref().clone(), &authority)?
+                };
+                if replay_origin != id && replay_moves.replays_as_explicit_move(replay_origin) {
+                    let row = state_file
+                        .as_ref()
+                        .and_then(|state_file| state_file.find_resource_for_id(replay_origin))
+                        .ok_or_else(|| AppError::MoveSourceNotLoaded {
+                            from: Box::new(ResolvedResourceId::new(replay_origin.clone())),
+                            to: Box::new(ResolvedResourceId::new(id.clone())),
+                        })?;
+                    orphans.insert(saved_orphan_from_current(current, row));
+                } else {
+                    managed.insert(replay_origin.clone(), current);
+                }
             } else if !matches!(current.as_ref(), Current::Absent(_)) {
                 // Plan-time orphan refresh owns these addresses. Keep only
                 // their ids: expansion needs the exclusion set, not a deep
@@ -533,10 +592,16 @@ impl SchemaCheckedPendingPlanFile {
                 already_refreshed.insert(id.clone());
             }
         }
-        ExpansionPriorStates {
-            managed,
-            already_refreshed,
+        for id in required_managed {
+            managed
+                .entry((*id).clone())
+                .or_insert_with(|| Current::absent((*id).clone()));
         }
+        Ok(ExpansionPriorStates {
+            managed,
+            orphans,
+            already_refreshed,
+        })
     }
 
     pub(super) fn data_source_values(
@@ -967,22 +1032,30 @@ mod tests {
     use std::path::Path;
 
     use carina_core::data_source_value::DataSourceValue;
+    use carina_core::effect::Effect;
     use carina_core::parser::ProviderConfig;
     use carina_core::plan::Plan;
     use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
-    use carina_core::resource::{ConcreteValue, DataSource, DeferredValue, State, Value};
+    use carina_core::resource::{
+        ConcreteValue, Current, DataSource, DeferredValue, ResolvedResourceId, Resource,
+        ResourceId, State, Value,
+    };
+    use carina_state::{ResourceState, StateFile};
     use indexmap::IndexMap;
 
     use super::{
         DesiredVerifiedPlanFile, HistoricalResourceAddresses, InspectedPlanFile,
-        ReloadedVerifiedPlanFile, VerifiedPlanFile,
+        ReloadedVerifiedPlanFile, SchemaCheckedPendingPlanFile, VerifiedPlanFile,
     };
     use crate::commands::apply::ApplyTarget;
     use crate::commands::plan::{
-        PlanFile, PlanFileContents, RecordedProviderArtifact, SavedDataSourceValue,
+        CurrentStateEntry, PlanFile, PlanFileContents, RecordedProviderArtifact,
+        SavedDataSourceValue, SavedManagedCurrent,
     };
     use crate::error::AppError;
-    use crate::wiring::{LoadedProviderFactory, ProviderLoad, ValidatedConfig};
+    use crate::wiring::{
+        LoadedProviderFactory, ProviderLoad, SavedPlanReplayMoves, ValidatedConfig,
+    };
 
     struct ArtifactFactory {
         name: &'static str,
@@ -1144,6 +1217,209 @@ mod tests {
                 .expect("reload saved plan"),
             schema_references,
         }
+    }
+
+    fn schema_checked_move_plan(
+        from: ResourceId,
+        to: ResourceId,
+        current: Current,
+    ) -> (SchemaCheckedPendingPlanFile, Option<StateFile>) {
+        let mut contents = empty_plan_contents(Vec::new());
+        contents.plan.add(Effect::Move {
+            from: ResolvedResourceId::new(from.clone()),
+            to: ResolvedResourceId::new(to.clone()),
+        });
+        contents.current_states.push(CurrentStateEntry::Managed {
+            id: to,
+            current: SavedManagedCurrent::from_current(current),
+        });
+        let mut source_row = ResourceState::try_applied(
+            from.resource_type.clone(),
+            from.identity().cloned().expect("move source is resolved"),
+            from.provider.clone(),
+            "resource-id",
+        )
+        .expect("fixture identifier is non-empty");
+        source_row.directives.provider_instance = from.provider_instance.clone();
+        let mut locked_state = StateFile::new();
+        locked_state
+            .upsert_resource(source_row)
+            .expect("test state setup must be valid");
+        let plan_file = contents
+            .record_for_test(&builtin_context())
+            .expect("test plan provider evidence must be valid")
+            .reload_in_flight_from_locked_state(Some(&locked_state))
+            .expect("reload saved move plan");
+        (
+            SchemaCheckedPendingPlanFile { plan_file },
+            Some(locked_state),
+        )
+    }
+
+    #[test]
+    fn saved_move_replay_keeps_routed_desired_target_placeholder() {
+        let from = ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "old",
+            Some("source-route".to_string()),
+        );
+        let to = ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "new",
+            Some("target-route".to_string()),
+        );
+        let planned = Current::from_state(
+            State::existing(to.clone(), HashMap::new()).with_identifier("resource-id"),
+        );
+        let (pending, state_file) = schema_checked_move_plan(from.clone(), to.clone(), planned);
+
+        let prior = pending
+            .expansion_prior_states(
+                &[Resource::from_id(to.clone())],
+                &SavedPlanReplayMoves::for_test_explicit([from.clone()]),
+                &state_file,
+            )
+            .expect("saved move replay state must restore");
+
+        assert!(prior.orphans.contains_key(&from));
+        assert!(!prior.managed.contains_key(&from));
+        assert!(matches!(
+            prior.managed.get(&to),
+            Some(Current::Absent(state)) if state.state().id == to
+        ));
+    }
+
+    #[test]
+    fn saved_move_replay_keeps_absent_source_as_an_orphan() {
+        let from = ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "old",
+            Some("source-route".to_string()),
+        );
+        let to = ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "new",
+            Some("target-route".to_string()),
+        );
+        let planned = Current::absent(to.clone());
+        let (pending, state_file) = schema_checked_move_plan(from.clone(), to.clone(), planned);
+
+        let prior = pending
+            .expansion_prior_states(
+                &[Resource::from_id(to.clone())],
+                &SavedPlanReplayMoves::for_test_explicit([from.clone()]),
+                &state_file,
+            )
+            .expect("saved absent move replay state must restore");
+
+        assert!(matches!(
+            prior.orphans.get(&from).map(|orphan| orphan.current()),
+            Some(Current::Absent(state)) if state.state().id == from
+        ));
+        assert!(!prior.managed.contains_key(&from));
+        assert!(matches!(
+            prior.managed.get(&to),
+            Some(Current::Absent(state)) if state.state().id == to
+        ));
+    }
+
+    #[test]
+    fn saved_move_replay_retains_moved_orphan_refresh_exclusion() {
+        let from = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
+        let to = ResourceId::with_provider_identity("mock", "test.resource", "retired", None);
+        let planned = Current::from_state(
+            State::existing(to.clone(), HashMap::new()).with_identifier("resource-id"),
+        );
+        let (pending, state_file) = schema_checked_move_plan(from.clone(), to.clone(), planned);
+
+        let prior = pending
+            .expansion_prior_states(
+                &[],
+                &SavedPlanReplayMoves::for_test_explicit([from.clone()]),
+                &state_file,
+            )
+            .expect("saved moved orphan replay state must restore");
+
+        assert!(prior.orphans.contains_key(&from));
+        assert!(!prior.managed.contains_key(&from));
+        assert!(
+            prior.already_refreshed.contains(&to),
+            "the post-move orphan address was refreshed when the plan was recorded"
+        );
+    }
+
+    #[test]
+    fn saved_early_automatic_move_restores_its_origin_for_replay() {
+        let from = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
+        let to = ResourceId::with_provider_identity("mock", "test.resource", "fresh", None);
+        let planned = Current::from_state(
+            State::existing(to.clone(), HashMap::new()).with_identifier("resource-id"),
+        );
+        let (pending, state_file) = schema_checked_move_plan(from.clone(), to.clone(), planned);
+
+        let prior = pending
+            .expansion_prior_states(
+                &[Resource::from_id(to.clone())],
+                &SavedPlanReplayMoves::for_test_automatic([from.clone()]),
+                &state_file,
+            )
+            .expect("early automatic move replay state must restore");
+
+        assert!(prior.managed.contains_key(&from));
+        assert!(matches!(prior.managed.get(&to), Some(Current::Absent(_))));
+    }
+
+    #[test]
+    fn saved_late_automatic_move_remains_at_target_when_late_detection_is_not_replayed() {
+        let from = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
+        let to = ResourceId::with_provider_identity("mock", "test.resource", "fresh", None);
+        let planned = Current::from_state(
+            State::existing(to.clone(), HashMap::new()).with_identifier("resource-id"),
+        );
+        let (pending, state_file) = schema_checked_move_plan(from.clone(), to.clone(), planned);
+
+        let prior = pending
+            .expansion_prior_states(
+                &[Resource::from_id(to.clone())],
+                &SavedPlanReplayMoves::for_test_automatic([]),
+                &state_file,
+            )
+            .expect("late automatic move target must remain addressed");
+
+        assert!(!prior.managed.contains_key(&from));
+        assert!(matches!(prior.managed.get(&to), Some(Current::Present(_))));
+    }
+
+    #[test]
+    fn saved_chained_move_restores_root_and_creates_intermediate_placeholder() {
+        let root = ResourceId::with_provider_identity("mock", "test.resource", "root", None);
+        let intermediate =
+            ResourceId::with_provider_identity("mock", "test.resource", "intermediate", None);
+        let target = ResourceId::with_provider_identity("mock", "test.resource", "target", None);
+        let planned = Current::from_state(
+            State::existing(target.clone(), HashMap::new()).with_identifier("resource-id"),
+        );
+        let (pending, state_file) = schema_checked_move_plan(root.clone(), target.clone(), planned);
+
+        let prior = pending
+            .expansion_prior_states(
+                &[Resource::from_id(intermediate.clone())],
+                &SavedPlanReplayMoves::for_test_automatic([root.clone()]),
+                &state_file,
+            )
+            .expect("chained move replay state must restore");
+
+        assert!(prior.managed.contains_key(&root));
+        assert!(matches!(
+            prior.managed.get(&intermediate),
+            Some(Current::Absent(_))
+        ));
+        assert!(!prior.managed.contains_key(&target));
+        assert!(prior.already_refreshed.contains(&target));
     }
 
     #[test]

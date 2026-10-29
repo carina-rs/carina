@@ -122,6 +122,18 @@ pub struct Orphan {
 }
 
 impl Orphan {
+    pub fn absent(
+        state: crate::resource::AbsentState,
+        binding: Option<String>,
+        directives: Directives,
+    ) -> Self {
+        Self {
+            current: Current::Absent(state),
+            binding,
+            directives,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn from_state(
         state: State,
@@ -302,6 +314,22 @@ pub fn rebind_current_for_move(
         });
     }
     current.rebind_for_move(authority);
+    Ok(current)
+}
+
+/// Restore a saved post-move snapshot to the source side of the exact move
+/// edge that will be replayed during current-configuration verification.
+pub fn restore_current_move_source(
+    mut current: Current,
+    authority: &MoveAuthority<'_>,
+) -> Result<Current, CurrentMoveRoutingMismatch> {
+    if current.id() != authority.to() {
+        return Err(CurrentMoveRoutingMismatch {
+            actual: Box::new(current.id().clone()),
+            expected: Box::new(authority.to().clone()),
+        });
+    }
+    current.restore_move_source(authority);
     Ok(current)
 }
 

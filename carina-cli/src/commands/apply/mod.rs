@@ -1,6 +1,6 @@
 pub(crate) mod saved_plan;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -76,12 +76,12 @@ use crate::error::{AppError, SavedPlanSecretVerificationError};
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     AddressedDataSourceReadInputs, LateAnonymousIdentityInputs, OverrideAwareBuildMode,
-    OverrideAwareResources, ProviderLoad, RebuildBindingsInputs, ValidatedConfig,
-    create_normalizers_from_configs_with_ctx, create_providers_from_configs_with_ctx,
-    get_provider_with_ctx, module_constraint_plan_errors, prepare_data_sources_for_plan,
-    prepare_default_provider_ready_config, read_managed_state_with_retry,
-    reconcile_late_anonymous_identities, refresh_loaded_orphan_with_retry,
-    refresh_loaded_resource_with_retry,
+    OverrideAwareResources, ProjectedPhase1RefreshInputs, ProviderLoad, RebuildBindingsInputs,
+    ValidatedConfig, create_normalizers_from_configs_with_ctx,
+    create_providers_from_configs_with_ctx, get_provider_with_ctx, module_constraint_plan_errors,
+    prepare_data_sources_for_plan, prepare_default_provider_ready_config,
+    read_managed_state_with_retry, reconcile_late_anonymous_identities,
+    refresh_loaded_orphan_with_retry,
 };
 #[cfg(test)]
 use crate::wiring::{ValidatedWiring, WiringContext, read_with_retry};
@@ -1793,7 +1793,7 @@ async fn run_apply_locked_owned(
             let crate::wiring::StateBlockResolution {
                 claims: state_block_claims,
                 targets: resolved_state_block_targets,
-            } = validated_config.reconcile_identities_with_state(&mut state_file)?;
+            } = validated_config.reconcile_identities_with_state(&state_file);
             let (ctx, canonical_resources) = validated_config.context_and_resources();
             let parsed = canonical_resources.parsed();
             let provider_inputs =
@@ -1822,10 +1822,14 @@ async fn run_apply_locked_owned(
                 canonical_resources,
                 &state_file,
                 ctx.schemas(),
+            )?
+            .detect_moves(
+                ctx,
+                &parsed.data_sources,
+                raw_provider_configs,
+                &state_block_claims,
             )?;
-            let sorted_resources = expansion_prelude.sorted_resources();
             let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
-
             // Read states for all resources using identifier from state
             // An address with no state row is absent. A persisted row without
             // an identifier stays present and invalid until planning reports it.
@@ -1836,65 +1840,27 @@ async fn run_apply_locked_owned(
             let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
             // Pre-build dependency_bindings from state file so we can restore them
             // after refresh. Provider.read() doesn't know about this metadata (#1565).
-            let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
-                .as_ref()
-                .map(|sf| {
-                    sorted_resources
-                        .iter()
-                        .filter_map(|r| {
-                            let identity = r.id.identity_str()?;
-                            let rs =
-                                sf.find_resource(&r.id.provider, &r.id.resource_type, identity)?;
-                            if rs.dependency_bindings.is_empty() {
-                                None
-                            } else {
-                                Some((r.id.clone(), rs.dependency_bindings.clone()))
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let saved_dep_bindings = expansion_prelude.saved_dependency_bindings();
 
             // Phase 1: refresh managed resources in parallel. carina#3181:
             // `sorted_resources` is managed-only — data sources are refreshed in
             // phase 2 below.
             let persisted_state = state_file.as_ref();
             let schemas = ctx.schemas();
-            let phase1_results: Vec<Result<(ResourceId, Current), AppError>> =
-                stream::iter(sorted_resources.iter())
-                    .map(|resource| {
-                        let progress = refresh_phase.begin(&resource.id);
-                        let loaded = persisted_state
-                            .map(|sf| sf.build_state_for_resource(&resource.id))
-                            .unwrap_or_else(|| Current::absent(resource.id.clone()));
-                        let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
-                        async move {
-                            let mut current = refresh_loaded_resource_with_retry(
-                                provider_ref,
-                                loaded,
-                                persisted_state,
-                                schemas,
-                            )
-                            .await
-                            .map_err(AppError::Provider)?;
-                            if let Some(deps) = dep_bindings {
-                                current.set_dependency_bindings(deps);
-                            }
-                            progress.finish();
-                            Ok((resource.id.clone(), current))
-                        }
-                    })
-                    .buffer_unordered(5)
-                    .collect()
-                    .await;
-            for result in phase1_results {
-                let (id, current) = result?;
-                managed_current.insert(id, current);
-            }
+            expansion_prelude
+                .refresh_managed_resource_set(
+                    ProjectedPhase1RefreshInputs {
+                        provider: provider_ref,
+                        refresh_phase: &refresh_phase,
+                        schemas,
+                    },
+                    &mut managed_current,
+                )
+                .await?;
 
             // Refresh orphaned resources (#844, #1685). Must run before the
-            // rename transfer below so old-name entries are present for
-            // `apply_anonymous_to_named_renames` to transfer.
+            // automatic move transfer below so old-address entries are present
+            // for the shared resolved-move path to transfer.
             let mut orphans = Orphans::new();
             // Ids the orphan pass already live-read this run. A for-loop child
             // applied previously is in state but not yet a desired resource at
@@ -1904,10 +1870,8 @@ async fn run_apply_locked_owned(
             // post-expansion child refresh so the same address is not read twice
             // (carina#3145). Mirrors the plan path in `wiring/mod.rs`.
             let mut orphan_refreshed_ids: HashSet<ResourceId> = HashSet::new();
-            if let Some(sf) = persisted_state {
-                let desired_ids: HashSet<ResourceId> =
-                    sorted_resources.iter().map(|r| r.id.clone()).collect();
-                let loaded_orphans = sf.build_orphans(&desired_ids);
+            if persisted_state.is_some() {
+                let loaded_orphans = expansion_prelude.loaded_orphans(std::iter::empty());
                 let orphan_results: Vec<
                     Result<(ResourceId, carina_core::differ::Orphan), AppError>,
                 > = stream::iter(loaded_orphans)
@@ -1942,8 +1906,8 @@ async fn run_apply_locked_owned(
                 orphans = refreshed_orphans.into_plan_orphans();
             }
 
-            // Hydrate, transfer state for moved blocks and anonymous → let-bound
-            // renames (#1685), then run phase 2 against the consolidated state.
+            // Hydrate, transfer explicit and detected anonymous address moves
+            // (#1685), then run phase 2 against the consolidated state.
             crate::wiring::hydrate_prior_managed_states(
                 &mut managed_current,
                 &mut orphans,
@@ -1952,18 +1916,9 @@ async fn run_apply_locked_owned(
                 state_file.as_ref(),
             )
             .await?;
-            let reconciled_expansion = expansion_prelude.reconcile_addresses(
-                crate::wiring::ReconcileDeferredForExpansionInputs {
-                    ctx,
-                    parsed,
-                    provider_configs: raw_provider_configs,
-                    state_block_claims: &state_block_claims,
-                    managed_current,
-                    orphans,
-                    already_refreshed: orphan_refreshed_ids,
-                },
-                crate::wiring::DeferredForWarningPolicy::Print,
-            )?;
+            let reconciled_expansion = expansion_prelude
+                .bind_projected_phase1_state(managed_current, orphans, orphan_refreshed_ids)
+                .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Print)?;
 
             // Phase 2 uses the same addressed managed/orphan view as plan and
             // state refresh and produces one outcome per query.
@@ -2023,13 +1978,9 @@ async fn run_apply_locked_owned(
             let (ctx, expanded_canonical_resources) = validated_expansion.context_and_resources();
             let sorted_resources = resorted;
             let crate::wiring::PreparedDeferredForExpansionParts {
-                mut managed_current,
+                mut addressed,
                 mut data_source_values,
-                mut orphans,
-                saved_attrs,
-                prev_explicit,
                 wait_aliases,
-                moved_pairs,
             } = prepared_expansion.into_parts();
             let parsed = expanded_canonical_resources.parsed();
             drop(refresh_phase);
@@ -2060,25 +2011,26 @@ async fn run_apply_locked_owned(
                 parsed.compositions.clone();
 
             let pre_apply_current = carina_core::resource::into_plan_input_current_map(
-                managed_current.clone(),
+                addressed.managed_current().clone(),
                 ctx.schemas(),
                 &sorted_resources,
             );
             let managed_stability = crate::wiring::derive_managed_binding_stability(
                 parsed,
                 &sorted_resources,
-                &managed_current,
+                addressed.managed_current(),
                 &data_source_values,
                 ctx.schemas(),
-                &saved_attrs,
-                &prev_explicit,
+                addressed.saved_attrs(),
+                addressed.prev_explicit(),
                 remote_bindings,
                 &wait_aliases,
             )?;
+            let projected_state = addressed.projected_state(state_file.as_ref());
             let (mut override_aware_resources, unresolved_override_aware_resources) =
                 OverrideAwareResources::build_pair_with_stability(
                     expanded_canonical_resources.as_pair(),
-                    state_file.as_ref(),
+                    &projected_state,
                     carina_core::binding_index::LivePreApplyInputs {
                         managed: &[],
                         compositions: &pre_resolve_compositions,
@@ -2092,7 +2044,7 @@ async fn run_apply_locked_owned(
                 )?;
             crate::legacy_name_overrides::emit_legacy_override_warnings(
                 &override_aware_resources,
-                state_file.as_ref(),
+                &projected_state,
             );
             // Resolve and canonicalize only refresh-time data sources. Deferred
             // reads keep their original input refs so the plan/executor dependency
@@ -2113,6 +2065,7 @@ async fn run_apply_locked_owned(
                 &pre_resolve_compositions,
             );
             let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
+            let (managed_current, orphans) = addressed.managed_current_and_orphans_mut();
             let preparation = if let Some(errors) = refresh_module_constraint_errors {
                 Err(crate::wiring::PlanPreparationError::Plan(errors))
             } else {
@@ -2121,9 +2074,9 @@ async fn run_apply_locked_owned(
                         &mut override_aware_resources,
                         &constraint_origin_resources,
                         &module_gate,
-                        &mut managed_current,
+                        managed_current,
                         &mut data_source_values,
-                        &mut orphans,
+                        orphans,
                         raw_provider_configs,
                         &mut data_sources_for_plan,
                         &data_sources,
@@ -2148,6 +2101,7 @@ async fn run_apply_locked_owned(
                 ctx,
                 LateAnonymousIdentityInputs {
                     resources: &mut override_aware_resources,
+                    addressed: &mut addressed,
                     data_sources: &data_sources_for_plan,
                     state_file: state_file.as_ref(),
                     state_block_claims: &state_block_claims,
@@ -2156,13 +2110,13 @@ async fn run_apply_locked_owned(
             )?;
             crate::wiring::validate_plan_time_state_block_collisions(
                 &resolved_desired_ids,
-                &moved_pairs,
+                addressed.moved_pairs(),
                 &resolved_state_block_targets,
                 &state_file,
             )?;
             let reconciled_provider_states = provider_states_for(
-                &managed_current,
-                &orphans,
+                addressed.managed_current(),
+                addressed.orphans(),
                 override_aware_resources.resources(),
             );
             let reconciled_input_current = carina_core::resource::into_plan_input_current_map(
@@ -2177,8 +2131,8 @@ async fn run_apply_locked_owned(
                 &stability_resources,
                 &reconciled_input_current,
                 ctx.schemas(),
-                &saved_attrs,
-                &prev_explicit,
+                addressed.saved_attrs(),
+                addressed.prev_explicit(),
             );
             override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
                 RebuildBindingsInputs {
@@ -2200,28 +2154,31 @@ async fn run_apply_locked_owned(
             let resolved_unresolved_resources =
                 ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
             let plan_input_current = carina_core::resource::into_plan_input_current_map(
-                managed_current.clone(),
+                addressed.managed_current().clone(),
                 ctx.schemas(),
                 override_aware_resources.resources(),
             );
-            let directives_map = state_file
-                .as_ref()
-                .map(|sf| sf.build_directives())
-                .unwrap_or_default();
+            let directives_map = addressed
+                .projected_state(state_file.as_ref())
+                .build_directives();
             let schemas = ctx.schemas();
             let mut plan = create_plan_with_cascades(
                 &resolved_resources,
                 &resolved_unresolved_resources,
                 &data_sources_for_plan,
                 &provider,
-                PlanPriorStates::new(&plan_input_current, &orphans),
+                PlanPriorStates::new(&plan_input_current, addressed.orphans()),
                 &directives_map,
                 schemas,
-                &saved_attrs,
-                &prev_explicit,
+                addressed.saved_attrs(),
+                addressed.prev_explicit(),
                 &wait_bindings,
             )?;
-            crate::wiring::add_deposed_delete_effects(&mut plan, &state_file, &moved_pairs);
+            crate::wiring::add_deposed_delete_effects(
+                &mut plan,
+                &state_file,
+                addressed.moved_pairs(),
+            );
             block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
             override_aware_resources.apply_plan_stability(&plan_input_current, &plan, schemas);
             // Add state block effects (import/removed/moved) only after both
@@ -2244,18 +2201,24 @@ async fn run_apply_locked_owned(
                 &mut plan,
                 &parsed.state_blocks,
                 &state_file,
-                &moved_pairs,
+                addressed.moved_pairs(),
                 override_aware_resources.resources(),
                 override_aware_resources.bindings(),
                 &no_unresolved_upstreams,
             );
             crate::wiring::add_deferred_create_effects(&mut plan, &deferred_create_targets);
-            managed_current = into_all_prior_states(orphans, managed_current);
-
-            let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
+            let moved_origins: HashMap<ResourceId, ResourceId> = addressed
+                .moved_pairs()
                 .iter()
                 .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
                 .collect();
+            let crate::wiring::AddressedStateParts {
+                managed_current,
+                orphans,
+                prev_explicit,
+                ..
+            } = addressed.into_parts();
+            let mut managed_current = into_all_prior_states(orphans, managed_current);
 
             render_plan_errors_and_abort(&plan)?;
             let executable_data_source_values = data_source_values
@@ -2811,22 +2774,27 @@ async fn prepare_saved_plan_secret_candidates(
         canonical_resources,
         &candidate_state,
         wiring.schemas(),
+    )?
+    .detect_moves(
+        wiring,
+        &parsed.data_sources,
+        provider_inputs.configs().as_provider_configs(),
+        &state_blocks.claims,
     )?;
-    let prior_states = pending_plan.expansion_prior_states(expansion_prelude.sorted_resources());
+    let replay_moves = expansion_prelude.saved_plan_replay_moves(parsed);
+    let prior_states = pending_plan.expansion_prior_states(
+        expansion_prelude.sorted_resources(),
+        &replay_moves,
+        &candidate_state,
+    )?;
     let data_source_values = pending_plan.data_source_values(&parsed.data_sources)?;
     let prepared_expansion = expansion_prelude
-        .reconcile_addresses(
-            crate::wiring::ReconcileDeferredForExpansionInputs {
-                ctx: wiring,
-                parsed,
-                provider_configs: provider_inputs.configs().as_provider_configs(),
-                state_block_claims: &state_blocks.claims,
-                managed_current: prior_states.managed,
-                orphans: Orphans::new(),
-                already_refreshed: prior_states.already_refreshed,
-            },
-            crate::wiring::DeferredForWarningPolicy::Suppress,
-        )?
+        .bind_projected_phase1_state(
+            prior_states.managed,
+            prior_states.orphans,
+            prior_states.already_refreshed,
+        )
+        .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Suppress)?
         .seal(data_source_values);
     let (mut validated_expansion, _expansion) = validated_config.expand_deferred_for(
         &prepared_expansion,

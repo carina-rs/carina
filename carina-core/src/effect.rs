@@ -384,6 +384,16 @@ impl MoveAuthority<'_> {
             self.to.identity().clone(),
         )
     }
+
+    /// Project the source to the routing-free address used when a saved plan
+    /// restores a post-move snapshot before replaying this exact move edge.
+    pub(crate) fn source_address(&self) -> StateBlockAddress {
+        StateBlockAddress::new(
+            self.from.provider().to_string(),
+            self.from.resource_type().to_string(),
+            self.from.identity().clone(),
+        )
+    }
 }
 
 /// A move whose source and destination identities have both crossed the

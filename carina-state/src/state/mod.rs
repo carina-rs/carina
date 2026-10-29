@@ -1018,37 +1018,6 @@ impl StateFile {
         self.upsert_resource(row)
     }
 
-    /// Rekey resource identities while preserving the state-wide uniqueness
-    /// invariant.
-    pub fn rename_resource_identities(
-        &mut self,
-        renames: &[(String, String)],
-    ) -> Result<(), BackendError> {
-        self.validate_unique_identities()
-            .map_err(BackendError::InvalidState)?;
-        let by_old: HashMap<&str, &str> = renames
-            .iter()
-            .map(|(old, new)| (old.as_str(), new.as_str()))
-            .collect();
-        let mut renamed = self.resources.clone();
-        for resource in &mut renamed {
-            if let Some(new_identity) = by_old.get(resource.identity.as_str()) {
-                resource.identity = ResourceIdentity::try_from((*new_identity).to_owned())
-                    .map_err(|error| BackendError::InvalidStateIdentity {
-                        context: format!(
-                            "cannot rename resource identity {:?} to {:?}",
-                            resource.identity.as_str(),
-                            new_identity
-                        ),
-                        error,
-                    })?;
-            }
-        }
-        validate_resource_identities(&renamed).map_err(BackendError::InvalidState)?;
-        self.resources = renamed;
-        Ok(())
-    }
-
     /// Remove one deposed generation after that exact generation's Delete
     /// succeeded. If the row was an exact deposed-only shell and this removes
     /// its last generation, the now-empty shell is dropped. A malformed

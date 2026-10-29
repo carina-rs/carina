@@ -2253,11 +2253,16 @@ let vpc = awscc.ec2.Vpc {{
     )
 }
 
-fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -> ResourceIdentity {
+fn concrete_subnet_identity(
+    ctx: &WiringContext,
+    providers: &[ProviderConfig],
+    vpc_id: &str,
+    cidr_block: &str,
+) -> ResourceIdentity {
     let mut resources = vec![
         Resource::pending_with_provider("awscc", "ec2.Subnet", None)
-            .with_attribute("vpc_id", string_value("vpc-old"))
-            .with_attribute("cidr_block", string_value("10.220.1.0/24"))
+            .with_attribute("vpc_id", string_value(vpc_id))
+            .with_attribute("cidr_block", string_value(cidr_block))
             .with_attribute("availability_zone", string_value("ap-northeast-1c")),
     ];
     let canonical =
@@ -2292,7 +2297,7 @@ fn seed_apply_cascade_state(
     if include_subnet {
         let mut subnet_state = ResourceState::try_applied(
             "ec2.Subnet",
-            concrete_subnet_identity(ctx, providers),
+            concrete_subnet_identity(ctx, providers, "vpc-old", "10.220.1.0/24"),
             "awscc",
             "subnet-old",
         )
@@ -3774,9 +3779,10 @@ fn apply_emits_legacy_override_warning_to_stderr() {
     let current_states = HashMap::new();
     let remote_bindings = HashMap::new();
     let wait_aliases = Vec::new();
+    let projected_state = crate::wiring::ProjectedStateRead::for_test_unmoved(Some(&state));
     let (override_aware, _) = OverrideAwareResources::build_pair_with_stability(
         &canonical_resources_for_test(vec![resource], &SchemaRegistry::new()),
-        Some(&state),
+        &projected_state,
         LivePreApplyInputs {
             managed: &[],
             compositions: &[],
@@ -3793,7 +3799,7 @@ fn apply_emits_legacy_override_warning_to_stderr() {
     let mut stderr = Vec::new();
     crate::legacy_name_overrides::write_legacy_override_warnings(
         &override_aware,
-        Some(&state),
+        &projected_state,
         &mut stderr,
     )
     .expect("warning write should succeed");
@@ -4449,8 +4455,22 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
 
     let raw = std::fs::read_to_string(fixture.state_path()).expect("state file must be written");
     let state: serde_json::Value = serde_json::from_str(&raw).expect("state must be valid JSON");
-    let subnet_identity = concrete_subnet_identity(ctx, &parsed.providers);
-    let subnet = state_json_resource(&state, "awscc", "ec2.Subnet", subnet_identity.as_str());
+    let old_subnet_identity =
+        concrete_subnet_identity(ctx, &parsed.providers, "vpc-old", "10.220.1.0/24");
+    let subnet_rows = state["resources"]
+        .as_array()
+        .expect("state resources must be an array")
+        .iter()
+        .filter(|row| row["provider"] == "awscc" && row["resource_type"] == "ec2.Subnet")
+        .collect::<Vec<_>>();
+    let [subnet] = subnet_rows.as_slice() else {
+        panic!("expected exactly one persisted subnet row: {subnet_rows:#?}")
+    };
+    assert_ne!(
+        subnet["identity"],
+        old_subnet_identity.as_str(),
+        "Move+Replace writeback must not leave the anonymous subnet under its old hash",
+    );
     assert_eq!(
         subnet["current"]["identifier"],
         serde_json::json!("subnet-new")
@@ -4636,7 +4656,7 @@ awscc.ec2.Subnet {{
 
     let mut subnet_state = ResourceState::try_applied(
         "ec2.Subnet",
-        concrete_subnet_identity(ctx, &parsed.providers),
+        concrete_subnet_identity(ctx, &parsed.providers, "vpc-old", "10.220.1.0/24"),
         "awscc",
         "subnet-old",
     )

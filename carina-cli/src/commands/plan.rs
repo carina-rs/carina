@@ -3824,7 +3824,7 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
     provider_context: &ProviderContext,
     upstream_policy: UpstreamMissingStatePolicy,
 ) -> Result<PreparedPlanIdentityData, AppError> {
-    let state_blocks = validated_config.reconcile_identities_with_state(state_file)?;
+    let state_blocks = validated_config.reconcile_identities_with_state(state_file);
 
     let provider_inputs = load_and_resolve_provider_configs(
         validated_config.resources().parsed(),

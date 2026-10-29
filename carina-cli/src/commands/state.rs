@@ -1146,7 +1146,7 @@ pub(crate) async fn run_state_refresh_locked(
         return Ok(());
     }
 
-    validated_config.reconcile_for_state_refresh(&mut state_file)?;
+    validated_config.reconcile_for_state_refresh(&state_file);
     let (ctx, parsed) = validated_config.context_and_resources();
 
     let provider_inputs = load_and_resolve_provider_configs(
@@ -1332,13 +1332,17 @@ pub(crate) async fn run_state_refresh_locked(
     let (ctx, parsed) = validated_config.context_and_resources();
     let sorted_resources = resorted;
     let crate::wiring::PreparedDeferredForExpansionParts {
-        mut managed_current,
+        addressed,
         mut data_source_values,
+        wait_aliases,
+    } = prepared_expansion.into_parts();
+    let projected_state = addressed.projected_state(state_file.as_ref());
+    let crate::wiring::AddressedStateParts {
+        mut managed_current,
         orphans,
         saved_attrs: saved_attrs_for_expansion,
-        wait_aliases,
         ..
-    } = prepared_expansion.into_parts();
+    } = addressed.into_parts();
     data_source_values = crate::wiring::read_expanded_data_sources_phase2(
         data_source_values,
         crate::wiring::ExpandedDataSourceReadInputs {
@@ -1396,7 +1400,7 @@ pub(crate) async fn run_state_refresh_locked(
         &mut Orphans::new(),
         &provider,
         &saved_attrs,
-        state_file.as_ref(),
+        &projected_state,
     )
     .await?;
     crate::wiring::lift_data_source_value_enum_leaves(
@@ -3689,11 +3693,13 @@ mod tests {
             })
             .await
             .expect("refresh expansion should succeed");
-        let crate::wiring::PreparedDeferredForExpansionParts {
+        let crate::wiring::PreparedDeferredForExpansionParts { addressed, .. } =
+            prepared_expansion.into_parts();
+        let crate::wiring::AddressedStateParts {
             managed_current: current_states,
             orphans,
             ..
-        } = prepared_expansion.into_parts();
+        } = addressed.into_parts();
         assert_eq!(expanded.new_child_ids, HashSet::from([child.id.clone()]));
         assert!(
             !current_states.contains_key(&child.id),
