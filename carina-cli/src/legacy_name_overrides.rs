@@ -1,7 +1,9 @@
 use std::io::{self, Write};
 
-use carina_core::override_aware::{NameOverrideSource, OverrideAwareResources};
+use carina_core::name_override::NameOverrideSource;
 use carina_state::StateFile;
+
+use crate::wiring::OverrideAwareResources;
 
 pub(crate) fn emit_legacy_override_warnings(
     resources: &OverrideAwareResources,

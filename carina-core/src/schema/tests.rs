@@ -4476,24 +4476,16 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
         ..Default::default()
     };
 
-    let canonical_pair = resolve_config_block_names_with_schemas(
+    let (evaluated, unresolved) = resolve_config_block_names(
         evaluated,
         crate::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         &schemas,
     )
     .expect("schema alias must resolve independently of the authored value shape");
 
-    assert!(
-        canonical_pair.parsed().resources[0]
-            .attributes
-            .contains_key("rules")
-    );
-    assert!(
-        !canonical_pair.parsed().resources[0]
-            .attributes
-            .contains_key("rule")
-    );
-    let unresolved = &canonical_pair.unresolved()[0].attributes;
+    assert!(evaluated.resources[0].attributes.contains_key("rules"));
+    assert!(!evaluated.resources[0].attributes.contains_key("rule"));
+    let unresolved = &unresolved[0].attributes;
     assert_eq!(unresolved.get("rules"), Some(&unresolved_ref));
     assert!(!unresolved.contains_key("rule"));
 }
@@ -4555,17 +4547,14 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
         ..Default::default()
     };
 
-    let canonical_pair = resolve_config_block_names_with_schemas(
+    let (evaluated, unresolved) = resolve_config_block_names(
         evaluated,
         crate::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         &schemas,
     )
     .expect("paired resolution must use the authored ambiguous-key decision");
 
-    for resource in [
-        &canonical_pair.parsed().resources[0],
-        &canonical_pair.unresolved()[0],
-    ] {
+    for resource in [&evaluated.resources[0], &unresolved[0]] {
         let lifecycle = match resource.get_attr("lifecycle_configuration") {
             Some(Value::Concrete(ConcreteValue::Map(map))) => map,
             _ => panic!("expected lifecycle map"),
@@ -4573,11 +4562,10 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
         assert!(lifecycle.contains_key("transition"));
         assert!(!lifecycle.contains_key("transitions"));
     }
-    let unresolved_lifecycle =
-        match canonical_pair.unresolved()[0].get_attr("lifecycle_configuration") {
-            Some(Value::Concrete(ConcreteValue::Map(map))) => map,
-            _ => panic!("expected unresolved lifecycle map"),
-        };
+    let unresolved_lifecycle = match unresolved[0].get_attr("lifecycle_configuration") {
+        Some(Value::Concrete(ConcreteValue::Map(map))) => map,
+        _ => panic!("expected unresolved lifecycle map"),
+    };
     assert_eq!(
         unresolved_lifecycle.get("transition"),
         Some(&unresolved_ref)

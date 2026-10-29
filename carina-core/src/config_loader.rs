@@ -270,11 +270,12 @@ impl AuthoredBindingView {
 /// alias resolution. Its schema-resolved output also becomes the plan's
 /// unresolved, authored-form resources used for let-binding pairing.
 ///
-/// Its parsed representation is crate-private so downstream callers cannot
-/// extract a raw resource vector. Function calls may already be folded in this
-/// snapshot; it does not represent the exact authored reference graph. Schema
-/// block-name resolution consumes this value and returns the typestate required
-/// by override-aware planning.
+/// This wrapper fixes the input shape for block-name resolution. Function calls
+/// may already be folded in this snapshot; it does not represent the exact
+/// authored reference graph. Core's block-name resolver consumes this value and
+/// returns its resources as plain resolved resources with no pairing guarantee;
+/// carina-cli validation wiring alone turns them into its canonical
+/// resource-pair typestate.
 #[derive(Debug, Clone)]
 pub struct UnresolvedConfigSnapshot {
     parsed: ParsedFile,
@@ -282,8 +283,8 @@ pub struct UnresolvedConfigSnapshot {
 
 impl UnresolvedConfigSnapshot {
     /// Wrap a parsed pre-resolution snapshot for schema-aware alias
-    /// resolution. The raw value remains opaque after construction; the only
-    /// way to recover its resources is to consume it through the resolver.
+    /// resolution. Core's block-name resolver returns its resources as plain
+    /// resolved resources with no pairing guarantee.
     pub fn from_parsed(parsed: ParsedFile) -> Self {
         Self { parsed }
     }

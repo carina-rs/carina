@@ -347,9 +347,7 @@ impl ReloadedPendingPlanFile {
     ) -> Result<
         (
             SchemaCheckedPendingPlanFile,
-            ValidatedConfig<
-                carina_core::override_aware::CanonicalResourcePair<InferredExportParam>,
-            >,
+            ValidatedConfig<crate::wiring::CanonicalResourcePair<InferredExportParam>>,
         ),
         AppError,
     > {

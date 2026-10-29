@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use carina_core::config_loader::{DuplicateDeclaration, UnresolvedConfigSnapshot};
 use carina_core::module_resolver;
-use carina_core::override_aware::CanonicalResourcePair;
 use carina_core::parser::{BackendConfig, ProviderContext};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::inference::ExportInferenceError;
@@ -40,7 +39,7 @@ use crate::module_walk::ModuleWalk;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::wiring::ProviderLoad;
 use crate::wiring::{
-    WiringContext, compute_anonymous_identifiers_with_ctx,
+    CanonicalResourcePair, WiringContext, compute_anonymous_identifiers_with_ctx,
     compute_canonical_pair_anonymous_identifiers_with_ctx, resolve_file_names_with_ctx,
     validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
     validate_module_attribute_refs_after_expansion_failure, validate_module_calls_with_imported,

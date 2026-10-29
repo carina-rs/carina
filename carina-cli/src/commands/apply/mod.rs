@@ -22,9 +22,6 @@ use carina_core::executor::{
     ExecutionCheckpointSink, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
     ProviderCheckInputs, UnresolvedResource,
 };
-use carina_core::override_aware::{
-    OverrideAwareBuildMode, OverrideAwareResources, RebuildBindingsInputs,
-};
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
@@ -74,7 +71,8 @@ use crate::display::print_plan;
 use crate::error::{AppError, SavedPlanSecretVerificationError};
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
-    AddressedDataSourceReadInputs, LateAnonymousIdentityInputs, ProviderLoad, ValidatedConfig,
+    AddressedDataSourceReadInputs, LateAnonymousIdentityInputs, OverrideAwareBuildMode,
+    OverrideAwareResources, ProviderLoad, RebuildBindingsInputs, ValidatedConfig,
     create_normalizers_from_configs_with_ctx, create_providers_from_configs_with_ctx,
     get_provider_with_ctx, module_constraint_plan_errors, prepare_data_sources_for_plan,
     prepare_default_provider_ready_config, read_managed_state_with_retry,

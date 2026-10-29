@@ -27,7 +27,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use carina_cli::commands::validate_and_resolve_errors;
-use carina_cli::wiring::{PlanPreprocessor, ProviderLoad};
+use carina_cli::wiring::{
+    OverrideAwareBuildMode, OverrideAwareResources, PlanPreprocessor, ProviderLoad,
+    resolve_config_block_names_for_test,
+};
 use carina_core::binding_index::ResolvedBindings;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::data_source_value::ExecutableDataSourceValues;
@@ -557,32 +560,31 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         ..Default::default()
     };
     let canonical_for_plan = unresolved_for_plan.clone();
-    let canonical_unresolved = carina_core::schema::resolve_config_block_names_with_schemas(
+    let canonical_unresolved = resolve_config_block_names_for_test(
         canonical_for_plan,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved_for_plan),
         ctx.schemas(),
     )
     .expect("block-name resolution");
-    let (mut override_aware_resources, _) =
-        carina_core::override_aware::OverrideAwareResources::build_pair_with_stability(
-            &canonical_unresolved,
-            None::<&carina_state::StateFile>,
-            carina_core::binding_index::PreApplyInputs {
-                managed: &[],
-                compositions: &parsed.compositions,
-                managed_current: &carina_core::resource::into_plan_input_current_map(
-                    current_states.clone(),
-                    ctx.schemas(),
-                    &resource_origins,
-                ),
-                data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-                remote_bindings: &remote_bindings,
-                wait_aliases: &wait_aliases,
-            },
-            &HashMap::new(),
-            carina_core::override_aware::OverrideAwareBuildMode::Apply,
-        )
-        .expect("override-aware resolve");
+    let (mut override_aware_resources, _) = OverrideAwareResources::build_pair_with_stability(
+        &canonical_unresolved,
+        None::<&carina_state::StateFile>,
+        carina_core::binding_index::PreApplyInputs {
+            managed: &[],
+            compositions: &parsed.compositions,
+            managed_current: &carina_core::resource::into_plan_input_current_map(
+                current_states.clone(),
+                ctx.schemas(),
+                &resource_origins,
+            ),
+            data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
+            remote_bindings: &remote_bindings,
+            wait_aliases: &wait_aliases,
+        },
+        &HashMap::new(),
+        OverrideAwareBuildMode::Apply,
+    )
+    .expect("override-aware resolve");
 
     let provider = NoopProvider { cert_publishes_arn };
     let wait_bindings = parsed.wait_bindings.clone();
