@@ -7,18 +7,37 @@ const tocHeadings = headings.filter(h => h.depth >= 2 && h.depth <= 3);
 ---
 {tocHeadings.length > 0 && (
   <nav class="toc" aria-label="On this page">
-    <button
-      type="button"
-      class="toc-toggle"
-      aria-expanded="true"
-      aria-controls="doc-toc-content"
-      aria-label="Hide on this page"
-      data-toc-toggle
-    >
-      <span class="toc-toggle-icon" aria-hidden="true"></span>
-    </button>
-    <div id="doc-toc-content" class="toc-content">
+    <div class="toc-header">
+      <button
+        type="button"
+        class="rail-toggle toc-toggle"
+        aria-expanded="true"
+        aria-controls="doc-toc-content"
+        aria-label="Hide on this page"
+        data-toc-toggle
+      >
+        <svg
+          class="toc-toggle-icon"
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+          <path d="M15 3v18"></path>
+          <polyline class="chevron-close" points="8 9 11 12 8 15"></polyline>
+          <polyline class="chevron-open" points="11 9 8 12 11 15"></polyline>
+        </svg>
+      </button>
       <p class="toc-label">On this page</p>
+    </div>
+    <div id="doc-toc-content" class="toc-content">
       <ul class="toc-list">
         {tocHeadings.map(h => (
           <li class:list={['toc-item', `toc-depth-${h.depth}`]}>
@@ -32,47 +51,45 @@ const tocHeadings = headings.filter(h => h.depth >= 2 && h.depth <= 3);
 
 <style>
   .toc {
-    padding: var(--space-2) 0;
+    position: sticky;
+    top: var(--topbar-height);
+    box-sizing: border-box;
+    max-height: calc(100dvh - var(--topbar-height));
+    padding: calc(var(--space-8) + var(--space-4)) 0 var(--space-4);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-gutter: stable;
     font-size: var(--text-sm);
   }
 
-  .toc-toggle {
+  .toc-header {
     display: flex;
     align-items: center;
-    justify-content: center;
-    width: 2rem;
-    height: 2rem;
-    margin: 0 0 var(--space-4) auto;
-    padding: 0;
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--toc-link-color);
-    cursor: pointer;
-  }
-
-  .toc-toggle:hover {
-    border-color: var(--toc-link-hover-color);
-    color: var(--toc-link-hover-color);
-  }
-
-  .toc-toggle:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
+    gap: var(--space-2);
+    margin-bottom: var(--space-3);
   }
 
   .toc-toggle-icon {
-    width: 0.45rem;
-    height: 0.45rem;
-    border-right: 2px solid currentColor;
-    border-bottom: 2px solid currentColor;
-    transform: rotate(-45deg);
+    display: block;
   }
 
-  :global(html[data-toc-collapsed]) .toc-toggle-icon {
-    transform: rotate(135deg);
+  .chevron-open { display: none; }
+
+  :global(html[data-toc-collapsed]) .chevron-close { display: none; }
+  :global(html[data-toc-collapsed]) .chevron-open { display: block; }
+
+  @media (min-width: 48.001rem) {
+    .toc-header {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: var(--bg);
+    }
   }
 
+  :global(html[data-toc-collapsed]) .toc-header { margin-bottom: 0; }
+  :global(html[data-toc-collapsed]) .toc-label,
   :global(html[data-toc-collapsed]) .toc-content { display: none; }
 
   .toc-label {
@@ -82,7 +99,7 @@ const tocHeadings = headings.filter(h => h.depth >= 2 && h.depth <= 3);
     letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--toc-label-color);
-    margin: 0 0 var(--space-3);
+    margin: 0;
   }
 
   .toc-list {
@@ -111,6 +128,19 @@ const tocHeadings = headings.filter(h => h.depth >= 2 && h.depth <= 3);
   @media (prefers-reduced-motion: reduce) {
     .toc-link { transition: none; }
   }
+
+  @media (max-width: 48rem) {
+    .toc {
+      position: static;
+      top: auto;
+      max-height: none;
+      padding: 0;
+      overflow-y: visible;
+      overscroll-behavior: auto;
+      scrollbar-width: auto;
+      scrollbar-gutter: auto;
+    }
+  }
 </style>
 
 <script>
@@ -121,6 +151,9 @@ const tocHeadings = headings.filter(h => h.depth >= 2 && h.depth <= 3);
       const slug = a.dataset.tocSlug;
       if (slug) bySlug.set(slug, a);
     });
+    const topbarHeight = Number.parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue('--topbar-height'),
+    ) || 64;
     const obs = new IntersectionObserver(entries => {
       for (const e of entries) {
         const link = bySlug.get(e.target.id);
@@ -130,7 +163,7 @@ const tocHeadings = headings.filter(h => h.depth >= 2 && h.depth <= 3);
           link.setAttribute('data-current', 'true');
         }
       }
-    }, { rootMargin: '0px 0px -70% 0px' });
+    }, { rootMargin: `-${topbarHeight}px 0px -70% 0px` });
     document.querySelectorAll('article h2[id], article h3[id]').forEach(h => obs.observe(h));
   }
 </script>
