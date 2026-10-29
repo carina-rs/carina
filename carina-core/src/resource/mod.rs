@@ -2512,14 +2512,6 @@ pub enum DeferredValue {
     ResourceRef { path: AccessPath },
     /// Reference to a binding without an attribute selector.
     BindingRef { binding: String },
-    /// A bare value binding retained until its expected sink type is known.
-    ///
-    /// The parser used to replace a bare value binding immediately, losing the
-    /// authored spelling before enum validation could distinguish it from enum
-    /// shorthand. Keeping the spelling and the already-resolved lexical value
-    /// together lets the typed binding resolver preserve binding precedence
-    /// while still producing an enum-aware shadowing diagnostic.
-    BindingCandidate { binding: String, value: Box<Value> },
     /// Null/missing coalescing deferred until the left operand's resolution
     /// boundary can distinguish a definitive absence from an unknown value.
     Coalesce {
@@ -2761,7 +2753,6 @@ impl Value {
             Value::Deferred(
                 DeferredValue::ResourceRef { .. }
                 | DeferredValue::BindingRef { .. }
-                | DeferredValue::BindingCandidate { .. }
                 | DeferredValue::Coalesce { .. }
                 | DeferredValue::Interpolation(_)
                 | DeferredValue::FunctionCall { .. }
@@ -2794,10 +2785,6 @@ impl Serialize for DeferredValue {
             BindingRef {
                 binding: &'a str,
             },
-            BindingCandidate {
-                binding: &'a str,
-                value: &'a Value,
-            },
             Coalesce {
                 value: &'a Value,
                 default: &'a Value,
@@ -2825,13 +2812,6 @@ impl Serialize for DeferredValue {
                 binding: binding.as_str(),
             }
             .serialize(serializer),
-            Self::BindingCandidate { binding, value } => {
-                SerializableDeferredValue::BindingCandidate {
-                    binding: binding.as_str(),
-                    value,
-                }
-                .serialize(serializer)
-            }
             Self::Coalesce { value, default } => {
                 SerializableDeferredValue::Coalesce { value, default }.serialize(serializer)
             }
@@ -2877,10 +2857,6 @@ impl<'de> Deserialize<'de> for DeferredValue {
             BindingRef {
                 binding: String,
             },
-            BindingCandidate {
-                binding: String,
-                value: Box<Value>,
-            },
             Coalesce {
                 value: Box<Value>,
                 default: Box<Value>,
@@ -2904,9 +2880,6 @@ impl<'de> Deserialize<'de> for DeferredValue {
         match DeserializableDeferredValue::deserialize(deserializer)? {
             DeserializableDeferredValue::ResourceRef { path } => Ok(Self::ResourceRef { path }),
             DeserializableDeferredValue::BindingRef { binding } => Ok(Self::BindingRef { binding }),
-            DeserializableDeferredValue::BindingCandidate { binding, value } => {
-                Ok(Self::BindingCandidate { binding, value })
-            }
             DeserializableDeferredValue::Coalesce { value, default } => {
                 Ok(Self::Coalesce { value, default })
             }
@@ -2949,11 +2922,6 @@ impl fmt::Debug for DeferredValue {
             Self::BindingRef { binding } => f
                 .debug_struct("BindingRef")
                 .field("binding", binding)
-                .finish(),
-            Self::BindingCandidate { binding, value } => f
-                .debug_struct("BindingCandidate")
-                .field("binding", binding)
-                .field("value", value)
                 .finish(),
             Self::Coalesce { value, default } => f
                 .debug_struct("Coalesce")
@@ -3788,10 +3756,6 @@ pub enum DeferredValueRef<'a> {
     BindingRef {
         binding: &'a str,
     },
-    BindingCandidate {
-        binding: &'a str,
-        value: &'a Value,
-    },
     Coalesce {
         value: &'a Value,
         default: &'a Value,
@@ -3861,9 +3825,6 @@ impl Value {
                 value.contains_diagnostic_sensitive_string()
                     || default.contains_diagnostic_sensitive_string()
             }
-            Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-                value.contains_diagnostic_sensitive_string()
-            }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 inner.contains_diagnostic_sensitive_string()
             }
@@ -3922,9 +3883,6 @@ impl Value {
             Value::Deferred(d) => Some(match d {
                 DeferredValue::ResourceRef { path } => DeferredValueRef::ResourceRef { path },
                 DeferredValue::BindingRef { binding } => DeferredValueRef::BindingRef { binding },
-                DeferredValue::BindingCandidate { binding, value } => {
-                    DeferredValueRef::BindingCandidate { binding, value }
-                }
                 DeferredValue::Coalesce { value, default } => {
                     DeferredValueRef::Coalesce { value, default }
                 }
@@ -4134,16 +4092,6 @@ impl PartialEq for Value {
                 Value::Deferred(DeferredValue::BindingRef { binding: a }),
                 Value::Deferred(DeferredValue::BindingRef { binding: b }),
             ) => a == b,
-            (
-                Value::Deferred(DeferredValue::BindingCandidate {
-                    binding: ab,
-                    value: av,
-                }),
-                Value::Deferred(DeferredValue::BindingCandidate {
-                    binding: bb,
-                    value: bv,
-                }),
-            ) => ab == bb && av == bv,
             (
                 Value::Deferred(DeferredValue::Coalesce {
                     value: av,
@@ -4414,9 +4362,6 @@ impl Value {
     ) {
         match self {
             Value::Deferred(DeferredValue::ResourceRef { path }) => f(path, usage),
-            Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-                value.visit_resource_refs_with_usage_inner(usage, f)
-            }
             Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
                     v.visit_resource_refs_with_usage_inner(usage, f);
@@ -4495,9 +4440,6 @@ impl Value {
     pub fn visit_binding_refs(&self, f: &mut impl FnMut(&str)) {
         match self {
             Value::Deferred(DeferredValue::BindingRef { binding }) => f(binding),
-            Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-                value.visit_binding_refs(f)
-            }
             Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
                     v.visit_binding_refs(f);
@@ -4672,7 +4614,6 @@ pub(crate) fn find_unavailable_evaluation(
                 .iter()
                 .find_map(|argument| recurse(argument.walker_value())),
             Value::Deferred(DeferredValue::Access(access)) => recurse(access.base()),
-            Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => recurse(value),
             Value::Deferred(DeferredValue::Secret(inner)) => match secret_policy {
                 UnavailableSecretPolicy::Exclude => None,
                 UnavailableSecretPolicy::Include | UnavailableSecretPolicy::OnlyInside => {
@@ -4794,10 +4735,6 @@ impl Value {
             }
             Value::Deferred(DeferredValue::BindingRef { binding }) => {
                 binding.hash(hasher);
-            }
-            Value::Deferred(DeferredValue::BindingCandidate { binding, value }) => {
-                binding.hash(hasher);
-                value.hash_into(hasher);
             }
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 value.hash_into(hasher);
@@ -7265,12 +7202,6 @@ pub(crate) fn assert_value_fully_resolved(
             })
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            Err(crate::value::SerializationError::UnresolvedResourceRef {
-                path: binding.clone(),
-                context,
-            })
-        }
-        Value::Deferred(DeferredValue::BindingCandidate { binding, .. }) => {
             Err(crate::value::SerializationError::UnresolvedResourceRef {
                 path: binding.clone(),
                 context,

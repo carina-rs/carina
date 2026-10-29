@@ -53,6 +53,64 @@ fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
 }
 
+#[test]
+fn skip_resource_validation_cannot_bypass_pending_bare_binding_uses() {
+    let fixture = tempfile::tempdir().expect("pending binding fixture");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let VPC = test.Source { name = "source" }
+test.Target { resource_type = VPC }
+"#,
+    )
+    .unwrap();
+    let bootstrap_schemas = SchemaRegistry::new();
+    let loaded = carina_core::config_loader::load_configuration_with_config(
+        fixture.path(),
+        &ProviderContext::default(),
+        &bootstrap_schemas,
+    )
+    .expect("schema-independent bootstrap parse");
+
+    let source_schema = ResourceSchema::new("Source")
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .validate()
+        .unwrap();
+    let target_schema = ResourceSchema::new("Target")
+        .attribute(
+            AttributeSchema::optional(
+                "resource_type",
+                AttributeType::enum_(
+                    carina_core::schema::enum_identity("ResourceType", Some("test.Target")),
+                    Some(vec!["VPC".to_string()]),
+                    vec![("VPC".to_string(), "vpc".to_string())],
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let providers = ProviderLoad::for_fixture_with_additional_schemas(
+        Vec::new(),
+        &loaded.parsed.providers,
+        [
+            ("test".to_string(), source_schema),
+            ("test".to_string(), target_schema),
+        ],
+    );
+
+    let error = providers
+        .validate_evaluated_config(loaded.parsed, fixture.path(), true, &[], &[])
+        .expect_err("skip_resource_validation must not mint ValidationReady for a pending slot");
+    assert!(
+        error.to_string().contains(
+            "`VPC` was interpreted as the `let` binding; if you meant the enum `ResourceType` value, write `test.Target.ResourceType.vpc`"
+        ),
+        "unexpected validation error: {error}",
+    );
+}
+
 struct EvidenceTestFactory {
     name: String,
 }
@@ -1153,6 +1211,7 @@ fn test_find_state_bucket_resource_matching_type() {
         requires: vec![],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: carina_core::resource::ExpansionTrace::new(),

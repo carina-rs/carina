@@ -4223,7 +4223,6 @@ pub(crate) struct Fit<'a> {
 pub(crate) enum FitKind<'a> {
     PassThrough,
     Deferred,
-    BindingCandidate(Box<Fit<'a>>),
     Secret(Box<Fit<'a>>),
     Coalesce {
         value: Box<Fit<'a>>,
@@ -4254,7 +4253,6 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
         FitKind::Union { fit, .. } => canonical_enum_key_from_fit(fit),
         FitKind::PassThrough
         | FitKind::Deferred
-        | FitKind::BindingCandidate(_)
         | FitKind::Secret(_)
         | FitKind::Coalesce { .. }
         | FitKind::List(_)
@@ -4342,17 +4340,6 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
             exactness,
             attr,
             FitKind::Secret(Box::new(inner)),
-        ));
-    }
-
-    if let Value::Deferred(DeferredValue::BindingCandidate { value: inner, .. }) = value {
-        let inner =
-            fit_value_to_resolved_type_on_path(attr, inner, defs, ancestry, purpose, visited_refs)?;
-        let exactness = inner.exactness;
-        return Some(Fit::with_kind(
-            exactness,
-            attr,
-            FitKind::BindingCandidate(Box::new(inner)),
         ));
     }
 
@@ -6624,7 +6611,6 @@ impl Value {
             Value::Deferred(DeferredValue::BindingRef { binding }) => {
                 format!("BindingRef({})", binding)
             }
-            Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => value.type_name(),
             Value::Deferred(DeferredValue::Coalesce { .. }) => "Coalesce".to_string(),
             Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation".to_string(),
             Value::Deferred(

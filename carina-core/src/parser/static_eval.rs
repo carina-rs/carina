@@ -29,7 +29,6 @@ pub(crate) fn is_static_value(value: &Value) -> bool {
             argument.handle().is_some() || argument.value().is_some_and(is_static_value)
         }),
         Value::Deferred(DeferredValue::Access(access)) => is_static_value(access.base()),
-        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => is_static_value(value),
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             parts.iter().all(|part| match part {
                 InterpolationPart::Literal(_) => true,
@@ -54,6 +53,7 @@ pub(crate) fn is_static_eval(value: &EvalValue) -> bool {
     match value {
         EvalValue::User(v) => is_static_value(v),
         EvalValue::StructuralHandle(_) => true,
+        EvalValue::PendingValue(_) => false,
         EvalValue::ProvisionalReference { .. } => false,
         EvalValue::ComputedWithStructuralHandles { value, .. } => is_static_value(value),
         EvalValue::DeferredForValue { .. } => false,
@@ -84,12 +84,6 @@ pub(crate) fn evaluate_static_value(
         Value::Deferred(DeferredValue::Secret(inner)) => Ok(Value::Deferred(
             DeferredValue::Secret(Box::new(evaluate_static_value(*inner, config)?)),
         )),
-        Value::Deferred(DeferredValue::BindingCandidate { binding, value }) => {
-            Ok(Value::Deferred(DeferredValue::BindingCandidate {
-                binding,
-                value: Box::new(evaluate_static_value(*value, config)?),
-            }))
-        }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             let evaluated = parts
                 .into_iter()

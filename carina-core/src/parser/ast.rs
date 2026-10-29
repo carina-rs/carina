@@ -8,7 +8,7 @@ use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
 use crate::binding_index::IterableBindings;
-use crate::eval_value::{StructuralHandle, StructuralHandleMetadata};
+use crate::eval_value::{StructuralHandle, StructuralHandleKind, StructuralHandleMetadata};
 use crate::provider_source::ProviderSource;
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, Directives, FunctionArgument, GraphNode, LeafNode,
@@ -1217,8 +1217,238 @@ impl From<Value> for ModuleArgument {
 pub struct SourceFileId(PathBuf);
 
 impl SourceFileId {
+    pub(in crate::parser) fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+
     pub fn path(&self) -> &Path {
         &self.0
+    }
+}
+
+/// Parser-owned identity of one lexical binding scope.
+///
+/// The directory path separates root and imported-module scopes. A lexical
+/// child additionally carries its source file and parser-minted ordinal so
+/// sibling files cannot mint the same child identity. Authored names are
+/// deliberately not used as scope identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BindingScopeId {
+    directory: PathBuf,
+    lexical_source_file: Option<PathBuf>,
+    ordinal: u64,
+}
+
+impl BindingScopeId {
+    pub(in crate::parser) fn root(source_file: &Path) -> Self {
+        Self {
+            directory: source_file
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+            lexical_source_file: None,
+            ordinal: 0,
+        }
+    }
+
+    pub(in crate::parser) fn child(&self, source_file: &Path, ordinal: u64) -> Self {
+        Self {
+            directory: self.directory.clone(),
+            lexical_source_file: Some(source_file.to_path_buf()),
+            ordinal,
+        }
+    }
+
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    pub fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+}
+
+/// Stable parser address of a resource that owns an authored value sink.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResourceAddress(ResourceId);
+
+impl ResourceAddress {
+    pub(in crate::parser) fn new(id: ResourceId) -> Self {
+        Self(id)
+    }
+
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.0
+    }
+}
+
+/// Owner of one successfully resolved bare binding use.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BindingUseOwner {
+    Resource(ResourceAddress),
+    ModuleArgument {
+        call: ModuleCallId,
+        argument: String,
+    },
+}
+
+/// One structural step below a resource attribute or module argument.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AttributePathSegment {
+    Attribute(String),
+    ListIndex(usize),
+    Key(String),
+    StructField(String),
+}
+
+/// Parser-authored path from an owning sink to one bare binding leaf.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AttributePath(Vec<AttributePathSegment>);
+
+impl AttributePath {
+    pub(in crate::parser) fn root(name: impl Into<String>) -> Self {
+        Self(vec![AttributePathSegment::Attribute(name.into())])
+    }
+
+    pub(in crate::parser) fn with_segment(&self, segment: AttributePathSegment) -> Self {
+        let mut path = self.0.clone();
+        path.push(segment);
+        Self(path)
+    }
+
+    pub fn segments(&self) -> &[AttributePathSegment] {
+        &self.0
+    }
+
+    pub fn root_name(&self) -> &str {
+        match self.0.first() {
+            Some(AttributePathSegment::Attribute(name)) => name,
+            Some(
+                AttributePathSegment::ListIndex(_)
+                | AttributePathSegment::Key(_)
+                | AttributePathSegment::StructField(_),
+            )
+            | None => unreachable!("AttributePath is constructed with an attribute root"),
+        }
+    }
+}
+
+/// Parser-side classification of the lexical binding selected for a bare use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BareBindingKind {
+    Value {
+        declaration: crate::schema::BindingKind,
+    },
+    Structural {
+        kind: StructuralHandleKind,
+        resource_type: Option<ResourceTypePath>,
+    },
+}
+
+/// Authored provenance for one bare identifier resolved by normal lexical
+/// lookup. This data is parser-only and never enters [`Value`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BareBindingUse {
+    pub source_file: SourceFileId,
+    pub scope: BindingScopeId,
+    pub owner: BindingUseOwner,
+    pub path: AttributePath,
+    pub name: String,
+    pub span: SourceSpan,
+    pub binding: BareBindingKind,
+}
+
+/// A value sink reserved because at least one structural leaf cannot be
+/// represented as runtime [`Value`] data.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PendingValueSlot {
+    pub owner: BindingUseOwner,
+    pub path: AttributePath,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BareBindingSource {
+    Value {
+        value: Value,
+        declared_type: Option<TypeExpr>,
+    },
+    Structural(StructuralHandle),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParsedBareBindingUse {
+    pub(crate) authored: BareBindingUse,
+    pub(crate) source: BareBindingSource,
+}
+
+/// Opaque parsed-file side data for bare binding provenance and pending sinks.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParsedBindingUses {
+    records: Vec<ParsedBareBindingUse>,
+    pending_slots: Vec<PendingValueSlot>,
+}
+
+impl ParsedBindingUses {
+    pub(crate) fn record(&mut self, authored: BareBindingUse, source: BareBindingSource) {
+        self.records.push(ParsedBareBindingUse { authored, source });
+    }
+
+    pub(crate) fn reserve(&mut self, slot: PendingValueSlot) {
+        if !self.pending_slots.contains(&slot) {
+            self.pending_slots.push(slot);
+        }
+    }
+
+    pub(crate) fn records(&self) -> &[ParsedBareBindingUse] {
+        &self.records
+    }
+
+    pub fn uses(&self) -> impl ExactSizeIterator<Item = &BareBindingUse> {
+        self.records.iter().map(|record| &record.authored)
+    }
+
+    pub fn pending_slots(&self) -> &[PendingValueSlot] {
+        &self.pending_slots
+    }
+
+    pub(crate) fn remap_resource_owner(&mut self, from: &ResourceId, to: &ResourceId) {
+        let remap = |owner: &mut BindingUseOwner| {
+            if let BindingUseOwner::Resource(address) = owner
+                && address.resource_id() == from
+            {
+                *address = ResourceAddress::new(to.clone());
+            }
+        };
+        for record in &mut self.records {
+            remap(&mut record.authored.owner);
+        }
+        for slot in &mut self.pending_slots {
+            remap(&mut slot.owner);
+        }
+    }
+
+    pub(crate) fn remap_module_call_owner(&mut self, from: &ModuleCallId, to: &ModuleCallId) {
+        let remap = |owner: &mut BindingUseOwner| {
+            if let BindingUseOwner::ModuleArgument { call, .. } = owner
+                && call == from
+            {
+                *call = to.clone();
+            }
+        };
+        for record in &mut self.records {
+            remap(&mut record.authored.owner);
+        }
+        for slot in &mut self.pending_slots {
+            remap(&mut slot.owner);
+        }
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.records.extend(other.records);
+        for slot in other.pending_slots {
+            self.reserve(slot);
+        }
     }
 }
 
@@ -1252,7 +1482,7 @@ pub struct ModuleCallId {
 }
 
 impl ModuleCallId {
-    fn direct(source_file: PathBuf, call_span: SourceSpan) -> Self {
+    pub(in crate::parser) fn direct(source_file: PathBuf, call_span: SourceSpan) -> Self {
         Self {
             source_file: SourceFileId(source_file),
             call_span,
@@ -2028,6 +2258,9 @@ pub struct File<E> {
     /// Evaluator-only classification carried between directory parse passes.
     #[doc(hidden)]
     pub parser_binding_metadata: ParserBindingMetadata,
+    /// Bare binding provenance and typed pending value slots.
+    #[doc(hidden)]
+    pub parsed_binding_uses: ParsedBindingUses,
     /// Non-fatal warnings collected during parsing.
     pub warnings: Vec<ParseWarning>,
     /// For-expressions whose iterables are unresolved; displayed as deferred in plan.
@@ -2074,6 +2307,7 @@ impl<E> Default for File<E> {
             requires: Vec::new(),
             structural_bindings: HashSet::new(),
             parser_binding_metadata: ParserBindingMetadata::default(),
+            parsed_binding_uses: ParsedBindingUses::default(),
             warnings: Vec::new(),
             deferred_for_expressions: Vec::new(),
             expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -2082,6 +2316,10 @@ impl<E> Default for File<E> {
 }
 
 impl<E> File<E> {
+    pub fn bare_binding_uses(&self) -> &ParsedBindingUses {
+        &self.parsed_binding_uses
+    }
+
     /// Transform only the export-param phase (`File<E>` → `File<B>`),
     /// applying `f` to the export params and moving every other field
     /// through unchanged.
@@ -2115,6 +2353,7 @@ impl<E> File<E> {
             requires,
             structural_bindings,
             parser_binding_metadata,
+            parsed_binding_uses,
             warnings,
             deferred_for_expressions,
             expansion_trace,
@@ -2139,6 +2378,7 @@ impl<E> File<E> {
             requires,
             structural_bindings,
             parser_binding_metadata,
+            parsed_binding_uses,
             warnings,
             deferred_for_expressions,
             expansion_trace,
@@ -2526,9 +2766,6 @@ fn deferred_iterable_kind(value: &Value) -> &'static str {
         Value::Concrete(ConcreteValue::Map(_)) => "map",
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "deferred resource reference",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "deferred binding reference",
-        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-            deferred_iterable_kind(value)
-        }
         Value::Deferred(DeferredValue::Coalesce { .. }) => "deferred coalesce expression",
         Value::Deferred(DeferredValue::Interpolation(_)) => "deferred interpolation",
         Value::Deferred(
@@ -2839,9 +3076,6 @@ fn substitute_placeholder_lazily(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             substitute_placeholder_lazily(inner, index, key, item);
         }
-        Value::Deferred(DeferredValue::BindingCandidate { value: inner, .. }) => {
-            substitute_placeholder_lazily(inner, index, key, item);
-        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -3036,6 +3270,7 @@ mod substitute_placeholder_tests {
             requires: _,
             structural_bindings: _,
             parser_binding_metadata: _,
+            parsed_binding_uses: _,
             warnings: _,
             deferred_for_expressions: _,
             expansion_trace: _,

@@ -9,9 +9,7 @@ use std::collections::HashSet;
 
 use indexmap::IndexMap;
 
-use crate::binding_index::{
-    BindingIndex, BindingNameKind, BindingNameSet, RefType, RefTypeError, ResolvedRefType,
-};
+use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
     ForBinding, ModuleCall, ProviderContext, ResourceContext, ResourceRef, ResourceTypePath,
@@ -267,50 +265,112 @@ impl std::error::Error for BindingResolutionError {
     }
 }
 
-enum BindingCandidateSource<'a> {
-    Value {
-        value: &'a Value,
-        declared_type: Option<&'a TypeExpr>,
-        prechecked_error: Option<BindingResolutionError>,
-    },
-    Structural(&'a crate::eval_value::StructuralHandle),
-}
-
 struct ExpectedEnumTarget<'a> {
     attr_type: &'a AttributeType,
     defs: &'a std::collections::BTreeMap<String, AttributeType>,
     ancestry: FieldAncestry,
 }
 
-fn binding_kind(kind: Option<&BindingNameKind>) -> BindingKind {
-    match kind {
-        Some(BindingNameKind::Argument) => BindingKind::Argument,
-        Some(
-            BindingNameKind::Resource
-            | BindingNameKind::ModuleCall
-            | BindingNameKind::UpstreamState
-            | BindingNameKind::Use
-            | BindingNameKind::UserFunction
-            | BindingNameKind::Variable
-            | BindingNameKind::Structural
-            | BindingNameKind::Wait { .. },
-        )
-        | None => BindingKind::Let,
+/// Typed inputs shared by CLI and LSP while consuming parser-authored bare
+/// binding uses. Provider context is deliberately mandatory: bootstrap parsing
+/// may leave dotted declarations unresolved, but this validation seam may not.
+pub struct ValidationTypeContext<'a> {
+    pub schemas: &'a SchemaRegistry,
+    pub provider_context: &'a ProviderContext,
+    pub module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+    scope_bindings: BindingIndex<'a>,
+    inference_bindings: inference::InferenceBindings,
+}
+
+impl<'a> ValidationTypeContext<'a> {
+    pub fn new<E>(
+        file: &'a crate::parser::File<E>,
+        schemas: &'a SchemaRegistry,
+        provider_context: &'a ProviderContext,
+        module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+    ) -> Self {
+        Self {
+            schemas,
+            provider_context,
+            module_signatures,
+            scope_bindings: BindingIndex::from_parsed_with_module_signatures(
+                file,
+                schemas,
+                module_signatures,
+            ),
+            inference_bindings: inference::bindings_from_parsed(file),
+        }
+    }
+}
+
+/// One typed failure tied directly to the parser token that authored the use.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindingUseFinding {
+    pub use_site: crate::parser::BareBindingUse,
+    pub error: BindingResolutionError,
+}
+
+/// Complete result of consuming one parsed file's out-of-band provenance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindingUseReport {
+    findings: Vec<BindingUseFinding>,
+    consumed_uses: usize,
+    total_uses: usize,
+    pending_slots: Vec<crate::parser::PendingValueSlot>,
+}
+
+/// Sealed proof that every parser-authored bare binding use was consumed by
+/// [`resolve_bare_binding_uses`] and that no typed pending slot survived.
+///
+/// The fields are private so downstream crates can carry this proof through a
+/// typestate transition but cannot manufacture it from a raw [`File`](crate::parser::File).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedBindingUses {
+    _sealed: (),
+}
+
+impl BindingUseReport {
+    pub fn findings(&self) -> &[BindingUseFinding] {
+        &self.findings
+    }
+
+    pub fn into_findings(self) -> Vec<BindingUseFinding> {
+        self.findings
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.findings.is_empty()
+            && self.consumed_uses == self.total_uses
+            && self.pending_slots.is_empty()
+    }
+
+    pub fn pending_slots(&self) -> &[crate::parser::PendingValueSlot] {
+        &self.pending_slots
+    }
+
+    /// Consume a successful report into the sealed production-transition
+    /// proof. The original report is returned unchanged when any finding,
+    /// unconsumed use, or pending slot remains.
+    pub fn into_resolved(self) -> Result<ResolvedBindingUses, Self> {
+        if self.is_ready() {
+            Ok(ResolvedBindingUses { _sealed: () })
+        } else {
+            Err(self)
+        }
     }
 }
 
 fn binding_value_assignable_to_enum(
     value: &Value,
     declared_type: Option<&TypeExpr>,
-    config: Option<&ProviderContext>,
+    config: &ProviderContext,
     target: &ExpectedEnumTarget<'_>,
     resolver: &EnumValueResolver<'_>,
     identity: &TypeIdentity,
-) -> Result<(), TypeError> {
+) -> Result<(), BindingResolutionError> {
     if let Some(declared_type) = declared_type {
-        let resolved = config
-            .and_then(|config| resolve_type_expr(declared_type, config).ok())
-            .unwrap_or_else(|| declared_type.clone());
+        let resolved =
+            resolve_type_expr(declared_type, config).map_err(BindingResolutionError::Existing)?;
         match resolved {
             TypeExpr::SchemaType { owned }
                 if owned.identity().same_type(identity)
@@ -320,10 +380,10 @@ fn binding_value_assignable_to_enum(
             }
             TypeExpr::Unknown => {}
             other => {
-                return Err(TypeError::TypeMismatch {
+                return Err(BindingResolutionError::Type(TypeError::TypeMismatch {
                     expected: identity.to_string(),
                     got: other.to_string(),
-                });
+                }));
             }
         }
     }
@@ -332,84 +392,53 @@ fn binding_value_assignable_to_enum(
             if !canonical.identity().same_type(identity)
                 || !canonical.identity().assignable_to(identity)
             {
-                return Err(TypeError::TypeMismatch {
+                return Err(BindingResolutionError::Type(TypeError::TypeMismatch {
                     expected: identity.to_string(),
                     got: canonical.identity().to_string(),
-                });
+                }));
             }
             resolver
                 .resolve_state_text(canonical.api_value())
                 .map(|_| ())
+                .map_err(BindingResolutionError::Type)
         }
-        Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
-            resolver.resolve_raw(raw).map(|_| ())
-        }
+        Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => resolver
+            .resolve_raw(raw)
+            .map(|_| ())
+            .map_err(BindingResolutionError::Type),
         _ => crate::schema::validate_attr_with_defs_and_ancestry(
             target.attr_type,
             value,
             target.defs,
             target.ancestry,
-        ),
+        )
+        .map_err(BindingResolutionError::Type),
     }
 }
 
-/// The one schema-aware decision point for a bare lexical binding in an enum
-/// position. Bindings retain lexical precedence when assignable. Only a
-/// proven mismatch whose authored spelling is a member becomes the structured
-/// shadowing error.
-fn resolve_binding_candidate_against_enum(
-    name: &str,
-    kind: BindingKind,
-    source: BindingCandidateSource<'_>,
+fn enum_shadow_or_existing(
+    use_site: &crate::parser::BareBindingUse,
     target: ExpectedEnumTarget<'_>,
-    config: Option<&ProviderContext>,
-) -> Result<(), BindingResolutionError> {
+    existing_error: BindingResolutionError,
+) -> BindingResolutionError {
     let resolver = EnumValueResolver::with_defs(target.attr_type, target.defs);
     let Some(identity) = resolver.enum_identity() else {
-        return Ok(());
+        return existing_error;
     };
-
-    let existing_error = match source {
-        BindingCandidateSource::Value {
-            value,
-            declared_type,
-            prechecked_error,
-        } => {
-            if let Some(error) = prechecked_error {
-                error
-            } else {
-                match binding_value_assignable_to_enum(
-                    value,
-                    declared_type,
-                    config,
-                    &target,
-                    &resolver,
-                    &identity,
-                ) {
-                    Ok(()) => return Ok(()),
-                    Err(error) => BindingResolutionError::Type(error),
-                }
-            }
-        }
-        BindingCandidateSource::Structural(handle) => {
-            BindingResolutionError::Existing(handle.bare_error().to_string())
-        }
-    };
-
-    if let Ok((_canonical, qualified)) =
-        resolver.resolve_member(&RawEnumIdentifier::parse(name.to_string()))
-    {
-        return Err(BindingResolutionError::Type(
+    match resolver.resolve_member(&RawEnumIdentifier::parse(use_site.name.clone())) {
+        Ok((_canonical, qualified)) => BindingResolutionError::Type(
             TypeError::BindingShadowsEnumMember(Box::new(BindingShadowsEnumMemberError {
-                name: name.to_string(),
-                binding_kind: kind,
+                name: use_site.name.clone(),
+                binding_kind: match &use_site.binding {
+                    crate::parser::BareBindingKind::Value { declaration } => *declaration,
+                    crate::parser::BareBindingKind::Structural { .. } => BindingKind::Let,
+                },
                 r#enum: identity,
                 qualified,
             })),
-        ));
+        ),
+        Err(_) => existing_error,
     }
-
-    Err(existing_error)
 }
 
 fn enum_target_from_sink<'a>(sink: RefSink<'a>) -> Option<ExpectedEnumTarget<'a>> {
@@ -436,11 +465,10 @@ fn declared_value_assignable_to_sink(
     name: &str,
     declared_type: &TypeExpr,
     sink: RefSink<'_>,
-    config: Option<&ProviderContext>,
+    config: &ProviderContext,
 ) -> Result<(), BindingResolutionError> {
-    let resolved = config
-        .and_then(|config| resolve_type_expr(declared_type, config).ok())
-        .unwrap_or_else(|| declared_type.clone());
+    let resolved =
+        resolve_type_expr(declared_type, config).map_err(BindingResolutionError::Existing)?;
     if matches!(resolved, TypeExpr::Unknown) {
         return Ok(());
     }
@@ -543,27 +571,14 @@ fn deferred_value_mismatch(
             | ConcreteValue::StringList(_)
             | ConcreteValue::Map(_),
         ) => None,
-        Value::Deferred(DeferredValue::BindingCandidate { .. }) => {
-            unreachable!("a binding candidate cannot contain itself as its direct value")
-        }
     }
 }
 
-fn precheck_binding_candidate_source(
-    source: &mut BindingCandidateSource<'_>,
+fn precheck_value_source(
+    value: &Value,
     sink: RefSink<'_>,
-    inference_bindings: &inference::InferenceBindings,
-    schemas: &SchemaRegistry,
-    bindings: &BindingIndex<'_>,
-) {
-    let BindingCandidateSource::Value {
-        value,
-        declared_type: None,
-        prechecked_error,
-    } = source
-    else {
-        return;
-    };
+    context: &ValidationTypeContext<'_>,
+) -> Option<BindingResolutionError> {
     let string_sink = AttributeType::string();
     let lifted_sink;
     let target = match sink {
@@ -572,165 +587,148 @@ fn precheck_binding_candidate_source(
         } => attr_type.in_schema(defs),
         RefSink::String => crate::schema::TypeInSchema::schemaless(&string_sink),
         RefSink::TypeExpr(type_expr) => {
-            let Some(lifted) = lift_type_expr(type_expr) else {
-                return;
-            };
+            let lifted = lift_type_expr(type_expr)?;
             lifted_sink = lifted;
             crate::schema::TypeInSchema::schemaless(&lifted_sink)
         }
     };
-    *prechecked_error =
-        deferred_value_mismatch(value, target, inference_bindings, schemas, bindings);
+    deferred_value_mismatch(
+        value,
+        target,
+        &context.inference_bindings,
+        context.schemas,
+        &context.scope_bindings,
+    )
 }
 
-fn resolve_binding_candidate_against_sink(
-    name: &str,
-    kind: BindingKind,
-    source: BindingCandidateSource<'_>,
+fn resolve_value_source_against_sink(
+    use_site: &crate::parser::BareBindingUse,
+    value: &Value,
+    declared_type: Option<&TypeExpr>,
     sink: RefSink<'_>,
-    config: Option<&ProviderContext>,
-) -> Option<Result<(), BindingResolutionError>> {
-    if let Some(target) = enum_target_from_sink(sink) {
-        return Some(resolve_binding_candidate_against_enum(
-            name, kind, source, target, config,
-        ));
-    }
-    match source {
-        BindingCandidateSource::Structural(handle) => Some(Err(BindingResolutionError::Existing(
-            handle.bare_error().to_string(),
-        ))),
-        BindingCandidateSource::Value {
-            value,
-            declared_type,
-            prechecked_error,
-        } => {
-            if let Some(error) = prechecked_error {
-                return Some(Err(error));
-            }
-            if let Some(declared_type) = declared_type {
-                return Some(declared_value_assignable_to_sink(
-                    name,
-                    declared_type,
-                    sink,
-                    config,
-                ));
-            }
-            match sink {
-                RefSink::EffectiveType {
-                    attr_type,
-                    defs,
-                    ancestry,
-                } => Some(
-                    crate::schema::validate_attr_with_defs_and_ancestry(
-                        attr_type, value, defs, ancestry,
-                    )
-                    .map_err(BindingResolutionError::Type),
-                ),
-                RefSink::String => Some(
-                    crate::schema::validate_attr_with_defs_and_ancestry(
-                        &AttributeType::string(),
-                        value,
-                        crate::schema::empty_defs_for_schema_walks(),
-                        FieldAncestry::WRITABLE,
-                    )
-                    .map_err(BindingResolutionError::Type),
-                ),
-                RefSink::TypeExpr(_) => None,
-            }
-        }
-    }
-}
+    context: &ValidationTypeContext<'_>,
+) -> Result<(), BindingResolutionError> {
+    let prechecked = declared_type
+        .is_none()
+        .then(|| precheck_value_source(value, sink, context))
+        .flatten();
 
-fn parsed_binding_candidate<'a, E>(
-    parsed: &'a crate::parser::File<E>,
-    name: &str,
-    value: Option<&'a Value>,
-) -> Option<(BindingKind, BindingCandidateSource<'a>)> {
-    let names = BindingNameSet::from_parsed(parsed);
-    let kind = binding_kind(names.kind(name));
-    if let Some(value) = value {
-        let declared_type = (kind == BindingKind::Argument)
-            .then(|| {
-                parsed
-                    .arguments
-                    .iter()
-                    .find(|argument| argument.name == name)
-                    .map(|argument| &argument.type_expr)
-            })
-            .flatten();
-        return Some((
-            kind,
-            BindingCandidateSource::Value {
+    if let Some(target) = enum_target_from_sink(sink) {
+        let resolver = EnumValueResolver::with_defs(target.attr_type, target.defs);
+        let identity = resolver
+            .enum_identity()
+            .expect("enum_target_from_sink proved the enum identity");
+        let existing = match prechecked {
+            Some(error) => Err(error),
+            None => binding_value_assignable_to_enum(
                 value,
                 declared_type,
-                prechecked_error: None,
-            },
-        ));
+                context.provider_context,
+                &target,
+                &resolver,
+                &identity,
+            ),
+        };
+        return existing.map_err(|error| enum_shadow_or_existing(use_site, target, error));
     }
-    parsed
-        .parser_binding_metadata
-        .structural_handles()
-        .get(name)
-        .map(|handle| (kind, BindingCandidateSource::Structural(handle)))
+
+    if let Some(error) = prechecked {
+        return Err(error);
+    }
+    if let Some(declared_type) = declared_type {
+        return declared_value_assignable_to_sink(
+            &use_site.name,
+            declared_type,
+            sink,
+            context.provider_context,
+        );
+    }
+
+    match sink {
+        RefSink::EffectiveType {
+            attr_type,
+            defs,
+            ancestry,
+        } => crate::schema::validate_attr_with_defs_and_ancestry(attr_type, value, defs, ancestry)
+            .map_err(BindingResolutionError::Type),
+        RefSink::String => crate::schema::validate_attr_with_defs_and_ancestry(
+            &AttributeType::string(),
+            value,
+            crate::schema::empty_defs_for_schema_walks(),
+            FieldAncestry::WRITABLE,
+        )
+        .map_err(BindingResolutionError::Type),
+        RefSink::TypeExpr(type_expr) => typecheck::check_type_expr_value(
+            type_expr,
+            value,
+            context.provider_context,
+            typecheck::TypecheckInference::Unavailable,
+        )
+        .map_err(|error| BindingResolutionError::Existing(error.to_string())),
+    }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct BindingResolutionFinding {
-    pub name: String,
-    pub error: BindingResolutionError,
-}
-
-/// Walk one resource value in lockstep with its expected schema and return
-/// every rejected bare binding candidate. This is the structured adapter used
-/// by editor diagnostics; CLI validation calls the same resolver while doing
-/// its broader reference pass.
-pub fn resolve_resource_binding_candidates<E>(
-    parsed: &crate::parser::File<E>,
-    value: &Value,
-    expected: &crate::schema::EffectiveType<'_>,
-    config: &ProviderContext,
-    inference_bindings: &inference::InferenceBindings,
-    schemas: &SchemaRegistry,
-    bindings: &BindingIndex<'_>,
-) -> Vec<BindingResolutionFinding> {
-    let mut findings = Vec::new();
-    visit_refs_with_sink(
-        value,
-        Some(RefSink::from_effective_type(expected.clone())),
-        &mut |reference, sink, _usage, candidate_value| {
-            let Some(sink) = sink else {
-                return;
-            };
-            let Some((kind, mut source)) =
-                parsed_binding_candidate(parsed, reference.binding(), candidate_value)
-            else {
-                return;
-            };
-            precheck_binding_candidate_source(
-                &mut source,
-                sink,
-                inference_bindings,
-                schemas,
-                bindings,
-            );
-            let Some(result) = resolve_binding_candidate_against_sink(
-                reference.binding(),
-                kind,
-                source,
-                sink,
-                Some(config),
-            ) else {
-                return;
-            };
-            if let Err(error) = result {
-                findings.push(BindingResolutionFinding {
-                    name: reference.binding().to_string(),
-                    error,
-                });
-            }
-        },
+fn resource_sink<'a, E>(
+    file: &'a crate::parser::File<E>,
+    address: &crate::parser::ResourceAddress,
+    path: &crate::parser::AttributePath,
+    schemas: &'a SchemaRegistry,
+) -> Option<RefSink<'a>> {
+    let resource = file
+        .iter_all_resources()
+        .find(|resource| resource.id() == address.resource_id())?;
+    let schema = match resource {
+        ResourceRef::LiveComposition(_) => return None,
+        ResourceRef::DataSource(data_source) => schemas.get_for_data_source(data_source),
+        ResourceRef::Resource(resource) | ResourceRef::Deferred { resource, .. } => {
+            schemas.get_for(resource)
+        }
+    }?
+    .schema();
+    let mut segments = path.segments().iter();
+    let crate::parser::AttributePathSegment::Attribute(root) = segments.next()? else {
+        return None;
+    };
+    let mut sink = RefSink::from_effective_type(
+        schema
+            .effective_attribute_by_authored_name(root)?
+            .value_type(),
     );
-    findings
+    for segment in segments {
+        sink = match segment {
+            crate::parser::AttributePathSegment::ListIndex(_) => sink.list_element()?,
+            crate::parser::AttributePathSegment::Key(key)
+            | crate::parser::AttributePathSegment::StructField(key) => sink.map_entry(key)?,
+            crate::parser::AttributePathSegment::Attribute(_) => return None,
+        };
+    }
+    Some(sink)
+}
+
+fn module_argument_type<E>(
+    file: &crate::parser::File<E>,
+    call_id: &crate::parser::ModuleCallId,
+    argument: &str,
+    signatures: &crate::module_resolver::ResolvedModuleSignatures,
+) -> Option<TypeExpr> {
+    if let Some(call) = file.module_calls.iter().find(|call| call.id() == call_id) {
+        return signatures
+            .get(&call.module_name)?
+            .arguments
+            .iter()
+            .find(|parameter| parameter.name == argument)
+            .map(|parameter| parameter.type_expr.clone());
+    }
+    file.compositions
+        .iter()
+        .find(|composition| {
+            composition
+                .call_path()
+                .calls()
+                .any(|call| &call.id == call_id)
+        })
+        .and_then(|composition| composition.signature.arguments.get(argument))
+        .map(|argument| argument.declared_type().clone())
 }
 
 fn module_enum_declaration(
@@ -745,153 +743,229 @@ fn module_enum_declaration(
         .map_err(|error| BindingResolutionError::CustomType(Box::new(error)))
 }
 
-fn resolve_module_value_binding_candidates(
-    value: &Value,
+fn descend_module_type_expr(
     expected: &TypeExpr,
+    segment: &crate::parser::AttributePathSegment,
+) -> Option<TypeExpr> {
+    match (expected, segment) {
+        (TypeExpr::List(element), crate::parser::AttributePathSegment::ListIndex(_))
+        | (TypeExpr::Map(element), crate::parser::AttributePathSegment::Key(_))
+        | (TypeExpr::Map(element), crate::parser::AttributePathSegment::StructField(_)) => {
+            Some((**element).clone())
+        }
+        (
+            TypeExpr::Struct { fields },
+            crate::parser::AttributePathSegment::Key(name)
+            | crate::parser::AttributePathSegment::StructField(name),
+        ) => fields
+            .iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, field_type)| field_type.clone()),
+        (TypeExpr::Union(members), _) => exactly_one(
+            members
+                .iter()
+                .filter_map(|member| descend_module_type_expr(member, segment)),
+        ),
+        (
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Unknown,
+            _,
+        )
+        | (_, crate::parser::AttributePathSegment::Attribute(_)) => None,
+        _ => None,
+    }
+}
+
+fn resolve_module_argument_path_type(
+    expected: &TypeExpr,
+    path: &crate::parser::AttributePath,
     config: &ProviderContext,
-    errors: &mut Vec<BindingResolutionError>,
-) {
-    if let Value::Deferred(DeferredValue::BindingCandidate { binding, value }) = value {
-        match module_enum_declaration(expected, config) {
-            Ok(Some(declaration)) => {
+) -> Result<Option<ResolvedParameterType>, BindingResolutionError> {
+    let Some(resolved) = resolve_parameter_type_for_check(expected, config)
+        .map_err(BindingResolutionError::Existing)?
+    else {
+        return Ok(None);
+    };
+    let mut segments = path.segments().iter();
+    let Some(crate::parser::AttributePathSegment::Attribute(_)) = segments.next() else {
+        return Ok(None);
+    };
+    let mut leaf = resolved.as_type_expr();
+    for segment in segments {
+        let Some(descended) = descend_module_type_expr(&leaf, segment) else {
+            return Ok(None);
+        };
+        leaf = descended;
+    }
+    Ok(Some(match leaf {
+        TypeExpr::Ref(path) => ResolvedParameterType::Handle(path),
+        value => ResolvedParameterType::Value(value),
+    }))
+}
+
+fn resolve_record_against_module(
+    record: &crate::parser::ParsedBareBindingUse,
+    expected: &TypeExpr,
+    context: &ValidationTypeContext<'_>,
+) -> Result<(), BindingResolutionError> {
+    let Some(resolved) = resolve_module_argument_path_type(
+        expected,
+        &record.authored.path,
+        context.provider_context,
+    )?
+    else {
+        return Ok(());
+    };
+    let expected = resolved.as_type_expr();
+    let enum_declaration = module_enum_declaration(&expected, context.provider_context)?;
+
+    match &record.source {
+        crate::parser::BareBindingSource::Value {
+            value,
+            declared_type,
+        } => {
+            if let Some(declaration) = enum_declaration.as_ref() {
                 let target = ExpectedEnumTarget {
-                    attr_type: &declaration,
+                    attr_type: declaration,
                     defs: crate::schema::empty_defs_for_schema_walks(),
                     ancestry: FieldAncestry::WRITABLE,
                 };
-                if let Err(error) = resolve_binding_candidate_against_enum(
-                    binding,
-                    BindingKind::Let,
-                    BindingCandidateSource::Value {
-                        value,
-                        declared_type: None,
-                        prechecked_error: None,
-                    },
-                    target,
-                    Some(config),
-                ) {
-                    errors.push(error);
-                }
+                let resolver = EnumValueResolver::with_defs(target.attr_type, target.defs);
+                let identity = resolver
+                    .enum_identity()
+                    .expect("module enum declaration must have an enum identity");
+                return binding_value_assignable_to_enum(
+                    value,
+                    declared_type.as_ref(),
+                    context.provider_context,
+                    &target,
+                    &resolver,
+                    &identity,
+                )
+                .map_err(|error| enum_shadow_or_existing(&record.authored, target, error));
             }
-            Ok(None) => {}
-            Err(error) => errors.push(error),
-        }
-        return;
-    }
-
-    match (value, expected) {
-        (Value::Concrete(ConcreteValue::List(values)), TypeExpr::List(inner)) => {
-            for value in values {
-                resolve_module_value_binding_candidates(value, inner, config, errors);
-            }
-        }
-        (Value::Concrete(ConcreteValue::Map(values)), TypeExpr::Map(inner)) => {
-            for value in values.values() {
-                resolve_module_value_binding_candidates(value, inner, config, errors);
-            }
-        }
-        (Value::Concrete(ConcreteValue::Map(values)), TypeExpr::Struct { fields }) => {
-            for (name, field_type) in fields {
-                if let Some(value) = values.get(name) {
-                    resolve_module_value_binding_candidates(value, field_type, config, errors);
-                }
-            }
-        }
-        (Value::Deferred(DeferredValue::Secret(inner)), _) => {
-            resolve_module_value_binding_candidates(inner, expected, config, errors);
-        }
-        (Value::Deferred(DeferredValue::Coalesce { value, default }), _) => {
-            resolve_module_value_binding_candidates(value, expected, config, errors);
-            resolve_module_value_binding_candidates(default, expected, config, errors);
-        }
-        (
-            Value::Concrete(
-                ConcreteValue::String(_)
-                | ConcreteValue::EnumIdentifier(_)
-                | ConcreteValue::CanonicalEnum(_)
-                | ConcreteValue::Int(_)
-                | ConcreteValue::Float(_)
-                | ConcreteValue::Bool(_)
-                | ConcreteValue::Duration(_)
-                | ConcreteValue::StringList(_),
+            resolve_value_source_against_sink(
+                &record.authored,
+                value,
+                declared_type.as_ref(),
+                RefSink::TypeExpr(&expected),
+                context,
             )
-            | Value::Deferred(
-                DeferredValue::ResourceRef { .. }
-                | DeferredValue::BindingRef { .. }
-                | DeferredValue::Interpolation(_)
-                | DeferredValue::FunctionCall { .. }
-                | DeferredValue::Unavailable { .. }
-                | DeferredValue::ResolvedFunctionCall { .. }
-                | DeferredValue::Access(_)
-                | DeferredValue::RedactedSecret { .. }
-                | DeferredValue::Unknown(_),
-            ),
-            _,
-        )
-        | (Value::Concrete(ConcreteValue::List(_) | ConcreteValue::Map(_)), _) => {}
-        (Value::Deferred(DeferredValue::BindingCandidate { .. }), _) => {
-            unreachable!("binding candidates return before recursive module-value dispatch")
+        }
+        crate::parser::BareBindingSource::Structural(handle) => {
+            let existing = match check_handle_sink(handle, &resolved) {
+                Ok(()) => return Ok(()),
+                Err(error) => BindingResolutionError::Existing(error.to_string()),
+            };
+            match enum_declaration.as_ref() {
+                Some(declaration) => Err(enum_shadow_or_existing(
+                    &record.authored,
+                    ExpectedEnumTarget {
+                        attr_type: declaration,
+                        defs: crate::schema::empty_defs_for_schema_walks(),
+                        ancestry: FieldAncestry::WRITABLE,
+                    },
+                    existing,
+                )),
+                None => Err(existing),
+            }
         }
     }
 }
 
-/// Apply the shared binding-versus-enum resolver to every typed position in a
-/// module argument. Provider [`TypeExpr::SchemaType`] declarations are looked
-/// up from their structured owner index.
-pub fn resolve_module_argument_binding_candidates(
-    argument: &crate::parser::ModuleArgument,
-    expected: &ResolvedParameterType,
-    config: &ProviderContext,
-) -> Vec<BindingResolutionError> {
-    let expected = expected.as_type_expr();
-    if let Some(handle) = argument.handle() {
-        let declaration = match module_enum_declaration(&expected, config) {
-            Ok(Some(declaration)) => declaration,
-            Ok(None) => return Vec::new(),
-            Err(error) => return vec![error],
-        };
-        let name = handle
-            .alias_name()
-            .unwrap_or_else(|| handle.canonical_binding_name());
-        let kind = match handle.kind() {
-            crate::eval_value::StructuralHandleKind::ModuleParameter
-            | crate::eval_value::StructuralHandleKind::FunctionParameter => BindingKind::Argument,
-            crate::eval_value::StructuralHandleKind::Resource(_)
-            | crate::eval_value::StructuralHandleKind::For
-            | crate::eval_value::StructuralHandleKind::If
-            | crate::eval_value::StructuralHandleKind::Use
-            | crate::eval_value::StructuralHandleKind::Module
-            | crate::eval_value::StructuralHandleKind::Wait
-            | crate::eval_value::StructuralHandleKind::UpstreamState
-            | crate::eval_value::StructuralHandleKind::Provider => BindingKind::Let,
-        };
-        let target = ExpectedEnumTarget {
-            attr_type: &declaration,
-            defs: crate::schema::empty_defs_for_schema_walks(),
-            ancestry: FieldAncestry::WRITABLE,
-        };
-        return resolve_binding_candidate_against_enum(
-            name,
-            kind,
-            BindingCandidateSource::Structural(handle),
-            target,
-            Some(config),
-        )
-        .err()
-        .into_iter()
-        .collect();
-    }
-
-    let mut errors = Vec::new();
-    resolve_module_value_binding_candidates(
-        argument.walker_value(),
-        &expected,
-        config,
-        &mut errors,
-    );
-    errors
+fn same_authored_finding(left: &BindingUseFinding, right: &BindingUseFinding) -> bool {
+    left.use_site.source_file == right.use_site.source_file
+        && left.use_site.span == right.use_site.span
+        && left.use_site.name == right.use_site.name
+        && left.error == right.error
 }
 
+/// Single schema-aware authority for every parser-recorded bare binding use.
+pub fn resolve_bare_binding_uses<E>(
+    file: &crate::parser::File<E>,
+    context: &ValidationTypeContext<'_>,
+) -> BindingUseReport {
+    let mut report = BindingUseReport {
+        findings: Vec::new(),
+        consumed_uses: 0,
+        total_uses: file.parsed_binding_uses.records().len(),
+        pending_slots: file.parsed_binding_uses.pending_slots().to_vec(),
+    };
+
+    for record in file.parsed_binding_uses.records() {
+        report.consumed_uses += 1;
+        let result = match &record.authored.owner {
+            crate::parser::BindingUseOwner::Resource(address) => {
+                match resource_sink(file, address, &record.authored.path, context.schemas) {
+                    Some(sink) => match &record.source {
+                        crate::parser::BareBindingSource::Value {
+                            value,
+                            declared_type,
+                        } => resolve_value_source_against_sink(
+                            &record.authored,
+                            value,
+                            declared_type.as_ref(),
+                            sink,
+                            context,
+                        ),
+                        crate::parser::BareBindingSource::Structural(handle) => {
+                            let existing =
+                                BindingResolutionError::Existing(handle.bare_error().to_string());
+                            match enum_target_from_sink(sink) {
+                                Some(target) => {
+                                    Err(enum_shadow_or_existing(&record.authored, target, existing))
+                                }
+                                None => Err(existing),
+                            }
+                        }
+                    },
+                    None => match &record.source {
+                        crate::parser::BareBindingSource::Value { .. } => Ok(()),
+                        crate::parser::BareBindingSource::Structural(handle) => Err(
+                            BindingResolutionError::Existing(handle.bare_error().to_string()),
+                        ),
+                    },
+                }
+            }
+            crate::parser::BindingUseOwner::ModuleArgument { call, argument } => {
+                match module_argument_type(file, call, argument, context.module_signatures) {
+                    Some(expected) => resolve_record_against_module(record, &expected, context),
+                    None => match &record.source {
+                        crate::parser::BareBindingSource::Value { .. } => Ok(()),
+                        crate::parser::BareBindingSource::Structural(handle) => Err(
+                            BindingResolutionError::Existing(handle.bare_error().to_string()),
+                        ),
+                    },
+                }
+            }
+        };
+
+        if let Err(error) = result {
+            let finding = BindingUseFinding {
+                use_site: record.authored.clone(),
+                error,
+            };
+            if !report
+                .findings
+                .iter()
+                .any(|existing| same_authored_finding(existing, &finding))
+            {
+                report.findings.push(finding);
+            }
+        }
+    }
+
+    report
+}
 fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
     let value = values.next()?;
     values.next().is_none().then_some(value)
@@ -965,9 +1039,6 @@ fn visit_refs_with_sink_inner<'a>(
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             f(ReferencePathRef::Binding(binding), sink, usage, None)
-        }
-        Value::Deferred(DeferredValue::BindingCandidate { binding, value }) => {
-            f(ReferencePathRef::Binding(binding), sink, usage, Some(value))
         }
         Value::Deferred(DeferredValue::Unknown(
             crate::resource::UnknownReason::ModuleArgument { name, .. },
@@ -1109,7 +1180,6 @@ fn visit_computed_accesses_with_sink<'a>(
         }
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
-        | Value::Deferred(DeferredValue::BindingCandidate { .. })
         | Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
         | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -1888,14 +1958,6 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
                 unknown_policy,
                 errors,
             ),
-            Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => check_function_calls(
-                value,
-                result_sink,
-                context,
-                bindings,
-                unknown_policy,
-                errors,
-            ),
             Value::Deferred(DeferredValue::Access(access)) => check_function_calls(
                 access.base(),
                 None,
@@ -2459,85 +2521,7 @@ fn validate_resource_ref_types_inner<E>(
             visit_refs_with_sink(
                 attr_value,
                 sink,
-                &mut |reference, sink, usage, candidate_value| {
-                    if let Some(candidate_value) = candidate_value {
-                        let Some(sink) = sink else {
-                            return;
-                        };
-                        if let Some((kind, mut source)) = parsed_binding_candidate(
-                            parsed,
-                            reference.binding(),
-                            Some(candidate_value),
-                        ) {
-                            precheck_binding_candidate_source(
-                                &mut source,
-                                sink,
-                                &inference_bindings,
-                                registry,
-                                bindings,
-                            );
-                            if let Some(result) = resolve_binding_candidate_against_sink(
-                                reference.binding(),
-                                kind,
-                                source,
-                                sink,
-                                None,
-                            ) {
-                                if let Err(error) = result {
-                                    all_errors.push(format!("{}: {}", resource_location, error));
-                                }
-                                return;
-                            }
-                        }
-                        let result = match sink {
-                            RefSink::EffectiveType {
-                                attr_type,
-                                defs,
-                                ancestry,
-                            } => crate::schema::validate_attr_with_defs_and_ancestry(
-                                attr_type,
-                                candidate_value,
-                                defs,
-                                ancestry,
-                            ),
-                            RefSink::String => crate::schema::validate_attr_with_defs_and_ancestry(
-                                &AttributeType::string(),
-                                candidate_value,
-                                crate::schema::empty_defs_for_schema_walks(),
-                                FieldAncestry::WRITABLE,
-                            ),
-                            RefSink::TypeExpr(type_expr) => typecheck::check_type_expr_value(
-                                type_expr,
-                                candidate_value,
-                                &ProviderContext::default(),
-                                typecheck::TypecheckInference::Unavailable,
-                            )
-                            .map_err(|error| TypeError::ValidationFailed {
-                                message: error.to_string(),
-                            }),
-                        };
-                        if let Err(error) = result {
-                            all_errors.push(format!("{}: {}", resource_location, error));
-                        }
-                        return;
-                    }
-
-                    if let (Some(sink), Some((kind, source))) = (
-                        sink,
-                        parsed_binding_candidate(parsed, reference.binding(), None),
-                    ) && let Some(result) = resolve_binding_candidate_against_sink(
-                        reference.binding(),
-                        kind,
-                        source,
-                        sink,
-                        None,
-                    ) {
-                        if let Err(error) = result {
-                            all_errors.push(format!("{}: {}", resource_location, error));
-                        }
-                        return;
-                    }
-
+                &mut |reference, sink, usage, _candidate_value| {
                     let Some(source) = resolve_resource_reference(
                         resource_id,
                         reference,
@@ -3651,7 +3635,6 @@ pub fn value_contains_unresolved_ref(value: &Value) -> bool {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
-        | Value::Deferred(DeferredValue::BindingCandidate { .. })
         | Value::Deferred(DeferredValue::Coalesce { .. })
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
@@ -3743,19 +3726,6 @@ pub fn validate_module_calls(
                                 continue;
                             }
                         };
-                    let binding_errors = resolve_module_argument_binding_candidates(
-                        arg_value,
-                        &resolved_parameter,
-                        config,
-                    );
-                    if !binding_errors.is_empty() {
-                        errors.extend(
-                            binding_errors
-                                .into_iter()
-                                .map(|error| format!("{context}: {error}")),
-                        );
-                        continue;
-                    }
                     if let Some(handle) = arg_value.handle() {
                         if let Err(error) = check_handle_sink(handle, &resolved_parameter) {
                             errors.push(format!("{context}: {error}"));
@@ -3966,10 +3936,10 @@ pub fn validate_attribute_params(
 /// Check for unused `let` bindings and return the unused binding names.
 ///
 /// A binding is unused if its name never appears as a value-carried reference
-/// (attribute refs, bare refs, interpolation expressions, function arguments,
-/// or secret inner values) in resource attributes, module call arguments,
-/// attribute parameters, export parameters, or an `import.id`; as a
-/// `directives.depends_on` or wait target/dependency; or as the configured
+/// (attribute refs, interpolation expressions, function arguments, or secret
+/// inner values) or parser-recorded bare use in resource attributes, module
+/// call arguments, attribute parameters, export parameters, or an `import.id`;
+/// as a `directives.depends_on` or wait target/dependency; or as the configured
 /// resource matched by an `import.to` or `moved.to` address.
 /// `moved.from` and `removed.from` identify state rows absent from the desired
 /// configuration and therefore do not count as references.
@@ -4044,6 +4014,16 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
             collect_dependencies(value.walker_value(), &mut referenced);
         }
     }
+    // Bare lexical values resolve to their ordinary runtime Value, while a
+    // pending structural leaf is deliberately omitted from that Value tree.
+    // Their authored names live only in parser side data, so preserve the
+    // existing unused-binding semantics by consuming that provenance here.
+    referenced.extend(
+        parsed
+            .bare_binding_uses()
+            .uses()
+            .map(|use_site| use_site.name.clone()),
+    );
     for attr_param in &parsed.attribute_params {
         if let Some(value) = &attr_param.value {
             collect_dependencies(value, &mut referenced);

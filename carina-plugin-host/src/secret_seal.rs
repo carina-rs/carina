@@ -321,9 +321,6 @@ impl Unsealer {
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 self.restore_value(value) && self.restore_value(default)
             }
-            Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-                self.restore_value(value)
-            }
             Value::Deferred(DeferredValue::RedactedSecret { .. }) => false,
             Value::Concrete(
                 ConcreteValue::String(_)
@@ -464,7 +461,6 @@ fn preserve_equal_json_subtrees(
             | Value::Deferred(
                 DeferredValue::ResourceRef { .. }
                 | DeferredValue::BindingRef { .. }
-                | DeferredValue::BindingCandidate { .. }
                 | DeferredValue::Coalesce { .. }
                 | DeferredValue::Interpolation(_)
                 | DeferredValue::FunctionCall { .. }

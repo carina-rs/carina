@@ -61,7 +61,6 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Concrete(ConcreteValue::Map(_)) => "map",
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource reference",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference",
-        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => value_type_name(value),
         Value::Deferred(DeferredValue::Coalesce { .. }) => "coalesce expression",
         Value::Deferred(DeferredValue::Interpolation(_)) => "string",
         Value::Deferred(
@@ -82,6 +81,7 @@ pub(crate) fn eval_type_name(value: &EvalValue) -> &'static str {
     match value {
         EvalValue::User(v) => value_type_name(v),
         EvalValue::StructuralHandle(_) => "resource handle",
+        EvalValue::PendingValue(_) => "pending value",
         EvalValue::ProvisionalReference { .. } => "unresolved reference",
         EvalValue::ComputedWithStructuralHandles { value, .. } => value_type_name(value),
         EvalValue::DeferredForValue { .. } => "unknown",

@@ -5,12 +5,14 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
-use crate::eval_value::{EvalValue, StructuralHandleKind};
+use crate::eval_value::{EvalValue, ParsedSinkValue, StructuralHandleKind};
 use crate::parser::Rule;
-use crate::parser::context::{ParseContext, extract_key_string, first_inner, next_pair};
+use crate::parser::context::{
+    ExpressionMode, ParseContext, extract_key_string, first_inner, next_pair,
+};
 use crate::parser::error::ParseError;
 use crate::parser::util::expression_is_plain_string_literal;
-use crate::parser::{parse_expression, parse_expression_eval};
+use crate::parser::{parse_expression, parse_expression_eval, parse_expression_in_sink};
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId, ResourceIdentity,
     Value,
@@ -21,6 +23,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 pub(in crate::parser) fn parse_anonymous_resource(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
+    preprocessed_file: &crate::parser::PreprocessedFile,
+    source_file: &std::path::Path,
 ) -> Result<Resource, ParseError> {
     let inner = pair.into_inner();
 
@@ -38,11 +42,13 @@ pub(in crate::parser) fn parse_anonymous_resource(
     let provider = parts[0];
     let resource_type = parts[1..].join(".");
 
+    let provisional_id = ResourceId::pending_with_provider(provider, resource_type.clone(), None);
+    let mode = ExpressionMode::resource(provisional_id.clone(), source_file, preprocessed_file);
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
-    let typed_ctx = ctx.for_typed_value_sink();
     let parsed_contents = parse_block_contents_with_quoted(
         iter,
-        &typed_ctx,
+        ctx,
+        &mode,
         &mut quoted_out,
         ReservedAttributeNamePolicy::Reject,
     )?;
@@ -55,6 +61,7 @@ pub(in crate::parser) fn parse_anonymous_resource(
         resource_type,
         directives.provider_instance.clone(),
     );
+    ctx.remap_binding_use_resource(&provisional_id, &id);
 
     Ok(Resource {
         id,
@@ -69,21 +76,25 @@ pub(in crate::parser) fn parse_anonymous_resource(
     })
 }
 
-/// Parse block contents (attributes, nested blocks, and local let bindings)
-/// Nested blocks with the same name are collected into a list.
-/// Local let bindings are resolved within the block scope and NOT included in
-/// the returned attributes.
-pub(crate) fn parse_block_contents(
+pub(crate) fn parse_block_contents_with_mode(
     pairs: pest::iterators::Pairs<Rule>,
     ctx: &ParseContext,
-) -> Result<IndexMap<String, Value>, ParseError> {
-    parse_block_contents_with_quoted(pairs, ctx, &mut None, ReservedAttributeNamePolicy::Allow)
-        .map(|contents| contents.attributes)
+    mode: &ExpressionMode<'_>,
+) -> Result<Option<IndexMap<String, Value>>, ParseError> {
+    let contents = parse_block_contents_with_quoted(
+        pairs,
+        ctx,
+        mode,
+        &mut None,
+        ReservedAttributeNamePolicy::Allow,
+    )?;
+    Ok((!contents.pending).then_some(contents.attributes))
 }
 
 struct ParsedBlockContents {
     attributes: IndexMap<String, Value>,
     directives: Option<Directives>,
+    pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +103,7 @@ pub(in crate::parser) enum ReservedAttributeNamePolicy {
     Reject,
 }
 
-/// As [`parse_block_contents`], but if `quoted_out` is `Some`, populate it
+/// If `quoted_out` is `Some`, populate it
 /// with the names of top-level attributes whose value is a plain quoted
 /// string literal (`attr = "..."`). Used by resource-level callers to
 /// build `Resource.quoted_string_attrs` for enum-attribute diagnostics
@@ -100,6 +111,7 @@ pub(in crate::parser) enum ReservedAttributeNamePolicy {
 fn parse_block_contents_with_quoted(
     pairs: pest::iterators::Pairs<Rule>,
     ctx: &ParseContext,
+    mode: &ExpressionMode<'_>,
     quoted_out: &mut Option<HashSet<String>>,
     reserved_attribute_names: ReservedAttributeNamePolicy,
 ) -> Result<ParsedBlockContents, ParseError> {
@@ -112,7 +124,9 @@ fn parse_block_contents_with_quoted(
     let mut directives = None;
 
     // Local scope extends the parent context with block-scoped let bindings
-    let mut local_ctx = ctx.clone();
+    let mut local_ctx = ctx.child_scope();
+    let mut pending = false;
+    let mut pending_names = HashSet::new();
 
     for content_pair in pairs {
         match content_pair.as_rule() {
@@ -125,10 +139,9 @@ fn parse_block_contents_with_quoted(
                             next_pair(&mut binding_inner, "binding name", "local let binding")?
                                 .as_str()
                                 .to_string();
-                        let untyped_ctx = local_ctx.without_typed_value_sink();
                         let value = parse_expression(
                             next_pair(&mut binding_inner, "binding value", "local let binding")?,
-                            &untyped_ctx,
+                            &local_ctx,
                         )?;
                         // Add to local scope only, not to attributes
                         local_ctx.set_variable(name, value);
@@ -147,8 +160,16 @@ fn parse_block_contents_with_quoted(
                         let value_pair =
                             next_pair(&mut attr_inner, "attribute value", "block content")?;
                         record_quoted_if_literal(quoted_out, &key, &value_pair);
-                        let value = parse_expression(value_pair, &local_ctx)?;
-                        attributes.insert(key, value);
+                        let value_mode = mode.at_named_child(key.clone());
+                        match parse_expression_in_sink(value_pair, &local_ctx, &value_mode)? {
+                            ParsedSinkValue::Ready(value) => {
+                                attributes.insert(key, value);
+                            }
+                            ParsedSinkValue::Pending(_) => {
+                                pending = true;
+                                pending_names.insert(key);
+                            }
+                        }
                     }
                     Rule::nested_block => {
                         let mut block_inner = inner.into_inner();
@@ -158,12 +179,27 @@ fn parse_block_contents_with_quoted(
                         if block_name == "directives" {
                             check_directives_depends_on_elements(block_inner.clone())?;
                             check_directives_provider_value(block_inner.clone())?;
-                            let untyped_ctx = local_ctx.without_typed_value_sink();
-                            directives = Some(parse_directives(block_inner, &untyped_ctx)?);
+                            directives = Some(parse_directives(block_inner, &local_ctx)?);
                             continue;
                         }
                         // Recursively parse nested block contents (supports arbitrary depth)
-                        let block_attrs = parse_block_contents(block_inner, &local_ctx)?;
+                        let block_index = nested_blocks.get(&block_name).map_or(0, Vec::len);
+                        let block_mode = mode
+                            .at_named_child(block_name.clone())
+                            .at_list_index(block_index);
+                        let block_contents = parse_block_contents_with_quoted(
+                            block_inner,
+                            &local_ctx,
+                            &block_mode,
+                            &mut None,
+                            ReservedAttributeNamePolicy::Allow,
+                        )?;
+                        if block_contents.pending {
+                            pending = true;
+                            pending_names.insert(block_name);
+                            continue;
+                        }
+                        let block_attrs = block_contents.attributes;
 
                         nested_blocks
                             .entry(block_name)
@@ -181,8 +217,16 @@ fn parse_block_contents_with_quoted(
                 reject_reserved_resource_attribute(&key, key_span, reserved_attribute_names)?;
                 let value_pair = next_pair(&mut attr_inner, "attribute value", "block content")?;
                 record_quoted_if_literal(quoted_out, &key, &value_pair);
-                let value = parse_expression(value_pair, &local_ctx)?;
-                attributes.insert(key, value);
+                let value_mode = mode.at_named_child(key.clone());
+                match parse_expression_in_sink(value_pair, &local_ctx, &value_mode)? {
+                    ParsedSinkValue::Ready(value) => {
+                        attributes.insert(key, value);
+                    }
+                    ParsedSinkValue::Pending(_) => {
+                        pending = true;
+                        pending_names.insert(key);
+                    }
+                }
             }
             _ => {}
         }
@@ -190,12 +234,16 @@ fn parse_block_contents_with_quoted(
 
     // Convert nested blocks to list attributes
     for (name, blocks) in nested_blocks {
-        attributes.insert(name, Value::Concrete(ConcreteValue::List(blocks)));
+        if !pending_names.contains(&name) {
+            attributes.insert(name, Value::Concrete(ConcreteValue::List(blocks)));
+        }
     }
+    attributes.retain(|name, _| !pending_names.contains(name));
 
     Ok(ParsedBlockContents {
         attributes,
         directives,
+        pending,
     })
 }
 
@@ -237,6 +285,8 @@ pub(crate) fn parse_resource_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     binding_name: &str,
+    preprocessed_file: &crate::parser::PreprocessedFile,
+    source_file: &std::path::Path,
 ) -> Result<Resource, ParseError> {
     let mut inner = pair.into_inner();
 
@@ -254,11 +304,18 @@ pub(crate) fn parse_resource_expr(
     let provider = parts[0];
     let resource_type = parts[1..].join(".");
 
+    let provisional_id = ResourceId::with_provider_identity(
+        provider,
+        resource_type.clone(),
+        ResourceIdentity::new(binding_name.to_string()),
+        None,
+    );
+    let mode = ExpressionMode::resource(provisional_id.clone(), source_file, preprocessed_file);
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
-    let typed_ctx = ctx.for_typed_value_sink();
     let parsed_contents = parse_block_contents_with_quoted(
         inner,
-        &typed_ctx,
+        ctx,
+        &mode,
         &mut quoted_out,
         ReservedAttributeNamePolicy::Reject,
     )?;
@@ -275,6 +332,7 @@ pub(crate) fn parse_resource_expr(
         ResourceIdentity::new(resource_name),
         directives.provider_instance.clone(),
     );
+    ctx.remap_binding_use_resource(&provisional_id, &id);
 
     Ok(Resource {
         id,
@@ -294,6 +352,8 @@ pub(crate) fn parse_read_resource_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     binding_name: &str,
+    preprocessed_file: &crate::parser::PreprocessedFile,
+    source_file: &std::path::Path,
 ) -> Result<DataSource, ParseError> {
     let mut inner = pair.into_inner();
 
@@ -311,11 +371,18 @@ pub(crate) fn parse_read_resource_expr(
     let provider = parts[0];
     let resource_type = parts[1..].join(".");
 
+    let provisional_id = ResourceId::with_provider_identity(
+        provider,
+        resource_type.clone(),
+        ResourceIdentity::new(binding_name.to_string()),
+        None,
+    );
+    let mode = ExpressionMode::resource(provisional_id.clone(), source_file, preprocessed_file);
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
-    let typed_ctx = ctx.for_typed_value_sink();
     let parsed_contents = parse_block_contents_with_quoted(
         inner,
-        &typed_ctx,
+        ctx,
+        &mode,
         &mut quoted_out,
         ReservedAttributeNamePolicy::Reject,
     )?;
@@ -332,6 +399,7 @@ pub(crate) fn parse_read_resource_expr(
         ResourceIdentity::new(resource_name),
         directives.provider_instance.clone(),
     );
+    ctx.remap_binding_use_resource(&provisional_id, &id);
 
     Ok(DataSource {
         id,

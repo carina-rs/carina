@@ -13,13 +13,36 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use crate::document::Document;
 use crate::position;
 use carina_core::parser::{
-    ParseError, ParsedFile, ResourceRef, WarningKind, contains_function_call,
+    ParseError, ParsedFile, ResourceRef, SourceSpan, WarningKind, contains_function_call,
 };
 use carina_core::provider::{
     HostErrorCause, ProviderError, ProviderFactory, SuspendedValidationId,
 };
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
+
+fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
+    let text = doc.text();
+    let position = |byte: usize| {
+        if byte > text.len() || !text.is_char_boundary(byte) {
+            return None;
+        }
+        let prefix = &text[..byte];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
+        Some(Position {
+            line,
+            character: position::byte_offset_to_char_offset(
+                &text[line_start..byte],
+                byte - line_start,
+            ),
+        })
+    };
+    Some(Range {
+        start: position(span.start_byte())?,
+        end: position(span.end_byte())?,
+    })
+}
 
 #[derive(Default)]
 pub(super) struct ProviderValidationDeduplicator {
@@ -580,6 +603,84 @@ impl DiagnosticEngine {
             );
             let inference_bindings =
                 carina_core::validation::inference::bindings_from_parsed(binding_input);
+            let binding_type_context = carina_core::validation::ValidationTypeContext::new(
+                binding_input,
+                &self.schemas,
+                &self.provider_context,
+                &module_signatures,
+            );
+            let binding_use_report = carina_core::validation::resolve_bare_binding_uses(
+                binding_input,
+                &binding_type_context,
+            );
+            // A direct bare binding occupies the complete attribute value, so
+            // the shared authority owns that sink even when it succeeds. In
+            // particular, an enum-typed argument must not be reinterpreted by
+            // the LSP's legacy BindingIndex pass using a differently enriched
+            // bootstrap identity. Nested uses keep the surrounding schema
+            // walk so unrelated sibling leaves are still validated.
+            let binding_error_sinks = parsed
+                .bare_binding_uses()
+                .uses()
+                .filter(|use_site| {
+                    use_site.path.segments().len() == 1
+                        || binding_use_report.findings().iter().any(|finding| {
+                            finding.use_site.source_file == use_site.source_file
+                                && finding.use_site.span == use_site.span
+                                && finding.use_site.name == use_site.name
+                        })
+                })
+                .filter_map(|use_site| match &use_site.owner {
+                    carina_core::parser::BindingUseOwner::Resource(address) => Some((
+                        address.resource_id().clone(),
+                        use_site.path.root_name().to_string(),
+                    )),
+                    carina_core::parser::BindingUseOwner::ModuleArgument { .. } => None,
+                })
+                .collect::<HashSet<_>>();
+            let pending_resource_sinks = parsed
+                .bare_binding_uses()
+                .pending_slots()
+                .iter()
+                .filter_map(|slot| match &slot.owner {
+                    carina_core::parser::BindingUseOwner::Resource(address) => Some((
+                        address.resource_id().clone(),
+                        slot.path.root_name().to_string(),
+                    )),
+                    carina_core::parser::BindingUseOwner::ModuleArgument { .. } => None,
+                })
+                .collect::<HashSet<_>>();
+            let diagnostic_file = current_file_path.unwrap_or_else(|| doc.source_file());
+            for finding in binding_use_report.findings() {
+                if finding.use_site.source_file.path() != diagnostic_file {
+                    continue;
+                }
+                let Some(range) = parser_span_range(doc, finding.use_site.span) else {
+                    continue;
+                };
+                if let Some(type_error) = finding.error.type_error()
+                    && let Some(diagnostic) =
+                        build_enum_diagnostic_from_error(type_error, Some(range))
+                {
+                    diagnostics.push(diagnostic);
+                } else {
+                    let severity = match &finding.use_site.binding {
+                        carina_core::parser::BareBindingKind::Structural { .. } => {
+                            DiagnosticSeverity::ERROR
+                        }
+                        carina_core::parser::BareBindingKind::Value { .. } => {
+                            DiagnosticSeverity::WARNING
+                        }
+                    };
+                    diagnostics.push(Diagnostic {
+                        range,
+                        severity: Some(severity),
+                        source: Some("carina".to_string()),
+                        message: finding.error.to_string(),
+                        ..Default::default()
+                    });
+                }
+            }
             let semantic_file = current_file_path.and_then(|path| {
                 merged_result
                     .as_ref()
@@ -595,6 +696,7 @@ impl DiagnosticEngine {
                     &semantic_view,
                     &module_signatures,
                     &inference_bindings,
+                    &binding_use_report,
                 ));
                 let constraint_diagnostics = current_file_path
                     .zip(merged_result.as_ref())
@@ -943,35 +1045,9 @@ impl DiagnosticEngine {
                                 continue;
                             }
 
-                            let binding_findings =
-                                carina_core::validation::resolve_resource_binding_candidates(
-                                    binding_input,
-                                    typecheck_value,
-                                    &effective_type,
-                                    &self.provider_context,
-                                    &inference_bindings,
-                                    &self.schemas,
-                                    &binding_index,
-                                );
-                            if !binding_findings.is_empty() {
-                                for finding in binding_findings {
-                                    let range =
-                                        self.find_bare_binding_range(doc, &finding.name, scope);
-                                    if let Some(error) = finding.error.type_error()
-                                        && let Some(diagnostic) =
-                                            build_enum_diagnostic_from_error(error, range)
-                                    {
-                                        diagnostics.push(diagnostic);
-                                    } else if let Some(range) = range {
-                                        diagnostics.push(Diagnostic {
-                                            range,
-                                            severity: Some(DiagnosticSeverity::WARNING),
-                                            source: Some("carina".to_string()),
-                                            message: finding.error.to_string(),
-                                            ..Default::default()
-                                        });
-                                    }
-                                }
+                            if binding_error_sinks
+                                .contains(&(resource_id.clone(), attr_name.clone()))
+                            {
                                 continue;
                             }
 
@@ -1286,6 +1362,20 @@ impl DiagnosticEngine {
                         self.provider_context.custom_type_resolver(),
                     ) {
                         for error in errors {
+                            if let carina_core::schema::TypeError::MissingRequired { name } = &error
+                                && pending_resource_sinks.iter().any(
+                                    |(pending_resource, authored_name)| {
+                                        pending_resource == resource_id
+                                            && bn_map
+                                                .get(authored_name)
+                                                .map(String::as_str)
+                                                .unwrap_or(authored_name)
+                                                == name
+                                    },
+                                )
+                            {
+                                continue;
+                            }
                             if !provider_validation_deduplicator.should_emit_type_error(&error) {
                                 continue;
                             }
@@ -1783,57 +1873,6 @@ impl DiagnosticEngine {
             });
         }
         None
-    }
-
-    fn find_bare_binding_range(
-        &self,
-        doc: &Document,
-        binding: &str,
-        scope: Option<(u32, u32)>,
-    ) -> Option<tower_lsp::lsp_types::Range> {
-        use tower_lsp::lsp_types::{Position, Range};
-
-        let (start, end) = scope.unwrap_or((0, u32::MAX));
-        let mut fallback = None;
-        for (line_index, line) in doc.text().lines().enumerate() {
-            let line_index = line_index as u32;
-            if line_index < start {
-                continue;
-            }
-            if line_index >= end {
-                break;
-            }
-            for (byte, _) in line.match_indices(binding) {
-                let before = line[..byte].chars().next_back();
-                let after = line[byte + binding.len()..].chars().next();
-                let identifier = |character: char| character == '_' || character.is_alphanumeric();
-                if before.is_some_and(identifier) || after.is_some_and(identifier) {
-                    continue;
-                }
-                let start_character = position::byte_offset_to_char_offset(line, byte);
-                let range = Range {
-                    start: Position {
-                        line: line_index,
-                        character: start_character,
-                    },
-                    end: Position {
-                        line: line_index,
-                        character: start_character + binding.chars().count() as u32,
-                    },
-                };
-                // Prefer an occurrence on the value side of an assignment.
-                // This skips local `let <binding> = ...` declarations and
-                // map keys that happen to share the candidate spelling.
-                if line[..byte].contains('=') {
-                    return Some(range);
-                }
-                // Multiline lists/maps can put the value on a line without
-                // `=`. The last identifier occurrence in the resource scope
-                // is a better fallback than an earlier declaration.
-                fallback = Some(range);
-            }
-        }
-        fallback
     }
 }
 

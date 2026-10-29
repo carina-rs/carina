@@ -302,9 +302,6 @@ fn stamp_unresolved_upstream(
                 crate::resource::UnknownReason::UpstreamAllExports { binding },
             ))
         }
-        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-            stamp_unresolved_upstream(*value, upstream_binding_names)
-        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(stamp_unresolved_upstream(*value, upstream_binding_names)),
@@ -601,9 +598,6 @@ fn resolve_ref_value_status_inner(
                 Ok(ValueResolution::Unknown(value.clone()))
             }
         }
-        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-            resolve_ref_value_status_inner(value, bindings, config, allow_absent_default)
-        }
         Value::Deferred(DeferredValue::Access(access)) => {
             let resolved_base = match resolve_ref_value_status_inner(
                 access.base(),
@@ -714,9 +708,6 @@ fn resolve_ref_value_inner(
             Ok(value.clone())
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => Ok(value.clone()),
-        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-            resolve_ref_value_inner(value, bindings, config)
-        }
         Value::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<Value>, String> = items
                 .iter()

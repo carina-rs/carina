@@ -14,8 +14,8 @@ use indexmap::IndexMap;
 use super::resolver::ModuleResolver;
 use super::*;
 use crate::parser::{
-    ArgumentOrigin, ArgumentParameter, ModuleArgument, ModuleCall, ParsedFile, ProviderContext,
-    TypeExpr,
+    ArgumentOrigin, ArgumentParameter, AttributePathSegment, BindingUseOwner, ModuleArgument,
+    ModuleCall, ParsedFile, ProviderContext, TypeExpr,
 };
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, RawEnumIdentifier, Resource,
@@ -151,6 +151,7 @@ fn create_test_module() -> ParsedFile {
         requires: vec![],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -278,6 +279,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
         requires: vec![],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -467,6 +469,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
         requires: vec![],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -649,6 +652,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
         requires: vec![],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -791,6 +795,7 @@ fn create_module_with_attributes() -> ParsedFile {
         requires: vec![],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -1104,6 +1109,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         requires: vec![],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -2465,6 +2471,7 @@ fn create_module_with_interpolation() -> ParsedFile {
         requires: vec![],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -2559,6 +2566,84 @@ fn test_nested_module_two_level() {
             .all(|resource| resource.attributes.keys().all(|key| !key.starts_with('_'))),
         "module expansion must not introduce host metadata into resource attributes"
     );
+}
+
+#[test]
+fn nested_module_expansion_remaps_bare_use_owners_and_keeps_list_map_paths() {
+    let fixture = tempfile::tempdir().expect("nested bare-use fixture");
+    let outer_dir = fixture.path().join("outer");
+    let inner_dir = fixture.path().join("inner");
+    fs::create_dir_all(&outer_dir).unwrap();
+    fs::create_dir_all(&inner_dir).unwrap();
+    fs::write(
+        fixture.path().join("main.crn"),
+        r#"let outer_module = use { source = "outer" }
+let root = outer_module {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        outer_dir.join("main.crn"),
+        r#"let inner_module = use { source = "../inner" }
+let outer_value = "forwarded"
+attributes { result = outer_value }
+let nested = inner_module { param = outer_value }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        inner_dir.join("main.crn"),
+        r#"arguments { param: String }
+mock.test.Consumer {
+  name = "consumer"
+  values = [param]
+  mapping = { primary = param }
+}
+"#,
+    )
+    .unwrap();
+
+    let root = fs::read_to_string(fixture.path().join("main.crn")).unwrap();
+    let mut parsed = crate::parser::parse(&root, &ProviderContext::default()).unwrap();
+    resolve_modules(&mut parsed, fixture.path()).expect("expand both module levels");
+
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "test.Consumer")
+        .expect("expanded inner consumer");
+    assert_eq!(
+        consumer.get_attr("values"),
+        Some(&Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("forwarded".into()),)
+        ]))),
+    );
+
+    let inner_uses = parsed
+        .bare_binding_uses()
+        .uses()
+        .filter(|use_site| use_site.name == "param")
+        .collect::<Vec<_>>();
+    assert_eq!(inner_uses.len(), 2, "one list and one map leaf");
+    assert!(
+        inner_uses
+            .iter()
+            .all(|use_site| use_site.source_file.path().ends_with("inner/main.crn"))
+    );
+    assert!(inner_uses.iter().all(|use_site| matches!(
+        &use_site.owner,
+        BindingUseOwner::Resource(address) if address.resource_id() == &consumer.id
+    )));
+    assert!(inner_uses.iter().any(|use_site| matches!(
+        use_site.path.segments(),
+        [AttributePathSegment::Attribute(root), AttributePathSegment::ListIndex(0)]
+            if root == "values"
+    )));
+    assert!(inner_uses.iter().any(|use_site| matches!(
+        use_site.path.segments(),
+        [AttributePathSegment::Attribute(root), AttributePathSegment::Key(key)]
+            if root == "mapping" && key == "primary"
+    )));
 }
 
 #[test]
@@ -3008,6 +3093,7 @@ fn create_module_with_port_validation() -> ParsedFile {
         requires: vec![],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -3180,6 +3266,7 @@ let root = outer { outer_port = producer.port }
         requires: vec![],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -3366,6 +3453,7 @@ fn test_argument_validation_no_message_uses_default() {
         requires: vec![],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -3432,6 +3520,7 @@ fn test_argument_validation_len_with_list() {
         requires: vec![],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -3528,6 +3617,7 @@ fn test_require_block_passes() {
         )],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -3603,6 +3693,7 @@ fn test_require_block_fails_with_not_expr() {
         )],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -3677,6 +3768,7 @@ fn test_require_block_len_function() {
         )],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -3769,6 +3861,7 @@ fn test_require_block_multiple_constraints() {
         )],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -5597,6 +5690,7 @@ fn create_module_with_environment_union() -> ParsedFile {
         requires: vec![],
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_expressions: vec![],
         expansion_trace: crate::resource::ExpansionTrace::new(),

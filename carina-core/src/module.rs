@@ -177,7 +177,6 @@ fn format_value(value: &Value) -> String {
             format!("{}.{}", path.binding(), path.attribute())
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => binding.clone(),
-        Value::Deferred(DeferredValue::BindingCandidate { binding, .. }) => binding.clone(),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             format!("{} ?? {}", format_value(value), format_value(default))
         }
@@ -503,9 +502,6 @@ impl RootConfigSignature {
                         used_in: attr_key.to_string(),
                     },
                 );
-            }
-            Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-                Self::collect_typed_dependencies(from, attr_key, value, graph, binding_types);
             }
             Value::Concrete(ConcreteValue::List(items)) => {
                 for item in items {
@@ -1018,16 +1014,6 @@ impl ModuleSignature {
                         attribute: String::new(),
                         used_in: attr_key.to_string(),
                     },
-                );
-            }
-            Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-                Self::collect_typed_dependencies(
-                    from,
-                    attr_key,
-                    value,
-                    graph,
-                    binding_types,
-                    argument_types,
                 );
             }
             Value::Concrete(ConcreteValue::List(items)) => {

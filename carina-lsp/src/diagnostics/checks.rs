@@ -77,9 +77,6 @@ fn value_depends_on_module_output(
                     )
                 })
         }
-        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
-        }
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(|value| {
             value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
         }),
@@ -261,7 +258,6 @@ impl<'a> ContextFreeValue<'a> {
                 Value::Concrete(ConcreteValue::EnumIdentifier(_))
                 | Value::Deferred(DeferredValue::ResourceRef { .. })
                 | Value::Deferred(DeferredValue::BindingRef { .. })
-                | Value::Deferred(DeferredValue::BindingCandidate { .. })
                 | Value::Deferred(DeferredValue::FunctionCall { .. })
                 | Value::Deferred(DeferredValue::Unavailable { .. })
                 | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
@@ -1921,6 +1917,7 @@ impl DiagnosticEngine {
         semantic_view: &SemanticView<'_>,
         imported_modules: &carina_core::module_resolver::ResolvedModuleSignatures,
         inference_bindings: &carina_core::validation::inference::InferenceBindings,
+        binding_use_report: &carina_core::validation::BindingUseReport,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
@@ -1976,45 +1973,20 @@ impl DiagnosticEngine {
                         .lookup(call)
                         .and_then(|semantic_call| semantic_call.argument(arg_name))
                         .unwrap_or(authored_argument);
-                    let binding_errors =
-                        carina_core::validation::resolve_module_argument_binding_candidates(
-                            semantic_argument,
-                            &resolved_parameter,
-                            &self.provider_context,
-                        );
-                    if !binding_errors.is_empty() {
-                        let value_span = authored.value_span();
-                        let value_range = tower_lsp::lsp_types::Range {
-                            start: tower_lsp::lsp_types::Position {
-                                line: value_span.start_line().saturating_sub(1) as u32,
-                                character: value_span.start_column().saturating_sub(1) as u32,
-                            },
-                            end: tower_lsp::lsp_types::Position {
-                                line: value_span.end_line().saturating_sub(1) as u32,
-                                character: value_span.end_column().saturating_sub(1) as u32,
-                            },
-                        };
-                        for error in binding_errors {
-                            if let Some(type_error) = error.type_error()
-                                && let Some(diagnostic) = super::build_enum_diagnostic_from_error(
-                                    type_error,
-                                    Some(value_range),
-                                )
-                            {
-                                diagnostics.push(diagnostic);
-                            } else {
-                                diagnostics.push(carina_diagnostic(
-                                    value_range.start.line,
-                                    value_range.start.character,
-                                    value_range
-                                        .end
-                                        .character
-                                        .max(value_range.start.character.saturating_add(1)),
-                                    DiagnosticSeverity::WARNING,
-                                    error.to_string(),
-                                ));
-                            }
-                        }
+                    if parsed.bare_binding_uses().uses().any(|use_site| {
+                        matches!(
+                            &use_site.owner,
+                            carina_core::parser::BindingUseOwner::ModuleArgument {
+                                call: owner,
+                                argument,
+                            } if owner == call.id() && argument == arg_name
+                        ) && (use_site.path.segments().len() == 1
+                            || binding_use_report.findings().iter().any(|finding| {
+                                finding.use_site.source_file == use_site.source_file
+                                    && finding.use_site.span == use_site.span
+                                    && finding.use_site.name == use_site.name
+                            }))
+                    }) {
                         continue;
                     }
                     if let Some(result) = carina_core::validation::check_module_argument_handle_sink(
@@ -2063,7 +2035,22 @@ impl DiagnosticEngine {
 
                 // Check for missing required parameters
                 for arg in module_args {
-                    if arg.default.is_none() && !call.contains_argument(&arg.name) {
+                    let pending_slot =
+                        parsed
+                            .bare_binding_uses()
+                            .pending_slots()
+                            .iter()
+                            .any(|slot| {
+                                matches!(
+                                    &slot.owner,
+                                    carina_core::parser::BindingUseOwner::ModuleArgument {
+                                        call: owner,
+                                        argument,
+                                    } if owner == call.id() && argument == &arg.name
+                                )
+                            });
+                    if arg.default.is_none() && !call.contains_argument(&arg.name) && !pending_slot
+                    {
                         let (line, col) = module_call_position(call);
                         diagnostics.push(carina_diagnostic(
                             line,

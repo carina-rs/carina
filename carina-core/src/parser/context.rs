@@ -5,14 +5,17 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use super::ast::{
-    DeferredForExpression, PendingFunctionTypeCheck, ProviderConfig, UpstreamState, UserFunction,
-    WaitBinding,
+    AttributePath, AttributePathSegment, BareBindingKind, BareBindingSource, BareBindingUse,
+    BindingScopeId, BindingUseOwner, DeferredForExpression, ModuleCallId, ParsedBindingUses,
+    PendingFunctionTypeCheck, PendingValueSlot, ProviderConfig, ResourceAddress, SourceFileId,
+    SourceSpan, TypeExpr, UpstreamState, UserFunction, WaitBinding,
 };
 use super::error::{ParseError, ParseWarning};
 use super::{ProviderContext, Rule};
 use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
-use crate::resource::{Resource, Value};
+use crate::resource::{Resource, ResourceId};
 use indexmap::IndexMap;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -28,8 +31,10 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(super) enum ParseBinding {
     Value {
-        value: EvalValue,
+        value: Box<EvalValue>,
         source_line: usize,
+        declaration: crate::schema::BindingKind,
+        declared_type: Option<TypeExpr>,
     },
     Structural {
         handle: StructuralHandle,
@@ -38,7 +43,11 @@ pub(super) enum ParseBinding {
 
 #[derive(Clone, Copy)]
 pub(super) enum ParseBindingRef<'a> {
-    Value { value: &'a EvalValue },
+    Value {
+        value: &'a EvalValue,
+        declaration: crate::schema::BindingKind,
+        declared_type: Option<&'a TypeExpr>,
+    },
     Structural(&'a StructuralHandle),
     Unbound,
 }
@@ -98,11 +107,13 @@ pub(crate) struct ParseContext<'cfg> {
     /// control-flow expressions defer only that provisional case; the final
     /// parse runs with this disabled and reports the classified error.
     pub(super) defer_provisional_static_conditions: bool,
-    /// Preserve bare lexical bindings until an expected value type is known.
-    /// Resource attributes and nested module-call expressions enable this;
-    /// untyped `let` expressions retain their original eager behavior.
-    preserve_typed_value_candidates: bool,
-    preserve_typed_structural_candidates: bool,
+    /// Shared parser-side provenance recorder. Real lexical child contexts
+    /// share it; expression parsing never clones the context merely to change
+    /// sink behavior.
+    pub(super) parsed_binding_uses: Rc<RefCell<ParsedBindingUses>>,
+    pub(super) binding_scope: BindingScopeId,
+    binding_scope_source_file: std::path::PathBuf,
+    next_binding_scope: Rc<Cell<u64>>,
 }
 
 impl<'cfg> ParseContext<'cfg> {
@@ -125,9 +136,42 @@ impl<'cfg> ParseContext<'cfg> {
             seeded_bindings: HashSet::new(),
             pending_function_type_checks: Rc::new(RefCell::new(Vec::new())),
             defer_provisional_static_conditions: false,
-            preserve_typed_value_candidates: false,
-            preserve_typed_structural_candidates: false,
+            parsed_binding_uses: Rc::new(RefCell::new(ParsedBindingUses::default())),
+            binding_scope: BindingScopeId::root(std::path::Path::new("test.crn")),
+            binding_scope_source_file: std::path::PathBuf::from("test.crn"),
+            next_binding_scope: Rc::new(Cell::new(1)),
         }
+    }
+
+    pub(super) fn set_source_scope(&mut self, source_file: &std::path::Path) {
+        self.binding_scope = BindingScopeId::root(source_file);
+        self.binding_scope_source_file = source_file.to_path_buf();
+    }
+
+    pub(super) fn child_scope(&self) -> Self {
+        let ordinal = self.next_binding_scope.get();
+        self.next_binding_scope.set(ordinal + 1);
+        let mut child = self.clone();
+        child.binding_scope = self
+            .binding_scope
+            .child(&self.binding_scope_source_file, ordinal);
+        child
+    }
+
+    pub(super) fn take_parsed_binding_uses(&self) -> ParsedBindingUses {
+        std::mem::take(&mut *self.parsed_binding_uses.borrow_mut())
+    }
+
+    pub(super) fn remap_binding_use_resource(&self, from: &ResourceId, to: &ResourceId) {
+        self.parsed_binding_uses
+            .borrow_mut()
+            .remap_resource_owner(from, to);
+    }
+
+    pub(super) fn remap_binding_use_module_call(&self, from: &ModuleCallId, to: &ModuleCallId) {
+        self.parsed_binding_uses
+            .borrow_mut()
+            .remap_module_call_owner(from, to);
     }
 
     pub(super) fn record_pending_function_type_check(&self, check: PendingFunctionTypeCheck) {
@@ -214,31 +258,29 @@ impl<'cfg> ParseContext<'cfg> {
         self.bindings.insert(
             name,
             ParseBinding::Value {
-                value: value.into(),
+                value: Box::new(value.into()),
                 source_line,
+                declaration: crate::schema::BindingKind::Let,
+                declared_type: None,
             },
         );
     }
 
-    pub(super) fn for_typed_value_sink(&self) -> Self {
-        let mut typed = self.clone();
-        typed.preserve_typed_value_candidates = true;
-        typed.preserve_typed_structural_candidates = true;
-        typed
-    }
-
-    pub(super) fn for_typed_module_value_sink(&self) -> Self {
-        let mut typed = self.clone();
-        typed.preserve_typed_value_candidates = true;
-        typed.preserve_typed_structural_candidates = false;
-        typed
-    }
-
-    pub(super) fn without_typed_value_sink(&self) -> Self {
-        let mut untyped = self.clone();
-        untyped.preserve_typed_value_candidates = false;
-        untyped.preserve_typed_structural_candidates = false;
-        untyped
+    pub(super) fn set_argument_variable(
+        &mut self,
+        name: String,
+        value: impl Into<EvalValue>,
+        declared_type: Option<TypeExpr>,
+    ) {
+        self.bindings.insert(
+            name,
+            ParseBinding::Value {
+                value: Box::new(value.into()),
+                source_line: 0,
+                declaration: crate::schema::BindingKind::Argument,
+                declared_type,
+            },
+        );
     }
 
     pub(super) fn set_structural_binding(&mut self, name: String, handle: StructuralHandle) {
@@ -257,38 +299,26 @@ impl<'cfg> ParseContext<'cfg> {
 
     pub(super) fn get_variable(&self, name: &str) -> Option<&EvalValue> {
         match self.bindings.get(name) {
-            Some(ParseBinding::Value { value, .. }) => Some(value),
+            Some(ParseBinding::Value { value, .. }) => Some(value.as_ref()),
             Some(ParseBinding::Structural { .. }) | None => None,
         }
     }
 
     pub(super) fn lookup_binding(&self, name: &str) -> ParseBindingRef<'_> {
         match self.bindings.get(name) {
-            Some(ParseBinding::Value { value, .. }) => ParseBindingRef::Value { value },
+            Some(ParseBinding::Value {
+                value,
+                declaration,
+                declared_type,
+                ..
+            }) => ParseBindingRef::Value {
+                value: value.as_ref(),
+                declaration: *declaration,
+                declared_type: declared_type.as_ref(),
+            },
             Some(ParseBinding::Structural { handle, .. }) => ParseBindingRef::Structural(handle),
             None => ParseBindingRef::Unbound,
         }
-    }
-
-    pub(super) fn preserves_bare_binding(&self, name: &str) -> bool {
-        self.preserve_typed_structural_candidates && self.is_structural_binding(name)
-    }
-
-    pub(super) fn bare_value_binding_candidate(&self, name: &str) -> Option<Value> {
-        if !self.preserve_typed_value_candidates {
-            return None;
-        }
-        let ParseBinding::Value { value, .. } = self.bindings.get(name)? else {
-            return None;
-        };
-        value.clone().into_value().ok()
-    }
-
-    pub(super) fn is_structural_binding(&self, name: &str) -> bool {
-        matches!(
-            self.bindings.get(name),
-            Some(ParseBinding::Structural { .. })
-        )
     }
 
     pub(super) fn contains_binding(&self, name: &str) -> bool {
@@ -312,6 +342,203 @@ impl<'cfg> ParseContext<'cfg> {
             );
         }
         self.resource_bindings.insert(name, resource);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StructuralSinkMode {
+    Pending,
+    DirectHandle,
+}
+
+#[derive(Clone)]
+pub(crate) struct ExpressionMode<'a> {
+    sink: Option<ExpressionSink<'a>>,
+}
+
+#[derive(Clone)]
+struct ExpressionSink<'a> {
+    owner: BindingUseOwner,
+    root_path: AttributePath,
+    path: AttributePath,
+    source_file: &'a std::path::Path,
+    preprocessed_file: &'a super::PreprocessedFile,
+    structural: StructuralSinkMode,
+}
+
+impl ExpressionMode<'_> {
+    pub(super) const fn untyped() -> Self {
+        Self { sink: None }
+    }
+}
+
+impl<'a> ExpressionMode<'a> {
+    pub(super) fn resource(
+        id: ResourceId,
+        source_file: &'a std::path::Path,
+        preprocessed_file: &'a super::PreprocessedFile,
+    ) -> Self {
+        Self {
+            sink: Some(ExpressionSink {
+                owner: BindingUseOwner::Resource(ResourceAddress::new(id)),
+                root_path: AttributePath::root("<resource>"),
+                path: AttributePath::root("<resource>"),
+                source_file,
+                preprocessed_file,
+                structural: StructuralSinkMode::Pending,
+            }),
+        }
+    }
+
+    pub(super) fn module_argument(
+        call: super::ModuleCallId,
+        argument: String,
+        source_file: &'a std::path::Path,
+        preprocessed_file: &'a super::PreprocessedFile,
+        structural: StructuralSinkMode,
+    ) -> Self {
+        let path = AttributePath::root(argument.clone());
+        Self {
+            sink: Some(ExpressionSink {
+                owner: BindingUseOwner::ModuleArgument { call, argument },
+                root_path: path.clone(),
+                path,
+                source_file,
+                preprocessed_file,
+                structural,
+            }),
+        }
+    }
+
+    pub(super) fn at_attribute(&self, name: impl Into<String>) -> Self {
+        let Some(sink) = &self.sink else {
+            return Self::untyped();
+        };
+        let path = AttributePath::root(name);
+        Self {
+            sink: Some(ExpressionSink {
+                root_path: path.clone(),
+                path,
+                ..sink.clone()
+            }),
+        }
+    }
+
+    pub(super) fn at_named_child(&self, name: impl Into<String>) -> Self {
+        let name = name.into();
+        match self.sink.as_ref() {
+            Some(sink) if sink.root_path.root_name() == "<resource>" => self.at_attribute(name),
+            Some(_) => self.at_struct_field(name),
+            None => Self::untyped(),
+        }
+    }
+
+    pub(super) fn at_list_index(&self, index: usize) -> Self {
+        self.with_segment(AttributePathSegment::ListIndex(index))
+    }
+
+    pub(super) fn at_key(&self, key: impl Into<String>) -> Self {
+        self.with_segment(AttributePathSegment::Key(key.into()))
+    }
+
+    pub(super) fn at_struct_field(&self, name: impl Into<String>) -> Self {
+        self.with_segment(AttributePathSegment::StructField(name.into()))
+    }
+
+    fn with_segment(&self, segment: AttributePathSegment) -> Self {
+        let Some(sink) = &self.sink else {
+            return Self::untyped();
+        };
+        Self {
+            sink: Some(ExpressionSink {
+                path: sink.path.with_segment(segment),
+                // A structural handle is directly transportable only when it
+                // is the complete module argument. Once parsing descends into
+                // a list/map/struct leaf there is no runtime Value placeholder
+                // to manufacture, so reserve the owning argument instead.
+                structural: StructuralSinkMode::Pending,
+                ..sink.clone()
+            }),
+        }
+    }
+
+    pub(super) fn pending_slot(&self) -> Option<PendingValueSlot> {
+        self.sink.as_ref().map(|sink| PendingValueSlot {
+            owner: sink.owner.clone(),
+            path: sink.root_path.clone(),
+        })
+    }
+
+    pub(super) fn record_bare_binding(
+        &self,
+        ctx: &ParseContext<'_>,
+        name: &str,
+        token: &pest::iterators::Pair<'_, Rule>,
+    ) -> Option<PendingValueSlot> {
+        let sink = self.sink.as_ref()?;
+        let (binding, source) = match ctx.lookup_binding(name) {
+            ParseBindingRef::Value {
+                value,
+                declaration,
+                declared_type,
+            } => {
+                let value = value.clone().into_value().ok()?;
+                (
+                    BareBindingKind::Value { declaration },
+                    BareBindingSource::Value {
+                        value,
+                        declared_type: declared_type.cloned(),
+                    },
+                )
+            }
+            ParseBindingRef::Structural(handle) => {
+                let resource_type = match handle.kind() {
+                    StructuralHandleKind::Resource(resource_type) => Some(resource_type.clone()),
+                    StructuralHandleKind::For
+                    | StructuralHandleKind::If
+                    | StructuralHandleKind::Use
+                    | StructuralHandleKind::Module
+                    | StructuralHandleKind::Wait
+                    | StructuralHandleKind::UpstreamState
+                    | StructuralHandleKind::Provider
+                    | StructuralHandleKind::ModuleParameter
+                    | StructuralHandleKind::FunctionParameter => None,
+                };
+                (
+                    BareBindingKind::Structural {
+                        kind: handle.kind().clone(),
+                        resource_type,
+                    },
+                    BareBindingSource::Structural(handle.clone()),
+                )
+            }
+            ParseBindingRef::Unbound => return None,
+        };
+        let authored = BareBindingUse {
+            source_file: SourceFileId::new(sink.source_file.to_path_buf()),
+            scope: ctx.binding_scope.clone(),
+            owner: sink.owner.clone(),
+            path: sink.path.clone(),
+            name: name.to_string(),
+            span: SourceSpan::from_pest(token, sink.preprocessed_file),
+            binding,
+        };
+        ctx.parsed_binding_uses
+            .borrow_mut()
+            .record(authored, source);
+
+        if matches!(ctx.lookup_binding(name), ParseBindingRef::Structural(_))
+            && sink.structural == StructuralSinkMode::Pending
+        {
+            let slot = PendingValueSlot {
+                owner: sink.owner.clone(),
+                path: sink.root_path.clone(),
+            };
+            ctx.parsed_binding_uses.borrow_mut().reserve(slot.clone());
+            Some(slot)
+        } else {
+            None
+        }
     }
 }
 

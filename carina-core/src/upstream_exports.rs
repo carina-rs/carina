@@ -620,9 +620,6 @@ pub fn check_upstream_state_for_iterable_shapes<E>(
                 visit_possible_iterables(default, f);
             }
             Value::Deferred(DeferredValue::Secret(inner)) => visit_possible_iterables(inner, f),
-            Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-                visit_possible_iterables(value, f)
-            }
             // References inside a function argument constrain that argument,
             // not the function result used as the iterable.
             Value::Concrete(_)

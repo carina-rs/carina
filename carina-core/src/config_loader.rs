@@ -937,6 +937,7 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
         requires,
         structural_bindings,
         parser_binding_metadata,
+        parsed_binding_uses,
         warnings,
         deferred_for_expressions,
         expansion_trace,
@@ -961,6 +962,7 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
     target
         .parser_binding_metadata
         .extend(parser_binding_metadata);
+    target.parsed_binding_uses.extend(parsed_binding_uses);
     target.warnings.extend(warnings);
     target
         .deferred_for_expressions

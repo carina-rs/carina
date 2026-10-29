@@ -386,15 +386,21 @@ pub(crate) enum ConfigNameResolution {
 /// through concrete [`crate::wiring::ValidatedConfig`] methods or consuming
 /// owner transitions.
 pub(crate) enum ResolvedConfig<'a> {
-    Evaluated(&'a mut carina_core::parser::InferredFile),
-    Paired(Box<CanonicalResourcePair<carina_core::parser::InferredExportParam>>),
+    Evaluated {
+        parsed: &'a mut carina_core::parser::InferredFile,
+        binding_uses: carina_core::validation::ResolvedBindingUses,
+    },
+    Paired {
+        resources: Box<CanonicalResourcePair<carina_core::parser::InferredExportParam>>,
+        binding_uses: carina_core::validation::ResolvedBindingUses,
+    },
 }
 
 impl ResolvedConfig<'_> {
     fn parsed(&self) -> &carina_core::parser::InferredFile {
         match self {
-            Self::Evaluated(parsed) => parsed,
-            Self::Paired(pair) => pair.parsed(),
+            Self::Evaluated { parsed, .. } => parsed,
+            Self::Paired { resources, .. } => resources.parsed(),
         }
     }
 
@@ -404,7 +410,7 @@ impl ResolvedConfig<'_> {
     ) -> Result<Vec<AppError>, AppError> {
         let providers = self.parsed().providers.clone();
         match self {
-            Self::Evaluated(parsed) => {
+            Self::Evaluated { parsed, .. } => {
                 let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
                     &mut parsed.resources,
                     ctx.schemas(),
@@ -415,10 +421,27 @@ impl ResolvedConfig<'_> {
                     &providers,
                 ))
             }
-            Self::Paired(pair) => {
-                compute_canonical_pair_anonymous_identifiers_with_ctx(ctx, pair, &providers)
+            Self::Paired { resources, .. } => {
+                compute_canonical_pair_anonymous_identifiers_with_ctx(ctx, resources, &providers)
             }
         }
+    }
+}
+
+fn extend_binding_use_errors(
+    errors: &mut Vec<AppError>,
+    report: &carina_core::validation::BindingUseReport,
+) {
+    errors.extend(
+        report
+            .findings()
+            .iter()
+            .map(|finding| AppError::Validation(finding.error.to_string())),
+    );
+    if !report.is_ready() && report.findings().is_empty() {
+        errors.push(AppError::Validation(
+            "bare binding validation left an unconsumed pending value slot".to_string(),
+        ));
     }
 }
 
@@ -434,11 +457,11 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
 ) -> Result<ResolvedConfig<'a>, Vec<AppError>> {
-    let module_walk = if skip_resource_validation {
-        ModuleWalk::default()
-    } else {
-        ModuleWalk::load(parsed, base_dir)
-    };
+    // Binding-use validation is a production-readiness invariant, not a
+    // resource-validation preference. Keep the recursive module snapshots
+    // available even on destroy/state recovery paths; the later optional
+    // policy checks remain gated by `skip_resource_validation`.
+    let module_walk = ModuleWalk::load(parsed, base_dir);
 
     let mut errors: Vec<AppError> = Vec::new();
 
@@ -565,6 +588,51 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     let imported_module_signatures =
         module_resolver::load_resolved_module_signatures(parsed, base_dir, &enriched_context);
 
+    // Consume caller-authored uses before the legacy module-argument checker
+    // or expansion can turn a typed pending slot into a secondary missing-
+    // argument error. This authority is mandatory even for destroy/state
+    // recovery paths (`skip_resource_validation`): the flag may skip provider
+    // resource checks, but it cannot mint validation readiness.
+    let binding_use_report = carina_core::validation::resolve_bare_binding_uses(
+        parsed,
+        &carina_core::validation::ValidationTypeContext::new(
+            parsed,
+            ctx.schemas(),
+            &enriched_context,
+            &imported_module_signatures,
+        ),
+    );
+    extend_binding_use_errors(&mut errors, &binding_use_report);
+    for module in module_walk.iter() {
+        let module_parsed = &module.loaded().parsed;
+        let module_signatures = module_resolver::load_resolved_module_signatures(
+            module_parsed,
+            module.module_path(),
+            &enriched_context,
+        );
+        let report = carina_core::validation::resolve_bare_binding_uses(
+            module_parsed,
+            &carina_core::validation::ValidationTypeContext::new(
+                module_parsed,
+                ctx.schemas(),
+                &enriched_context,
+                &module_signatures,
+            ),
+        );
+        let prefix = module.diagnostic_path().display();
+        errors.extend(
+            report
+                .findings()
+                .iter()
+                .map(|finding| AppError::Validation(format!("{prefix}: {}", finding.error))),
+        );
+        if !report.is_ready() && report.findings().is_empty() {
+            errors.push(AppError::Validation(format!(
+                "{prefix}: bare binding validation left an unconsumed pending value slot"
+            )));
+        }
+    }
+
     // Validate module call arguments before expansion (needs enriched
     // context for custom type validators).
     errors.extend(validate_module_calls_with_imported(
@@ -644,6 +712,27 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         return Err(errors);
     }
 
+    // Expansion carries module-internal side data in parallel with each
+    // expanded resource and remaps its owner. Re-run the same authority over
+    // that final graph, then retain its sealed success proof for the
+    // ValidatedConfig transition. This is not a second interpretation path:
+    // both passes use resolve_bare_binding_uses and the same mandatory
+    // provider context.
+    let binding_use_report = carina_core::validation::resolve_bare_binding_uses(
+        parsed,
+        &carina_core::validation::ValidationTypeContext::new(
+            parsed,
+            ctx.schemas(),
+            &enriched_context,
+            &imported_module_signatures,
+        ),
+    );
+    extend_binding_use_errors(&mut errors, &binding_use_report);
+    let binding_uses = match binding_use_report.into_resolved() {
+        Ok(binding_uses) => binding_uses,
+        Err(_) => return Err(errors),
+    };
+
     let parsed: &mut carina_core::parser::InferredFile = &mut *parsed;
 
     // Resolve names (let bindings -> resource names) — must succeed
@@ -656,11 +745,17 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
                 errors.extend(name_errors);
                 return Err(errors);
             }
-            ResolvedConfig::Evaluated(parsed)
+            ResolvedConfig::Evaluated {
+                parsed,
+                binding_uses,
+            }
         }
         ConfigNameResolution::Paired(unresolved) => {
             match access.resolve_config_names(ctx, std::mem::take(parsed), *unresolved) {
-                Ok(pair) => ResolvedConfig::Paired(Box::new(pair)),
+                Ok(resources) => ResolvedConfig::Paired {
+                    resources: Box::new(resources),
+                    binding_uses,
+                },
                 Err(name_errors) => {
                     errors.extend(name_errors);
                     return Err(errors);

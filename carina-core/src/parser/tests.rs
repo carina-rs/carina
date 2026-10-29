@@ -14115,13 +14115,114 @@ fn assert_bare_handle_error(source: &str, binding: &str, kind: &str) {
     );
 }
 
-fn assert_bare_handle_preserved_for_typed_resource_value(source: &str, binding: &str) {
+#[test]
+fn resolved_bare_value_stays_clean_and_records_parser_side_provenance() {
+    let parsed = parse(
+        r#"let authored_name = "runtime-value"
+mock.test.Consumer { name = authored_name }"#,
+        &ProviderContext::default(),
+    )
+    .expect("a normal let binding resolves exactly as main evaluation does");
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "test.Consumer")
+        .expect("consumer");
+    assert_eq!(
+        consumer.get_attr("name"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "runtime-value".into()
+        ))),
+        "authored-name provenance must not enter Value",
+    );
+
+    let uses = parsed.bare_binding_uses().uses().collect::<Vec<_>>();
+    assert_eq!(uses.len(), 1);
+    assert_eq!(uses[0].name, "authored_name");
+    assert_eq!(uses[0].path.root_name(), "name");
+    assert!(matches!(
+        uses[0].binding,
+        BareBindingKind::Value {
+            declaration: crate::schema::BindingKind::Let
+        }
+    ));
+    assert!(parsed.bare_binding_uses().pending_slots().is_empty());
+}
+
+#[test]
+fn lexical_child_scope_ids_are_unique_across_sibling_files() {
+    use crate::config_loader::parse_directory;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("first.crn"),
+        r#"let first = mock.test.Consumer {
+  let local_name = "first"
+  name = local_name
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("second.crn"),
+        r#"let second = mock.test.Consumer {
+  let local_name = "second"
+  name = local_name
+}
+"#,
+    )
+    .unwrap();
+
+    let parsed = parse_directory(directory.path(), &ProviderContext::default())
+        .expect("parse sibling lexical scopes");
+    let uses = parsed
+        .bare_binding_uses()
+        .uses()
+        .filter(|use_site| use_site.name == "local_name")
+        .collect::<Vec<_>>();
+    assert_eq!(uses.len(), 2);
+    assert_eq!(uses[0].scope.directory(), uses[1].scope.directory());
+    assert_ne!(
+        uses[0].scope, uses[1].scope,
+        "child scopes in different source files must have distinct identities",
+    );
+}
+
+fn assert_bare_handle_is_pending_for_typed_resource_value(source: &str, binding: &str) {
     let parsed = parse(source, &ProviderContext::default())
-        .expect("typed resource values retain bare handles for schema-aware validation");
-    let value = resource_attribute(&parsed, "test.Consumer", "name");
+        .expect("typed resource values retain parser-side handle provenance");
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "test.Consumer")
+        .expect("consumer resource");
     assert!(
-        matches!(&value, Value::Deferred(DeferredValue::BindingRef { binding: actual }) if actual == binding),
-        "expected BindingRef({binding}), got {value:?}",
+        consumer.get_attr("name").is_none(),
+        "a structural leaf must not manufacture a runtime Value: {:?}",
+        consumer.attributes,
+    );
+
+    let use_site = parsed
+        .bare_binding_uses()
+        .uses()
+        .find(|use_site| use_site.name == binding)
+        .expect("recorded structural use");
+    assert!(matches!(
+        use_site.binding,
+        BareBindingKind::Structural { .. }
+    ));
+    assert_eq!(use_site.path.root_name(), "name");
+    assert!(matches!(
+        &use_site.owner,
+        BindingUseOwner::Resource(address) if address.resource_id() == &consumer.id
+    ));
+    assert!(
+        parsed
+            .bare_binding_uses()
+            .pending_slots()
+            .iter()
+            .any(|slot| slot.owner == use_site.owner && slot.path.root_name() == "name"),
+        "the omitted attribute must retain a typed pending slot",
     );
 }
 
@@ -14150,33 +14251,101 @@ attributes { handle: String = vpc }"#,
 }
 
 #[test]
-fn bare_resource_handles_are_preserved_in_typed_resource_values() {
-    for (source, binding) in [
-        (
-            r#"let vpc = mock.test.Thing { name = "source" }
+fn bare_resource_handles_become_typed_pending_resource_slots() {
+    assert_bare_handle_is_pending_for_typed_resource_value(
+        r#"let vpc = mock.test.Thing { name = "source" }
 mock.test.Consumer { name = vpc }"#,
-            "vpc",
-        ),
-        (
-            r#"let vpc = mock.test.Thing { name = "source" }
-let alias = vpc
-mock.test.Consumer { name = alias }"#,
-            "alias",
-        ),
-    ] {
-        assert_bare_handle_preserved_for_typed_resource_value(source, binding);
-    }
+        "vpc",
+    );
 }
 
 #[test]
-fn bare_resource_handle_in_module_collection_keeps_existing_rejection() {
-    assert_bare_handle_error(
+fn bare_resource_handle_in_module_collection_becomes_a_pending_argument_slot() {
+    let parsed = parse(
         r#"let vpc = mock.test.Thing { name = "source" }
 let child_module = use { source = "./child" }
 let child = child_module { values = [vpc] }"#,
-        "vpc",
-        "a resource",
+        &ProviderContext::default(),
+    )
+    .expect("module argument parsing defers structural diagnostics");
+    let call = parsed.module_calls.first().expect("module call");
+    assert!(
+        call.arguments().all(|(name, _)| name != "values"),
+        "the pending argument must not contain a placeholder Value",
     );
+    let use_site = parsed
+        .bare_binding_uses()
+        .uses()
+        .find(|use_site| use_site.name == "vpc")
+        .expect("nested structural module-argument use");
+    assert!(matches!(
+        &use_site.owner,
+        BindingUseOwner::ModuleArgument { call: owner, argument }
+            if owner == call.id() && argument == "values"
+    ));
+    assert!(matches!(
+        use_site.path.segments(),
+        [AttributePathSegment::Attribute(argument), AttributePathSegment::ListIndex(0)]
+            if argument == "values"
+    ));
+    assert_eq!(parsed.bare_binding_uses().pending_slots().len(), 1);
+}
+
+#[test]
+fn grouped_direct_module_resource_argument_keeps_the_handle_boundary() {
+    let parsed = parse(
+        r#"let vpc = mock.test.Thing { name = "source" }
+let child_module = use { source = "./child" }
+let child = child_module { parent = (vpc) }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("a grouped direct handle remains a direct module argument");
+    let call = parsed.module_calls.first().expect("module call");
+    let parent = call
+        .arguments()
+        .find_map(|(name, argument)| (name == "parent").then_some(argument))
+        .expect("parent argument");
+    assert!(parent.value().is_none());
+    assert!(
+        parent
+            .bare_handle_error()
+            .is_some_and(|message| message.contains("'vpc' is a resource"))
+    );
+    assert!(parsed.bare_binding_uses().pending_slots().is_empty());
+}
+
+#[test]
+fn for_expansion_remaps_module_argument_use_owners_to_each_expanded_call() {
+    let parsed = parse(
+        r#"let shared = "value"
+let child_module = use { source = "./child" }
+for item in ["one", "two"] {
+  child_module { param = shared }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("expand module calls in a for expression");
+    assert_eq!(parsed.module_calls.len(), 2);
+    let uses = parsed
+        .bare_binding_uses()
+        .uses()
+        .filter(|use_site| use_site.name == "shared")
+        .collect::<Vec<_>>();
+    assert_eq!(uses.len(), 2);
+    for call in &parsed.module_calls {
+        assert!(
+            uses.iter().any(|use_site| matches!(
+                &use_site.owner,
+                BindingUseOwner::ModuleArgument { call: owner, argument }
+                    if owner == call.id() && argument == "param"
+            )),
+            "each expanded call must own its corresponding use: {:?}",
+            call.id(),
+        );
+        assert!(matches!(call.id().expansion(), CallExpansion::Expanded(_)));
+    }
 }
 
 #[test]
@@ -14232,7 +14401,7 @@ fn deferred_call_in_user_function_body_reports_the_body_line() {
 }
 
 #[test]
-fn every_structural_binding_kind_is_preserved_in_a_typed_resource_value() {
+fn every_structural_binding_kind_becomes_a_typed_pending_resource_slot() {
     let cases = [
         (
             r#"let items = for name in ["one"] { mock.test.Thing { name = name } }
@@ -14281,7 +14450,7 @@ mock.test.Consumer { name = secondary }"#,
     ];
 
     for (source, binding, _kind) in cases {
-        assert_bare_handle_preserved_for_typed_resource_value(source, binding);
+        assert_bare_handle_is_pending_for_typed_resource_value(source, binding);
     }
 }
 
@@ -14439,7 +14608,7 @@ fn non_ref_typed_user_function_argument_rejects_a_structural_handle() {
 }
 
 #[test]
-fn forward_structural_handle_is_preserved_after_directory_kind_resolution() {
+fn forward_structural_handle_is_pending_after_directory_kind_resolution() {
     use crate::config_loader::parse_directory;
 
     let directory = tempfile::tempdir().unwrap();
@@ -14452,18 +14621,21 @@ fn forward_structural_handle_is_preserved_after_directory_kind_resolution() {
 
     let parsed = parse_directory(directory.path(), &ProviderContext::default())
         .expect("a forward structural handle reaches typed validation");
-    let value = resource_attribute(&parsed, "test.Consumer", "name");
-    assert!(
-        matches!(
-            &value,
-            Value::Deferred(DeferredValue::BindingRef { binding }) if binding == "zz"
-        ),
-        "forward structural handle was not preserved: {value:?}",
-    );
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "test.Consumer")
+        .expect("consumer");
+    assert!(consumer.get_attr("name").is_none());
+    assert!(parsed.bare_binding_uses().uses().any(|use_site| {
+        use_site.name == "zz"
+            && use_site.path.root_name() == "name"
+            && matches!(use_site.binding, BareBindingKind::Structural { .. })
+    }));
 }
 
 #[test]
-fn sibling_structural_handle_is_preserved_after_directory_kind_resolution() {
+fn sibling_structural_handle_is_pending_after_directory_kind_resolution() {
     use crate::config_loader::parse_directory;
 
     let directory = tempfile::tempdir().unwrap();
@@ -14480,14 +14652,17 @@ fn sibling_structural_handle_is_preserved_after_directory_kind_resolution() {
 
     let parsed = parse_directory(directory.path(), &ProviderContext::default())
         .expect("a sibling structural handle reaches typed validation");
-    let value = resource_attribute(&parsed, "test.Consumer", "name");
-    assert!(
-        matches!(
-            &value,
-            Value::Deferred(DeferredValue::BindingRef { binding }) if binding == "sibling"
-        ),
-        "sibling structural handle was not preserved: {value:?}",
-    );
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "test.Consumer")
+        .expect("consumer");
+    assert!(consumer.get_attr("name").is_none());
+    assert!(parsed.bare_binding_uses().uses().any(|use_site| {
+        use_site.name == "sibling"
+            && use_site.path.root_name() == "name"
+            && matches!(use_site.binding, BareBindingKind::Structural { .. })
+    }));
 }
 
 #[test]

@@ -6,11 +6,12 @@
 //!   [`parse_if_expr`], which returns a [`LetBindingRhs`] so the body can
 //!   be a resource, a module call, or a value.
 //! * value position (interpolations, attribute values) — handled by
-//!   [`parse_if_value_expr`], which only allows a [`Value`] body and
+//!   [`parse_if_value_expr_with_mode`], which only allows a [`Value`] body and
 //!   requires an `else` clause.
 
 use crate::ValueDescription;
 use crate::eval_value::EvalValue;
+use crate::parser::context::ExpressionMode;
 use crate::parser::{
     LetBindingKind, LetBindingRhs, ModuleCall, ParseContext, ParseError, PreprocessedFile, Rule,
     evaluate_static_value, first_inner, if_structural_handle, is_static_value, next_pair,
@@ -183,7 +184,7 @@ pub(crate) fn parse_if_body(
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<IfBodyResult, ParseError> {
-    let mut local_ctx = ctx.clone();
+    let mut local_ctx = ctx.child_scope();
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
@@ -199,11 +200,23 @@ pub(crate) fn parse_if_body(
                 local_ctx.set_variable(name, value);
             }
             Rule::resource_expr => {
-                let resource = parse_resource_expr(inner, &local_ctx, binding_name)?;
+                let resource = parse_resource_expr(
+                    inner,
+                    &local_ctx,
+                    binding_name,
+                    preprocessed_file,
+                    source_file,
+                )?;
                 return Ok(IfBodyResult::Resource(Box::new(resource)));
             }
             Rule::read_resource_expr => {
-                let data_source = parse_read_resource_expr(inner, &local_ctx, binding_name)?;
+                let data_source = parse_read_resource_expr(
+                    inner,
+                    &local_ctx,
+                    binding_name,
+                    preprocessed_file,
+                    source_file,
+                )?;
                 return Ok(IfBodyResult::DataSource(Box::new(data_source)));
             }
             Rule::module_call => {
@@ -231,10 +244,11 @@ pub(crate) fn parse_if_body(
 /// Unlike `parse_if_expr()` which returns `LetBindingRhs` (resources, module calls, or values),
 /// this function only returns `Value`. The condition must be a static Bool.
 /// An else clause is required when the condition is false (a value must always be determined).
-pub(crate) fn parse_if_value_expr(
+pub(crate) fn parse_if_value_expr_with_mode(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-) -> Result<Value, ParseError> {
+    mode: &ExpressionMode<'_>,
+) -> Result<EvalValue, ParseError> {
     let mut inner = pair.into_inner();
 
     // Parse the condition expression
@@ -245,7 +259,7 @@ pub(crate) fn parse_if_value_expr(
         && ctx.defer_provisional_static_conditions
     {
         let if_body_pair = next_pair(&mut inner, "if body", "if value expression")?;
-        return parse_if_body_value(if_body_pair, ctx);
+        return parse_if_body_value_with_mode(if_body_pair, ctx, mode);
     }
     let condition_value = condition_value
         .into_value()
@@ -284,10 +298,10 @@ pub(crate) fn parse_if_value_expr(
     let else_body_pair = inner.next();
 
     if condition {
-        parse_if_body_value(if_body_pair, ctx)
+        parse_if_body_value_with_mode(if_body_pair, ctx, mode)
     } else if let Some(else_pair) = else_body_pair {
         let else_body = first_inner(else_pair, "else body", "else clause")?;
-        parse_if_body_value(else_body, ctx)
+        parse_if_body_value_with_mode(else_body, ctx, mode)
     } else {
         Err(ParseError::InvalidExpression {
             line: condition_line,
@@ -298,12 +312,12 @@ pub(crate) fn parse_if_value_expr(
     }
 }
 
-/// Parse the body of an if expression in value position and return only the value.
-pub(crate) fn parse_if_body_value(
+fn parse_if_body_value_with_mode(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-) -> Result<Value, ParseError> {
-    let mut local_ctx = ctx.clone();
+    mode: &ExpressionMode<'_>,
+) -> Result<EvalValue, ParseError> {
+    let mut local_ctx = ctx.child_scope();
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
@@ -319,7 +333,7 @@ pub(crate) fn parse_if_body_value(
                 local_ctx.set_variable(name, value);
             }
             Rule::expression => {
-                return parse_expression(inner, &local_ctx);
+                return crate::parser::parse_expression_eval_with_mode(inner, &local_ctx, mode);
             }
             Rule::resource_expr | Rule::read_resource_expr | Rule::module_call => {
                 return Err(ParseError::InvalidExpression {

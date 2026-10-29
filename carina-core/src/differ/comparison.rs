@@ -579,9 +579,6 @@ fn contains_post_create_read_incomplete(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Access(access)) => {
             contains_post_create_read_incomplete(access.base())
         }
-        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-            contains_post_create_read_incomplete(value)
-        }
         Value::Deferred(DeferredValue::Secret(inner)) => {
             contains_post_create_read_incomplete(inner)
         }
@@ -729,9 +726,6 @@ fn has_observable_content(value: &Value) -> bool {
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(has_observable_content),
         Value::Concrete(ConcreteValue::StringList(items)) => !items.is_empty(),
         Value::Deferred(DeferredValue::Secret(inner)) => has_observable_content(inner),
-        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-            has_observable_content(value)
-        }
         Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
         | Value::Concrete(ConcreteValue::CanonicalEnum(_))

@@ -71,28 +71,6 @@ fn unavailable_identifier_material_matches_function_call_and_ignores_diagnostics
     );
 }
 
-#[test]
-fn binding_candidate_provenance_does_not_change_identifier_material() {
-    let value = Value::Concrete(ConcreteValue::String("same".into()));
-    let first = Value::Deferred(DeferredValue::BindingCandidate {
-        binding: "first_name".to_string(),
-        value: Box::new(value.clone()),
-    });
-    let second = Value::Deferred(DeferredValue::BindingCandidate {
-        binding: "second_name".to_string(),
-        value: Box::new(value.clone()),
-    });
-
-    assert_eq!(
-        deterministic_value_string(&first),
-        deterministic_value_string(&value)
-    );
-    assert_eq!(
-        deterministic_value_string(&second),
-        deterministic_value_string(&value)
-    );
-}
-
 fn reconcile_anonymous_identifiers(
     resources: &mut [Resource],
     registry: &SchemaRegistry,

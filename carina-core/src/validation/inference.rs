@@ -425,9 +425,6 @@ pub(crate) fn infer_type_from_value_without_bindings(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             infer_type_from_value_without_bindings(inner)
         }
-        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-            infer_type_from_value_without_bindings(value)
-        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             let left = infer_type_from_value_without_bindings(value)?;
             match infer_type_from_value_without_bindings(default) {
@@ -540,9 +537,6 @@ fn infer_type_from_value_with_visiting(
         Value::Deferred(DeferredValue::Interpolation(_)) => Ok(TypeExpr::String),
         Value::Deferred(DeferredValue::Secret(inner)) => {
             infer_type_from_value_with_visiting(inner, bindings, schemas, visiting)
-        }
-        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-            infer_type_from_value_with_visiting(value, bindings, schemas, visiting)
         }
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => Err(InferenceError::UnknownType {
             reason: "saved-plan secret has not been rehydrated".to_string(),

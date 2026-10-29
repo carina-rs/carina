@@ -219,7 +219,6 @@ fn needs_apply_resolution(value: &Value) -> bool {
         Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
-            | DeferredValue::BindingCandidate { .. }
             | DeferredValue::Coalesce { .. }
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
@@ -360,16 +359,6 @@ fn assert_fully_resolved(
             binding,
             bindings,
         )),
-        Value::Deferred(DeferredValue::BindingCandidate { binding, .. }) => {
-            Err(unresolved_binding_message(
-                attribute_key,
-                UnresolvedSite::Ref {
-                    path: binding.clone(),
-                },
-                binding,
-                bindings,
-            ))
-        }
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             Err(SerializationError::UnresolvedCoalesce {
                 context: SerializationContext::WasmBoundary,
@@ -483,9 +472,6 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { path }) => out.push(path.binding()),
         Value::Deferred(DeferredValue::BindingRef { binding }) => out.push(binding.as_str()),
-        Value::Deferred(DeferredValue::BindingCandidate { binding, .. }) => {
-            out.push(binding.as_str())
-        }
         Value::Deferred(DeferredValue::Secret(inner)) => collect_unresolved_bindings(inner, out),
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => {}
         Value::Deferred(DeferredValue::Interpolation(parts)) => {

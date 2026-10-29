@@ -67,6 +67,7 @@ fn empty_parsed() -> ParsedFile {
         requires: Vec::new(),
         structural_bindings: HashSet::new(),
         parser_binding_metadata: Default::default(),
+        parsed_binding_uses: Default::default(),
         warnings: Vec::new(),
         deferred_for_expressions: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -698,7 +699,7 @@ fn binding_referenced_only_by_deferred_for_iterable_is_not_unused() {
 }
 
 #[test]
-fn seeded_bare_structural_binding_is_preserved_for_typed_validation() {
+fn seeded_bare_structural_binding_is_a_typed_pending_slot() {
     let src = r#"
         let _ = aws.s3.Bucket {
             bucket_name = role
@@ -723,17 +724,21 @@ fn seeded_bare_structural_binding_is_preserved_for_typed_validation() {
     )
     .expect("a seeded structural handle reaches typed validation");
 
-    let bucket_name = parsed.resources[0]
-        .attributes
-        .get("bucket_name")
-        .expect("bucket_name");
     assert!(
-        matches!(
-            bucket_name,
-            Value::Deferred(DeferredValue::BindingRef { binding }) if binding == "role"
-        ),
-        "seeded handle was not preserved: {bucket_name:?}",
+        parsed.resources[0].attributes.get("bucket_name").is_none(),
+        "a pending structural leaf must not manufacture a runtime Value",
     );
+    let use_site = parsed
+        .bare_binding_uses()
+        .uses()
+        .find(|use_site| use_site.name == "role")
+        .expect("seeded structural use");
+    assert!(matches!(
+        use_site.binding,
+        crate::parser::BareBindingKind::Structural { .. }
+    ));
+    assert_eq!(use_site.path.root_name(), "bucket_name");
+    assert_eq!(parsed.bare_binding_uses().pending_slots().len(), 1);
 }
 
 #[test]

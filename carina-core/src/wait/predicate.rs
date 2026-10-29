@@ -276,9 +276,6 @@ fn unresolved_enum_identifier(value: &Value) -> Option<&str> {
             .find_map(|argument| unresolved_enum_identifier(argument.walker_value())),
         Value::Deferred(DeferredValue::Access(access)) => unresolved_enum_identifier(access.base()),
         Value::Deferred(DeferredValue::Secret(inner)) => unresolved_enum_identifier(inner),
-        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-            unresolved_enum_identifier(value)
-        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             unresolved_enum_identifier(value).or_else(|| unresolved_enum_identifier(default))
         }

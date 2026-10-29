@@ -463,6 +463,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // Expand managed resources with substituted values.
         let mut resources: Vec<Resource> = Vec::new();
         let mut expanded_parser_metadata = crate::parser::ParserBindingMetadata::default();
+        let mut expanded_binding_uses = module.parsed_binding_uses.clone();
         for resource in &module.resources {
             let source_file = module
                 .parser_binding_metadata
@@ -483,6 +484,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 expanded_parser_metadata
                     .insert_resource_source_file(expanded.id.clone(), source_file.to_path_buf());
             }
+            expanded_binding_uses.remap_resource_owner(&resource.id, &expanded.id);
             resources.push(expanded);
         }
 
@@ -508,6 +510,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 expanded_parser_metadata
                     .insert_resource_source_file(expanded.id.clone(), source_file.to_path_buf());
             }
+            expanded_binding_uses.remap_resource_owner(&data_source.id, &expanded.id);
             data_sources.push(expanded);
         }
 
@@ -750,6 +753,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             requires: Vec::new(),
             structural_bindings: HashSet::new(),
             parser_binding_metadata: expanded_parser_metadata,
+            parsed_binding_uses: expanded_binding_uses,
             warnings: module.warnings.clone(),
 
             // ExpansionTrace (#3306): pre-built above against the
@@ -2027,16 +2031,6 @@ fn substitute_arguments_with_position(
                 .value()
                 .clone()
         }
-        Value::Deferred(DeferredValue::BindingCandidate { binding, value }) => {
-            Value::Deferred(DeferredValue::BindingCandidate {
-                binding: binding.clone(),
-                value: Box::new(substitute_arguments_with_position(
-                    value,
-                    arguments,
-                    ArgumentSubstitutionPosition::Value,
-                )?),
-            })
-        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let Some(argument) = arguments.arguments.get(path.binding()) else {
                 return Ok(value.clone());
@@ -2243,20 +2237,6 @@ pub(super) fn rewrite_intra_module_refs(
     intra_module_bindings: &HashSet<String>,
 ) -> Value {
     match value {
-        Value::Deferred(DeferredValue::BindingCandidate { binding, value }) => {
-            Value::Deferred(DeferredValue::BindingCandidate {
-                binding: if intra_module_bindings.contains(binding) {
-                    apply_instance_prefix(instance_prefix, binding)
-                } else {
-                    binding.clone()
-                },
-                value: Box::new(rewrite_intra_module_refs(
-                    value,
-                    instance_prefix,
-                    intra_module_bindings,
-                )),
-            })
-        }
         Value::Deferred(DeferredValue::BindingRef { binding })
             if intra_module_bindings.contains(binding) =>
         {

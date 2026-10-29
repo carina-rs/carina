@@ -574,12 +574,6 @@ fn deterministic_value_string(value: &Value) -> String {
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             format!("BindingRef({})", binding)
         }
-        // BindingCandidate carries authoring provenance only. Resource
-        // identity must remain a function of the resolved value, never of the
-        // lexical binding name used to spell that value.
-        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-            deterministic_value_string(value)
-        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => format!(
             "Coalesce({}, {})",
             deterministic_value_string(value),

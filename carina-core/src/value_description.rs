@@ -38,9 +38,6 @@ impl ValueDescription {
             }
             Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource reference".to_string(),
             Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference".to_string(),
-            Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
-                return Self::of(value);
-            }
             Value::Deferred(DeferredValue::Coalesce { .. }) => "coalesce expression".to_string(),
             Value::Deferred(DeferredValue::Interpolation(_)) => "interpolation".to_string(),
             Value::Deferred(
