@@ -3,6 +3,14 @@
 <!-- derived-from ./2026-05-09-wait-construct-design.md -->
 <!-- constrained-by ./2026-05-09-wait-construct-design.md#value-semantics -->
 
+> **Correction (2026-10-29, carina#3094).** The "Chosen design" §3 and the
+> "Blast radius" section below describe threading the parser `WaitBinding`
+> into the plan and apply resolver entry points only. The #3085
+> implementation covered two more paths and introduced `WaitAliasSpec`, and
+> the resolver entry points have since changed shape. See
+> [Threading surface as built, and today](#threading-surface-as-built-and-today)
+> at the end of this document. The text below is kept as written at the time.
+
 ## Goal
 
 Make `<wait-binding>.<attr>` (e.g. `cert_issued.certificate_arn`)
@@ -355,3 +363,62 @@ in the type system rather than reconstruct them with runtime lookups.
   wait effect out to all consumers (it does via the existing dependency
   machinery — the value-layer change does not alter this, but the
   test plan item 4 fixture should include two consumers to lock it).
+
+## Threading surface as built, and today
+
+*Added 2026-10-29 for carina#3094. Checked against main at 948e9c45.*
+
+**`WaitAliasSpec` instead of `WaitBinding`.** The implementation does not
+pass the parser `WaitBinding` into resolution. It introduced
+`carina_core::binding_index::WaitAliasSpec { binding, target }` (typed
+`BindingName`s), with `From<&WaitBinding>` for the source-driven paths. This
+keeps carina-core resolution independent of the parser AST, and lets the
+saved-plan path, which has no AST, build the same spec from its serialized
+pairs.
+
+**Two paths the design omitted.** Both needed the alias, or a
+`<wait-binding>.<attr>` reference would stay unresolved and reappear as a
+phantom diff:
+
+1. *Apply from a saved plan* (`carina apply <plan>`). The plan file persists
+   the wait bindings as `PlanFile.wait_bindings: Vec<PlanWaitBinding>`, a
+   `String` pair projection (`carina-cli/src/commands/plan.rs`), because the
+   parser `WaitBinding` is not `Serialize`. This mirrors `UpstreamSource`.
+   The saved-plan apply converts them back to `WaitAliasSpec` for its
+   re-resolution, including the export-only fast path
+   (`carina-cli/src/commands/apply/mod.rs`).
+2. *Export resolution*. `exports { x = cert_issued.arn }` resolves through
+   the same binding construction, so the aliases are threaded through the
+   export chain. Today that is `FinalizeApplyInput.wait_aliases` and
+   `ResolveExportValuesPostApplyInput.wait_aliases`
+   (`resolve_export_values_post_apply`,
+   `carina-cli/src/commands/shared/state_writeback.rs`), and the
+   `wait_aliases` argument of `persist_exports_only`
+   (`carina-cli/src/commands/apply/mod.rs`). The #3085 implementation named
+   the post-apply resolver `resolve_exports`; it has since been replaced by
+   `resolve_export_values_post_apply`. The saved-plan
+   apply passes the reconstructed aliases to `FinalizeApplyInput` too, but
+   runs no export resolution there: saved plans do not persist export
+   parameters, so `state.exports` is preserved and source-driven
+   `carina apply` reconciles exports (#2932).
+
+**Where the aliases enter today.** `ResolvedBindings::from_resources_with_state`
+no longer exists, and `resolve_refs_for_plan` /
+`resolve_refs_with_state_and_remote` now take an already-built
+`ResolvedBindings` instead of extra parameters. The aliases enter where the
+bindings are built, as a required `wait_aliases: &[WaitAliasSpec]` field of
+each typed input:
+
+- `LivePreApplyInputs` (`ResolvedBindings::pre_apply_live`, plan and
+  source-driven apply);
+- `SavedPreApplyInputs` (`ResolvedBindings::pre_apply_saved`, apply from a
+  saved plan);
+- `LivePreDataSourceReadInputs` (`ResolvedBindings::pre_data_source_read_live`,
+  also used by `ResolvedBindings::for_validation` for CLI and LSP
+  validation).
+
+Because the field is required on every input type, a new binding
+construction site cannot forget the aliases; it can only pass an empty
+slice deliberately. The two type-level pieces of the design shipped as
+described: `BindingNameKind::Wait { target }` and
+`BindingValueSource::WaitAlias { target }`.
