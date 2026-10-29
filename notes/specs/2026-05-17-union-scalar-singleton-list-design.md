@@ -2,6 +2,13 @@
 
 <!-- constrained-by ./2026-05-16-schema-aware-detail-rows-design.md -->
 
+> **Correction (2026-10-29, carina#3082).** This design claims that reusing
+> `union_member_score` makes the canonicalizer and the validator pick the
+> same Union member, so the two "can't drift". That was stronger than what
+> the #3080 implementation did, and the mechanism it describes no longer
+> exists. See [Member selection as built, and today](#member-selection-as-built-and-today)
+> at the end of this document. The text below is kept as written at the time.
+
 ## Goal
 
 Make `value::canonicalize_with_type` recurse through
@@ -299,3 +306,47 @@ predicates.
   the #2481 invariant for Union nesting; it must not be paired with any
   comparator change. The implementation PR must explicitly NOT touch
   `type_aware_equal`'s Union arm (the rejected approach B).
+
+## Member selection as built, and today
+
+*Added 2026-10-29 for carina#3082. Checked against main at 948e9c45.*
+
+**What #3080 actually shipped.** The canonicalizer and the validator both
+called `union_member_score`, but over different scopes. `validate_union`
+scored a member only after that member's `validate_concrete` had failed,
+because its job was to choose which member's error to report; the first
+member that validated `Ok` short-circuited the loop. `select_union_member`
+scored every member, because its job was to choose the member to
+canonicalize into. For the shapes the fix targeted (`Union[Struct, String]`,
+`Union[String, List<String>]`) the members are shape-disjoint, so exactly
+one member scores above zero and both functions chose the same member. The
+equivalence held because those unions are shape-disjoint, not
+unconditionally: for overlapping members the two scopes could pick
+differently. The #3080 implementation already said so in the doc comments of
+`select_union_member` and the `canonicalize_with_type` Union arm.
+
+**What main does now.** `union_member_score`, `validate_union` and
+`select_union_member` no longer exist. #3756 replaced `union_member_score`
+with a member judgement used to explain why a value matched no member, and
+#3881 introduced a fit witness together with the failure rank
+(`UnionFailureRank`) that today's diagnostics use:
+
+- Acceptance is decided once, by `fit_union_members_on_path`
+  (`carina-core/src/schema/mod.rs`). It fits the complete value against
+  each member with the schema-aware validator, keeps only members that
+  accept, and orders them by semantic exactness (`FitExactness`) and then by
+  declaration order. Members that reject never compete.
+- The validator's Union arm calls `select_union_member_on_path`, which uses
+  that fit first. Only when no member accepts does it fall back to
+  `UnionFailureRank` to choose which errors to report.
+- The canonicalizer (`canonicalize_with_type_for_purpose` in
+  `carina-core/src/value.rs`) computes the fit for the whole value and then
+  consumes the witness (`canonicalize_with_fit`). The witness records the
+  chosen member, so canonicalization never selects a member a second time.
+
+So the property this design wanted now holds by construction, through a
+different mechanism than the one described above: the member a value is
+canonicalized into is the member the fit accepted, for overlapping unions as
+well. The one remaining difference between the two callers is the
+canonicalization purpose they pass: validation fits authored desired values,
+while canonicalization uses its caller's purpose (desired or state).

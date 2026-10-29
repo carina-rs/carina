@@ -862,6 +862,25 @@ impl ModuleSignature {
         }
     }
 
+    fn dependency_target_type(type_expr: &TypeExpr) -> Option<ResourceTypePath> {
+        match type_expr {
+            TypeExpr::Ref(path) | TypeExpr::DottedUnresolved(path) => Some(path.clone()),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Simple(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_)
+            | TypeExpr::Unknown => None,
+        }
+    }
+
     /// Build a module signature from a directory-based module (ParsedFile with top-level arguments/attributes)
     pub fn from_directory_module<E>(parsed: &crate::parser::File<E>, module_name: &str) -> Self {
         // Build requires (typed inputs)
@@ -974,11 +993,7 @@ impl ModuleSignature {
                 let binding_name = path.binding();
                 let target_type = if let Some(arg_type) = argument_types.get(binding_name) {
                     // Argument parameter reference (lexically scoped)
-                    if let TypeExpr::Ref(p) = arg_type {
-                        Some(p.clone())
-                    } else {
-                        None
-                    }
+                    Self::dependency_target_type(arg_type)
                 } else {
                     binding_types.get(binding_name).cloned()
                 };
@@ -998,11 +1013,7 @@ impl ModuleSignature {
             // attribute slot.
             Value::Deferred(DeferredValue::BindingRef { binding }) => {
                 let target_type = if let Some(arg_type) = argument_types.get(binding) {
-                    if let TypeExpr::Ref(p) = arg_type {
-                        Some(p.clone())
-                    } else {
-                        None
-                    }
+                    Self::dependency_target_type(arg_type)
                 } else {
                     binding_types.get(binding).cloned()
                 };
@@ -1127,10 +1138,7 @@ impl ModuleSignature {
             )) => {
                 let target_type = argument_types
                     .get(name)
-                    .and_then(|arg_type| match arg_type {
-                        TypeExpr::Ref(path) => Some(path.clone()),
-                        _ => None,
-                    });
+                    .and_then(Self::dependency_target_type);
                 graph.add_edge(
                     from.to_string(),
                     TypedDependency {
@@ -1700,6 +1708,54 @@ mod tests {
         assert_eq!(deps[0].target, "vpc");
         assert_eq!(deps[0].attribute, "");
         assert!(deps[0].target_type.is_some());
+    }
+
+    #[test]
+    fn dotted_unresolved_argument_type_is_retained_for_every_dependency_value_shape() {
+        let argument_path = ResourceTypePath::new("awscc", "ec2.Vpc");
+        let argument_types = HashMap::from([(
+            "vpc".to_string(),
+            TypeExpr::DottedUnresolved(argument_path.clone()),
+        )]);
+        let binding_types = HashMap::new();
+        let values = [
+            ("resource ref", Value::resource_ref("vpc", "id", vec![])),
+            (
+                "bare binding ref",
+                Value::Deferred(DeferredValue::BindingRef {
+                    binding: "vpc".to_string(),
+                }),
+            ),
+            (
+                "module argument placeholder",
+                Value::Deferred(DeferredValue::Unknown(
+                    crate::resource::UnknownReason::ModuleArgument {
+                        name: "vpc".to_string(),
+                        source_line: 1.into(),
+                        diagnostic_name: None,
+                    },
+                )),
+            ),
+        ];
+
+        for (label, value) in values {
+            let mut graph = TypedDependencyGraph::new();
+            ModuleSignature::collect_typed_dependencies(
+                "consumer",
+                "vpc_id",
+                &value,
+                &mut graph,
+                &binding_types,
+                &argument_types,
+            );
+            let dependencies = graph.dependencies_of("consumer");
+            assert_eq!(dependencies.len(), 1, "{label}: {dependencies:#?}");
+            assert_eq!(
+                dependencies[0].target_type.as_ref(),
+                Some(&argument_path),
+                "{label} dropped the unresolved dotted resource type",
+            );
+        }
     }
 
     #[test]

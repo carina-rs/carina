@@ -144,7 +144,13 @@ impl CompletionProvider {
             CompletionContext::AfterEqualsInModuleCall {
                 module_name,
                 arg_name,
-            } => self.module_call_arg_value_completions(&module_name, &arg_name, &text, base_path),
+            } => self.module_call_arg_value_completions(
+                &module_name,
+                &arg_name,
+                &text,
+                base_path,
+                provider_ctx,
+            ),
             CompletionContext::InsideStructBlock {
                 resource_type,
                 attr_path,
@@ -694,6 +700,7 @@ impl CompletionProvider {
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
+        let mut field_is_enum = false;
         if let Some(schema) = self.lookup_schema(resource_type)
             && let Some(resolved) = schema.effective_node_at_authored_path(attr_path)
             && !resolved.is_read_only()
@@ -703,15 +710,25 @@ impl CompletionProvider {
                 if field.is_read_only() {
                     return vec![];
                 }
+                field_is_enum = carina_core::resource::EnumValueResolver::with_defs(
+                    field.field_type(),
+                    schema.as_schema().defs(),
+                )
+                .enum_identity()
+                .is_some();
                 completions
                     .extend(self.completions_for_type(field.field_type(), Some(resource_type)));
             }
         }
-        completions.extend(self.in_scope_binding_completions(
+        let mut in_scope = self.in_scope_binding_completions(
             text,
             base_path,
             values::InScopeBindingMode::ValuePosition { current_binding },
-        ));
+        );
+        if field_is_enum {
+            self.remove_structural_resource_bindings(&mut in_scope, text, base_path);
+        }
+        completions.extend(in_scope);
         completions
     }
 }

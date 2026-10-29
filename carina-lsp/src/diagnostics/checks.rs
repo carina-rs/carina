@@ -1917,6 +1917,7 @@ impl DiagnosticEngine {
         semantic_view: &SemanticView<'_>,
         imported_modules: &carina_core::module_resolver::ResolvedModuleSignatures,
         inference_bindings: &carina_core::validation::inference::InferenceBindings,
+        binding_use_report: &carina_core::validation::BindingUseReport,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
@@ -1972,6 +1973,14 @@ impl DiagnosticEngine {
                         .lookup(call)
                         .and_then(|semantic_call| semantic_call.argument(arg_name))
                         .unwrap_or(authored_argument);
+                    if carina_core::validation::binding_use_authority_owns_module_argument(
+                        parsed,
+                        binding_use_report,
+                        call.id(),
+                        arg_name,
+                    ) {
+                        continue;
+                    }
                     if let Some(result) = carina_core::validation::check_module_argument_handle_sink(
                         semantic_argument,
                         &resolved_parameter,
@@ -2018,7 +2027,14 @@ impl DiagnosticEngine {
 
                 // Check for missing required parameters
                 for arg in module_args {
-                    if arg.default.is_none() && !call.contains_argument(&arg.name) {
+                    let pending_slot =
+                        carina_core::validation::module_argument_has_pending_binding_use(
+                            parsed,
+                            call.id(),
+                            &arg.name,
+                        );
+                    if arg.default.is_none() && !call.contains_argument(&arg.name) && !pending_slot
+                    {
                         let (line, col) = module_call_position(call);
                         diagnostics.push(carina_diagnostic(
                             line,

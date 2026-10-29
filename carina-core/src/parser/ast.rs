@@ -1,6 +1,10 @@
 //! Parser AST types and the public `ParsedFile` result.
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
+//!
+//! `TypeExpr::Unknown` is one of several "not determined yet" forms.
+//! `notes/specs/2026-10-29-unknown-forms-current-state.md` explains each form,
+//! which stage produces and consumes it, and how validation treats it.
 
 use super::display_string_literal;
 use super::error::{ParseWarning, WarningKind};
@@ -8,7 +12,7 @@ use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
 use crate::binding_index::IterableBindings;
-use crate::eval_value::{StructuralHandle, StructuralHandleMetadata};
+use crate::eval_value::{StructuralHandle, StructuralHandleKind, StructuralHandleMetadata};
 use crate::provider_source::ProviderSource;
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, Directives, FunctionArgument, GraphNode, LeafNode,
@@ -19,6 +23,7 @@ use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// A for-expression whose iterable is unresolved (e.g., upstream_state not yet available).
 /// Captures the structural shape of the loop body so the plan can show what
@@ -426,14 +431,24 @@ pub enum TypeExpr {
     /// additions (`String | Int`, nullable types via `T | none`) drop
     /// in without another structural change. See carina-rs/carina#2611.
     Union(Vec<TypeExpr>),
-    /// Sentinel for inference failure: an unannotated export whose
-    /// rhs could not be statically typed. Produced *only* by
-    /// `apply_inference`, never by the parser. Type-comparison
-    /// predicates reject `Unknown` against any concrete receiver. When
-    /// inference has a concrete failure reason, the `inference_errors`
-    /// channel surfaces the actionable "type annotation required"
-    /// message; non-inferable values remain `Unknown` for later
-    /// existence-only validation. See #2360 stage 2.
+    /// Sentinel used when no sound static type is available.
+    ///
+    /// Export type inference in `infer_export_params` produces this for both
+    /// non-inferable exports and failed inferences. Failures are reported
+    /// separately with the export's index, while non-inferable values retain
+    /// this sentinel for later existence-only validation.
+    /// `resolve_file_type_exprs_or_unknown` also produces it when upstream
+    /// export discovery encounters a type the consumer's provider context
+    /// cannot name. Deferred-iterable validation uses `List(Unknown)` /
+    /// `Map(Unknown)` as an element-type placeholder.
+    ///
+    /// Consumers treat it as "do not type-check": value type checking accepts
+    /// any value when `Unknown` is expected, `inferred_type_fits` treats it as
+    /// a wildcard in the expected position, and export-reference validation
+    /// checks existence without comparing types. It does not satisfy a
+    /// concrete expectation when it is the inferred actual type. Accessing
+    /// `.` or `[]` on an unknown base is still an inference error. See #2360
+    /// stage 2. #4093 tracks removing this variant.
     Unknown,
 }
 
@@ -1214,11 +1229,305 @@ impl From<Value> for ModuleArgument {
 /// diagnostics and saved-plan normalization, but only the parser can mint an
 /// identity-bearing module call.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SourceFileId(PathBuf);
+pub struct SourceFileId(Arc<Path>);
 
 impl SourceFileId {
+    pub(in crate::parser) fn new(path: PathBuf) -> Self {
+        Self(Arc::from(path.into_boxed_path()))
+    }
+
     pub fn path(&self) -> &Path {
         &self.0
+    }
+}
+
+/// Parser-owned identity of one lexical binding scope.
+///
+/// The directory path separates root and imported-module scopes. A lexical
+/// child additionally carries its source file and parser-minted ordinal so
+/// sibling files cannot mint the same child identity. Authored names are
+/// deliberately not used as scope identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BindingScopeId {
+    directory: Arc<Path>,
+    lexical_source_file: Option<Arc<Path>>,
+    ordinal: u64,
+}
+
+impl BindingScopeId {
+    pub(crate) fn root(source_file: &Path) -> Self {
+        let directory = source_file
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Self {
+            directory: Arc::from(directory.into_boxed_path()),
+            lexical_source_file: None,
+            ordinal: 0,
+        }
+    }
+
+    pub(in crate::parser) fn child(&self, source_file: &Path, ordinal: u64) -> Self {
+        Self {
+            directory: self.directory.clone(),
+            lexical_source_file: Some(Arc::from(source_file.to_path_buf().into_boxed_path())),
+            ordinal,
+        }
+    }
+
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    pub fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+}
+
+/// Stable parser address of a resource that owns an authored value sink.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResourceAddress(ResourceId);
+
+impl ResourceAddress {
+    pub(in crate::parser) fn new(id: ResourceId) -> Self {
+        Self(id)
+    }
+
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.0
+    }
+}
+
+/// Owner of one successfully resolved bare binding use.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BindingUseOwner {
+    Resource(ResourceAddress),
+    ModuleArgument {
+        call: ModuleCallId,
+        argument: String,
+    },
+}
+
+/// One structural step below a resource attribute or module argument.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AttributePathSegment {
+    Attribute(String),
+    ListIndex(usize),
+    Key(String),
+    StructField(String),
+}
+
+/// Parser-authored path from an owning sink to one bare binding leaf.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AttributePath(Arc<[AttributePathSegment]>);
+
+impl AttributePath {
+    pub(in crate::parser) fn root(name: impl Into<String>) -> Self {
+        Self(Arc::from([AttributePathSegment::Attribute(name.into())]))
+    }
+
+    pub(in crate::parser) fn with_segment(&self, segment: AttributePathSegment) -> Self {
+        let mut path = self.0.to_vec();
+        path.push(segment);
+        Self(path.into())
+    }
+
+    pub fn segments(&self) -> &[AttributePathSegment] {
+        &self.0
+    }
+
+    pub fn root_name(&self) -> &str {
+        match self.0.first() {
+            Some(AttributePathSegment::Attribute(name)) => name,
+            Some(
+                AttributePathSegment::ListIndex(_)
+                | AttributePathSegment::Key(_)
+                | AttributePathSegment::StructField(_),
+            )
+            | None => unreachable!("AttributePath is constructed with an attribute root"),
+        }
+    }
+}
+
+/// Parser-side classification of the lexical binding selected for a bare use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BareBindingKind {
+    Value {
+        declaration: crate::schema::BindingKind,
+    },
+    Structural {
+        kind: StructuralHandleKind,
+        resource_type: Option<ResourceTypePath>,
+    },
+}
+
+/// Authored provenance for one bare identifier resolved by normal lexical
+/// lookup. This data is parser-only and never enters [`Value`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BareBindingUse {
+    pub source_file: SourceFileId,
+    pub scope: BindingScopeId,
+    pub owner: BindingUseOwner,
+    pub path: AttributePath,
+    pub name: String,
+    pub span: SourceSpan,
+    pub binding: BareBindingKind,
+}
+
+/// A value sink reserved because at least one structural leaf cannot be
+/// represented as runtime [`Value`] data.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PendingValueSlot {
+    pub owner: BindingUseOwner,
+    pub path: AttributePath,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BareBindingSource {
+    Value {
+        value: Arc<Value>,
+        declared_type: Option<Arc<TypeExpr>>,
+    },
+    Structural(StructuralHandle),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParsedBareBindingUse {
+    pub(crate) authored: BareBindingUse,
+    pub(crate) source: BareBindingSource,
+    pub(crate) pending_slot: Option<PendingValueSlot>,
+}
+
+/// Opaque parsed-file side data for bare binding provenance and pending sinks.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParsedBindingUses {
+    records: Vec<ParsedBareBindingUse>,
+    record_indices_by_owner: HashMap<BindingUseOwnerKey, Vec<usize>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum BindingUseOwnerKey {
+    Resource(ResourceId),
+    ModuleCall(ModuleCallId),
+}
+
+impl From<&BindingUseOwner> for BindingUseOwnerKey {
+    fn from(owner: &BindingUseOwner) -> Self {
+        match owner {
+            BindingUseOwner::Resource(address) => Self::Resource(address.resource_id().clone()),
+            BindingUseOwner::ModuleArgument { call, .. } => Self::ModuleCall(call.clone()),
+        }
+    }
+}
+
+impl ParsedBindingUses {
+    pub(crate) fn record(
+        &mut self,
+        authored: BareBindingUse,
+        source: BareBindingSource,
+        pending_slot: Option<PendingValueSlot>,
+    ) {
+        let owner = BindingUseOwnerKey::from(&authored.owner);
+        let pending_slot = pending_slot.filter(|candidate| {
+            !self
+                .records
+                .iter()
+                .filter_map(|record| record.pending_slot.as_ref())
+                .any(|slot| slot == candidate)
+        });
+        let index = self.records.len();
+        self.records.push(ParsedBareBindingUse {
+            authored,
+            source,
+            pending_slot,
+        });
+        self.record_indices_by_owner
+            .entry(owner)
+            .or_default()
+            .push(index);
+    }
+
+    pub(crate) fn records(&self) -> &[ParsedBareBindingUse] {
+        &self.records
+    }
+
+    pub fn uses(&self) -> impl ExactSizeIterator<Item = &BareBindingUse> {
+        self.records.iter().map(|record| &record.authored)
+    }
+
+    pub fn pending_slots(&self) -> impl Iterator<Item = &PendingValueSlot> {
+        self.records
+            .iter()
+            .filter_map(|record| record.pending_slot.as_ref())
+    }
+
+    pub(crate) fn has_pending_slot_for(&self, use_site: &BareBindingUse) -> bool {
+        self.record_indices_by_owner
+            .get(&BindingUseOwnerKey::from(&use_site.owner))
+            .is_some_and(|indices| {
+                indices.iter().any(|index| {
+                    self.records[*index]
+                        .pending_slot
+                        .as_ref()
+                        .is_some_and(|slot| slot.path.root_name() == use_site.path.root_name())
+                })
+            })
+    }
+
+    pub(crate) fn remap_resource_owner(&mut self, from: &ResourceId, to: &ResourceId) {
+        let from = BindingUseOwnerKey::Resource(from.clone());
+        let to_key = BindingUseOwnerKey::Resource(to.clone());
+        if let Some(indices) = self.record_indices_by_owner.remove(&from) {
+            for index in &indices {
+                let BindingUseOwner::Resource(address) = &mut self.records[*index].authored.owner
+                else {
+                    unreachable!("resource owner index points to a module argument")
+                };
+                *address = ResourceAddress::new(to.clone());
+                if let Some(slot) = &mut self.records[*index].pending_slot {
+                    let BindingUseOwner::Resource(address) = &mut slot.owner else {
+                        unreachable!("resource record has a module-argument pending slot")
+                    };
+                    *address = ResourceAddress::new(to.clone());
+                }
+            }
+            self.record_indices_by_owner
+                .entry(to_key)
+                .or_default()
+                .extend(indices);
+        }
+    }
+
+    pub(crate) fn remap_module_call_owner(&mut self, from: &ModuleCallId, to: &ModuleCallId) {
+        let from = BindingUseOwnerKey::ModuleCall(from.clone());
+        let to_key = BindingUseOwnerKey::ModuleCall(to.clone());
+        if let Some(indices) = self.record_indices_by_owner.remove(&from) {
+            for index in &indices {
+                let BindingUseOwner::ModuleArgument { call, .. } =
+                    &mut self.records[*index].authored.owner
+                else {
+                    unreachable!("module-call owner index points to a resource")
+                };
+                *call = to.clone();
+                if let Some(slot) = &mut self.records[*index].pending_slot {
+                    let BindingUseOwner::ModuleArgument { call, .. } = &mut slot.owner else {
+                        unreachable!("module-call record has a resource pending slot")
+                    };
+                    *call = to.clone();
+                }
+            }
+            self.record_indices_by_owner
+                .entry(to_key)
+                .or_default()
+                .extend(indices);
+        }
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        for record in other.records {
+            self.record(record.authored, record.source, record.pending_slot);
+        }
     }
 }
 
@@ -1252,9 +1561,9 @@ pub struct ModuleCallId {
 }
 
 impl ModuleCallId {
-    fn direct(source_file: PathBuf, call_span: SourceSpan) -> Self {
+    pub(in crate::parser) fn direct(source_file: PathBuf, call_span: SourceSpan) -> Self {
         Self {
-            source_file: SourceFileId(source_file),
+            source_file: SourceFileId::new(source_file),
             call_span,
             expansion: CallExpansion::Direct,
         }
@@ -1989,6 +2298,10 @@ impl ExportParamLike for InferredExportParam {
 /// `apply_inference` and yields `File<InferredExportParam>` where every
 /// export's `type_expr` is bare. Every other field is identical between
 /// phases. See `notes/specs/2026-05-03-typeexpr-stage2-design.md`.
+///
+/// Bare-binding provenance is read-only outside the parser pipeline in
+/// production builds, so callers cannot erase it to bypass
+/// [`crate::validation::resolve_bare_binding_uses`].
 #[derive(Debug, Clone)]
 pub struct File<E> {
     pub providers: Vec<ProviderConfig>,
@@ -2028,6 +2341,15 @@ pub struct File<E> {
     /// Evaluator-only classification carried between directory parse passes.
     #[doc(hidden)]
     pub parser_binding_metadata: ParserBindingMetadata,
+    /// Bare binding provenance and typed pending value slots.
+    #[cfg(not(test))]
+    #[doc(hidden)]
+    parsed_binding_uses: ParsedBindingUses,
+    /// Crate-local unit-test fixtures may initialize the otherwise-private
+    /// provenance channel.
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub(crate) parsed_binding_uses: ParsedBindingUses,
     /// Non-fatal warnings collected during parsing.
     pub warnings: Vec<ParseWarning>,
     /// For-expressions whose iterables are unresolved; displayed as deferred in plan.
@@ -2074,6 +2396,7 @@ impl<E> Default for File<E> {
             requires: Vec::new(),
             structural_bindings: HashSet::new(),
             parser_binding_metadata: ParserBindingMetadata::default(),
+            parsed_binding_uses: ParsedBindingUses::default(),
             warnings: Vec::new(),
             deferred_for_expressions: Vec::new(),
             expansion_trace: crate::resource::ExpansionTrace::new(),
@@ -2082,6 +2405,75 @@ impl<E> Default for File<E> {
 }
 
 impl<E> File<E> {
+    pub fn bare_binding_uses(&self) -> &ParsedBindingUses {
+        &self.parsed_binding_uses
+    }
+
+    pub(crate) fn empty_with_parsed_binding_uses(parsed_binding_uses: ParsedBindingUses) -> Self {
+        Self {
+            parsed_binding_uses,
+            ..Self::default()
+        }
+    }
+
+    /// Merge one same-phase file without exposing mutable bare-binding
+    /// provenance. The exhaustive destructure keeps new `File` fields from
+    /// being silently dropped by directory and module merges.
+    pub(crate) fn merge_from(&mut self, source: Self) {
+        let File {
+            providers,
+            resources,
+            data_sources,
+            compositions,
+            variables,
+            uses,
+            module_calls,
+            arguments,
+            attribute_params,
+            export_params,
+            backend,
+            state_blocks,
+            user_functions,
+            upstream_states,
+            wait_bindings,
+            requires,
+            structural_bindings,
+            parser_binding_metadata,
+            parsed_binding_uses,
+            warnings,
+            deferred_for_expressions,
+            expansion_trace,
+        } = source;
+
+        self.providers.extend(providers);
+        self.resources.extend(resources);
+        self.data_sources.extend(data_sources);
+        self.compositions.extend(compositions);
+        self.variables.extend(variables);
+        self.uses.extend(uses);
+        self.module_calls.extend(module_calls);
+        self.arguments.extend(arguments);
+        self.attribute_params.extend(attribute_params);
+        self.export_params.extend(export_params);
+        self.state_blocks.extend(state_blocks);
+        self.user_functions.extend(user_functions);
+        self.upstream_states.extend(upstream_states);
+        self.wait_bindings.extend(wait_bindings);
+        self.requires.extend(requires);
+        self.structural_bindings.extend(structural_bindings);
+        self.parser_binding_metadata.extend(parser_binding_metadata);
+        self.parsed_binding_uses.extend(parsed_binding_uses);
+        self.warnings.extend(warnings);
+        self.deferred_for_expressions
+            .extend(deferred_for_expressions);
+        for (leaf, call_sites) in expansion_trace.leaf_to_call_sites {
+            self.expansion_trace.record(leaf, call_sites);
+        }
+        if let Some(backend) = backend {
+            self.backend = Some(backend);
+        }
+    }
+
     /// Transform only the export-param phase (`File<E>` → `File<B>`),
     /// applying `f` to the export params and moving every other field
     /// through unchanged.
@@ -2115,6 +2507,7 @@ impl<E> File<E> {
             requires,
             structural_bindings,
             parser_binding_metadata,
+            parsed_binding_uses,
             warnings,
             deferred_for_expressions,
             expansion_trace,
@@ -2139,6 +2532,7 @@ impl<E> File<E> {
             requires,
             structural_bindings,
             parser_binding_metadata,
+            parsed_binding_uses,
             warnings,
             deferred_for_expressions,
             expansion_trace,
@@ -3030,6 +3424,7 @@ mod substitute_placeholder_tests {
             requires: _,
             structural_bindings: _,
             parser_binding_metadata: _,
+            parsed_binding_uses: _,
             warnings: _,
             deferred_for_expressions: _,
             expansion_trace: _,

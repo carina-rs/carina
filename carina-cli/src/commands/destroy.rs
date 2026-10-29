@@ -2270,10 +2270,8 @@ mod tests {
             unresolved_attributes: Default::default(),
             binding: None,
         };
-        let parsed = carina_core::parser::InferredFile {
-            providers: vec![provider_config.clone(), provider_config],
-            ..Default::default()
-        };
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers = vec![provider_config.clone(), provider_config];
         let state_path = project.path().join("state.json");
         let lock_path = state_path.with_extension("lock");
         let backend: Arc<dyn StateBackend> =

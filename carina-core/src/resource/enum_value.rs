@@ -246,6 +246,41 @@ impl<'a> EnumValueResolver<'a> {
         self.resolve_text(raw.as_str(), EnumInputPhase::RawDsl)
     }
 
+    pub fn enum_identity(&self) -> Option<TypeIdentity> {
+        self.parts().ok().map(|(identity, ..)| identity.clone())
+    }
+
+    /// Resolve one authored DSL member and return both its canonical API value
+    /// and the fully-qualified spelling accepted by this declaration.
+    ///
+    /// The qualified form is derived from the declaration's structured
+    /// identity and API→DSL map; callers never reconstruct it from display
+    /// strings.
+    pub fn resolve_member(
+        &self,
+        raw: &RawEnumIdentifier,
+    ) -> Result<(CanonicalEnumValue, ExpectedEnumVariant), TypeError> {
+        let canonical = match self.resolve_raw(raw) {
+            Ok(canonical) => canonical,
+            Err(dsl_error) if matches!(raw.parsed(), RawEnumIdentifierParts::Bare { .. }) => {
+                // Binding-shadow detection is intentionally broader than
+                // normal DSL value acceptance: a lexical binding can collide
+                // with either the preferred DSL alias (`vpc`) or the
+                // provider's canonical API spelling (`VPC`). The latter is
+                // still rejected as an ordinary authored enum value, but it
+                // must be recognized here so the diagnostic can offer the
+                // TypeIdentity-derived accepted spelling.
+                self.resolve_state_text(raw.as_str())
+                    .map_err(|_| dsl_error)?
+            }
+            Err(error) => return Err(error),
+        };
+        let (identity, _values, _aliases, _validate, dsl_map) = self.parts()?;
+        let dsl_value = dsl_map.dsl_for(canonical.api_value());
+        let qualified = ExpectedEnumVariant::from_identity(identity, dsl_value.into_owned(), false);
+        Ok((canonical, qualified))
+    }
+
     pub fn resolve_state_text(&self, text: &str) -> Result<CanonicalEnumValue, TypeError> {
         self.resolve_text(text, EnumInputPhase::StateText)
     }

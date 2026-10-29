@@ -1815,10 +1815,8 @@ mod schema_fingerprint_tests {
     }
 
     fn saved_provider_configs(configs: Vec<ProviderConfig>) -> SavedProviderConfigs {
-        let parsed = carina_core::parser::InferredFile {
-            providers: configs,
-            ..Default::default()
-        };
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers = configs;
         let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &HashMap::new(),
@@ -5807,10 +5805,8 @@ mod run_plan_out_tests {
                 |_| carina_core::data_source_value::DataSourceValue::deferred_to_apply(Vec::new()),
             );
 
-        let parsed = carina_core::parser::ParsedFile {
-            data_sources: vec![parsed_data_source],
-            ..Default::default()
-        };
+        let mut parsed = carina_core::parser::ParsedFile::default();
+        parsed.data_sources = vec![parsed_data_source];
         let ctx = crate::wiring::PlanContext {
             plan: Plan::new(),
             provider: ProviderRouter::new(),
@@ -6006,10 +6002,8 @@ mod run_plan_out_tests {
             unresolved_attributes: indexmap::IndexMap::new(),
             binding: None,
         };
-        let parsed = carina_core::parser::InferredFile {
-            providers: vec![configured.clone()],
-            ..Default::default()
-        };
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers = vec![configured.clone()];
         let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &HashMap::new(),

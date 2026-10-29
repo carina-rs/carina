@@ -5772,7 +5772,7 @@ let child = selector { items = ["x", "y"] }
 }
 
 #[test]
-fn bare_structural_handle_is_a_real_engine_parse_error() {
+fn bare_structural_handle_is_a_real_engine_validation_error() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let mut schemas = SchemaRegistry::new();
@@ -5805,8 +5805,8 @@ mock.test.resource {
 
     let document = create_document(source);
     assert!(
-        document.parsed().is_none(),
-        "the parser must reject the handle"
+        document.parsed().is_some(),
+        "the parser must preserve the authored use for typed validation"
     );
     let diagnostics = engine.analyze(&document, None);
     let diagnostic = diagnostics
@@ -12044,6 +12044,108 @@ fn sibling_user_function_for_iterable_uses_the_directory_function_table() {
         }),
         "the directory-defined function must drive the iterable: {diagnostics:#?}",
     );
+}
+
+fn sibling_for_before_anonymous_resource_diagnostics(
+    for_count: &str,
+    trailing_count: &str,
+) -> Vec<Diagnostic> {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::required("count", AttributeType::int()).build())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let engine = custom_engine(schemas);
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("values.crn"),
+        "provider mock {}\nlet sibling_values = [\"one\", \"two\"]\n",
+    )
+    .unwrap();
+    let source = format!(
+        "for ignored in sibling_values {{\n  mock.test.resource {{\n    count = {for_count}\n  }}\n}}\n\nmock.test.resource {{\n  count = {trailing_count}\n}}\n"
+    );
+    std::fs::write(root.path().join("main.crn"), &source).unwrap();
+
+    analyze_with_buffer(&engine, root.path(), "main.crn", &source)
+}
+
+#[test]
+fn sibling_expanded_for_does_not_shift_invalid_value_onto_valid_anonymous_resource() {
+    let diagnostics = sibling_for_before_anonymous_resource_diagnostics("\"wrong\"", "1");
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("expected Int"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(mismatches.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(mismatches[0].range.start.line, 2);
+}
+
+#[test]
+fn sibling_expanded_for_does_not_hide_invalid_trailing_anonymous_resource() {
+    let diagnostics = sibling_for_before_anonymous_resource_diagnostics("1", "\"wrong\"");
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("expected Int"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(mismatches.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(mismatches[0].range.start.line, 7);
+}
+
+#[test]
+fn static_union_uses_function_value_whose_argument_is_a_sibling_file_let() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("test.resource")
+            .attribute(
+                AttributeSchema::required(
+                    "mode",
+                    AttributeType::union(vec![
+                        AttributeType::enum_(
+                            TypeIdentity::bare("Mode"),
+                            Some(vec!["active".to_string(), "passive".to_string()]),
+                            vec![],
+                            None,
+                            None,
+                        ),
+                        AttributeType::int(),
+                    ]),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let engine = custom_engine(schemas);
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("values.crn"),
+        "provider test {}\nlet sibling_mode = \"invalid\"\n",
+    )
+    .unwrap();
+    let source = "let target = test.test.resource {\n  mode = upper(sibling_mode)\n}\n";
+    std::fs::write(root.path().join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, root.path(), "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("expects an enum identifier")
+                && diagnostic.message.contains("active, passive")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].range.start.line, 1);
 }
 
 #[test]

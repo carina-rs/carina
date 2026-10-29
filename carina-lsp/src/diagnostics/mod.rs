@@ -4,7 +4,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -13,13 +13,36 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use crate::document::Document;
 use crate::position;
 use carina_core::parser::{
-    ParseError, ParsedFile, ResourceRef, WarningKind, contains_function_call,
+    ParseError, ParsedFile, ResourceRef, SourceSpan, WarningKind, contains_function_call,
 };
 use carina_core::provider::{
     HostErrorCause, ProviderError, ProviderFactory, SuspendedValidationId,
 };
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
+
+fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
+    let text = doc.text();
+    let position = |byte: usize| {
+        if byte > text.len() || !text.is_char_boundary(byte) {
+            return None;
+        }
+        let prefix = &text[..byte];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
+        Some(Position {
+            line,
+            character: position::byte_offset_to_char_offset(
+                &text[line_start..byte],
+                byte - line_start,
+            ),
+        })
+    };
+    Some(Range {
+        start: position(span.start_byte())?,
+        end: position(span.end_byte())?,
+    })
+}
 
 #[derive(Default)]
 pub(super) struct ProviderValidationDeduplicator {
@@ -580,6 +603,77 @@ impl DiagnosticEngine {
             );
             let inference_bindings =
                 carina_core::validation::inference::bindings_from_parsed(binding_input);
+            let binding_type_context = carina_core::validation::ValidationTypeContext::new(
+                binding_input,
+                &self.schemas,
+                &self.provider_context,
+                &module_signatures,
+            );
+            let binding_use_report = carina_core::validation::check_bare_binding_uses(
+                binding_input,
+                &binding_type_context,
+            );
+            // A direct bare binding occupies the complete attribute value, so
+            // the shared authority owns that sink even when it succeeds. In
+            // particular, an enum-typed argument must not be reinterpreted by
+            // the LSP's legacy BindingIndex pass using a differently enriched
+            // bootstrap identity. Nested uses keep the surrounding schema
+            // walk so unrelated sibling leaves are still validated.
+            let binding_error_sinks = parsed
+                .bare_binding_uses()
+                .uses()
+                .filter(|use_site| {
+                    use_site.path.segments().len() == 1
+                        || binding_use_report.findings().iter().any(|finding| {
+                            finding.use_site.source_file == use_site.source_file
+                                && finding.use_site.span == use_site.span
+                                && finding.use_site.name == use_site.name
+                        })
+                })
+                .filter_map(|use_site| match &use_site.owner {
+                    carina_core::parser::BindingUseOwner::Resource(address) => Some((
+                        address.resource_id().clone(),
+                        use_site.path.root_name().to_string(),
+                    )),
+                    carina_core::parser::BindingUseOwner::ModuleArgument { .. } => None,
+                })
+                .collect::<HashSet<_>>();
+            let pending_resource_sinks = parsed
+                .bare_binding_uses()
+                .pending_slots()
+                .filter_map(|slot| match &slot.owner {
+                    carina_core::parser::BindingUseOwner::Resource(address) => Some((
+                        address.resource_id().clone(),
+                        slot.path.root_name().to_string(),
+                    )),
+                    carina_core::parser::BindingUseOwner::ModuleArgument { .. } => None,
+                })
+                .collect::<HashSet<_>>();
+            let diagnostic_file = current_file_path.unwrap_or_else(|| doc.source_file());
+            for finding in binding_use_report.findings() {
+                if finding.use_site.source_file.path() != diagnostic_file {
+                    continue;
+                }
+                let Some(range) = parser_span_range(doc, finding.use_site.span) else {
+                    continue;
+                };
+                let severity = DiagnosticSeverity::ERROR;
+                if let Some(type_error) = finding.error.type_error()
+                    && let Some(mut diagnostic) =
+                        build_enum_diagnostic_from_error(type_error, Some(range))
+                {
+                    diagnostic.severity = Some(severity);
+                    diagnostics.push(diagnostic);
+                } else {
+                    diagnostics.push(Diagnostic {
+                        range,
+                        severity: Some(severity),
+                        source: Some("carina".to_string()),
+                        message: finding.error.to_string(),
+                        ..Default::default()
+                    });
+                }
+            }
             let semantic_file = current_file_path.and_then(|path| {
                 merged_result
                     .as_ref()
@@ -595,6 +689,7 @@ impl DiagnosticEngine {
                     &semantic_view,
                     &module_signatures,
                     &inference_bindings,
+                    &binding_use_report,
                 ));
                 let constraint_diagnostics = current_file_path
                     .zip(merged_result.as_ref())
@@ -669,6 +764,16 @@ impl DiagnosticEngine {
                     .iter_all_resources()
                     .collect::<Vec<carina_core::parser::ResourceRef<'_>>>()
             });
+            let mut anonymous_resource_lines = HashMap::<(String, String), VecDeque<u32>>::new();
+            if let Ok(spans) = carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
+            {
+                for authored in spans {
+                    anonymous_resource_lines
+                        .entry((authored.provider, authored.resource_type))
+                        .or_default()
+                        .push_back(authored.span.start_line.saturating_sub(1) as u32);
+                }
+            }
             // Check resource types — include for-body template resources so
             // attribute/type/enum validation fires inside `for` loops too.
             for (resource_index, rref) in parsed.iter_all_resources().enumerate() {
@@ -685,15 +790,16 @@ impl DiagnosticEngine {
                 // Directory-aware semantic ASTs can expand a sibling-backed
                 // `for` before the buffer-only AST does, so positional
                 // resource indexes are not a stable join key. Named bindings
-                // are parser-enforced identities; anonymous resources fall
-                // back to the buffer value because they have no such key.
-                let semantic_resource_attributes = rref.binding().and_then(|binding| {
-                    semantic_file.and_then(|parsed| {
-                        parsed
-                            .iter_all_resources()
-                            .find(|candidate| candidate.binding() == Some(binding))
-                            .map(|candidate| candidate.attributes())
-                    })
+                // are parser-enforced identities. Anonymous resources have no
+                // stable cross-AST key and therefore keep the buffer value.
+                let semantic_resource_attributes = semantic_file.and_then(|parsed| {
+                    rref.binding()
+                        .and_then(|binding| {
+                            parsed
+                                .iter_all_resources()
+                                .find(|candidate| candidate.binding() == Some(binding))
+                        })
+                        .map(|candidate| candidate.attributes())
                 });
                 let resource_quoted_string_attrs = rref.quoted_string_attrs();
                 let resource_schema = || match rref {
@@ -708,10 +814,24 @@ impl DiagnosticEngine {
                 };
                 let provider = &resource_id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource_id.resource_type);
+                let authored_direct_start = match rref {
+                    ResourceRef::Resource(resource) if resource.binding.is_none() => {
+                        anonymous_resource_lines
+                            .get_mut(&(provider.to_string(), resource_id.resource_type.clone()))
+                            .and_then(VecDeque::pop_front)
+                    }
+                    _ => None,
+                };
                 // Source-range hint for attribute position lookups. Without
                 // this, a `for`-body diagnostic like `mode = "aaa"` would
                 // anchor on the first top-level `mode =` in the file.
-                let scope = resource_source_range(doc, ctx, provider, &resource_id.resource_type);
+                let scope = resource_source_range(
+                    doc,
+                    ctx,
+                    provider,
+                    &resource_id.resource_type,
+                    authored_direct_start,
+                );
 
                 if resource_schema().is_none() {
                     let provider_loaded = self.provider_names.contains(&provider.to_string());
@@ -929,6 +1049,12 @@ impl DiagnosticEngine {
                             // assignments. Skip type and authoring guidance here so it
                             // emits the single writability diagnostic, matching core.
                             if effective_attribute.is_read_only() {
+                                continue;
+                            }
+
+                            if binding_error_sinks
+                                .contains(&(resource_id.clone(), attr_name.clone()))
+                            {
                                 continue;
                             }
 
@@ -1243,6 +1369,20 @@ impl DiagnosticEngine {
                         self.provider_context.custom_type_resolver(),
                     ) {
                         for error in errors {
+                            if let carina_core::schema::TypeError::MissingRequired { name } = &error
+                                && pending_resource_sinks.iter().any(
+                                    |(pending_resource, authored_name)| {
+                                        pending_resource == resource_id
+                                            && bn_map
+                                                .get(authored_name)
+                                                .map(String::as_str)
+                                                .unwrap_or(authored_name)
+                                                == name
+                                    },
+                                )
+                            {
+                                continue;
+                            }
                             if !provider_validation_deduplicator.should_emit_type_error(&error) {
                                 continue;
                             }
@@ -1267,6 +1407,7 @@ impl DiagnosticEngine {
                                     &error,
                                     carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
                                         | carina_core::schema::TypeError::TypeMismatch { .. }
+                                        | carina_core::schema::TypeError::BindingShadowsEnumMember(_)
                                         | carina_core::schema::TypeError::InvalidEnumVariant { .. }
                                         | carina_core::schema::TypeError::UnknownStructField { .. }
                                         | carina_core::schema::TypeError::UnionStructMismatch { .. }
@@ -1746,8 +1887,9 @@ impl DiagnosticEngine {
 ///
 /// - For `Deferred(for_expr)` the scope starts at the `for` line and ends
 ///   at the closing brace of the for expression.
-/// - For `Direct` we locate the `provider.resource_type` token and scan
-///   forward from there.
+/// - For an authored anonymous `Direct` resource, the parser-derived start
+///   line selects that exact declaration. Other direct resources fall back to
+///   locating the `provider.resource_type` token.
 ///
 /// Returns `None` when the block can't be located (e.g., during partial
 /// parses). Callers that fall back to `None` get document-wide search —
@@ -1758,6 +1900,7 @@ fn resource_source_range(
     ctx: carina_core::parser::ResourceContext<'_>,
     provider: &str,
     resource_type: &str,
+    authored_direct_start: Option<u32>,
 ) -> Option<(u32, u32)> {
     use carina_core::parser::ResourceContext;
     let text = doc.text();
@@ -1767,12 +1910,16 @@ fn resource_source_range(
         // `DeferredForExpression.line` is 1-indexed (pest line_col). Convert to 0-indexed.
         ResourceContext::Deferred(d) => d.line.saturating_sub(1) as u32,
         ResourceContext::Direct => {
-            let pattern = format!("{}.{}", provider, resource_type);
-            let (idx, _) = lines
-                .iter()
-                .enumerate()
-                .find(|(_, l)| l.contains(pattern.as_str()))?;
-            idx as u32
+            if let Some(start) = authored_direct_start {
+                start
+            } else {
+                let pattern = format!("{}.{}", provider, resource_type);
+                let (idx, _) = lines
+                    .iter()
+                    .enumerate()
+                    .find(|(_, l)| l.contains(pattern.as_str()))?;
+                idx as u32
+            }
         }
     };
 
@@ -1856,7 +2003,7 @@ fn build_enum_diagnostic(
     build_enum_diagnostic_from_error(&reshaped, value_range)
 }
 
-fn build_enum_diagnostic_from_error(
+pub(super) fn build_enum_diagnostic_from_error(
     error: &carina_core::schema::TypeError,
     value_range: Option<tower_lsp::lsp_types::Range>,
 ) -> Option<Diagnostic> {

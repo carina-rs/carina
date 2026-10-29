@@ -1,7 +1,7 @@
 //! Code-action support for enum-mismatch diagnostics. See #2309.
 //!
-//! Diagnostics produced for `TypeError::InvalidEnumVariant` and
-//! `TypeError::StringLiteralExpectedEnum` carry a serialized
+//! Diagnostics produced for `TypeError::BindingShadowsEnumMember`,
+//! `TypeError::InvalidEnumVariant`, and `TypeError::StringLiteralExpectedEnum` carry a serialized
 //! [`EnumDiagnosticData`] payload on `Diagnostic.data`. The LSP's
 //! `textDocument/codeAction` handler reads that payload back, dedupes
 //! the candidate list, and returns one `CodeAction` per remaining
@@ -91,6 +91,10 @@ impl EnumDiagnosticData {
 /// would replace the entire collection with one identifier.
 pub(crate) fn enum_diagnostic_data_for_error(error: &TypeError) -> Option<EnumDiagnosticData> {
     match error {
+        TypeError::BindingShadowsEnumMember(error) => Some(EnumDiagnosticData::new(
+            EnumDiagnosticKind::BareInvalid,
+            vec![error.qualified.clone()],
+        )),
         TypeError::InvalidEnumVariant { expected, .. } => Some(EnumDiagnosticData::new(
             EnumDiagnosticKind::BareInvalid,
             expected.clone(),

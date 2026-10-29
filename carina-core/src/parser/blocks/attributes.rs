@@ -130,7 +130,7 @@ pub(in crate::parser) fn parse_arguments_block(
                 }
             }
 
-            register_argument_binding(ctx, &name);
+            register_argument_binding(ctx, &name, &type_expr);
             arguments.push(ArgumentParameter {
                 name,
                 type_expr,
@@ -155,8 +155,12 @@ pub(in crate::parser) fn parse_arguments_block(
 /// body representation neutral avoids guessing before provider schemas are
 /// available; expansion later applies access to a value or a canonical handle
 /// base according to the typed call-site argument.
-fn register_argument_binding(ctx: &mut ParseContext, name: &str) {
-    ctx.set_variable(
+fn register_argument_binding(
+    ctx: &mut ParseContext,
+    name: &str,
+    type_expr: &crate::parser::TypeExpr,
+) {
+    ctx.set_argument_variable(
         name.to_string(),
         Value::Deferred(DeferredValue::Unknown(
             crate::resource::UnknownReason::ModuleArgument {
@@ -165,6 +169,7 @@ fn register_argument_binding(ctx: &mut ParseContext, name: &str) {
                 diagnostic_name: None,
             },
         )),
+        Some(type_expr.clone()),
     );
     // The local declaration is the real one for this file; drop the
     // seed mark (if any) so a later real duplicate (`let <name> = ...`

@@ -29,7 +29,7 @@ jobs:
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
           changed=$(git diff --name-only "$base" "$head")
-          if echo "$changed" | grep -qE '^(.*\.rs$|.*Cargo\.toml$|Cargo\.lock$|\.cargo/.*|\.config/.*|scripts/.*|\.github/(workflows|actions)/.*)'; then
+          if echo "$changed" | grep -qE '^(.*\.rs$|.*Cargo\.toml$|Cargo\.lock$|\.cargo/.*|\.config/.*|scripts/.*|site/src/content/providers/writing/schemas\.md$|\.github/(workflows|actions)/.*)'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
             echo "code=false" >> "$GITHUB_OUTPUT"
@@ -139,6 +139,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash scripts/check-rust-cache-via-local-action.sh
+
+  check-vendored-patches-used:
+    name: Check Vendored Patches Used
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash scripts/check-vendored-patches-used.sh
 
   check-examples:
     name: Check Example Files

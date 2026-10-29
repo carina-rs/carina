@@ -562,10 +562,8 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .expect("resolve_refs");
 
     let resource_origins = sorted_resources.clone();
-    let unresolved_for_plan = carina_core::parser::ParsedFile {
-        resources: resources_for_plan.clone(),
-        ..Default::default()
-    };
+    let mut unresolved_for_plan = carina_core::parser::ParsedFile::default();
+    unresolved_for_plan.resources = resources_for_plan.clone();
     let canonical_for_plan = unresolved_for_plan.clone();
     let canonical_unresolved = resolve_config_block_names_for_test(
         canonical_for_plan,

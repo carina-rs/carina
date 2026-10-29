@@ -19,6 +19,14 @@ use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
 #[test]
+fn saved_plan_validation_ready_constructor_is_unit_typed() {
+    let ready: ValidationReady<()> = ValidationReady::from_saved_plan_artifact();
+    let ValidationReady { inner: (), origin } = ready;
+
+    assert!(matches!(origin, ValidationReadyOrigin::SavedPlanArtifact));
+}
+
+#[test]
 fn data_source_reads_select_only_the_owning_identical_anonymous_call() {
     let tmp = tempfile::tempdir().expect("temporary project");
     let module_dir = tmp.path().join("modules/query");
@@ -202,16 +210,17 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
             ]),
         )
     };
-    let invalid_config = || carina_core::parser::InferredFile {
-        providers: provider_configs(),
-        arguments: vec![carina_core::parser::ArgumentParameter {
+    let invalid_config = || {
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers = provider_configs();
+        parsed.arguments = vec![carina_core::parser::ArgumentParameter {
             name: "unrelated".to_string(),
             type_expr: carina_core::parser::TypeExpr::String,
             default: None,
             description: None,
             validations: Vec::new(),
-        }],
-        ..Default::default()
+        }];
+        parsed
     };
 
     let evaluated_error = match incomplete_load().validate_evaluated_config(
@@ -259,17 +268,15 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
         std::slice::from_ref(&provider),
         HashMap::from([("broken".to_string(), "broken provider failed".to_string())]),
     );
-    let parsed = carina_core::parser::InferredFile {
-        providers: vec![provider],
-        arguments: vec![carina_core::parser::ArgumentParameter {
-            name: "unrelated".to_string(),
-            type_expr: carina_core::parser::TypeExpr::String,
-            default: None,
-            description: None,
-            validations: Vec::new(),
-        }],
-        ..Default::default()
-    };
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.providers = vec![provider];
+    parsed.arguments = vec![carina_core::parser::ArgumentParameter {
+        name: "unrelated".to_string(),
+        type_expr: carina_core::parser::TypeExpr::String,
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    }];
 
     let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
@@ -572,10 +579,8 @@ fn canonical_unresolved(
     resources: Vec<Resource>,
     schemas: &SchemaRegistry,
 ) -> CanonicalResourcePair<carina_core::parser::ParsedExportParam> {
-    let unresolved = carina_core::parser::ParsedFile {
-        resources,
-        ..Default::default()
-    };
+    let mut unresolved = carina_core::parser::ParsedFile::default();
+    unresolved.resources = resources;
     resolve_config_block_names_for_test(
         unresolved.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -600,10 +605,8 @@ fn canonical_pair<E: Clone>(
     unresolved_resources: Vec<Resource>,
     schemas: &SchemaRegistry,
 ) -> CanonicalResourcePair<E> {
-    let unresolved = carina_core::parser::ParsedFile {
-        resources: unresolved_resources,
-        ..Default::default()
-    };
+    let mut unresolved = carina_core::parser::ParsedFile::default();
+    unresolved.resources = unresolved_resources;
     resolve_config_block_names_for_test(
         evaluated.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -1125,10 +1128,8 @@ fn resolved_provider_configs_with_remote<E>(
 fn validated_provider_configs(
     configs: Vec<ProviderConfig>,
 ) -> carina_core::parser::ResolvedProviderConfigs {
-    let parsed = carina_core::parser::InferredFile {
-        providers: configs,
-        ..Default::default()
-    };
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.providers = configs;
     resolved_provider_configs(&parsed)
 }
 
@@ -1152,10 +1153,8 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
     )?;
     let wiring = ValidatedWiring::for_test(factories, provider_configs.as_provider_configs());
     let ctx = wiring.context();
-    let unresolved = carina_core::parser::ParsedFile {
-        resources: unresolved_resources.to_vec(),
-        ..Default::default()
-    };
+    let mut unresolved = carina_core::parser::ParsedFile::default();
+    unresolved.resources = unresolved_resources.to_vec();
     let canonical_resources = resolve_config_block_names_for_test(
         parsed.clone(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -5024,10 +5023,8 @@ fn resource_move_invariants_projected_state_read_preserves_dependency_bindings()
     let desired = desired_association(new_name, "private_rtb", "subnet-a");
     let resources = vec![desired];
     let state = Some(state_file);
-    let parsed = carina_core::parser::InferredFile {
-        resources,
-        ..Default::default()
-    };
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.resources = resources;
     let detected = DeferredForExpansionPrelude::new_for_test(&parsed, &state, ctx.schemas())
         .expect("build expansion prelude")
         .detect_moves(&ctx, &[], &[], &StateBlockClaims::empty())
@@ -5136,11 +5133,10 @@ fn destroy_and_state_refresh_identity_preparation_preserve_anonymous_addresses()
         Some(state)
     };
     let config = || {
+        let mut parsed = InferredFile::default();
+        parsed.resources = vec![desired()];
         ValidatedConfig::from_factories_with_additional_schemas_for_test(
-            InferredFile {
-                resources: vec![desired()],
-                ..Default::default()
-            },
+            parsed,
             vec![Box::new(AssociationCreateOnlyFactory)],
             &[],
             Vec::<(String, ValidatedResourceSchema)>::new(),
@@ -6450,10 +6446,8 @@ fn validate_resources_with_ctx_returns_each_error_as_app_error() {
     // produces its own "Unknown resource type" entry.
     let r1 = Resource::new("foo.nothing", "first");
     let r2 = Resource::new("bar.nothing", "second");
-    let parsed = ParsedFile {
-        resources: vec![r1, r2],
-        ..ParsedFile::default()
-    };
+    let mut parsed = ParsedFile::default();
+    parsed.resources = vec![r1, r2];
 
     let provider_ctx = carina_core::parser::ProviderContext::default();
     let errors = validate_resources_with_ctx(&ctx, &parsed, &provider_ctx);
@@ -6527,11 +6521,9 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
         binding: carina_core::parser::ForBinding::Simple("item".to_string()),
         template_resource,
     };
-    let evaluated = carina_core::parser::ParsedFile {
-        resources: vec![resource],
-        deferred_for_expressions: vec![deferred],
-        ..Default::default()
-    };
+    let mut evaluated = carina_core::parser::ParsedFile::default();
+    evaluated.resources = vec![resource];
+    evaluated.deferred_for_expressions = vec![deferred];
     let unresolved = evaluated.clone();
 
     let canonical_unresolved = resolve_config_names_with_ctx(
@@ -6591,10 +6583,8 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
     let resource = Resource::with_provider("test", "thing", "direct", None)
         .with_attribute("rule", rules.clone())
         .with_attribute("rules", rules);
-    let evaluated = carina_core::parser::ParsedFile {
-        resources: vec![resource],
-        ..Default::default()
-    };
+    let mut evaluated = carina_core::parser::ParsedFile::default();
+    evaluated.resources = vec![resource];
     let unresolved = evaluated.clone();
 
     let errors = resolve_config_names_with_ctx(
@@ -6623,15 +6613,13 @@ fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
         &[],
         [("test".to_string(), schema)],
     );
-    let evaluated = carina_core::parser::ParsedFile {
-        resources: vec![
-            Resource::with_provider("test", "thing", "direct", None).with_attribute(
-                "name_prefix",
-                Value::Concrete(ConcreteValue::String("owned-".into())),
-            ),
-        ],
-        ..Default::default()
-    };
+    let mut evaluated = carina_core::parser::ParsedFile::default();
+    evaluated.resources = vec![
+        Resource::with_provider("test", "thing", "direct", None).with_attribute(
+            "name_prefix",
+            Value::Concrete(ConcreteValue::String("owned-".into())),
+        ),
+    ];
     let unresolved = evaluated.clone();
 
     let canonical = resolve_config_names_with_ctx(
@@ -7090,10 +7078,21 @@ fn module_and_provider_wrappers_return_vec_app_error() {
     let errors = validate_provider_region_with_ctx(&ctx, &parsed);
     assert!(errors.is_empty(), "provider_region: got {errors:?}");
 
+    let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
+    let binding_use_report = carina_core::validation::check_bare_binding_uses(
+        &parsed,
+        &carina_core::validation::ValidationTypeContext::new(
+            &parsed,
+            ctx.schemas(),
+            &provider_ctx,
+            &module_signatures,
+        ),
+    );
     let errors = validate_module_calls_with_imported(
         &parsed,
-        &carina_core::module_resolver::ResolvedModuleSignatures::new(),
+        &module_signatures,
         &provider_ctx,
+        &binding_use_report,
     );
     assert!(errors.is_empty(), "module_calls: got {errors:?}");
 
@@ -7113,10 +7112,9 @@ fn module_and_provider_wrappers_return_vec_app_error() {
 fn parsed_with_attr(attr_name: &str, attr_value: Value) -> ParsedFile {
     let mut r = Resource::new("foo.bar", "x");
     r.attributes.insert(attr_name.to_string(), attr_value);
-    ParsedFile {
-        resources: vec![r],
-        ..ParsedFile::default()
-    }
+    let mut parsed = ParsedFile::default();
+    parsed.resources = vec![r];
+    parsed
 }
 
 #[test]
@@ -8877,10 +8875,8 @@ mod kind_default_source_tests {
     }
 
     fn resolved(configs: Vec<ProviderConfig>) -> ResolvedProviderConfigs {
-        let parsed = carina_core::parser::InferredFile {
-            providers: configs,
-            ..Default::default()
-        };
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers = configs;
         carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &std::collections::HashMap::new(),

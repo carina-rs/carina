@@ -1,4 +1,10 @@
 //! Resource - Representing resources and their state
+//!
+//! The `Value::Deferred` / `DeferredValue` representation (including
+//! `DeferredValue::Unknown(UnknownReason)`) is one of several "not determined
+//! yet" forms.
+//! `notes/specs/2026-10-29-unknown-forms-current-state.md` explains each form,
+//! which stage produces and consumes it, and how validation treats it.
 
 mod enum_value;
 
@@ -3934,6 +3940,11 @@ impl Value {
 /// Why a `Value::Unknown` is unknown. Each variant carries only the
 /// information its own consumer needs — no shared "context" field invites
 /// drift across reasons. See RFC #2371.
+/// These reasons span parser-stage placeholders (`FnParam`, `FnLocal`,
+/// `ModuleArgument`, `EmptyInterpolation`, and the `ForKey`, `ForIndex`, and
+/// `ForValue` loop placeholders) and markers that survive into plan/apply
+/// (`UpstreamExport`, `UpstreamAllExports`, and `PostCreateReadIncomplete`);
+/// #4094 tracks splitting them by stage.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UnknownReason {
     /// One export reached through an attribute path on an `upstream_state`
