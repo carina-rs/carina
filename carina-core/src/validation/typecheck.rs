@@ -140,15 +140,22 @@ pub fn check_type_expr_value(
     config: &ProviderContext,
     inference: TypecheckInference<'_>,
 ) -> Result<(), TypeExprValueError> {
-    if matches!(expected, TypeExpr::Unknown) {
-        return Ok(());
-    }
-
     match value {
         Value::Deferred(DeferredValue::ResourceRef { .. }) => match expected {
             TypeExpr::StringLiteral(_) => return Err(mismatch(expected, value)),
             TypeExpr::Union(_) => {}
-            _ => return Ok(()),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. } => return Ok(()),
         },
         Value::Deferred(
             DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
@@ -168,13 +175,32 @@ pub fn check_type_expr_value(
             return match inferred {
                 Ok(actual) if inferred_type_fits(expected, &actual) => Ok(()),
                 Ok(_) => Err(mismatch(expected, value)),
-                Err(error @ super::inference::InferenceError::InvalidAccess { .. })
-                | Err(error @ super::inference::InferenceError::UnknownAttribute { .. }) => {
+                Err(crate::static_type::InferenceIssue::InvalidAccess { base_type, step }) => {
                     Err(TypeExprValueError::InvalidAccess {
-                        message: error.to_string(),
+                        message: super::inference::InferenceError::InvalidAccess {
+                            base_type,
+                            step,
+                        }
+                        .to_string(),
                     })
                 }
-                Err(_) => Ok(()),
+                Err(crate::static_type::InferenceIssue::UnknownAttribute {
+                    binding,
+                    attribute,
+                }) => Err(TypeExprValueError::InvalidAccess {
+                    message: super::inference::InferenceError::UnknownAttribute {
+                        binding,
+                        attribute,
+                    }
+                    .to_string(),
+                }),
+                Err(crate::static_type::InferenceIssue::UnknownType { .. })
+                | Err(crate::static_type::InferenceIssue::HeterogeneousCollection { .. })
+                | Err(crate::static_type::InferenceIssue::IncompatibleCoalesceTypes { .. })
+                | Err(crate::static_type::InferenceIssue::UnknownBinding { .. })
+                | Err(crate::static_type::InferenceIssue::NonInferableBinding { .. })
+                | Err(crate::static_type::InferenceIssue::SchemaUnavailable { .. })
+                | Err(crate::static_type::InferenceIssue::CyclicVirtualBinding { .. }) => Ok(()),
             };
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => return Ok(()),
@@ -352,7 +378,6 @@ pub fn check_type_expr_value(
                 Err(mismatch(expected, value))
             }
         }
-        TypeExpr::Unknown => Ok(()),
     }
 }
 
@@ -468,7 +493,7 @@ fn is_qualified_enum_identifier(identifier: &str) -> bool {
 }
 
 fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
-    if expected == actual || matches!(expected, TypeExpr::Unknown) {
+    if expected == actual {
         return true;
     }
     match (expected, actual) {
@@ -486,7 +511,95 @@ fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
             .any(|member| inferred_type_fits(member, actual)),
         (TypeExpr::List(expected), TypeExpr::List(actual))
         | (TypeExpr::Map(expected), TypeExpr::Map(actual)) => inferred_type_fits(expected, actual),
-        _ => false,
+        (
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        )
+        | (
+            TypeExpr::Float,
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        )
+        | (
+            TypeExpr::SchemaType { .. },
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        )
+        | (
+            TypeExpr::List(_),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        )
+        | (
+            TypeExpr::Map(_),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        ) => false,
     }
 }
 
@@ -648,7 +761,6 @@ mod tests {
                 TypeExpr::StringLiteral("dev".to_string()),
                 TypeExpr::StringLiteral("prod".to_string()),
             ]),
-            TypeExpr::Unknown,
         ]
     }
 
@@ -780,7 +892,6 @@ mod tests {
                 ),
             },
             TypeExpr::Struct { fields: Vec::new() },
-            TypeExpr::Unknown,
         ] {
             assert!(
                 check(&expected, &resource_ref).is_ok(),

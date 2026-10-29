@@ -10,6 +10,10 @@ use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
 use carina_core::resource::EnumValueResolver;
 use carina_core::schema::{AttributeType, Shape, TypeIdentity, TypeInSchema};
+use carina_core::static_type::{
+    InferenceError, InferredUncheckedReason, NotInferableReason, StaticType, UnnameableInConsumer,
+};
+use carina_core::upstream_exports::{UpstreamExportEntry, UpstreamExportType};
 
 use super::{AttributeValueTarget, CompletionProvider, DslSource};
 
@@ -17,6 +21,42 @@ use super::{AttributeValueTarget, CompletionProvider, DslSource};
 const UPSTREAM_SOURCE_MAX_UP: usize = 6;
 /// Safety cap on the number of suggestions returned.
 const UPSTREAM_SOURCE_MAX_ITEMS: usize = 100;
+
+enum UpstreamCompletionStaticType<'a> {
+    DeclaredKnown(&'a TypeExpr),
+    DeclaredUnnameable(&'a UnnameableInConsumer),
+    InferredKnown(&'a TypeExpr),
+    InferenceFailed(&'a InferenceError),
+    NotInferable(&'a NotInferableReason),
+    InferredUnnameable(&'a UnnameableInConsumer),
+    InferenceNotRun,
+}
+
+fn upstream_completion_static_type(
+    entry: &UpstreamExportEntry,
+) -> UpstreamCompletionStaticType<'_> {
+    match &entry.static_type {
+        UpstreamExportType::Static(carina_core::static_type::ExportStaticType::Declared(
+            StaticType::Known(type_expr),
+        )) => UpstreamCompletionStaticType::DeclaredKnown(type_expr),
+        UpstreamExportType::Static(carina_core::static_type::ExportStaticType::Declared(
+            StaticType::Unchecked(reason),
+        )) => UpstreamCompletionStaticType::DeclaredUnnameable(reason),
+        UpstreamExportType::Static(carina_core::static_type::ExportStaticType::Inferred(
+            StaticType::Known(type_expr),
+        )) => UpstreamCompletionStaticType::InferredKnown(type_expr),
+        UpstreamExportType::Static(carina_core::static_type::ExportStaticType::Inferred(
+            StaticType::Unchecked(InferredUncheckedReason::InferenceFailed(error)),
+        )) => UpstreamCompletionStaticType::InferenceFailed(error),
+        UpstreamExportType::Static(carina_core::static_type::ExportStaticType::Inferred(
+            StaticType::Unchecked(InferredUncheckedReason::NotInferable(reason)),
+        )) => UpstreamCompletionStaticType::NotInferable(reason),
+        UpstreamExportType::Static(carina_core::static_type::ExportStaticType::Inferred(
+            StaticType::Unchecked(InferredUncheckedReason::UnnameableInConsumer(reason)),
+        )) => UpstreamCompletionStaticType::InferredUnnameable(reason),
+        UpstreamExportType::InferenceNotRun => UpstreamCompletionStaticType::InferenceNotRun,
+    }
+}
 
 /// Treat non-liftable boundary declarations as unchecked; otherwise compare
 /// the declared source to the schema sink through the shared directional
@@ -271,8 +311,14 @@ impl CompletionProvider {
                     &mut exports_cache,
                 );
                 for (export_name, entry) in exports {
-                    let Some(export_type) = &entry.type_expr else {
-                        continue;
+                    let export_type = match upstream_completion_static_type(entry) {
+                        UpstreamCompletionStaticType::DeclaredKnown(type_expr)
+                        | UpstreamCompletionStaticType::InferredKnown(type_expr) => type_expr,
+                        UpstreamCompletionStaticType::DeclaredUnnameable(_reason) => continue,
+                        UpstreamCompletionStaticType::InferenceFailed(_error) => continue,
+                        UpstreamCompletionStaticType::NotInferable(_reason) => continue,
+                        UpstreamCompletionStaticType::InferredUnnameable(_reason) => continue,
+                        UpstreamCompletionStaticType::InferenceNotRun => continue,
                     };
                     if !type_expr_source_is_assignable_to(
                         export_type,
@@ -1111,9 +1157,26 @@ impl CompletionProvider {
             .map(|(key, entry)| CompletionItem {
                 label: key.clone(),
                 kind: Some(CompletionItemKind::FIELD),
-                detail: Some(match &entry.type_expr {
-                    Some(t) => format!("export from upstream_state `{}`: {}", binding, t),
-                    None => format!("export from upstream_state `{}`", binding),
+                detail: Some(match upstream_completion_static_type(entry) {
+                    UpstreamCompletionStaticType::DeclaredKnown(type_expr)
+                    | UpstreamCompletionStaticType::InferredKnown(type_expr) => {
+                        format!("export from upstream_state `{binding}`: {type_expr}")
+                    }
+                    UpstreamCompletionStaticType::DeclaredUnnameable(_reason) => {
+                        format!("export from upstream_state `{binding}`")
+                    }
+                    UpstreamCompletionStaticType::InferenceFailed(_error) => {
+                        format!("export from upstream_state `{binding}`")
+                    }
+                    UpstreamCompletionStaticType::NotInferable(_reason) => {
+                        format!("export from upstream_state `{binding}`")
+                    }
+                    UpstreamCompletionStaticType::InferredUnnameable(_reason) => {
+                        format!("export from upstream_state `{binding}`")
+                    }
+                    UpstreamCompletionStaticType::InferenceNotRun => {
+                        format!("export from upstream_state `{binding}`")
+                    }
                 }),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range,
@@ -1152,9 +1215,14 @@ impl CompletionProvider {
         let Some(entry) = keys.get(key) else {
             return Vec::new();
         };
-        let Some(type_expr) = &entry.type_expr else {
-            // Untyped or unknown key: we have no fields to descend into.
-            return Vec::new();
+        let type_expr = match upstream_completion_static_type(entry) {
+            UpstreamCompletionStaticType::DeclaredKnown(type_expr)
+            | UpstreamCompletionStaticType::InferredKnown(type_expr) => type_expr,
+            UpstreamCompletionStaticType::DeclaredUnnameable(_reason) => return Vec::new(),
+            UpstreamCompletionStaticType::InferenceFailed(_error) => return Vec::new(),
+            UpstreamCompletionStaticType::NotInferable(_reason) => return Vec::new(),
+            UpstreamCompletionStaticType::InferredUnnameable(_reason) => return Vec::new(),
+            UpstreamCompletionStaticType::InferenceNotRun => return Vec::new(),
         };
         let partial_chars = partial.chars().count() as u32;
         let range = Range {
@@ -1221,7 +1289,18 @@ impl CompletionProvider {
                 items.sort_by(|a, b| a.label.cmp(&b.label));
                 items
             }
-            _ => {
+            carina_core::parser::TypeExpr::String
+            | carina_core::parser::TypeExpr::Bool
+            | carina_core::parser::TypeExpr::Int
+            | carina_core::parser::TypeExpr::Float
+            | carina_core::parser::TypeExpr::Duration
+            | carina_core::parser::TypeExpr::Simple(_)
+            | carina_core::parser::TypeExpr::List(_)
+            | carina_core::parser::TypeExpr::Ref(_)
+            | carina_core::parser::TypeExpr::DottedUnresolved(_)
+            | carina_core::parser::TypeExpr::SchemaType { .. }
+            | carina_core::parser::TypeExpr::StringLiteral(_)
+            | carina_core::parser::TypeExpr::Union(_) => {
                 // List / scalars: depth-2 names are runtime values, not
                 // part of the type. Suggest nothing rather than something
                 // potentially invalid (#2041).
@@ -1464,8 +1543,14 @@ impl CompletionProvider {
                 &mut exports_cache,
             );
             for (export_name, entry) in exports {
-                let Some(export_type) = &entry.type_expr else {
-                    continue;
+                let export_type = match upstream_completion_static_type(entry) {
+                    UpstreamCompletionStaticType::DeclaredKnown(type_expr)
+                    | UpstreamCompletionStaticType::InferredKnown(type_expr) => type_expr,
+                    UpstreamCompletionStaticType::DeclaredUnnameable(_reason) => continue,
+                    UpstreamCompletionStaticType::InferenceFailed(_error) => continue,
+                    UpstreamCompletionStaticType::NotInferable(_reason) => continue,
+                    UpstreamCompletionStaticType::InferredUnnameable(_reason) => continue,
+                    UpstreamCompletionStaticType::InferenceNotRun => continue,
                 };
                 if !type_expr_source_is_assignable_to(export_type, target, target_defs) {
                     continue;
@@ -1569,8 +1654,10 @@ impl CompletionProvider {
                 continue;
             };
             for export in &parsed.export_params {
-                let Some(ref export_ty) = export.type_expr else {
-                    continue;
+                let export_ty = match &export.static_type {
+                    Some(StaticType::Known(type_expr)) => type_expr,
+                    Some(StaticType::Unchecked(_unnameable)) => continue,
+                    None => continue,
                 };
                 if !type_expr_source_is_assignable_to(export_ty, target, target_defs) {
                     continue;
@@ -2030,7 +2117,15 @@ fn infer_for_binding_type(
             // don't pay a deep `Value` clone on the per-keystroke path.
             resolved.remove(&iterable.binding).unwrap_or_default()
         });
-    let export_type = exports.get(&iterable.export)?.type_expr.as_ref()?;
+    let export_type = match upstream_completion_static_type(exports.get(&iterable.export)?) {
+        UpstreamCompletionStaticType::DeclaredKnown(type_expr)
+        | UpstreamCompletionStaticType::InferredKnown(type_expr) => type_expr,
+        UpstreamCompletionStaticType::DeclaredUnnameable(_reason) => return None,
+        UpstreamCompletionStaticType::InferenceFailed(_error) => return None,
+        UpstreamCompletionStaticType::NotInferable(_reason) => return None,
+        UpstreamCompletionStaticType::InferredUnnameable(_reason) => return None,
+        UpstreamCompletionStaticType::InferenceNotRun => return None,
+    };
 
     match (export_type, binding.slot) {
         (TypeExpr::List(inner), ForBindingSlot::Value | ForBindingSlot::PairValue) => {
@@ -2055,7 +2150,20 @@ fn infer_for_binding_type(
             }
         }
         (TypeExpr::Struct { .. }, ForBindingSlot::PairKey) => Some(TypeExpr::String),
-        _ => None,
+        (
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+            ForBindingSlot::Value | ForBindingSlot::PairKey | ForBindingSlot::PairValue,
+        ) => None,
     }
 }
 

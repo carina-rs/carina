@@ -8,6 +8,7 @@ use crate::parser::{
     ResourceTypePath, TypeExpr, display_double_quoted_literal_part, display_string_literal,
 };
 use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
+use crate::static_type::{ConsumerStaticType, StaticType};
 
 /// Dependency between resources
 #[derive(Debug, Clone)]
@@ -232,7 +233,7 @@ pub struct TypedArgument {
     /// Argument parameter name
     pub name: String,
     /// Type expression (including ref types)
-    pub type_expr: TypeExpr,
+    pub static_type: ConsumerStaticType,
     /// Whether this argument is required (no default)
     pub required: bool,
     /// Default value as a display string
@@ -258,7 +259,7 @@ pub struct TypedAttributeParam {
     /// Attribute parameter name
     pub name: String,
     /// Type expression (including ref types), None if inferred
-    pub type_expr: Option<TypeExpr>,
+    pub static_type: Option<ConsumerStaticType>,
     /// Source binding name (if the output comes from a resource)
     pub source_binding: Option<String>,
 }
@@ -857,8 +858,7 @@ impl ModuleSignature {
             | TypeExpr::Ref(_)
             | TypeExpr::DottedUnresolved(_)
             | TypeExpr::SchemaType { .. }
-            | TypeExpr::StringLiteral(_)
-            | TypeExpr::Unknown => type_expr.clone(),
+            | TypeExpr::StringLiteral(_) => type_expr.clone(),
         }
     }
 
@@ -876,8 +876,7 @@ impl ModuleSignature {
             | TypeExpr::SchemaType { .. }
             | TypeExpr::Struct { .. }
             | TypeExpr::StringLiteral(_)
-            | TypeExpr::Union(_)
-            | TypeExpr::Unknown => None,
+            | TypeExpr::Union(_) => None,
         }
     }
 
@@ -889,7 +888,12 @@ impl ModuleSignature {
             .iter()
             .map(|input| TypedArgument {
                 name: input.name.clone(),
-                type_expr: Self::signature_type_expr(&input.type_expr),
+                static_type: match &input.static_type {
+                    StaticType::Known(type_expr) => {
+                        StaticType::Known(Self::signature_type_expr(type_expr))
+                    }
+                    StaticType::Unchecked(reason) => StaticType::Unchecked(reason.clone()),
+                },
                 required: input.default.is_none(),
                 default: input.default.as_ref().map(format_value),
                 description: input.description.clone(),
@@ -900,7 +904,12 @@ impl ModuleSignature {
         let argument_types: HashMap<String, TypeExpr> = parsed
             .arguments
             .iter()
-            .map(|i| (i.name.clone(), Self::signature_type_expr(&i.type_expr)))
+            .filter_map(|argument| match &argument.static_type {
+                StaticType::Known(type_expr) => {
+                    Some((argument.name.clone(), Self::signature_type_expr(type_expr)))
+                }
+                StaticType::Unchecked(_reason) => None,
+            })
             .collect();
 
         // Build creates (resource creations with dependencies)
@@ -965,7 +974,14 @@ impl ModuleSignature {
 
                 TypedAttributeParam {
                     name: attr_param.name.clone(),
-                    type_expr: attr_param.type_expr.as_ref().map(Self::signature_type_expr),
+                    static_type: attr_param.static_type.as_ref().map(
+                        |static_type| match static_type {
+                            StaticType::Known(type_expr) => {
+                                StaticType::Known(Self::signature_type_expr(type_expr))
+                            }
+                            StaticType::Unchecked(reason) => StaticType::Unchecked(reason.clone()),
+                        },
+                    ),
                     source_binding,
                 }
             })
@@ -1190,11 +1206,19 @@ impl ModuleSignature {
                     .as_ref()
                     .map(|d| format!(" {}={} {}{}{}", c.dim, c.reset, c.green, d, c.reset))
                     .unwrap_or_default();
-                let type_str = self.format_type_expr(&input.type_expr, &c);
-                output.push_str(&format!(
-                    "  {}{}{}: {}{}  {}\n",
-                    c.white, input.name, c.reset, type_str, default_str, required_str
-                ));
+                match &input.static_type {
+                    StaticType::Known(type_expr) => {
+                        let type_str = self.format_type_expr(type_expr, &c);
+                        output.push_str(&format!(
+                            "  {}{}{}: {}{}  {}\n",
+                            c.white, input.name, c.reset, type_str, default_str, required_str
+                        ));
+                    }
+                    StaticType::Unchecked(_reason) => output.push_str(&format!(
+                        "  {}{}{}{}  {}\n",
+                        c.white, input.name, c.reset, default_str, required_str
+                    )),
+                }
                 if let Some(desc) = &input.description {
                     output.push_str(&format!("    {}{}{}\n", c.dim, desc, c.reset));
                 }
@@ -1241,14 +1265,20 @@ impl ModuleSignature {
             output.push_str(&format!("  {}(none){}\n", c.dim, c.reset));
         } else {
             for attr_param in &self.exposes {
-                if let Some(type_expr) = &attr_param.type_expr {
-                    let type_str = self.format_type_expr(type_expr, &c);
-                    output.push_str(&format!(
-                        "  {}{}{}: {}\n",
-                        c.white, attr_param.name, c.reset, type_str
-                    ));
-                } else {
-                    output.push_str(&format!("  {}{}{}\n", c.white, attr_param.name, c.reset));
+                match &attr_param.static_type {
+                    Some(StaticType::Known(type_expr)) => {
+                        let type_str = self.format_type_expr(type_expr, &c);
+                        output.push_str(&format!(
+                            "  {}{}{}: {}\n",
+                            c.white, attr_param.name, c.reset, type_str
+                        ));
+                    }
+                    Some(StaticType::Unchecked(_reason)) => {
+                        output.push_str(&format!("  {}{}{}\n", c.white, attr_param.name, c.reset));
+                    }
+                    None => {
+                        output.push_str(&format!("  {}{}{}\n", c.white, attr_param.name, c.reset));
+                    }
                 }
             }
         }
@@ -1307,8 +1337,7 @@ impl ModuleSignature {
             | TypeExpr::Simple(_)
             | TypeExpr::SchemaType { .. }
             | TypeExpr::StringLiteral(_)
-            | TypeExpr::Union(_)
-            | TypeExpr::Unknown => format!("{}{}{}", c.green, type_expr, c.reset),
+            | TypeExpr::Union(_) => format!("{}{}{}", c.green, type_expr, c.reset),
         }
     }
 
@@ -1794,7 +1823,10 @@ mod tests {
         // Check requires
         assert_eq!(signature.requires.len(), 2);
         assert_eq!(signature.requires[0].name, "vpc");
-        assert!(matches!(signature.requires[0].type_expr, TypeExpr::Ref(_)));
+        assert!(matches!(
+            signature.requires[0].static_type,
+            crate::static_type::StaticType::Known(TypeExpr::Ref(_))
+        ));
 
         // Check creates
         assert_eq!(signature.creates.len(), 1);

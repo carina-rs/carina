@@ -16,6 +16,7 @@ use crate::parser::grammar::PreprocessedFile;
 use crate::parser::parse_expression;
 use crate::parser::types::parse_type_expr;
 use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::static_type::StaticType;
 
 /// Parse arguments block. See `register_argument_binding` for the
 /// incremental scoping discipline that lets a later argument's default
@@ -133,7 +134,7 @@ pub(in crate::parser) fn parse_arguments_block(
             register_argument_binding(ctx, &name, &type_expr);
             arguments.push(ArgumentParameter {
                 name,
-                type_expr,
+                static_type: StaticType::Known(type_expr),
                 default,
                 description,
                 validations,

@@ -376,7 +376,14 @@ impl CompletionProvider {
 
         if let Some(parsed) = self.load_called_module(module_name, text, base_path) {
             for input in &parsed.arguments {
-                let type_str = self.format_type_expr(&input.type_expr);
+                let type_str = match &input.static_type {
+                    carina_core::static_type::StaticType::Known(type_expr) => {
+                        self.format_type_expr(type_expr)
+                    }
+                    carina_core::static_type::StaticType::Unchecked(unnameable) => {
+                        self.format_type_expr(&unnameable.original)
+                    }
+                };
                 let required_marker = if input.default.is_some() {
                     ""
                 } else {
@@ -436,8 +443,12 @@ impl CompletionProvider {
         let Some(arg) = parsed.arguments.iter().find(|a| a.name == arg_name) else {
             return Vec::new();
         };
+        let arg_type = match &arg.static_type {
+            carina_core::static_type::StaticType::Known(type_expr) => type_expr,
+            carina_core::static_type::StaticType::Unchecked(_unnameable) => return Vec::new(),
+        };
         // Literal-set fast path: candidates are syntactic.
-        let literal_items = literal_completions_from_type_expr(&arg.type_expr);
+        let literal_items = literal_completions_from_type_expr(arg_type);
         if !literal_items.is_empty() {
             return literal_items;
         }
@@ -445,9 +456,8 @@ impl CompletionProvider {
         // that identity through the same owner index used by validation so
         // an enum parameter retains its member declaration instead of being
         // flattened into a generic refined string.
-        let resolved_type =
-            carina_core::validation::resolve_type_expr(&arg.type_expr, provider_ctx)
-                .unwrap_or_else(|_| arg.type_expr.clone());
+        let resolved_type = carina_core::validation::resolve_type_expr(arg_type, provider_ctx)
+            .unwrap_or_else(|_| arg_type.clone());
         if let parser::TypeExpr::SchemaType { owned } = &resolved_type
             && let Ok(Some(declaration)) = provider_ctx.enum_declaration(owned)
         {
@@ -497,7 +507,6 @@ impl CompletionProvider {
             struct_type @ parser::TypeExpr::Struct { .. } => struct_type.to_string(),
             literal @ parser::TypeExpr::StringLiteral(_) => literal.to_string(),
             union @ parser::TypeExpr::Union(_) => union.to_string(),
-            parser::TypeExpr::Unknown => "<unknown>".to_string(),
         }
     }
 
@@ -989,10 +998,33 @@ fn literal_completions_from_type_expr(type_expr: &parser::TypeExpr) -> Vec<Compl
             .iter()
             .filter_map(|m| match m {
                 parser::TypeExpr::StringLiteral(s) => Some(literal_item(s)),
-                _ => None,
+                parser::TypeExpr::String
+                | parser::TypeExpr::Bool
+                | parser::TypeExpr::Int
+                | parser::TypeExpr::Float
+                | parser::TypeExpr::Duration
+                | parser::TypeExpr::Simple(_)
+                | parser::TypeExpr::List(_)
+                | parser::TypeExpr::Map(_)
+                | parser::TypeExpr::Ref(_)
+                | parser::TypeExpr::DottedUnresolved(_)
+                | parser::TypeExpr::SchemaType { .. }
+                | parser::TypeExpr::Struct { .. }
+                | parser::TypeExpr::Union(_) => None,
             })
             .collect(),
-        _ => Vec::new(),
+        parser::TypeExpr::String
+        | parser::TypeExpr::Bool
+        | parser::TypeExpr::Int
+        | parser::TypeExpr::Float
+        | parser::TypeExpr::Duration
+        | parser::TypeExpr::Simple(_)
+        | parser::TypeExpr::List(_)
+        | parser::TypeExpr::Map(_)
+        | parser::TypeExpr::Ref(_)
+        | parser::TypeExpr::DottedUnresolved(_)
+        | parser::TypeExpr::SchemaType { .. }
+        | parser::TypeExpr::Struct { .. } => Vec::new(),
     }
 }
 

@@ -137,7 +137,6 @@ fn cli_validated_file(
     .expect("load CLI fixture");
     let carina_core::config_loader::LoadedConfig {
         parsed,
-        inference_errors,
         duplicate_declarations,
         ..
     } = loaded;
@@ -146,13 +145,7 @@ fn cli_validated_file(
         &parsed.providers,
     );
     let validated = providers
-        .validate_evaluated_config(
-            parsed,
-            fixture.path(),
-            false,
-            &inference_errors,
-            &duplicate_declarations,
-        )
+        .validate_evaluated_config(parsed, fixture.path(), false, &duplicate_declarations)
         .expect("CLI validation fixture must pass");
     validated.evaluated_resources_for_test().clone()
 }
@@ -2042,8 +2035,10 @@ awscc.cloudfront.Distribution {
             .parsed
             .arguments
             .first()
-            .map(|argument| &argument.type_expr),
-        Some(carina_core::parser::TypeExpr::DottedUnresolved(_))
+            .map(|argument| &argument.static_type),
+        Some(carina_core::static_type::StaticType::Known(
+            carina_core::parser::TypeExpr::DottedUnresolved(_)
+        ))
     ));
     let matching_lsp =
         lsp_diagnostics(&engine_with_schemas(schemas.clone()), &matching, "main.crn");

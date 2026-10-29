@@ -161,7 +161,7 @@ impl TypeResolutionPolicy for DeferredUpstreamTypeResolution {
         parsed: &mut crate::parser::File<E>,
         config: &ProviderContext,
     ) -> Result<(), ModuleError> {
-        crate::validation::resolve_file_type_exprs_or_unknown(parsed, config);
+        crate::validation::resolve_file_static_types_for_consumer(parsed, config);
         Ok(())
     }
 }

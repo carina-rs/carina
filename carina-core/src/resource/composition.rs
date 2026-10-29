@@ -22,6 +22,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::parser::{TypeExpr, ValidateExpr};
+use crate::static_type::{ConsumerStaticType, StaticType};
 
 use super::{AccessPath, DeferredValue, ResolvedResourceId, StructuralOperand, Value};
 
@@ -74,7 +75,7 @@ enum CompositionAttributeValue {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveCompositionAttribute {
     value: CompositionAttributeValue,
-    declared_type: Option<TypeExpr>,
+    declared_type: Option<ConsumerStaticType>,
     /// The module argument directly forwarded by this output before call-site
     /// substitution. Validation checks that declaration in the module's own
     /// scope; retaining the provenance prevents an expanded caller value from
@@ -111,6 +112,13 @@ impl LiveCompositionAttribute {
     /// interpolation, function call, etc.) and lifts into
     /// classified as derived.
     pub fn from_value(value: Value, declared_type: Option<TypeExpr>) -> Self {
+        Self::from_value_with_static_type(value, declared_type.map(StaticType::Known))
+    }
+
+    pub fn from_value_with_static_type(
+        value: Value,
+        declared_type: Option<ConsumerStaticType>,
+    ) -> Self {
         let value = match value {
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 CompositionAttributeValue::Forwarded(path)
@@ -125,7 +133,7 @@ impl LiveCompositionAttribute {
     }
 
     /// The module-boundary annotation carried from `attributes {}`.
-    pub fn declared_type(&self) -> Option<&TypeExpr> {
+    pub fn declared_type(&self) -> Option<&ConsumerStaticType> {
         self.declared_type.as_ref()
     }
 
@@ -148,7 +156,7 @@ impl LiveCompositionAttribute {
 
     /// Reclassify a rewritten value while preserving its declaration.
     pub fn with_value(&self, value: Value) -> Self {
-        Self::from_value(value, self.declared_type.clone())
+        Self::from_value_with_static_type(value, self.declared_type.clone())
             .with_source_argument(self.source_argument.clone())
     }
 
@@ -244,7 +252,7 @@ pub struct LiveCompositionArgument {
 
 #[derive(Debug, Clone, PartialEq)]
 struct LiveCompositionArgumentMetadata {
-    declared_type: TypeExpr,
+    declared_type: ConsumerStaticType,
     origin: crate::parser::ArgumentOrigin,
 }
 
@@ -268,6 +276,14 @@ impl LiveCompositionArgument {
         declared_type: TypeExpr,
         origin: crate::parser::ArgumentOrigin,
     ) -> Self {
+        Self::from_value_with_static_type(value, StaticType::Known(declared_type), origin)
+    }
+
+    pub fn from_value_with_static_type(
+        value: Value,
+        declared_type: ConsumerStaticType,
+        origin: crate::parser::ArgumentOrigin,
+    ) -> Self {
         Self {
             operand: StructuralOperand::from_value(value),
             metadata: LiveCompositionArgumentMetadata {
@@ -277,9 +293,9 @@ impl LiveCompositionArgument {
         }
     }
 
-    pub(crate) fn from_handle(
+    pub(crate) fn from_handle_with_static_type(
         value: Value,
-        declared_type: TypeExpr,
+        declared_type: ConsumerStaticType,
         handle: crate::eval_value::StructuralHandle,
         origin: crate::parser::ArgumentOrigin,
     ) -> Self {
@@ -296,15 +312,17 @@ impl LiveCompositionArgument {
         self.operand.traversal_value()
     }
 
-    pub fn declared_type(&self) -> &TypeExpr {
+    pub fn declared_type(&self) -> &ConsumerStaticType {
         &self.metadata.declared_type
     }
 
-    pub fn metadata(&self) -> (&TypeExpr, crate::parser::ArgumentOrigin) {
+    pub fn metadata(&self) -> (&ConsumerStaticType, crate::parser::ArgumentOrigin) {
         (&self.metadata.declared_type, self.metadata.origin)
     }
 
-    pub(crate) fn validation_metadata(&self) -> (&TypeExpr, crate::parser::ArgumentOrigin) {
+    pub(crate) fn validation_metadata(
+        &self,
+    ) -> (&ConsumerStaticType, crate::parser::ArgumentOrigin) {
         self.metadata()
     }
 
@@ -1502,7 +1520,10 @@ mod tests {
 
         let rewritten = attr.with_value(Value::Concrete(ConcreteValue::String("x".into())));
 
-        assert_eq!(rewritten.declared_type(), Some(&declared));
+        assert_eq!(
+            rewritten.declared_type(),
+            Some(&crate::static_type::StaticType::Known(declared))
+        );
     }
 
     #[test]
@@ -1536,7 +1557,10 @@ mod tests {
 
         let rewritten = argument.with_value(Value::Concrete(ConcreteValue::String("x".into())));
 
-        assert_eq!(rewritten.declared_type(), &declared);
+        assert_eq!(
+            rewritten.declared_type(),
+            &crate::static_type::StaticType::Known(declared)
+        );
     }
 
     #[test]

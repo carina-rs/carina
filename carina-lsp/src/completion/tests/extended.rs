@@ -2301,6 +2301,60 @@ fn upstream_state_dot_completion_detail_shows_type_expr() {
     );
 }
 
+#[test]
+fn upstream_state_dot_completion_keeps_not_inferable_export_discoverable() {
+    let provider = test_provider();
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("parent");
+    let upstream = tmp.path().join("upstream");
+    let downstream = tmp.path().join("downstream");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::create_dir_all(&upstream).unwrap();
+    std::fs::create_dir_all(&downstream).unwrap();
+    std::fs::write(parent.join("main.crn"), "exports { y: String = 'y' }\n").unwrap();
+    std::fs::write(
+        upstream.join("main.crn"),
+        "let parent = upstream_state { source = '../parent' }\nexports { x = parent.y }\n",
+    )
+    .unwrap();
+    let source = "let up = upstream_state { source = '../upstream' }\nlet value = up.\n";
+    std::fs::write(downstream.join("main.crn"), source).unwrap();
+    let position = Position {
+        line: 1,
+        character: "let value = up.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&create_document(source), position, Some(&downstream));
+    let export = find_completion(&completions, "x");
+    let detail = export.detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains("up") && !detail.contains("String"),
+        "not-inferable export must use existence-only completion detail: {detail:?}",
+    );
+}
+
+#[test]
+fn upstream_state_dot_completion_keeps_consumer_unnameable_export_discoverable() {
+    let provider = test_provider();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  vpc_id: awscc.ec2.VpcId = 'vpc-1'\n}\n",
+        "let up = upstream_state { source = '../organizations' }\nlet value = up.\n",
+    );
+    let source = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let position = Position {
+        line: 1,
+        character: "let value = up.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&create_document(&source), position, Some(&base));
+    let export = find_completion(&completions, "vpc_id");
+    let detail = export.detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains("up") && !detail.contains("VpcId"),
+        "unnameable consumer type must fall back to existence-only detail: {detail:?}",
+    );
+}
+
 // =====================================================================
 // upstream_state depth-2 completion: dot after the export key (#2041)
 // =====================================================================

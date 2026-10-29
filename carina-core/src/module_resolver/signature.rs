@@ -3,14 +3,15 @@ use std::path::Path;
 
 use indexmap::IndexMap;
 
-use crate::parser::{ArgumentParameter, File, ParsedFile, ProviderContext, RequireBlock, TypeExpr};
+use crate::parser::{ArgumentParameter, File, ParsedFile, ProviderContext, RequireBlock};
+use crate::static_type::{ConsumerStaticType, StaticType};
 
 /// The statically declared boundary of one imported module after dotted type
 /// expressions have been resolved against the caller's provider context.
 #[derive(Debug, Clone)]
 pub struct ResolvedModuleSignature {
     pub arguments: Vec<ArgumentParameter>,
-    pub attributes: IndexMap<String, Option<TypeExpr>>,
+    pub attributes: IndexMap<String, Option<ConsumerStaticType>>,
     pub requires: Vec<RequireBlock>,
 }
 
@@ -32,9 +33,13 @@ pub(super) fn resolved_signature(
         .iter()
         .cloned()
         .map(|mut argument| {
-            if let Ok(resolved) = crate::validation::resolve_type_expr(&argument.type_expr, config)
-            {
-                argument.type_expr = resolved;
+            match &mut argument.static_type {
+                StaticType::Known(type_expr) => {
+                    if let Ok(resolved) = crate::validation::resolve_type_expr(type_expr, config) {
+                        *type_expr = resolved;
+                    }
+                }
+                StaticType::Unchecked(_reason) => {}
             }
             argument
         })
@@ -43,10 +48,18 @@ pub(super) fn resolved_signature(
         .attribute_params
         .iter()
         .map(|attribute| {
-            let resolved = attribute.type_expr.as_ref().map(|type_expr| {
-                crate::validation::resolve_type_expr(type_expr, config)
-                    .unwrap_or_else(|_| type_expr.clone())
-            });
+            let resolved = attribute
+                .static_type
+                .as_ref()
+                .map(|static_type| match static_type {
+                    StaticType::Known(type_expr) => {
+                        match crate::validation::resolve_type_expr(type_expr, config) {
+                            Ok(resolved) => StaticType::Known(resolved),
+                            Err(_error) => StaticType::Known(type_expr.clone()),
+                        }
+                    }
+                    StaticType::Unchecked(reason) => StaticType::Unchecked(reason.clone()),
+                });
             (attribute.name.clone(), resolved)
         })
         .collect();

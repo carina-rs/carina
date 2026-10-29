@@ -15,6 +15,7 @@ use carina_core::parser::{
 };
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::suggest_similar_name;
+use carina_core::static_type::{StaticType, UnnameableInConsumer};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
 use super::{DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic};
@@ -1958,9 +1959,13 @@ impl DiagnosticEngine {
 
                     // Type validation for known parameters
                     let arg = matching_arg.unwrap();
+                    let argument_type = match &arg.static_type {
+                        StaticType::Known(type_expr) => type_expr,
+                        StaticType::Unchecked(_unnameable) => continue,
+                    };
                     let Ok(Some(resolved_parameter)) =
                         carina_core::validation::resolve_parameter_type_for_check(
-                            &arg.type_expr,
+                            argument_type,
                             &self.provider_context,
                         )
                     else {
@@ -2405,7 +2410,7 @@ impl DiagnosticEngine {
                     // the parser's enum-identifier fallback until directory
                     // binding authority is available here.
                     Value::Concrete(ConcreteValue::EnumIdentifier(identifier))
-                        if attr_param.type_expr.is_none()
+                        if attr_param.static_type.is_none()
                             && !identifier.as_str().contains('.')
                             && !known_bindings.contains(identifier.as_str()) =>
                     {
@@ -2429,29 +2434,34 @@ impl DiagnosticEngine {
                     ));
                 }
 
-                if let Some(type_expr) = &attr_param.type_expr
-                    && let Some(semantic_value) =
-                        semantic_view.value_for_typecheck(attr_param, TypecheckValueSlot::Parameter)
-                    && let Err(type_error) =
-                        carina_core::validation::typecheck::check_type_expr_value(
-                            type_expr,
-                            semantic_value,
-                            &self.provider_context,
-                            carina_core::validation::typecheck::TypecheckInference::Available {
-                                bindings: inference_bindings,
-                                schemas: &self.schemas,
-                            },
-                        )
-                    && let Some((line, col)) =
-                        self.find_attributes_param_position(doc, &attr_param.name)
-                {
-                    diagnostics.push(carina_diagnostic(
-                        line,
-                        col,
-                        col + attr_param.name.len() as u32,
-                        DiagnosticSeverity::WARNING,
-                        type_error.to_string(),
-                    ));
+                match &attr_param.static_type {
+                    Some(StaticType::Known(type_expr)) => {
+                        if let Some(semantic_value) = semantic_view
+                            .value_for_typecheck(attr_param, TypecheckValueSlot::Parameter)
+                            && let Err(type_error) =
+                                carina_core::validation::typecheck::check_type_expr_value(
+                                    type_expr,
+                                    semantic_value,
+                                    &self.provider_context,
+                                    carina_core::validation::typecheck::TypecheckInference::Available {
+                                        bindings: inference_bindings,
+                                        schemas: &self.schemas,
+                                    },
+                                )
+                            && let Some((line, col)) =
+                                self.find_attributes_param_position(doc, &attr_param.name)
+                        {
+                            diagnostics.push(carina_diagnostic(
+                                line,
+                                col,
+                                col + attr_param.name.len() as u32,
+                                DiagnosticSeverity::WARNING,
+                                type_error.to_string(),
+                            ));
+                        }
+                    }
+                    Some(StaticType::Unchecked(_unnameable)) => {}
+                    None => {}
                 }
             }
         }
@@ -2468,11 +2478,26 @@ impl DiagnosticEngine {
             .cloned()
             .collect::<Vec<_>>();
         for parameter in &mut resolved_attribute_params {
-            if let Some(type_expr) = &parameter.type_expr
-                && let Ok(resolved) =
-                    carina_core::validation::resolve_type_expr(type_expr, &self.provider_context)
-            {
-                parameter.type_expr = Some(resolved);
+            let replacement = match &parameter.static_type {
+                Some(StaticType::Known(type_expr)) => {
+                    match carina_core::validation::resolve_type_expr(
+                        type_expr,
+                        &self.provider_context,
+                    ) {
+                        Ok(resolved) => Some(StaticType::Known(resolved)),
+                        Err(resolution_error) => {
+                            Some(StaticType::Unchecked(UnnameableInConsumer {
+                                original: type_expr.clone(),
+                                resolution_error,
+                            }))
+                        }
+                    }
+                }
+                Some(StaticType::Unchecked(_unnameable)) => None,
+                None => None,
+            };
+            if let Some(replacement) = replacement {
+                parameter.static_type = Some(replacement);
             }
         }
         if let Err(ref_errors) =
@@ -2622,17 +2647,23 @@ impl DiagnosticEngine {
 
         // Check for unknown type names in type annotations
         for param in &parsed.export_params {
-            if let Some(type_expr) = &param.type_expr
-                && let Some(error) = self.check_unknown_type_names(type_expr)
-                && let Some((line, col)) = self.find_exports_param_position(doc, &param.name)
-            {
-                diagnostics.push(carina_diagnostic(
-                    line,
-                    col,
-                    col + param.name.len() as u32,
-                    DiagnosticSeverity::WARNING,
-                    error,
-                ));
+            match &param.static_type {
+                Some(StaticType::Known(type_expr)) => {
+                    if let Some(error) = self.check_unknown_type_names(type_expr)
+                        && let Some((line, col)) =
+                            self.find_exports_param_position(doc, &param.name)
+                    {
+                        diagnostics.push(carina_diagnostic(
+                            line,
+                            col,
+                            col + param.name.len() as u32,
+                            DiagnosticSeverity::WARNING,
+                            error,
+                        ));
+                    }
+                }
+                Some(StaticType::Unchecked(_unnameable)) => {}
+                None => {}
             }
         }
 
@@ -2646,7 +2677,7 @@ impl DiagnosticEngine {
         let Some(inference_input) = semantic_view.parsed() else {
             return diagnostics;
         };
-        let (inferred_export_params, inference_errors) =
+        let inferred_export_params =
             carina_core::validation::inference::infer_export_params(inference_input, &self.schemas);
         // Surface inference failures as "type annotation required"
         // diagnostics, anchored at the export name. Errors for
@@ -2654,35 +2685,28 @@ impl DiagnosticEngine {
         // `merged`) won't anchor in this buffer and are skipped here —
         // the buffer that owns the export will surface them on its
         // own pass.
-        for inference_error in &inference_errors {
-            if let Some((line, col)) = self.find_exports_param_position(doc, &inference_error.name)
-            {
+        for inference_error in
+            carina_core::validation::inference::attached_inference_failures(&inferred_export_params)
+        {
+            if let Some((line, col)) = self.find_exports_param_position(doc, inference_error.name) {
                 diagnostics.push(carina_diagnostic(
                     line,
                     col,
                     col + inference_error.name.len() as u32,
                     DiagnosticSeverity::WARNING,
                     carina_core::validation::inference::format_inference_error(
-                        &inference_error.name,
-                        &inference_error.error,
+                        inference_error.name,
+                        inference_error.error,
                     ),
                 ));
             }
         }
-        // Inference and the Unknown-type existence walk share export-param
-        // indices as their diagnostic identity. The LSP inference input is
-        // post-expansion, so it can report composition misses through a
-        // `Virtual` binding; suppressing those exact indices prevents the
-        // composition authority from reporting the same typo again.
-        let reported_inference_error_indices: HashSet<usize> =
-            inference_errors.iter().map(|error| error.index).collect();
         let export_bindings =
             carina_core::binding_index::BindingIndex::from_parsed(inference_input, &self.schemas);
         if let Err(ref_errors) =
             carina_core::validation::validate_export_param_ref_types_with_bindings(
                 &inferred_export_params,
                 &export_bindings,
-                &reported_inference_error_indices,
             )
         {
             for error_msg in ref_errors.split('\n') {
@@ -2770,7 +2794,18 @@ impl DiagnosticEngine {
             TypeExpr::Struct { fields } => fields
                 .iter()
                 .find_map(|(_, ty)| self.check_unknown_type_names(ty)),
-            _ => None,
+            TypeExpr::Union(members) => members
+                .iter()
+                .find_map(|member| self.check_unknown_type_names(member)),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::StringLiteral(_) => None,
         }
     }
 

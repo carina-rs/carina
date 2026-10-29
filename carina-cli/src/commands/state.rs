@@ -886,7 +886,6 @@ async fn run_state_bucket_delete(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
 
@@ -912,13 +911,8 @@ async fn run_state_bucket_delete(
     // resolved provider values needed for construction can wait until after
     // confirmation.
     let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
-    let validated_config = providers.validate_evaluated_config(
-        parsed,
-        base_dir,
-        true,
-        &inference_errors,
-        &duplicate_declarations,
-    )?;
+    let validated_config =
+        providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
     println!(
         "{}",
@@ -1046,19 +1040,13 @@ pub async fn run_state_refresh(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
-    let validated_config = providers.validate_evaluated_config(
-        parsed,
-        base_dir,
-        true,
-        &inference_errors,
-        &duplicate_declarations,
-    )?;
+    let validated_config =
+        providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
     let verified_backend = verify_for_mutation(
         path,
@@ -2536,7 +2524,7 @@ mod tests {
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &downstream).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &downstream, true, &[], &[])
+            .validate_evaluated_config(parsed, &downstream, true, &[])
             .unwrap();
 
         run_state_refresh_locked(
@@ -2558,7 +2546,7 @@ mod tests {
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &base_dir, true, &[], &[])
+            .validate_evaluated_config(parsed, &base_dir, true, &[])
             .unwrap();
 
         run_state_refresh_locked(
@@ -2580,7 +2568,7 @@ mod tests {
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &base_dir, true, &[], &[])
+            .validate_evaluated_config(parsed, &base_dir, true, &[])
             .unwrap();
 
         run_state_refresh_locked(

@@ -733,7 +733,6 @@ fn validation_report_from<'a>(
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
-    prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> ValidationReport<'a> {
     let errors = match crate::commands::validate_and_resolve_errors_inner(
@@ -743,7 +742,6 @@ fn validation_report_from<'a>(
         context,
         load_errors,
         skip_resource_validation,
-        prior_inference_errors,
         duplicate_declarations,
         crate::commands::ConfigNameResolution::EvaluatedOnly,
     ) {
@@ -776,7 +774,6 @@ fn resolve_config_pair_errors_with_context(
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     base_dir: &Path,
     skip_resource_validation: bool,
-    prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, Vec<AppError>> {
     match crate::commands::validate_and_resolve_errors_inner(
@@ -786,7 +783,6 @@ fn resolve_config_pair_errors_with_context(
         context,
         load_errors,
         skip_resource_validation,
-        prior_inference_errors,
         duplicate_declarations,
         crate::commands::ConfigNameResolution::Paired(Box::new(unresolved)),
     )? {
@@ -805,7 +801,6 @@ fn resolve_config_pair_with_context(
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     base_dir: &Path,
     skip_resource_validation: bool,
-    prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, AppError> {
     resolve_config_pair_errors_with_context(
@@ -815,7 +810,6 @@ fn resolve_config_pair_with_context(
         unresolved,
         base_dir,
         skip_resource_validation,
-        prior_inference_errors,
         duplicate_declarations,
     )
     .map_err(crate::commands::collapse_errors)
@@ -922,7 +916,6 @@ impl ProviderLoad {
         parsed: &mut carina_core::parser::InferredFile,
         base_dir: &Path,
         skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> ValidationReport<'a> {
         validation_report_from(
@@ -931,7 +924,6 @@ impl ProviderLoad {
             parsed,
             base_dir,
             skip_resource_validation,
-            prior_inference_errors,
             duplicate_declarations,
         )
     }
@@ -943,7 +935,6 @@ impl ProviderLoad {
         mut parsed: carina_core::parser::InferredFile,
         base_dir: &Path,
         skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig<carina_core::parser::InferredFile>, AppError> {
         let ValidationReport {
@@ -955,7 +946,6 @@ impl ProviderLoad {
             &mut parsed,
             base_dir,
             skip_resource_validation,
-            prior_inference_errors,
             duplicate_declarations,
         );
         // The resource-skipping pipeline omits provider-load diagnostics.
@@ -985,7 +975,6 @@ impl ProviderLoad {
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
         base_dir: &Path,
         skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig, AppError> {
         let canonical_resources = match resolve_config_pair_errors_with_context(
@@ -995,7 +984,6 @@ impl ProviderLoad {
             unresolved,
             base_dir,
             skip_resource_validation,
-            prior_inference_errors,
             duplicate_declarations,
         ) {
             Ok(canonical_resources) => {
@@ -1077,7 +1065,6 @@ impl CompleteProviderLoad {
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
         base_dir: &Path,
         skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<CheckedSavedPlanInputs, AppError> {
         let canonical_resources = resolve_config_pair_with_context(
@@ -1087,7 +1074,6 @@ impl CompleteProviderLoad {
             unresolved,
             base_dir,
             skip_resource_validation,
-            prior_inference_errors,
             duplicate_declarations,
         )?;
         let (parsed, unresolved) =
@@ -1154,7 +1140,6 @@ impl ReportingProviderLoad {
         parsed: &mut carina_core::parser::InferredFile,
         base_dir: &Path,
         skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> ValidationReport<'a> {
         validation_report_from(
@@ -1163,7 +1148,6 @@ impl ReportingProviderLoad {
             parsed,
             base_dir,
             skip_resource_validation,
-            prior_inference_errors,
             duplicate_declarations,
         )
     }
@@ -1368,7 +1352,6 @@ impl ValidatedConfig<CanonicalResourcePair<carina_core::parser::InferredExportPa
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
         base_dir: &Path,
         skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig, AppError> {
         let Self {
@@ -1382,7 +1365,6 @@ impl ValidatedConfig<CanonicalResourcePair<carina_core::parser::InferredExportPa
             unresolved,
             base_dir,
             skip_resource_validation,
-            prior_inference_errors,
             duplicate_declarations,
         )?;
         let (parsed, unresolved) =

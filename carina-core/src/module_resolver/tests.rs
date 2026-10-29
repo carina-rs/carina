@@ -128,14 +128,14 @@ fn create_test_module() -> ParsedFile {
         arguments: vec![
             ArgumentParameter {
                 name: "vpc_id".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "enable_flag".to_string(),
-                type_expr: TypeExpr::Bool,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::Bool),
                 default: Some(Value::Concrete(ConcreteValue::Bool(true))),
                 description: None,
                 validations: Vec::new(),
@@ -637,7 +637,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "cidr".to_string(),
-            type_expr: TypeExpr::String,
+            static_type: crate::static_type::StaticType::Known(TypeExpr::String),
             default: None,
             description: None,
             validations: Vec::new(),
@@ -1080,14 +1080,14 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         arguments: vec![
             ArgumentParameter {
                 name: "region".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: vec![],
             },
             ArgumentParameter {
                 name: "instance_count".to_string(),
-                type_expr: TypeExpr::Int,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::Int),
                 default: None,
                 description: None,
                 validations: vec![],
@@ -1169,7 +1169,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
             .arguments
             .get("region")
             .map(|argument| argument.declared_type()),
-        Some(&TypeExpr::String),
+        Some(&crate::static_type::StaticType::Known(TypeExpr::String)),
         "the declared sink type must travel with the argument value",
     );
 
@@ -2448,14 +2448,14 @@ fn create_module_with_interpolation() -> ParsedFile {
         arguments: vec![
             ArgumentParameter {
                 name: "cidr_block".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "env_name".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -3064,7 +3064,7 @@ fn create_module_with_port_validation() -> ParsedFile {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "port".to_string(),
-            type_expr: TypeExpr::Int,
+            static_type: crate::static_type::StaticType::Known(TypeExpr::Int),
             default: Some(Value::Concrete(ConcreteValue::Int(8080))),
             description: Some("Web server port".to_string()),
             validations: vec![ValidationBlock::dummy(
@@ -3132,7 +3132,7 @@ fn test_argument_validation_with_resource_reference_is_pending() {
     use crate::parser::{CompareOp, ValidateExpr, ValidationBlock};
 
     let mut module = create_module_with_port_validation();
-    module.arguments[0].type_expr = TypeExpr::String;
+    module.arguments[0].static_type = crate::static_type::StaticType::Known(TypeExpr::String);
     module.arguments[0].validations = vec![ValidationBlock::dummy(
         ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::FunctionCall {
@@ -3251,7 +3251,7 @@ let root = outer { outer_port = producer.port }
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "outer_port".to_string(),
-            type_expr: TypeExpr::String,
+            static_type: crate::static_type::StaticType::Known(TypeExpr::String),
             default: None,
             description: None,
             validations: vec![],
@@ -3431,7 +3431,7 @@ fn test_argument_validation_no_message_uses_default() {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "count".to_string(),
-            type_expr: TypeExpr::Int,
+            static_type: crate::static_type::StaticType::Known(TypeExpr::Int),
             default: None,
             description: None,
             validations: vec![ValidationBlock::dummy(
@@ -3495,7 +3495,9 @@ fn test_argument_validation_len_with_list() {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "tags".to_string(),
-            type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+            static_type: crate::static_type::StaticType::Known(TypeExpr::List(Box::new(
+                TypeExpr::String,
+            ))),
             default: None,
             description: None,
             validations: vec![ValidationBlock::dummy(
@@ -3579,14 +3581,14 @@ fn test_require_block_passes() {
         arguments: vec![
             ArgumentParameter {
                 name: "enable_https".to_string(),
-                type_expr: TypeExpr::Bool,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::Bool),
                 default: Some(Value::Concrete(ConcreteValue::Bool(true))),
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "cert_arn".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::String),
                 default: Some(Value::Concrete(ConcreteValue::String(
                     "arn:aws:acm:us-east-1:123:cert/abc".into(),
                 ))),
@@ -3661,14 +3663,14 @@ fn test_require_block_fails_with_not_expr() {
         arguments: vec![
             ArgumentParameter {
                 name: "enable_https".to_string(),
-                type_expr: TypeExpr::Bool,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::Bool),
                 default: Some(Value::Concrete(ConcreteValue::Bool(true))),
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "has_cert".to_string(),
-                type_expr: TypeExpr::Bool,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::Bool),
                 default: Some(Value::Concrete(ConcreteValue::Bool(false))),
                 description: None,
                 validations: Vec::new(),
@@ -3742,7 +3744,9 @@ fn test_require_block_len_function() {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "subnet_ids".to_string(),
-            type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+            static_type: crate::static_type::StaticType::Known(TypeExpr::List(Box::new(
+                TypeExpr::String,
+            ))),
             default: None,
             description: None,
             validations: Vec::new(),
@@ -3830,14 +3834,14 @@ fn test_require_block_multiple_constraints() {
         arguments: vec![
             ArgumentParameter {
                 name: "min_size".to_string(),
-                type_expr: TypeExpr::Int,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::Int),
                 default: None,
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "max_size".to_string(),
-                type_expr: TypeExpr::Int,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::Int),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -4031,7 +4035,7 @@ fn test_argument_type_custom_validator() {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "policy_arn".to_string(),
-        type_expr: TypeExpr::SchemaType { owned },
+        static_type: crate::static_type::StaticType::Known(TypeExpr::SchemaType { owned }),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -4113,7 +4117,9 @@ fn test_argument_type_list_of_custom_type() {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "policy_arns".to_string(),
-        type_expr: TypeExpr::List(Box::new(TypeExpr::SchemaType { owned })),
+        static_type: crate::static_type::StaticType::Known(TypeExpr::List(Box::new(
+            TypeExpr::SchemaType { owned },
+        ))),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -5672,10 +5678,10 @@ fn create_module_with_environment_union() -> ParsedFile {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "environment".to_string(),
-            type_expr: TypeExpr::Union(vec![
+            static_type: crate::static_type::StaticType::Known(TypeExpr::Union(vec![
                 TypeExpr::StringLiteral("dev".to_string()),
                 TypeExpr::StringLiteral("prod".to_string()),
-            ]),
+            ])),
             default: Some(Value::Concrete(ConcreteValue::String("dev".into()))),
             description: None,
             validations: Vec::new(),
@@ -6567,7 +6573,9 @@ fn argument_type_list_accepts_resource_ref() {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "role_arns".to_string(),
-        type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("arn".to_string()))),
+        static_type: crate::static_type::StaticType::Known(TypeExpr::List(Box::new(
+            TypeExpr::Simple("arn".to_string()),
+        ))),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -6605,7 +6613,9 @@ fn argument_type_map_accepts_resource_ref() {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "tags".to_string(),
-        type_expr: TypeExpr::Map(Box::new(TypeExpr::String)),
+        static_type: crate::static_type::StaticType::Known(TypeExpr::Map(Box::new(
+            TypeExpr::String,
+        ))),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -6642,9 +6652,9 @@ fn argument_type_struct_accepts_resource_ref() {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "options".to_string(),
-        type_expr: TypeExpr::Struct {
+        static_type: crate::static_type::StaticType::Known(TypeExpr::Struct {
             fields: vec![("name".to_string(), TypeExpr::String)],
-        },
+        }),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -6678,7 +6688,7 @@ fn argument_type_int_accepts_resource_ref_for_later_ref_type_validation() {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "count".to_string(),
-        type_expr: TypeExpr::Int,
+        static_type: crate::static_type::StaticType::Known(TypeExpr::Int),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -6814,7 +6824,7 @@ fn module_argument_type_error_with_config(
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: arg_name.to_string(),
-        type_expr,
+        static_type: crate::static_type::StaticType::Known(type_expr),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -6977,10 +6987,10 @@ fn binding_ref_argument_defers_to_binding_index() {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "environment".to_string(),
-        type_expr: TypeExpr::Union(vec![
+        static_type: crate::static_type::StaticType::Known(TypeExpr::Union(vec![
             TypeExpr::StringLiteral("dev".to_string()),
             TypeExpr::StringLiteral("prod".to_string()),
-        ]),
+        ])),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -7188,10 +7198,14 @@ fn resolved_module_signature_groups_all_owners_of_a_dotted_annotation() {
     .expect("module signature fixture must parse");
 
     let signature = super::signature::resolved_signature(&parsed, &context);
-    let resolved = &signature.arguments[0].type_expr;
+    let resolved = &signature.arguments[0].static_type;
 
     assert!(
-        matches!(resolved, TypeExpr::List(inner) if matches!(inner.as_ref(), TypeExpr::SchemaType { .. })),
+        matches!(
+            resolved,
+            crate::static_type::StaticType::Known(TypeExpr::List(inner))
+                if matches!(inner.as_ref(), TypeExpr::SchemaType { .. })
+        ),
         "module signatures must not retain DottedUnresolved for a known shared identity: {resolved:?}"
     );
 }

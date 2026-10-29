@@ -60,7 +60,7 @@ pub enum BindingTarget<'a> {
     Schema(&'a ResourceSchema),
     LiveComposition(&'a LiveComposition),
     ModuleCall(&'a crate::module_resolver::ResolvedModuleSignature),
-    Argument(&'a crate::parser::TypeExpr),
+    Argument(&'a crate::static_type::ConsumerStaticType),
     UpstreamState(&'a crate::upstream_exports::UpstreamExportEntries),
 }
 
@@ -415,7 +415,8 @@ impl std::fmt::Display for RefTypeError {
 pub enum RefType {
     Typed(ResolvedRefType),
     /// The binding exists but no sound schema type can be represented. This
-    /// includes derived composition values and `TypeExpr::Unknown`.
+    /// includes derived composition values and explicitly unchecked static
+    /// types.
     Unchecked,
     UnknownBinding {
         binding: String,
@@ -599,7 +600,7 @@ impl<'a> BindingIndex<'a> {
             entries
                 .entry(argument.name.clone())
                 .or_insert(BindingEntry {
-                    target: BindingTarget::Argument(&argument.type_expr),
+                    target: BindingTarget::Argument(&argument.static_type),
                 });
         }
 
@@ -641,8 +642,8 @@ impl<'a> BindingIndex<'a> {
     /// bindings preserve a liftable declared boundary type together with all
     /// inferable forwarded-source constraints; otherwise a forwarded output
     /// recursively inherits the target path's type. Derived values and
-    /// `TypeExpr::Unknown` remains unchecked. The active path set
-    /// bounds malformed/cyclic forwarded chains.
+    /// typed unchecked reasons remain unchecked. The active path set bounds
+    /// malformed/cyclic forwarded chains.
     pub fn ref_type<'p>(&self, path: impl Into<ReferencePathRef<'p>>) -> RefType {
         self.ref_type_inner(
             path.into(),
@@ -743,68 +744,74 @@ impl<'a> BindingIndex<'a> {
                         ));
                     };
 
-                    if let Some(declared) = attribute
-                        .declared_type()
-                        .and_then(crate::validation::lift_type_expr)
-                    {
-                        let defs = crate::schema::empty_defs_for_schema_walks();
-                        let rendered_path = path.to_dot_string();
-                        match narrow_type(
-                            &declared,
-                            path.segments(),
-                            defs,
-                            &rendered_path,
-                            invalid_access,
-                        ) {
-                            Ok(Some(attr_type)) => {
-                                let inferred = attribute.forwarded_path().and_then(|forwarded| {
-                                    match self.ref_type_inner(
-                                        ReferencePathRef::Access(forwarded),
-                                        visiting,
-                                        check,
-                                    ) {
-                                        RefType::Typed(resolved) => resolved
-                                            .narrow(path.segments(), path, invalid_access)
-                                            .ok()
-                                            .flatten(),
-                                        RefType::Unchecked
-                                        | RefType::UnknownBinding { .. }
-                                        | RefType::UnknownAttribute(_) => None,
-                                    }
-                                });
-                                RefType::Typed(ResolvedRefType::with_declared_type(
-                                    ResolvedTypeConstraint::new(attr_type.clone(), defs.clone()),
-                                    inferred,
-                                ))
-                            }
-                            Ok(None) => RefType::Unchecked,
-                            Err(error) => RefType::UnknownAttribute(error),
-                        }
-                    } else if attribute.source_argument().is_some()
-                        && attribute.declared_type().is_some()
-                    {
-                        // The declaration is the source of truth for a directly
-                        // forwarded module argument. An unknown declaration
-                        // stays unchecked rather than inheriting the caller's
-                        // substituted value type.
-                        RefType::Unchecked
-                    } else if let Some(forwarded) = attribute.forwarded_path() {
-                        match self.ref_type_inner(
-                            ReferencePathRef::Access(forwarded),
-                            visiting,
-                            check,
-                        ) {
-                            RefType::Typed(resolved) => {
-                                match resolved.narrow(path.segments(), path, invalid_access) {
-                                    Ok(Some(resolved)) => RefType::Typed(resolved),
-                                    Ok(None) => RefType::Unchecked,
-                                    Err(error) => RefType::UnknownAttribute(error),
+                    match attribute.declared_type() {
+                        Some(crate::static_type::StaticType::Known(type_expr)) => {
+                            let Some(declared) = crate::validation::lift_type_expr(type_expr)
+                            else {
+                                visiting.remove(&key);
+                                return RefType::Unchecked;
+                            };
+                            let defs = crate::schema::empty_defs_for_schema_walks();
+                            let rendered_path = path.to_dot_string();
+                            match narrow_type(
+                                &declared,
+                                path.segments(),
+                                defs,
+                                &rendered_path,
+                                invalid_access,
+                            ) {
+                                Ok(Some(attr_type)) => {
+                                    let inferred =
+                                        attribute.forwarded_path().and_then(|forwarded| match self
+                                            .ref_type_inner(
+                                                ReferencePathRef::Access(forwarded),
+                                                visiting,
+                                                check,
+                                            ) {
+                                            RefType::Typed(resolved) => resolved
+                                                .narrow(path.segments(), path, invalid_access)
+                                                .ok()
+                                                .flatten(),
+                                            RefType::Unchecked
+                                            | RefType::UnknownBinding { .. }
+                                            | RefType::UnknownAttribute(_) => None,
+                                        });
+                                    RefType::Typed(ResolvedRefType::with_declared_type(
+                                        ResolvedTypeConstraint::new(
+                                            attr_type.clone(),
+                                            defs.clone(),
+                                        ),
+                                        inferred,
+                                    ))
                                 }
+                                Ok(None) => RefType::Unchecked,
+                                Err(error) => RefType::UnknownAttribute(error),
                             }
-                            other => other,
                         }
-                    } else {
-                        RefType::Unchecked
+                        Some(crate::static_type::StaticType::Unchecked(_reason)) => {
+                            RefType::Unchecked
+                        }
+                        None => {
+                            if let Some(forwarded) = attribute.forwarded_path() {
+                                match self.ref_type_inner(
+                                    ReferencePathRef::Access(forwarded),
+                                    visiting,
+                                    check,
+                                ) {
+                                    RefType::Typed(resolved) => {
+                                        match resolved.narrow(path.segments(), path, invalid_access)
+                                        {
+                                            Ok(Some(resolved)) => RefType::Typed(resolved),
+                                            Ok(None) => RefType::Unchecked,
+                                            Err(error) => RefType::UnknownAttribute(error),
+                                        }
+                                    }
+                                    other => other,
+                                }
+                            } else {
+                                RefType::Unchecked
+                            }
+                        }
                     }
                 }
                 BindingTarget::ModuleCall(signature) => {
@@ -821,10 +828,18 @@ impl<'a> BindingIndex<'a> {
                             RefTargetKind::LiveComposition,
                         ));
                     };
-                    let Some(declared) = declared
-                        .as_ref()
-                        .and_then(crate::validation::lift_type_expr)
-                    else {
+                    let Some(static_type) = declared.as_ref() else {
+                        visiting.remove(&key);
+                        return RefType::Unchecked;
+                    };
+                    let type_expr = match static_type {
+                        crate::static_type::StaticType::Known(type_expr) => type_expr,
+                        crate::static_type::StaticType::Unchecked(_reason) => {
+                            visiting.remove(&key);
+                            return RefType::Unchecked;
+                        }
+                    };
+                    let Some(declared) = crate::validation::lift_type_expr(type_expr) else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
@@ -844,7 +859,11 @@ impl<'a> BindingIndex<'a> {
                         Err(error) => RefType::UnknownAttribute(error),
                     }
                 }
-                BindingTarget::Argument(type_expr) => {
+                BindingTarget::Argument(crate::static_type::StaticType::Unchecked(_reason)) => {
+                    visiting.remove(&key);
+                    return RefType::Unchecked;
+                }
+                BindingTarget::Argument(crate::static_type::StaticType::Known(type_expr)) => {
                     let invalid_access = check.invalid_access_policy(entry.target);
                     // A resource-handle argument is substituted with the
                     // caller's concrete resource binding during module
@@ -928,15 +947,70 @@ impl<'a> BindingIndex<'a> {
                             known_exports,
                         });
                     };
-                    if !export.has_declared_type {
-                        visiting.remove(&key);
-                        return RefType::Unchecked;
-                    }
-                    let Some(declared) = export
-                        .type_expr
-                        .as_ref()
-                        .and_then(crate::validation::lift_type_expr)
-                    else {
+                    let type_expr = match &export.static_type {
+                        crate::upstream_exports::UpstreamExportType::Static(
+                            crate::static_type::ExportStaticType::Declared(
+                                crate::static_type::StaticType::Known(type_expr),
+                            ),
+                        ) => type_expr,
+                        crate::upstream_exports::UpstreamExportType::Static(
+                            crate::static_type::ExportStaticType::Declared(
+                                crate::static_type::StaticType::Unchecked(_reason),
+                            ),
+                        ) => {
+                            visiting.remove(&key);
+                            return RefType::Unchecked;
+                        }
+                        crate::upstream_exports::UpstreamExportType::Static(
+                            crate::static_type::ExportStaticType::Inferred(
+                                crate::static_type::StaticType::Known(_type_expr),
+                            ),
+                        ) => {
+                            visiting.remove(&key);
+                            return RefType::Unchecked;
+                        }
+                        crate::upstream_exports::UpstreamExportType::Static(
+                            crate::static_type::ExportStaticType::Inferred(
+                                crate::static_type::StaticType::Unchecked(
+                                    crate::static_type::InferredUncheckedReason::InferenceFailed(
+                                        _error,
+                                    ),
+                                ),
+                            ),
+                        ) => {
+                            visiting.remove(&key);
+                            return RefType::Unchecked;
+                        }
+                        crate::upstream_exports::UpstreamExportType::Static(
+                            crate::static_type::ExportStaticType::Inferred(
+                                crate::static_type::StaticType::Unchecked(
+                                    crate::static_type::InferredUncheckedReason::NotInferable(
+                                        _reason,
+                                    ),
+                                ),
+                            ),
+                        ) => {
+                            visiting.remove(&key);
+                            return RefType::Unchecked;
+                        }
+                        crate::upstream_exports::UpstreamExportType::Static(
+                            crate::static_type::ExportStaticType::Inferred(
+                                crate::static_type::StaticType::Unchecked(
+                                    crate::static_type::InferredUncheckedReason::UnnameableInConsumer(
+                                        _reason,
+                                    ),
+                                ),
+                            ),
+                        ) => {
+                            visiting.remove(&key);
+                            return RefType::Unchecked;
+                        }
+                        crate::upstream_exports::UpstreamExportType::InferenceNotRun => {
+                            visiting.remove(&key);
+                            return RefType::Unchecked;
+                        }
+                    };
+                    let Some(declared) = crate::validation::lift_type_expr(type_expr) else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
@@ -2527,8 +2601,8 @@ let existing = read aws.ec2.Vpc {
             crate::module_resolver::ResolvedModuleSignature {
                 arguments: Vec::new(),
                 attributes: indexmap::indexmap! {
-                    "count".to_string() => Some(TypeExpr::Int),
-                    "name".to_string() => Some(TypeExpr::String),
+                    "count".to_string() => Some(crate::static_type::StaticType::Known(TypeExpr::Int)),
+                    "name".to_string() => Some(crate::static_type::StaticType::Known(TypeExpr::String)),
                 },
                 requires: Vec::new(),
             },
@@ -2934,16 +3008,16 @@ let vpc = aws.ec2.Vpc {
         parsed.arguments.extend([
             ArgumentParameter {
                 name: "name".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "cfg".to_string(),
-                type_expr: TypeExpr::Struct {
+                static_type: crate::static_type::StaticType::Known(TypeExpr::Struct {
                     fields: vec![("enabled".to_string(), TypeExpr::Bool)],
-                },
+                }),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -2968,7 +3042,9 @@ let vpc = aws.ec2.Vpc {
         let mut parsed = parse("", &Default::default()).expect("parse");
         parsed.arguments.push(ArgumentParameter {
             name: "vpc".to_string(),
-            type_expr: TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc")),
+            static_type: crate::static_type::StaticType::Known(TypeExpr::Ref(
+                ResourceTypePath::new("aws", "ec2.Vpc"),
+            )),
             default: None,
             description: None,
             validations: Vec::new(),
@@ -3043,13 +3119,18 @@ let vpc = aws.ec2.Vpc {
             HashMap::from([(
                 "vpc".to_string(),
                 crate::upstream_exports::UpstreamExportEntry {
-                    type_expr: Some(TypeExpr::SchemaType {
-                        owned: crate::parser::OwnedTypeIdentity::provider(
-                            "aws",
-                            crate::schema::TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
+                    static_type: crate::upstream_exports::UpstreamExportType::Static(
+                        crate::static_type::ExportStaticType::Declared(
+                            crate::static_type::StaticType::Known(TypeExpr::SchemaType {
+                                owned: crate::parser::OwnedTypeIdentity::provider(
+                                    "aws",
+                                    crate::schema::TypeIdentity::from_schema_type(
+                                        "aws", "ec2.Vpc", "Id",
+                                    ),
+                                ),
+                            }),
                         ),
-                    }),
-                    has_declared_type: true,
+                    ),
                     value: None,
                 },
             )]),
@@ -3084,8 +3165,11 @@ let vpc = aws.ec2.Vpc {
             HashMap::from([(
                 "opaque".to_string(),
                 crate::upstream_exports::UpstreamExportEntry {
-                    type_expr: Some(TypeExpr::String),
-                    has_declared_type: false,
+                    static_type: crate::upstream_exports::UpstreamExportType::Static(
+                        crate::static_type::ExportStaticType::Inferred(
+                            crate::static_type::StaticType::Known(TypeExpr::String),
+                        ),
+                    ),
                     value: None,
                 },
             )]),

@@ -624,7 +624,7 @@ fn unannotated_export_of_struct_with_nested_union_stays_compatibility_clean() {
 }
 
 #[test]
-fn prior_heterogeneous_export_error_is_not_rederived_by_plan_style_validation() {
+fn attached_heterogeneous_export_error_is_shared_by_plan_style_validation() {
     let fixture = Fixture::direct(&[("exports.crn", "exports {\n  mixed = [\"text\", 1]\n}\n")]);
 
     let validate_diags = fixture.validate();
@@ -645,12 +645,6 @@ fn prior_heterogeneous_export_error_is_not_rederived_by_plan_style_validation() 
         &carina_core::schema::SchemaRegistry::new(),
     )
     .expect("load plan-style fixture");
-    assert_eq!(
-        loaded.inference_errors.len(),
-        1,
-        "fixture must carry exactly the load-time inference error",
-    );
-    let inference_errors = loaded.inference_errors;
     let mut parsed = loaded.parsed;
     let providers = carina_cli::wiring::ProviderLoad::for_test(factories(), &parsed.providers);
     let retry_errors = carina_cli::commands::validate_and_resolve_errors(
@@ -658,13 +652,15 @@ fn prior_heterogeneous_export_error_is_not_rederived_by_plan_style_validation() 
         carina_core::config_loader::get_base_dir(&fixture.caller),
         &providers,
         false,
-        &inference_errors,
         &[],
     );
 
     assert!(
-        retry_errors.is_empty(),
-        "plan/apply-style validation must not re-report a prior load-time inference error: {retry_errors:#?}",
+        retry_errors.len() == 1
+            && retry_errors[0]
+                .to_string()
+                .contains("type annotation required"),
+        "plan/apply-style validation must report the attached inference error once: {retry_errors:#?}",
     );
 }
 

@@ -6528,7 +6528,7 @@ mod apply_state_save_tests {
 #[cfg(test)]
 mod export_writeback_tests {
     use super::*;
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::InferredExportParam;
     use carina_core::resource::{
         AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PartialReadMarker,
         UnknownReason, Value,
@@ -6538,7 +6538,15 @@ mod export_writeback_tests {
     fn export_param(name: &str, value: Value) -> InferredExportParam {
         InferredExportParam {
             name: name.to_string(),
-            type_expr: TypeExpr::Unknown,
+            static_type: carina_core::static_type::ExportStaticType::Inferred(
+                carina_core::static_type::StaticType::Unchecked(
+                    carina_core::static_type::InferredUncheckedReason::NotInferable(
+                        carina_core::static_type::NotInferableReason::SchemaUnavailable {
+                            binding: "test fixture".to_string(),
+                        },
+                    ),
+                ),
+            ),
             value: Some(value),
         }
     }

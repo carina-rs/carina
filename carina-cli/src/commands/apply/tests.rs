@@ -40,7 +40,6 @@ fn validate_with_test_factories(
     skip_resource_validation: bool,
     factories: Vec<Box<dyn ProviderFactory>>,
     load_errors: HashMap<String, String>,
-    prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Vec<AppError> {
     let providers = crate::wiring::ProviderLoad::for_test_with_load_errors(
@@ -53,7 +52,6 @@ fn validate_with_test_factories(
         base_dir,
         &providers,
         skip_resource_validation,
-        prior_inference_errors,
         duplicate_declarations,
     )
 }
@@ -652,6 +650,18 @@ fn checked_exports(
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("test exports must pass the secret boundary")
+}
+
+fn fixture_unchecked_export_static_type() -> carina_core::static_type::ExportStaticType {
+    carina_core::static_type::ExportStaticType::Inferred(
+        carina_core::static_type::StaticType::Unchecked(
+            carina_core::static_type::InferredUncheckedReason::NotInferable(
+                carina_core::static_type::NotInferableReason::SchemaUnavailable {
+                    binding: "test fixture".to_string(),
+                },
+            ),
+        ),
+    )
 }
 
 fn resolve_and_materialize_exports_for_test(
@@ -2387,7 +2397,6 @@ async fn run_apply_cascade_fixture(
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -2729,7 +2738,6 @@ fn load_and_resolve_module_data_source_fixture(
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -2892,7 +2900,6 @@ let lookup = read mock.iam.Roles {{
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(validation_errors.is_empty(), "{validation_errors:?}");
@@ -3934,7 +3941,6 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
             unresolved_parsed,
             base_dir,
             false,
-            &loaded.inference_errors,
             &loaded.duplicate_declarations,
         )
         .expect("fixture must validate");
@@ -4174,7 +4180,6 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
         false,
         vec![Box::new(FailBCreateFactory)],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -4251,7 +4256,6 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -4346,7 +4350,6 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -4415,7 +4418,6 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -4640,7 +4642,6 @@ awscc.ec2.Subnet {{
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -4727,7 +4728,6 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -4780,7 +4780,6 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -4881,7 +4880,6 @@ let nat = mock.ec2.NatGateway {{
                 shared: shared.clone(),
             })],
             HashMap::new(),
-            &loaded.inference_errors,
             &loaded.duplicate_declarations,
         );
         assert!(
@@ -5055,7 +5053,6 @@ let igw = mock.ec2.InternetGateway {{{tags}
                 shared: shared.clone(),
             })],
             HashMap::new(),
-            &loaded.inference_errors,
             &loaded.duplicate_declarations,
         );
         assert!(
@@ -5223,7 +5220,6 @@ async fn assert_failed_nested_pending_removal_is_replanned(
                 shared: shared.clone(),
             })],
             HashMap::new(),
-            &loaded.inference_errors,
             &loaded.duplicate_declarations,
         );
         assert!(
@@ -5504,7 +5500,6 @@ let consumer = mock.iam.Role {{
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -7648,7 +7643,7 @@ fn format_duration_zero() {
 
 #[test]
 fn resolve_exports_resolves_cross_file_resource_refs() {
-    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
+    use carina_core::parser::InferredExportParam as ExportParameter;
     use carina_core::resource::Value;
 
     // Build a state file with a resource that has a binding and attributes
@@ -7679,7 +7674,7 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
     // parser-produced ResourceRef shape.
     let export_params = vec![ExportParameter {
         name: "account_id".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::resource_ref(
             "registry_prod".to_string(),
             "account_id".to_string(),
@@ -7732,7 +7727,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
     // identity and never lands in `state.resources`, so an export
     // referencing `<module_call>.<attr>` failed with
     // `unresolved reference <call>.<attr>`.
-    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
+    use carina_core::parser::InferredExportParam as ExportParameter;
     use carina_core::resource::{AccessPath, DeferredValue, LiveComposition, Value};
 
     let state = {
@@ -7798,7 +7793,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
 
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("github_actions_carina", "role_arn"),
         })),
@@ -7845,7 +7840,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
     // through `ResourceRef` recursion before bottoming out at the real
     // role's `arn` from state. Pins the resolver's transitive walk so a
     // regression that broke after a single hop would surface.
-    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
+    use carina_core::parser::InferredExportParam as ExportParameter;
     use carina_core::resource::{AccessPath, DeferredValue, LiveComposition, Value};
 
     let state = {
@@ -7925,7 +7920,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
 
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("outer", "public_role_arn"),
         })),
@@ -8006,7 +8001,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // mutated composition's stale concrete attribute and return
     // OLD_ARN. With the fix in place, the pre-resolve snapshot
     // kicks in and re-resolves against the post-apply state.
-    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
+    use carina_core::parser::InferredExportParam as ExportParameter;
     use carina_core::resolver::resolve_managed_refs_with_state_and_remote;
     use carina_core::resource::{
         AccessPath, ConcreteValue, DeferredValue, LiveComposition, ResourceId,
@@ -8123,7 +8118,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
 
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("carina_module", "role_arn"),
         })),
@@ -8184,7 +8179,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     // Without the fix, `resolve_export_values_post_apply` returns an empty map (no
     // entry for the export) instead of the NEW arn — exports stays
     // at the pre-apply literal in production.
-    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
+    use carina_core::parser::InferredExportParam as ExportParameter;
     use carina_core::resource::{
         AccessPath, ConcreteValue, DataSource, DeferredValue, ResourceId, State as ResourceState,
         Value,
@@ -8237,7 +8232,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     // The export: `exports { admin_access_role_arns = admin_access_roles.arns }`.
     let export_params = vec![ExportParameter {
         name: "admin_access_role_arns".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("admin_access_roles", "arns"),
         })),

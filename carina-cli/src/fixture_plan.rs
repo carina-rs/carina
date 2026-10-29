@@ -250,7 +250,6 @@ where
     let state_path = fixture_path.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
 
     let loaded = load_configuration(&fixture_pathbuf).unwrap();
-    let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let unresolved_parsed = loaded.unresolved_parsed;
     let parsed = loaded.parsed;
@@ -270,7 +269,6 @@ where
             unresolved_parsed,
             base_dir,
             true,
-            &inference_errors,
             &duplicate_declarations,
         )
         .unwrap_or_else(|error| panic!("fixture validation failed: {error}"));

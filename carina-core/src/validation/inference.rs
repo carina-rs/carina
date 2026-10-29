@@ -1,11 +1,9 @@
 //! Rhs-driven type inference for `exports { }` declarations whose
 //! `type_expr` annotation is omitted.
 //!
-//! [`apply_inference`] is the bridge from `ParsedFile` (where exports
-//! carry `Option<TypeExpr>`) to `InferredFile` (where every export
-//! carries a bare `TypeExpr`, possibly the [`TypeExpr::Unknown`]
-//! sentinel for a failure paired with an [`ExportInferenceError`] entry
-//! on the side). The loader runs this once per directory load so
+//! [`apply_inference`] is the bridge from `ParsedFile` to `InferredFile`.
+//! Each inferred export retains its declared/inferred origin and any typed
+//! unchecked reason directly on the parameter. The loader runs this once per directory load so
 //! downstream consumers (CLI validate, LSP diagnostics, LSP
 //! completion) see a definitive type per export instead of having to
 //! re-derive it. See `notes/specs/2026-05-03-typeexpr-stage2-design.md`.
@@ -30,111 +28,16 @@
 //!   `max`, `map`) is "depends on arguments" — counts as inference
 //!   failure.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::builtins::{BuiltinReturnType, builtin_functions};
 use crate::parser::TypeExpr;
-use crate::resource::{ConcreteValue, DeferredValue, PathSegment, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Value};
 use crate::schema::{AttrTypeKind, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry};
-
-/// Why inference failed. Carries the rhs description so downstream
-/// callers can render an actionable "type annotation required" error
-/// pointing at the offending field.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InferenceError {
-    /// Value cannot have a static type (function returns `Any`,
-    /// unknown builtin, deferred-eval shape with no concrete type).
-    UnknownType { reason: String },
-    /// Heterogeneous collection — inferred element types disagreed.
-    HeterogeneousCollection { reason: String },
-    /// Both coalesce operands have statically known, incompatible types.
-    /// Unlike a genuinely unknown type this must not be swallowed by schema
-    /// validation, or the mismatch can survive until provider dispatch.
-    IncompatibleCoalesceTypes { left: String, default: String },
-    /// `ResourceRef`'s binding doesn't appear in the binding map.
-    UnknownBinding { binding: String },
-    /// Binding is known but inference can't proceed through it —
-    /// today this is only `upstream_state` bindings (the export's
-    /// type lives in the upstream's `parsed.export_params`, which the
-    /// inferer doesn't recursively resolve today, see #2357). Distinct from
-    /// `UnknownBinding` so callers can swallow this case (the
-    /// downstream consumer's typecheck will still gate the use)
-    /// while a true typo bubbles up as a hard error.
-    NonInferableBinding { binding: String },
-    /// `ResourceRef`'s attribute (or nested field) isn't on the
-    /// resource schema.
-    UnknownAttribute { binding: String, attribute: String },
-    /// Could not look up the binding's resource schema (provider
-    /// not loaded, etc.).
-    SchemaUnavailable { binding: String },
-    /// The base type is statically known, but the authored postfix step
-    /// cannot be applied to that type.
-    InvalidAccess {
-        base_type: String,
-        step: PathSegment,
-    },
-    /// Inference re-entered a `Virtual` binding it was already
-    /// resolving — a cycle in the module-call attribute graph. Today
-    /// the parser and module resolver reject module-of-module cycles,
-    /// so this is reachable only via hand-constructed bindings or a
-    /// future refactor that breaks that invariant; the variant is the
-    /// inferer's defense in depth (#2497). `cycle` records the
-    /// binding-name path in the order they were entered, so the
-    /// diagnostic can name which bindings closed the loop.
-    CyclicVirtualBinding { cycle: Vec<String> },
-}
-
-/// An export inference failure tied to the parameter's stable position
-/// in `File::export_params`.
-///
-/// `index` is the equality-bearing identity used when a later validation
-/// walk suppresses a diagnostic already reported by inference. `name` is
-/// retained only for user-facing messages: sibling files may legally
-/// contribute duplicate export names, so the name cannot identify a
-/// parameter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExportInferenceError {
-    pub index: usize,
-    pub name: String,
-    pub error: InferenceError,
-}
-
-impl std::fmt::Display for InferenceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            InferenceError::UnknownType { reason } => write!(f, "{}", reason),
-            InferenceError::HeterogeneousCollection { reason } => write!(f, "{}", reason),
-            InferenceError::IncompatibleCoalesceTypes { left, default } => write!(
-                f,
-                "coalesce default type `{default}` does not match left type `{left}`"
-            ),
-            InferenceError::UnknownBinding { binding } => {
-                write!(f, "unknown binding `{}`", binding)
-            }
-            InferenceError::NonInferableBinding { binding } => write!(
-                f,
-                "cannot infer through binding `{}` (upstream_state)",
-                binding
-            ),
-            InferenceError::UnknownAttribute { binding, attribute } => {
-                write!(f, "unknown attribute `{}` on `{}`", attribute, binding)
-            }
-            InferenceError::SchemaUnavailable { binding } => {
-                write!(f, "no schema available for binding `{}`", binding)
-            }
-            InferenceError::InvalidAccess { base_type, step } => {
-                write!(f, "cannot apply access {step} to {base_type}")
-            }
-            InferenceError::CyclicVirtualBinding { cycle } => {
-                write!(
-                    f,
-                    "cyclic composition binding chain: {}",
-                    cycle.join(" -> ")
-                )
-            }
-        }
-    }
-}
+pub use crate::static_type::InferenceError;
+use crate::static_type::{
+    ExportStaticType, InferenceIssue, InferredUncheckedReason, NotInferableReason, StaticType,
+};
 
 /// One entry in the binding map. Resource bindings (`let <name> = <provider>.<resource> { ... }`)
 /// carry the provider/resource type and are inferred through; `upstream_state`
@@ -172,7 +75,7 @@ pub enum InferenceBinding {
     /// caller value is substituted; retaining the declaration here lets
     /// postfix access be checked before expansion.
     Argument {
-        type_expr: TypeExpr,
+        static_type: crate::static_type::ConsumerStaticType,
     },
     /// A user-defined function whose call may remain deferred until provider
     /// schemas are available. Its annotation is still enough authority to
@@ -216,7 +119,7 @@ pub fn bindings_from_parsed<E>(parsed: &crate::parser::File<E>) -> InferenceBind
     for argument in &parsed.arguments {
         out.entry(argument.name.clone())
             .or_insert_with(|| InferenceBinding::Argument {
-                type_expr: argument.type_expr.clone(),
+                static_type: argument.static_type.clone(),
             });
     }
     for function in parsed.user_functions.values() {
@@ -313,19 +216,9 @@ pub fn bindings_from_parts(
 ///
 /// - `Ok(Some(type_expr))` — declaration has either an explicit
 ///   annotation (kept) or an inferred one (newly added).
-/// - `Ok(None)` — no `value` to infer from, **or** the rhs references
-///   a binding the inferer doesn't know about (typically an
-///   `upstream_state` binding, which lives in `parsed.upstream_states`
-///   not `parsed.resources`). The declaration carries no type today
-///   and the caller falls back to today's behavior of skipping the
-///   downstream predicate. Inferring through `upstream_state` requires
-///   recursively resolving the upstream's exports and is tracked as a
-///   follow-up to #2361.
-/// - `Err(InferenceError)` — annotation is omitted, the rhs is
-///   present, and inference failed for a reason other than an
-///   unknown binding (heterogeneous list, dynamic builtin return,
-///   unknown attribute, etc.). The caller surfaces this as a
-///   "type annotation required" diagnostic.
+/// - `Ok(None)` — no `value` exists to infer from.
+/// - `Err(InferenceIssue)` — inference either failed or reached a typed
+///   not-inferable boundary.
 ///
 /// `infer_type_expr` is a thin convenience over [`infer_type_from_value`]
 /// that resolves the explicit-annotation-wins precedence in one place
@@ -335,28 +228,14 @@ pub fn infer_type_expr(
     value: Option<&Value>,
     bindings: &InferenceBindings,
     schemas: &SchemaRegistry,
-) -> Result<Option<TypeExpr>, InferenceError> {
+) -> Result<Option<TypeExpr>, InferenceIssue> {
     if let Some(ty) = declared {
         return Ok(Some(ty.clone()));
     }
     let Some(v) = value else {
         return Ok(None);
     };
-    match infer_type_from_value(v, bindings, schemas) {
-        Ok(t) => Ok(Some(t)),
-        // Known but non-inferable (upstream_state) — fall through to
-        // today's "no static type" behavior; the downstream consumer's
-        // typecheck still gates the use. A true typo (`UnknownBinding`)
-        // is *not* swallowed here so it surfaces as a hard error
-        // instead of silently degrading the typecheck.
-        Err(InferenceError::NonInferableBinding { .. }) => Ok(None),
-        // Schema not yet loaded for the binding's resource type
-        // (provider lock missing, in-progress edit) — also pass
-        // through; treating this as a hard error would block validate
-        // against an in-flux configuration.
-        Err(InferenceError::SchemaUnavailable { .. }) => Ok(None),
-        Err(other) => Err(other),
-    }
+    infer_type_from_value(v, bindings, schemas).map(Some)
 }
 
 /// Try to synthesize a `TypeExpr` from a `Value`. Returns `Err` if the
@@ -368,7 +247,7 @@ pub fn infer_type_from_value(
     value: &Value,
     bindings: &InferenceBindings,
     schemas: &SchemaRegistry,
-) -> Result<TypeExpr, InferenceError> {
+) -> Result<TypeExpr, InferenceIssue> {
     let mut visiting = indexmap::IndexSet::new();
     infer_type_from_value_with_visiting(value, bindings, schemas, &mut visiting)
 }
@@ -381,14 +260,14 @@ pub fn infer_type_from_value(
 /// this instead of manufacturing empty binding/schema registries.
 pub(crate) fn infer_type_from_value_without_bindings(
     value: &Value,
-) -> Result<TypeExpr, InferenceError> {
+) -> Result<TypeExpr, InferenceIssue> {
     fn infer_collection_without_bindings<'a>(
         values: impl IntoIterator<Item = &'a Value>,
         wrap: impl FnOnce(Box<TypeExpr>) -> TypeExpr,
-    ) -> Result<TypeExpr, InferenceError> {
+    ) -> Result<TypeExpr, InferenceIssue> {
         let mut values = values.into_iter();
         let Some(first) = values.next() else {
-            return Err(InferenceError::UnknownType {
+            return Err(InferenceIssue::UnknownType {
                 reason: "empty collection has no inferable element type".to_string(),
             });
         };
@@ -396,7 +275,7 @@ pub(crate) fn infer_type_from_value_without_bindings(
         for value in values {
             let next = infer_type_from_value_without_bindings(value)?;
             if next != element {
-                return Err(InferenceError::UnknownType {
+                return Err(InferenceIssue::UnknownType {
                     reason: "collection elements have different types".to_string(),
                 });
             }
@@ -429,11 +308,11 @@ pub(crate) fn infer_type_from_value_without_bindings(
             let left = infer_type_from_value_without_bindings(value)?;
             match infer_type_from_value_without_bindings(default) {
                 Ok(right) if right == left => Ok(left),
-                Ok(right) => Err(InferenceError::IncompatibleCoalesceTypes {
+                Ok(right) => Err(InferenceIssue::IncompatibleCoalesceTypes {
                     left: left.to_string(),
                     default: right.to_string(),
                 }),
-                Err(InferenceError::UnknownType { .. })
+                Err(InferenceIssue::UnknownType { .. })
                     if matches!(
                         (default.as_ref(), &left),
                         (
@@ -461,7 +340,7 @@ pub(crate) fn infer_type_from_value_without_bindings(
                 .iter()
                 .find(|function| function.name == name.as_str())
                 .map(|function| function.return_type)
-                .ok_or_else(|| InferenceError::UnknownType {
+                .ok_or_else(|| InferenceIssue::UnknownType {
                     reason: format!("unknown built-in function `{name}`"),
                 })?;
             match return_type {
@@ -470,14 +349,14 @@ pub(crate) fn infer_type_from_value_without_bindings(
                 BuiltinReturnType::StringList => Ok(TypeExpr::List(Box::new(TypeExpr::String))),
                 BuiltinReturnType::Secret => args.first().map_or_else(
                     || {
-                        Err(InferenceError::UnknownType {
+                        Err(InferenceIssue::UnknownType {
                             reason: format!("built-in `{name}` has no argument to wrap as secret"),
                         })
                     },
                     |argument| infer_type_from_value_without_bindings(argument.walker_value()),
                 ),
                 BuiltinReturnType::List | BuiltinReturnType::Map | BuiltinReturnType::Any => {
-                    Err(InferenceError::UnknownType {
+                    Err(InferenceIssue::UnknownType {
                         reason: format!("built-in `{name}` return type depends on arguments"),
                     })
                 }
@@ -486,7 +365,7 @@ pub(crate) fn infer_type_from_value_without_bindings(
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => function
             .return_type
             .clone()
-            .ok_or_else(|| InferenceError::UnknownType {
+            .ok_or_else(|| InferenceIssue::UnknownType {
                 reason: format!(
                     "user function `{}` has no declared return type",
                     function.name
@@ -495,7 +374,7 @@ pub(crate) fn infer_type_from_value_without_bindings(
         Value::Deferred(DeferredValue::Access(access)) => {
             let base_type = infer_type_from_value_without_bindings(access.base())?;
             super::narrow_type_expr(&base_type, std::slice::from_ref(access.step()), None)
-                .ok_or_else(|| InferenceError::InvalidAccess {
+                .ok_or_else(|| InferenceIssue::InvalidAccess {
                     base_type: base_type.to_string(),
                     step: access.step().clone(),
                 })
@@ -503,7 +382,7 @@ pub(crate) fn infer_type_from_value_without_bindings(
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
-        | Value::Deferred(DeferredValue::Unknown(_)) => Err(InferenceError::UnknownType {
+        | Value::Deferred(DeferredValue::Unknown(_)) => Err(InferenceIssue::UnknownType {
             reason: "value requires binding/schema authority".to_string(),
         }),
     }
@@ -522,7 +401,7 @@ fn infer_type_from_value_with_visiting(
     bindings: &InferenceBindings,
     schemas: &SchemaRegistry,
     visiting: &mut indexmap::IndexSet<String>,
-) -> Result<TypeExpr, InferenceError> {
+) -> Result<TypeExpr, InferenceIssue> {
     match value {
         Value::Concrete(ConcreteValue::String(_)) => Ok(TypeExpr::String),
         // Enum identifiers infer as `String` for the type-expression
@@ -538,7 +417,7 @@ fn infer_type_from_value_with_visiting(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             infer_type_from_value_with_visiting(inner, bindings, schemas, visiting)
         }
-        Value::Deferred(DeferredValue::RedactedSecret { .. }) => Err(InferenceError::UnknownType {
+        Value::Deferred(DeferredValue::RedactedSecret { .. }) => Err(InferenceIssue::UnknownType {
             reason: "saved-plan secret has not been rehydrated".to_string(),
         }),
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -561,18 +440,18 @@ fn infer_type_from_value_with_visiting(
         // `BindingRef` is a bare-binding placeholder with no attribute
         // and therefore no inferable position. Inference treats it as
         // "type unknown until accessed" — same shape as `Unknown(_)`.
-        Value::Deferred(DeferredValue::BindingRef { .. }) => Err(InferenceError::UnknownType {
+        Value::Deferred(DeferredValue::BindingRef { .. }) => Err(InferenceIssue::UnknownType {
             reason: "bare binding reference has no attribute to infer".to_string(),
         }),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             let left = infer_type_from_value_with_visiting(value, bindings, schemas, visiting)?;
             match infer_type_from_value_with_visiting(default, bindings, schemas, visiting) {
                 Ok(right) if right == left => Ok(left),
-                Ok(right) => Err(InferenceError::IncompatibleCoalesceTypes {
+                Ok(right) => Err(InferenceIssue::IncompatibleCoalesceTypes {
                     left: left.to_string(),
                     default: right.to_string(),
                 }),
-                Err(InferenceError::UnknownType { .. })
+                Err(InferenceIssue::UnknownType { .. })
                     if matches!(
                         (default.as_ref(), &left),
                         (
@@ -599,7 +478,7 @@ fn infer_type_from_value_with_visiting(
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => function
             .return_type
             .clone()
-            .ok_or_else(|| InferenceError::UnknownType {
+            .ok_or_else(|| InferenceIssue::UnknownType {
                 reason: format!(
                     "user function `{}` has no declared return type",
                     function.name
@@ -608,17 +487,12 @@ fn infer_type_from_value_with_visiting(
         Value::Deferred(DeferredValue::Access(access)) => {
             let base_type =
                 infer_type_from_value_with_visiting(access.base(), bindings, schemas, visiting)?;
-            if matches!(base_type, TypeExpr::Unknown) {
-                return Err(InferenceError::UnknownType {
-                    reason: "postfix access base type is not known".to_string(),
-                });
-            }
             super::narrow_type_expr(
                 &base_type,
                 std::slice::from_ref(access.step()),
                 Some(schemas),
             )
-            .ok_or_else(|| InferenceError::InvalidAccess {
+            .ok_or_else(|| InferenceIssue::InvalidAccess {
                 base_type: base_type.to_string(),
                 step: access.step().clone(),
             })
@@ -626,12 +500,24 @@ fn infer_type_from_value_with_visiting(
         Value::Deferred(DeferredValue::Unknown(
             crate::resource::UnknownReason::ModuleArgument { name, .. },
         )) => match bindings.get(name) {
-            Some(InferenceBinding::Argument { type_expr }) => Ok(type_expr.clone()),
-            _ => Err(InferenceError::UnknownType {
+            Some(InferenceBinding::Argument {
+                static_type: StaticType::Known(type_expr),
+            }) => Ok(type_expr.clone()),
+            Some(InferenceBinding::Argument {
+                static_type: StaticType::Unchecked(_reason),
+            }) => Err(InferenceIssue::NonInferableBinding {
+                binding: name.clone(),
+            }),
+            Some(InferenceBinding::Resource { .. })
+            | Some(InferenceBinding::UpstreamState)
+            | Some(InferenceBinding::Virtual { .. })
+            | Some(InferenceBinding::ModuleCall)
+            | Some(InferenceBinding::UserFunction { .. })
+            | None => Err(InferenceIssue::UnknownType {
                 reason: format!("module argument `{name}` has no type authority"),
             }),
         },
-        Value::Deferred(DeferredValue::Unknown(_)) => Err(InferenceError::UnknownType {
+        Value::Deferred(DeferredValue::Unknown(_)) => Err(InferenceIssue::UnknownType {
             reason: "value not yet known at plan time (unresolved upstream)".to_string(),
         }),
     }
@@ -643,7 +529,7 @@ fn infer_collection<'a, I, F>(
     schemas: &SchemaRegistry,
     visiting: &mut indexmap::IndexSet<String>,
     wrap: F,
-) -> Result<TypeExpr, InferenceError>
+) -> Result<TypeExpr, InferenceIssue>
 where
     I: IntoIterator<Item = &'a Value>,
     F: FnOnce(Box<TypeExpr>) -> TypeExpr,
@@ -660,7 +546,7 @@ where
     let first = match iter.next() {
         Some(v) => infer_type_from_value_with_visiting(v, bindings, schemas, visiting)?,
         None => {
-            return Err(InferenceError::UnknownType {
+            return Err(InferenceIssue::UnknownType {
                 reason: "empty collection — element type cannot be inferred".to_string(),
             });
         }
@@ -668,7 +554,7 @@ where
     for next in iter {
         let next_type = infer_type_from_value_with_visiting(next, bindings, schemas, visiting)?;
         if next_type != first {
-            return Err(InferenceError::HeterogeneousCollection {
+            return Err(InferenceIssue::HeterogeneousCollection {
                 reason: format!(
                     "collection element types disagree: `{}` vs `{}`",
                     first, next_type
@@ -686,7 +572,7 @@ fn infer_resource_ref_with_visiting(
     bindings: &InferenceBindings,
     schemas: &SchemaRegistry,
     visiting: &mut indexmap::IndexSet<String>,
-) -> Result<TypeExpr, InferenceError> {
+) -> Result<TypeExpr, InferenceIssue> {
     let target = match bindings.get(binding) {
         Some(InferenceBinding::Resource {
             provider,
@@ -696,7 +582,7 @@ fn infer_resource_ref_with_visiting(
         | Some(InferenceBinding::ModuleCall)
         | Some(InferenceBinding::Argument { .. })
         | Some(InferenceBinding::UserFunction { .. }) => {
-            return Err(InferenceError::NonInferableBinding {
+            return Err(InferenceIssue::NonInferableBinding {
                 binding: binding.to_string(),
             });
         }
@@ -709,7 +595,7 @@ fn infer_resource_ref_with_visiting(
             let inner =
                 attributes
                     .get(attribute)
-                    .ok_or_else(|| InferenceError::UnknownAttribute {
+                    .ok_or_else(|| InferenceIssue::UnknownAttribute {
                         binding: binding.to_string(),
                         attribute: attribute.to_string(),
                     })?;
@@ -727,32 +613,32 @@ fn infer_resource_ref_with_visiting(
             if !visiting.insert(binding.to_string()) {
                 let mut cycle: Vec<String> = visiting.iter().cloned().collect();
                 cycle.push(binding.to_string());
-                return Err(InferenceError::CyclicVirtualBinding { cycle });
+                return Err(InferenceIssue::CyclicVirtualBinding { cycle });
             }
             let inner_type_result =
                 infer_type_from_value_with_visiting(inner, bindings, schemas, visiting);
             visiting.shift_remove(binding);
             let inner_type = inner_type_result?;
             return super::narrow_type_expr(&inner_type, segments, Some(schemas)).ok_or_else(
-                || InferenceError::UnknownAttribute {
+                || InferenceIssue::UnknownAttribute {
                     binding: binding.to_string(),
                     attribute: attribute.to_string(),
                 },
             );
         }
         None => {
-            return Err(InferenceError::UnknownBinding {
+            return Err(InferenceIssue::UnknownBinding {
                 binding: binding.to_string(),
             });
         }
     };
     let Some(schema) = lookup_schema(schemas, target.0, target.1) else {
-        return Err(InferenceError::SchemaUnavailable {
+        return Err(InferenceIssue::SchemaUnavailable {
             binding: binding.to_string(),
         });
     };
     let Some(attr_schema) = schema.attributes.get(attribute) else {
-        return Err(InferenceError::UnknownAttribute {
+        return Err(InferenceIssue::UnknownAttribute {
             binding: binding.to_string(),
             attribute: attribute.to_string(),
         });
@@ -776,7 +662,7 @@ fn infer_resource_ref_with_visiting(
                 match descend_struct_field(resolved, name, &schema.defs) {
                     Some(t) => t,
                     None => {
-                        return Err(InferenceError::UnknownAttribute {
+                        return Err(InferenceIssue::UnknownAttribute {
                             binding: binding.to_string(),
                             attribute: format!("{}.{}", attribute, name),
                         });
@@ -800,7 +686,7 @@ fn infer_resource_ref_with_visiting(
                 AttrTypeKind::Map { value, .. },
             ) => value,
             _ => {
-                return Err(InferenceError::InvalidAccess {
+                return Err(InferenceIssue::InvalidAccess {
                     base_type: attribute_type_to_type_expr(resolved, target.0).to_string(),
                     step: seg.clone(),
                 });
@@ -826,7 +712,7 @@ fn infer_resource_ref_with_visiting(
     // TypeExpr projection see the underlying shape (carina#3340).
     let current = current.resolve_refs_with_defs(&schema.defs).as_attr();
     if matches!(&current.kind, AttrTypeKind::Union(_)) {
-        return Err(InferenceError::UnknownType {
+        return Err(InferenceIssue::UnknownType {
             reason: format!(
                 "rhs `{}.{}` resolves to a union type; annotate the export to pick a branch",
                 binding, attribute
@@ -988,7 +874,7 @@ fn infer_function_call(
     bindings: &InferenceBindings,
     schemas: &SchemaRegistry,
     visiting: &mut indexmap::IndexSet<String>,
-) -> Result<TypeExpr, InferenceError> {
+) -> Result<TypeExpr, InferenceIssue> {
     let return_type = builtin_functions()
         .iter()
         .find(|f| f.name == name)
@@ -999,11 +885,11 @@ fn infer_function_call(
                 return_type: Some(return_type),
             }) => Ok(return_type.clone()),
             Some(InferenceBinding::UserFunction { return_type: None }) => {
-                Err(InferenceError::UnknownType {
+                Err(InferenceIssue::UnknownType {
                     reason: format!("user-defined function `{name}` has no declared return type"),
                 })
             }
-            _ => Err(InferenceError::UnknownType {
+            _ => Err(InferenceIssue::UnknownType {
                 reason: format!("unknown built-in function `{name}`"),
             }),
         };
@@ -1011,14 +897,14 @@ fn infer_function_call(
     match return_type {
         BuiltinReturnType::String => Ok(TypeExpr::String),
         BuiltinReturnType::Int => Ok(TypeExpr::Int),
-        BuiltinReturnType::List => Err(InferenceError::UnknownType {
+        BuiltinReturnType::List => Err(InferenceIssue::UnknownType {
             reason: format!(
                 "built-in `{}` returns a list whose element type depends on arguments",
                 name
             ),
         }),
         BuiltinReturnType::StringList => Ok(TypeExpr::List(Box::new(TypeExpr::String))),
-        BuiltinReturnType::Map => Err(InferenceError::UnknownType {
+        BuiltinReturnType::Map => Err(InferenceIssue::UnknownType {
             reason: format!(
                 "built-in `{}` returns a map whose value type depends on arguments",
                 name
@@ -1026,7 +912,7 @@ fn infer_function_call(
         }),
         BuiltinReturnType::Secret => args.first().map_or_else(
             || {
-                Err(InferenceError::UnknownType {
+                Err(InferenceIssue::UnknownType {
                     reason: format!("built-in `{name}` has no argument to wrap as secret"),
                 })
             },
@@ -1039,35 +925,28 @@ fn infer_function_call(
                 )
             },
         ),
-        BuiltinReturnType::Any => Err(InferenceError::UnknownType {
+        BuiltinReturnType::Any => Err(InferenceIssue::UnknownType {
             reason: format!("built-in `{}` return type depends on arguments", name),
         }),
     }
 }
 
-/// Phase transition (#2360 stage 2): walk every `ParsedExportParam` in
-/// `parsed`, resolve its effective `TypeExpr` (annotation wins;
-/// otherwise infer from rhs), and emit an `InferredFile` with bare
-/// `TypeExpr` on every export. Failed inferences are *not* dropped —
-/// they are kept with `type_expr: TypeExpr::Unknown` and accompanied
-/// by an entry in the returned `Vec<InferenceError>`. The
-/// sentinel-over-exclude shape prevents cascading "missing export"
-/// diagnostics; the inference error is the single point of truth for
-/// "this needs an annotation".
+/// Phase transition (#2360 stage 2): attach declared/inferred origin and any
+/// typed unchecked reason to every export.
 pub fn apply_inference(
     parsed: crate::parser::ParsedFile,
     schemas: &SchemaRegistry,
-) -> (crate::parser::InferredFile, Vec<ExportInferenceError>) {
-    let (inferred_exports, errors) = infer_export_params(&parsed, schemas);
+) -> crate::parser::InferredFile {
+    let inferred_exports = infer_export_params(&parsed, schemas);
     // Single phase-axis surface (carina#3126): only `export_params`
     // changes phase; every other field moves through `map_export_params`
     // so a new `File<E>` field cannot be silently dropped on the
     // parser→inferred relabel.
-    (parsed.map_export_params(|_| inferred_exports), errors)
+    parsed.map_export_params(|_| inferred_exports)
 }
 
 /// Borrowing variant of [`apply_inference`] that returns just the
-/// inferred export parameters and any inference errors. The full
+/// inferred export parameters. The full
 /// `InferredFile` reconstruction in `apply_inference` clones every
 /// non-export field; consumers that only need the export-side typecheck
 /// (LSP diagnostics, in particular) should use this instead to avoid
@@ -1075,104 +954,125 @@ pub fn apply_inference(
 pub fn infer_export_params(
     parsed: &crate::parser::ParsedFile,
     schemas: &SchemaRegistry,
-) -> (
-    Vec<crate::parser::InferredExportParam>,
-    Vec<ExportInferenceError>,
-) {
+) -> Vec<crate::parser::InferredExportParam> {
     let bindings = bindings_from_parsed(parsed);
-    let mut errors = Vec::new();
-    let inferred_exports: Vec<crate::parser::InferredExportParam> = parsed
+    parsed
         .export_params
         .iter()
-        .enumerate()
-        .map(|(index, p)| {
-            let type_expr =
-                match infer_type_expr(p.type_expr.as_ref(), p.value.as_ref(), &bindings, schemas) {
-                    Ok(Some(ty)) => ty,
-                    Ok(None) => TypeExpr::Unknown,
-                    Err(e) => {
-                        errors.push(ExportInferenceError {
-                            index,
-                            name: p.name.clone(),
-                            error: e,
-                        });
-                        TypeExpr::Unknown
-                    }
-                };
+        .map(|parameter| {
+            let static_type = match &parameter.static_type {
+                Some(StaticType::Known(type_expr)) => {
+                    ExportStaticType::Declared(StaticType::Known(type_expr.clone()))
+                }
+                Some(StaticType::Unchecked(reason)) => {
+                    ExportStaticType::Declared(StaticType::Unchecked(reason.clone()))
+                }
+                None => match &parameter.value {
+                    None => ExportStaticType::Inferred(StaticType::Unchecked(
+                        InferredUncheckedReason::NotInferable(NotInferableReason::MissingValue),
+                    )),
+                    Some(value) => match infer_type_from_value(value, &bindings, schemas) {
+                        Ok(type_expr) => ExportStaticType::Inferred(StaticType::Known(type_expr)),
+                        Err(issue) => ExportStaticType::Inferred(StaticType::Unchecked(
+                            issue.into_unchecked_reason(),
+                        )),
+                    },
+                },
+            };
             crate::parser::InferredExportParam {
-                name: p.name.clone(),
-                type_expr,
-                value: p.value.clone(),
+                name: parameter.name.clone(),
+                static_type,
+                value: parameter.value.clone(),
             }
         })
-        .collect();
-    (inferred_exports, errors)
+        .collect()
 }
 
-/// Retry only sentinel-bearing exports after provider schemas become available.
-///
-/// CLI configuration loading initially runs before provider plugins are wired,
-/// so a schema-backed resource ref can temporarily yield
-/// [`InferenceError::SchemaUnavailable`] and become [`TypeExpr::Unknown`]
-/// without an inference diagnostic. Call this at the provider-wiring boundary
-/// to report errors from those deferred schema lookups. Running before versus
-/// after module expansion affects which authority reports a composition typo:
-/// inference can inspect a post-expansion `Virtual` binding, while the shared
-/// existence walk inspects the composition signature. Either ordering remains
-/// duplicate-safe because parameters already reported by inference are
-/// suppressed by export-param index. Indices already present in `prior_errors`
-/// are skipped so schema-independent failures (for example an `Any`-returning
-/// builtin) are not reported twice.
-///
-/// Successful inference is deliberately discarded and the parameter remains
-/// [`TypeExpr::Unknown`]. [`attribute_type_to_type_expr`] uses lossy sentinels
-/// for nested unions and cycle-cutting refs, so feeding its projection back into
-/// schema compatibility can falsely reject the same value it was inferred from.
-/// This retry exists only to recover errors hidden by bootstrap-time missing
-/// schemas; it is not a second type-upgrade phase.
-///
-/// On the CLI's current pre-expansion retry path, module-call refs remain
-/// `Unknown` without an error because [`InferenceBinding::ModuleCall`] is
-/// deliberately non-inferable. Their declared attribute membership is then
-/// checked against the expanded composition by
-/// [`crate::validation::validate_export_param_ref_types_with_bindings`]. The
-/// LSP runs inference post-expansion and may report the same class through its
-/// `Virtual` binding instead; index suppression gives both paths one diagnostic.
-pub fn retry_unknown_export_inference(
-    parsed: &crate::parser::InferredFile,
-    schemas: &SchemaRegistry,
-    prior_errors: &[ExportInferenceError],
-) -> Vec<ExportInferenceError> {
-    let bindings = bindings_from_parsed(parsed);
-    let prior_error_indices: HashSet<usize> =
-        prior_errors.iter().map(|error| error.index).collect();
-    let mut errors = Vec::new();
+#[derive(Debug, Clone, Copy)]
+pub struct AttachedInferenceFailure<'a> {
+    pub index: usize,
+    pub name: &'a str,
+    pub error: &'a InferenceError,
+}
 
-    for (index, param) in parsed.export_params.iter().enumerate() {
-        if !matches!(param.type_expr, TypeExpr::Unknown) || prior_error_indices.contains(&index) {
+pub fn attached_inference_failures(
+    parameters: &[crate::parser::InferredExportParam],
+) -> impl Iterator<Item = AttachedInferenceFailure<'_>> {
+    parameters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, parameter)| match &parameter.static_type {
+            ExportStaticType::Declared(StaticType::Known(_type_expr)) => None,
+            ExportStaticType::Declared(StaticType::Unchecked(_reason)) => None,
+            ExportStaticType::Inferred(StaticType::Known(_type_expr)) => None,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::NotInferable(_reason),
+            )) => None,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::UnnameableInConsumer(_reason),
+            )) => None,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::InferenceFailed(error),
+            )) => Some(AttachedInferenceFailure {
+                index,
+                name: &parameter.name,
+                error,
+            }),
+        })
+}
+
+/// Retry inferred exports whose original reason was not having enough schema
+/// authority. A newly reportable failure replaces that reason; successful or
+/// still-deferred probes retain the original provenance.
+pub fn retry_unchecked_export_inference(
+    parsed: &mut crate::parser::InferredFile,
+    schemas: &SchemaRegistry,
+) {
+    let bindings = bindings_from_parsed(parsed);
+
+    for parameter in &mut parsed.export_params {
+        let retry = match &parameter.static_type {
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::NotInferable(NotInferableReason::MissingValue),
+            )) => false,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::NotInferable(
+                    NotInferableReason::NonInferableBinding { .. }
+                    | NotInferableReason::SchemaUnavailable { .. },
+                ),
+            )) => true,
+            ExportStaticType::Declared(StaticType::Known(_type_expr)) => false,
+            ExportStaticType::Declared(StaticType::Unchecked(_reason)) => false,
+            ExportStaticType::Inferred(StaticType::Known(_type_expr)) => false,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::InferenceFailed(_error),
+            )) => false,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::UnnameableInConsumer(_reason),
+            )) => false,
+        };
+        if !retry {
             continue;
         }
-        let Some(value) = &param.value else {
+        let Some(value) = &parameter.value else {
             continue;
         };
 
         match infer_type_from_value(value, &bindings, schemas) {
-            Ok(_) => {}
-            Err(InferenceError::NonInferableBinding { .. })
-            | Err(InferenceError::SchemaUnavailable { .. }) => {}
-            Err(error) => errors.push(ExportInferenceError {
-                index,
-                name: param.name.clone(),
-                error,
-            }),
+            Ok(_type_expr) => {}
+            Err(InferenceIssue::NonInferableBinding { .. })
+            | Err(InferenceIssue::SchemaUnavailable { .. }) => {}
+            Err(issue) => {
+                parameter.static_type = ExportStaticType::Inferred(StaticType::Unchecked(
+                    issue.into_unchecked_reason(),
+                ));
+            }
         }
     }
-
-    errors
 }
 
-/// Format an inference error pointing at the offending export. The CLI
-/// (`carina-cli/src/commands/validate.rs`) and the LSP
+/// Format an inference error pointing at the offending export. The shared CLI
+/// validation pipeline and the LSP
 /// (`carina-lsp/src/diagnostics/checks.rs`) both surface this same
 /// "type annotation required" wording so editor and command line stay
 /// in parity (the existing e2e parity tests pin this).
@@ -1321,7 +1221,7 @@ mod tests {
         );
         assert!(matches!(
             r,
-            Err(InferenceError::HeterogeneousCollection { .. })
+            Err(InferenceIssue::HeterogeneousCollection { .. })
         ));
     }
 
@@ -1359,7 +1259,7 @@ mod tests {
         );
         assert!(matches!(
             r,
-            Err(InferenceError::HeterogeneousCollection { .. })
+            Err(InferenceIssue::HeterogeneousCollection { .. })
         ));
     }
 
@@ -1409,7 +1309,7 @@ mod tests {
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
-        assert!(matches!(r, Err(InferenceError::UnknownType { .. })));
+        assert!(matches!(r, Err(InferenceIssue::UnknownType { .. })));
     }
 
     #[test]
@@ -1419,7 +1319,7 @@ mod tests {
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
-        assert!(matches!(r, Err(InferenceError::UnknownType { .. })));
+        assert!(matches!(r, Err(InferenceIssue::UnknownType { .. })));
     }
 
     #[test]
@@ -1466,7 +1366,7 @@ mod tests {
             .expect_err("coalesce default must match the left type");
         assert!(matches!(
             &error,
-            InferenceError::IncompatibleCoalesceTypes { .. }
+            InferenceIssue::IncompatibleCoalesceTypes { .. }
         ));
         assert!(error.to_string().contains("does not match left type"));
     }
@@ -1543,7 +1443,7 @@ mod tests {
             &InferenceBindings::new(),
             &schemas_with_vpc(),
         );
-        assert!(matches!(r, Err(InferenceError::UnknownBinding { .. })));
+        assert!(matches!(r, Err(InferenceIssue::UnknownBinding { .. })));
     }
 
     #[test]
@@ -1554,7 +1454,7 @@ mod tests {
             &binding_to_vpc("vpc"),
             &schemas_with_vpc(),
         );
-        assert!(matches!(r, Err(InferenceError::UnknownAttribute { .. })));
+        assert!(matches!(r, Err(InferenceIssue::UnknownAttribute { .. })));
     }
 
     #[test]
@@ -1660,7 +1560,7 @@ mod tests {
         let inferred =
             infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new());
 
-        assert!(matches!(inferred, Err(InferenceError::UnknownType { .. })));
+        assert!(matches!(inferred, Err(InferenceIssue::UnknownType { .. })));
     }
 
     #[test]
@@ -1676,7 +1576,7 @@ mod tests {
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
-        assert!(matches!(r, Err(InferenceError::UnknownType { .. })));
+        assert!(matches!(r, Err(InferenceIssue::UnknownType { .. })));
     }
 
     #[test]
@@ -1718,7 +1618,7 @@ mod tests {
             &binding_to_vpc("main"),
             &schemas_with_vpc(),
         );
-        assert!(matches!(r, Err(InferenceError::UnknownBinding { .. })));
+        assert!(matches!(r, Err(InferenceIssue::UnknownBinding { .. })));
     }
 
     #[test]
@@ -1736,13 +1636,13 @@ mod tests {
             &bindings,
             &SchemaRegistry::new(),
         );
-        assert!(matches!(r, Err(InferenceError::NonInferableBinding { .. })));
+        assert!(matches!(r, Err(InferenceIssue::NonInferableBinding { .. })));
     }
 
     #[test]
-    fn infer_type_expr_swallows_upstream_state_but_surfaces_typo() {
-        // Outer convenience function: NonInferableBinding → Ok(None);
-        // UnknownBinding → Err.
+    fn infer_type_expr_distinguishes_upstream_state_from_typo() {
+        // A known binding outside the inferer's authority remains distinct
+        // from an unknown binding caused by a typo.
         let mut bindings = InferenceBindings::new();
         bindings.insert("network".to_string(), InferenceBinding::UpstreamState);
 
@@ -1755,7 +1655,14 @@ mod tests {
             &bindings,
             &SchemaRegistry::new(),
         );
-        assert_eq!(r, Ok(None), "upstream_state ref must pass through");
+        assert!(
+            matches!(
+                r,
+                Err(InferenceIssue::NonInferableBinding { binding })
+                    if binding == "network"
+            ),
+            "upstream_state ref must retain its non-inferable reason"
+        );
 
         let typo_path = AccessPath::new("nonexistent", "vpc_id");
         let r = infer_type_expr(
@@ -1767,7 +1674,7 @@ mod tests {
             &SchemaRegistry::new(),
         );
         assert!(
-            matches!(r, Err(InferenceError::UnknownBinding { .. })),
+            matches!(r, Err(InferenceIssue::UnknownBinding { .. })),
             "typo'd binding must surface as a hard error"
         );
     }
@@ -1792,7 +1699,7 @@ mod tests {
             &binding_to_vpc("vpc"),
             &schemas,
         );
-        assert!(matches!(r, Err(InferenceError::UnknownType { .. })));
+        assert!(matches!(r, Err(InferenceIssue::UnknownType { .. })));
     }
 
     #[test]
@@ -1929,21 +1836,24 @@ mod tests {
                 )),
             ));
 
-        let (inferred, errors) = apply_inference(parsed, &schemas_with_vpc());
-        assert!(errors.is_empty(), "no errors expected, got {:?}", errors);
+        let inferred = apply_inference(parsed, &schemas_with_vpc());
         assert_eq!(inferred.export_params.len(), 1);
-        assert_eq!(inferred.export_params[0].type_expr, owned_vpc_id_type());
+        assert_eq!(
+            inferred.export_params[0].static_type,
+            ExportStaticType::Inferred(StaticType::Known(owned_vpc_id_type()))
+        );
     }
 
     #[test]
-    fn apply_inference_substitutes_unknown_for_failed_inference() {
+    fn apply_inference_attaches_failure_to_inferred_export() {
+        use crate::static_type::{ExportStaticType, InferredUncheckedReason, StaticType};
+
         let mut parsed = crate::parser::ParsedFile::default();
         parsed
             .export_params
             .push(crate::parser::ParsedExportParam::dummy(
                 "zone_id".to_string(),
                 None,
-                // `lookup` returns Any: inference fails, sentinel produced.
                 Some(Value::Deferred(DeferredValue::FunctionCall {
                     name: crate::builtins::BuiltinFunction::lookup,
                     args: vec![],
@@ -1951,20 +1861,125 @@ mod tests {
                 })),
             ));
 
-        let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
-        assert_eq!(inferred.export_params.len(), 1);
-        assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].index, 0);
-        assert_eq!(errors[0].name, "zone_id");
+        let inferred = apply_inference(parsed, &SchemaRegistry::new());
+
         assert!(matches!(
-            errors[0].error,
-            InferenceError::UnknownType { .. }
+            &inferred.export_params[0].static_type,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::InferenceFailed(InferenceError::UnknownType { .. })
+            ))
         ));
     }
 
     #[test]
-    fn retry_unknown_export_inference_surfaces_schema_attribute_error_once_schemas_exist() {
+    fn apply_inference_preserves_declared_and_inferred_origins() {
+        use crate::static_type::{ExportStaticType, StaticType};
+
+        let mut parsed = crate::parser::ParsedFile::default();
+        parsed
+            .export_params
+            .push(crate::parser::ParsedExportParam::dummy(
+                "declared".to_string(),
+                Some(TypeExpr::String),
+                Some(Value::Concrete(ConcreteValue::String("declared".into()))),
+            ));
+        parsed
+            .export_params
+            .push(crate::parser::ParsedExportParam::dummy(
+                "inferred".to_string(),
+                None,
+                Some(Value::Concrete(ConcreteValue::String("inferred".into()))),
+            ));
+
+        let inferred = apply_inference(parsed, &SchemaRegistry::new());
+
+        assert_eq!(
+            inferred.export_params[0].static_type,
+            ExportStaticType::Declared(StaticType::Known(TypeExpr::String))
+        );
+        assert_eq!(
+            inferred.export_params[1].static_type,
+            ExportStaticType::Inferred(StaticType::Known(TypeExpr::String))
+        );
+    }
+
+    #[test]
+    fn apply_inference_keeps_not_inferable_reasons_distinct() {
+        use crate::parser::UpstreamState;
+        use crate::static_type::{
+            ExportStaticType, InferredUncheckedReason, NotInferableReason, StaticType,
+        };
+
+        let mut parsed = crate::parser::ParsedFile::default();
+        parsed.upstream_states.push(UpstreamState {
+            binding: "upstream".to_string(),
+            source: std::path::PathBuf::from("../upstream"),
+        });
+        let resource = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
+            .with_binding("main");
+        parsed.resources.push(resource); // allow: direct — fixture test inspection
+        parsed
+            .export_params
+            .push(crate::parser::ParsedExportParam::dummy(
+                "missing".to_string(),
+                None,
+                None,
+            ));
+        parsed
+            .export_params
+            .push(crate::parser::ParsedExportParam::dummy(
+                "upstream".to_string(),
+                None,
+                Some(Value::resource_ref(
+                    "upstream".to_string(),
+                    "value".to_string(),
+                    vec![],
+                )),
+            ));
+        parsed
+            .export_params
+            .push(crate::parser::ParsedExportParam::dummy(
+                "schema".to_string(),
+                None,
+                Some(Value::resource_ref(
+                    "main".to_string(),
+                    "vpc_id".to_string(),
+                    vec![],
+                )),
+            ));
+
+        let inferred = apply_inference(parsed, &SchemaRegistry::new());
+
+        assert_eq!(
+            inferred.export_params[0].static_type,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::NotInferable(NotInferableReason::MissingValue)
+            ))
+        );
+        assert_eq!(
+            inferred.export_params[1].static_type,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::NotInferable(NotInferableReason::NonInferableBinding {
+                    binding: "upstream".to_string()
+                })
+            ))
+        );
+        assert_eq!(
+            inferred.export_params[2].static_type,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::NotInferable(NotInferableReason::SchemaUnavailable {
+                    binding: "main".to_string()
+                })
+            ))
+        );
+    }
+
+    #[test]
+    fn retry_unchecked_export_inference_attaches_reportable_failure() {
+        use crate::static_type::{
+            ExportStaticType, InferredUncheckedReason, NotInferableReason, StaticType,
+        };
+
         let mut parsed = crate::parser::ParsedFile::default();
         let resource = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
             .with_binding("main");
@@ -1981,29 +1996,35 @@ mod tests {
                 )),
             ));
 
-        let (inferred, initial_errors) = apply_inference(parsed, &SchemaRegistry::new());
-        assert!(
-            initial_errors.is_empty(),
-            "schema-unavailable bootstrap is deferred"
+        let mut inferred = apply_inference(parsed, &SchemaRegistry::new());
+        assert_eq!(
+            inferred.export_params[0].static_type,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::NotInferable(NotInferableReason::SchemaUnavailable {
+                    binding: "main".to_string()
+                })
+            ))
         );
-        assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
 
-        let retry_errors =
-            retry_unknown_export_inference(&inferred, &schemas_with_vpc(), &initial_errors);
+        retry_unchecked_export_inference(&mut inferred, &schemas_with_vpc());
 
-        assert_eq!(retry_errors.len(), 1);
-        assert_eq!(retry_errors[0].index, 0);
-        assert_eq!(retry_errors[0].name, "vpc_id");
         assert!(matches!(
-            &retry_errors[0].error,
-            InferenceError::UnknownAttribute { binding, attribute }
-                if binding == "main" && attribute == "vpc_i"
+            &inferred.export_params[0].static_type,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::InferenceFailed(InferenceError::UnknownAttribute {
+                    binding,
+                    attribute,
+                })
+            )) if binding == "main" && attribute == "vpc_i"
         ));
-        assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
     }
 
     #[test]
-    fn retry_unknown_export_inference_keeps_type_unknown_after_success() {
+    fn retry_unchecked_export_inference_preserves_reason_after_success() {
+        use crate::static_type::{
+            ExportStaticType, InferredUncheckedReason, NotInferableReason, StaticType,
+        };
+
         let mut parsed = crate::parser::ParsedFile::default();
         let resource = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
             .with_binding("main");
@@ -2020,18 +2041,17 @@ mod tests {
                 )),
             ));
 
-        let (inferred, initial_errors) = apply_inference(parsed, &SchemaRegistry::new());
-        assert!(initial_errors.is_empty());
-        assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
+        let mut inferred = apply_inference(parsed, &SchemaRegistry::new());
+        retry_unchecked_export_inference(&mut inferred, &schemas_with_vpc());
 
-        let retry_errors =
-            retry_unknown_export_inference(&inferred, &schemas_with_vpc(), &initial_errors);
-
-        assert!(retry_errors.is_empty());
         assert_eq!(
-            inferred.export_params[0].type_expr,
-            TypeExpr::Unknown,
-            "retry is an existence-error probe, not a second inference pass",
+            inferred.export_params[0].static_type,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::NotInferable(NotInferableReason::SchemaUnavailable {
+                    binding: "main".to_string()
+                })
+            )),
+            "retry probes for reportable errors without replacing unchecked provenance",
         );
     }
 
@@ -2046,11 +2066,10 @@ mod tests {
                 Some(Value::Concrete(ConcreteValue::String("vpc-abc".into()))),
             ));
 
-        let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
-        assert!(errors.is_empty(), "no errors expected, got {:?}", errors);
+        let inferred = apply_inference(parsed, &SchemaRegistry::new());
         assert_eq!(
-            inferred.export_params[0].type_expr,
-            TypeExpr::Simple("vpc_id".to_string())
+            inferred.export_params[0].static_type,
+            ExportStaticType::Declared(StaticType::Known(TypeExpr::Simple("vpc_id".to_string())))
         );
     }
 
@@ -2125,16 +2144,11 @@ mod tests {
                 )),
             ));
 
-        let (inferred, errors) = apply_inference(parsed, &schemas_with_vpc());
-        assert!(
-            errors.is_empty(),
-            "module-call attribute export must infer cleanly, got: {errs:?}",
-            errs = errors
-        );
+        let inferred = apply_inference(parsed, &schemas_with_vpc());
         assert_eq!(inferred.export_params.len(), 1);
         assert_eq!(
-            inferred.export_params[0].type_expr,
-            owned_vpc_id_type(),
+            inferred.export_params[0].static_type,
+            ExportStaticType::Inferred(StaticType::Known(owned_vpc_id_type())),
             "expected the inner attribute's type to flow through the composition binding"
         );
     }
@@ -2146,7 +2160,7 @@ mod tests {
         // run yet, so the composition resource isn't in `parsed.resources`
         // and the bindings map can't see the module-call's projection.
         // The inferer must treat the binding as known-but-non-inferable
-        // (mirroring `upstream_state`) so the export gets `Unknown`
+        // (mirroring `upstream_state`) so the export remains unchecked
         // without a noisy `unknown binding` error. A post-expansion consumer
         // such as the LSP can run inference against the `Virtual` arm exercised
         // by the sibling test above; the CLI retry remains report-only.
@@ -2168,19 +2182,21 @@ mod tests {
                 )),
             ));
 
-        let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
-        assert!(
-            errors.is_empty(),
-            "module-call binding without a composition yet must not error, got: {:?}",
-            errors
+        let inferred = apply_inference(parsed, &SchemaRegistry::new());
+        assert_eq!(
+            inferred.export_params[0].static_type,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::NotInferable(NotInferableReason::NonInferableBinding {
+                    binding: "github_actions_carina".to_string()
+                })
+            ))
         );
-        assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
     }
 
     #[test]
-    fn apply_inference_substitutes_unknown_for_export_without_value() {
+    fn apply_inference_attaches_missing_value_reason() {
         // Export with no value and no annotation: nothing to infer from
-        // → Unknown sentinel, no error (the value-less shape is the
+        // → a typed non-failure reason (the value-less shape is the
         // parser-tombstoned state, not an inference failure).
         let mut parsed = crate::parser::ParsedFile::default();
         parsed
@@ -2191,9 +2207,13 @@ mod tests {
                 None,
             ));
 
-        let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
-        assert!(errors.is_empty());
-        assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
+        let inferred = apply_inference(parsed, &SchemaRegistry::new());
+        assert_eq!(
+            inferred.export_params[0].static_type,
+            ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::NotInferable(NotInferableReason::MissingValue)
+            ))
+        );
     }
 
     /// Convenience for the `Virtual`-binding cycle tests below.
@@ -2234,7 +2254,7 @@ mod tests {
         let entry = Value::resource_ref("a".to_string(), "x".to_string(), vec![]);
         let r = infer_type_from_value(&entry, &bindings, &SchemaRegistry::new());
         match r {
-            Err(InferenceError::CyclicVirtualBinding { cycle }) => {
+            Err(InferenceIssue::CyclicVirtualBinding { cycle }) => {
                 assert_eq!(
                     cycle,
                     vec!["a".to_string(), "b".to_string(), "a".to_string()],
@@ -2270,7 +2290,7 @@ mod tests {
         let entry = Value::resource_ref("a".to_string(), "x".to_string(), vec![]);
         let r = infer_type_from_value(&entry, &bindings, &SchemaRegistry::new());
         match r {
-            Err(InferenceError::CyclicVirtualBinding { cycle }) => {
+            Err(InferenceIssue::CyclicVirtualBinding { cycle }) => {
                 assert_eq!(
                     cycle,
                     vec!["a".to_string(), "a".to_string()],

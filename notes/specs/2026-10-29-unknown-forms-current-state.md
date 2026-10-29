@@ -6,7 +6,7 @@ Tracking: carina-rs/carina#3212
 
 carinaには、「今はまだ決まっていない」を表す形がいくつもあります。値がまだ評価できない、型が静的に分からない、作成した資源の属性がまだ読めていない、などです。[gradual typingの設計](./2026-05-23-gradual-typing-design.md)は、これらを整理して型で区別する道筋を描きました。#3212はその最初の段階（Phase 1）で、それぞれの形を1か所で説明することが目的です。
 
-この文書は、main（948e9c45）のコードと突き合わせた現状をまとめます。設計文書の§1.1の表は、書かれた後にコードが変わり、一部が古くなっています。どこが変わったかは最後の節にまとめました。コードの位置は、行番号ではなく型と関数の名前で示します。
+この文書は、main（948e9c45）を基点に、#4093の変更を加えたコードの現状をまとめます。設計文書の§1.1の表は、書かれた後にコードが変わり、一部が古くなっています。どこが変わったかは最後の節にまとめました。コードの位置は、行番号ではなく型と関数の名前で示します。
 
 ## 一覧
 
@@ -16,7 +16,7 @@ carinaには、「今はまだ決まっていない」を表す形がいくつ�
 | `DeferredValue::Unavailable` | 値 | 組み込み関数を評価しようとして失敗した呼び出し。待っている仕事ではない | 参照の解決（寛容なモード） | 同上。保存するときは`FunctionCall`に戻す |
 | `DeferredValue::Unknown(UnknownReason)` | 値 | plan時には分からない値。理由が11種類ある（次の節） | 理由ごとに違う | 飛ばす。境界では`UnknownNotAllowed`で拒む |
 | `DeferredValue::Secret`、`RedactedSecret` | 値 | 秘匿の印。未確定とは別の軸 | `secret()`、stateと保存したplanの読み込み | `Secret`は中を検証する。`RedactedSecret`はパーサーからは作れない |
-| `TypeExpr::Unknown` | 型（静的） | 健全な静的な型が付けられないので、型の検査をしない | 3か所（後述） | 型の検査を省き、存在だけを確かめる |
+| `StaticType::Unchecked` | 型の検査状態 | `TypeExpr`で検査できない理由を型付きで保持 | exportの推論と利用側の型解決 | 参照先の存在だけを確かめる |
 | 絞り込みの型の`MetadataOnly(None)` | 型（静的） | 名前（`TypeIdentity`）を持たない型。素の`String`か、名前のない絞り込み | スキーマのbuilder | 検査できる普通の型。名前のある型へは代入できない |
 
 このほかに、値ではないが「まだ分からない」に見えるものが3つあります。
@@ -42,15 +42,15 @@ carinaには、「今はまだ決まっていない」を表す形がいくつ�
 
 `Unknown`は、何とも等しくなりません。同じ理由の`Unknown`どうしでもです。例外は`ModuleArgument`どうしです。ディレクトリの解析を不動点まで繰り返すときに、同じ置き場所だと分かる必要があるからです。
 
-## `TypeExpr::Unknown`を作る3か所
+## `TypeExpr::Unknown`の削除
 
-`TypeExpr::Unknown`のdocコメントは「apply_inferenceだけが作る」と書いていましたが、今は3か所から作られます。
+#4093で`TypeExpr::Unknown`を削除しました。`TypeExpr`は検査できる型だけを表します。以前の3つの用途は、次の型に分かれました。
 
-1. exportの型の推論（`infer_export_params`）。推論できなかったとき（`Ok(None)`）と、推論が失敗したとき（`Err`）です。失敗したときは、エラーも何番目のexportかと一緒に記録されます。スキーマが手に入った後の再試行（`retry_unknown_export_inference`）は、エラーを出し直しますが、値は`Unknown`のまま残します。
-2. upstreamのexportを読むとき（`resolve_file_type_exprs_or_unknown`）。読む側のprovider contextでは名前を解決できない型を、`Unknown`に置き換えます。読む側にとって健全な制約がないからです。これは推論の失敗ではありません。
-3. iterableの要素の型の置き場所（`List(Unknown)`、`Map(Unknown)`）。具体的なリストやマップの、要素の型を決めずに外側の形だけを表します。
+- exportの推論結果は`ExportStaticType`が宣言型と推論型を区別し、`InferredUncheckedReason`が推論失敗と推論できない理由を保持します。
+- 利用側で名前を解決できない型は`UnnameableInConsumer`が元の型と`TypeResolutionError`を保持します。
+- iterableの外形だけが分かる場合は`DeferredIterableShape`が`List`と`Map`を表します。
 
-使う側は、どこでも「型を検査しない」として扱います。型の検査はどんな値も通し（`typecheck`）、exportへの参照は型を比べずに存在だけを確かめます（`RefType::Unchecked`）。ただし、`Unknown`が推論された側の型のときは、具体的な型を期待する場所には当てはまりません。型を持たない土台への`.`や`[]`によるアクセスは、推論のエラーになります。
+`InferenceFailed`はvalidate、plan、applyで同じ診断になります。`NotInferable`と`UnnameableInConsumer`は型を比較せず、参照先の存在だけを確かめます。
 
 ## 検証が何をするか
 
@@ -74,17 +74,17 @@ carinaには、「今はまだ決まっていない」を表す形がいくつ�
 - 絞り込みのない型から、名前のない受け取り側へ: 受け入れ、受け取り側のpatternと長さは具体的な値で確かめます（#3805）。
 - それ以外の`String`どうし: patternを文字列として比べ、長さの制約の包含を確かめます。名前のある型から名前のない型への代入は、ここに入ります。
 
-組み込みの型（`Ipv4Cidr`など）も、今は`TypeIdentity::bare`で名前を持っています。`TypeExpr::Unknown`はこの比較に来ません。静的な型を`AttributeType`に持ち上げるところで`None`になり、呼び出し側が型を検査しない参照として扱うからです。
+組み込みの型（`Ipv4Cidr`など）も、今は`TypeIdentity::bare`で名前を持っています。`StaticType::Unchecked`はこの比較に来ません。`StaticType::Known`が持つ`TypeExpr`だけを`AttributeType`に持ち上げます。
 
 ## 統合するかどうかの判断
 
 #3212は、重なっている形を1つにまとめられるかを判断することも求めています。判断は次のとおりです。
 
-`TypeExpr::Unknown`と、名前のない絞り込みの型は、1つの`Dynamic`にまとめません。前者は「型を検査しない」という判断で、後者は「検査できる型の形」です。重なる場面がありません。設計文書のPhase 2.b（`CustomTypeOrigin`）は取り下げます。`AttributeType::Custom`はすでになく、組み込みの型も名前を持つようになり、#3218の健全性の修正も軸ごとの代入（`assignable_to`）として入ったので、前提がなくなりました。
+`StaticType::Unchecked`と、名前のない絞り込みの型は、1つの`Dynamic`にまとめません。前者は「型を検査できない理由」で、後者は「検査できる型の形」です。設計文書のPhase 2.b（`CustomTypeOrigin`）は取り下げます。`AttributeType::Custom`はすでになく、組み込みの型も名前を持つようになり、#3218の健全性の修正も軸ごとの代入（`assignable_to`）として入ったので、前提がなくなりました。
 
 `Value::Unknown`と`Value::Deferred`は、すでに1つの`DeferredValue`にまとまっています。残っている問題は逆向きで、1つの型に意味の違うものが入っていることです。参照と式は評価すれば具体的になり、`Unknown`はplan時には分からず、`Secret`は秘匿の印です。`UnknownReason`の中にも、パーサーの中でしか存在してはいけない置き場所（`FnParam`、`FnLocal`、`ModuleArgument`、`EmptyInterpolation`）と、planやapplyまで残る印（upstream、`PostCreateReadIncomplete`）が混ざっています。これを型で分けるのがPhase 2.cで、#4094で扱います。
 
-`TypeExpr::Unknown`を取り除くPhase 2.aは、#4093で扱います。ただし、設計文書が考えていた「推論の戻り値を`Result`にする」だけでは足りません。今の`Unknown`は、推論の失敗、読む側では名前を解決できない型、要素の型の置き場所という3つの意味を持っているからです。それぞれに、`TypeExpr`の外の型付きの置き場所を用意する必要があります。#2597と#2598（upstreamのexportの推論の失敗を伝える）とも重なります。
+Phase 2.aは#4093で完了しました。推論の失敗、利用側では名前を解決できない型、iterableの外形を別の型で表し、#2597と#2598の診断経路も統合しました。
 
 ## 設計文書との違い
 
@@ -92,7 +92,7 @@ carinaには、「今はまだ決まっていない」を表す形がいくつ�
 
 - 6行目の`AttributeType::Custom { identity: None }`はありません。名前を持つかどうかは、絞り込みの型が持つ`RefinementBinding`（`MetadataOnly(Option<TypeIdentity>)`か、名前が必須の`Validator`）が表します。
 - `None`の3つの意味のうち、組み込みの型はもう`None`ではありません。
-- `TypeExpr::Unknown`は、`apply_inference`だけでなく3か所から作られます。
+- `TypeExpr::Unknown`は#4093で削除され、3つの用途は別の型に分かれました。
 - `UnknownReason`には、表にない`FnParam`、`FnLocal`、`ModuleArgument`、`PostCreateReadIncomplete`があります。`DeferredValue`にも、`Coalesce`、`Unavailable`、`Access`、`ResolvedFunctionCall`、`RedactedSecret`が加わっています。
 
 ## 関連する文書

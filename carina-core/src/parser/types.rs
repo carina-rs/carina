@@ -94,9 +94,9 @@ pub const BUILTIN_BARE_CUSTOM_TYPES: &[&str] = &[
 pub(crate) fn resolve_known_bare_custom_type(
     snake: &str,
     config: &ProviderContext,
-) -> Result<Option<TypeExpr>, String> {
+) -> Option<TypeExpr> {
     if BUILTIN_BARE_CUSTOM_TYPES.contains(&snake) {
-        return Ok(Some(TypeExpr::Simple(snake.to_string())));
+        return Some(TypeExpr::Simple(snake.to_string()));
     }
     let pascal = snake_to_pascal(snake);
     let matches = config
@@ -108,9 +108,7 @@ pub(crate) fn resolve_known_bare_custom_type(
                 && owned.identity().kind == pascal
         })
         .collect::<Vec<_>>();
-    let Some(first) = matches.first() else {
-        return Ok(None);
-    };
+    let first = matches.first()?;
     let owners = matches
         .iter()
         .skip(1)
@@ -118,7 +116,7 @@ pub(crate) fn resolve_known_bare_custom_type(
             owners.union(owned.owners())
         });
     let owned = crate::parser::OwnedTypeIdentity::with_owners(first.identity().clone(), owners);
-    Ok(Some(TypeExpr::SchemaType { owned }))
+    Some(TypeExpr::SchemaType { owned })
 }
 
 fn custom_type_suggestion_key(id: &TypeIdentity) -> String {
@@ -222,12 +220,11 @@ fn parse_type_expr_atom(
                     // typos and renamed-then-removed types went unnoticed.
                     if config.custom_types_loaded() {
                         return match resolve_known_bare_custom_type(&snake, config) {
-                            Ok(Some(resolved)) => Ok(resolved),
-                            Ok(None) => Err(ParseError::InvalidExpression {
+                            Some(resolved) => Ok(resolved),
+                            None => Err(ParseError::InvalidExpression {
                                 line,
                                 message: unknown_custom_type_message(other, config),
                             }),
-                            Err(message) => Err(ParseError::InvalidExpression { line, message }),
                         };
                     }
                     Ok(TypeExpr::Simple(snake))

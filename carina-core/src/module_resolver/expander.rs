@@ -282,10 +282,17 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 ArgumentOrigin::Authored { value_span, .. } => value_span.start_line(),
                 ArgumentOrigin::Defaulted => call_line,
             };
+            let type_expr = match &arg.static_type {
+                crate::static_type::StaticType::Known(type_expr) => type_expr,
+                crate::static_type::StaticType::Unchecked(_reason) => continue,
+            };
             let Some(resolved_parameter) =
-                crate::validation::resolve_parameter_type_for_check(&arg.type_expr, self.config)
-                    .map_err(|message| {
-                        ModuleError::Parse(ParseError::InvalidExpression { line, message })
+                crate::validation::resolve_parameter_type_for_check(type_expr, self.config)
+                    .map_err(|error| {
+                        ModuleError::Parse(ParseError::InvalidExpression {
+                            line,
+                            message: error.to_string(),
+                        })
                     })?
             else {
                 continue;
@@ -546,13 +553,13 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             for attr_param in &module.attribute_params {
                 if let Some(value) = &attr_param.value {
                     let source_argument = source_argument_name(value, &argument_values);
-                    let declared_type = attr_param.type_expr.clone().or_else(|| {
+                    let declared_type = attr_param.static_type.clone().or_else(|| {
                         source_argument.as_deref().and_then(|source_argument| {
                             module
                                 .arguments
                                 .iter()
                                 .find(|argument| argument.name == source_argument)
-                                .map(|argument| argument.type_expr.clone())
+                                .map(|argument| argument.static_type.clone())
                         })
                     });
                     // Rewrite intra-module refs and substitute arguments
@@ -571,7 +578,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     substituted.canonicalize_in_place();
                     composition_attrs.insert(
                         attr_param.name.clone(),
-                        crate::resource::LiveCompositionAttribute::from_value(
+                        crate::resource::LiveCompositionAttribute::from_value_with_static_type(
                             substituted,
                             declared_type,
                         )
@@ -593,25 +600,27 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 if let Some(argument) = resolved_arguments.get(&arg.name) {
                     let recorded = match argument.value_ref() {
                         StructuralOperandRef::Value(value) => {
-                            crate::resource::LiveCompositionArgument::from_value(
+                            crate::resource::LiveCompositionArgument::from_value_with_static_type(
                                 value.clone(),
-                                arg.type_expr.clone(),
+                                arg.static_type.clone(),
                                 argument.origin,
                             )
                         }
                         StructuralOperandRef::Handle {
                             handle,
                             access_base,
-                        } => crate::resource::LiveCompositionArgument::from_handle(
-                            access_base.clone(),
-                            arg.type_expr.clone(),
-                            handle.clone(),
-                            argument.origin,
-                        ),
-                        StructuralOperandRef::Parameter { access_base, .. } => {
-                            crate::resource::LiveCompositionArgument::from_value(
+                        } => {
+                            crate::resource::LiveCompositionArgument::from_handle_with_static_type(
                                 access_base.clone(),
-                                arg.type_expr.clone(),
+                                arg.static_type.clone(),
+                                handle.clone(),
+                                argument.origin,
+                            )
+                        }
+                        StructuralOperandRef::Parameter { access_base, .. } => {
+                            crate::resource::LiveCompositionArgument::from_value_with_static_type(
+                                access_base.clone(),
+                                arg.static_type.clone(),
                                 argument.origin,
                             )
                         }
@@ -1673,13 +1682,16 @@ fn check_composition_argument_type(
     config: &crate::parser::ProviderContext,
     line: usize,
 ) -> Result<(), ArgumentSubstitutionError> {
-    let declared_type = argument.declared_type();
+    let declared_type = match argument.declared_type() {
+        crate::static_type::StaticType::Known(type_expr) => type_expr,
+        crate::static_type::StaticType::Unchecked(_reason) => return Ok(()),
+    };
     let Some(resolved_parameter) =
         crate::validation::resolve_parameter_type_for_check(declared_type, config).map_err(
-            |message| ArgumentSubstitutionError {
+            |error| ArgumentSubstitutionError {
                 source_file: None,
                 line,
-                message,
+                message: error.to_string(),
                 parse_error: None,
             },
         )?

@@ -34,6 +34,131 @@ fn rendered_typecheck_result(
     .map(|error| error.to_string())
 }
 
+#[test]
+fn deferred_iterable_shape_classifies_concrete_list_without_placeholder_type() {
+    let shape = deferred_iterable_shape(
+        &Value::Concrete(ConcreteValue::List(Vec::new())),
+        &inference::InferenceBindings::new(),
+        &SchemaRegistry::new(),
+    )
+    .expect("concrete list shape");
+
+    assert_eq!(shape, DeferredIterableShape::List);
+}
+
+#[test]
+fn deferred_iterable_shape_classifies_concrete_map_without_placeholder_type() {
+    let shape = deferred_iterable_shape(
+        &Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        &inference::InferenceBindings::new(),
+        &SchemaRegistry::new(),
+    )
+    .expect("concrete map shape");
+
+    assert_eq!(shape, DeferredIterableShape::Map);
+}
+
+#[test]
+fn deferred_iterable_shape_preserves_non_iterable_scalar_type() {
+    let shape = deferred_iterable_shape(
+        &Value::Concrete(ConcreteValue::Int(1)),
+        &inference::InferenceBindings::new(),
+        &SchemaRegistry::new(),
+    )
+    .expect("concrete scalar shape");
+
+    assert_eq!(shape, DeferredIterableShape::NonIterable(TypeExpr::Int));
+}
+
+#[test]
+fn consumer_resolution_marks_all_parameter_positions_and_preserves_inference_failure() {
+    use crate::parser::{
+        ArgumentParameter, InferredExportParam, ResourceTypePath, ValidationBlock,
+    };
+    use crate::static_type::{
+        ExportStaticType, InferenceError, InferredUncheckedReason, StaticType,
+    };
+
+    let unknown = TypeExpr::DottedUnresolved(ResourceTypePath::new("missing", "Thing"));
+    let mut parsed = ParsedFile::default();
+    parsed.arguments.push(ArgumentParameter {
+        name: "argument".to_string(),
+        static_type: StaticType::Known(unknown.clone()),
+        default: None,
+        description: None,
+        validations: Vec::<ValidationBlock>::new(),
+    });
+    parsed
+        .attribute_params
+        .push(crate::parser::AttributeParameter::dummy(
+            "attribute".to_string(),
+            Some(unknown.clone()),
+            None,
+        ));
+    parsed
+        .export_params
+        .push(crate::parser::ParsedExportParam::dummy(
+            "parsed_export".to_string(),
+            Some(unknown.clone()),
+            None,
+        ));
+
+    resolve_file_static_types_for_consumer(&mut parsed, &ProviderContext::default());
+
+    assert!(matches!(
+        &parsed.arguments[0].static_type,
+        StaticType::Unchecked(reason)
+            if reason.original == unknown
+                && matches!(
+                    reason.resolution_error,
+                    crate::static_type::TypeResolutionError::UnknownCustomType { .. }
+                )
+    ));
+    assert!(matches!(
+        &parsed.attribute_params[0].static_type,
+        Some(StaticType::Unchecked(reason)) if reason.original == unknown
+    ));
+    assert!(matches!(
+        &parsed.export_params[0].static_type,
+        Some(StaticType::Unchecked(reason)) if reason.original == unknown
+    ));
+
+    let failure = InferenceError::UnknownType {
+        reason: "dynamic".to_string(),
+    };
+    let mut inferred = ParsedFile::default().map_export_params(|_exports| {
+        vec![
+            InferredExportParam {
+                name: "inferred_export".to_string(),
+                static_type: ExportStaticType::Inferred(StaticType::Known(unknown.clone())),
+                value: None,
+            },
+            InferredExportParam {
+                name: "failed_export".to_string(),
+                static_type: ExportStaticType::Inferred(StaticType::Unchecked(
+                    InferredUncheckedReason::InferenceFailed(failure.clone()),
+                )),
+                value: None,
+            },
+        ]
+    });
+
+    resolve_file_static_types_for_consumer(&mut inferred, &ProviderContext::default());
+
+    assert!(matches!(
+        &inferred.export_params[0].static_type,
+        ExportStaticType::Inferred(StaticType::Unchecked(
+            InferredUncheckedReason::UnnameableInConsumer(reason)
+        )) if reason.original == unknown
+    ));
+    assert_eq!(
+        inferred.export_params[1].static_type,
+        ExportStaticType::Inferred(StaticType::Unchecked(
+            InferredUncheckedReason::InferenceFailed(failure)
+        ))
+    );
+}
+
 fn rendered_struct_typecheck_result(
     fields: &[(String, TypeExpr)],
     entries: &IndexMap<String, Value>,
@@ -105,10 +230,14 @@ fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
 fn validate_resource_ref_types_for_test<E>(
     parsed: &crate::parser::File<E>,
     schemas: &SchemaRegistry,
-    argument_names: &HashSet<String>,
 ) -> Result<(), String> {
     let bindings = crate::binding_index::BindingIndex::from_parsed(parsed, schemas);
-    super::validate_resource_ref_types(parsed, schemas, argument_names, &bindings)
+    let argument_names = parsed
+        .arguments
+        .iter()
+        .map(|argument| argument.name.clone())
+        .collect();
+    super::validate_resource_ref_types(parsed, schemas, &argument_names, &bindings)
 }
 
 fn function_ref_schema() -> SchemaRegistry {
@@ -411,7 +540,6 @@ fn lift_type_expr_recurses_and_only_unknown_remains_unchecked() {
             crate::schema::TypeInSchema::schemaless(&AttributeType::string())
         )
     );
-    assert!(lift_type_expr(&TypeExpr::Unknown).is_none());
 }
 
 #[test]
@@ -1243,7 +1371,7 @@ fn resource_ref_validation_checks_composition_attribute_membership_only() {
         .push(make_composition("instance", &["target_group_arn"]));
     parsed.resources.extend([valid, invalid]); // allow: direct — fixture test inspection
 
-    let err = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    let err = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert_eq!(
         err.lines().count(),
         1,
@@ -1273,7 +1401,7 @@ fn unknown_binding_reference_reports_error() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(subnet); // allow: direct — fixture test inspection
-    let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
+    let result = validate_resource_ref_types_for_test(&parsed, &schemas);
     assert_eq!(
         result.unwrap_err(),
         "awscc.ec2.Subnet.web-subnet: unknown binding 'vpc' in reference vpc.vpc_id"
@@ -1313,7 +1441,7 @@ fn unknown_attribute_reference_reports_error() {
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
     parsed.resources.push(subnet); // allow: direct — fixture test inspection
-    let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
+    let result = validate_resource_ref_types_for_test(&parsed, &schemas);
     assert_eq!(
         result.unwrap_err(),
         "awscc.ec2.Subnet.web-subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
@@ -1395,13 +1523,12 @@ fn postfix_and_path_access_report_the_same_unknown_struct_field() {
 
     let (path_parsed, schemas) =
         postfix_access_validation_fixture(path_value, AttributeType::string());
-    let path_error = validate_resource_ref_types_for_test(&path_parsed, &schemas, &HashSet::new())
+    let path_error = validate_resource_ref_types_for_test(&path_parsed, &schemas)
         .expect_err("path form must reject the unknown field");
     let (postfix_parsed, schemas) =
         postfix_access_validation_fixture(postfix_value, AttributeType::string());
-    let postfix_error =
-        validate_resource_ref_types_for_test(&postfix_parsed, &schemas, &HashSet::new())
-            .expect_err("postfix form must reject the same unknown field");
+    let postfix_error = validate_resource_ref_types_for_test(&postfix_parsed, &schemas)
+        .expect_err("postfix form must reject the same unknown field");
 
     assert_eq!(postfix_error, path_error);
     assert!(postfix_error.contains("unknown field 'nope'"));
@@ -1449,7 +1576,7 @@ fn parenthesized_for_address_reports_the_same_unknown_field_as_direct_path() {
         .expect("schema fixture must be valid"),
     );
 
-    let error = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new())
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas)
         .expect_err("unknown field must be rejected for both spellings");
     assert_eq!(
         error.matches("unknown attribute 'nope'").count(),
@@ -1497,7 +1624,7 @@ fn postfix_access_rejects_steps_that_do_not_fit_known_base_types() {
 
     for value in cases {
         let (parsed, schemas) = postfix_access_validation_fixture(value, AttributeType::string());
-        let error = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new())
+        let error = validate_resource_ref_types_for_test(&parsed, &schemas)
             .expect_err("a known base type must reject an incompatible access step");
         assert!(
             error.contains("cannot apply") || error.contains("does not fit"),
@@ -1531,7 +1658,7 @@ fn postfix_function_result_type_is_checked_against_resource_attribute_type() {
 
     let (invalid, schemas) =
         postfix_access_validation_fixture(split_element(), AttributeType::int());
-    let error = validate_resource_ref_types_for_test(&invalid, &schemas, &HashSet::new())
+    let error = validate_resource_ref_types_for_test(&invalid, &schemas)
         .expect_err("split()[0] is String, not Int");
     assert!(
         error.contains("expected Int") && error.contains("String"),
@@ -1540,7 +1667,7 @@ fn postfix_function_result_type_is_checked_against_resource_attribute_type() {
 
     let (valid, schemas) =
         postfix_access_validation_fixture(split_element(), AttributeType::string());
-    validate_resource_ref_types_for_test(&valid, &schemas, &HashSet::new())
+    validate_resource_ref_types_for_test(&valid, &schemas)
         .expect("split()[0] is assignable to String");
 }
 
@@ -1561,7 +1688,7 @@ fn secret_preserves_its_argument_type_through_postfix_access() {
         AttributeType::string(),
     );
 
-    validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new())
+    validate_resource_ref_types_for_test(&parsed, &schemas)
         .expect("secret(list(String))[0] must infer as String");
 }
 
@@ -1585,7 +1712,7 @@ fn resource_reference_segments_reject_wrong_shape_like_computed_access() {
         AttributeType::string(),
     );
 
-    let error = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new())
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas)
         .expect_err("indexing a String resource attribute must fail validation");
     assert_eq!(
         error.matches("cannot apply access [0] to String").count(),
@@ -1635,7 +1762,7 @@ fn unknown_attribute_reference_suggests_similar_name() {
     let mut parsed = empty_parsed();
     parsed.resources.push(igw); // allow: direct — fixture test inspection
     parsed.resources.push(route); // allow: direct — fixture test inspection
-    let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
+    let result = validate_resource_ref_types_for_test(&parsed, &schemas);
     let err = result.unwrap_err();
     assert!(
         err.contains("Did you mean 'internet_gateway_id'?"),
@@ -1702,7 +1829,7 @@ fn unknown_attribute_reference_through_wait_binding_reports_error() {
     });
     parsed.resources.push(listener); // allow: direct — fixture test inspection
 
-    let err = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    let err = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert!(
         err.contains("unknown attribute 'certificate_arnn' on 'cert_issued'"),
         "expected wait binding attribute error, got: {err}",
@@ -1775,7 +1902,7 @@ fn known_attribute_reference_through_wait_binding_is_accepted() {
     });
     parsed.resources.push(listener); // allow: direct — fixture test inspection
 
-    assert!(validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).is_ok());
+    assert!(validate_resource_ref_types_for_test(&parsed, &schemas).is_ok());
 }
 
 #[test]
@@ -1821,7 +1948,7 @@ let sink = test.r.sink {
     )
     .unwrap();
 
-    let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
+    let result = validate_resource_ref_types_for_test(&parsed, &schemas);
     assert!(
         result.is_ok(),
         "String should flow into Union<Ref(S), Ref(L)> without a spurious error: {result:?}",
@@ -1865,7 +1992,7 @@ let sink = test.r.sink {
     )
     .unwrap();
 
-    let error = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new())
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas)
         .expect_err("String must not be assignable to Bool");
     assert!(
         error.contains("expected Bool, got String"),
@@ -1917,7 +2044,7 @@ let sink = test.r.sink {
     )
     .unwrap();
 
-    let error = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new())
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas)
         .expect_err("Bool must not be assignable to String | List<String>");
     assert!(
         error.contains("expected String | List<String>, got Bool"),
@@ -1998,7 +2125,7 @@ fn unknown_attribute_reference_through_wait_binding_inside_nested_struct_reports
     });
     parsed.resources.push(listener); // allow: direct — fixture test inspection
 
-    let err = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    let err = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert!(
         err.contains("unknown attribute 'arn' on 'cert_issued'"),
         "expected nested wait binding attribute error, got: {err}",
@@ -2062,7 +2189,7 @@ fn unknown_attribute_reference_through_managed_binding_inside_nested_struct_repo
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.resources.push(listener); // allow: direct — fixture test inspection
 
-    let err = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    let err = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert!(
         err.contains("unknown attribute 'arn' on 'cert'"),
         "expected nested managed binding attribute error, got: {err}",
@@ -2097,7 +2224,7 @@ fn unknown_outer_attr_does_not_mask_nested_unknown_binding_ref() {
     let mut parsed = empty_parsed();
     parsed.resources.push(listener); // allow: direct — fixture test inspection
 
-    let err = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    let err = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert!(
         err.contains("unknown binding 'unknown_binding' in reference unknown_binding.foo"),
         "expected nested unknown binding under unknown outer attr, got: {err}",
@@ -2135,7 +2262,7 @@ fn unknown_attribute_reference_no_suggestion_when_too_different() {
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
     parsed.resources.push(subnet); // allow: direct — fixture test inspection
-    let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
+    let result = validate_resource_ref_types_for_test(&parsed, &schemas);
     let err = result.unwrap_err();
     assert!(
         !err.contains("Did you mean"),
@@ -2179,7 +2306,7 @@ fn ref_type_mismatch_inside_for_body_is_rejected() {
             .expect("schema fixture must be valid"),
     );
 
-    let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
+    let result = validate_resource_ref_types_for_test(&parsed, &schemas);
     assert!(result.is_err(), "expected type-mismatch error in for body");
     let msg = result.unwrap_err();
     assert!(
@@ -2203,7 +2330,7 @@ fn provider_in_module_with_arguments_errors() {
     });
     parsed.arguments.push(crate::parser::ArgumentParameter {
         name: "vpc_cidr".to_string(),
-        type_expr: TypeExpr::String,
+        static_type: crate::static_type::StaticType::Known(TypeExpr::String),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -2265,7 +2392,7 @@ fn module_without_provider_ok() {
     let mut parsed = empty_parsed();
     parsed.arguments.push(crate::parser::ArgumentParameter {
         name: "vpc_cidr".to_string(),
-        type_expr: TypeExpr::String,
+        static_type: crate::static_type::StaticType::Known(TypeExpr::String),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -2556,7 +2683,7 @@ fn module_without_exports_ok() {
 fn argument_param(name: &str) -> crate::parser::ArgumentParameter {
     crate::parser::ArgumentParameter {
         name: name.to_string(),
-        type_expr: TypeExpr::String,
+        static_type: crate::static_type::StaticType::Known(TypeExpr::String),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -3254,53 +3381,6 @@ fn lifted_struct_rejects_map_with_wrong_element_type() {
     ));
 }
 
-// Issue #2358: a generic `TypeExpr::String` declaration must not satisfy
-// a receiver typed as `Custom { semantic_name: Some(_) }`. The receiver
-// names a specific type (e.g. `VpcId`); a value carrying only the
-// `String` constraint cannot prove it satisfies the more specific
-// invariants the receiver demands.
-#[test]
-fn non_liftable_unknown_is_unchecked_for_concrete_sinks() {
-    // Sentinel for failed inference (#2360 stage 2): the boundary relation
-    // remains unchecked while the inference-errors channel surfaces the
-    // actionable "type annotation required" diagnostic.
-    assert!(lifted_source_is_assignable_to_schema(
-        &TypeExpr::Unknown,
-        &AttributeType::string(),
-        crate::schema::empty_defs_for_schema_walks(),
-    ));
-    assert!(lifted_source_is_assignable_to_schema(
-        &TypeExpr::Unknown,
-        &AttributeType::int(),
-        crate::schema::empty_defs_for_schema_walks(),
-    ));
-    assert!(lifted_source_is_assignable_to_schema(
-        &TypeExpr::Unknown,
-        &AttributeType::bool(),
-        crate::schema::empty_defs_for_schema_walks(),
-    ));
-}
-
-#[test]
-fn non_liftable_unknown_is_unchecked_for_custom_sink() {
-    use crate::schema::legacy_validator;
-    fn noop(_v: &crate::resource::Value) -> Result<(), String> {
-        Ok(())
-    }
-    let custom = AttributeType::refined_string_with_validator(
-        TypeIdentity::bare("VpcId"),
-        None,
-        None,
-        legacy_validator(noop),
-        None,
-    );
-    assert!(lifted_source_is_assignable_to_schema(
-        &TypeExpr::Unknown,
-        &custom,
-        crate::schema::empty_defs_for_schema_walks(),
-    ));
-}
-
 #[test]
 fn directional_relation_rejects_plain_string_for_identified_sink() {
     use crate::schema::legacy_validator;
@@ -3474,7 +3554,9 @@ fn validate_module_calls_rejects_custom_type() {
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "managed_policy_arns".to_string(),
-                type_expr: TypeExpr::List(Box::new(iam_policy_arn_type_expr())),
+                static_type: crate::static_type::StaticType::Known(TypeExpr::List(Box::new(
+                    iam_policy_arn_type_expr(),
+                ))),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -3506,11 +3588,11 @@ fn validate_module_calls_rejects_literal_union_mismatch() {
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "environment".to_string(),
-                type_expr: TypeExpr::Union(vec![
+                static_type: crate::static_type::StaticType::Known(TypeExpr::Union(vec![
                     TypeExpr::StringLiteral("dev".to_string()),
                     TypeExpr::StringLiteral("stg".to_string()),
                     TypeExpr::StringLiteral("prod".to_string()),
-                ]),
+                ])),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -3555,7 +3637,7 @@ let inst = m { n = 'abc' }
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "n".to_string(),
-                type_expr: TypeExpr::Int,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::Int),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -3595,7 +3677,7 @@ fn validate_module_calls_defers_binding_refs_to_the_binding_index() {
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "name".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -3667,7 +3749,7 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "mode".to_string(),
-                type_expr: schema_type.clone(),
+                static_type: crate::static_type::StaticType::Known(schema_type.clone()),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -3691,7 +3773,9 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
 
     let exports = [InferredExportParam {
         name: "mode".to_string(),
-        type_expr: schema_type,
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::static_type::StaticType::Known(schema_type),
+        ),
         value: Some(authored()),
     }];
     check_export_values_pre_apply(&exports, &ResolvedBindings::default(), &config)
@@ -4309,12 +4393,14 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "subnet_ids".to_string(),
-                type_expr: TypeExpr::List(Box::new(TypeExpr::SchemaType {
-                    owned: crate::parser::OwnedTypeIdentity::provider(
-                        "aws",
-                        TypeIdentity::from_schema_type("aws", "ec2.Subnet", "Id"),
-                    ),
-                })),
+                static_type: crate::static_type::StaticType::Known(TypeExpr::List(Box::new(
+                    TypeExpr::SchemaType {
+                        owned: crate::parser::OwnedTypeIdentity::provider(
+                            "aws",
+                            TypeIdentity::from_schema_type("aws", "ec2.Subnet", "Id"),
+                        ),
+                    },
+                ))),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -4377,7 +4463,7 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "number".to_string(),
-                type_expr: TypeExpr::Float,
+                static_type: crate::static_type::StaticType::Known(TypeExpr::Float),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -4797,7 +4883,9 @@ fn validate_export_params_rejects_invalid_custom_type() {
     let config = context_with_iam_policy_arn_validator();
     let exports = vec![InferredExportParam {
         name: "policy".to_string(),
-        type_expr: iam_policy_arn_type_expr(),
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::static_type::StaticType::Known(iam_policy_arn_type_expr()),
+        ),
         value: Some(Value::Concrete(ConcreteValue::String("not-an-arn".into()))),
     }];
     let result = resolve_and_validate_export_params(&exports, &config);
@@ -4814,7 +4902,11 @@ fn validate_export_params_rejects_invalid_list_element() {
     let config = context_with_iam_policy_arn_validator();
     let exports = vec![InferredExportParam {
         name: "policies".to_string(),
-        type_expr: TypeExpr::List(Box::new(iam_policy_arn_type_expr())),
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::static_type::StaticType::Known(TypeExpr::List(Box::new(
+                iam_policy_arn_type_expr(),
+            ))),
+        ),
         value: Some(Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::String(
                 "arn:aws:iam::123456789012:policy/valid".into(),
@@ -4836,7 +4928,9 @@ fn validate_export_params_accepts_valid_values() {
     let config = context_with_iam_policy_arn_validator();
     let exports = vec![InferredExportParam {
         name: "policy".to_string(),
-        type_expr: iam_policy_arn_type_expr(),
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::static_type::StaticType::Known(iam_policy_arn_type_expr()),
+        ),
         value: Some(Value::Concrete(ConcreteValue::String(
             "arn:aws:iam::123456789012:policy/admin".into(),
         ))),
@@ -4846,16 +4940,19 @@ fn validate_export_params_accepts_valid_values() {
 }
 
 #[test]
-fn validate_export_params_skips_unknown_sentinel() {
+fn validate_export_params_skips_unchecked_inference() {
     use crate::parser::InferredExportParam;
+    use crate::static_type::{
+        ExportStaticType, InferredUncheckedReason, NotInferableReason, StaticType,
+    };
 
-    // Stage 2 (#2360): exports with `TypeExpr::Unknown` are skipped —
-    // the loader's `inference_errors` channel reports the missing
-    // annotation, so re-checking here would double-report.
+    // Unchecked exports do not invent a real type for value validation.
     let config = ProviderContext::default();
     let exports = vec![InferredExportParam {
         name: "raw".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: ExportStaticType::Inferred(StaticType::Unchecked(
+            InferredUncheckedReason::NotInferable(NotInferableReason::MissingValue),
+        )),
         value: Some(Value::Concrete(ConcreteValue::String("anything".into()))),
     }];
     let result = resolve_and_validate_export_params(&exports, &config);
@@ -4869,7 +4966,9 @@ fn validate_export_params_rejects_type_mismatch() {
     let config = ProviderContext::default();
     let exports = vec![InferredExportParam {
         name: "flag".to_string(),
-        type_expr: TypeExpr::Bool,
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::static_type::StaticType::Known(TypeExpr::Bool),
+        ),
         value: Some(Value::Concrete(ConcreteValue::String("not-a-bool".into()))),
     }];
     let result = resolve_and_validate_export_params(&exports, &config);
@@ -4896,7 +4995,9 @@ fn validate_export_params_rejects_decrypt_result_as_secret_export() {
     .expect("test decryptor");
     let exports = vec![InferredExportParam {
         name: "count".to_string(),
-        type_expr: TypeExpr::Int,
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::static_type::StaticType::Known(TypeExpr::Int),
+        ),
         value: Some(value),
     }];
 
@@ -4936,17 +5037,23 @@ fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
     let exports = vec![
         InferredExportParam {
             name: "direct".into(),
-            type_expr: TypeExpr::String,
+            static_type: crate::static_type::ExportStaticType::Declared(
+                crate::static_type::StaticType::Known(TypeExpr::String),
+            ),
             value: Some(secret_string()),
         },
         InferredExportParam {
             name: "builtin".into(),
-            type_expr: TypeExpr::String,
+            static_type: crate::static_type::ExportStaticType::Declared(
+                crate::static_type::StaticType::Known(TypeExpr::String),
+            ),
             value: Some(builtin),
         },
         InferredExportParam {
             name: "interpolated".into(),
-            type_expr: TypeExpr::String,
+            static_type: crate::static_type::ExportStaticType::Declared(
+                crate::static_type::StaticType::Known(TypeExpr::String),
+            ),
             value: Some(Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("prefix-".into()),
                 InterpolationPart::Expr(secret_string()),
@@ -4954,12 +5061,16 @@ fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
         },
         InferredExportParam {
             name: "nested_list".into(),
-            type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+            static_type: crate::static_type::ExportStaticType::Declared(
+                crate::static_type::StaticType::Known(TypeExpr::List(Box::new(TypeExpr::String))),
+            ),
             value: Some(Value::Concrete(ConcreteValue::List(vec![secret_string()]))),
         },
         InferredExportParam {
             name: "nested_map".into(),
-            type_expr: TypeExpr::Map(Box::new(TypeExpr::String)),
+            static_type: crate::static_type::ExportStaticType::Declared(
+                crate::static_type::StaticType::Known(TypeExpr::Map(Box::new(TypeExpr::String))),
+            ),
             value: Some(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                 "key".into(),
                 secret_string(),
@@ -4967,7 +5078,9 @@ fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
         },
         InferredExportParam {
             name: "decrypted".into(),
-            type_expr: TypeExpr::String,
+            static_type: crate::static_type::ExportStaticType::Declared(
+                crate::static_type::StaticType::Known(TypeExpr::String),
+            ),
             value: Some(decrypt),
         },
     ];
@@ -5016,7 +5129,9 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
 
     let exports = [InferredExportParam {
         name: "id".into(),
-        type_expr: TypeExpr::String,
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::static_type::StaticType::Known(TypeExpr::String),
+        ),
         value: Some(Value::resource_ref("r", "identifier", vec![])),
     }];
     let pre_apply =
@@ -5337,15 +5452,16 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
     let exports = vec![InferredExportParam {
         name: "accounts".to_string(),
         // declared as map(string), and values are String-typed — should pass
-        type_expr: TypeExpr::Map(Box::new(TypeExpr::String)),
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::static_type::StaticType::Known(TypeExpr::Map(Box::new(TypeExpr::String))),
+        ),
         value: Some(Value::Concrete(ConcreteValue::Map(map_value))),
     }];
 
     let mut parsed = empty_parsed();
     parsed.resources.push(registry_prod); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let result =
-        validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new());
+    let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
         result.is_ok(),
         "map(String) = {{ prod = registry_prod.account_id (String) }} should pass, got: {:?}",
@@ -5388,15 +5504,16 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
     let exports = vec![InferredExportParam {
         name: "accounts".to_string(),
         // declared as map(bool) — values should be rejected as they are strings
-        type_expr: TypeExpr::Map(Box::new(TypeExpr::Bool)),
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::static_type::StaticType::Known(TypeExpr::Map(Box::new(TypeExpr::Bool))),
+        ),
         value: Some(Value::Concrete(ConcreteValue::Map(map_value))),
     }];
 
     let mut parsed = empty_parsed();
     parsed.resources.push(registry_prod); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let result =
-        validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new());
+    let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
         result.is_err(),
         "map(Bool) = {{ prod = registry_prod.account_id }} (String) should be flagged as type mismatch"
@@ -5434,7 +5551,9 @@ fn export_param_ref_type_mismatch_displays_resolved_nested_ref_names() {
         .with_attribute("values", Value::Concrete(ConcreteValue::List(Vec::new())));
     let exports = vec![InferredExportParam {
         name: "values".to_string(),
-        type_expr: TypeExpr::Bool,
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::static_type::StaticType::Known(TypeExpr::Bool),
+        ),
         value: Some(Value::resource_ref(
             "source".to_string(),
             "values".to_string(),
@@ -5445,7 +5564,7 @@ fn export_param_ref_type_mismatch_displays_resolved_nested_ref_names() {
     parsed.resources.push(source); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
-    let error = validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new())
+    let error = validate_export_param_ref_types_with_bindings(&exports, &bindings)
         .expect_err("List<String> must not satisfy Bool");
     assert!(
         error.contains("expected Bool, got List<String>"),
@@ -5478,7 +5597,9 @@ fn export_param_ref_types_flags_unknown_attribute() {
 
     let exports = vec![InferredExportParam {
         name: "x".to_string(),
-        type_expr: TypeExpr::String,
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::static_type::StaticType::Known(TypeExpr::String),
+        ),
         value: Some(Value::resource_ref(
             "vpc".to_string(),
             "bad_attr".to_string(),
@@ -5489,8 +5610,7 @@ fn export_param_ref_types_flags_unknown_attribute() {
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new())
-        .unwrap_err();
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
     assert!(
         err.contains("export 'x': unknown attribute 'bad_attr' on 'vpc' in reference vpc.bad_attr"),
         "expected export unknown attribute error, got: {err}",
@@ -5504,7 +5624,9 @@ fn export_param_ref_types_check_composition_attribute_membership_only() {
     let exports = vec![
         InferredExportParam {
             name: "valid".to_string(),
-            type_expr: TypeExpr::Bool,
+            static_type: crate::static_type::ExportStaticType::Declared(
+                crate::static_type::StaticType::Known(TypeExpr::Bool),
+            ),
             value: Some(Value::resource_ref(
                 "instance".to_string(),
                 "target_group_arn".to_string(),
@@ -5513,7 +5635,9 @@ fn export_param_ref_types_check_composition_attribute_membership_only() {
         },
         InferredExportParam {
             name: "invalid".to_string(),
-            type_expr: TypeExpr::Bool,
+            static_type: crate::static_type::ExportStaticType::Declared(
+                crate::static_type::StaticType::Known(TypeExpr::Bool),
+            ),
             value: Some(Value::resource_ref(
                 "instance".to_string(),
                 "target_group_ar".to_string(),
@@ -5528,8 +5652,7 @@ fn export_param_ref_types_check_composition_attribute_membership_only() {
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
-    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new())
-        .unwrap_err();
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
 
     assert_eq!(
         err.lines().count(),
@@ -5543,8 +5666,11 @@ fn export_param_ref_types_check_composition_attribute_membership_only() {
 }
 
 #[test]
-fn unknown_type_export_checks_both_authorities_except_reported_indices() {
+fn unchecked_export_checks_existence_and_attached_failure_skips_duplicate_walk() {
     use crate::parser::InferredExportParam;
+    use crate::static_type::{
+        ExportStaticType, InferenceError, InferredUncheckedReason, NotInferableReason, StaticType,
+    };
 
     let schema_resource =
         Resource::with_provider("awscc", "elbv2.TargetGroup", "tg", None).with_binding("tg");
@@ -5561,7 +5687,11 @@ fn unknown_type_export_checks_both_authorities_except_reported_indices() {
     let exports = vec![
         InferredExportParam {
             name: "composition_bad".to_string(),
-            type_expr: TypeExpr::Unknown,
+            static_type: ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::NotInferable(NotInferableReason::NonInferableBinding {
+                    binding: "instance".to_string(),
+                }),
+            )),
             value: Some(Value::resource_ref(
                 "instance".to_string(),
                 "target_group_ar".to_string(),
@@ -5570,7 +5700,11 @@ fn unknown_type_export_checks_both_authorities_except_reported_indices() {
         },
         InferredExportParam {
             name: "schema_bad".to_string(),
-            type_expr: TypeExpr::Unknown,
+            static_type: ExportStaticType::Inferred(StaticType::Unchecked(
+                InferredUncheckedReason::NotInferable(NotInferableReason::NonInferableBinding {
+                    binding: "tg".to_string(),
+                }),
+            )),
             value: Some(Value::resource_ref(
                 "tg".to_string(),
                 "target_group_ar".to_string(),
@@ -5586,8 +5720,7 @@ fn unknown_type_export_checks_both_authorities_except_reported_indices() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
     let all_errors =
-        validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new())
-            .unwrap_err();
+        validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
     assert_eq!(
         all_errors.lines().count(),
         2,
@@ -5596,8 +5729,13 @@ fn unknown_type_export_checks_both_authorities_except_reported_indices() {
     assert!(all_errors.contains("export 'composition_bad': unknown attribute"));
     assert!(all_errors.contains("export 'schema_bad': unknown attribute"));
 
-    let reported_indices = HashSet::from([1]);
-    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings, &reported_indices)
+    let mut exports_with_failure = exports;
+    exports_with_failure[1].static_type = ExportStaticType::Inferred(StaticType::Unchecked(
+        InferredUncheckedReason::InferenceFailed(InferenceError::UnknownType {
+            reason: "already reported".to_string(),
+        }),
+    ));
+    let err = validate_export_param_ref_types_with_bindings(&exports_with_failure, &bindings)
         .unwrap_err();
 
     assert_eq!(
@@ -5642,7 +5780,9 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
 
     let exports = vec![InferredExportParam {
         name: "x".to_string(),
-        type_expr: TypeExpr::String,
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::static_type::StaticType::Known(TypeExpr::String),
+        ),
         value: Some(Value::resource_ref(
             "cert_issued".to_string(),
             "bad_attr".to_string(),
@@ -5666,8 +5806,7 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
     });
 
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new())
-        .unwrap_err();
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
     assert!(
         err.contains(
             "export 'x': unknown attribute 'bad_attr' on 'cert_issued' in reference cert_issued.bad_attr"
@@ -5707,7 +5846,9 @@ fn export_param_ref_types_flags_unknown_struct_field_inside_path() {
 
     let exports = vec![InferredExportParam {
         name: "x".to_string(),
-        type_expr: TypeExpr::String,
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::static_type::StaticType::Known(TypeExpr::String),
+        ),
         value: Some(Value::resource_ref(
             "vpc".to_string(),
             "config".to_string(),
@@ -5718,8 +5859,7 @@ fn export_param_ref_types_flags_unknown_struct_field_inside_path() {
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new())
-        .unwrap_err();
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
     assert!(
         err.contains(
             "export 'x': unknown field 'bad_field' on struct 'VpcConfig' in reference vpc.config.bad_field"
@@ -5729,8 +5869,11 @@ fn export_param_ref_types_flags_unknown_struct_field_inside_path() {
 }
 
 #[test]
-fn validate_export_param_ref_types_skips_reported_unknown_index() {
+fn validate_export_param_ref_types_skips_attached_inference_failure() {
     use crate::parser::InferredExportParam;
+    use crate::static_type::{
+        ExportStaticType, InferenceError, InferredUncheckedReason, StaticType,
+    };
 
     let schema_resource =
         Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None).with_binding("vpc");
@@ -5743,7 +5886,11 @@ fn validate_export_param_ref_types_skips_reported_unknown_index() {
     );
     let exports = vec![InferredExportParam {
         name: "zone_id".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: ExportStaticType::Inferred(StaticType::Unchecked(
+            InferredUncheckedReason::InferenceFailed(InferenceError::UnknownType {
+                reason: "already reported".to_string(),
+            }),
+        )),
         value: Some(Value::resource_ref(
             "vpc".to_string(),
             "bad_attr".to_string(),
@@ -5754,8 +5901,7 @@ fn validate_export_param_ref_types_skips_reported_unknown_index() {
     let mut parsed = empty_parsed();
     parsed.resources.push(schema_resource); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let result =
-        validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::from([0]));
+    let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
         result.is_ok(),
         "the exact Unknown parameter already reported by inference must be skipped, got {:?}",
@@ -5790,7 +5936,9 @@ fn validate_export_param_ref_types_against_inferred_inputs() {
 
     let exports = vec![InferredExportParam {
         name: "id".to_string(),
-        type_expr: TypeExpr::String,
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::static_type::StaticType::Known(TypeExpr::String),
+        ),
         value: Some(Value::resource_ref(
             "registry_prod".to_string(),
             "account_id".to_string(),
@@ -5802,8 +5950,7 @@ fn validate_export_param_ref_types_against_inferred_inputs() {
     let mut parsed = empty_parsed();
     parsed.resources.push(registry_prod); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let result =
-        validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new());
+    let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(result.is_ok(), "got {:?}", result);
 }
 
@@ -6336,7 +6483,7 @@ fn ref_with_chained_subscript_then_field_narrows_through_list() {
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.resources.push(record); // allow: direct — fixture test inspection
-    let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
+    let result = validate_resource_ref_types_for_test(&parsed, &schemas);
     assert!(
         result.is_ok(),
         "chained subscript-then-field should narrow List<Struct> → Struct → String, got: {:?}",
@@ -6399,7 +6546,7 @@ fn ref_with_chained_subscript_then_field_rejects_real_mismatch() {
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.resources.push(record); // allow: direct — fixture test inspection
-    let err = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    let err = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert!(
         err.contains("expected String"),
         "expected real Int→String mismatch to be flagged, got: {err}"
@@ -6488,7 +6635,7 @@ fn ref_with_chained_field_on_struct_flags_unknown_field() {
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.resources.push(record); // allow: direct — fixture test inspection
-    let err = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    let err = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert!(
         err.contains("resource_record_name"),
         "error must name the unknown field, got: {err}",
@@ -6841,7 +6988,9 @@ fn validate_argument_custom_types_rejects_unknown_in_arguments() {
     let mut parsed = empty_parsed();
     parsed.arguments.push(ArgumentParameter {
         name: "bad_arg".to_string(),
-        type_expr: TypeExpr::Simple("totally_made_up_type".to_string()),
+        static_type: crate::static_type::StaticType::Known(TypeExpr::Simple(
+            "totally_made_up_type".to_string(),
+        )),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -6870,7 +7019,9 @@ fn validate_argument_custom_types_accepts_registered_bare_identity() {
         // validator; this is the round-trip "name a registered custom
         // type and have it pass" path that proves the walker isn't
         // over-firing.
-        type_expr: TypeExpr::Simple("iam_policy_arn".to_string()),
+        static_type: crate::static_type::StaticType::Known(TypeExpr::Simple(
+            "iam_policy_arn".to_string(),
+        )),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -6892,7 +7043,9 @@ fn validate_argument_custom_types_walks_into_list_map_union_struct() {
     // List<UnknownA>
     parsed.arguments.push(ArgumentParameter {
         name: "in_list".to_string(),
-        type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("unknown_a".to_string()))),
+        static_type: crate::static_type::StaticType::Known(TypeExpr::List(Box::new(
+            TypeExpr::Simple("unknown_a".to_string()),
+        ))),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -6901,7 +7054,9 @@ fn validate_argument_custom_types_walks_into_list_map_union_struct() {
     // Map<UnknownB>
     parsed.arguments.push(ArgumentParameter {
         name: "in_map".to_string(),
-        type_expr: TypeExpr::Map(Box::new(TypeExpr::Simple("unknown_b".to_string()))),
+        static_type: crate::static_type::StaticType::Known(TypeExpr::Map(Box::new(
+            TypeExpr::Simple("unknown_b".to_string()),
+        ))),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -6913,10 +7068,10 @@ fn validate_argument_custom_types_walks_into_list_map_union_struct() {
     // the user pinpoint the typo.
     parsed.arguments.push(ArgumentParameter {
         name: "in_union".to_string(),
-        type_expr: TypeExpr::Union(vec![
+        static_type: crate::static_type::StaticType::Known(TypeExpr::Union(vec![
             TypeExpr::Simple("unknown_c".to_string()),
             TypeExpr::Simple("unknown_d".to_string()),
-        ]),
+        ])),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -6925,12 +7080,12 @@ fn validate_argument_custom_types_walks_into_list_map_union_struct() {
     // Struct { nested: UnknownE }
     parsed.arguments.push(ArgumentParameter {
         name: "in_struct".to_string(),
-        type_expr: TypeExpr::Struct {
+        static_type: crate::static_type::StaticType::Known(TypeExpr::Struct {
             fields: vec![(
                 "nested".to_string(),
                 TypeExpr::Simple("unknown_e".to_string()),
             )],
-        },
+        }),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -6954,7 +7109,9 @@ fn validate_argument_custom_types_is_independent_of_custom_type_load_state() {
     let mut parsed = empty_parsed();
     parsed.arguments.push(ArgumentParameter {
         name: "bad_arg".to_string(),
-        type_expr: TypeExpr::Simple("totally_made_up_type".to_string()),
+        static_type: crate::static_type::StaticType::Known(TypeExpr::Simple(
+            "totally_made_up_type".to_string(),
+        )),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -7043,7 +7200,7 @@ fn resolve_type_expr_keeps_every_owner_of_the_same_semantic_identity() {
 }
 
 #[test]
-fn best_effort_file_resolution_does_not_degrade_a_multi_owner_identity_to_unknown() {
+fn consumer_file_resolution_retains_a_multi_owner_identity() {
     use crate::parser::{OwnedTypeIdentity, TypeExpr};
 
     let identity = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
@@ -7057,15 +7214,16 @@ fn best_effort_file_resolution_does_not_degrade_a_multi_owner_identity_to_unknow
     )
     .expect("multi-file export fixture syntax must parse");
 
-    resolve_file_type_exprs_or_unknown(&mut parsed, &ctx);
+    resolve_file_static_types_for_consumer(&mut parsed, &ctx);
 
-    let resolved = parsed.export_params[0]
-        .type_expr
-        .as_ref()
-        .expect("typed export must retain its declaration");
+    let Some(crate::static_type::StaticType::Known(resolved)) =
+        parsed.export_params[0].static_type.as_ref()
+    else {
+        panic!("typed export must retain its known declaration")
+    };
     assert!(
         matches!(resolved, TypeExpr::List(inner) if matches!(inner.as_ref(), TypeExpr::SchemaType { .. })),
-        "a known multi-owner identity must not become Unknown: {resolved:?}"
+        "a known multi-owner identity must remain known: {resolved:?}"
     );
 }
 
