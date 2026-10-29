@@ -4,16 +4,17 @@
 
 - Prefer crate-specific commands over workspace-wide commands unless the change spans multiple crates.
 - For long-running Rust commands executed via Codex shell tools, increase the initial wait time instead of polling too aggressively.
-- Use `yield_time_ms >= 30000` for crate-scoped `cargo test` / `cargo build`.
-- Use `yield_time_ms >= 120000` for `cargo test --workspace`, `cargo build`, and other workspace-wide commands.
+- Use `yield_time_ms >= 30000` for crate-scoped `cargo nextest run` / `cargo check`.
+- Use `yield_time_ms >= 120000` for `cargo nextest run --workspace`, `cargo build`, and other workspace-wide commands.
 - Wrap long-running test/build commands in `timeout` when possible so hung runs fail explicitly instead of leaving an open session.
 - If a shell command returns a running session, poll that session instead of starting the same command again.
 
 ## Rust Test Strategy
 
-- Start with `cargo test -p <crate>` whenever possible.
-- Use `cargo test --workspace` only for cross-crate changes or final verification.
-- After changing state-management or apply/destroy flows, run at least `cargo test -p carina-state` and `cargo test -p carina-cli`.
+- Run tests with `cargo nextest run`, not plain `cargo test` (nextest 0.9.133 or newer). The setup script in `.config/nextest.toml` gives each run a temporary `HOME`, so tests never write to the developer's real `~/.carina`; plain `cargo test` skips that isolation. Use `cargo test` only for doctests (`cargo test --workspace --doc`).
+- Start with `cargo nextest run -p <crate>` whenever possible.
+- Use `cargo nextest run --workspace` only for cross-crate changes or final verification.
+- After changing state-management or apply/destroy flows, run at least `cargo nextest run -p carina-state` and `cargo nextest run -p carina-cli`.
 - After changing parser, schema, formatter, or completion/diagnostics behavior, run the most relevant crate tests first (`carina-core`, `carina-lsp`, provider crate) before considering a workspace run.
 
 ## AWS And Acceptance Tests
