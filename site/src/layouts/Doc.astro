@@ -1,5 +1,6 @@
 ---
 import BaseLayout from '../components/BaseLayout.astro';
+import Footer from '../components/Footer.astro';
 import Sidebar from '../components/Sidebar.astro';
 import TOC from '../components/TOC.astro';
 
@@ -13,7 +14,7 @@ interface Props {
 const { title, description, headings = [] } = Astro.props;
 const hasToc = headings.some(heading => heading.depth >= 2 && heading.depth <= 3);
 ---
-<BaseLayout title={title} description={description} showSidebar={false}>
+<BaseLayout title={title} description={description} showSidebar={false} showFooter={false}>
   <div class:list={['doc-grid', { 'has-toc': hasToc }]}>
     <Sidebar />
     <article class="doc-main">
@@ -24,6 +25,7 @@ const hasToc = headings.some(heading => heading.depth >= 2 && heading.depth <= 3
       <div class="doc-body">
         <slot />
       </div>
+      <Footer />
     </article>
     {hasToc && <TOC headings={headings} />}
   </div>
@@ -37,10 +39,12 @@ const hasToc = headings.some(heading => heading.depth >= 2 && heading.depth <= 3
 
     display: grid;
     grid-template-columns: var(--nav-column-width) minmax(0, 1fr);
+    align-items: start;
     gap: var(--space-8);
     max-width: 96rem;
+    min-height: calc(100dvh - var(--topbar-height));
     margin: 0 auto;
-    padding: var(--space-8) var(--space-6);
+    padding: 0 var(--space-6);
   }
 
   .doc-grid.has-toc {
@@ -57,6 +61,7 @@ const hasToc = headings.some(heading => heading.depth >= 2 && heading.depth <= 3
 
   .doc-main {
     min-width: 0;
+    padding: var(--space-8) 0;
     overflow-wrap: break-word;
   }
 
@@ -87,7 +92,6 @@ const hasToc = headings.some(heading => heading.depth >= 2 && heading.depth <= 3
     margin-top: 4rem;
     padding-top: 1.25rem;
     margin-bottom: var(--space-4);
-    scroll-margin-top: var(--space-8);
     font-size: 1.55rem;
     font-weight: 700;
   }
@@ -106,7 +110,6 @@ const hasToc = headings.some(heading => heading.depth >= 2 && heading.depth <= 3
   .doc-body :global(h3) {
     margin-top: var(--space-6);
     margin-bottom: var(--space-3);
-    scroll-margin-top: var(--space-8);
   }
 
   .doc-body :global(p) { margin: 0 0 var(--space-4); }
@@ -183,6 +186,7 @@ const hasToc = headings.some(heading => heading.depth >= 2 && heading.depth <= 3
     .doc-grid,
     .doc-grid.has-toc {
       grid-template-columns: minmax(0, 1fr);
+      row-gap: 0;
     }
   }
 </style>
@@ -250,4 +254,26 @@ const hasToc = headings.some(heading => heading.depth >= 2 && heading.depth <= 3
   });
 
   syncDesktopToggles();
+
+  const scrollActiveSidebarLinkIntoView = () => {
+    if (
+      !window.matchMedia('(min-width: 48.001rem)').matches
+      || root.hasAttribute('data-nav-collapsed')
+    ) return;
+
+    const sidebar = document.querySelector<HTMLElement>('.sidebar');
+    const activeLink = sidebar?.querySelector<HTMLElement>('.sidebar-link[aria-current="page"]');
+    if (!sidebar || !activeLink) return;
+
+    const linkTop = activeLink.offsetTop;
+    const linkBottom = linkTop + activeLink.offsetHeight;
+    const visibleTop = sidebar.scrollTop;
+    const visibleBottom = visibleTop + sidebar.clientHeight;
+
+    if (linkTop < visibleTop || linkBottom > visibleBottom) {
+      sidebar.scrollTop = linkTop - (sidebar.clientHeight - activeLink.offsetHeight) / 2;
+    }
+  };
+
+  scrollActiveSidebarLinkIntoView();
 </script>
