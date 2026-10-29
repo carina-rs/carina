@@ -217,6 +217,17 @@ fn collect_unsynchronized_refs(
                 out,
             );
         }
+        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
+            collect_unsynchronized_refs(
+                value,
+                attribute_key,
+                holder_binding,
+                by_binding,
+                synchronized,
+                schemas,
+                out,
+            );
+        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             collect_unsynchronized_refs(
                 value,

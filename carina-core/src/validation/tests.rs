@@ -91,7 +91,7 @@ fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
     visit_refs_with_sink(
         &value,
         Some(RefSink::TypeExpr(&result_type)),
-        &mut |path, sink, _usage| visited.push((path.to_dot_string(), sink.is_none())),
+        &mut |path, sink, _usage, _candidate| visited.push((path.to_dot_string(), sink.is_none())),
     );
 
     assert_eq!(
@@ -698,7 +698,7 @@ fn binding_referenced_only_by_deferred_for_iterable_is_not_unused() {
 }
 
 #[test]
-fn seeded_bare_structural_binding_is_rejected_as_a_value() {
+fn seeded_bare_structural_binding_is_preserved_for_typed_validation() {
     let src = r#"
         let _ = aws.s3.Bucket {
             bucket_name = role
@@ -714,20 +714,25 @@ fn seeded_bare_structural_binding_is_rejected_as_a_value() {
         )),
         "role",
     );
-    let error = crate::parser::parse_with_seeded_bindings(
+    let parsed = crate::parser::parse_with_seeded_bindings(
         src,
         &crate::parser::ProviderContext::default(),
         &[crate::parser::BindingSeed::typed_structural(
             "role", &handle,
         )],
     )
-    .expect_err("a seeded structural handle is not a value");
+    .expect("a seeded structural handle reaches typed validation");
 
+    let bucket_name = parsed.resources[0]
+        .attributes
+        .get("bucket_name")
+        .expect("bucket_name");
     assert!(
-        error
-            .to_string()
-            .contains("'role' is a resource, not a value"),
-        "unexpected error: {error}",
+        matches!(
+            bucket_name,
+            Value::Deferred(DeferredValue::BindingRef { binding }) if binding == "role"
+        ),
+        "seeded handle was not preserved: {bucket_name:?}",
     );
 }
 

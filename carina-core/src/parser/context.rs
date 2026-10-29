@@ -11,7 +11,7 @@ use super::ast::{
 use super::error::{ParseError, ParseWarning};
 use super::{ProviderContext, Rule};
 use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
-use crate::resource::Resource;
+use crate::resource::{Resource, Value};
 use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -38,7 +38,7 @@ pub(super) enum ParseBinding {
 
 #[derive(Clone, Copy)]
 pub(super) enum ParseBindingRef<'a> {
-    Value(&'a EvalValue),
+    Value { value: &'a EvalValue },
     Structural(&'a StructuralHandle),
     Unbound,
 }
@@ -98,6 +98,11 @@ pub(crate) struct ParseContext<'cfg> {
     /// control-flow expressions defer only that provisional case; the final
     /// parse runs with this disabled and reports the classified error.
     pub(super) defer_provisional_static_conditions: bool,
+    /// Preserve bare lexical bindings until an expected value type is known.
+    /// Resource attributes and nested module-call expressions enable this;
+    /// untyped `let` expressions retain their original eager behavior.
+    preserve_typed_value_candidates: bool,
+    preserve_typed_structural_candidates: bool,
 }
 
 impl<'cfg> ParseContext<'cfg> {
@@ -120,6 +125,8 @@ impl<'cfg> ParseContext<'cfg> {
             seeded_bindings: HashSet::new(),
             pending_function_type_checks: Rc::new(RefCell::new(Vec::new())),
             defer_provisional_static_conditions: false,
+            preserve_typed_value_candidates: false,
+            preserve_typed_structural_candidates: false,
         }
     }
 
@@ -213,6 +220,27 @@ impl<'cfg> ParseContext<'cfg> {
         );
     }
 
+    pub(super) fn for_typed_value_sink(&self) -> Self {
+        let mut typed = self.clone();
+        typed.preserve_typed_value_candidates = true;
+        typed.preserve_typed_structural_candidates = true;
+        typed
+    }
+
+    pub(super) fn for_typed_module_value_sink(&self) -> Self {
+        let mut typed = self.clone();
+        typed.preserve_typed_value_candidates = true;
+        typed.preserve_typed_structural_candidates = false;
+        typed
+    }
+
+    pub(super) fn without_typed_value_sink(&self) -> Self {
+        let mut untyped = self.clone();
+        untyped.preserve_typed_value_candidates = false;
+        untyped.preserve_typed_structural_candidates = false;
+        untyped
+    }
+
     pub(super) fn set_structural_binding(&mut self, name: String, handle: StructuralHandle) {
         self.bindings
             .insert(name, ParseBinding::Structural { handle });
@@ -236,10 +264,31 @@ impl<'cfg> ParseContext<'cfg> {
 
     pub(super) fn lookup_binding(&self, name: &str) -> ParseBindingRef<'_> {
         match self.bindings.get(name) {
-            Some(ParseBinding::Value { value, .. }) => ParseBindingRef::Value(value),
+            Some(ParseBinding::Value { value, .. }) => ParseBindingRef::Value { value },
             Some(ParseBinding::Structural { handle, .. }) => ParseBindingRef::Structural(handle),
             None => ParseBindingRef::Unbound,
         }
+    }
+
+    pub(super) fn preserves_bare_binding(&self, name: &str) -> bool {
+        self.preserve_typed_structural_candidates && self.is_structural_binding(name)
+    }
+
+    pub(super) fn bare_value_binding_candidate(&self, name: &str) -> Option<Value> {
+        if !self.preserve_typed_value_candidates {
+            return None;
+        }
+        let ParseBinding::Value { value, .. } = self.bindings.get(name)? else {
+            return None;
+        };
+        value.clone().into_value().ok()
+    }
+
+    pub(super) fn is_structural_binding(&self, name: &str) -> bool {
+        matches!(
+            self.bindings.get(name),
+            Some(ParseBinding::Structural { .. })
+        )
     }
 
     pub(super) fn contains_binding(&self, name: &str) -> bool {

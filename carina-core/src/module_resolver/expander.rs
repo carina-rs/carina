@@ -2027,6 +2027,16 @@ fn substitute_arguments_with_position(
                 .value()
                 .clone()
         }
+        Value::Deferred(DeferredValue::BindingCandidate { binding, value }) => {
+            Value::Deferred(DeferredValue::BindingCandidate {
+                binding: binding.clone(),
+                value: Box::new(substitute_arguments_with_position(
+                    value,
+                    arguments,
+                    ArgumentSubstitutionPosition::Value,
+                )?),
+            })
+        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let Some(argument) = arguments.arguments.get(path.binding()) else {
                 return Ok(value.clone());
@@ -2233,6 +2243,20 @@ pub(super) fn rewrite_intra_module_refs(
     intra_module_bindings: &HashSet<String>,
 ) -> Value {
     match value {
+        Value::Deferred(DeferredValue::BindingCandidate { binding, value }) => {
+            Value::Deferred(DeferredValue::BindingCandidate {
+                binding: if intra_module_bindings.contains(binding) {
+                    apply_instance_prefix(instance_prefix, binding)
+                } else {
+                    binding.clone()
+                },
+                value: Box::new(rewrite_intra_module_refs(
+                    value,
+                    instance_prefix,
+                    intra_module_bindings,
+                )),
+            })
+        }
         Value::Deferred(DeferredValue::BindingRef { binding })
             if intra_module_bindings.contains(binding) =>
         {

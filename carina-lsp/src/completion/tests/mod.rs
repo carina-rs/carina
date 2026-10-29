@@ -381,3 +381,103 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
     );
     CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
 }
+
+fn enum_shadow_schemas() -> Vec<carina_core::schema::ValidatedResourceSchema> {
+    let event_type = AttributeType::enum_(
+        carina_core::schema::enum_identity("EventType", Some("awscc.cloudfront.Distribution")),
+        Some(vec![
+            "ViewerRequest".to_string(),
+            "OriginRequest".to_string(),
+        ]),
+        vec![
+            ("ViewerRequest".to_string(), "viewer_request".to_string()),
+            ("OriginRequest".to_string(), "origin_request".to_string()),
+        ],
+        None,
+        None,
+    );
+    let source = ResourceSchema::new("test.Source")
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build());
+    let distribution = ResourceSchema::new("cloudfront.Distribution")
+        .attribute(AttributeSchema::optional("event_type", event_type).build());
+    vec![
+        source
+            .validate()
+            .expect("source schema fixture must be valid"),
+        distribution
+            .validate()
+            .expect("distribution schema fixture must be valid"),
+    ]
+}
+
+struct EnumShadowFactory;
+
+impl ProviderFactory for EnumShadowFactory {
+    fn name(&self) -> &str {
+        "awscc"
+    }
+
+    fn display_name(&self) -> &str {
+        "enum shadow test provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> carina_core::provider::ProviderResult<()> {
+        Ok(())
+    }
+
+    fn extract_region(
+        &self,
+        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
+    ) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = carina_core::provider::ProviderResult<
+                        Box<dyn carina_core::provider::Provider>,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        unimplemented!("completion tests do not instantiate providers")
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        enum_shadow_schemas()
+    }
+}
+
+pub(super) fn create_enum_shadow_document(content: &str) -> Document {
+    let factories: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(vec![Box::new(EnumShadowFactory)]);
+    let schemas = carina_core::provider::collect_schemas(factories.as_slice());
+    let resource_types = ProviderContext::resource_types_from_schema_registry(&schemas);
+    let custom_types = carina_core::provider::provider_custom_types_from_factories(factories);
+    Document::new(
+        content.to_string(),
+        Arc::new(ProviderContext {
+            decryptor: None,
+            custom_types,
+            resource_types,
+        }),
+    )
+}
+
+pub(super) fn test_provider_with_enum_shadow_schema() -> CompletionProvider {
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(EnumShadowFactory)];
+    let schemas = carina_core::provider::collect_schemas(&factories);
+    CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
+}

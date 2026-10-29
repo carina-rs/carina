@@ -326,6 +326,9 @@ fn contains_deferred_user_function_call(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Secret(value)) => {
             contains_deferred_user_function_call(value)
         }
+        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
+            contains_deferred_user_function_call(value)
+        }
         Value::Deferred(DeferredValue::Access(access)) => {
             contains_deferred_user_function_call(access.base())
         }
@@ -388,6 +391,9 @@ fn contains_module_argument(value: &Value) -> bool {
             matches!(part, crate::resource::InterpolationPart::Expr(value) if contains_module_argument(value))
         }),
         Value::Deferred(DeferredValue::Secret(inner)) => contains_module_argument(inner),
+        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
+            contains_module_argument(value)
+        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_module_argument(value) || contains_module_argument(default)
         }
@@ -1073,6 +1079,12 @@ fn substitute_fn_params_with_position(
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
             Box::new(substitute_fn_params(inner, substitutions, source_line)?),
         )),
+        Value::Deferred(DeferredValue::BindingCandidate { binding, value }) => {
+            Value::Deferred(DeferredValue::BindingCandidate {
+                binding: binding.clone(),
+                value: Box::new(substitute_fn_params(value, substitutions, source_line)?),
+            })
+        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(substitute_fn_params(value, substitutions, source_line)?),
@@ -1302,6 +1314,12 @@ pub(super) fn try_evaluate_fn_value(
                 }
             }
             Ok(Value::Deferred(DeferredValue::Interpolation(evaluated)))
+        }
+        Value::Deferred(DeferredValue::BindingCandidate { binding, value }) => {
+            Ok(Value::Deferred(DeferredValue::BindingCandidate {
+                binding,
+                value: Box::new(try_evaluate_fn_value(*value, ctx, containing_line)?),
+            }))
         }
         Value::Deferred(DeferredValue::Unavailable {
             name,

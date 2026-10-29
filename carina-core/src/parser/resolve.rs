@@ -1087,6 +1087,9 @@ fn collect_reference_roots(
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             push_root(binding, variables, structural, roots);
         }
+        Value::Deferred(DeferredValue::BindingCandidate { binding, .. }) => {
+            push_root(binding, variables, structural, roots);
+        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             push_root(path.binding(), variables, structural, roots);
         }
@@ -1404,6 +1407,18 @@ fn resolve_value_with_config(
                 None => Ok(value.clone()),
             }
         }
+        Value::Deferred(DeferredValue::BindingCandidate { binding, value }) => {
+            Ok(Value::Deferred(DeferredValue::BindingCandidate {
+                binding: binding.clone(),
+                value: Box::new(resolve_value_with_config(
+                    value,
+                    binding_map,
+                    fn_ctx,
+                    defer_unknown_functions,
+                    preserve_failed_user_calls,
+                )?),
+            }))
+        }
         Value::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<Value>, ParseError> = items
                 .iter()
@@ -1662,6 +1677,18 @@ fn resolve_function_calls_only(
             defer_unknown_functions,
             preserve_failed_user_calls,
         ),
+        Value::Deferred(DeferredValue::BindingCandidate { binding, value }) => {
+            Ok(Value::Deferred(DeferredValue::BindingCandidate {
+                binding: binding.clone(),
+                value: Box::new(resolve_function_calls_only(
+                    value,
+                    binding_map,
+                    fn_ctx,
+                    defer_unknown_functions,
+                    preserve_failed_user_calls,
+                )?),
+            }))
+        }
         Value::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<Value>, ParseError> = items
                 .iter()

@@ -39,9 +39,10 @@ pub(in crate::parser) fn parse_anonymous_resource(
     let resource_type = parts[1..].join(".");
 
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
+    let typed_ctx = ctx.for_typed_value_sink();
     let parsed_contents = parse_block_contents_with_quoted(
         iter,
-        ctx,
+        &typed_ctx,
         &mut quoted_out,
         ReservedAttributeNamePolicy::Reject,
     )?;
@@ -124,9 +125,10 @@ fn parse_block_contents_with_quoted(
                             next_pair(&mut binding_inner, "binding name", "local let binding")?
                                 .as_str()
                                 .to_string();
+                        let untyped_ctx = local_ctx.without_typed_value_sink();
                         let value = parse_expression(
                             next_pair(&mut binding_inner, "binding value", "local let binding")?,
-                            &local_ctx,
+                            &untyped_ctx,
                         )?;
                         // Add to local scope only, not to attributes
                         local_ctx.set_variable(name, value);
@@ -156,7 +158,8 @@ fn parse_block_contents_with_quoted(
                         if block_name == "directives" {
                             check_directives_depends_on_elements(block_inner.clone())?;
                             check_directives_provider_value(block_inner.clone())?;
-                            directives = Some(parse_directives(block_inner, &local_ctx)?);
+                            let untyped_ctx = local_ctx.without_typed_value_sink();
+                            directives = Some(parse_directives(block_inner, &untyped_ctx)?);
                             continue;
                         }
                         // Recursively parse nested block contents (supports arbitrary depth)
@@ -252,9 +255,10 @@ pub(crate) fn parse_resource_expr(
     let resource_type = parts[1..].join(".");
 
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
+    let typed_ctx = ctx.for_typed_value_sink();
     let parsed_contents = parse_block_contents_with_quoted(
         inner,
-        ctx,
+        &typed_ctx,
         &mut quoted_out,
         ReservedAttributeNamePolicy::Reject,
     )?;
@@ -308,9 +312,10 @@ pub(crate) fn parse_read_resource_expr(
     let resource_type = parts[1..].join(".");
 
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
+    let typed_ctx = ctx.for_typed_value_sink();
     let parsed_contents = parse_block_contents_with_quoted(
         inner,
-        ctx,
+        &typed_ctx,
         &mut quoted_out,
         ReservedAttributeNamePolicy::Reject,
     )?;

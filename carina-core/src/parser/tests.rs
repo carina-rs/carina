@@ -14115,11 +14115,19 @@ fn assert_bare_handle_error(source: &str, binding: &str, kind: &str) {
     );
 }
 
+fn assert_bare_handle_preserved_for_typed_resource_value(source: &str, binding: &str) {
+    let parsed = parse(source, &ProviderContext::default())
+        .expect("typed resource values retain bare handles for schema-aware validation");
+    let value = resource_attribute(&parsed, "test.Consumer", "name");
+    assert!(
+        matches!(&value, Value::Deferred(DeferredValue::BindingRef { binding: actual }) if actual == binding),
+        "expected BindingRef({binding}), got {value:?}",
+    );
+}
+
 #[test]
-fn bare_resource_handle_is_rejected_in_every_value_position() {
+fn bare_resource_handle_is_rejected_in_untyped_value_positions() {
     for source in [
-        r#"let vpc = mock.test.Thing { name = "source" }
-mock.test.Consumer { name = vpc }"#,
         r#"let vpc = mock.test.Thing { name = "source" }
 let values = [vpc, "ok"]"#,
         r#"let vpc = mock.test.Thing { name = "source" }
@@ -14131,18 +14139,44 @@ exports { handle = vpc }"#,
         r#"let vpc = mock.test.Thing { name = "source" }
 let rendered = "prefix-${vpc}""#,
         r#"let vpc = mock.test.Thing { name = "source" }
-let alias = vpc
-mock.test.Consumer { name = alias }"#,
+mock.test.Consumer { name = "prefix-${vpc}" }"#,
+        r#"let vpc = mock.test.Thing { name = "source" }
+mock.test.Consumer { name = upper(vpc) }"#,
         r#"let vpc = mock.test.Thing { name = "source" }
 attributes { handle: String = vpc }"#,
     ] {
-        let binding = if source.contains("name = alias") {
-            "alias"
-        } else {
-            "vpc"
-        };
-        assert_bare_handle_error(source, binding, "a resource");
+        assert_bare_handle_error(source, "vpc", "a resource");
     }
+}
+
+#[test]
+fn bare_resource_handles_are_preserved_in_typed_resource_values() {
+    for (source, binding) in [
+        (
+            r#"let vpc = mock.test.Thing { name = "source" }
+mock.test.Consumer { name = vpc }"#,
+            "vpc",
+        ),
+        (
+            r#"let vpc = mock.test.Thing { name = "source" }
+let alias = vpc
+mock.test.Consumer { name = alias }"#,
+            "alias",
+        ),
+    ] {
+        assert_bare_handle_preserved_for_typed_resource_value(source, binding);
+    }
+}
+
+#[test]
+fn bare_resource_handle_in_module_collection_keeps_existing_rejection() {
+    assert_bare_handle_error(
+        r#"let vpc = mock.test.Thing { name = "source" }
+let child_module = use { source = "./child" }
+let child = child_module { values = [vpc] }"#,
+        "vpc",
+        "a resource",
+    );
 }
 
 #[test]
@@ -14198,7 +14232,7 @@ fn deferred_call_in_user_function_body_reports_the_body_line() {
 }
 
 #[test]
-fn every_structural_binding_kind_has_a_bare_value_error() {
+fn every_structural_binding_kind_is_preserved_in_a_typed_resource_value() {
     let cases = [
         (
             r#"let items = for name in ["one"] { mock.test.Thing { name = name } }
@@ -14246,8 +14280,8 @@ mock.test.Consumer { name = secondary }"#,
         ),
     ];
 
-    for (source, binding, kind) in cases {
-        assert_bare_handle_error(source, binding, kind);
+    for (source, binding, _kind) in cases {
+        assert_bare_handle_preserved_for_typed_resource_value(source, binding);
     }
 }
 
@@ -14405,7 +14439,7 @@ fn non_ref_typed_user_function_argument_rejects_a_structural_handle() {
 }
 
 #[test]
-fn forward_structural_handle_is_rejected_after_directory_kind_resolution() {
+fn forward_structural_handle_is_preserved_after_directory_kind_resolution() {
     use crate::config_loader::parse_directory;
 
     let directory = tempfile::tempdir().unwrap();
@@ -14416,16 +14450,20 @@ fn forward_structural_handle_is_rejected_after_directory_kind_resolution() {
     )
     .unwrap();
 
-    let error = parse_directory(directory.path(), &ProviderContext::default())
-        .expect_err("a forward structural handle is not a value");
+    let parsed = parse_directory(directory.path(), &ProviderContext::default())
+        .expect("a forward structural handle reaches typed validation");
+    let value = resource_attribute(&parsed, "test.Consumer", "name");
     assert!(
-        error.contains("'zz' is a resource, not a value") && error.contains("line 1"),
-        "unexpected error: {error}",
+        matches!(
+            &value,
+            Value::Deferred(DeferredValue::BindingRef { binding }) if binding == "zz"
+        ),
+        "forward structural handle was not preserved: {value:?}",
     );
 }
 
 #[test]
-fn sibling_structural_handle_is_rejected_after_directory_kind_resolution() {
+fn sibling_structural_handle_is_preserved_after_directory_kind_resolution() {
     use crate::config_loader::parse_directory;
 
     let directory = tempfile::tempdir().unwrap();
@@ -14440,11 +14478,15 @@ fn sibling_structural_handle_is_rejected_after_directory_kind_resolution() {
     )
     .unwrap();
 
-    let error = parse_directory(directory.path(), &ProviderContext::default())
-        .expect_err("a sibling structural handle is not a value");
+    let parsed = parse_directory(directory.path(), &ProviderContext::default())
+        .expect("a sibling structural handle reaches typed validation");
+    let value = resource_attribute(&parsed, "test.Consumer", "name");
     assert!(
-        error.contains("'sibling' is a resource, not a value") && error.contains("line 1"),
-        "unexpected error: {error}",
+        matches!(
+            &value,
+            Value::Deferred(DeferredValue::BindingRef { binding }) if binding == "sibling"
+        ),
+        "sibling structural handle was not preserved: {value:?}",
     );
 }
 

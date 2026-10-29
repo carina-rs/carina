@@ -760,6 +760,12 @@ fn value_to_json_inner(
                 context: ctx,
             })
         }
+        Value::Deferred(DeferredValue::BindingCandidate { binding, .. }) => {
+            Err(SerializationError::UnresolvedResourceRef {
+                path: binding.clone(),
+                context: ctx,
+            })
+        }
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             Err(SerializationError::UnresolvedCoalesce { context: ctx })
         }
@@ -1620,6 +1626,9 @@ fn format_value_into_context(
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             sink.write_token(ValueSpanKind::Reference, binding)
         }
+        Value::Deferred(DeferredValue::BindingCandidate { binding, .. }) => {
+            sink.write_token(ValueSpanKind::Reference, binding)
+        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             let parenthesize_left = matches!(
                 value.as_ref(),
@@ -1860,6 +1869,7 @@ pub fn contains_secret(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_secret(value) || contains_secret(default)
         }
+        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => contains_secret(value),
         Value::Deferred(DeferredValue::Access(access)) => contains_secret(access.base()),
         Value::Concrete(
             ConcreteValue::String(_)
@@ -1912,6 +1922,9 @@ pub fn contains_unredacted_secret(value: &Value) -> bool {
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_unredacted_secret(value) || contains_unredacted_secret(default)
+        }
+        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
+            contains_unredacted_secret(value)
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -2174,6 +2187,9 @@ fn secret_value_requires_provider_material(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Secret(inner)) => {
             secret_value_requires_provider_material(inner)
         }
+        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
+            secret_value_requires_provider_material(value)
+        }
         Value::Concrete(ConcreteValue::List(values)) => {
             values.iter().any(secret_value_requires_provider_material)
         }
@@ -2393,6 +2409,9 @@ fn canonical_secret_template(value: &Value) -> Result<serde_json::Value, Seriali
         ),
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             tagged("binding_ref", JsonValue::String(binding.clone()))
+        }
+        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
+            canonical_secret_template(value)?
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => tagged(
             "coalesce",
@@ -5158,6 +5177,15 @@ fn canonicalize_with_fit<P: CanonicalizationErrorPolicy>(
     }
 
     match (value, fit.kind) {
+        (
+            Value::Deferred(DeferredValue::BindingCandidate { binding, value }),
+            crate::schema::FitKind::BindingCandidate(fit),
+        ) => canonicalize_with_fit(*value, *fit, defs, purpose, error_policy).map(|value| {
+            Value::Deferred(DeferredValue::BindingCandidate {
+                binding,
+                value: Box::new(value),
+            })
+        }),
         (Value::Deferred(DeferredValue::Secret(value)), crate::schema::FitKind::Secret(fit)) => {
             canonicalize_with_fit(*value, *fit, defs, purpose, error_policy)
                 .map(|value| Value::Deferred(DeferredValue::Secret(Box::new(value))))
@@ -5306,6 +5334,9 @@ fn collect_canonicalized_map<P: CanonicalizationErrorPolicy>(
 
 fn canonical_map_key_text(value: Value) -> Result<String, crate::schema::TypeError> {
     match value {
+        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
+            canonical_map_key_text(*value)
+        }
         Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
             Ok(canonical.api_value().to_string())
         }
@@ -5756,6 +5787,9 @@ fn first_enum_identifier_inner(
             .values()
             .find_map(|value| first_enum_identifier_inner(value, inside_secret)),
         Value::Deferred(DeferredValue::Secret(inner)) => first_enum_identifier_inner(inner, true),
+        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
+            first_enum_identifier_inner(value, inside_secret)
+        }
         Value::Deferred(DeferredValue::Access(access)) => {
             first_enum_identifier_inner(access.base(), inside_secret)
         }

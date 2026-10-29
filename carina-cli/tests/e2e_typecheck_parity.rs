@@ -953,6 +953,439 @@ fn enum_schemas() -> SchemaRegistry {
     )
 }
 
+fn enum_shadow_schemas() -> SchemaRegistry {
+    let event_type = AttributeType::enum_(
+        carina_core::schema::enum_identity("EventType", Some("awscc.cloudfront.Distribution")),
+        Some(vec![
+            "ViewerRequest".to_string(),
+            "OriginRequest".to_string(),
+        ]),
+        vec![
+            ("ViewerRequest".to_string(), "viewer_request".to_string()),
+            ("OriginRequest".to_string(), "origin_request".to_string()),
+        ],
+        None,
+        None,
+    );
+    let behavior = AttributeType::list(AttributeType::struct_(
+        "Behavior",
+        vec![StructField::optional("event_type", event_type.clone()).build()],
+    ));
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        ResourceSchema::new("test.Source")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("count", AttributeType::int()).build())
+            .validate()
+            .expect("source schema fixture must be valid"),
+    );
+    schemas.insert(
+        "awscc",
+        ResourceSchema::new("cloudfront.Distribution")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("event_type", event_type.clone()).build())
+            .attribute(
+                AttributeSchema::optional("behaviors", behavior)
+                    .with_block_name("behavior")
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("event_types", AttributeType::list(event_type.clone()))
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("event_type_map", AttributeType::map(event_type)).build(),
+            )
+            .validate()
+            .expect("distribution schema fixture must be valid"),
+    );
+    schemas
+}
+
+const ENUM_SHADOW_MESSAGE: &str = "`viewer_request` was interpreted as the `let` binding; if you meant the enum `EventType` value, write `awscc.cloudfront.Distribution.EventType.viewer_request`";
+
+fn enum_shadow_fixture(use_site: &str) -> TempDir {
+    write_fixture(&[
+        (
+            "bindings.crn",
+            r#"let viewer_request = awscc.test.Source {
+  name = "shadow"
+}
+"#,
+        ),
+        (
+            "main.crn",
+            &format!("awscc.cloudfront.Distribution {{\n  name = \"distribution\"\n{use_site}}}\n"),
+        ),
+    ])
+}
+
+#[test]
+fn enum_member_shadowed_by_sibling_resource_binding_reports_typed_error_in_every_resource_position()
+{
+    for (position, use_site) in [
+        ("attribute", "  event_type = viewer_request\n"),
+        (
+            "nested block",
+            "  behavior {\n    event_type = viewer_request\n  }\n",
+        ),
+        ("list element", "  event_types = [viewer_request]\n"),
+        (
+            "map element",
+            "  event_type_map = { default = viewer_request }\n",
+        ),
+    ] {
+        let schemas = enum_shadow_schemas();
+        let fixture = enum_shadow_fixture(use_site);
+        let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains(ENUM_SHADOW_MESSAGE)),
+            "{position} must report the typed enum-shadow diagnostic, got: {diagnostics:#?}",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.contains("write 'viewer_request'")),
+            "the diagnostic must not advertise a quoted-string escape rejected by strict enum validation: {diagnostics:#?}",
+        );
+    }
+}
+
+#[test]
+fn structural_binding_without_matching_enum_member_keeps_existing_guidance() {
+    let schemas = enum_shadow_schemas();
+    for (attribute, declaration) in [
+        (
+            "event_type",
+            "let not_a_member = awscc.test.Source { name = \"shadow\" }\n",
+        ),
+        (
+            "name",
+            "let not_a_member = awscc.test.Source { name = \"shadow\" }\n",
+        ),
+    ] {
+        let fixture = write_fixture(&[
+            ("bindings.crn", declaration),
+            (
+                "main.crn",
+                &format!(
+                    "awscc.cloudfront.Distribution {{\n  name = \"distribution\"\n  {attribute} = not_a_member\n}}\n"
+                ),
+            ),
+        ]);
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas.clone()), &fixture, "main.crn");
+        let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
+        let lsp_message = lsp.iter().find(|diagnostic| {
+            diagnostic.message.contains(
+                "'not_a_member' is a resource, not a value; reference one of its attributes",
+            )
+        });
+        let cli_message = diagnostics.iter().find(|diagnostic| {
+            diagnostic.contains(
+                "'not_a_member' is a resource, not a value; reference one of its attributes",
+            )
+        });
+        assert!(
+            lsp_message.is_some() && cli_message.is_some(),
+            "{attribute} must retain CLI/LSP structural-binding guidance; CLI={diagnostics:#?}; LSP={lsp:#?}",
+        );
+        assert!(
+            cli_message
+                .expect("checked above")
+                .contains(&lsp_message.expect("checked above").message),
+            "{attribute} guidance must render identically; CLI={diagnostics:#?}; LSP={lsp:#?}",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.contains("`not_a_member` was interpreted")),
+            "a non-member spelling must not become an enum-shadow error: {diagnostics:#?}",
+        );
+    }
+}
+
+#[test]
+fn non_enum_value_binding_keeps_existing_reference_type_check() {
+    let schemas = enum_shadow_schemas();
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"let source = awscc.test.Source {
+  name = "shadow"
+  count = 1
+}
+let forwarded = source.count
+
+awscc.cloudfront.Distribution {
+  name = forwarded
+}
+"#,
+    )]);
+
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas.clone()), &fixture, "main.crn");
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    assert!(
+        cli.iter().any(|diagnostic| {
+            diagnostic.contains("Type mismatch")
+                && diagnostic.contains("expected String")
+                && diagnostic.contains("got Int")
+        }),
+        "CLI must retain the forwarded binding's reference type check: {cli:#?}",
+    );
+    assert!(
+        lsp.iter().any(|diagnostic| {
+            diagnostic.message.contains("Type mismatch")
+                && diagnostic.message.contains("expected String")
+                && diagnostic.message.contains("got Int")
+        }),
+        "LSP must retain the same forwarded binding type check: {lsp:#?}",
+    );
+}
+
+#[test]
+fn enum_member_shadowed_by_resource_binding_reports_cli_lsp_parity_and_quick_fix() {
+    let schemas = enum_shadow_schemas();
+    let fixture = enum_shadow_fixture("  event_type = viewer_request\n");
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+
+    let cli_message = cli
+        .iter()
+        .find(|message| message.contains(ENUM_SHADOW_MESSAGE))
+        .expect("CLI enum-shadow diagnostic");
+    let diagnostic = lsp
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains(ENUM_SHADOW_MESSAGE))
+        .unwrap_or_else(|| panic!("LSP enum-shadow diagnostic; got {lsp:#?}"));
+    assert!(
+        cli_message.contains(&diagnostic.message),
+        "CLI and LSP must render the same typed error; CLI={cli:#?}; LSP={lsp:#?}",
+    );
+
+    let line = "  event_type = viewer_request";
+    let start = line.find("viewer_request").expect("value start") as u32;
+    assert_eq!(diagnostic.range.start.line, 2);
+    assert_eq!(diagnostic.range.end.line, 2);
+    assert_eq!(diagnostic.range.start.character, start);
+    assert_eq!(
+        diagnostic.range.end.character,
+        start + "viewer_request".len() as u32
+    );
+
+    let uri = tower_lsp::lsp_types::Url::from_file_path(fixture.path().join("main.crn"))
+        .expect("fixture URI");
+    let actions = carina_lsp::code_action::code_actions_for_diagnostic(&uri, diagnostic);
+    let action = actions
+        .iter()
+        .find(|action| {
+            action.title == "Replace with `awscc.cloudfront.Distribution.EventType.viewer_request`"
+        })
+        .unwrap_or_else(|| panic!("enum-shadow quick fix; got {actions:#?}"));
+    let edit = action
+        .edit
+        .as_ref()
+        .and_then(|edit| edit.changes.as_ref())
+        .and_then(|changes| changes.get(&uri))
+        .and_then(|edits| edits.first())
+        .expect("quick-fix text edit");
+    assert_eq!(edit.range, diagnostic.range);
+    assert_eq!(
+        edit.new_text,
+        "awscc.cloudfront.Distribution.EventType.viewer_request"
+    );
+}
+
+#[test]
+fn enum_typed_module_argument_reports_resource_binding_shadow() {
+    let schemas = enum_shadow_schemas();
+    let fixture = tempfile::tempdir().expect("module enum-shadow fixture");
+    let module = fixture.path().join("modules/inner");
+    std::fs::create_dir_all(&module).expect("create inner module");
+    std::fs::write(
+        fixture.path().join("bindings.crn"),
+        "let viewer_request = awscc.test.Source { name = \"shadow\" }\n",
+    )
+    .expect("write binding fixture");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let inner = use { source = "./modules/inner" }
+inner {
+  event_type = viewer_request
+}
+"#,
+    )
+    .expect("write module call fixture");
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  event_type: awscc.cloudfront.Distribution.EventType\n}\n",
+    )
+    .expect("write module signature");
+
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas.clone()), &fixture, "main.crn");
+    let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains(ENUM_SHADOW_MESSAGE)),
+        "module argument must use the provider-owned enum declaration: {diagnostics:#?}",
+    );
+    let diagnostic = lsp
+        .iter()
+        .find(|diagnostic| diagnostic.message == ENUM_SHADOW_MESSAGE)
+        .unwrap_or_else(|| panic!("module LSP enum-shadow diagnostic; got {lsp:#?}"));
+    let line = "  event_type = viewer_request";
+    let start = line.find("viewer_request").expect("module value start") as u32;
+    assert_eq!(diagnostic.range.start.line, 2);
+    assert_eq!(diagnostic.range.end.line, 2);
+    assert_eq!(diagnostic.range.start.character, start);
+    assert_eq!(
+        diagnostic.range.end.character,
+        start + "viewer_request".len() as u32,
+    );
+
+    let uri = tower_lsp::lsp_types::Url::from_file_path(fixture.path().join("main.crn"))
+        .expect("fixture URI");
+    let actions = carina_lsp::code_action::code_actions_for_diagnostic(&uri, diagnostic);
+    let edit = actions
+        .iter()
+        .find(|action| {
+            action.title == "Replace with `awscc.cloudfront.Distribution.EventType.viewer_request`"
+        })
+        .and_then(|action| action.edit.as_ref())
+        .and_then(|edit| edit.changes.as_ref())
+        .and_then(|changes| changes.get(&uri))
+        .and_then(|edits| edits.first())
+        .unwrap_or_else(|| panic!("module enum-shadow quick fix; got {actions:#?}"));
+    assert_eq!(edit.range, diagnostic.range);
+    assert_eq!(
+        edit.new_text,
+        "awscc.cloudfront.Distribution.EventType.viewer_request",
+    );
+}
+
+#[test]
+fn enum_value_binding_keeps_lexical_precedence_and_validates() {
+    let schemas = enum_shadow_schemas();
+    let fixture = write_fixture(&[
+        (
+            "bindings.crn",
+            "let viewer_request = awscc.cloudfront.Distribution.EventType.viewer_request\n",
+        ),
+        (
+            "main.crn",
+            r#"awscc.cloudfront.Distribution {
+  name = "distribution"
+  event_type = viewer_request
+}
+"#,
+        ),
+    ]);
+
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas.clone()), &fixture, "main.crn");
+    let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
+    assert!(
+        diagnostics.is_empty(),
+        "an assignable enum-valued binding must win over shorthand: {diagnostics:#?}",
+    );
+    assert!(
+        lsp.iter().all(|diagnostic| {
+            !diagnostic.message.contains(ENUM_SHADOW_MESSAGE)
+                && !diagnostic.message.contains("event_type")
+        }),
+        "LSP must accept the same enum-valued binding: {lsp:#?}",
+    );
+}
+
+#[test]
+fn enum_typed_argument_binding_wins_and_string_argument_reports_shadow() {
+    let schemas = enum_shadow_schemas();
+    let matching = write_fixture(&[(
+        "main.crn",
+        r#"arguments {
+  viewer_request: awscc.cloudfront.Distribution.EventType
+}
+
+awscc.cloudfront.Distribution {
+  name = "distribution"
+  event_type = viewer_request
+}
+"#,
+    )]);
+    let matching_lsp =
+        lsp_diagnostics(&engine_with_schemas(schemas.clone()), &matching, "main.crn");
+    let matching_cli = cli_diagnostics(factories_for(&schemas), &matching);
+    assert!(
+        matching_cli.is_empty(),
+        "an argument declared as the expected enum must keep lexical precedence: {matching_cli:#?}",
+    );
+    assert!(
+        matching_lsp
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("viewer_request")),
+        "LSP must accept the same enum-typed argument: {matching_lsp:#?}",
+    );
+
+    let mismatched = write_fixture(&[(
+        "main.crn",
+        r#"arguments {
+  viewer_request: String
+}
+
+awscc.cloudfront.Distribution {
+  name = "distribution"
+  event_type = viewer_request
+}
+"#,
+    )]);
+    let expected = "`viewer_request` was interpreted as the `argument` binding; if you meant the enum `EventType` value, write `awscc.cloudfront.Distribution.EventType.viewer_request`";
+    let mismatched_lsp = lsp_diagnostics(
+        &engine_with_schemas(schemas.clone()),
+        &mismatched,
+        "main.crn",
+    );
+    let mismatched_cli = cli_diagnostics(factories_for(&schemas), &mismatched);
+    assert!(
+        mismatched_cli
+            .iter()
+            .any(|diagnostic| diagnostic.contains(expected)),
+        "a String argument that shadows the enum member must use the structured error: {mismatched_cli:#?}",
+    );
+    assert!(
+        mismatched_lsp
+            .iter()
+            .any(|diagnostic| diagnostic.message == expected),
+        "LSP must render the same argument-shadow error: {mismatched_lsp:#?}",
+    );
+}
+
+#[test]
+fn fully_qualified_enum_escape_works_when_provider_segment_is_a_binding() {
+    let schemas = enum_shadow_schemas();
+    let fixture = write_fixture(&[
+        (
+            "bindings.crn",
+            "let awscc = awscc.test.Source { name = \"shadow\" }\n",
+        ),
+        (
+            "main.crn",
+            r#"awscc.cloudfront.Distribution {
+  name = "distribution"
+  event_type = awscc.cloudfront.Distribution.EventType.viewer_request
+}
+"#,
+        ),
+    ]);
+
+    let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
+    assert!(
+        diagnostics.is_empty(),
+        "the fully-qualified enum spelling must remain an unconditional escape: {diagnostics:#?}",
+    );
+}
+
 #[test]
 fn enum_bare_typequalified_fully_qualified_all_pass_parity() {
     let schemas = enum_schemas();

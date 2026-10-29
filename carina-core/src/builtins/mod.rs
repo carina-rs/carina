@@ -611,6 +611,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Concrete(ConcreteValue::Map(_)) => "Map",
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "ResourceRef",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "BindingRef",
+        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => value_type_name(value),
         Value::Deferred(DeferredValue::Coalesce { .. }) => "Coalesce",
         Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation",
         Value::Deferred(

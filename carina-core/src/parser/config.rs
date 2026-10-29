@@ -503,6 +503,12 @@ pub type CustomTypeValidatorFn = Box<
         + Sync,
 >;
 
+type CustomTypeEnumLookupFn = Box<
+    dyn Fn(&OwnedTypeIdentity) -> Result<Option<AttributeType>, CustomTypeValidationError>
+        + Send
+        + Sync,
+>;
+
 /// Owner-aware custom-type validation capability.
 ///
 /// Both the factory-backed resolver and [`ProviderCustomTypes`] implement this
@@ -514,6 +520,17 @@ pub trait CustomTypeResolver: Send + Sync {
         target: CustomTypeValidationTarget<'a>,
         value: &'a Value,
     ) -> Result<(), CustomTypeValidationError>;
+
+    /// Return the exact enum declaration owned by `owned`, when the custom
+    /// type is an enum. Implementations must resolve by structured identity
+    /// and owner; callers must not reconstruct declarations from authored
+    /// names.
+    fn enum_declaration(
+        &self,
+        _owned: &OwnedTypeIdentity,
+    ) -> Result<Option<AttributeType>, CustomTypeValidationError> {
+        Ok(None)
+    }
 }
 
 /// A provider-derived resolver whose recognition keys come from the same
@@ -561,6 +578,7 @@ enum ProviderCustomTypeState {
     Loaded {
         known: BTreeSet<OwnedTypeIdentity>,
         resolver: CustomTypeValidatorFn,
+        enum_lookup: CustomTypeEnumLookupFn,
     },
 }
 
@@ -584,16 +602,20 @@ impl ProviderCustomTypes {
             state: ProviderCustomTypeState::Loaded {
                 known: known.into_iter().collect(),
                 resolver,
+                enum_lookup: Box::new(|_| Ok(None)),
             },
         }
     }
 
     pub(crate) fn from_source(source: impl ProviderCustomTypeSource) -> Self {
         let known = source.known_custom_types();
+        let source = std::sync::Arc::new(source);
+        let validation_source = std::sync::Arc::clone(&source);
         Self {
             state: ProviderCustomTypeState::Loaded {
                 known,
-                resolver: Box::new(move |target, value| source.validate(target, value)),
+                resolver: Box::new(move |target, value| validation_source.validate(target, value)),
+                enum_lookup: Box::new(move |owned| source.enum_declaration(owned)),
             },
         }
     }
@@ -612,6 +634,7 @@ impl ProviderCustomTypes {
             ProviderCustomTypeState::Loaded {
                 known,
                 resolver: _resolver,
+                enum_lookup: _enum_lookup,
             } => known,
         }
     }
@@ -627,7 +650,18 @@ impl CustomTypeResolver for ProviderCustomTypes {
             ProviderCustomTypeState::Loaded {
                 known: _known,
                 resolver,
+                enum_lookup: _enum_lookup,
             } => resolver(target, value),
+            ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
+        }
+    }
+
+    fn enum_declaration(
+        &self,
+        owned: &OwnedTypeIdentity,
+    ) -> Result<Option<AttributeType>, CustomTypeValidationError> {
+        match &self.state {
+            ProviderCustomTypeState::Loaded { enum_lookup, .. } => enum_lookup(owned),
             ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
         }
     }
@@ -670,6 +704,13 @@ impl ProviderContext {
         &self.custom_types
     }
 
+    pub fn enum_declaration(
+        &self,
+        owned: &OwnedTypeIdentity,
+    ) -> Result<Option<AttributeType>, CustomTypeValidationError> {
+        self.custom_types.enum_declaration(owned)
+    }
+
     /// Return `true` iff `(provider, resource_type)` is a loaded managed
     /// resource or data source kind.
     pub fn has_resource_type(&self, provider: &str, resource_type: &str) -> bool {
@@ -707,6 +748,7 @@ impl std::fmt::Debug for ProviderCustomTypes {
             ProviderCustomTypeState::Loaded {
                 known,
                 resolver: _resolver,
+                enum_lookup: _enum_lookup,
             } => formatter
                 .debug_struct("Loaded")
                 .field("known", known)

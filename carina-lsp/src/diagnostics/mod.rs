@@ -687,13 +687,24 @@ impl DiagnosticEngine {
                 // resource indexes are not a stable join key. Named bindings
                 // are parser-enforced identities; anonymous resources fall
                 // back to the buffer value because they have no such key.
-                let semantic_resource_attributes = rref.binding().and_then(|binding| {
-                    semantic_file.and_then(|parsed| {
-                        parsed
-                            .iter_all_resources()
-                            .find(|candidate| candidate.binding() == Some(binding))
-                            .map(|candidate| candidate.attributes())
-                    })
+                let semantic_resource_attributes = semantic_file.and_then(|parsed| {
+                    rref.binding()
+                        .and_then(|binding| {
+                            parsed
+                                .iter_all_resources()
+                                .find(|candidate| candidate.binding() == Some(binding))
+                        })
+                        .or_else(|| {
+                            // `semantic_file` is already narrowed to the
+                            // current authored file, so anonymous direct
+                            // resources retain source order even though the
+                            // directory-wide expanded graph does not.
+                            rref.binding()
+                                .is_none()
+                                .then(|| parsed.iter_all_resources().nth(resource_index))
+                                .flatten()
+                        })
+                        .map(|candidate| candidate.attributes())
                 });
                 let resource_quoted_string_attrs = rref.quoted_string_attrs();
                 let resource_schema = || match rref {
@@ -929,6 +940,38 @@ impl DiagnosticEngine {
                             // assignments. Skip type and authoring guidance here so it
                             // emits the single writability diagnostic, matching core.
                             if effective_attribute.is_read_only() {
+                                continue;
+                            }
+
+                            let binding_findings =
+                                carina_core::validation::resolve_resource_binding_candidates(
+                                    binding_input,
+                                    typecheck_value,
+                                    &effective_type,
+                                    &self.provider_context,
+                                    &inference_bindings,
+                                    &self.schemas,
+                                    &binding_index,
+                                );
+                            if !binding_findings.is_empty() {
+                                for finding in binding_findings {
+                                    let range =
+                                        self.find_bare_binding_range(doc, &finding.name, scope);
+                                    if let Some(error) = finding.error.type_error()
+                                        && let Some(diagnostic) =
+                                            build_enum_diagnostic_from_error(error, range)
+                                    {
+                                        diagnostics.push(diagnostic);
+                                    } else if let Some(range) = range {
+                                        diagnostics.push(Diagnostic {
+                                            range,
+                                            severity: Some(DiagnosticSeverity::WARNING),
+                                            source: Some("carina".to_string()),
+                                            message: finding.error.to_string(),
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
                                 continue;
                             }
 
@@ -1267,6 +1310,7 @@ impl DiagnosticEngine {
                                     &error,
                                     carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
                                         | carina_core::schema::TypeError::TypeMismatch { .. }
+                                        | carina_core::schema::TypeError::BindingShadowsEnumMember(_)
                                         | carina_core::schema::TypeError::InvalidEnumVariant { .. }
                                         | carina_core::schema::TypeError::UnknownStructField { .. }
                                         | carina_core::schema::TypeError::UnionStructMismatch { .. }
@@ -1740,6 +1784,57 @@ impl DiagnosticEngine {
         }
         None
     }
+
+    fn find_bare_binding_range(
+        &self,
+        doc: &Document,
+        binding: &str,
+        scope: Option<(u32, u32)>,
+    ) -> Option<tower_lsp::lsp_types::Range> {
+        use tower_lsp::lsp_types::{Position, Range};
+
+        let (start, end) = scope.unwrap_or((0, u32::MAX));
+        let mut fallback = None;
+        for (line_index, line) in doc.text().lines().enumerate() {
+            let line_index = line_index as u32;
+            if line_index < start {
+                continue;
+            }
+            if line_index >= end {
+                break;
+            }
+            for (byte, _) in line.match_indices(binding) {
+                let before = line[..byte].chars().next_back();
+                let after = line[byte + binding.len()..].chars().next();
+                let identifier = |character: char| character == '_' || character.is_alphanumeric();
+                if before.is_some_and(identifier) || after.is_some_and(identifier) {
+                    continue;
+                }
+                let start_character = position::byte_offset_to_char_offset(line, byte);
+                let range = Range {
+                    start: Position {
+                        line: line_index,
+                        character: start_character,
+                    },
+                    end: Position {
+                        line: line_index,
+                        character: start_character + binding.chars().count() as u32,
+                    },
+                };
+                // Prefer an occurrence on the value side of an assignment.
+                // This skips local `let <binding> = ...` declarations and
+                // map keys that happen to share the candidate spelling.
+                if line[..byte].contains('=') {
+                    return Some(range);
+                }
+                // Multiline lists/maps can put the value on a line without
+                // `=`. The last identifier occurrence in the resource scope
+                // is a better fallback than an earlier declaration.
+                fallback = Some(range);
+            }
+        }
+        fallback
+    }
 }
 
 /// Derive the source line range (0-indexed, half-open) of a resource block.
@@ -1856,7 +1951,7 @@ fn build_enum_diagnostic(
     build_enum_diagnostic_from_error(&reshaped, value_range)
 }
 
-fn build_enum_diagnostic_from_error(
+pub(super) fn build_enum_diagnostic_from_error(
     error: &carina_core::schema::TypeError,
     value_range: Option<tower_lsp::lsp_types::Range>,
 ) -> Option<Diagnostic> {

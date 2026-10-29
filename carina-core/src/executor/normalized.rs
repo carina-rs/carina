@@ -200,6 +200,7 @@ pub fn is_value_fully_concrete_for_expansion(value: &Value) -> bool {
         Value::Deferred(deferred) => match deferred {
             DeferredValue::ResourceRef { .. } => false,
             DeferredValue::BindingRef { .. } => false,
+            DeferredValue::BindingCandidate { .. } => false,
             DeferredValue::Coalesce { .. } => false,
             DeferredValue::Interpolation(_) => false,
             DeferredValue::FunctionCall { .. } => false,

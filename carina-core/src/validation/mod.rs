@@ -9,7 +9,9 @@ use std::collections::HashSet;
 
 use indexmap::IndexMap;
 
-use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
+use crate::binding_index::{
+    BindingIndex, BindingNameKind, BindingNameSet, RefType, RefTypeError, ResolvedRefType,
+};
 use crate::deps::collect_dependencies;
 use crate::parser::{
     ForBinding, ModuleCall, ProviderContext, ResourceContext, ResourceRef, ResourceTypePath,
@@ -17,10 +19,13 @@ use crate::parser::{
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{
-    CompositionCallPath, ConcreteValue, DeferredValue, ReferencePath, ReferencePathRef, Resource,
-    Value,
+    CompositionCallPath, ConcreteValue, DeferredValue, EnumValueResolver, RawEnumIdentifier,
+    ReferencePath, ReferencePathRef, Resource, Value,
 };
-use crate::schema::{AttributeType, SchemaRegistry, Shape, TypeIdentity};
+use crate::schema::{
+    AttributeType, BindingKind, BindingShadowsEnumMemberError, FieldAncestry, SchemaRegistry,
+    Shape, TypeError, TypeIdentity,
+};
 
 /// Lift a module-boundary [`TypeExpr`] into the schema type system.
 ///
@@ -221,6 +226,672 @@ impl<'a> RefSink<'a> {
     }
 }
 
+/// Failure from the single typed binding-versus-enum resolver.
+///
+/// Enum collisions retain their structured [`TypeError`] for LSP code actions;
+/// pre-existing handle guidance remains text because that evaluator error is
+/// intentionally parser-internal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BindingResolutionError {
+    Type(TypeError),
+    CustomType(Box<crate::parser::CustomTypeValidationError>),
+    Existing(String),
+}
+
+impl BindingResolutionError {
+    pub fn type_error(&self) -> Option<&TypeError> {
+        match self {
+            Self::Type(error) => Some(error),
+            Self::CustomType(_) | Self::Existing(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for BindingResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Type(error) => error.fmt(formatter),
+            Self::CustomType(error) => error.fmt(formatter),
+            Self::Existing(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for BindingResolutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Type(error) => Some(error),
+            Self::CustomType(error) => Some(error),
+            Self::Existing(_) => None,
+        }
+    }
+}
+
+enum BindingCandidateSource<'a> {
+    Value {
+        value: &'a Value,
+        declared_type: Option<&'a TypeExpr>,
+        prechecked_error: Option<BindingResolutionError>,
+    },
+    Structural(&'a crate::eval_value::StructuralHandle),
+}
+
+struct ExpectedEnumTarget<'a> {
+    attr_type: &'a AttributeType,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    ancestry: FieldAncestry,
+}
+
+fn binding_kind(kind: Option<&BindingNameKind>) -> BindingKind {
+    match kind {
+        Some(BindingNameKind::Argument) => BindingKind::Argument,
+        Some(
+            BindingNameKind::Resource
+            | BindingNameKind::ModuleCall
+            | BindingNameKind::UpstreamState
+            | BindingNameKind::Use
+            | BindingNameKind::UserFunction
+            | BindingNameKind::Variable
+            | BindingNameKind::Structural
+            | BindingNameKind::Wait { .. },
+        )
+        | None => BindingKind::Let,
+    }
+}
+
+fn binding_value_assignable_to_enum(
+    value: &Value,
+    declared_type: Option<&TypeExpr>,
+    config: Option<&ProviderContext>,
+    target: &ExpectedEnumTarget<'_>,
+    resolver: &EnumValueResolver<'_>,
+    identity: &TypeIdentity,
+) -> Result<(), TypeError> {
+    if let Some(declared_type) = declared_type {
+        let resolved = config
+            .and_then(|config| resolve_type_expr(declared_type, config).ok())
+            .unwrap_or_else(|| declared_type.clone());
+        match resolved {
+            TypeExpr::SchemaType { owned }
+                if owned.identity().same_type(identity)
+                    && owned.identity().assignable_to(identity) =>
+            {
+                return Ok(());
+            }
+            TypeExpr::Unknown => {}
+            other => {
+                return Err(TypeError::TypeMismatch {
+                    expected: identity.to_string(),
+                    got: other.to_string(),
+                });
+            }
+        }
+    }
+    match value {
+        Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
+            if !canonical.identity().same_type(identity)
+                || !canonical.identity().assignable_to(identity)
+            {
+                return Err(TypeError::TypeMismatch {
+                    expected: identity.to_string(),
+                    got: canonical.identity().to_string(),
+                });
+            }
+            resolver
+                .resolve_state_text(canonical.api_value())
+                .map(|_| ())
+        }
+        Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
+            resolver.resolve_raw(raw).map(|_| ())
+        }
+        _ => crate::schema::validate_attr_with_defs_and_ancestry(
+            target.attr_type,
+            value,
+            target.defs,
+            target.ancestry,
+        ),
+    }
+}
+
+/// The one schema-aware decision point for a bare lexical binding in an enum
+/// position. Bindings retain lexical precedence when assignable. Only a
+/// proven mismatch whose authored spelling is a member becomes the structured
+/// shadowing error.
+fn resolve_binding_candidate_against_enum(
+    name: &str,
+    kind: BindingKind,
+    source: BindingCandidateSource<'_>,
+    target: ExpectedEnumTarget<'_>,
+    config: Option<&ProviderContext>,
+) -> Result<(), BindingResolutionError> {
+    let resolver = EnumValueResolver::with_defs(target.attr_type, target.defs);
+    let Some(identity) = resolver.enum_identity() else {
+        return Ok(());
+    };
+
+    let existing_error = match source {
+        BindingCandidateSource::Value {
+            value,
+            declared_type,
+            prechecked_error,
+        } => {
+            if let Some(error) = prechecked_error {
+                error
+            } else {
+                match binding_value_assignable_to_enum(
+                    value,
+                    declared_type,
+                    config,
+                    &target,
+                    &resolver,
+                    &identity,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => BindingResolutionError::Type(error),
+                }
+            }
+        }
+        BindingCandidateSource::Structural(handle) => {
+            BindingResolutionError::Existing(handle.bare_error().to_string())
+        }
+    };
+
+    if let Ok((_canonical, qualified)) =
+        resolver.resolve_member(&RawEnumIdentifier::parse(name.to_string()))
+    {
+        return Err(BindingResolutionError::Type(
+            TypeError::BindingShadowsEnumMember(Box::new(BindingShadowsEnumMemberError {
+                name: name.to_string(),
+                binding_kind: kind,
+                r#enum: identity,
+                qualified,
+            })),
+        ));
+    }
+
+    Err(existing_error)
+}
+
+fn enum_target_from_sink<'a>(sink: RefSink<'a>) -> Option<ExpectedEnumTarget<'a>> {
+    match sink {
+        RefSink::EffectiveType {
+            attr_type,
+            defs,
+            ancestry,
+        } if EnumValueResolver::with_defs(attr_type, defs)
+            .enum_identity()
+            .is_some() =>
+        {
+            Some(ExpectedEnumTarget {
+                attr_type,
+                defs,
+                ancestry,
+            })
+        }
+        RefSink::EffectiveType { .. } | RefSink::TypeExpr(_) | RefSink::String => None,
+    }
+}
+
+fn declared_value_assignable_to_sink(
+    name: &str,
+    declared_type: &TypeExpr,
+    sink: RefSink<'_>,
+    config: Option<&ProviderContext>,
+) -> Result<(), BindingResolutionError> {
+    let resolved = config
+        .and_then(|config| resolve_type_expr(declared_type, config).ok())
+        .unwrap_or_else(|| declared_type.clone());
+    if matches!(resolved, TypeExpr::Unknown) {
+        return Ok(());
+    }
+    let Some(source) = lift_type_expr(&resolved) else {
+        return Ok(());
+    };
+    let source = crate::schema::TypeInSchema::schemaless(&source);
+    let string_sink = AttributeType::string();
+    let lifted_sink;
+    let target = match sink {
+        RefSink::EffectiveType {
+            attr_type, defs, ..
+        } => attr_type.in_schema(defs),
+        RefSink::String => crate::schema::TypeInSchema::schemaless(&string_sink),
+        RefSink::TypeExpr(type_expr) => {
+            let Some(lifted) = lift_type_expr(type_expr) else {
+                return Ok(());
+            };
+            lifted_sink = lifted;
+            crate::schema::TypeInSchema::schemaless(&lifted_sink)
+        }
+    };
+    if source.is_assignable_to(target) {
+        return Ok(());
+    }
+    Err(BindingResolutionError::Existing(format!(
+        "Type mismatch: expected {}, got {} (from {name})",
+        target.resolved_type_name(),
+        source.resolved_type_name(),
+    )))
+}
+
+fn reference_value_mismatch(
+    reference: ReferencePathRef<'_>,
+    target: crate::schema::TypeInSchema<'_>,
+    bindings: &BindingIndex<'_>,
+) -> Option<BindingResolutionError> {
+    match bindings.ref_type(reference) {
+        RefType::Typed(source) => source.is_assignable_to_sink(target).err().map(|mismatch| {
+            BindingResolutionError::Existing(format!(
+                "Type mismatch: expected {}, got {} ({})",
+                target.resolved_type_name(),
+                mismatch.actual_type_name(),
+                mismatch.origin_description(reference),
+            ))
+        }),
+        RefType::Unchecked => None,
+        RefType::UnknownBinding { binding, attribute } => {
+            let reference = if attribute.is_empty() {
+                binding
+            } else {
+                format!("{binding}.{attribute}")
+            };
+            Some(BindingResolutionError::Existing(format!(
+                "unknown binding in reference '{reference}'"
+            )))
+        }
+        RefType::UnknownAttribute(error) => {
+            Some(BindingResolutionError::Existing(error.to_string()))
+        }
+    }
+}
+
+fn deferred_value_mismatch(
+    value: &Value,
+    target: crate::schema::TypeInSchema<'_>,
+    inference_bindings: &inference::InferenceBindings,
+    schemas: &SchemaRegistry,
+    bindings: &BindingIndex<'_>,
+) -> Option<BindingResolutionError> {
+    match value {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            reference_value_mismatch(ReferencePathRef::Access(path), target, bindings)
+        }
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            reference_value_mismatch(ReferencePathRef::Binding(binding), target, bindings)
+        }
+        Value::Deferred(
+            DeferredValue::Coalesce { .. }
+            | DeferredValue::Interpolation(_)
+            | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Unavailable { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::Access(_)
+            | DeferredValue::Secret(_)
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        ) => check_deferred_access_type(value, target, inference_bindings, schemas, bindings)
+            .err()
+            .map(|error| BindingResolutionError::Existing(error.to_string())),
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::List(_)
+            | ConcreteValue::StringList(_)
+            | ConcreteValue::Map(_),
+        ) => None,
+        Value::Deferred(DeferredValue::BindingCandidate { .. }) => {
+            unreachable!("a binding candidate cannot contain itself as its direct value")
+        }
+    }
+}
+
+fn precheck_binding_candidate_source(
+    source: &mut BindingCandidateSource<'_>,
+    sink: RefSink<'_>,
+    inference_bindings: &inference::InferenceBindings,
+    schemas: &SchemaRegistry,
+    bindings: &BindingIndex<'_>,
+) {
+    let BindingCandidateSource::Value {
+        value,
+        declared_type: None,
+        prechecked_error,
+    } = source
+    else {
+        return;
+    };
+    let string_sink = AttributeType::string();
+    let lifted_sink;
+    let target = match sink {
+        RefSink::EffectiveType {
+            attr_type, defs, ..
+        } => attr_type.in_schema(defs),
+        RefSink::String => crate::schema::TypeInSchema::schemaless(&string_sink),
+        RefSink::TypeExpr(type_expr) => {
+            let Some(lifted) = lift_type_expr(type_expr) else {
+                return;
+            };
+            lifted_sink = lifted;
+            crate::schema::TypeInSchema::schemaless(&lifted_sink)
+        }
+    };
+    *prechecked_error =
+        deferred_value_mismatch(value, target, inference_bindings, schemas, bindings);
+}
+
+fn resolve_binding_candidate_against_sink(
+    name: &str,
+    kind: BindingKind,
+    source: BindingCandidateSource<'_>,
+    sink: RefSink<'_>,
+    config: Option<&ProviderContext>,
+) -> Option<Result<(), BindingResolutionError>> {
+    if let Some(target) = enum_target_from_sink(sink) {
+        return Some(resolve_binding_candidate_against_enum(
+            name, kind, source, target, config,
+        ));
+    }
+    match source {
+        BindingCandidateSource::Structural(handle) => Some(Err(BindingResolutionError::Existing(
+            handle.bare_error().to_string(),
+        ))),
+        BindingCandidateSource::Value {
+            value,
+            declared_type,
+            prechecked_error,
+        } => {
+            if let Some(error) = prechecked_error {
+                return Some(Err(error));
+            }
+            if let Some(declared_type) = declared_type {
+                return Some(declared_value_assignable_to_sink(
+                    name,
+                    declared_type,
+                    sink,
+                    config,
+                ));
+            }
+            match sink {
+                RefSink::EffectiveType {
+                    attr_type,
+                    defs,
+                    ancestry,
+                } => Some(
+                    crate::schema::validate_attr_with_defs_and_ancestry(
+                        attr_type, value, defs, ancestry,
+                    )
+                    .map_err(BindingResolutionError::Type),
+                ),
+                RefSink::String => Some(
+                    crate::schema::validate_attr_with_defs_and_ancestry(
+                        &AttributeType::string(),
+                        value,
+                        crate::schema::empty_defs_for_schema_walks(),
+                        FieldAncestry::WRITABLE,
+                    )
+                    .map_err(BindingResolutionError::Type),
+                ),
+                RefSink::TypeExpr(_) => None,
+            }
+        }
+    }
+}
+
+fn parsed_binding_candidate<'a, E>(
+    parsed: &'a crate::parser::File<E>,
+    name: &str,
+    value: Option<&'a Value>,
+) -> Option<(BindingKind, BindingCandidateSource<'a>)> {
+    let names = BindingNameSet::from_parsed(parsed);
+    let kind = binding_kind(names.kind(name));
+    if let Some(value) = value {
+        let declared_type = (kind == BindingKind::Argument)
+            .then(|| {
+                parsed
+                    .arguments
+                    .iter()
+                    .find(|argument| argument.name == name)
+                    .map(|argument| &argument.type_expr)
+            })
+            .flatten();
+        return Some((
+            kind,
+            BindingCandidateSource::Value {
+                value,
+                declared_type,
+                prechecked_error: None,
+            },
+        ));
+    }
+    parsed
+        .parser_binding_metadata
+        .structural_handles()
+        .get(name)
+        .map(|handle| (kind, BindingCandidateSource::Structural(handle)))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindingResolutionFinding {
+    pub name: String,
+    pub error: BindingResolutionError,
+}
+
+/// Walk one resource value in lockstep with its expected schema and return
+/// every rejected bare binding candidate. This is the structured adapter used
+/// by editor diagnostics; CLI validation calls the same resolver while doing
+/// its broader reference pass.
+pub fn resolve_resource_binding_candidates<E>(
+    parsed: &crate::parser::File<E>,
+    value: &Value,
+    expected: &crate::schema::EffectiveType<'_>,
+    config: &ProviderContext,
+    inference_bindings: &inference::InferenceBindings,
+    schemas: &SchemaRegistry,
+    bindings: &BindingIndex<'_>,
+) -> Vec<BindingResolutionFinding> {
+    let mut findings = Vec::new();
+    visit_refs_with_sink(
+        value,
+        Some(RefSink::from_effective_type(expected.clone())),
+        &mut |reference, sink, _usage, candidate_value| {
+            let Some(sink) = sink else {
+                return;
+            };
+            let Some((kind, mut source)) =
+                parsed_binding_candidate(parsed, reference.binding(), candidate_value)
+            else {
+                return;
+            };
+            precheck_binding_candidate_source(
+                &mut source,
+                sink,
+                inference_bindings,
+                schemas,
+                bindings,
+            );
+            let Some(result) = resolve_binding_candidate_against_sink(
+                reference.binding(),
+                kind,
+                source,
+                sink,
+                Some(config),
+            ) else {
+                return;
+            };
+            if let Err(error) = result {
+                findings.push(BindingResolutionFinding {
+                    name: reference.binding().to_string(),
+                    error,
+                });
+            }
+        },
+    );
+    findings
+}
+
+fn module_enum_declaration(
+    expected: &TypeExpr,
+    config: &ProviderContext,
+) -> Result<Option<AttributeType>, BindingResolutionError> {
+    let TypeExpr::SchemaType { owned } = expected else {
+        return Ok(None);
+    };
+    config
+        .enum_declaration(owned)
+        .map_err(|error| BindingResolutionError::CustomType(Box::new(error)))
+}
+
+fn resolve_module_value_binding_candidates(
+    value: &Value,
+    expected: &TypeExpr,
+    config: &ProviderContext,
+    errors: &mut Vec<BindingResolutionError>,
+) {
+    if let Value::Deferred(DeferredValue::BindingCandidate { binding, value }) = value {
+        match module_enum_declaration(expected, config) {
+            Ok(Some(declaration)) => {
+                let target = ExpectedEnumTarget {
+                    attr_type: &declaration,
+                    defs: crate::schema::empty_defs_for_schema_walks(),
+                    ancestry: FieldAncestry::WRITABLE,
+                };
+                if let Err(error) = resolve_binding_candidate_against_enum(
+                    binding,
+                    BindingKind::Let,
+                    BindingCandidateSource::Value {
+                        value,
+                        declared_type: None,
+                        prechecked_error: None,
+                    },
+                    target,
+                    Some(config),
+                ) {
+                    errors.push(error);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => errors.push(error),
+        }
+        return;
+    }
+
+    match (value, expected) {
+        (Value::Concrete(ConcreteValue::List(values)), TypeExpr::List(inner)) => {
+            for value in values {
+                resolve_module_value_binding_candidates(value, inner, config, errors);
+            }
+        }
+        (Value::Concrete(ConcreteValue::Map(values)), TypeExpr::Map(inner)) => {
+            for value in values.values() {
+                resolve_module_value_binding_candidates(value, inner, config, errors);
+            }
+        }
+        (Value::Concrete(ConcreteValue::Map(values)), TypeExpr::Struct { fields }) => {
+            for (name, field_type) in fields {
+                if let Some(value) = values.get(name) {
+                    resolve_module_value_binding_candidates(value, field_type, config, errors);
+                }
+            }
+        }
+        (Value::Deferred(DeferredValue::Secret(inner)), _) => {
+            resolve_module_value_binding_candidates(inner, expected, config, errors);
+        }
+        (Value::Deferred(DeferredValue::Coalesce { value, default }), _) => {
+            resolve_module_value_binding_candidates(value, expected, config, errors);
+            resolve_module_value_binding_candidates(default, expected, config, errors);
+        }
+        (
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::StringList(_),
+            )
+            | Value::Deferred(
+                DeferredValue::ResourceRef { .. }
+                | DeferredValue::BindingRef { .. }
+                | DeferredValue::Interpolation(_)
+                | DeferredValue::FunctionCall { .. }
+                | DeferredValue::Unavailable { .. }
+                | DeferredValue::ResolvedFunctionCall { .. }
+                | DeferredValue::Access(_)
+                | DeferredValue::RedactedSecret { .. }
+                | DeferredValue::Unknown(_),
+            ),
+            _,
+        )
+        | (Value::Concrete(ConcreteValue::List(_) | ConcreteValue::Map(_)), _) => {}
+        (Value::Deferred(DeferredValue::BindingCandidate { .. }), _) => {
+            unreachable!("binding candidates return before recursive module-value dispatch")
+        }
+    }
+}
+
+/// Apply the shared binding-versus-enum resolver to every typed position in a
+/// module argument. Provider [`TypeExpr::SchemaType`] declarations are looked
+/// up from their structured owner index.
+pub fn resolve_module_argument_binding_candidates(
+    argument: &crate::parser::ModuleArgument,
+    expected: &ResolvedParameterType,
+    config: &ProviderContext,
+) -> Vec<BindingResolutionError> {
+    let expected = expected.as_type_expr();
+    if let Some(handle) = argument.handle() {
+        let declaration = match module_enum_declaration(&expected, config) {
+            Ok(Some(declaration)) => declaration,
+            Ok(None) => return Vec::new(),
+            Err(error) => return vec![error],
+        };
+        let name = handle
+            .alias_name()
+            .unwrap_or_else(|| handle.canonical_binding_name());
+        let kind = match handle.kind() {
+            crate::eval_value::StructuralHandleKind::ModuleParameter
+            | crate::eval_value::StructuralHandleKind::FunctionParameter => BindingKind::Argument,
+            crate::eval_value::StructuralHandleKind::Resource(_)
+            | crate::eval_value::StructuralHandleKind::For
+            | crate::eval_value::StructuralHandleKind::If
+            | crate::eval_value::StructuralHandleKind::Use
+            | crate::eval_value::StructuralHandleKind::Module
+            | crate::eval_value::StructuralHandleKind::Wait
+            | crate::eval_value::StructuralHandleKind::UpstreamState
+            | crate::eval_value::StructuralHandleKind::Provider => BindingKind::Let,
+        };
+        let target = ExpectedEnumTarget {
+            attr_type: &declaration,
+            defs: crate::schema::empty_defs_for_schema_walks(),
+            ancestry: FieldAncestry::WRITABLE,
+        };
+        return resolve_binding_candidate_against_enum(
+            name,
+            kind,
+            BindingCandidateSource::Structural(handle),
+            target,
+            Some(config),
+        )
+        .err()
+        .into_iter()
+        .collect();
+    }
+
+    let mut errors = Vec::new();
+    resolve_module_value_binding_candidates(
+        argument.walker_value(),
+        &expected,
+        config,
+        &mut errors,
+    );
+    errors
+}
+
 fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
     let value = values.next()?;
     values.next().is_none().then_some(value)
@@ -267,7 +938,12 @@ fn unique_union_map_member<'a>(
 pub(crate) fn visit_refs_with_sink<'a>(
     value: &Value,
     sink: Option<RefSink<'a>>,
-    f: &mut impl FnMut(ReferencePathRef<'_>, Option<RefSink<'a>>, crate::resource::ResourceRefUsage),
+    f: &mut impl FnMut(
+        ReferencePathRef<'_>,
+        Option<RefSink<'a>>,
+        crate::resource::ResourceRefUsage,
+        Option<&Value>,
+    ),
 ) {
     visit_refs_with_sink_inner(value, sink, crate::resource::ResourceRefUsage::Required, f);
 }
@@ -276,18 +952,26 @@ fn visit_refs_with_sink_inner<'a>(
     value: &Value,
     sink: Option<RefSink<'a>>,
     usage: crate::resource::ResourceRefUsage,
-    f: &mut impl FnMut(ReferencePathRef<'_>, Option<RefSink<'a>>, crate::resource::ResourceRefUsage),
+    f: &mut impl FnMut(
+        ReferencePathRef<'_>,
+        Option<RefSink<'a>>,
+        crate::resource::ResourceRefUsage,
+        Option<&Value>,
+    ),
 ) {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            f(ReferencePathRef::Access(path), sink, usage)
+            f(ReferencePathRef::Access(path), sink, usage, None)
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            f(ReferencePathRef::Binding(binding), sink, usage)
+            f(ReferencePathRef::Binding(binding), sink, usage, None)
+        }
+        Value::Deferred(DeferredValue::BindingCandidate { binding, value }) => {
+            f(ReferencePathRef::Binding(binding), sink, usage, Some(value))
         }
         Value::Deferred(DeferredValue::Unknown(
             crate::resource::UnknownReason::ModuleArgument { name, .. },
-        )) => f(ReferencePathRef::Binding(name), sink, usage),
+        )) => f(ReferencePathRef::Binding(name), sink, usage, None),
         Value::Concrete(ConcreteValue::List(items)) => {
             let child_sink = sink.and_then(RefSink::list_element);
             for item in items {
@@ -325,7 +1009,7 @@ fn visit_refs_with_sink_inner<'a>(
                 // structural references. Project their postfix chain through
                 // BindingIndex so `cfg.field` receives the same narrowing and
                 // diagnostic origin as an ordinary path.
-                f(reference.as_ref(), sink, usage);
+                f(reference.as_ref(), sink, usage, None);
             } else {
                 // Other Access values have computed operands. References
                 // nested inside the computation do not inherit its result
@@ -425,6 +1109,7 @@ fn visit_computed_accesses_with_sink<'a>(
         }
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
+        | Value::Deferred(DeferredValue::BindingCandidate { .. })
         | Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
         | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -720,7 +1405,7 @@ fn validate_module_call_argument_ref_types_inner(
             visit_refs_with_sink(
                 value.walker_value(),
                 declared_sink.map(RefSink::TypeExpr),
-                &mut |path, sink, usage| {
+                &mut |path, sink, usage, _candidate| {
                     let Some(kind) =
                         composition_ref_error_kind(path, sink, bindings, unknown_policy, usage)
                     else {
@@ -1009,7 +1694,7 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
         unknown_policy: UnknownReferencePolicy,
         errors: &mut Vec<String>,
     ) {
-        visit_refs_with_sink(value, sink, &mut |path, sink, usage| {
+        visit_refs_with_sink(value, sink, &mut |path, sink, usage, _candidate| {
             let Some(sink) = sink else {
                 return;
             };
@@ -1197,6 +1882,14 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
             }
             Value::Deferred(DeferredValue::Secret(inner)) => check_function_calls(
                 inner,
+                result_sink,
+                context,
+                bindings,
+                unknown_policy,
+                errors,
+            ),
+            Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => check_function_calls(
+                value,
                 result_sink,
                 context,
                 bindings,
@@ -1418,7 +2111,7 @@ pub fn validate_composition_ref_types_with_bindings(
             visit_refs_with_sink(
                 argument.value(),
                 Some(RefSink::TypeExpr(declared_type)),
-                &mut |path, sink, usage| {
+                &mut |path, sink, usage, _candidate| {
                     let current_position = reference_position;
                     reference_position += 1;
                     let Some(kind) = composition_ref_error_kind(
@@ -1457,7 +2150,7 @@ pub fn validate_composition_ref_types_with_bindings(
             visit_refs_with_sink(
                 &value,
                 attribute.declared_type().map(RefSink::TypeExpr),
-                &mut |path, sink, usage| {
+                &mut |path, sink, usage, _candidate| {
                     let current_position = reference_position;
                     reference_position += 1;
                     let Some(kind) = composition_ref_error_kind(
@@ -1763,50 +2456,132 @@ fn validate_resource_ref_types_inner<E>(
                 .effective_attribute_by_authored_name(attr_name)
                 .map(|attribute| RefSink::from_effective_type(attribute.value_type()));
             let string_sink = AttributeType::string();
-            visit_refs_with_sink(attr_value, sink, &mut |reference, sink, usage| {
-                let Some(source) = resolve_resource_reference(
-                    resource_id,
-                    reference,
-                    bindings,
-                    usage,
-                    &mut all_errors,
-                ) else {
-                    return;
-                };
-                if matches!(
-                    reference,
-                    ReferencePathRef::Access(path) if !path.segments().is_empty()
-                ) {
-                    // The shared postfix authority below owns both narrowing
-                    // and sink compatibility for a segmented ResourceRef.
-                    return;
-                }
-                let Some(sink_type) = (match sink {
-                    Some(RefSink::EffectiveType {
-                        attr_type, defs, ..
-                    }) => Some(attr_type.in_schema(defs)),
-                    Some(RefSink::String) => {
-                        Some(crate::schema::TypeInSchema::schemaless(&string_sink))
+            visit_refs_with_sink(
+                attr_value,
+                sink,
+                &mut |reference, sink, usage, candidate_value| {
+                    if let Some(candidate_value) = candidate_value {
+                        let Some(sink) = sink else {
+                            return;
+                        };
+                        if let Some((kind, mut source)) = parsed_binding_candidate(
+                            parsed,
+                            reference.binding(),
+                            Some(candidate_value),
+                        ) {
+                            precheck_binding_candidate_source(
+                                &mut source,
+                                sink,
+                                &inference_bindings,
+                                registry,
+                                bindings,
+                            );
+                            if let Some(result) = resolve_binding_candidate_against_sink(
+                                reference.binding(),
+                                kind,
+                                source,
+                                sink,
+                                None,
+                            ) {
+                                if let Err(error) = result {
+                                    all_errors.push(format!("{}: {}", resource_location, error));
+                                }
+                                return;
+                            }
+                        }
+                        let result = match sink {
+                            RefSink::EffectiveType {
+                                attr_type,
+                                defs,
+                                ancestry,
+                            } => crate::schema::validate_attr_with_defs_and_ancestry(
+                                attr_type,
+                                candidate_value,
+                                defs,
+                                ancestry,
+                            ),
+                            RefSink::String => crate::schema::validate_attr_with_defs_and_ancestry(
+                                &AttributeType::string(),
+                                candidate_value,
+                                crate::schema::empty_defs_for_schema_walks(),
+                                FieldAncestry::WRITABLE,
+                            ),
+                            RefSink::TypeExpr(type_expr) => typecheck::check_type_expr_value(
+                                type_expr,
+                                candidate_value,
+                                &ProviderContext::default(),
+                                typecheck::TypecheckInference::Unavailable,
+                            )
+                            .map_err(|error| TypeError::ValidationFailed {
+                                message: error.to_string(),
+                            }),
+                        };
+                        if let Err(error) = result {
+                            all_errors.push(format!("{}: {}", resource_location, error));
+                        }
+                        return;
                     }
-                    Some(RefSink::TypeExpr(_)) | None => None,
-                }) else {
-                    return;
-                };
-                let Err(mismatch) = source.is_assignable_to_sink(sink_type) else {
-                    return;
-                };
-                let source_name = mismatch.actual_type_name();
-                let origin = mismatch.origin_description(reference);
-                all_errors.push(format!(
-                    "{}: cannot assign {} to '{}': expected {}, got {} ({})",
-                    resource_location,
-                    source_name,
-                    attr_name,
-                    sink_type.resolved_type_name(),
-                    source_name,
-                    origin,
-                ));
-            });
+
+                    if let (Some(sink), Some((kind, source))) = (
+                        sink,
+                        parsed_binding_candidate(parsed, reference.binding(), None),
+                    ) && let Some(result) = resolve_binding_candidate_against_sink(
+                        reference.binding(),
+                        kind,
+                        source,
+                        sink,
+                        None,
+                    ) {
+                        if let Err(error) = result {
+                            all_errors.push(format!("{}: {}", resource_location, error));
+                        }
+                        return;
+                    }
+
+                    let Some(source) = resolve_resource_reference(
+                        resource_id,
+                        reference,
+                        bindings,
+                        usage,
+                        &mut all_errors,
+                    ) else {
+                        return;
+                    };
+                    if matches!(
+                        reference,
+                        ReferencePathRef::Access(path) if !path.segments().is_empty()
+                    ) {
+                        // The shared postfix authority below owns both narrowing
+                        // and sink compatibility for a segmented ResourceRef.
+                        return;
+                    }
+                    let Some(sink_type) = (match sink {
+                        Some(RefSink::EffectiveType {
+                            attr_type, defs, ..
+                        }) => Some(attr_type.in_schema(defs)),
+                        Some(RefSink::String) => {
+                            Some(crate::schema::TypeInSchema::schemaless(&string_sink))
+                        }
+                        Some(RefSink::TypeExpr(_)) | None => None,
+                    }) else {
+                        return;
+                    };
+                    let Err(mismatch) = source.is_assignable_to_sink(sink_type) else {
+                        return;
+                    };
+                    let source_name = mismatch.actual_type_name();
+                    let origin = mismatch.origin_description(reference);
+                    all_errors.push(format!(
+                        "{}: cannot assign {} to '{}': expected {}, got {} ({})",
+                        resource_location,
+                        source_name,
+                        attr_name,
+                        sink_type.resolved_type_name(),
+                        source_name,
+                        origin,
+                    ));
+                },
+            );
             visit_computed_accesses_with_sink(attr_value, sink, &mut |access, sink| {
                 let sink_type = match sink {
                     Some(RefSink::EffectiveType {
@@ -2060,7 +2835,7 @@ fn validate_attribute_param_ref_types_inner(
         visit_refs_with_sink(
             value,
             param.type_expr.as_ref().map(RefSink::TypeExpr),
-            &mut |path, sink, usage| {
+            &mut |path, sink, usage, _candidate| {
                 check_attribute_param_ref(
                     &param.name,
                     sink.and_then(RefSink::as_type_expr),
@@ -2161,7 +2936,7 @@ fn validate_export_param_ref_types_inner<E: crate::parser::ExportParamLike>(
         let sink = type_expr
             .filter(|type_expr| !matches!(type_expr, crate::parser::TypeExpr::Unknown))
             .map(RefSink::TypeExpr);
-        visit_refs_with_sink(value, sink, &mut |path, sink, usage| {
+        visit_refs_with_sink(value, sink, &mut |path, sink, usage, _candidate| {
             check_export_ref(
                 param.name(),
                 sink.and_then(RefSink::as_type_expr),
@@ -2876,6 +3651,7 @@ pub fn value_contains_unresolved_ref(value: &Value) -> bool {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
+        | Value::Deferred(DeferredValue::BindingCandidate { .. })
         | Value::Deferred(DeferredValue::Coalesce { .. })
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
@@ -2967,6 +3743,19 @@ pub fn validate_module_calls(
                                 continue;
                             }
                         };
+                    let binding_errors = resolve_module_argument_binding_candidates(
+                        arg_value,
+                        &resolved_parameter,
+                        config,
+                    );
+                    if !binding_errors.is_empty() {
+                        errors.extend(
+                            binding_errors
+                                .into_iter()
+                                .map(|error| format!("{context}: {error}")),
+                        );
+                        continue;
+                    }
                     if let Some(handle) = arg_value.handle() {
                         if let Err(error) = check_handle_sink(handle, &resolved_parameter) {
                             errors.push(format!("{context}: {error}"));

@@ -2526,6 +2526,9 @@ fn deferred_iterable_kind(value: &Value) -> &'static str {
         Value::Concrete(ConcreteValue::Map(_)) => "map",
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "deferred resource reference",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "deferred binding reference",
+        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => {
+            deferred_iterable_kind(value)
+        }
         Value::Deferred(DeferredValue::Coalesce { .. }) => "deferred coalesce expression",
         Value::Deferred(DeferredValue::Interpolation(_)) => "deferred interpolation",
         Value::Deferred(
@@ -2834,6 +2837,9 @@ fn substitute_placeholder_lazily(
             substitute_placeholder_lazily(default, index, key, item);
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
+            substitute_placeholder_lazily(inner, index, key, item);
+        }
+        Value::Deferred(DeferredValue::BindingCandidate { value: inner, .. }) => {
             substitute_placeholder_lazily(inner, index, key, item);
         }
         Value::Concrete(

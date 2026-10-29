@@ -41,7 +41,17 @@ pub(crate) fn parse_module_call(
             let value_pair = next_pair(&mut arg_inner, "argument value", "module call argument")?;
             let value_source_span = SourceSpan::from_pest(&value_pair, preprocessed_file);
             let value_line = value_pair.line_col().0;
-            let eval = parse_expression_eval(value_pair, ctx)?;
+            let bare = value_pair.as_str().trim();
+            let typed_ctx = ctx.for_typed_module_value_sink();
+            let expression_ctx = if ctx.is_structural_binding(bare) {
+                // A direct module argument retains its parser-only handle.
+                // Structural bindings nested in a collection use the typed
+                // context so the expected element type can diagnose them.
+                ctx
+            } else {
+                &typed_ctx
+            };
+            let eval = parse_expression_eval(value_pair, expression_ctx)?;
             let argument = match &eval {
                 crate::eval_value::EvalValue::StructuralHandle(handle) => {
                     ModuleArgument::from_handle(handle.clone())

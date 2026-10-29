@@ -702,6 +702,7 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&UnknownReason)) {
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => visit_unknowns(access.base(), f),
+        Value::Deferred(DeferredValue::BindingCandidate { value, .. }) => visit_unknowns(value, f),
         Value::Deferred(DeferredValue::Secret(inner)) => visit_unknowns(inner, f),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             visit_unknowns(value, f);

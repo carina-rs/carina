@@ -246,6 +246,27 @@ impl<'a> EnumValueResolver<'a> {
         self.resolve_text(raw.as_str(), EnumInputPhase::RawDsl)
     }
 
+    pub fn enum_identity(&self) -> Option<TypeIdentity> {
+        self.parts().ok().map(|(identity, ..)| identity.clone())
+    }
+
+    /// Resolve one authored DSL member and return both its canonical API value
+    /// and the fully-qualified spelling accepted by this declaration.
+    ///
+    /// The qualified form is derived from the declaration's structured
+    /// identity and API→DSL map; callers never reconstruct it from display
+    /// strings.
+    pub fn resolve_member(
+        &self,
+        raw: &RawEnumIdentifier,
+    ) -> Result<(CanonicalEnumValue, ExpectedEnumVariant), TypeError> {
+        let canonical = self.resolve_raw(raw)?;
+        let (identity, _values, _aliases, _validate, dsl_map) = self.parts()?;
+        let dsl_value = dsl_map.dsl_for(canonical.api_value());
+        let qualified = ExpectedEnumVariant::from_identity(identity, dsl_value.into_owned(), false);
+        Ok((canonical, qualified))
+    }
+
     pub fn resolve_state_text(&self, text: &str) -> Result<CanonicalEnumValue, TypeError> {
         self.resolve_text(text, EnumInputPhase::StateText)
     }

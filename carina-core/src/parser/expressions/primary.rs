@@ -101,7 +101,8 @@ pub(crate) fn parse_postfix_path_segment(
         Rule::index_access => {
             let line = pair.line_col().0;
             let index_expr_pair = first_inner(pair, "index expression", "index access")?;
-            let index_value = parse_expression(index_expr_pair, ctx)?;
+            let untyped_ctx = ctx.without_typed_value_sink();
+            let index_value = parse_expression(index_expr_pair, &untyped_ctx)?;
             subscript_from_value(index_value, line).map(|index| PathSegment::Subscript { index })
         }
         Rule::field_access => {
@@ -227,8 +228,15 @@ pub(crate) fn parse_postfix_eval(
     };
     let mut inner = pair.into_inner();
     let base = next_pair(&mut inner, "primary expression", context)?;
-    let value = parse_primary_eval(base, ctx)?;
-    apply_postfix_steps(value, inner, ctx)
+    let steps = inner.collect::<Vec<_>>();
+    let untyped_ctx = (!steps.is_empty()).then(|| ctx.without_typed_value_sink());
+    // The expected sink describes the result of a postfix expression, not
+    // values inside its intermediate base. In particular, `[resource][0].id`
+    // must retain the established bare-handle rejection instead of treating
+    // the resource as an enum candidate merely because the final expression
+    // occurs in a typed attribute.
+    let value = parse_primary_eval(base, untyped_ctx.as_ref().unwrap_or(ctx))?;
+    apply_postfix_steps(value, steps, ctx)
 }
 
 /// Lower a `namespaced_id` pair to its `EvalValue`, attaching any
@@ -265,6 +273,22 @@ fn parse_namespaced_id_value(
         EvalValue::from_value(Value::Deferred(DeferredValue::ResourceRef { path }))
     };
 
+    // A fully-qualified enum identifier is the explicit escape from a
+    // colliding lexical binding. Its grammar-level classification is known
+    // before schema validation, so do not reinterpret its provider segment as
+    // a binding head. Type and membership are still checked by the enum
+    // resolver at the expected sink.
+    if trailing_segments.is_empty()
+        && matches!(
+            crate::resource::RawEnumIdentifier::parse(full_str).parsed(),
+            crate::resource::RawEnumIdentifierParts::FullyQualified { .. }
+        )
+    {
+        return Ok(EvalValue::from_value(Value::Concrete(
+            ConcreteValue::enum_identifier(full_str.to_string()),
+        )));
+    }
+
     match ctx.lookup_binding(parts[0]) {
         ParseBindingRef::Structural(handle) if handle.addressable_binding().is_some() => {
             return Ok(as_resource_ref(trailing_segments));
@@ -286,7 +310,7 @@ fn parse_namespaced_id_value(
                 DeferredValue::ResourceRef { path },
             )));
         }
-        ParseBindingRef::Value(bound) => {
+        ParseBindingRef::Value { value: bound } => {
             // A dotted name whose head is an ordinary bound variable is value
             // access, not a resource path. Apply every `.field` and trailing
             // subscript through the same postfix primitive used by
@@ -503,15 +527,19 @@ pub(crate) fn parse_primary_eval(
             let value = parse_duration_literal(inner.as_str(), line)?;
             Ok(EvalValue::from_value(value))
         }
-        Rule::string => parse_string_value(inner, ctx).map(EvalValue::from_value),
+        Rule::string => {
+            let untyped_ctx = ctx.without_typed_value_sink();
+            parse_string_value(inner, &untyped_ctx).map(EvalValue::from_value)
+        }
         Rule::function_call => {
             let (line, column) = inner.line_col();
             let mut fc_inner = inner.into_inner();
             let func_name = next_pair(&mut fc_inner, "function name", "function call")?
                 .as_str()
                 .to_string();
+            let untyped_ctx = ctx.without_typed_value_sink();
             let eval_args: Result<Vec<EvalValue>, ParseError> = fc_inner
-                .map(|arg| parse_expression_eval(arg, ctx))
+                .map(|arg| parse_expression_eval(arg, &untyped_ctx))
                 .collect();
             let eval_args = eval_args?;
 
@@ -606,6 +634,21 @@ pub(crate) fn parse_primary_eval(
 
             if access_steps.is_empty() {
                 // Simple variable reference (no access chain)
+                if let Some(bound) = ctx.bare_value_binding_candidate(first_ident) {
+                    return Ok(EvalValue::from_value(Value::Deferred(
+                        DeferredValue::BindingCandidate {
+                            binding: first_ident.to_string(),
+                            value: Box::new(bound),
+                        },
+                    )));
+                }
+                if ctx.preserves_bare_binding(first_ident) {
+                    return Ok(EvalValue::from_value(Value::Deferred(
+                        DeferredValue::BindingRef {
+                            binding: first_ident.to_string(),
+                        },
+                    )));
+                }
                 //
                 // Bare identifiers (`dedicated`, `enabled`) are emitted as
                 // `ConcreteValue::EnumIdentifier` short form. The validator
@@ -617,7 +660,7 @@ pub(crate) fn parse_primary_eval(
                 // above — we only reach the `None` branch when the parser
                 // has no in-scope variable / let-binding for this name.
                 match ctx.lookup_binding(first_ident) {
-                    ParseBindingRef::Value(value) => {
+                    ParseBindingRef::Value { value } => {
                         Ok(value.clone().with_reference_source_line(line))
                     }
                     ParseBindingRef::Structural(handle) => {
@@ -629,7 +672,7 @@ pub(crate) fn parse_primary_eval(
                 }
             } else {
                 match ctx.lookup_binding(first_ident) {
-                    ParseBindingRef::Value(bound) => {
+                    ParseBindingRef::Value { value: bound } => {
                         return apply_postfix_steps(
                             bound.clone().with_reference_source_line(line),
                             access_steps,
@@ -741,7 +784,7 @@ pub(crate) fn parse_primary_eval(
                         )));
                     }
                     match ctx.lookup_binding(binding_name.expose_plaintext()) {
-                        ParseBindingRef::Value(value) => Ok(value.clone()),
+                        ParseBindingRef::Value { value } => Ok(value.clone()),
                         ParseBindingRef::Structural(_) | ParseBindingRef::Unbound
                             if binding_name.is_diagnostic_sensitive() =>
                         {

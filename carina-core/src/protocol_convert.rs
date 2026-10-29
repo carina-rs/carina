@@ -1484,6 +1484,7 @@ fn deferred_value_variant(value: &DeferredValue) -> &'static str {
     match value {
         DeferredValue::ResourceRef { path: _path } => "ResourceRef",
         DeferredValue::BindingRef { binding: _binding } => "BindingRef",
+        DeferredValue::BindingCandidate { .. } => "BindingCandidate",
         DeferredValue::Coalesce {
             value: _value,
             default: _default,
