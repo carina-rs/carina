@@ -59,7 +59,7 @@ impl HistoricalDisplayAttributes {
     /// Build the fail-safe display view available from a plan alone. Desired
     /// secret shapes mask their historical counterparts; callers with state
     /// provenance should then refine it through the persisted-shape methods.
-    pub fn for_plan(plan: &Plan) -> Self {
+    pub fn for_plan<S>(plan: &Plan<S>) -> Self {
         let mut display = Self {
             updates: HashMap::new(),
             deletes: HashMap::new(),
@@ -524,8 +524,8 @@ pub enum ListOfMapsDiffField {
 
 /// Build detail rows for an effect using delete attributes keyed by resource
 /// id plus generation.
-pub fn build_detail_rows_by_instance(
-    effect: &Effect,
+pub fn build_detail_rows_by_instance<S>(
+    effect: &Effect<S>,
     registry: Option<&SchemaRegistry>,
     detail: DetailLevel,
     historical_attributes: &HistoricalDisplayAttributes,
@@ -745,9 +745,9 @@ fn default_tag_annotation(default_tag_keys: &DefaultTagKeys, key: &str) -> Optio
         .then(|| "# default_tags".to_string())
 }
 
-fn build_update_rows(
+fn build_update_rows<S>(
     historical_attributes: &HashMap<String, Value>,
-    to: &crate::resource::Resource,
+    to: &crate::resource::Resource<S>,
     changed_attributes: &[String],
     schema: Option<&ResourceSchema>,
     detail: DetailLevel,
@@ -1036,8 +1036,8 @@ fn project_previous_attrs(
     }
 }
 
-fn build_attribute_diff_rows(
-    to: &crate::resource::Resource,
+fn build_attribute_diff_rows<S>(
+    to: &crate::resource::Resource<S>,
     ctx: AttributeDiffContext<'_>,
 ) -> AttributeDiffRows {
     let mut rows = Vec::new();
@@ -1226,9 +1226,9 @@ fn build_attribute_diff_rows(
 /// effect. This helper owns the delete-index lookup so every renderer consumes
 /// the same masked historical view rather than reconstructing that lookup.
 #[allow(clippy::too_many_arguments)]
-pub fn build_replace_detail_rows_from_display(
-    plan: &Plan,
-    to: &crate::resource::Resource,
+pub fn build_replace_detail_rows_from_display<S>(
+    plan: &Plan<S>,
+    to: &crate::resource::Resource<S>,
     replacement: ReplaceDisplayInfo<'_>,
     historical_display: &HistoricalDisplayAttributes,
     registry: Option<&SchemaRegistry>,
@@ -1269,10 +1269,10 @@ pub fn build_replace_detail_rows_from_display(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_replace_rows_from_attributes(
+fn build_replace_rows_from_attributes<S>(
     previous_attributes: &HashMap<String, Value>,
     nested_write_only: &NestedWriteOnlyRecord,
-    to: &crate::resource::Resource,
+    to: &crate::resource::Resource<S>,
     changed_create_only: &[String],
     temporary_name: Option<&crate::effect::TemporaryName>,
     cascade_ref_hints: &[(String, String)],
@@ -2253,7 +2253,7 @@ mod tests {
     use crate::effect::{ChangedCreateOnly, EffectGeneration};
     use crate::explicit::{ExplicitFields, PendingPaths};
     use crate::parser::ProviderConfig;
-    use crate::plan::ReplaceDisplayMetadata;
+    use crate::plan::{ReplaceDisplayMetadata, SavedPlan};
     use crate::resource::{ResolvedResource, Resource, ResourceId, State};
     use std::collections::HashSet;
 
@@ -2725,7 +2725,8 @@ mod tests {
         // metadata. Round-trip here so the display path proves that desired
         // default-tag provenance survives serialization without being copied
         // into ReplaceDisplayMetadata.
-        let plan: Plan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        let plan =
+            serde_json::from_str::<SavedPlan>(&serde_json::to_string(&plan).unwrap()).unwrap();
         let Effect::Create(saved_to) = &plan.effects()[0] else {
             panic!("replacement create effect must survive saved-plan round trip");
         };

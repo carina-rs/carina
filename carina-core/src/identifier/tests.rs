@@ -1,11 +1,30 @@
 use super::*;
 use crate::parser::StateBlockAddress;
-use crate::resource::{AccessPath, Resource, Subscript, UnknownReason, ValueString};
+use crate::resource::{
+    AccessPath, CompositionCall, CompositionCallPath, ModuleInstanceScope, ModuleSource, Resource,
+    Subscript, UnknownReason, ValueString,
+};
 use crate::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry,
     ValidatedConfigSchema, enum_identity,
 };
 use indexmap::IndexMap;
+
+fn live_module_source(name: &str, instance: &str) -> ModuleSource {
+    ModuleSource::expanded_module(
+        name,
+        instance,
+        ModuleInstanceScope::for_call(name, Some(instance), instance),
+        CompositionCallPath::direct(CompositionCall {
+            id: crate::parser::ModuleCallId::test_dummy_in(format!("{instance}.crn")),
+            module_name: name.to_string(),
+            binding: Some(instance.to_string()),
+            instance: instance.to_string(),
+            module_source: Some(format!("./{name}")),
+            module_directory: None,
+        }),
+    )
+}
 
 #[test]
 fn redacted_secret_identifier_material_bytes_are_legacy_compatible() {
@@ -653,8 +672,6 @@ fn check_keeps_default_and_named_provider_instances_in_separate_scopes() {
 
 #[test]
 fn check_allows_stable_named_and_separate_module_instance_resources() {
-    use crate::resource::ModuleSource;
-
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
             .create_only()
@@ -688,9 +705,9 @@ fn check_allows_stable_named_and_separate_module_instance_resources() {
     named.binding = Some("named".to_string());
 
     let module_one = Resource::pending_with_provider("mock", "other.resource", None)
-        .with_module_source(ModuleSource::module("fixture", "module_one"));
+        .with_module_source(live_module_source("fixture", "module_one"));
     let module_two = Resource::pending_with_provider("mock", "other.resource", None)
-        .with_module_source(ModuleSource::module("fixture", "module_two"));
+        .with_module_source(live_module_source("fixture", "module_two"));
 
     let conflicts = check_attribute_derived_anonymous_resource_conflicts(
         &[stable_one, stable_two, named, module_one, module_two],
@@ -1806,8 +1823,6 @@ fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
 /// anonymous resource.
 #[test]
 fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
-    use crate::resource::ModuleSource;
-
     let schema = ResourceSchema::new("iam.RolePolicy")
         .attribute(AttributeSchema::optional("policy_name", AttributeType::string()).build());
     let mut schemas = SchemaRegistry::new();
@@ -1837,11 +1852,7 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
         "policy_name".to_string(),
         Value::Concrete(ConcreteValue::String("inline".into())),
     );
-    r.module_source = Some(ModuleSource::Module {
-        name: "github_oidc".to_string(),
-        instance: "bootstrap".to_string(),
-        scope: None,
-    });
+    r.module_source = Some(live_module_source("github_oidc", "bootstrap"));
 
     let mut resources = vec![r];
     compute_anonymous_identifiers_for_test(&mut resources, &providers, &schemas, &identity_fn)
@@ -2368,14 +2379,10 @@ fn association_state_entry(
 }
 
 fn route_with_deferred_route_table(name: &'static str, route_table_binding: &str) -> Resource {
-    use crate::resource::{AccessPath, ModuleSource};
+    use crate::resource::AccessPath;
 
     let mut resource = Resource::with_provider("awscc", "ec2.Route", name, None);
-    resource.module_source = Some(ModuleSource::Module {
-        name: "mymod".to_string(),
-        instance: "inst".to_string(),
-        scope: None,
-    });
+    resource.module_source = Some(live_module_source("mymod", "inst"));
     resource.set_attr(
         "route_table_id".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {

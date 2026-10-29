@@ -753,10 +753,10 @@ impl MockProvider {
         })
     }
 
-    async fn create_resource(
+    async fn create_resource<S>(
         &self,
         id: ResourceId,
-        resource: Resource,
+        resource: Resource<S>,
         attempt: CreateAttempt,
     ) -> Result<CreateOutcome, CreateFailure> {
         let mode = env::var("CARINA_MOCK_CREATE_MODE").unwrap_or_else(|_| "success".to_string());
@@ -881,10 +881,10 @@ impl MockProvider {
         Ok(issued.succeeded(state_attrs))
     }
 
-    fn persist_resumed_resource(
+    fn persist_resumed_resource<S>(
         &self,
         id: &ResourceId,
-        resource: &Resource,
+        resource: &Resource<S>,
     ) -> ProviderResult<HashMap<String, Value>> {
         let _state_guard = Self::lock_state_file()?;
         let mut states = self.load_states_for_operation()?;
@@ -1046,7 +1046,7 @@ impl Default for MockProvider {
 impl ProviderNormalizer for MockProvider {
     fn normalize_desired<'a>(
         &'a self,
-        resources: &'a mut [Resource],
+        resources: &'a mut [carina_core::resource::ProviderResource],
     ) -> BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
             for resource in resources
@@ -1445,7 +1445,7 @@ mod tests {
         resource: Resource,
     ) -> Result<CreateOutcome, CreateFailure> {
         let bindings = carina_core::binding_index::ResolvedBindings::default();
-        let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = carina_core::schema::SchemaRegistry::new();
         let preparation = carina_core::executor::ProviderPreparationContext::new(
             &bindings,
@@ -1624,7 +1624,8 @@ mod tests {
             let mode_guard = EnvGuard::set("CARINA_MOCK_RESUME_MODE", mode);
             let request = runtime.block_on(async {
                 let bindings = carina_core::binding_index::ResolvedBindings::default();
-                let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+                let module_gate =
+                    carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
                 let schemas = carina_core::schema::SchemaRegistry::new();
                 let preparation = carina_core::executor::ProviderPreparationContext::new(
                     &bindings,
@@ -2167,7 +2168,8 @@ mod tests {
             from_attrs.insert("comment".to_string(), string_value("v1"));
             let from = State::existing(id.clone(), from_attrs).with_identifier("mock-id");
             let bindings = carina_core::binding_index::ResolvedBindings::default();
-            let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+            let module_gate =
+                carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
             let mut schemas = carina_core::schema::SchemaRegistry::new();
             schemas.insert(
                 "mock",
@@ -2263,12 +2265,8 @@ mod tests {
             partial_create: None,
             partial_update: None,
         };
-        let mut resources = vec![Resource::with_provider(
-            "mock",
-            "test.resource",
-            "normalize-me",
-            None,
-        )];
+        let mut resources =
+            vec![Resource::with_provider("mock", "test.resource", "normalize-me", None).into()];
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();

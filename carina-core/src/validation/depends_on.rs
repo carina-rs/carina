@@ -73,7 +73,7 @@ impl DependsOnDiagnostic {
 
 /// The `directives.depends_on` list of a resource, or an empty slice.
 ///
-/// `Composition` carries no directives — [`ResourceRef::directives`]
+/// `LiveComposition` carries no directives — [`ResourceRef::directives`]
 /// is `None` for that arm, treated here as an empty `depends_on` list.
 fn depends_on_of<'a>(rref: ResourceRef<'a>) -> &'a [String] {
     rref.directives()

@@ -1573,8 +1573,8 @@ pub(crate) fn wit_to_core_delete_outcome(outcome: wit::DeleteOutcome) -> WasmDel
 
 // -- Resource --
 
-pub(crate) fn core_to_wit_resource(
-    resource: &CoreResource,
+pub(crate) fn core_to_wit_resource<S>(
+    resource: &CoreResource<S>,
 ) -> Result<wit::ResourceDef, SerializationError> {
     Ok(wit::ResourceDef {
         id: core_to_wit_resource_id(&resource.id),
@@ -1586,8 +1586,8 @@ pub(crate) fn core_to_wit_resource(
 /// plugin boundary. The WIT contract has a single `ResourceDef` record,
 /// so a data source maps to the same `{ id, attributes }` shape as a
 /// managed resource (carina#3181).
-pub(crate) fn core_data_source_to_wit_resource(
-    data_source: &CoreDataSource,
+pub(crate) fn core_data_source_to_wit_resource<S>(
+    data_source: &CoreDataSource<S>,
 ) -> Result<wit::ResourceDef, SerializationError> {
     Ok(wit::ResourceDef {
         id: core_to_wit_resource_id(&data_source.id),
@@ -4092,7 +4092,7 @@ mod tests {
             ]),
         );
         let bindings = carina_core::binding_index::ResolvedBindings::default();
-        let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let mut schemas = carina_core::schema::SchemaRegistry::new();
         schemas.insert(
             "",

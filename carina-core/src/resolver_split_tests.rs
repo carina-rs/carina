@@ -2,7 +2,7 @@
 //!
 //! - `resolve_managed_refs_with_state_and_remote(&mut [Resource], ...)`
 //!   — pre-apply path, accepts only `Resource` slices.
-//! - `resolve_virtual_refs_post_apply(&mut [Composition], &ResolvedBindings)`
+//! - `resolve_live_composition_refs_post_apply(&mut [LiveComposition], &ResolvedBindings)`
 //!   — post-apply path, takes a pre-built bindings view.
 //!
 //! Both are new entry points layered over the existing
@@ -16,11 +16,11 @@ use indexmap::IndexMap;
 
 use crate::binding_index::ResolvedBindings;
 use crate::resolver::{
-    resolve_managed_refs_with_state_and_remote, resolve_virtual_refs_post_apply,
+    resolve_live_composition_refs_post_apply, resolve_managed_refs_with_state_and_remote,
 };
 use crate::resource::{
-    AccessPath, Composition, ConcreteValue, DeferredValue, Resource, ResourceId, Signature, State,
-    Value,
+    AccessPath, ConcreteValue, DeferredValue, LiveComposition, LiveCompositionSignature, Resource,
+    ResourceId, State, Value,
 };
 
 fn s(s: &str) -> Value {
@@ -51,20 +51,21 @@ fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
     }
 }
 
-fn make_virtual(binding: &'static str, attrs: &[(&str, Value)]) -> Composition {
-    let mut attributes: IndexMap<String, crate::resource::CompositionAttribute> = IndexMap::new();
+fn make_virtual(binding: &'static str, attrs: &[(&str, Value)]) -> LiveComposition {
+    let mut attributes: IndexMap<String, crate::resource::LiveCompositionAttribute> =
+        IndexMap::new();
     for (k, v) in attrs {
         attributes.insert(
             (*k).into(),
-            crate::resource::CompositionAttribute::from_value(v.clone(), None),
+            crate::resource::LiveCompositionAttribute::from_value(v.clone(), None),
         );
     }
-    Composition {
+    LiveComposition {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "_virtual.module",
             binding,
         )),
-        signature: Signature {
+        signature: LiveCompositionSignature {
             arguments: IndexMap::new(),
             attributes,
             pending_constraints: Vec::new(),
@@ -73,7 +74,7 @@ fn make_virtual(binding: &'static str, attrs: &[(&str, Value)]) -> Composition {
         dependency_bindings: BTreeSet::new(),
         module_name: "m".into(),
         instance: binding.into(),
-        provenance: Default::default(),
+        call_path: Default::default(),
         quoted_string_attrs: Default::default(),
     }
 }
@@ -86,7 +87,7 @@ fn resolve_managed_refs_resolves_resource_ref_against_managed_sibling() {
     let mut managed = vec![a, b];
 
     {
-        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
             managed: &managed,
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -110,7 +111,7 @@ fn resolve_managed_refs_records_dependency_bindings() {
     let mut managed = vec![a, b];
 
     {
-        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
             managed: &managed,
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -146,7 +147,7 @@ fn resolve_managed_refs_falls_through_state_attributes() {
     );
 
     {
-        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
             managed: &managed,
             compositions: &[],
             managed_current: &crate::resource::into_plan_input_current_map_from_states(
@@ -167,12 +168,12 @@ fn resolve_managed_refs_falls_through_state_attributes() {
 }
 
 #[test]
-fn resolve_virtual_refs_post_apply_uses_provided_bindings() {
+fn resolve_live_composition_refs_post_apply_uses_provided_bindings() {
     // Bindings built externally (#3177's job at apply time). Verify
-    // that the post-apply entry resolves `Composition` refs
+    // that the post-apply entry resolves `LiveComposition` refs
     // against the supplied view.
     let referenced = make_managed("a", &[("value", s("post_apply_value"))]);
-    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
         managed: std::slice::from_ref(&referenced),
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -182,7 +183,8 @@ fn resolve_virtual_refs_post_apply_uses_provided_bindings() {
     });
 
     let mut compositions = vec![make_virtual("v", &[("forwarded", ref_to("a", "value"))])];
-    resolve_virtual_refs_post_apply(&mut compositions, &bindings).expect("resolve compositions");
+    resolve_live_composition_refs_post_apply(&mut compositions, &bindings)
+        .expect("resolve compositions");
 
     let forwarded = compositions[0]
         .signature
@@ -193,24 +195,25 @@ fn resolve_virtual_refs_post_apply_uses_provided_bindings() {
 }
 
 #[test]
-fn resolve_virtual_refs_post_apply_picks_post_apply_value_not_pre_apply() {
+fn resolve_live_composition_refs_post_apply_picks_post_apply_value_not_pre_apply() {
     // #3169 root cause: a composition that references a managed Role
     // gets the *pre-apply* ARN if resolution runs against the
     // pre-apply state, and the *post-apply* ARN if it runs against
     // the post-apply state. Verify the post-apply entry selects the
     // post-apply value when handed the post-apply bindings view.
     let role = make_managed("role", &[("arn", s("post_apply_arn"))]);
-    let post_apply_bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
-        managed: std::slice::from_ref(&role),
-        compositions: &[],
-        managed_current: &HashMap::new(),
-        data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
-        wait_aliases: &[],
-    });
+    let post_apply_bindings =
+        ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
+            managed: std::slice::from_ref(&role),
+            compositions: &[],
+            managed_current: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
 
     let mut compositions = vec![make_virtual("rd", &[("role_arn", ref_to("role", "arn"))])];
-    resolve_virtual_refs_post_apply(&mut compositions, &post_apply_bindings)
+    resolve_live_composition_refs_post_apply(&mut compositions, &post_apply_bindings)
         .expect("resolve compositions");
 
     let role_arn = compositions[0]
@@ -226,10 +229,10 @@ fn resolve_virtual_refs_post_apply_picks_post_apply_value_not_pre_apply() {
 }
 
 #[test]
-fn resolve_virtual_refs_post_apply_leaves_non_ref_values_intact() {
-    // A literal attribute on a `Composition` should be preserved
+fn resolve_live_composition_refs_post_apply_leaves_non_ref_values_intact() {
+    // A literal attribute on a `LiveComposition` should be preserved
     // verbatim by the post-apply pass.
-    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
         managed: &[],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -239,7 +242,8 @@ fn resolve_virtual_refs_post_apply_leaves_non_ref_values_intact() {
     });
     let mut compositions = vec![make_virtual("v", &[("literal", s("kept"))])];
 
-    resolve_virtual_refs_post_apply(&mut compositions, &bindings).expect("resolve compositions");
+    resolve_live_composition_refs_post_apply(&mut compositions, &bindings)
+        .expect("resolve compositions");
 
     let literal = compositions[0]
         .signature
@@ -253,7 +257,7 @@ fn resolve_virtual_refs_post_apply_leaves_non_ref_values_intact() {
 fn resolve_managed_refs_with_empty_slice_is_ok() {
     let mut managed: Vec<Resource> = Vec::new();
     {
-        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
             managed: &managed,
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -268,8 +272,8 @@ fn resolve_managed_refs_with_empty_slice_is_ok() {
 }
 
 #[test]
-fn resolve_virtual_refs_post_apply_with_empty_slice_is_ok() {
-    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+fn resolve_live_composition_refs_post_apply_with_empty_slice_is_ok() {
+    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
         managed: &[],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -277,8 +281,8 @@ fn resolve_virtual_refs_post_apply_with_empty_slice_is_ok() {
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
-    let mut compositions: Vec<Composition> = Vec::new();
-    resolve_virtual_refs_post_apply(&mut compositions, &bindings)
+    let mut compositions: Vec<LiveComposition> = Vec::new();
+    resolve_live_composition_refs_post_apply(&mut compositions, &bindings)
         .expect("empty composition slice resolves cleanly");
     assert!(compositions.is_empty());
 }
@@ -293,7 +297,7 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
     let mut managed = vec![a_new.clone(), b_new.clone()];
 
     {
-        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
             managed: &managed,
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -307,7 +311,7 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
 
     let mut legacy: Vec<Resource> = vec![a_new.clone(), b_new.clone()];
     {
-        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
             managed: &legacy,
             compositions: &[],
             managed_current: &HashMap::new(),

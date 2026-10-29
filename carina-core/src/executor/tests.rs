@@ -316,12 +316,12 @@ struct MockProvider {
     /// Resources passed in to `create()` in call order — lets a test
     /// assert that the executor handed the provider a fully-resolved
     /// resource (no remaining `Value::Deferred(ResourceRef)` etc.).
-    create_resources: Arc<Mutex<Vec<Resource>>>,
+    create_resources: Arc<Mutex<Vec<crate::resource::ProviderResource>>>,
     /// `UpdateRequest`s passed in to `update()` in call order — lets a
     /// test assert the patch carries re-normalized attribute values.
     update_requests: Arc<Mutex<Vec<UpdateRequest>>>,
     /// Data sources passed to `read_data_source()` in call order.
-    data_source_reads: Arc<Mutex<Vec<DataSource>>>,
+    data_source_reads: Arc<Mutex<Vec<crate::resource::ProviderDataSource>>>,
 }
 
 enum ClassifiedCreateFixture {
@@ -393,7 +393,7 @@ impl MockProvider {
         self.call_log.lock().unwrap().clone()
     }
 
-    fn captured_create_resources(&self) -> Vec<Resource> {
+    fn captured_create_resources(&self) -> Vec<crate::resource::ProviderResource> {
         self.create_resources.lock().unwrap().clone()
     }
 
@@ -401,7 +401,7 @@ impl MockProvider {
         self.update_requests.lock().unwrap().clone()
     }
 
-    fn captured_data_source_reads(&self) -> Vec<DataSource> {
+    fn captured_data_source_reads(&self) -> Vec<crate::resource::ProviderDataSource> {
         self.data_source_reads.lock().unwrap().clone()
     }
 }
@@ -818,7 +818,7 @@ fn canonicalize_value(v: &Value) -> Option<Value> {
 impl crate::provider::ProviderNormalizer for CanonicalizingNormalizer {
     fn normalize_desired<'a>(
         &'a self,
-        resources: &'a mut [Resource],
+        resources: &'a mut [crate::resource::ProviderResource],
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         Box::pin(async move {
             for r in resources.iter_mut() {
@@ -856,7 +856,7 @@ struct SecretListToScalarNormalizer;
 impl crate::provider::ProviderNormalizer for SecretListToScalarNormalizer {
     fn normalize_desired<'a>(
         &'a self,
-        resources: &'a mut [Resource],
+        resources: &'a mut [crate::resource::ProviderResource],
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         Box::pin(async move {
             for resource in resources {
@@ -2098,7 +2098,7 @@ async fn resume_dispatch_validates_resent_sent_against_checked_request() {
     let id = resource.id.clone();
     let pending = persisted_unissued_create_for_executor(&id);
     let bindings = ResolvedBindings::default();
-    let module_gate = crate::executor::ModuleConstraintGate::new(&[]);
+    let module_gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let preparation = crate::executor::ProviderPreparationContext::new(
         &bindings,
         &module_gate,
@@ -2146,7 +2146,7 @@ async fn create_dispatch_rejects_an_outcome_bound_to_another_resource() {
     let other_id = make_resource("other", &[]).id;
     provider.push_create(Ok(ok_state(&other_id)));
     let bindings = ResolvedBindings::default();
-    let module_gate = crate::executor::ModuleConstraintGate::new(&[]);
+    let module_gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let preparation = crate::executor::ProviderPreparationContext::new(
         &bindings,
         &module_gate,
@@ -2546,7 +2546,7 @@ struct MustNotNormalizeInvalidValue;
 impl crate::provider::ProviderNormalizer for MustNotNormalizeInvalidValue {
     fn normalize_desired<'a>(
         &'a self,
-        _resources: &'a mut [Resource],
+        _resources: &'a mut [crate::resource::ProviderResource],
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         Box::pin(async { panic!("normalizer ran before the value-constraint gate") })
     }
@@ -2978,7 +2978,7 @@ async fn absent_entirely_write_only_struct_stays_reassert_during_apply_augmentat
 
 #[tokio::test]
 async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
 
     let provider = MockProvider::new();
     let producer = make_resource("producer", &[]);
@@ -3009,7 +3009,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
             UnresolvedResource::from_pre_resolve(consumer.clone()),
         ),
     ]);
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: &[producer, consumer],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -3057,7 +3057,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
 
 #[tokio::test]
 async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
 
     let provider = MockProvider::new();
     let producer = make_resource("producer-update", &[]);
@@ -3114,7 +3114,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
             UnresolvedResource::from_pre_resolve(unresolved_consumer.clone()),
         ),
     ]);
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: &[producer, unresolved_consumer],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -3235,7 +3235,7 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
 
 #[tokio::test]
 async fn invalid_deferred_data_source_input_never_reaches_provider() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
 
     let provider = MockProvider::new();
     let upstream = make_resource("data-source-producer", &[]);
@@ -3265,7 +3265,7 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
     });
     let executable_data_source_values =
         executable_deferred_data_source_values(std::slice::from_ref(&data_source));
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: &[upstream],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -3316,7 +3316,7 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
 
 #[tokio::test]
 async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
 
     let provider = MockProvider::new();
     let upstream = make_resource("plan-data-source-producer", &[]);
@@ -3350,7 +3350,7 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
         upstream.id.clone(),
         UnresolvedResource::from_pre_resolve(upstream.clone()),
     )]);
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: std::slice::from_ref(&upstream),
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -3407,21 +3407,21 @@ fn pending_module_composition(
     instance: &'static str,
     arguments: Vec<(&str, Value)>,
     constraints: Vec<crate::resource::PendingModuleConstraint>,
-) -> crate::resource::Composition {
+) -> crate::resource::LiveComposition {
     use crate::parser::TypeExpr;
-    use crate::resource::{Composition, CompositionArgument, Signature};
+    use crate::resource::{LiveComposition, LiveCompositionArgument, LiveCompositionSignature};
 
-    Composition {
+    LiveComposition {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "_virtual", instance,
         )),
-        signature: Signature {
+        signature: LiveCompositionSignature {
             arguments: arguments
                 .into_iter()
                 .map(|(name, value)| {
                     (
                         name.to_string(),
-                        CompositionArgument::from_value(
+                        LiveCompositionArgument::from_value(
                             value,
                             TypeExpr::String,
                             crate::parser::ArgumentOrigin::Defaulted,
@@ -3436,7 +3436,7 @@ fn pending_module_composition(
         dependency_bindings: std::collections::BTreeSet::new(),
         module_name: "checked_module".to_string(),
         instance: instance.to_string(),
-        provenance: Default::default(),
+        call_path: Default::default(),
         quoted_string_attrs: HashSet::new(),
     }
 }
@@ -3476,8 +3476,8 @@ fn module_require_equal_constraint(
 
 #[tokio::test]
 async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
-    use crate::resource::CompositionAttribute;
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
+    use crate::resource::LiveCompositionAttribute;
 
     let provider = MockProvider::new();
     let upstream = make_resource("module-data-source-producer", &[]);
@@ -3500,7 +3500,7 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
     composition.binding = Some("checked".to_string());
     composition.signature.attributes.insert(
         "value".to_string(),
-        CompositionAttribute::from_value(
+        LiveCompositionAttribute::from_value(
             Value::resource_ref("module-data-source-producer", "value", vec![]),
             None,
         ),
@@ -3527,7 +3527,7 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
         upstream.id.clone(),
         UnresolvedResource::from_pre_resolve(upstream.clone()),
     )]);
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: std::slice::from_ref(&upstream),
         compositions: std::slice::from_ref(&composition),
         managed_current: &HashMap::new(),
@@ -3581,9 +3581,18 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
 }
 
 fn mark_module_resource(resource: &mut Resource, instance: &str) {
-    resource.module_source = Some(crate::resource::ModuleSource::module(
+    resource.module_source = Some(crate::resource::ModuleSource::expanded_module(
         "checked_module",
         instance,
+        crate::resource::ModuleInstanceScope::for_call("checked_module", Some(instance), instance),
+        crate::resource::CompositionCallPath::direct(crate::resource::CompositionCall {
+            id: crate::parser::ModuleCallId::test_dummy_in(format!("{instance}.crn")),
+            module_name: "checked_module".to_string(),
+            binding: Some(instance.to_string()),
+            instance: instance.to_string(),
+            module_source: Some("./checked_module".to_string()),
+            module_directory: None,
+        }),
     ));
 }
 
@@ -3735,8 +3744,8 @@ async fn nested_forwarded_module_constraint_blocks_provider_dispatch() {
 
 #[tokio::test]
 async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
-    use crate::resource::CompositionAttribute;
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
+    use crate::resource::LiveCompositionAttribute;
 
     let provider = MockProvider::new();
     let violating = Value::Concrete(ConcreteValue::String("bad".into()));
@@ -3748,7 +3757,7 @@ async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch(
     outer.binding = Some("outer_call".to_string());
     outer.signature.attributes.insert(
         "forwarded".to_string(),
-        CompositionAttribute::from_value(violating, None),
+        LiveCompositionAttribute::from_value(violating, None),
     );
 
     let mut inner_resource = make_resource("nested-inner-consumer", &[]);
@@ -3758,7 +3767,7 @@ async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch(
     );
     mark_module_resource(&mut inner_resource, "root.outer.inner");
     let resource_id = inner_resource.id.clone();
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: std::slice::from_ref(&inner_resource),
         compositions: std::slice::from_ref(&outer),
         managed_current: &HashMap::new(),
@@ -3807,8 +3816,8 @@ async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch(
 
 #[tokio::test]
 async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
-    use crate::resource::CompositionAttribute;
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
+    use crate::resource::LiveCompositionAttribute;
 
     let provider = MockProvider::new();
     let violating = Value::Concrete(ConcreteValue::String("bad".into()));
@@ -3820,7 +3829,7 @@ async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() 
     composition.binding = Some("exporter".to_string());
     composition.signature.attributes.insert(
         "forwarded".to_string(),
-        CompositionAttribute::from_value(violating, None),
+        LiveCompositionAttribute::from_value(violating, None),
     );
 
     let mut top_level = make_resource("top-level-consumer", &[]);
@@ -3830,7 +3839,7 @@ async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() 
     );
     assert!(top_level.module_source.is_none());
     let resource_id = top_level.id.clone();
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: std::slice::from_ref(&top_level),
         compositions: std::slice::from_ref(&composition),
         managed_current: &HashMap::new(),
@@ -4401,7 +4410,7 @@ fn terminal_gate_still_reports_decidable_violations_when_pending_is_suppressed()
         )],
         vec![module_not_bad_constraint("value")],
     );
-    let gate = ModuleConstraintGate::new(std::slice::from_ref(&composition));
+    let gate = ModuleConstraintGate::from_live_compositions(std::slice::from_ref(&composition));
 
     let error = gate
         .finish(&ResolvedBindings::default(), false)
@@ -5202,7 +5211,7 @@ async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error(
 /// plan time must not be rechecked merely because a sibling reference resolves.
 #[tokio::test]
 async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let provider = MockProvider::new();
@@ -5247,7 +5256,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
 
     let executable_data_source_values =
         executable_deferred_data_source_values(std::slice::from_ref(&authored));
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: std::slice::from_ref(&producer),
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -6152,7 +6161,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
     impl crate::provider::ProviderNormalizer for LockHoldingNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            resources: &'a mut [Resource],
+            resources: &'a mut [crate::resource::ProviderResource],
         ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
             Box::pin(async move {
                 let mut guard = self.store.lock().await;
@@ -7020,7 +7029,7 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
             )
         })
         .collect();
-    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
         managed: &resources,
         compositions: &[],
         managed_current: &crate::resource::into_plan_input_current_map_from_states(
@@ -7099,7 +7108,7 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
             )
         })
         .collect();
-    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
         managed: &resources,
         compositions: &[],
         managed_current: &crate::resource::into_plan_input_current_map_from_states(
@@ -7858,7 +7867,7 @@ impl Provider for CascadeReplaceProvider {
 
 #[tokio::test]
 async fn cascading_replacement_child_create_uses_new_parent_binding() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
     use crate::differ::create_plan_with_cascades;
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 
@@ -8020,7 +8029,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         "subnet create must depend on replacement VPC create; deps: {deps:?}; effects: {:?}",
         plan.effects()
     );
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: &managed_resources,
         compositions: &[],
         managed_current: &plan_input_states,
@@ -9424,7 +9433,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     impl crate::provider::ProviderNormalizer for LockOrderNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            resources: &'a mut [Resource],
+            resources: &'a mut [crate::resource::ProviderResource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 let is_alb = resources.iter().any(|resource| {
@@ -9718,7 +9727,7 @@ fn cert_state_for_deferred_replace_deadlock(id: &ResourceId) -> State {
 /// on `carina-rs/infra@main`.
 #[tokio::test]
 async fn test_data_source_read_state_resolves_for_downstream_resource() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
     use crate::resource::{AccessPath, ResourceId};
 
     // `RecordingMockProvider` captures the resolved attribute map the
@@ -9793,7 +9802,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
     // Build bindings the way the real apply path does (carina#3248):
     // one typed constructor that lays managed resources, data sources, and
     // their split state maps in one go.
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: &[role],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -9861,7 +9870,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
 /// publish its read state before downstream consumers run.
 #[tokio::test]
 async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
     use crate::resource::{AccessPath, PathSegment, ResourceId, State, Subscript};
 
     let provider = MockProvider::new();
@@ -9939,7 +9948,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
     let current_states: HashMap<ResourceId, State> = HashMap::new();
     let executable_data_source_values =
         executable_deferred_data_source_values(std::slice::from_ref(&data_source));
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: &[upstream, consumer],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -10014,7 +10023,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
 
 #[tokio::test]
 async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
     use crate::resource::{AccessPath, PathSegment, ResourceId, State, Subscript};
 
     let provider = MockProvider::new();
@@ -10076,7 +10085,7 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
     let current_states: HashMap<ResourceId, State> = HashMap::new();
     let executable_data_source_values =
         executable_deferred_data_source_values(std::slice::from_ref(&data_source));
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: &[upstream, consumer],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -10137,7 +10146,7 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
 
 #[tokio::test]
 async fn test_apply_time_data_source_read_retries_throttling_errors() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
     use crate::resource::ResourceId;
 
     let provider = MockProvider::new();
@@ -10163,7 +10172,7 @@ async fn test_apply_time_data_source_read_retries_throttling_errors() {
 
     let executable_data_source_values =
         executable_deferred_data_source_values(std::slice::from_ref(&data_source));
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: &[],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -10206,7 +10215,7 @@ async fn test_apply_time_data_source_read_retries_throttling_errors() {
 
 #[tokio::test]
 async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
-    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
     use crate::resource::{AccessPath, PathSegment, ResourceId, State, Subscript};
 
     let provider = MockProvider::new();
@@ -10260,7 +10269,7 @@ async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
     });
     plan.add(create_effect(consumer.clone()));
 
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: &[consumer],
         compositions: &[],
         managed_current: &HashMap::new(),

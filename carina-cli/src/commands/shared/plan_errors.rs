@@ -4,7 +4,7 @@ use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 
 use crate::error::AppError;
 
-pub(crate) fn render_plan_errors_and_abort(plan: &Plan) -> Result<(), AppError> {
+pub(crate) fn render_plan_errors_and_abort<S>(plan: &Plan<S>) -> Result<(), AppError> {
     let errors = plan.errors();
     if errors.is_empty() {
         return Ok(());

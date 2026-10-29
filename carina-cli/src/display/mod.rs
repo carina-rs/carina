@@ -20,9 +20,9 @@ use carina_core::plan_tree::{
     deferred_for_detail_rows, deferred_for_display_name, deferred_for_source, deferred_for_verb,
     extract_compact_hint,
 };
-use carina_core::resource::ResourceId;
 #[cfg(test)]
 use carina_core::resource::Value;
+use carina_core::resource::{ModuleSource, ResourceId};
 use carina_core::schema::SchemaRegistry;
 use carina_core::value::{RenderedValue, ValueSpanKind, render_export_json_value, render_value};
 
@@ -34,12 +34,12 @@ use crate::plan_summary::PlanChangeSummary;
 /// Production has exactly one implementation: the display-safe type built by
 /// the planning seam. The test-only legacy-map implementation keeps older
 /// rendering fixtures concise without reopening the production boundary.
-pub trait HistoricalDisplaySource {
-    fn historical_display<'a>(&'a self, plan: &Plan) -> Cow<'a, HistoricalDisplayAttributes>;
+pub trait HistoricalDisplaySource<S = ModuleSource> {
+    fn historical_display<'a>(&'a self, plan: &Plan<S>) -> Cow<'a, HistoricalDisplayAttributes>;
 }
 
-impl HistoricalDisplaySource for HistoricalDisplayAttributes {
-    fn historical_display<'a>(&'a self, _plan: &Plan) -> Cow<'a, HistoricalDisplayAttributes> {
+impl<S> HistoricalDisplaySource<S> for HistoricalDisplayAttributes {
+    fn historical_display<'a>(&'a self, _plan: &Plan<S>) -> Cow<'a, HistoricalDisplayAttributes> {
         Cow::Borrowed(self)
     }
 }
@@ -101,7 +101,7 @@ struct Sigil {
 }
 
 impl Sigil {
-    fn from_effect(effect: &Effect) -> Self {
+    fn from_effect<S>(effect: &Effect<S>) -> Self {
         let raw = effect.display_glyph();
         let rendered = match effect {
             Effect::Create(_) | Effect::DeferredCreate { .. } => raw.green().bold(),
@@ -199,7 +199,7 @@ fn module_child_prefix() -> String {
 }
 
 /// Check if a resource has a `let` binding (i.e., is not anonymous).
-fn has_binding(resource: carina_core::parser::ResourceRef<'_>) -> bool {
+fn has_binding<S>(resource: carina_core::parser::ResourceRef<'_, S>) -> bool {
     resource.binding().is_some()
 }
 
@@ -209,8 +209,8 @@ fn has_binding(resource: carina_core::parser::ResourceRef<'_>) -> bool {
 /// `name` is the display name of the resource (typically `id.name`).
 /// `parent_binding` is the binding name of the parent in the tree, used to skip
 /// redundant ResourceRef hints.
-fn format_compact_name(
-    resource: carina_core::parser::ResourceRef<'_>,
+fn format_compact_name<S>(
+    resource: carina_core::parser::ResourceRef<'_, S>,
     name: &str,
     parent_binding: Option<&str>,
 ) -> String {
@@ -284,8 +284,8 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn print_plan<D: HistoricalDisplaySource + ?Sized>(
-    plan: &Plan,
+pub fn print_plan<S, D: HistoricalDisplaySource<S> + ?Sized>(
+    plan: &Plan<S>,
     summary: &PlanChangeSummary,
     detail: DetailLevel,
     historical_display: &D,
@@ -319,8 +319,8 @@ pub fn print_plan<D: HistoricalDisplaySource + ?Sized>(
 /// unchanged-attribute counting (refs awscc#206), so server-side default
 /// fields the user never wrote do not inflate the plan output.
 #[allow(clippy::too_many_arguments)]
-pub fn format_plan_with_delete_instances<D: HistoricalDisplaySource + ?Sized>(
-    plan: &Plan,
+pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Sized>(
+    plan: &Plan<S>,
     summary: &PlanChangeSummary,
     detail: DetailLevel,
     historical_display: &D,
@@ -508,10 +508,10 @@ pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?S
 ///
 /// Groups the parameters that are threaded through every recursive call of
 /// `format_effect_tree`, reducing parameter count from 13 to 6.
-struct TreeRenderContext<'a> {
+struct TreeRenderContext<'a, S> {
     out: String,
     printed: HashSet<usize>,
-    plan: &'a Plan,
+    plan: &'a Plan<S>,
     dependents: HashMap<usize, Vec<usize>>,
     replacement_create_info: HashMap<usize, ReplaceDisplayInfo<'a>>,
     replacement_delete_indices: HashSet<usize>,
@@ -528,7 +528,7 @@ struct TreeRenderContext<'a> {
     update_or_replace_targets: HashSet<ResourceId>,
 }
 
-impl<'a> TreeRenderContext<'a> {
+impl<'a, S> TreeRenderContext<'a, S> {
     fn format_effect_tree(
         &mut self,
         idx: usize,
@@ -1106,8 +1106,8 @@ fn child_prefix_for_parent(
 /// `historical_display` provides display-safe historical values for Update,
 /// Replace, and Delete effects.
 #[allow(clippy::too_many_arguments)]
-fn format_plan_tree<'a>(
-    plan: &Plan,
+fn format_plan_tree<'a, S>(
+    plan: &Plan<S>,
     detail: DetailLevel,
     historical_display: &'a HistoricalDisplayAttributes,
     schemas: Option<&'a SchemaRegistry>,
@@ -1164,7 +1164,7 @@ fn format_plan_tree<'a>(
     // followed by the leaf rows. Roots with no lineage entry render
     // at the top level as before. (carina#3307 introduced the
     // grouping; carina#3322 renamed the user-facing label from
-    // `Composition "<binding>"` to the DSL-visible
+    // `LiveComposition "<binding>"` to the DSL-visible
     // `module "<binding>" (<source_path>)` shape.)
     let composition_groups = group_roots_by_outermost_composition(plan, &roots, expansion_trace);
 
@@ -1229,7 +1229,7 @@ fn format_plan_tree<'a>(
 /// `module` matches the DSL `module_call` construct the operator
 /// wrote (`let r = infra { ... }`), so it is something they can
 /// trace back to their own `.crn` — unlike the previous internal
-/// `Composition` label (carina#3322).
+/// `LiveComposition` label (carina#3322).
 fn format_composition_header(binding: &str, source_path: Option<&str>) -> String {
     let sigil = Sigil::module_header();
     let prefix = top_level_sigil_prefix(&sigil);
@@ -1274,8 +1274,8 @@ struct CompositionGroup {
 /// using the `ExpansionTrace`. A root whose effect's resource has an
 /// outermost composition in the trace lands in the grouped bucket
 /// under that call site; everything else stays ungrouped.
-fn group_roots_by_outermost_composition(
-    plan: &Plan,
+fn group_roots_by_outermost_composition<S>(
+    plan: &Plan<S>,
     roots: &[usize],
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
 ) -> CompositionGroups {
@@ -1445,7 +1445,7 @@ fn colored_value_dimmed(rendered: &RenderedValue) -> String {
 }
 
 /// Render a single `DetailRow` into the output string with ANSI colors.
-fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_prefix: &str) {
+fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, attr_prefix: &str) {
     match row {
         DetailRow::Text { text } => {
             writeln!(out, "{}{}", attr_prefix, text).unwrap();
@@ -2035,7 +2035,7 @@ fn render_modified_fields(fields: &[ListOfMapsDiffField]) -> String {
     result_parts.join(", ")
 }
 
-pub fn format_effect(effect: &Effect) -> String {
+pub fn format_effect<S>(effect: &Effect<S>) -> String {
     match effect {
         Effect::Create(r) => format!("Create {}", r.id.human()),
         Effect::ResumeCreate { resource, .. } => {

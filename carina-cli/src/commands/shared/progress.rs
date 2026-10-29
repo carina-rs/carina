@@ -5,14 +5,14 @@
 //! target or finish a spinner without the plain-output fallback.
 
 use std::collections::HashMap;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use carina_core::effect::{Effect, EffectInstanceKey};
 use carina_core::executor::ProgressInfo;
-use carina_core::resource::ResourceId;
+use carina_core::resource::{ModuleSource, ResourceId};
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
@@ -71,15 +71,43 @@ impl ProgressSink {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct EffectProgressKey {
+#[derive(Debug)]
+pub(super) struct EffectProgressKey<S = ModuleSource> {
     resource_id: ResourceId,
     instance: EffectInstanceKey,
-    variant: std::mem::Discriminant<Effect>,
+    variant: std::mem::Discriminant<Effect<S>>,
 }
 
-impl EffectProgressKey {
-    pub(super) fn new(effect: &Effect) -> Self {
+impl<S> Clone for EffectProgressKey<S> {
+    fn clone(&self) -> Self {
+        Self {
+            resource_id: self.resource_id.clone(),
+            instance: self.instance.clone(),
+            variant: self.variant,
+        }
+    }
+}
+
+impl<S> PartialEq for EffectProgressKey<S> {
+    fn eq(&self, other: &Self) -> bool {
+        self.resource_id == other.resource_id
+            && self.instance == other.instance
+            && self.variant == other.variant
+    }
+}
+
+impl<S> Eq for EffectProgressKey<S> {}
+
+impl<S> Hash for EffectProgressKey<S> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.resource_id.hash(state);
+        self.instance.hash(state);
+        self.variant.hash(state);
+    }
+}
+
+impl<S> EffectProgressKey<S> {
+    pub(super) fn new(effect: &Effect<S>) -> Self {
         Self {
             resource_id: effect.resource_id().clone(),
             instance: effect.instance_key(),
@@ -505,10 +533,10 @@ where
     }
 }
 
-impl ProgressBackend<EffectProgressKey> {
+impl<S> ProgressBackend<EffectProgressKey<S>> {
     /// Start a non-refresh effect spinner without exposing the generic spinner
     /// primitive to `ProgressBackend<ResourceId>` callers.
-    pub(super) fn start_effect(&self, key: EffectProgressKey, label: impl Into<String>) {
+    pub(super) fn start_effect(&self, key: EffectProgressKey<S>, label: impl Into<String>) {
         self.start(key, label);
     }
 }

@@ -16,12 +16,14 @@ use carina_core::parser::ProviderConfig;
 use carina_core::parser::{
     BackendConfig, ProviderContext, ResolvedProviderConfigs, SavedProviderConfigs, UpstreamState,
 };
-use carina_core::plan::Plan;
+use carina_core::plan::{Plan, SavedPlan};
 use carina_core::provider_source::ProviderSource;
 #[cfg(test)]
 use carina_core::resource::DeferredValue;
 use carina_core::resource::{
-    Composition, ConcreteValue, Current, DataSource, Resource, ResourceId, State, Value,
+    CompositionSourceIdentityResolver, ConcreteValue, Current, LiveComposition, ModuleSource,
+    Resource, ResourceId, SavedComposition, SavedCompositionOriginId, SavedDataSource,
+    SavedModuleSource, SavedResource, State, Value,
 };
 use carina_core::schema::SchemaKind;
 #[cfg(test)]
@@ -346,16 +348,18 @@ mod recorded_provider_artifact_tests {
 /// }
 /// ```
 #[derive(Debug, Clone)]
-pub struct PlanFileContents {
+pub struct PlanFileContents<S = ModuleSource> {
     /// Plan file format version.
     ///
     /// `PlanFileHeader` in `commands/apply/mod.rs` relies on this field and
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 26 adds mandatory identities for every loaded provider
-    /// artifact. Plan format 25 adds the mandatory typed `data_source_values`
-    /// outcomes and removes duplicate data-source rows from `current_states`.
+    /// Plan format 27 adds a mandatory normalized module-call origin path to
+    /// every saved composition. Plan format 26 adds mandatory identities for
+    /// every loaded provider artifact. Plan format 25 adds the mandatory typed
+    /// `data_source_values` outcomes and removes duplicate data-source rows
+    /// from `current_states`.
     /// Plan format 24 removes the redundant wait target schema kind now that
     /// waits are managed-only. Plan format 23 adds the mandatory
     /// `schema_fingerprints` snapshot. Plan format 21 explicitly tags managed
@@ -385,17 +389,17 @@ pub struct PlanFileContents {
     /// Backend configuration
     pub backend_config: Option<BackendConfig>,
     /// The plan (effects)
-    pub plan: Plan,
+    pub plan: Plan<S>,
     /// Pre-resolution resources sorted by dependencies and keyed with their
     /// paired resolved IDs (for post-apply state saving).
-    pub sorted_resources: Vec<Resource>,
+    pub sorted_resources: Vec<Resource<S>>,
     /// Pre-resolution resources captured before ResourceRef substitution and
     /// stored in the same order as `sorted_resources`.
     ///
     /// The saved-plan apply path zips this snapshot with `sorted_resources`
     /// and keys by the sorted resource ID for dependency analysis and
     /// apply-time reference re-resolution.
-    pub unresolved_resources: Vec<Resource>,
+    pub unresolved_resources: Vec<Resource<S>>,
     /// Virtual resources (module-call attribute containers) emitted
     /// by module expansion at plan time (carina#3248). Persisted so
     /// the saved-plan apply path builds the same `ResolvedBindings`
@@ -412,7 +416,9 @@ pub struct PlanFileContents {
     ///
     /// Empty when the configuration declares no module calls /
     /// `attributes { ... }` blocks.
-    pub compositions: Vec<carina_core::resource::Composition>,
+    /// Every entry carries a required normalized call-ID path; the field is
+    /// mandatory so apply never falls back to resource or binding names.
+    pub compositions: Vec<SavedComposition>,
     /// Data sources (`let x = read aws.iam.user { ... }`) emitted by
     /// module expansion at plan time (carina#3248). Persisted so the
     /// saved-plan apply path can re-create the same unified
@@ -430,12 +436,12 @@ pub struct PlanFileContents {
     ///
     /// Empty when the configuration declares no `read`-bound
     /// bindings.
-    pub data_sources: Vec<carina_core::resource::DataSource>,
+    pub data_sources: Vec<carina_core::resource::DataSource<S>>,
     /// Authored, pre-normalization counterparts of `data_sources`, paired by
     /// index and rewritten to the resolved IDs above. Apply uses these to
     /// derive which input attributes became known at runtime without
     /// rechecking canonicalized literals as authored values.
-    pub data_source_origins: Vec<carina_core::resource::DataSource>,
+    pub data_source_origins: Vec<carina_core::resource::DataSource<S>>,
     /// One plan-time phase-2 outcome for every entry in `data_sources`.
     ///
     /// Format 25 persists this total collection so saved-plan apply never
@@ -473,6 +479,65 @@ pub struct PlanFileContents {
     pub wait_bindings: Vec<PlanWaitBinding>,
 }
 
+impl From<PlanFileContents> for PlanFileContents<SavedModuleSource> {
+    fn from(contents: PlanFileContents) -> Self {
+        let PlanFileContents {
+            version,
+            carina_version,
+            timestamp,
+            source_path,
+            state_lineage,
+            state_serial,
+            provider_configs,
+            backend_config,
+            plan,
+            sorted_resources,
+            unresolved_resources,
+            compositions,
+            data_sources,
+            data_source_origins,
+            data_source_values,
+            current_states,
+            upstream_snapshot,
+            upstream_sources,
+            wait_bindings,
+        } = contents;
+        Self {
+            version,
+            carina_version,
+            timestamp,
+            source_path,
+            state_lineage,
+            state_serial,
+            provider_configs,
+            backend_config,
+            plan: plan.into(),
+            sorted_resources: sorted_resources
+                .into_iter()
+                .map(SavedResource::from)
+                .collect(),
+            unresolved_resources: unresolved_resources
+                .into_iter()
+                .map(SavedResource::from)
+                .collect(),
+            compositions,
+            data_sources: data_sources
+                .into_iter()
+                .map(SavedDataSource::from)
+                .collect(),
+            data_source_origins: data_source_origins
+                .into_iter()
+                .map(SavedDataSource::from)
+                .collect(),
+            data_source_values,
+            current_states,
+            upstream_snapshot,
+            upstream_sources,
+            wait_bindings,
+        }
+    }
+}
+
 /// Provider evidence captured atomically from the wiring context used to plan.
 ///
 /// The fields are private so production code cannot assemble stale, partial,
@@ -495,18 +560,17 @@ struct ProviderEvidence {
 /// inventory to match every referenced type exactly and the provider-artifact
 /// keys to match the providers implied by the saved provider configurations.
 ///
-/// The format remains 26 because this change does not alter its on-disk shape;
-/// it only tightens validation. Plans written by the unreleased #4059 build
-/// that violate these rules are rejected as corrupt. No release has shipped
-/// since format 26 was introduced.
+/// Format 27 persists saved compositions with mandatory normalized call-origin
+/// paths. Provider evidence is also validated both when recording and when
+/// decoding a saved plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(into = "PlanFileWire", try_from = "PlanFileWire")]
 pub struct PlanFile {
-    contents: PlanFileContents,
+    contents: PlanFileContents<SavedModuleSource>,
     evidence: ProviderEvidence,
 }
 
-/// Private format-26 wire representation.
+/// Private format-27 wire representation.
 ///
 /// Field order is intentionally identical to the historical `PlanFile`
 /// serialization order. Evidence is mandatory and is never defaulted.
@@ -520,15 +584,14 @@ struct PlanFileWire {
     state_serial: Option<u64>,
     provider_configs: SavedProviderConfigs,
     backend_config: Option<BackendConfig>,
-    plan: Plan,
-    sorted_resources: Vec<Resource>,
-    unresolved_resources: Vec<Resource>,
+    plan: SavedPlan,
+    sorted_resources: Vec<SavedResource>,
+    unresolved_resources: Vec<SavedResource>,
+    compositions: Vec<SavedComposition>,
     #[serde(default)]
-    compositions: Vec<Composition>,
+    data_sources: Vec<SavedDataSource>,
     #[serde(default)]
-    data_sources: Vec<DataSource>,
-    #[serde(default)]
-    data_source_origins: Vec<DataSource>,
+    data_source_origins: Vec<SavedDataSource>,
     data_source_values: Vec<SavedDataSourceValue>,
     current_states: Vec<CurrentStateEntry>,
     upstream_snapshot: HashMap<String, HashMap<String, Value>>,
@@ -935,7 +998,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
 }
 
 impl Deref for PlanFile {
-    type Target = PlanFileContents;
+    type Target = PlanFileContents<SavedModuleSource>;
 
     fn deref(&self) -> &Self::Target {
         &self.contents
@@ -965,11 +1028,31 @@ impl PlanFileContents {
         let references = self.referenced_schema_types();
         let evidence = ProviderEvidence::capture(&references, &self.provider_configs, ctx)?;
         Ok(PlanFile {
+            contents: self.into(),
+            evidence,
+        })
+    }
+}
+
+#[cfg(test)]
+impl PlanFileContents<SavedModuleSource> {
+    /// Re-record saved contents after a fixture mutates them without
+    /// converting the saved module source back into a live source.
+    fn record_for_test<R>(
+        self,
+        validated: &ValidatedConfig<R>,
+    ) -> Result<PlanFile, ProviderEvidenceError> {
+        let references = self.referenced_schema_types();
+        let evidence =
+            ProviderEvidence::capture(&references, &self.provider_configs, validated.context())?;
+        Ok(PlanFile {
             contents: self,
             evidence,
         })
     }
+}
 
+impl<S> PlanFileContents<S> {
     pub(crate) fn referenced_schema_types(&self) -> PlanSchemaReferences {
         fn insert(
             references: &mut BTreeSet<PlanSchemaReference>,
@@ -1091,10 +1174,10 @@ impl PlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 26;
+    pub const CURRENT_VERSION: u32 = 27;
 
     #[cfg(test)]
-    pub(crate) fn into_contents(self) -> PlanFileContents {
+    pub(crate) fn into_contents(self) -> PlanFileContents<SavedModuleSource> {
         self.contents
     }
 
@@ -1220,9 +1303,9 @@ impl PlanFile {
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.
     pub(crate) fn contains_redacted_secret_placeholders(&self) -> bool {
-        use carina_core::resource::{Composition, DataSource, Signature};
+        use carina_core::resource::{DataSource, SavedComposition};
 
-        fn resource_contains(resource: &Resource) -> bool {
+        fn resource_contains<S>(resource: &Resource<S>) -> bool {
             let Resource {
                 id: _id,
                 attributes,
@@ -1239,7 +1322,7 @@ impl PlanFile {
                 .any(carina_core::value::contains_redacted_secret)
         }
 
-        fn data_source_contains(data_source: &DataSource) -> bool {
+        fn data_source_contains<S>(data_source: &DataSource<S>) -> bool {
             let DataSource {
                 id: _id,
                 attributes,
@@ -1252,30 +1335,6 @@ impl PlanFile {
             attributes
                 .values()
                 .any(carina_core::value::contains_redacted_secret)
-        }
-
-        fn composition_contains(composition: &Composition) -> bool {
-            let Composition {
-                id: _id,
-                signature,
-                binding: _binding,
-                dependency_bindings: _dependency_bindings,
-                module_name: _module_name,
-                instance: _instance,
-                provenance: _provenance,
-                quoted_string_attrs: _quoted_string_attrs,
-            } = composition;
-            let Signature {
-                arguments,
-                attributes,
-                pending_constraints: _pending_constraints,
-            } = signature;
-            arguments
-                .values()
-                .any(|argument| argument.contains_redacted_secret_placeholder())
-                || attributes
-                    .values()
-                    .any(|attribute| attribute.contains_redacted_secret_placeholder())
         }
 
         fn state_contains(state: &State) -> bool {
@@ -1340,7 +1399,9 @@ impl PlanFile {
             || plan.contains_redacted_secret_placeholders()
             || sorted_resources.iter().any(resource_contains)
             || unresolved_resources.iter().any(resource_contains)
-            || compositions.iter().any(composition_contains)
+            || compositions
+                .iter()
+                .any(SavedComposition::contains_redacted_secret_placeholder)
             || data_sources.iter().any(data_source_contains)
             || data_source_origins.iter().any(data_source_contains)
             || data_source_values.iter().any(data_source_value_contains)
@@ -1893,8 +1954,8 @@ mod schema_fingerprint_tests {
     }
 }
 
-pub(crate) fn collect_historical_display_attributes(
-    plan: &Plan,
+pub(crate) fn collect_historical_display_attributes<S>(
+    plan: &Plan<S>,
     managed_current: &HashMap<ResourceId, Current>,
     state_file: Option<&StateFile>,
 ) -> HistoricalDisplayAttributes {
@@ -1969,7 +2030,7 @@ pub(crate) struct MovedOrigins {
 }
 
 impl MovedOrigins {
-    pub(crate) fn from_plan(plan: &Plan) -> Self {
+    pub(crate) fn from_plan<S>(plan: &Plan<S>) -> Self {
         let by_destination = plan
             .effects()
             .iter()
@@ -2177,9 +2238,16 @@ impl ReloadedCurrentStateEntry {
 /// inconsistent with its evidence.
 #[derive(Debug)]
 pub(crate) struct ReloadedPlanFile {
-    contents: PlanFileContents,
+    contents: PlanFileContents<SavedModuleSource>,
     evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ReloadedCompositionRehydrationError {
+    MissingCandidate(Box<SavedCompositionOriginId>),
+    SourceIdentity(carina_core::resource::CompositionSourceIdentityError),
+    Secret(carina_core::value::SecretRehydrationSiteError),
 }
 
 impl ReloadedPlanFile {
@@ -2212,51 +2280,89 @@ impl ReloadedPlanFile {
         Ok(())
     }
 
-    pub(crate) fn plan(&self) -> &Plan {
+    pub(crate) fn plan(&self) -> &SavedPlan {
         &self.contents.plan
     }
 
-    pub(crate) fn plan_mut(&mut self) -> &mut Plan {
+    pub(crate) fn plan_mut(&mut self) -> &mut SavedPlan {
         &mut self.contents.plan
     }
 
-    pub(crate) fn sorted_resources(&self) -> &[Resource] {
+    pub(crate) fn sorted_resources(&self) -> &[SavedResource] {
         &self.contents.sorted_resources
     }
 
-    pub(crate) fn sorted_resources_mut(&mut self) -> &mut Vec<Resource> {
+    pub(crate) fn sorted_resources_mut(&mut self) -> &mut Vec<SavedResource> {
         &mut self.contents.sorted_resources
     }
 
-    pub(crate) fn unresolved_resources(&self) -> &[Resource] {
+    pub(crate) fn unresolved_resources(&self) -> &[SavedResource] {
         &self.contents.unresolved_resources
     }
 
-    pub(crate) fn unresolved_resources_mut(&mut self) -> &mut Vec<Resource> {
+    pub(crate) fn unresolved_resources_mut(&mut self) -> &mut Vec<SavedResource> {
         &mut self.contents.unresolved_resources
     }
 
-    pub(crate) fn compositions(&self) -> &[Composition] {
+    pub(crate) fn compositions(&self) -> &[SavedComposition] {
         &self.contents.compositions
     }
 
-    pub(crate) fn compositions_mut(&mut self) -> &mut Vec<Composition> {
-        &mut self.contents.compositions
+    pub(crate) fn rehydrate_composition_secrets(
+        &mut self,
+        evaluated: &[LiveComposition],
+        source_identities: &mut CompositionSourceIdentityResolver,
+    ) -> Result<(), ReloadedCompositionRehydrationError> {
+        let needs_rehydration = self
+            .contents
+            .compositions
+            .iter()
+            .any(SavedComposition::contains_redacted_secret_placeholder);
+        if !needs_rehydration {
+            return Ok(());
+        }
+
+        let mut candidates = HashMap::with_capacity(evaluated.len());
+        for live in evaluated {
+            let origin = source_identities
+                .saved_origin_id(live.call_path())
+                .map_err(ReloadedCompositionRehydrationError::SourceIdentity)?;
+            candidates.insert(origin, live);
+        }
+        let rehydrated = self
+            .contents
+            .compositions
+            .iter()
+            .map(|composition| {
+                if !composition.contains_redacted_secret_placeholder() {
+                    return Ok(composition.clone());
+                }
+                let candidate = candidates.get(&composition.origin_id).ok_or_else(|| {
+                    ReloadedCompositionRehydrationError::MissingCandidate(Box::new(
+                        composition.origin_id.clone(),
+                    ))
+                })?;
+                carina_core::value::rehydrate_saved_composition_secrets(composition, candidate)
+                    .map_err(ReloadedCompositionRehydrationError::Secret)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.contents.compositions = rehydrated;
+        Ok(())
     }
 
-    pub(crate) fn data_sources(&self) -> &[DataSource] {
+    pub(crate) fn data_sources(&self) -> &[SavedDataSource] {
         &self.contents.data_sources
     }
 
-    pub(crate) fn data_sources_mut(&mut self) -> &mut Vec<DataSource> {
+    pub(crate) fn data_sources_mut(&mut self) -> &mut Vec<SavedDataSource> {
         &mut self.contents.data_sources
     }
 
-    pub(crate) fn data_source_origins(&self) -> &[DataSource] {
+    pub(crate) fn data_source_origins(&self) -> &[SavedDataSource] {
         &self.contents.data_source_origins
     }
 
-    pub(crate) fn data_source_origins_mut(&mut self) -> &mut Vec<DataSource> {
+    pub(crate) fn data_source_origins_mut(&mut self) -> &mut Vec<SavedDataSource> {
         &mut self.contents.data_source_origins
     }
 
@@ -2666,7 +2772,10 @@ mod managed_current_serde_tests {
         let plan = plan
             .reload_in_flight_from_locked_state(Some(&locked))
             .expect("a moved continuation must reload from its source row");
-        let ReloadedCurrentStateEntry::Managed { id, current } = &plan.current_states()[0];
+        let ReloadedCurrentStateEntry::Managed { id, current } = plan
+            .current_states()
+            .first()
+            .expect("moved continuation current state");
         assert_eq!(id, &destination);
         let Current::CreateInFlight(pending) = current.as_ref() else {
             panic!("moved marker must reload the state-owned continuation");
@@ -2700,6 +2809,7 @@ impl CurrentStateEntry {
 #[derive(Debug)]
 enum PlanSaveError {
     Serialization(carina_core::value::SerializationError),
+    CompositionSourceIdentity(carina_core::resource::CompositionSourceIdentityError),
     ProviderEvidence(ProviderEvidenceError),
 }
 
@@ -2715,10 +2825,17 @@ impl From<ProviderEvidenceError> for PlanSaveError {
     }
 }
 
+impl From<carina_core::resource::CompositionSourceIdentityError> for PlanSaveError {
+    fn from(error: carina_core::resource::CompositionSourceIdentityError) -> Self {
+        Self::CompositionSourceIdentity(error)
+    }
+}
+
 impl std::fmt::Display for PlanSaveError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Serialization(error) => error.fmt(formatter),
+            Self::CompositionSourceIdentity(error) => error.fmt(formatter),
             Self::ProviderEvidence(error) => error.fmt(formatter),
         }
     }
@@ -2794,6 +2911,8 @@ fn build_plan_file_contents<E>(
         .unwrap_or_else(|_| path.to_path_buf())
         .display()
         .to_string();
+    let mut composition_source_identities =
+        CompositionSourceIdentityResolver::new(get_base_dir(path))?;
 
     let desired_resources: HashMap<ResourceId, Resource> = ctx
         .sorted_resources
@@ -3014,8 +3133,14 @@ fn build_plan_file_contents<E>(
         compositions: ctx
             .compositions
             .iter()
-            .map(carina_core::value::redact_secrets_in_virtual)
-            .collect::<Result<Vec<_>, _>>()?,
+            .map(|composition| {
+                let saved = composition
+                    .clone()
+                    .into_saved_with_resolver(&mut composition_source_identities)?;
+                carina_core::value::redact_secrets_in_saved_composition(&saved)
+                    .map_err(PlanSaveError::from)
+            })
+            .collect::<Result<Vec<_>, PlanSaveError>>()?,
         data_sources: ctx
             .data_sources
             .iter()
@@ -3078,20 +3203,22 @@ fn build_plan_file_contents<E>(
     Ok(contents)
 }
 
-/// Format a failure from `build_plan_file` into the CLI's
-/// "cannot save plan" diagnostic, suggesting the caller drop `flag` (for
-/// example `--json` or `--out`) to fall back to display-only output.
-fn format_plan_save_error(e: &PlanSaveError, flag: &str) -> String {
-    match e {
+/// Preserve typed plan-save failures where available, while adding the CLI's
+/// display-only fallback guidance to serialization failures that need it.
+fn map_plan_save_error(error: PlanSaveError, flag: &str) -> AppError {
+    match error {
         PlanSaveError::Serialization(
             carina_core::value::SerializationError::UnknownNotAllowed { reason, .. },
-        ) => format!(
+        ) => AppError::Config(format!(
             "Cannot save plan: it depends on values that are not yet \
              applied ({reason}). Apply the upstream module(s) first, \
              or rerun without {flag}."
-        ),
-        PlanSaveError::Serialization(error) => error.to_string(),
-        PlanSaveError::ProviderEvidence(error) => format!("Cannot save plan: {error}"),
+        )),
+        PlanSaveError::Serialization(error) => AppError::Config(error.to_string()),
+        PlanSaveError::CompositionSourceIdentity(error) => AppError::from(error),
+        PlanSaveError::ProviderEvidence(error) => {
+            AppError::Config(format!("Cannot save plan: {error}"))
+        }
     }
 }
 
@@ -3534,7 +3661,7 @@ pub async fn run_plan(
             &state_file,
             &validated_plan,
         )
-        .map_err(|e| format_plan_save_error(&e, "--json"))?;
+        .map_err(|error| map_plan_save_error(error, "--json"))?;
         let json_str = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         println!("{}", json_str);
@@ -3592,7 +3719,7 @@ pub async fn run_plan(
             &state_file,
             &validated_plan,
         )
-        .map_err(|e| format_plan_save_error(&e, "--out"))?;
+        .map_err(|error| map_plan_save_error(error, "--out"))?;
         let json_out = carina_core::utils::pretty_with_newline(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         Some(json_out)
@@ -3724,7 +3851,7 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
 pub(crate) struct CheckExportsPreApplyInput<'a> {
     pub export_params: &'a [carina_core::parser::InferredExportParam],
     pub resources: &'a [Resource],
-    pub compositions: &'a [carina_core::resource::Composition],
+    pub compositions: &'a [carina_core::resource::LiveComposition],
     pub managed_current: &'a HashMap<ResourceId, Current>,
     pub data_source_values: &'a carina_core::data_source_value::DataSourceValues,
     /// Persisted secret shapes that classify provider-returned plaintext before
@@ -3775,8 +3902,8 @@ pub(crate) fn check_exports_pre_apply(
         input.schemas,
         input.resources,
     );
-    let mut bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-        carina_core::binding_index::PreApplyInputs {
+    let mut bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+        carina_core::binding_index::LivePreApplyInputs {
             managed: input.resources,
             compositions: input.compositions,
             managed_current: &plan_input_current,
@@ -5058,8 +5185,8 @@ exports { region: String = "ap-northeast-1" }"#,
                 &parsed.data_sources,
                 |_| carina_core::data_source_value::DataSourceValue::deferred_to_apply(Vec::new()),
             );
-        let export_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-            carina_core::binding_index::PreApplyInputs {
+        let export_bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+            carina_core::binding_index::LivePreApplyInputs {
                 managed: &parsed.resources,
                 compositions: &parsed.compositions,
                 managed_current: &managed_current,
@@ -5128,9 +5255,9 @@ mod run_plan_out_tests {
     use carina_core::parser::{CompareOp, ValidateExpr};
     use carina_core::provider::ProviderRouter;
     use carina_core::resource::{
-        AccessPath, Composition, CompositionArgument, DataSource, DeferredValue,
-        ModuleConstraintId, PendingModuleConstraint, ResolvedResource, ResourceId, Signature,
-        Value,
+        AccessPath, DataSource, DeferredValue, LiveComposition, LiveCompositionArgument,
+        LiveCompositionSignature, ModuleConstraintId, PendingModuleConstraint, ResolvedResource,
+        ResourceId, Value,
     };
     use std::fs;
 
@@ -5143,8 +5270,12 @@ mod run_plan_out_tests {
             .clone()
     }
 
-    fn saved_composition_argument(value: Value) -> CompositionArgument {
-        serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap()
+    fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
+        LiveCompositionArgument::from_value(
+            value,
+            carina_core::parser::TypeExpr::String,
+            carina_core::parser::ArgumentOrigin::Defaulted,
+        )
     }
 
     fn resource_with_secret(identity: &str, plaintext: &str) -> Resource {
@@ -5740,11 +5871,11 @@ mod run_plan_out_tests {
             "name".to_string(),
             saved_composition_argument(Value::resource_ref("producer", "name", vec![])),
         );
-        let prepared = Composition {
+        let prepared = LiveComposition {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", "checked",
             )),
-            signature: Signature {
+            signature: LiveCompositionSignature {
                 arguments,
                 attributes: indexmap::IndexMap::new(),
                 pending_constraints: vec![PendingModuleConstraint {
@@ -5761,7 +5892,7 @@ mod run_plan_out_tests {
             dependency_bindings: Default::default(),
             module_name: "checked_module".to_string(),
             instance: "root.checked".to_string(),
-            provenance: Default::default(),
+            call_path: crate::test_composition_call_path(),
             quoted_string_attrs: Default::default(),
         };
         let parsed = carina_core::parser::ParsedFile::default();
@@ -5864,6 +5995,7 @@ mod run_plan_out_tests {
     fn build_plan_file_reports_provider_evidence_failure_without_panicking() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("main.crn");
+        fs::write(&path, "provider aws {}\n").expect("write source configuration");
         let configured = ProviderConfig {
             name: "aws".to_string(),
             attributes: indexmap::IndexMap::new(),
@@ -5918,8 +6050,29 @@ mod run_plan_out_tests {
             ) if provider == "aws"
         ));
         assert_eq!(
-            format_plan_save_error(&error, "--out"),
+            map_plan_save_error(error, "--out").to_string(),
             "Cannot save plan: invalid saved-plan provider evidence: provider_artifacts is missing expected provider `aws`"
+        );
+    }
+
+    #[test]
+    fn composition_identity_plan_save_error_stays_typed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("missing-source-root");
+        let identity_error = CompositionSourceIdentityResolver::new(&missing)
+            .expect_err("missing source root must fail canonicalization");
+
+        let error = map_plan_save_error(
+            PlanSaveError::CompositionSourceIdentity(identity_error),
+            "--out",
+        );
+        let AppError::CompositionSourceIdentity(identity_error) = error else {
+            panic!("plan save flattened the composition identity error: {error:?}");
+        };
+        assert!(
+            std::error::Error::source(&identity_error)
+                .is_some_and(|source| source.downcast_ref::<std::io::Error>().is_some()),
+            "plan save dropped the composition identity io source: {identity_error:?}",
         );
     }
 }
@@ -6024,8 +6177,8 @@ mod export_diff_tests {
                 "vpc_id",
                 Value::Concrete(ConcreteValue::String("vpc-123".into())),
             );
-        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-            carina_core::binding_index::PreApplyInputs {
+        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+            carina_core::binding_index::LivePreApplyInputs {
                 managed: &[resource],
                 compositions: &[],
                 managed_current: &HashMap::new(),
@@ -6056,8 +6209,8 @@ mod export_diff_tests {
                     ConcreteValue::String("topsecretXYZ".into()),
                 )))),
             );
-        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-            carina_core::binding_index::PreApplyInputs {
+        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+            carina_core::binding_index::LivePreApplyInputs {
                 managed: &[resource],
                 compositions: &[],
                 managed_current: &HashMap::new(),

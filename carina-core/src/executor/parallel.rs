@@ -13,8 +13,6 @@ use crate::resource::Resource;
 use crate::resource::{ResourceId, ResourceIdentity};
 use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
-#[cfg(test)]
-use super::ProviderCheckInputs;
 use super::basic::{
     BasicEffectCtx, ExecutionState, count_actionable_effects, execute_basic_effect,
     process_basic_result, refresh_pending_states, resolve_data_source,
@@ -23,8 +21,8 @@ use super::deferred_dispatch::PureMetaCtx;
 use super::provider_ready::ProviderPreparationContext;
 use super::replace::SingleEffectResult;
 use super::scheduler::{
-    FailureView, PureMetaOutcome, SchedulerDeps, build_scheduler_deps, dependency_failed_reason,
-    failure_binding_name, try_dispatch_pure_meta, wait_dependency_failed_reason,
+    FailureView, PureMetaOutcome, SchedulerDeps, dependency_failed_reason, failure_binding_name,
+    try_dispatch_pure_meta, wait_dependency_failed_reason,
 };
 use super::wait::{
     SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitOutcome, WaitSignal,
@@ -32,17 +30,21 @@ use super::wait::{
     wait_failure_message,
 };
 use super::{
-    ExecutionAccumulator, ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult,
-    ProgressInfo, unresolved_data_source_inputs,
+    ExecutionAccumulator, ExecutionEvent, ExecutionObserver, ExecutionResult, ProgressInfo,
+    RuntimeExecutionInput, unresolved_data_source_inputs,
 };
+#[cfg(test)]
+use super::{ExecutionInput, ProviderCheckInputs};
 
-pub(super) struct ExpandedEffects {
-    pub(super) effects: Vec<Effect>,
+pub(super) struct ExpandedEffects<S> {
+    pub(super) effects: Vec<Effect<S>>,
     pub(super) deferred_replace_delete_deps: Vec<(usize, usize)>,
     pub(super) source_effect_indices: Vec<usize>,
 }
 
-pub(super) fn expand_deferred_replace_effects(plan_effects: &[Effect]) -> ExpandedEffects {
+pub(super) fn expand_deferred_replace_effects<S: Clone>(
+    plan_effects: &[Effect<S>],
+) -> ExpandedEffects<S> {
     let mut effects = Vec::with_capacity(plan_effects.len());
     let mut deferred_replace_delete_deps = Vec::new();
     let mut source_effect_indices = Vec::with_capacity(plan_effects.len());
@@ -77,8 +79,8 @@ pub(super) fn expand_deferred_replace_effects(plan_effects: &[Effect]) -> Expand
     }
 }
 
-pub(super) fn apply_deferred_replace_delete_deps(
-    effects: &[Effect],
+pub(super) fn apply_deferred_replace_delete_deps<S>(
+    effects: &[Effect<S>],
     deps_of: &mut HashMap<usize, HashSet<usize>>,
     deferred_replace_delete_deps: &[(usize, usize)],
 ) {
@@ -108,18 +110,18 @@ pub(super) fn apply_deferred_replace_delete_deps(
     }
 }
 
-pub(super) fn is_runtime_dispatchable(
-    effect: &Effect,
-    data_source_values: &crate::data_source_value::ExecutableDataSourceValues,
+pub(super) fn is_runtime_dispatchable<S: Clone>(
+    effect: &Effect<S>,
+    data_source_values: &crate::data_source_value::ExecutableDataSourceValues<S>,
 ) -> bool {
     is_deferred_read(effect, data_source_values)
         || (!matches!(effect, Effect::Read { .. })
             && (!effect.is_state_operation() || effect.is_scheduler_meta()))
 }
 
-pub(super) fn is_runtime_noop(
-    effect: &Effect,
-    data_source_values: &crate::data_source_value::ExecutableDataSourceValues,
+pub(super) fn is_runtime_noop<S: Clone>(
+    effect: &Effect<S>,
+    data_source_values: &crate::data_source_value::ExecutableDataSourceValues<S>,
 ) -> bool {
     match effect {
         Effect::Read { .. } => !is_deferred_read(effect, data_source_values),
@@ -127,9 +129,9 @@ pub(super) fn is_runtime_noop(
     }
 }
 
-fn count_runtime_effects(
-    effects: &[Effect],
-    data_source_values: &crate::data_source_value::ExecutableDataSourceValues,
+fn count_runtime_effects<S: Clone>(
+    effects: &[Effect<S>],
+    data_source_values: &crate::data_source_value::ExecutableDataSourceValues<S>,
 ) -> usize {
     count_actionable_effects(effects)
         + effects
@@ -138,9 +140,9 @@ fn count_runtime_effects(
             .count()
 }
 
-fn is_deferred_read(
-    effect: &Effect,
-    data_source_values: &crate::data_source_value::ExecutableDataSourceValues,
+fn is_deferred_read<S: Clone>(
+    effect: &Effect<S>,
+    data_source_values: &crate::data_source_value::ExecutableDataSourceValues<S>,
 ) -> bool {
     matches!(effect, Effect::Read { resource } if data_source_values.deferred_inputs(&resource.id).is_some())
 }
@@ -172,7 +174,7 @@ fn format_unresolved_read_inputs(unresolved: &[super::UnresolvedDataSourceInput]
 pub(super) fn build_dependency_levels(
     effects: &[Effect],
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
-    compositions: &[crate::resource::Composition],
+    compositions: &[crate::resource::LiveComposition],
 ) -> Vec<Vec<usize>> {
     let deps_of = crate::effect::deps::build_effect_dependency_analysis(
         effects,
@@ -232,12 +234,12 @@ pub(super) fn build_dependency_levels(
     result
 }
 
-pub(super) async fn execute_effects_sequential(
+pub(super) async fn execute_effects_sequential<S: Clone>(
     provider: &dyn Provider,
-    input: &mut ExecutionInput<'_>,
-    observer: &dyn ExecutionObserver,
+    input: &mut RuntimeExecutionInput<'_, S>,
+    observer: &dyn ExecutionObserver<S>,
     shutdown: &ShutdownToken,
-) -> (ExecutionResult, bool) {
+) -> (ExecutionResult<S>, bool) {
     let result = ExecutionResult {
         success_count: input.precompleted_success_count,
         failure_count: 0,
@@ -259,7 +261,7 @@ pub(super) async fn execute_effects_sequential(
     }
     let mut pending_refreshes: HashMap<ResourceId, AppliedIdentifier> = HashMap::new();
     let mut runtime_authored_resource_ids: HashSet<ResourceId> = HashSet::new();
-    let module_gate = super::ModuleConstraintGate::new(input.compositions);
+    let module_gate = input.compositions.module_constraint_gate();
 
     let ExpandedEffects {
         effects: expanded_effects,
@@ -278,10 +280,9 @@ pub(super) async fn execute_effects_sequential(
     let SchedulerDeps {
         mut deps_of,
         unresolved: scheduler_dependency_errors,
-    } = build_scheduler_deps(
+    } = input.compositions.scheduler_dependencies(
         &effects,
         resource_origins,
-        input.compositions,
         &deferred_replace_delete_deps,
     );
 
@@ -334,7 +335,7 @@ pub(super) async fn execute_effects_sequential(
         }
     }
 
-    let mut in_flight: WaitAwareInFlight<'_, SingleEffectResult> = WaitAwareInFlight::new();
+    let mut in_flight: WaitAwareInFlight<'_, SingleEffectResult<S>> = WaitAwareInFlight::new();
     let mut cancelled = false;
     let cleanup_loop = shutdown.cleanup_aware_loop();
 
@@ -465,10 +466,9 @@ pub(super) async fn execute_effects_sequential(
                             effects.push(child);
                             actionable_indices.push(child_idx);
                         }
-                        let rebuilt = build_scheduler_deps(
+                        let rebuilt = input.compositions.scheduler_dependencies(
                             &effects,
                             resource_origins,
-                            input.compositions,
                             &deferred_replace_delete_deps,
                         );
                         deps_of = rebuilt.deps_of;
@@ -585,6 +585,7 @@ pub(super) async fn execute_effects_sequential(
                                     provider_check_inputs.data_source_input(resource.as_inner());
                                 match resolve_data_source(check_input, &binding_snapshot) {
                                     Ok(resolved_input) => {
+                                        resolved = resolved_input.value().clone();
                                         let resolved_secret_shapes =
                                             crate::resource::attrs_to_hashmap(
                                                 &resolved_input.value().attributes,
@@ -597,10 +598,9 @@ pub(super) async fn execute_effects_sequential(
                                                 &preparation,
                                             ) {
                                                 Ok(ready) => {
-                                                    resolved = ready.as_data_source().clone();
                                                     let provider_values =
                                                         crate::resource::attrs_to_hashmap(
-                                                            &resolved.attributes,
+                                                            &ready.as_data_source().attributes,
                                                         );
                                                     let resolved_attrs = crate::binding_index::SecretPreservingAttributes::from_provider_values(
                                                         &resolved_secret_shapes,
@@ -1008,7 +1008,7 @@ mod tests {
         ProviderResult, ReadRequest, UpdateRequest,
     };
     use crate::resource::{
-        Composition, ConcreteValue, ResolvedResource, ResourceIdentity, State, Value,
+        ConcreteValue, LiveComposition, ResolvedResource, ResourceIdentity, State, Value,
     };
     use crate::schema::SchemaRegistry;
     use crate::wait::predicate::{AttrPath, WaitPredicate};
@@ -1264,7 +1264,7 @@ mod tests {
             ),
         ]);
         let schemas = SchemaRegistry::new();
-        let mut input = ExecutionInput {
+        let mut input: RuntimeExecutionInput = ExecutionInput {
             plan: &plan,
             provider_check_inputs: ProviderCheckInputs::PlanNormalized {
                 resource_origins: &unresolved,
@@ -1281,7 +1281,8 @@ mod tests {
             parallelism: std::num::NonZeroUsize::new(2).unwrap(),
             precompleted_success_count: 0,
             checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
-        };
+        }
+        .into();
         let observer = RecordingSkipObserver::new();
 
         let result = tokio::time::timeout(
@@ -1381,7 +1382,7 @@ mod tests {
         );
 
         let schemas = SchemaRegistry::new();
-        let mut input = ExecutionInput {
+        let mut input: RuntimeExecutionInput = ExecutionInput {
             plan: &plan,
             provider_check_inputs: ProviderCheckInputs::PlanNormalized {
                 resource_origins: &unresolved,
@@ -1398,7 +1399,8 @@ mod tests {
             parallelism: std::num::NonZeroUsize::new(2).unwrap(),
             precompleted_success_count: 0,
             checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
-        };
+        }
+        .into();
         let observer = RecordingSkipObserver::new();
 
         let result = tokio::time::timeout(
@@ -1590,20 +1592,20 @@ mod tests {
             Value::resource_ref("module", "parent_id", vec![]),
         );
 
-        let mut virt_attrs: indexmap::IndexMap<String, crate::resource::CompositionAttribute> =
+        let mut virt_attrs: indexmap::IndexMap<String, crate::resource::LiveCompositionAttribute> =
             indexmap::IndexMap::new();
         virt_attrs.insert(
             "parent_id".to_string(),
-            crate::resource::CompositionAttribute::from_value(
+            crate::resource::LiveCompositionAttribute::from_value(
                 Value::resource_ref("parent", "id", vec![]),
                 None,
             ),
         );
-        let virt = Composition {
+        let virt = LiveComposition {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
                 "_virtual", "_virtual", "module", None,
             )),
-            signature: crate::resource::Signature {
+            signature: crate::resource::LiveCompositionSignature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,
                 pending_constraints: Vec::new(),
@@ -1612,7 +1614,7 @@ mod tests {
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "network".to_string(),
             instance: "module".to_string(),
-            provenance: Default::default(),
+            call_path: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         };
 
@@ -1650,7 +1652,7 @@ mod tests {
 
     #[test]
     fn relax_update_update_edges_handles_empty_plan() {
-        let effects = Vec::new();
+        let effects: Vec<Effect> = Vec::new();
         let mut analysis =
             build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply)
                 .expect("dependency analysis must resolve");
@@ -1692,23 +1694,23 @@ mod tests {
         role.binding = Some("bootstrap.role".to_string());
 
         // carina#3181: composition resources are a distinct typestate.
-        let mut virt_attrs: indexmap::IndexMap<String, crate::resource::CompositionAttribute> =
+        let mut virt_attrs: indexmap::IndexMap<String, crate::resource::LiveCompositionAttribute> =
             indexmap::IndexMap::new();
         virt_attrs.insert(
             "role_name".to_string(),
-            crate::resource::CompositionAttribute::from_value(
+            crate::resource::LiveCompositionAttribute::from_value(
                 Value::resource_ref("bootstrap.role", "role_name", vec![]),
                 None,
             ),
         );
-        let virt = Composition {
+        let virt = LiveComposition {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
                 "_virtual",
                 "_virtual",
                 "bootstrap",
                 None,
             )),
-            signature: crate::resource::Signature {
+            signature: crate::resource::LiveCompositionSignature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,
                 pending_constraints: Vec::new(),
@@ -1717,7 +1719,7 @@ mod tests {
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "github-oidc".to_string(),
             instance: "bootstrap".to_string(),
-            provenance: Default::default(),
+            call_path: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         };
 

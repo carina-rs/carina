@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::resource::{AccessPath, DataSource, ResourceId, State, UnknownReason};
+use crate::resource::{AccessPath, DataSource, ModuleSource, ResourceId, State, UnknownReason};
 
 /// A data-source input attribute whose unresolved value shapes make the read
 /// apply-time dependent or unsafe to hand to a provider.
@@ -51,16 +51,16 @@ impl DataSourceValue {
 /// paired `(DataSource, DataSourceValue)` entries and cannot observe a query
 /// that is absent from both the read-state and deferred sets.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DataSourceValues {
-    data_sources: Vec<DataSource>,
+pub struct DataSourceValues<S = ModuleSource> {
+    data_sources: Vec<DataSource<S>>,
     values: Vec<DataSourceValue>,
 }
 
-impl DataSourceValues {
+impl<S: Clone> DataSourceValues<S> {
     /// Build a total collection by classifying every configured data source.
     pub fn from_data_sources(
-        data_sources: &[DataSource],
-        mut value_for: impl FnMut(&DataSource) -> DataSourceValue,
+        data_sources: &[DataSource<S>],
+        mut value_for: impl FnMut(&DataSource<S>) -> DataSourceValue,
     ) -> Self {
         Self {
             data_sources: data_sources.to_vec(),
@@ -72,8 +72,8 @@ impl DataSourceValues {
     /// boundaries. An error aborts construction; it cannot produce a partial
     /// collection.
     pub fn try_from_data_sources<E>(
-        data_sources: &[DataSource],
-        mut value_for: impl FnMut(&DataSource) -> Result<DataSourceValue, E>,
+        data_sources: &[DataSource<S>],
+        mut value_for: impl FnMut(&DataSource<S>) -> Result<DataSourceValue, E>,
     ) -> Result<Self, E> {
         let values = data_sources
             .iter()
@@ -93,11 +93,11 @@ impl DataSourceValues {
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&DataSource, &DataSourceValue)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&DataSource<S>, &DataSourceValue)> {
         self.data_sources.iter().zip(&self.values)
     }
 
-    pub fn data_sources(&self) -> &[DataSource] {
+    pub fn data_sources(&self) -> &[DataSource<S>] {
         &self.data_sources
     }
 
@@ -177,7 +177,7 @@ impl DataSourceValues {
     /// so execution cannot silently reinterpret a blocked read as pre-read.
     pub fn into_executable(
         self,
-    ) -> Result<ExecutableDataSourceValues, BlockedDataSourceValuesError> {
+    ) -> Result<ExecutableDataSourceValues<S>, BlockedDataSourceValuesError> {
         let mut blocked = Vec::new();
         let values = self
             .data_sources
@@ -217,14 +217,14 @@ enum ExecutableDataSourceValue {
 /// [`DataSourceValue::BlockedByPlanError`]. It is the only data-source input
 /// accepted by the executor.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ExecutableDataSourceValues {
-    data_sources: Vec<DataSource>,
+pub struct ExecutableDataSourceValues<S = ModuleSource> {
+    data_sources: Vec<DataSource<S>>,
     values: Vec<ExecutableDataSourceValue>,
 }
 
-impl ExecutableDataSourceValues {
+impl<S: Clone> ExecutableDataSourceValues<S> {
     pub fn empty() -> Self {
-        DataSourceValues::empty()
+        DataSourceValues::<S>::empty()
             .into_executable()
             .expect("an empty collection cannot contain a blocked outcome")
     }

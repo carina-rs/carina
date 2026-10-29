@@ -191,6 +191,14 @@ impl DiagnosticEngine {
     /// of file identity; the directory and basename used for merged parsing
     /// are derived from it rather than inferred from buffer contents.
     pub fn analyze(&self, doc: &Document, current_file_path: Option<&Path>) -> Vec<Diagnostic> {
+        #[cfg(test)]
+        if let Some(current_file_path) = current_file_path {
+            assert_eq!(
+                doc.source_file(),
+                current_file_path,
+                "document source path must match the analyzed path",
+            );
+        }
         let mut diagnostics = Vec::new();
         let provider_validation_deduplicator = ProviderValidationDeduplicator::default();
         let text = doc.text();
@@ -240,13 +248,14 @@ impl DiagnosticEngine {
         // When the authoritative directory parse succeeds, use its per-file
         // semantic AST for source-oriented checks instead of dropping every
         // check merely because the provisional document parse failed.
-        let current_parsed = doc.parsed().or_else(|| {
+        let merged_current_file = || {
             current_file_path.and_then(|path| {
                 merged_result
                     .as_ref()
                     .and_then(|result| result.directory.semantic_file(path))
             })
-        });
+        };
+        let current_parsed = doc.parsed().or_else(merged_current_file);
         // A source parsed in isolation cannot know sibling function
         // declarations. Prefer the successful directory parse over that
         // provisional failure (notably a sibling user function used as a
@@ -547,12 +556,8 @@ impl DiagnosticEngine {
             // deliberately gives both composition-attribute existence checks
             // and `check_resource_ref_type_mismatch` directory-wide targets.
             let binding_input = merged.unwrap_or(parsed);
-            let semantic_view = checks::SemanticView::for_analysis(
-                parsed,
-                merged,
-                current_file_path,
-                base_path.is_some(),
-            );
+            let semantic_view =
+                checks::SemanticView::for_analysis(parsed, merged, base_path.is_some());
             let empty_upstream_exports = Default::default();
             let upstream_exports = upstream_resolution
                 .as_ref()
@@ -606,15 +611,14 @@ impl DiagnosticEngine {
                     && let Some(error) = merged_result
                         .as_ref()
                         .and_then(|result| result.module_error.as_ref())
-                    && let Some(diagnostic) = self.module_resolver_error_diagnostic(
+                {
+                    diagnostics.extend(self.module_resolver_error_diagnostics(
                         doc,
                         parsed,
                         error,
                         base_path,
                         current_file_path,
-                    )
-                {
-                    diagnostics.push(diagnostic);
+                    ));
                 }
             }
             let expansion_succeeded = merged_result
@@ -700,7 +704,7 @@ impl DiagnosticEngine {
                     carina_core::parser::ResourceRef::DataSource(d) => {
                         self.schemas.get_for_data_source(d)
                     }
-                    carina_core::parser::ResourceRef::Composition(_) => None,
+                    carina_core::parser::ResourceRef::LiveComposition(_) => None,
                 };
                 let provider = &resource_id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource_id.resource_type);

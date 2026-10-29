@@ -14,7 +14,10 @@ use std::ops::Deref;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use super::{Directives, ModuleSource, ResourceId, ResourceIdentity, ResourceIdentityState, Value};
+use super::{
+    Directives, ModuleSource, ProviderModuleSource, ResourceId, ResourceIdentity,
+    ResourceIdentityState, SavedModuleSource, Value,
+};
 
 /// A read-only resource (data source).
 ///
@@ -29,8 +32,29 @@ use super::{Directives, ModuleSource, ResourceId, ResourceIdentity, ResourceIden
 ///     &d.prefixes
 /// }
 /// ```
+///
+/// Saved module metadata cannot be placed on the live data-source type:
+///
+/// ```compile_fail,E0308
+/// use carina_core::resource::{DataSource, SavedModuleSource};
+///
+/// let mut data_source = DataSource::new("mock.Lookup", "example");
+/// data_source.module_source = Some(SavedModuleSource::Module {
+///     name: "lookup_module".to_string(),
+///     instance: "example".to_string(),
+/// });
+/// ```
+///
+/// A live data source cannot be deserialized from saved-plan JSON because the
+/// persisted module variant has no live call path:
+///
+/// ```compile_fail,E0277
+/// use carina_core::resource::DataSource;
+/// let _: DataSource = serde_json::from_str("{}").unwrap();
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DataSource {
+#[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
+pub struct DataSource<S = ModuleSource> {
     pub id: ResourceId,
     /// Source-order preserving map of attribute name → expression.
     pub attributes: IndexMap<String, Value>,
@@ -46,12 +70,41 @@ pub struct DataSource {
     pub dependency_bindings: BTreeSet<String>,
     /// Module source info for data sources from modules.
     #[serde(default)]
-    pub module_source: Option<ModuleSource>,
+    pub module_source: Option<S>,
     /// Parser-level: attributes whose value was written as a quoted
     /// string literal. Parse-time only; `#[serde(skip)]` keeps it out
     /// of state — mirrors [`Resource::quoted_string_attrs`](super::Resource).
     #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
+}
+
+/// Persisted data-source representation used by saved plans.
+pub type SavedDataSource = DataSource<SavedModuleSource>;
+
+/// Source-neutral data-source payload exposed to providers.
+pub type ProviderDataSource = DataSource<ProviderModuleSource>;
+
+impl From<DataSource> for SavedDataSource {
+    fn from(data_source: DataSource) -> Self {
+        let DataSource {
+            id,
+            attributes,
+            directives,
+            binding,
+            dependency_bindings,
+            module_source,
+            quoted_string_attrs,
+        } = data_source;
+        Self {
+            id,
+            attributes,
+            directives,
+            binding,
+            dependency_bindings,
+            module_source: module_source.as_ref().map(SavedModuleSource::from),
+            quoted_string_attrs,
+        }
+    }
 }
 
 impl DataSource {
@@ -129,7 +182,9 @@ impl DataSource {
             quoted_string_attrs: HashSet::new(),
         }
     }
+}
 
+impl<S: Clone> DataSource<S> {
     pub(crate) fn instantiate(&self) -> Self {
         let mut data_source = self.clone();
         data_source.id = self.id.instantiate_pending();
@@ -140,6 +195,30 @@ impl DataSource {
         let mut data_source = self.clone();
         data_source.id = self.id.instantiate_with_identity(identity);
         data_source
+    }
+}
+
+impl<S> DataSource<S> {
+    /// Remove module provenance while crossing into provider-owned code.
+    pub(crate) fn into_provider_data_source(self) -> ProviderDataSource {
+        let DataSource {
+            id,
+            attributes,
+            directives,
+            binding,
+            dependency_bindings,
+            module_source: _,
+            quoted_string_attrs,
+        } = self;
+        ProviderDataSource {
+            id,
+            attributes,
+            directives,
+            binding,
+            dependency_bindings,
+            module_source: None,
+            quoted_string_attrs,
+        }
     }
 
     /// Get an attribute value by key.
@@ -182,12 +261,24 @@ impl DataSource {
 /// let _: ResolvedDataSource = resource.into();
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "DataSource", into = "DataSource")]
-pub struct ResolvedDataSource(DataSource);
+#[serde(bound(
+    serialize = "S: Serialize + Clone",
+    deserialize = "S: Deserialize<'de>"
+))]
+#[serde(try_from = "DataSource<S>", into = "DataSource<S>")]
+pub struct ResolvedDataSource<S = ModuleSource>(DataSource<S>);
 
-impl ResolvedDataSource {
+pub type SavedResolvedDataSource = ResolvedDataSource<SavedModuleSource>;
+
+impl From<ResolvedDataSource> for SavedResolvedDataSource {
+    fn from(resource: ResolvedDataSource) -> Self {
+        Self::new(resource.into_inner().into())
+    }
+}
+
+impl<S> ResolvedDataSource<S> {
     /// Construct from a [`DataSource`], panicking if identity is pending.
-    pub fn new(resource: DataSource) -> Self {
+    pub fn new(resource: DataSource<S>) -> Self {
         assert!(
             matches!(
                 resource.id.identity_state(),
@@ -199,7 +290,7 @@ impl ResolvedDataSource {
     }
 
     /// Try to construct; returns `None` if identity is pending.
-    pub fn try_new(resource: DataSource) -> Option<Self> {
+    pub fn try_new(resource: DataSource<S>) -> Option<Self> {
         match resource.id.identity_state() {
             ResourceIdentityState::Pending(_) => None,
             ResourceIdentityState::Resolved(_) => Some(Self(resource)),
@@ -207,12 +298,12 @@ impl ResolvedDataSource {
     }
 
     /// Borrow the inner [`DataSource`].
-    pub fn as_inner(&self) -> &DataSource {
+    pub fn as_inner(&self) -> &DataSource<S> {
         &self.0
     }
 
     /// Consume and return the inner [`DataSource`].
-    pub fn into_inner(self) -> DataSource {
+    pub fn into_inner(self) -> DataSource<S> {
         self.0
     }
 
@@ -230,30 +321,30 @@ impl ResolvedDataSource {
     }
 }
 
-impl Deref for ResolvedDataSource {
-    type Target = DataSource;
+impl<S> Deref for ResolvedDataSource<S> {
+    type Target = DataSource<S>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl From<ResolvedDataSource> for DataSource {
-    fn from(resource: ResolvedDataSource) -> Self {
+impl<S> From<ResolvedDataSource<S>> for DataSource<S> {
+    fn from(resource: ResolvedDataSource<S>) -> Self {
         resource.0
     }
 }
 
-impl TryFrom<DataSource> for ResolvedDataSource {
+impl<S> TryFrom<DataSource<S>> for ResolvedDataSource<S> {
     type Error = String;
 
-    fn try_from(resource: DataSource) -> Result<Self, Self::Error> {
+    fn try_from(resource: DataSource<S>) -> Result<Self, Self::Error> {
         Self::try_new(resource).ok_or_else(|| "identity is required".to_string())
     }
 }
 
-impl AsRef<DataSource> for ResolvedDataSource {
-    fn as_ref(&self) -> &DataSource {
+impl<S> AsRef<DataSource<S>> for ResolvedDataSource<S> {
+    fn as_ref(&self) -> &DataSource<S> {
         self.as_inner()
     }
 }

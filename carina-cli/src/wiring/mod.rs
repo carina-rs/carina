@@ -84,7 +84,7 @@ use std::time::Duration;
 use colored::Colorize;
 use futures::stream::{self, StreamExt};
 
-use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec};
+use carina_core::binding_index::{LivePreApplyInputs, ResolvedBindings, WaitAliasSpec};
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::deps::{
     get_composition_dependencies, get_data_source_dependencies, get_resource_dependencies,
@@ -125,9 +125,9 @@ use carina_core::provider::{
 };
 use carina_core::provider_source::ProviderSource;
 use carina_core::resource::{
-    Composition, ConcreteValue, Current, DataSource, DeferredValue, ModuleSource, ResolvedResource,
-    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, ResourceIdentityError, State,
-    Value,
+    ConcreteValue, Current, DataSource, DeferredValue, LiveComposition, ModuleSource,
+    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
+    ResourceIdentityError, State, Value,
 };
 #[cfg(test)]
 use carina_core::schema::{AttributeSchema, AttributeType};
@@ -264,7 +264,7 @@ pub struct PlanContext {
     pub unresolved_resources: Vec<UnresolvedResource>,
     /// Module compositions after plan-time constraint evaluation. Pending
     /// constraints must survive in saved plans for apply-time re-evaluation.
-    pub compositions: Vec<Composition>,
+    pub compositions: Vec<LiveComposition>,
     /// Data sources exactly as supplied to the differ. Refresh-time reads
     /// have concrete inputs; apply-time deferred reads keep structural refs so
     /// saved-plan apply can reconstruct the same deferred-read set.
@@ -3779,7 +3779,7 @@ pub struct ReconciledDeferredForExpansion(AddressedDeferredForExpansionInputs);
 pub(crate) struct AddressedDataSourceReadInputs<'a, 'backend> {
     pub provider: &'a dyn Provider,
     pub refresh_phase: Option<&'a RefreshPhase<'backend>>,
-    pub compositions: &'a [Composition],
+    pub compositions: &'a [LiveComposition],
     pub data_sources: &'a [DataSource],
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub schemas: &'a SchemaRegistry,
@@ -4078,7 +4078,7 @@ pub fn derive_managed_binding_stability<E>(
         schemas,
         resources,
     );
-    let optimistic_bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let optimistic_bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: resources,
         compositions: &parsed.compositions,
         managed_current: &plan_input_current,
@@ -4335,8 +4335,8 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
         schemas,
         sorted_resources,
     );
-    let resolved_bindings = ResolvedBindings::pre_apply_with_stability(
-        PreApplyInputs {
+    let resolved_bindings = ResolvedBindings::pre_apply_live_with_stability(
+        LivePreApplyInputs {
             managed: sorted_resources,
             compositions: &parsed.compositions,
             managed_current: &plan_input_current,
@@ -4795,7 +4795,8 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     let mut orphan_refreshed_ids: HashSet<ResourceId> = HashSet::new();
     let mut orphans = Orphans::new();
 
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
+    let module_gate =
+        carina_core::executor::ModuleConstraintGate::from_live_compositions(&parsed.compositions);
     let progress_backend = ProgressBackend::new(progress_sink);
     let refresh_phase = refresh.then(|| RefreshPhase::start(&progress_backend));
     // Provider reads do not retain Carina-only dependency metadata. Build the
@@ -5100,7 +5101,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         OverrideAwareResources::build_pair_with_stability(
             expanded_canonical_resources.as_pair(),
             state_file.as_ref(),
-            PreApplyInputs {
+            LivePreApplyInputs {
                 managed: &[],
                 compositions: &parsed.compositions,
                 managed_current: &pre_apply_current,
@@ -6287,7 +6288,7 @@ pub(crate) struct ReadDataSourcesInputs<'a, 'backend> {
     pub provider: &'a dyn Provider,
     pub refresh_phase: Option<&'a RefreshPhase<'backend>>,
     pub managed: &'a [&'a Resource],
-    pub compositions: &'a [Composition],
+    pub compositions: &'a [LiveComposition],
     pub data_sources: &'a [DataSource],
     managed_current: ManagedCurrentView<'a>,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
@@ -6372,7 +6373,7 @@ pub(crate) struct ExpandedDataSourceReadInputs<'a, 'backend> {
     pub provider: &'a dyn Provider,
     pub refresh_phase: Option<&'a RefreshPhase<'backend>>,
     pub managed: &'a [Resource],
-    pub compositions: &'a [Composition],
+    pub compositions: &'a [LiveComposition],
     pub data_sources: &'a [DataSource],
     pub managed_current: &'a HashMap<ResourceId, Current>,
     pub orphans: &'a Orphans,
@@ -6450,10 +6451,10 @@ fn collect_data_source_values(
 /// substitution has already made its provider inputs literal.
 fn relevant_compositions_for_data_source_reads(
     managed: &[&Resource],
-    compositions: &[Composition],
+    compositions: &[LiveComposition],
     queries: &[DataSource],
     binding_data_sources: &[DataSource],
-) -> Vec<Composition> {
+) -> Vec<LiveComposition> {
     let managed_by_binding = managed
         .iter()
         .filter_map(|resource| {
@@ -6491,14 +6492,19 @@ fn relevant_compositions_for_data_source_reads(
     let mut relevant_indices = HashSet::new();
 
     for data_source in queries {
-        let Some(ModuleSource::Module { name, instance, .. }) = &data_source.module_source else {
-            continue;
-        };
-        for (index, composition) in compositions.iter().enumerate() {
-            if composition.module_name == *name && composition.instance == *instance {
-                relevant_indices.insert(index);
-                pending.extend(get_composition_dependencies(composition));
+        match data_source.module_source.as_ref() {
+            Some(ModuleSource::Module(source)) => {
+                for (index, composition) in compositions.iter().enumerate() {
+                    if composition
+                        .call_path()
+                        .is_prefix_of(source.module_call_path())
+                    {
+                        relevant_indices.insert(index);
+                        pending.extend(get_composition_dependencies(composition));
+                    }
+                }
             }
+            Some(ModuleSource::Root) | None => {}
         }
     }
 
@@ -6636,7 +6642,8 @@ async fn read_data_sources_phase2_pass(
         data_sources,
         data_source_bindings.data_sources(),
     );
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&relevant_compositions);
+    let module_gate =
+        carina_core::executor::ModuleConstraintGate::from_live_compositions(&relevant_compositions);
     let resolutions = resolve_data_source_refs_for_refresh_from_refs(
         inputs.managed,
         inputs.compositions,
@@ -6746,7 +6753,7 @@ async fn read_data_sources_phase2_pass(
 #[cfg(test)]
 pub(crate) fn resolve_data_source_refs_for_refresh(
     managed: &[Resource],
-    compositions: &[carina_core::resource::Composition],
+    compositions: &[carina_core::resource::LiveComposition],
     data_sources: &[DataSource],
     managed_current: &HashMap<ResourceId, Current>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -6769,7 +6776,7 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
 #[allow(clippy::too_many_arguments)]
 fn resolve_data_source_refs_for_refresh_from_refs(
     managed: &[&Resource],
-    compositions: &[carina_core::resource::Composition],
+    compositions: &[carina_core::resource::LiveComposition],
     data_sources: &[DataSource],
     data_source_bindings: Phase2DataSourceBindings<'_>,
     managed_current: ManagedCurrentView<'_>,
@@ -6831,7 +6838,7 @@ fn resolve_data_source_refs_for_refresh_from_refs(
 
 fn data_source_refresh_bindings_from_refs(
     managed: &[&Resource],
-    compositions: &[carina_core::resource::Composition],
+    compositions: &[carina_core::resource::LiveComposition],
     data_source_bindings: Phase2DataSourceBindings<'_>,
     managed_current: ManagedCurrentView<'_>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,

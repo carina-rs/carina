@@ -6,7 +6,7 @@
 //! Pre-#3293 every node in the IR carried a `ResourceId`. The state
 //! layer's lookup APIs (managed and data-source maps keyed by `ResourceId`,
 //! `StateBackend::load`, etc.) accepted any `&ResourceId`, including
-//! one from a [`Composition`](super::Composition) — which never
+//! one from a [`LiveComposition`](super::LiveComposition) — which never
 //! persists. A composition id passed to a state lookup is guaranteed
 //! to miss, but the type system gave no static signal of that.
 //!
@@ -14,7 +14,7 @@
 //! not enter the pre-apply differ" structurally (PR D). This PR
 //! mirrors that for state-load callers: a `PersistentId` can only
 //! be constructed from a leaf node ([`Resource`](super::Resource) or
-//! [`DataSource`](super::DataSource)); a `Composition` exposes only
+//! [`DataSource`](super::DataSource)); a `LiveComposition` exposes only
 //! `EphemeralId`. No `From<EphemeralId> for PersistentId` impl
 //! exists, and no `Deref<Target = ResourceId>` is provided, so a
 //! state API that takes `&PersistentId` cannot be handed a
@@ -24,7 +24,7 @@
 //!
 //! This PR is **boundary-only**: the wrappers exist, accessor
 //! methods on [`Resource`](super::Resource) / [`DataSource`](super::DataSource) /
-//! [`Composition`](super::Composition) make them reachable, but the
+//! [`LiveComposition`](super::LiveComposition) make them reachable, but the
 //! existing state maps still use `ResourceId` keys, and the ~1130 sites that
 //! touch `ResourceId` are *not* migrated in this PR. The wrappers become the
 //! canonical type at every new state-touching boundary; existing boundaries can
@@ -83,12 +83,12 @@ impl PersistentId {
 }
 
 /// An id of a node that **never persists** in state — i.e., a
-/// [`Composition`](super::Composition).
+/// [`LiveComposition`](super::LiveComposition).
 ///
 /// `EphemeralId` cannot convert to a [`PersistentId`] (no `From` impl
 /// exists), so passing it to a state-load API that takes
 /// `&PersistentId` is a compile error. Construct via
-/// [`Composition::ephemeral_id`](super::Composition::ephemeral_id) or
+/// [`LiveComposition::ephemeral_id`](super::LiveComposition::ephemeral_id) or
 /// via [`EphemeralId::new`] when you already have the id and know it
 /// came from a composition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -122,7 +122,7 @@ impl EphemeralId {
 ///
 /// Used by APIs that need to refer to **any** node by id without
 /// committing to leaf or composition statically. The chief consumer
-/// is the upcoming `CompositionAttribute::Forwarded(NodeId, AttrPath)`
+/// is the upcoming `LiveCompositionAttribute::Forwarded(NodeId, AttrPath)`
 /// (#3294), where a forwarded composition attribute may alias either
 /// a leaf attribute (`PersistentId`) or another composition's attribute
 /// (`EphemeralId`).

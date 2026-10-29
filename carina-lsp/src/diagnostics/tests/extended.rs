@@ -19,9 +19,10 @@ fn backend_directory_diagnostics_with_sibling(
     let fixture = tempfile::tempdir().unwrap();
     std::fs::write(fixture.path().join("main.crn"), sibling_source).unwrap();
     std::fs::write(fixture.path().join("backend.crn"), backend_source).unwrap();
+    let path = fixture.path().join("backend.crn");
     test_engine().analyze(
-        &create_document(backend_source),
-        Some(&(fixture.path()).join("backend.crn")),
+        &create_document_at(backend_source, path.clone()),
+        Some(&path),
     )
 }
 
@@ -509,10 +510,8 @@ let orphan = mock.test.resource {
             std::fs::write(fixture.path().join("functions.crn"), function_source).unwrap();
         }
 
-        let diagnostics = engine.analyze(
-            &create_document(&main),
-            Some(&(fixture.path()).join("main.crn")),
-        );
+        let path = fixture.path().join("main.crn");
+        let diagnostics = engine.analyze(&create_document_at(&main, path.clone()), Some(&path));
         let lsp_unused = unused_binding_names(&diagnostics);
         let loaded = carina_core::config_loader::load_configuration_with_config(
             fixture.path(),
@@ -599,10 +598,8 @@ let orphan = mock.test.resource {
         "malformed directory fixture unexpectedly parsed",
     );
 
-    let diagnostics = engine.analyze(
-        &create_document(main),
-        Some(&(fixture.path()).join("main.crn")),
-    );
+    let path = fixture.path().join("main.crn");
+    let diagnostics = engine.analyze(&create_document_at(main, path.clone()), Some(&path));
     let unused = unused_binding_names(&diagnostics);
 
     assert!(
@@ -634,13 +631,15 @@ fn attribute_derived_bindings_required_across_sibling_files_are_not_unused() {
     std::fs::write(temp.path().join("alpha.crn"), alpha).unwrap();
     std::fs::write(temp.path().join("beta.crn"), beta).unwrap();
 
+    let alpha_path = temp.path().join("alpha.crn");
+    let beta_path = temp.path().join("beta.crn");
     let alpha_diagnostics = engine.analyze(
-        &create_document(alpha),
-        Some(&(temp.path()).join("alpha.crn")),
+        &create_document_at(alpha, alpha_path.clone()),
+        Some(&alpha_path),
     );
     let beta_diagnostics = engine.analyze(
-        &create_document(beta),
-        Some(&(temp.path()).join("beta.crn")),
+        &create_document_at(beta, beta_path.clone()),
+        Some(&beta_path),
     );
 
     assert!(
@@ -681,10 +680,8 @@ import {
     std::fs::write(temp.path().join("resources.crn"), resource).unwrap();
     std::fs::write(temp.path().join("state.crn"), state_block).unwrap();
 
-    let diagnostics = engine.analyze(
-        &create_document(resource),
-        Some(&(temp.path()).join("resources.crn")),
-    );
+    let path = temp.path().join("resources.crn");
+    let diagnostics = engine.analyze(&create_document_at(resource, path.clone()), Some(&path));
 
     assert!(
         unused_binding_names(&diagnostics).is_empty(),
@@ -759,9 +756,16 @@ fn attribute_derived_anonymous_identity_error_is_directory_scoped_and_anchored()
     std::fs::write(base.join("alpha.crn"), alpha).unwrap();
     std::fs::write(base.join("beta.crn"), beta).unwrap();
 
-    let alpha_diagnostics =
-        engine.analyze(&create_document(alpha), Some(&(base).join("alpha.crn")));
-    let beta_diagnostics = engine.analyze(&create_document(beta), Some(&(base).join("beta.crn")));
+    let alpha_path = base.join("alpha.crn");
+    let beta_path = base.join("beta.crn");
+    let alpha_diagnostics = engine.analyze(
+        &create_document_at(alpha, alpha_path.clone()),
+        Some(&alpha_path),
+    );
+    let beta_diagnostics = engine.analyze(
+        &create_document_at(beta, beta_path.clone()),
+        Some(&beta_path),
+    );
 
     for (diagnostics, expected_line) in [(&alpha_diagnostics, 0), (&beta_diagnostics, 1)] {
         let matching = diagnostics
@@ -794,10 +798,8 @@ fn attribute_derived_anonymous_identity_error_anchors_every_same_file_declaratio
     let source = "mock.test.resource {\n  name = \"alpha\"\n}\n\nmock.test.resource {\n  name = \"beta\"\n}\n";
     std::fs::write(temp.path().join("main.crn"), source).unwrap();
 
-    let diagnostics = engine.analyze(
-        &create_document(source),
-        Some(&(temp.path()).join("main.crn")),
-    );
+    let path = temp.path().join("main.crn");
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
     let matching = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -842,10 +844,8 @@ mock.test.resource {
 "#;
     std::fs::write(temp.path().join("main.crn"), source).unwrap();
 
-    let diagnostics = engine.analyze(
-        &create_document(source),
-        Some(&(temp.path()).join("main.crn")),
-    );
+    let path = temp.path().join("main.crn");
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
     let matching = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -888,10 +888,8 @@ mock.test.resource {
 "#;
     std::fs::write(temp.path().join("main.crn"), source).unwrap();
 
-    let diagnostics = engine.analyze(
-        &create_document(source),
-        Some(&(temp.path()).join("main.crn")),
-    );
+    let path = temp.path().join("main.crn");
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
     let matching = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -1842,10 +1840,8 @@ fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
     std::fs::write(fixture.path().join("providers.crn"), "provider test {}\n")
         .expect("write providers.crn");
 
-    let diagnostics = engine.analyze(
-        &create_document(main),
-        Some(&(fixture.path()).join("main.crn")),
-    );
+    let path = fixture.path().join("main.crn");
+    let diagnostics = engine.analyze(&create_document_at(main, path.clone()), Some(&path));
     let matching = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.message == core_message)
@@ -2493,8 +2489,9 @@ fn provider_in_module_with_sibling_arguments_emits_error() {
 
     let engine = test_engine();
     let buffer = std::fs::read_to_string(base.join("providers.crn")).unwrap();
-    let doc = create_document(&buffer);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("providers.crn")));
+    let path = base.join("providers.crn");
+    let doc = create_document_at(&buffer, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     let provider_diag = diagnostics.iter().find(|diagnostic| {
         diagnostic
@@ -2527,8 +2524,9 @@ fn arguments_buffer_with_sibling_provider_has_no_provider_diagnostic() {
     std::fs::write(base.join("providers.crn"), "provider mock { }\n").unwrap();
 
     let engine = test_engine();
-    let doc = create_document(arguments);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("arguments.crn")));
+    let path = base.join("arguments.crn");
+    let doc = create_document_at(arguments, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
     let provider_diagnostics: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -2553,8 +2551,9 @@ fn provider_in_root_shaped_directory_no_error() {
 
     let engine = test_engine();
     let buffer = std::fs::read_to_string(base.join("providers.crn")).unwrap();
-    let doc = create_document(&buffer);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("providers.crn")));
+    let path = base.join("providers.crn");
+    let doc = create_document_at(&buffer, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     assert!(
         diagnostics.iter().all(|diagnostic| !diagnostic
@@ -2632,8 +2631,9 @@ import {
     std::fs::write(base.join("state.crn"), state_blocks).unwrap();
 
     let engine = test_engine();
-    let doc = create_document(state_blocks);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("state.crn")));
+    let path = base.join("state.crn");
+    let doc = create_document_at(state_blocks, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
     let state_block_diagnostics: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -2683,8 +2683,9 @@ fn arguments_buffer_with_sibling_state_block_has_no_state_block_diagnostic() {
     .unwrap();
 
     let engine = test_engine();
-    let doc = create_document(arguments);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("arguments.crn")));
+    let path = base.join("arguments.crn");
+    let doc = create_document_at(arguments, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
     let state_block_diagnostics: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -2722,8 +2723,9 @@ import {
     std::fs::write(base.join("values.crn"), "let environment = \"test\"\n").unwrap();
 
     let engine = test_engine();
-    let doc = create_document(state_blocks);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("state.crn")));
+    let path = base.join("state.crn");
+    let doc = create_document_at(state_blocks, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     assert!(
         diagnostics.iter().all(|diagnostic| !diagnostic
@@ -2860,8 +2862,9 @@ fn arguments_with_sibling_backend_emits_error() {
 
     let engine = test_engine();
     let buffer = std::fs::read_to_string(base.join("main.crn")).unwrap();
-    let doc = create_document(&buffer);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
+    let path = base.join("main.crn");
+    let doc = create_document_at(&buffer, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     assert!(
         diagnostics.iter().any(|d| d
@@ -4812,10 +4815,8 @@ exports {
     std::fs::write(directory.path().join("main.crn"), main).unwrap();
     std::fs::write(directory.path().join("exports.crn"), exports).unwrap();
 
-    let diagnostics = engine.analyze(
-        &create_document(exports),
-        Some(&(directory.path()).join("exports.crn")),
-    );
+    let path = directory.path().join("exports.crn");
+    let diagnostics = engine.analyze(&create_document_at(exports, path.clone()), Some(&path));
     let false_unknown = diagnostics.iter().find(|diagnostic| {
         diagnostic.message.contains("unknown binding 'parts[5]'")
             || diagnostic.message.contains("Undefined resource 'parts[5]'")
@@ -5292,8 +5293,9 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
     use carina_core::binding_index::BindingIndex;
     use carina_core::parser::{ArgumentOrigin, TypeExpr};
     use carina_core::resource::{
-        Composition, CompositionArgument, CompositionAttribute, CompositionCall,
-        CompositionProvenance, ConcreteValue, ResourceId, Signature, Value,
+        CompositionCall, CompositionCallPath, ConcreteValue, LiveComposition,
+        LiveCompositionArgument, LiveCompositionAttribute, LiveCompositionSignature, ResourceId,
+        Value,
     };
     use indexmap::IndexMap;
 
@@ -5306,19 +5308,27 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
         }
     }
 
-    fn composition(binding: &'static str, call_binding: &str) -> Composition {
+    fn composition(binding: &'static str, call_binding: &str) -> LiveComposition {
+        let source_file = std::path::PathBuf::from(format!("/{call_binding}.crn"));
+        let parsed = carina_core::parser::parse_file(
+            "let missing = use { source = '../missing' }\nmissing {}\n",
+            &source_file,
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .expect("parse synthetic composition call");
         let call = CompositionCall {
+            id: parsed.module_calls[0].id().clone(),
             module_name: "missing".to_string(),
             binding: Some(call_binding.to_string()),
             instance: call_binding.to_string(),
             module_source: Some("../missing".to_string()),
             module_directory: None,
         };
-        Composition {
+        LiveComposition {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", binding,
             )),
-            signature: Signature {
+            signature: LiveCompositionSignature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
                 pending_constraints: Vec::new(),
@@ -5327,7 +5337,7 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
             dependency_bindings: Default::default(),
             module_name: "missing".to_string(),
             instance: call_binding.to_string(),
-            provenance: Box::new(CompositionProvenance::expanded(call.clone(), call)),
+            call_path: CompositionCallPath::direct(call),
             quoted_string_attrs: Default::default(),
         }
     }
@@ -5344,7 +5354,7 @@ let first = unrelated { }
     let mut source = composition("source", "missing-source-call");
     source.signature.attributes.insert(
         "sg".to_string(),
-        CompositionAttribute::from_value(
+        LiveCompositionAttribute::from_value(
             Value::Concrete(ConcreteValue::String("sg-123".into())),
             Some(schema_type("ec2.SecurityGroup")),
         ),
@@ -5352,7 +5362,7 @@ let first = unrelated { }
     let mut consumer = composition("consumer", "missing-consumer-call");
     consumer.signature.arguments.insert(
         "vpc_id".to_string(),
-        CompositionArgument::from_value(
+        LiveCompositionArgument::from_value(
             Value::resource_ref("source", "missing", vec![]),
             schema_type("ec2.Vpc"),
             ArgumentOrigin::Defaulted,
@@ -5361,7 +5371,7 @@ let first = unrelated { }
     binding_input.compositions.extend([source, consumer]);
     let bindings = BindingIndex::from_parsed(&binding_input, &engine.schemas);
     let semantic_view =
-        super::super::checks::SemanticView::for_analysis(parsed, Some(&binding_input), None, true);
+        super::super::checks::SemanticView::for_analysis(parsed, Some(&binding_input), true);
 
     let diagnostics = engine.check_composition_ref_types(
         parsed,
@@ -5848,12 +5858,13 @@ fn sibling_bare_structural_handle_is_a_real_engine_parse_error() {
     )
     .unwrap();
 
-    let document = create_document(source);
+    let path = tmp.path().join("main.crn");
+    let document = create_document_at(source, path.clone());
     assert!(
         document.parsed().is_some(),
         "the buffer-only parser cannot yet classify a sibling name"
     );
-    let diagnostics = engine.analyze(&document, Some(&(tmp.path()).join("main.crn")));
+    let diagnostics = engine.analyze(&document, Some(&path));
     let diagnostic = diagnostics
         .iter()
         .find(|diagnostic| {
@@ -5912,8 +5923,9 @@ let child = imported {
 "#;
     std::fs::write(root.join("main.crn"), source).unwrap();
 
-    let document = create_document(source);
-    let diagnostics = engine.analyze(&document, Some(&(root).join("main.crn")));
+    let path = root.join("main.crn");
+    let document = create_document_at(source, path.clone());
+    let diagnostics = engine.analyze(&document, Some(&path));
     let diagnostic = diagnostics
         .iter()
         .find(|diagnostic| {
@@ -6042,8 +6054,8 @@ fn nested_bare_handle_diagnostic_is_anchored_at_the_root_call() {
 #[test]
 fn resolver_diagnostic_uses_explicit_current_file_path() {
     let (engine, fixture, main) = nested_bare_handle_fixture();
-    let document = create_document(&main);
     let current_file = fixture.path().join("main.crn");
+    let document = create_document_at(&main, current_file.clone());
 
     let diagnostics = engine.analyze(&document, Some(&current_file));
     let diagnostic = diagnostics
@@ -6076,9 +6088,10 @@ fn explicit_current_file_does_not_anchor_sibling_with_identical_span() {
         ("bbbb/arguments.crn", "arguments { parent: String }\n"),
     ]);
     let current_source = "let s = use { source = './safe' }\ns {}\n";
-    let document = create_document(current_source);
+    let path = fixture.path().join("main.crn");
+    let document = create_document_at(current_source, path.clone());
 
-    let diagnostics = engine.analyze(&document, Some(&fixture.path().join("main.crn")));
+    let diagnostics = engine.analyze(&document, Some(&path));
 
     assert!(
         diagnostics.iter().all(|diagnostic| !diagnostic
@@ -6118,12 +6131,13 @@ let instance = imported { parent = vpc }
 "#;
     std::fs::write(root.join("main.crn"), source).unwrap();
 
-    let document = create_document(source);
+    let path = root.join("main.crn");
+    let document = create_document_at(source, path.clone());
     assert!(
         document.parsed().is_some(),
         "module arguments retain handles"
     );
-    let diagnostics = engine.analyze(&document, Some(&(root).join("main.crn")));
+    let diagnostics = engine.analyze(&document, Some(&path));
     let diagnostic = diagnostics
         .iter()
         .find(|diagnostic| {
@@ -6567,6 +6581,56 @@ let web2 = issue {
 }
 
 #[test]
+fn identical_anonymous_module_calls_anchor_mismatches_at_their_own_spans() {
+    let engine = module_boundary_identity_engine();
+    let main = r#"let checked = use { source = './module' }
+
+let sg = aws.ec2.SecurityGroup {
+  name = "root"
+}
+
+checked {
+  vpc_id = sg.group_id
+}
+
+checked {
+  vpc_id = sg.group_id
+}
+"#;
+    let fixture = write_tag_key_fixture(&[
+        ("main.crn", main),
+        (
+            "module/main.crn",
+            "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&engine, fixture.path(), "main.crn", main);
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("module call 'checked': argument 'vpc_id'")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(mismatches.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        mismatches
+            .iter()
+            .map(|diagnostic| diagnostic.range)
+            .collect::<Vec<_>>(),
+        vec![
+            Range::new(Position::new(7, 2), Position::new(7, 8)),
+            Range::new(Position::new(11, 2), Position::new(11, 8)),
+        ],
+    );
+}
+
+#[test]
 fn defaulted_composition_argument_mismatch_anchors_the_authored_call() {
     let engine = module_boundary_identity_engine();
     let main = r#"let checked = use { source = './module' }
@@ -6825,6 +6889,49 @@ fn annotated_nested_module_call_is_reported_when_root_module_is_opened() {
 }
 
 #[test]
+fn annotated_nested_mismatches_anchor_each_anonymous_root_call_fallback() {
+    let engine = module_boundary_identity_engine();
+    let fixture = nested_module_call_lsp_fixture(": aws.ec2.SecurityGroup.Id");
+    let root_source = r#"let outer = use { source = '../outer' }
+
+let main_vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+outer {
+  vpc_id = main_vpc.vpc_id
+}
+
+outer {
+  vpc_id = main_vpc.vpc_id
+}
+"#;
+    std::fs::write(fixture.root.join("main.crn"), root_source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &fixture.root, "main.crn", root_source);
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("argument 'vpc_id'")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(mismatches.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        mismatches
+            .iter()
+            .map(|diagnostic| diagnostic.range)
+            .collect::<Vec<_>>(),
+        vec![
+            Range::new(Position::new(6, 0), Position::new(6, 5)),
+            Range::new(Position::new(10, 0), Position::new(10, 5)),
+        ],
+    );
+}
+
+#[test]
 fn unannotated_nested_module_call_is_inferred_when_root_module_is_opened() {
     let engine = module_boundary_identity_engine();
     let fixture = nested_module_call_lsp_fixture("");
@@ -6993,14 +7100,16 @@ fn upstream_state_missing_source_directory_is_flagged() {
     let base = tmp.path().to_path_buf();
 
     let engine = test_engine();
-    let doc = create_document(
+    let path = base.join("main.crn");
+    let doc = create_document_at(
         r#"let orgs = upstream_state {
     source = '../nonexistent'
 }
 "#,
+        path.clone(),
     );
 
-    let diagnostics = engine.analyze(&doc, Some(&base.join("main.crn")));
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     let diag = diagnostics
         .iter()
@@ -7032,7 +7141,8 @@ fn upstream_state_source_check_ignores_same_source_in_provider_block() {
     // A `provider` block with the same `source = '...'` string as the
     // `upstream_state` block. The diagnostic must land on the upstream_state
     // line (line 5 here, 0-based 4), not the provider line.
-    let doc = create_document(
+    let path = base.join("main.crn");
+    let doc = create_document_at(
         r#"provider aws {
     source = 'missing/provider'
     region = 'ap-northeast-1'
@@ -7041,9 +7151,10 @@ let orgs = upstream_state {
     source = 'missing/provider'
 }
 "#,
+        path.clone(),
     );
 
-    let diagnostics = engine.analyze(&doc, Some(&base.join("main.crn")));
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     let diag = diagnostics
         .iter()
@@ -7068,14 +7179,16 @@ fn upstream_state_existing_source_directory_is_ok() {
     std::fs::create_dir(tmp.path().join("upstream")).unwrap();
 
     let engine = test_engine();
-    let doc = create_document(
+    let path = base.join("main.crn");
+    let doc = create_document_at(
         r#"let orgs = upstream_state {
     source = '../upstream'
 }
 "#,
+        path.clone(),
     );
 
-    let diagnostics = engine.analyze(&doc, Some(&base.join("main.crn")));
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     let diag = diagnostics
         .iter()
@@ -7113,8 +7226,13 @@ fn analyze_with_buffer(
     filename: &str,
     buffer: &str,
 ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
-    let doc = create_document(buffer);
-    engine.analyze(&doc, Some(&(base).join(filename)))
+    let path = base.join(filename);
+    let doc = crate::document::Document::new_with_path(
+        buffer.to_string(),
+        path.clone(),
+        std::sync::Arc::new(carina_core::parser::ProviderContext::default()),
+    );
+    engine.analyze(&doc, Some(&path))
 }
 
 fn shared_role_arn_directory() -> (tempfile::TempDir, std::path::PathBuf, String) {
@@ -7404,10 +7522,9 @@ for key, value in (producer.tags ?? 5) {
 "#;
     let fixture = tempfile::tempdir().unwrap();
     std::fs::write(fixture.path().join("main.crn"), source).unwrap();
-    let diagnostics = custom_engine(schemas).analyze(
-        &create_document(source),
-        Some(&(fixture.path()).join("main.crn")),
-    );
+    let path = fixture.path().join("main.crn");
+    let diagnostics =
+        custom_engine(schemas).analyze(&create_document_at(source, path.clone()), Some(&path));
 
     assert!(
         diagnostics.iter().any(|diagnostic| {
@@ -9397,8 +9514,9 @@ fn sibling_user_function_is_not_reported_as_unknown() {
     let (_tmp, base) = sibling_user_fn_fixture(main_text);
 
     let engine = test_engine();
-    let doc = create_document(main_text);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
+    let path = base.join("main.crn");
+    let doc = create_document_at(main_text, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     let unknown_fn = diagnostics
         .iter()
@@ -9418,8 +9536,9 @@ fn truly_unknown_function_is_reported_without_redlining_sibling_function() {
     let (_tmp, base) = sibling_user_fn_fixture(main_text);
 
     let engine = test_engine();
-    let doc = create_document(main_text);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
+    let path = base.join("main.crn");
+    let doc = create_document_at(main_text, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     let unknown_fn = diagnostics
         .iter()
@@ -9483,8 +9602,9 @@ fn check_attributes_blocks_skips_sibling_resource_binding() {
     let (_tmp, base) = sibling_resource_binding_fixture(main_text);
 
     let engine = test_engine();
-    let doc = create_document(main_text);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
+    let path = base.join("main.crn");
+    let doc = create_document_at(main_text, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     let undefined_resource = diagnostics
         .iter()
@@ -9543,8 +9663,9 @@ fn check_attributes_blocks_skips_sibling_resource_binding_even_when_merge_fails(
     std::fs::write(base.join("broken.crn"), "provider gcp { region = ").unwrap();
 
     let engine = test_engine();
-    let doc = create_document(main_text);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
+    let path = base.join("main.crn");
+    let doc = create_document_at(main_text, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     let undefined_resource = diagnostics
         .iter()
@@ -9581,8 +9702,9 @@ fn check_attributes_blocks_skips_sibling_argument_even_when_merge_fails() {
     std::fs::write(base.join("main.crn"), main_text).unwrap();
 
     let engine = test_engine();
-    let doc = create_document(main_text);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
+    let path = base.join("main.crn");
+    let doc = create_document_at(main_text, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     let phantom_arg = diagnostics
         .iter()
@@ -9606,8 +9728,9 @@ fn check_attributes_blocks_warns_when_truly_undefined_even_when_merge_fails() {
     std::fs::write(base.join("broken.crn"), "provider gcp { region = ").unwrap();
 
     let engine = test_engine();
-    let doc = create_document(main_text);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
+    let path = base.join("main.crn");
+    let doc = create_document_at(main_text, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     let phantom_bar = diagnostics
         .iter()
@@ -9636,8 +9759,9 @@ fn check_attributes_blocks_still_warns_when_truly_undefined() {
     let (_tmp, base) = sibling_resource_binding_fixture(main_text);
 
     let engine = test_engine();
-    let doc = create_document(main_text);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
+    let path = base.join("main.crn");
+    let doc = create_document_at(main_text, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     let undefined_resource = diagnostics
         .iter()
@@ -9860,8 +9984,9 @@ fn empty_interpolation_does_not_cascade_undefined_for_sibling_bindings() {
     std::fs::write(base.join("main.crn"), main).unwrap();
 
     let engine = test_engine();
-    let doc = create_document(main);
-    let diagnostics = engine.analyze(&doc, Some(&(base).join("main.crn")));
+    let path = base.join("main.crn");
+    let doc = create_document_at(main, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
 
     let bucket_undefined = diagnostics
         .iter()
@@ -10101,10 +10226,9 @@ fn lsp_rejects_sibling_data_source_wait_target_at_target_anchor() {
     until = lookup.status == "ISSUED"
 }
 "#;
-    let diagnostics = test_engine_with_wait_target().analyze(
-        &create_document(source),
-        Some(&(fixture.path()).join("main.crn")),
-    );
+    let path = fixture.path().join("main.crn");
+    let diagnostics = test_engine_with_wait_target()
+        .analyze(&create_document_at(source, path.clone()), Some(&path));
     let diagnostic = diagnostics
         .iter()
         .find(|diagnostic| {
@@ -10297,9 +10421,10 @@ fn duplicate_provider_kind_across_buffer_and_sibling_is_one_anchored_error() {
     )
     .unwrap();
     let source = "provider mock {}\n";
-    let doc = create_document(source);
+    let path = base.join("main.crn");
+    let doc = create_document_at(source, path.clone());
 
-    let diagnostics = test_engine().analyze(&doc, Some(&(base).join("main.crn")));
+    let diagnostics = test_engine().analyze(&doc, Some(&path));
     let duplicates: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -10331,9 +10456,10 @@ fn duplicate_export_across_buffer_and_sibling_is_one_anchored_error() {
     )
     .unwrap();
     let source = "exports {\n  x = \"buffer\"\n}\n";
-    let doc = create_document(source);
+    let path = base.join("main.crn");
+    let doc = create_document_at(source, path.clone());
 
-    let diagnostics = test_engine().analyze(&doc, Some(&(base).join("main.crn")));
+    let diagnostics = test_engine().analyze(&doc, Some(&path));
     let duplicates: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.message.starts_with("duplicate export 'x'"))
@@ -10356,9 +10482,10 @@ fn duplicate_binding_across_buffer_and_sibling_is_one_anchored_error() {
     let base = temp.path();
     std::fs::write(base.join("sibling.crn"), "let v = \"sibling\"\n").unwrap();
     let source = "let v = \"buffer\"\n";
-    let doc = create_document(source);
+    let path = base.join("main.crn");
+    let doc = create_document_at(source, path.clone());
 
-    let diagnostics = test_engine().analyze(&doc, Some(&(base).join("main.crn")));
+    let diagnostics = test_engine().analyze(&doc, Some(&path));
     let duplicates: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.message.starts_with("duplicate binding 'v'"))
@@ -10381,9 +10508,10 @@ fn duplicate_user_function_anchors_on_exact_identifier() {
     let base = temp.path();
     std::fs::write(base.join("sibling.crn"), "fn tag() {\n  \"sibling\"\n}\n").unwrap();
     let source = "fn tag_name() {\n  \"longer name\"\n}\n\nfn tag() {\n  \"buffer\"\n}\n";
-    let doc = create_document(source);
+    let path = base.join("main.crn");
+    let doc = create_document_at(source, path.clone());
 
-    let diagnostics = test_engine().analyze(&doc, Some(&(base).join("main.crn")));
+    let diagnostics = test_engine().analyze(&doc, Some(&path));
     let duplicates: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.message.starts_with("duplicate function 'tag'"))
@@ -10401,9 +10529,10 @@ fn same_block_duplicate_export_has_error_without_last_wins_warning() {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path();
     let source = "exports {\n  x = \"one\"\n  x = \"two\"\n}\n";
-    let doc = create_document(source);
+    let path = base.join("main.crn");
+    let doc = create_document_at(source, path.clone());
 
-    let diagnostics = test_engine().analyze(&doc, Some(&(base).join("main.crn")));
+    let diagnostics = test_engine().analyze(&doc, Some(&path));
     let duplicates: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.message.starts_with("duplicate export 'x'"))
@@ -10427,9 +10556,10 @@ fn same_block_duplicate_module_attribute_has_error_without_last_wins_warning() {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path();
     let source = "attributes {\n  x = \"one\"\n  x = \"two\"\n}\n";
-    let doc = create_document(source);
+    let path = base.join("main.crn");
+    let doc = create_document_at(source, path.clone());
 
-    let diagnostics = test_engine().analyze(&doc, Some(&(base).join("main.crn")));
+    let diagnostics = test_engine().analyze(&doc, Some(&path));
     let duplicates: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -10458,9 +10588,10 @@ fn same_block_duplicate_export_survives_broken_sibling_parse() {
     let base = temp.path();
     std::fs::write(base.join("broken.crn"), "provider gcp { region = ").unwrap();
     let source = "exports {\n  x = \"one\"\n  x = \"two\"\n}\n";
-    let doc = create_document(source);
+    let path = base.join("main.crn");
+    let doc = create_document_at(source, path.clone());
 
-    let diagnostics = test_engine().analyze(&doc, Some(&(base).join("main.crn")));
+    let diagnostics = test_engine().analyze(&doc, Some(&path));
     let duplicates: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.message.starts_with("duplicate export 'x'"))

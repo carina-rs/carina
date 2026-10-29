@@ -37,7 +37,7 @@ struct AttributeReturningNormalizer {
 impl ProviderNormalizer for AttributeReturningNormalizer {
     fn normalize_desired<'a>(
         &'a self,
-        resources: &'a mut [Resource],
+        resources: &'a mut [crate::resource::ProviderResource],
     ) -> BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
             resources[0].set_attr(self.name, self.value.clone());
@@ -173,7 +173,7 @@ async fn normalization_error_stops_later_stages() {
     impl ProviderNormalizer for FailingNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            resources: &'a mut [Resource],
+            resources: &'a mut [crate::resource::ProviderResource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 assert!(
@@ -378,7 +378,7 @@ async fn desired_normalization_runs_stages_in_order() {
     impl ProviderNormalizer for OrderNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            resources: &'a mut [Resource],
+            resources: &'a mut [crate::resource::ProviderResource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 let subjects = resources[0].get_attr("subjects").cloned();
@@ -472,7 +472,7 @@ async fn desired_normalization_lifts_guest_string_alias_to_api_enum() {
     impl ProviderNormalizer for StringAliasNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            resources: &'a mut [Resource],
+            resources: &'a mut [crate::resource::ProviderResource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 resources[0].set_attr("mode", string_value("allow"));
@@ -535,7 +535,7 @@ async fn desired_normalization_rejects_guest_dotted_string_without_shape_strippi
     impl ProviderNormalizer for DottedStringNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            resources: &'a mut [Resource],
+            resources: &'a mut [crate::resource::ProviderResource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 resources[0].set_attr("mode", string_value("test.thing.Mode.allow"));
@@ -822,7 +822,7 @@ async fn apply_desired_normalization_passes_deferred_values_to_in_process_normal
     impl ProviderNormalizer for InspectingNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            resources: &'a mut [Resource],
+            resources: &'a mut [crate::resource::ProviderResource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 assert!(matches!(
@@ -896,7 +896,7 @@ async fn desired_normalization_slice_canonicalizes_and_runs_stages_on_full_resou
     impl ProviderNormalizer for FullResourceNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            resources: &'a mut [Resource],
+            resources: &'a mut [crate::resource::ProviderResource],
         ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 assert!(

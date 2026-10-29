@@ -23,8 +23,8 @@ use crate::binding_index::SecretPreservingAttributes;
 use crate::effect::PlanOp;
 use crate::parser::{ProviderConfig, StateBlockAddress};
 use crate::resource::{
-    CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker, Resource,
-    ResourceId, State, Value, ValueString,
+    CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker,
+    ProviderResource, Resource, ResourceId, State, Value, ValueString,
 };
 #[cfg(test)]
 use crate::resource::{DataSource, RedactedSecretHash};
@@ -3893,7 +3893,7 @@ pub trait ProviderNormalizer: Send + Sync {
     /// Providers without enum types return [`ready_noop`].
     fn normalize_desired<'a>(
         &'a self,
-        resources: &'a mut [Resource],
+        resources: &'a mut [ProviderResource],
     ) -> BoxFuture<'a, ProviderResult<()>>;
 
     /// Normalize current state values before diffing.
@@ -3967,7 +3967,7 @@ pub struct NoopNormalizer;
 impl ProviderNormalizer for NoopNormalizer {
     fn normalize_desired<'a>(
         &'a self,
-        _resources: &'a mut [Resource],
+        _resources: &'a mut [ProviderResource],
     ) -> BoxFuture<'a, ProviderResult<()>> {
         ready_noop()
     }
@@ -4102,9 +4102,9 @@ impl std::error::Error for DefaultTagEncodingError {}
 ///
 /// Records which tag keys came from defaults as host-owned provenance on the
 /// resource, separate from provider-facing attributes.
-pub fn merge_default_tags(
+pub fn merge_default_tags<S>(
     config: &ProviderConfig,
-    resources: &mut [Resource],
+    resources: &mut [Resource<S>],
     registry: &SchemaRegistry,
 ) -> ProviderResult<()> {
     if config.default_tags.is_empty() {
@@ -4369,7 +4369,7 @@ impl Provider for ProviderRouter {
 impl ProviderNormalizer for ProviderRouter {
     fn normalize_desired<'a>(
         &'a self,
-        resources: &'a mut [Resource],
+        resources: &'a mut [ProviderResource],
     ) -> BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
             // Sequential, never concurrent: normalizers are not
@@ -7167,7 +7167,7 @@ mod tests {
 
     fn resolved_for_test(resource: Resource) -> ProviderReadyResource {
         let bindings = crate::binding_index::ResolvedBindings::default();
-        let gate = crate::executor::ModuleConstraintGate::new(&[]);
+        let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = crate::schema::SchemaRegistry::new();
         let context = crate::executor::ProviderPreparationContext::new(
             &bindings,
@@ -7185,7 +7185,7 @@ mod tests {
 
     fn ready_data_source_for_test(resource: DataSource) -> ProviderReadyDataSource {
         let bindings = crate::binding_index::ResolvedBindings::default();
-        let gate = crate::executor::ModuleConstraintGate::new(&[]);
+        let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = crate::schema::SchemaRegistry::new();
         let context = crate::executor::ProviderPreparationContext::new(
             &bindings,
@@ -7622,7 +7622,7 @@ mod tests {
         impl ProviderNormalizer for FailingNormalizer {
             fn normalize_desired<'a>(
                 &'a self,
-                _resources: &'a mut [Resource],
+                _resources: &'a mut [ProviderResource],
             ) -> BoxFuture<'a, ProviderResult<()>> {
                 ready_noop()
             }
@@ -8940,7 +8940,7 @@ mod tests {
         impl ProviderNormalizer for SchemaOnlyProvider {
             fn normalize_desired<'a>(
                 &'a self,
-                resources: &'a mut [Resource],
+                resources: &'a mut [ProviderResource],
             ) -> BoxFuture<'a, ProviderResult<()>> {
                 Box::pin(async move {
                     // Prefix all string attribute values with "normalized:"
@@ -8985,10 +8985,14 @@ mod tests {
 
         // Test normalize_desired
         let ext = SchemaOnlyProvider;
-        let mut resources = vec![Resource::new("test", "example").with_attribute(
-            "key",
-            Value::Concrete(ConcreteValue::String("value".into())),
-        )];
+        let mut resources = vec![
+            Resource::new("test", "example")
+                .with_attribute(
+                    "key",
+                    Value::Concrete(ConcreteValue::String("value".into())),
+                )
+                .into_provider_resource(),
+        ];
         ext.normalize_desired(&mut resources).await.unwrap();
         assert_eq!(
             resources[0].get_attr("key"),
@@ -9104,7 +9108,7 @@ mod tests {
         impl ProviderNormalizer for TestNormalizer {
             fn normalize_desired<'a>(
                 &'a self,
-                resources: &'a mut [Resource],
+                resources: &'a mut [ProviderResource],
             ) -> BoxFuture<'a, ProviderResult<()>> {
                 Box::pin(async move {
                     for resource in resources.iter_mut() {
@@ -9156,7 +9160,8 @@ mod tests {
             Resource::with_provider("normalizing", "test", "example", None)
                 .with_attribute("key", Value::Concrete(ConcreteValue::String("val".into())))
                 .with_attribute("peer", peer_ref.clone())
-                .with_attribute("pending", pending.clone()),
+                .with_attribute("pending", pending.clone())
+                .into_provider_resource(),
         ];
         router.normalize_desired(&mut resources).await.unwrap();
         assert_eq!(

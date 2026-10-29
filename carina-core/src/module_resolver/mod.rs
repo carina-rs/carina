@@ -34,19 +34,20 @@ pub use loader::{
 };
 pub(crate) use resolver::resolve_upstream_modules_with_config;
 pub use resolver::{
-    ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleCallSystemIdentity,
-    ModuleResolutionDiagnosticReport, RefCheckedModuleGraph, ResolvedModuleConstraintOrigin,
-    ResolvedModuleConstraintOutcome, ResolvedModuleConstraintStatus, resolve_modules,
-    resolve_modules_with_config, resolve_modules_with_diagnostics,
+    ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticReport,
+    RefCheckedModuleGraph, ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
+    ResolvedModuleConstraintStatus, resolve_modules, resolve_modules_with_config,
+    resolve_modules_with_diagnostics,
 };
 pub use signature::{
     ResolvedModuleSignature, ResolvedModuleSignatures, load_resolved_module_signatures,
 };
 pub use validation::{
-    ConstraintEvaluation, EvaluatedModuleConstraint, ModuleConstraintCall,
+    ConstraintEvaluation, ConstraintOrigin, EvaluatedModuleConstraint, ModuleConstraintCall,
     ModuleConstraintDiagnostic, ModuleConstraintFailure, ModuleConstraintKind,
-    ModuleConstraintViolation, ModuleConstraints, evaluate_constraint, evaluate_module_constraints,
-    evaluate_pending_constraints, referenced_constraint_arguments,
+    ModuleConstraintViolation, ModuleConstraints, evaluate_constraint,
+    evaluate_live_pending_constraints, evaluate_module_constraints,
+    evaluate_saved_pending_constraints, referenced_constraint_arguments,
 };
 
 // Bring `pub(super)` helpers into mod.rs scope so the `tests` submodule (which

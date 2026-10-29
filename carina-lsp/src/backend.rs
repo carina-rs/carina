@@ -1017,8 +1017,9 @@ mock.test.Thing {
                 Ok(ProviderArtifactFingerprint::default()),
             )],
         );
-        let document = Document::new(
+        let document = Document::new_with_path(
             main.to_string(),
+            temp.path().join("main.crn"),
             Arc::new(carina_core::parser::ProviderContext::default()),
         );
 
@@ -1079,8 +1080,9 @@ mock.test.Thing {
                 Ok(ProviderArtifactFingerprint::default()),
             )],
         );
-        let document = Document::new(
+        let document = Document::new_with_path(
             main.to_string(),
+            temp.path().join("main.crn"),
             Arc::new(carina_core::parser::ProviderContext::default()),
         );
 

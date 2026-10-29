@@ -7,16 +7,17 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::effect::{ChangedCreateOnly, Effect, MoveAuthority, TemporaryName};
-use crate::module::DependencyGraph;
+use crate::effect::{
+    ChangedCreateOnly, Effect, EffectWithSource, MoveAuthority, SavedEffect, TemporaryName,
+};
 use crate::module_resolver::ModuleConstraintDiagnostic;
 use crate::name_override::NameOverride;
 use crate::provider::{AppliedIdentifier, Timestamp};
-pub use crate::resource::ModuleSource;
 use crate::resource::{
     DeposedKey, Directives, ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity,
     Value,
 };
+pub use crate::resource::{ModuleSource, SavedModuleSource};
 
 /// Error detected while constructing a plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -419,9 +420,13 @@ struct AbandonedDeposedGeneration {
 }
 
 /// Plan containing Effects to be executed
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Plan {
-    effects: Vec<Effect>,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "S: Serialize + Clone",
+    deserialize = "S: Deserialize<'de>"
+))]
+pub struct Plan<S = ModuleSource> {
+    effects: Vec<EffectWithSource<S>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) replace_display: Vec<ReplaceDisplayMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -435,13 +440,42 @@ pub struct Plan {
     abandoned_deposed: Vec<AbandonedDeposedGeneration>,
 }
 
+impl<S> Default for Plan<S> {
+    fn default() -> Self {
+        Self {
+            effects: Vec::new(),
+            replace_display: Vec::new(),
+            permanent_name_overrides: Vec::new(),
+            errors: Vec::new(),
+            abandoned_deposed: Vec::new(),
+        }
+    }
+}
+
+pub type SavedPlan = Plan<SavedModuleSource>;
+
+impl From<Plan> for SavedPlan {
+    fn from(plan: Plan) -> Self {
+        let Plan {
+            effects,
+            replace_display,
+            permanent_name_overrides,
+            errors,
+            abandoned_deposed,
+        } = plan;
+        Self {
+            effects: effects.into_iter().map(SavedEffect::from).collect(),
+            replace_display,
+            permanent_name_overrides,
+            errors,
+            abandoned_deposed,
+        }
+    }
+}
+
 impl Plan {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn add(&mut self, effect: Effect) {
-        self.effects.push(effect);
     }
 
     /// Add a token-free resume effect and retain only its non-secret display
@@ -494,8 +528,14 @@ impl Plan {
             self.permanent_name_overrides.push(override_);
         }
     }
+}
 
-    pub fn effects(&self) -> &[Effect] {
+impl<S> Plan<S> {
+    pub fn add(&mut self, effect: Effect<S>) {
+        self.effects.push(effect);
+    }
+
+    pub fn effects(&self) -> &[Effect<S>] {
         &self.effects
     }
 
@@ -586,7 +626,26 @@ impl Plan {
         overrides
     }
 
-    pub(crate) fn effects_mut(&mut self) -> &mut Vec<Effect> {
+    /// Add persisted name-override metadata to a fixture without requiring
+    /// the persisted plan representation to deserialize as a live plan.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn fixture_add_permanent_name_override(
+        &mut self,
+        resource_id: ResolvedResourceId,
+        attribute: impl Into<String>,
+        temp_value: impl Into<String>,
+        original_value: Option<String>,
+    ) {
+        self.permanent_name_overrides.push(PermanentNameOverride {
+            resource_id,
+            attribute: attribute.into(),
+            temp_value: temp_value.into(),
+            original_value,
+        });
+    }
+
+    pub(crate) fn effects_mut(&mut self) -> &mut Vec<Effect<S>> {
         &mut self.effects
     }
 
@@ -642,7 +701,7 @@ impl Plan {
     /// Remove effects that don't satisfy the predicate
     pub fn retain<F>(&mut self, f: F)
     where
-        F: FnMut(&Effect) -> bool,
+        F: FnMut(&Effect<S>) -> bool,
     {
         let mut keep = f;
         let mut old_to_new = vec![None; self.effects.len()];
@@ -848,199 +907,6 @@ impl std::fmt::Display for PlanSummary {
     }
 }
 
-/// A Plan with module source information
-#[derive(Debug, Clone, Default)]
-pub struct ModularPlan {
-    /// The underlying plan
-    pub plan: Plan,
-    /// Effect index -> module source mapping
-    pub effect_sources: HashMap<usize, ModuleSource>,
-    /// Module name -> dependency graph
-    pub module_graphs: HashMap<String, DependencyGraph>,
-}
-
-impl ModularPlan {
-    /// Create a new empty modular plan
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Create a modular plan from a regular plan with source extraction
-    pub fn from_plan(plan: Plan) -> Self {
-        let mut modular = Self {
-            plan: plan.clone(),
-            effect_sources: HashMap::new(),
-            module_graphs: HashMap::new(),
-        };
-
-        // Extract module sources from effect resources
-        for (idx, effect) in plan.effects().iter().enumerate() {
-            let source = match effect {
-                Effect::Create(r) | Effect::ResumeCreate { resource: r, .. } => {
-                    Self::extract_source(&r.module_source)
-                }
-                Effect::Update { to, .. } => Self::extract_source(&to.module_source),
-                Effect::Read { resource } => Self::extract_source(&resource.module_source),
-                Effect::Delete { .. }
-                | Effect::Import { .. }
-                | Effect::Remove { .. }
-                | Effect::Move { .. }
-                | Effect::Wait { .. }
-                | Effect::DeferredCreate { .. }
-                | Effect::DeferredReplace(_) => ModuleSource::Root,
-            };
-            modular.effect_sources.insert(idx, source);
-        }
-
-        modular
-    }
-
-    fn extract_source(module_source: &Option<ModuleSource>) -> ModuleSource {
-        module_source.clone().unwrap_or(ModuleSource::Root)
-    }
-
-    /// Get the source for an effect by index
-    pub fn source_of(&self, effect_idx: usize) -> &ModuleSource {
-        self.effect_sources
-            .get(&effect_idx)
-            .unwrap_or(&ModuleSource::Root)
-    }
-
-    /// Group effects by module source
-    pub fn group_by_module(&self) -> HashMap<ModuleSource, Vec<usize>> {
-        let mut groups: HashMap<ModuleSource, Vec<usize>> = HashMap::new();
-
-        for (idx, source) in &self.effect_sources {
-            groups.entry(source.clone()).or_default().push(*idx);
-        }
-
-        // Sort indices within each group
-        for indices in groups.values_mut() {
-            indices.sort();
-        }
-
-        groups
-    }
-
-    /// Display effects grouped by module
-    pub fn display_by_module(&self) -> String {
-        let mut output = String::new();
-        let groups = self.group_by_module();
-
-        // Display root effects first
-        if let Some(indices) = groups.get(&ModuleSource::Root) {
-            output.push_str("Root:\n");
-            for idx in indices {
-                if let Some(effect) = self.plan.effects().get(*idx) {
-                    output.push_str(&format!("  {}\n", format_effect_brief(effect)));
-                }
-            }
-            output.push('\n');
-        }
-
-        // Display module effects
-        let mut module_sources: Vec<_> = groups.keys().filter(|s| !s.is_root()).cloned().collect();
-        module_sources.sort_by(|a, b| match (a, b) {
-            (
-                ModuleSource::Module {
-                    name: n1,
-                    instance: i1,
-                    ..
-                },
-                ModuleSource::Module {
-                    name: n2,
-                    instance: i2,
-                    ..
-                },
-            ) => (n1, i1).cmp(&(n2, i2)),
-            _ => std::cmp::Ordering::Equal,
-        });
-
-        for source in module_sources {
-            if let ModuleSource::Module { name, instance, .. } = &source {
-                output.push_str(&format!("Module: {} (instance: {})\n", name, instance));
-
-                if let Some(indices) = groups.get(&source) {
-                    for idx in indices {
-                        if let Some(effect) = self.plan.effects().get(*idx) {
-                            output.push_str(&format!("  {}\n", format_effect_brief(effect)));
-                        }
-                    }
-                }
-                output.push('\n');
-            }
-        }
-
-        // Add summary
-        let summary = self.plan.summary();
-        output.push_str(&format!("Summary: {}\n", summary.render_body()));
-
-        output
-    }
-}
-
-/// Format an effect briefly for display
-fn format_effect_brief(effect: &Effect) -> String {
-    match effect {
-        Effect::Create(r) => format!("{} {}", effect.display_glyph(), r.id),
-        Effect::ResumeCreate { resource: r, .. } => {
-            format!("{} resume create {}", effect.display_glyph(), r.id)
-        }
-        Effect::Update { to, .. } => format!("{} {}", effect.display_glyph(), to.id),
-        Effect::Delete {
-            id,
-            identifier,
-            generation,
-            ..
-        } => {
-            let deposed_note = if matches!(generation, crate::effect::EffectGeneration::Deposed(_))
-            {
-                format!(" (deposed {identifier})")
-            } else {
-                String::new()
-            };
-            format!("{} {}{}", effect.display_glyph(), id, deposed_note)
-        }
-        Effect::Read { resource } => {
-            format!("{} {} (data source)", effect.display_glyph(), resource.id)
-        }
-        Effect::Import { id, identifier } => format!(
-            "{} {} (import: {})",
-            effect.display_glyph(),
-            id,
-            crate::effect::format_import_identifier(identifier)
-        ),
-        // carina#3332: leading `x` shape-collides with the `✗` failure
-        // indicator used elsewhere in apply output. Use `~` here too —
-        // matches the `display`/TUI plan-tree Remove symbol and the
-        // operation word disambiguates from Update.
-        Effect::Remove { id } => format!("{} {} (remove from state)", effect.display_glyph(), id),
-        Effect::Move { from, to } => format!("{} {} (from: {})", effect.display_glyph(), to, from),
-        Effect::Wait {
-            identity,
-            until_surface,
-            ..
-        } => format!(
-            "{} {} (until {})",
-            effect.display_glyph(),
-            identity,
-            until_surface
-        ),
-        Effect::DeferredCreate { id, template, .. } => format!(
-            "{} {} (deferred for: waits on {})",
-            effect.display_glyph(),
-            id,
-            template.binding_description()
-        ),
-        Effect::DeferredReplace(payload) => format!(
-            "{} {} (deferred for replace: waits on {})",
-            effect.display_glyph(),
-            payload.id,
-            payload.template.binding_description()
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1055,6 +921,14 @@ mod tests {
 
     fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
         ResolvedDataSource::new(resource)
+    }
+
+    fn deserialize_plan(json: &str) -> SavedPlan {
+        serde_json::from_str::<SavedPlan>(json).unwrap()
+    }
+
+    fn deserialize_plan_value(value: serde_json::Value) -> SavedPlan {
+        serde_json::from_value::<SavedPlan>(value).unwrap()
     }
 
     fn changed_create_only() -> ChangedCreateOnly {
@@ -1155,59 +1029,6 @@ mod tests {
         ))));
         assert!(plan.has_mutations());
         assert_eq!(plan.mutation_count(), 1);
-    }
-
-    /// carina#3332: `Effect::Remove` in the brief renderer must not
-    /// lead with `x` (shape-collides with the `✗` failure indicator
-    /// used in apply output). Pin the new `~ ... (remove from state)`
-    /// shape so a future tweak does not silently re-introduce the
-    /// confusing glyph.
-    #[test]
-    fn format_effect_brief_remove_has_no_failure_shaped_glyph() {
-        use crate::resource::ResourceId;
-        let id =
-            ResourceId::with_identity("aws.route53.RecordSet", "aws_route53_record_set_7059de08");
-        let s = format_effect_brief(&Effect::Remove {
-            id: crate::resource::ResolvedResourceId::new(id.clone()),
-        });
-        assert!(!s.contains('x'), "must not contain `x`; got: {s:?}");
-        assert!(!s.contains('✗'), "must not contain `✗`; got: {s:?}");
-        assert!(
-            s.contains("(remove from state)"),
-            "must name the operation; got: {s:?}"
-        );
-        assert!(
-            s.contains(&id.to_string()),
-            "must include the resource id; got: {s:?}"
-        );
-    }
-
-    #[test]
-    fn format_effect_brief_renders_wait() {
-        use crate::resource::{ConcreteValue, Value};
-        use crate::wait::predicate::{AttrPath, WaitPredicate};
-        use std::time::Duration;
-
-        let e = Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
-            target_id: crate::wait::ManagedWaitTarget::new(&resolved(Resource::new(
-                "acm.Certificate",
-                "cert",
-            ))),
-            until: WaitPredicate::equals(
-                AttrPath::single("status"),
-                Value::Concrete(ConcreteValue::String("ISSUED".into())),
-            )
-            .unwrap(),
-            until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
-            timeout: Duration::from_secs(75 * 60),
-            interval: Duration::from_secs(5),
-            explicit_dependencies: std::collections::HashSet::new(),
-        };
-        assert_eq!(
-            format_effect_brief(&e),
-            "> cert_issued (until cert.status == aws.acm.Certificate.Status.Issued)"
-        );
     }
 
     #[test]
@@ -1381,65 +1202,6 @@ mod tests {
     }
 
     #[test]
-    fn modular_plan_from_plan() {
-        let mut plan = Plan::new();
-
-        // Root resource
-        plan.add(Effect::Create(resolved(Resource::new("vpc", "main"))));
-
-        // Module resource
-        let module_resource =
-            Resource::new("security_group", "web_sg").with_module_source(ModuleSource::Module {
-                name: "web_tier".to_string(),
-                instance: "web".to_string(),
-                scope: None,
-            });
-        plan.add(Effect::Create(resolved(module_resource)));
-
-        let modular = ModularPlan::from_plan(plan);
-
-        assert_eq!(modular.source_of(0), &ModuleSource::Root);
-        assert_eq!(
-            modular.source_of(1),
-            &ModuleSource::Module {
-                name: "web_tier".to_string(),
-                instance: "web".to_string(),
-                scope: None,
-            }
-        );
-    }
-
-    #[test]
-    fn modular_plan_group_by_module() {
-        let mut plan = Plan::new();
-
-        // Two root resources
-        plan.add(Effect::Create(resolved(Resource::new("vpc", "main"))));
-        plan.add(Effect::Create(resolved(Resource::new("subnet", "public"))));
-
-        // Module resource
-        let module_resource =
-            Resource::new("security_group", "web_sg").with_module_source(ModuleSource::Module {
-                name: "web_tier".to_string(),
-                instance: "web".to_string(),
-                scope: None,
-            });
-        plan.add(Effect::Create(resolved(module_resource)));
-
-        let modular = ModularPlan::from_plan(plan);
-        let groups = modular.group_by_module();
-
-        assert_eq!(groups.get(&ModuleSource::Root).unwrap().len(), 2);
-        assert_eq!(
-            groups
-                .get(&ModuleSource::module("web_tier", "web"))
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[test]
     fn plan_add_replacement_registers_create_delete_and_display_atomically() {
         let consumer_updates = HashSet::from([ResourceIdentity::new("subnet_update")]);
         let group = replacement_group(consumer_updates.clone());
@@ -1559,7 +1321,7 @@ mod tests {
         let expected_replace_display = plan.replace_display.clone();
 
         let json = serde_json::to_string(&plan).unwrap();
-        let deserialized: Plan = serde_json::from_str(&json).unwrap();
+        let deserialized = deserialize_plan(&json);
 
         assert_eq!(deserialized.effects().len(), 2);
         assert_eq!(deserialized.replace_display, expected_replace_display);
@@ -1691,9 +1453,9 @@ mod tests {
         plan.add_replacement(group);
 
         let json = serde_json::to_string(&plan).unwrap();
-        let deserialized: Plan = serde_json::from_str(&json).unwrap();
+        let deserialized = deserialize_plan(&json);
 
-        assert_eq!(deserialized, plan);
+        assert_eq!(deserialized, SavedPlan::from(plan));
     }
 
     #[test]
@@ -1716,7 +1478,7 @@ mod tests {
         object.remove("permanent_name_overrides");
         assert!(!object.contains_key("permanent_name_overrides"));
 
-        let deserialized: Plan = serde_json::from_value(json).unwrap();
+        let deserialized = deserialize_plan_value(json);
         assert!(deserialized.permanent_name_overrides.is_empty());
         assert_eq!(deserialized.effects().len(), 1);
         assert_eq!(deserialized.errors().len(), 1);
@@ -1742,7 +1504,7 @@ mod tests {
         object.remove("replace_display");
         assert!(!object.contains_key("replace_display"));
 
-        let deserialized: Plan = serde_json::from_value(json).unwrap();
+        let deserialized = deserialize_plan_value(json);
         assert!(deserialized.replace_display.is_empty());
         assert_eq!(deserialized.effects().len(), 1);
         assert_eq!(deserialized.errors().len(), 1);
@@ -1769,8 +1531,9 @@ mod tests {
         });
 
         let json = serde_json::to_string(&plan).unwrap();
-        let deserialized: Plan = serde_json::from_str(&json).unwrap();
+        let deserialized = deserialize_plan(&json);
         assert_eq!(plan.effects().len(), deserialized.effects().len());
-        assert_eq!(plan.effects(), deserialized.effects());
+        let saved = SavedPlan::from(plan);
+        assert_eq!(saved.effects(), deserialized.effects());
     }
 }

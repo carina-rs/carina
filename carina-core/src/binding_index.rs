@@ -44,9 +44,10 @@
 
 use crate::data_source_value::{DataSourceValue, DataSourceValues};
 use crate::parser::{BindingName, ResourceRef};
+use crate::resource::composition::CompositionRuntimeRef;
 use crate::resource::{
-    AccessPath, Composition, PathSegment, PlanInputCurrent, ReferencePathRef, Resource, ResourceId,
-    State, Subscript, Value,
+    AccessPath, LiveComposition, PathSegment, PlanInputCurrent, ReferencePathRef, Resource,
+    ResourceId, SavedComposition, SavedModuleSource, SavedResource, State, Subscript, Value,
 };
 use crate::schema::{
     AttributeType, ResourceSchema, SchemaRegistry, Shape, TypeInSchema, suggest_similar_name,
@@ -57,7 +58,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[derive(Debug, Clone, Copy)]
 pub enum BindingTarget<'a> {
     Schema(&'a ResourceSchema),
-    Composition(&'a Composition),
+    LiveComposition(&'a LiveComposition),
     ModuleCall(&'a crate::module_resolver::ResolvedModuleSignature),
     Argument(&'a crate::parser::TypeExpr),
     UpstreamState(&'a crate::upstream_exports::UpstreamExportEntries),
@@ -98,7 +99,7 @@ impl ReferenceTypeCheck {
             (
                 Self::PostfixAccess,
                 BindingTarget::Schema(_)
-                | BindingTarget::Composition(_)
+                | BindingTarget::LiveComposition(_)
                 | BindingTarget::ModuleCall(_)
                 | BindingTarget::Argument(_),
             ) => InvalidAccessPolicy::Error,
@@ -344,7 +345,7 @@ pub enum RefTypeError {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RefTargetKind {
     Schema { resource_type: String },
-    Composition,
+    LiveComposition,
 }
 
 impl std::fmt::Display for RefTypeError {
@@ -455,7 +456,7 @@ impl<'a> BindingIndex<'a> {
     /// Managed/data bindings whose schema is missing from the registry are
     /// silently skipped — callers (validation / LSP) treat unknown resource
     /// types as a separate diagnostic, so reporting them again here would
-    /// double-count. Composition bindings do not need a registry lookup.
+    /// double-count. LiveComposition bindings do not need a registry lookup.
     pub fn from_parsed<E>(
         parsed: &'a crate::parser::File<E>,
         registry: &'a SchemaRegistry,
@@ -465,7 +466,7 @@ impl<'a> BindingIndex<'a> {
 
     /// Build the index with the declared output surfaces of imported modules.
     /// This is the pre-expansion authority for references such as `web.url`:
-    /// the module call is not a [`Composition`] yet, but its imported
+    /// the module call is not a [`LiveComposition`] yet, but its imported
     /// signature already declares the output type.
     pub fn from_parsed_with_module_signatures<E>(
         parsed: &'a crate::parser::File<E>,
@@ -526,7 +527,7 @@ impl<'a> BindingIndex<'a> {
                 continue;
             };
             known_names.insert(binding_name.to_string());
-            if !matches!(rref, ResourceRef::Composition(_)) {
+            if !matches!(rref, ResourceRef::LiveComposition(_)) {
                 let id = rref.id();
                 resource_handles.insert(
                     binding_name.to_string(),
@@ -543,7 +544,7 @@ impl<'a> BindingIndex<'a> {
                 ResourceRef::DataSource(d) => registry
                     .get_for_data_source(d)
                     .map(|schema| BindingTarget::Schema(schema.schema().as_schema())),
-                ResourceRef::Composition(c) => Some(BindingTarget::Composition(c)),
+                ResourceRef::LiveComposition(c) => Some(BindingTarget::LiveComposition(c)),
             };
             let Some(target) = target else {
                 continue;
@@ -636,7 +637,7 @@ impl<'a> BindingIndex<'a> {
 
     /// Resolve the static type of one complete reference path.
     ///
-    /// Schema bindings are narrowed through the path directly. Composition
+    /// Schema bindings are narrowed through the path directly. LiveComposition
     /// bindings preserve a liftable declared boundary type together with all
     /// inferable forwarded-source constraints; otherwise a forwarded output
     /// recursively inherits the target path's type. Derived values and
@@ -726,7 +727,7 @@ impl<'a> BindingIndex<'a> {
                         Err(error) => RefType::UnknownAttribute(error),
                     }
                 }
-                BindingTarget::Composition(composition) => {
+                BindingTarget::LiveComposition(composition) => {
                     let invalid_access = check.invalid_access_policy(entry.target);
                     let ReferencePathRef::Access(path) = reference else {
                         visiting.remove(&key);
@@ -738,7 +739,7 @@ impl<'a> BindingIndex<'a> {
                         return RefType::UnknownAttribute(unknown_attribute(
                             path,
                             composition.signature.attributes.keys(),
-                            RefTargetKind::Composition,
+                            RefTargetKind::LiveComposition,
                         ));
                     };
 
@@ -817,7 +818,7 @@ impl<'a> BindingIndex<'a> {
                         return RefType::UnknownAttribute(unknown_attribute(
                             path,
                             signature.attributes.keys(),
-                            RefTargetKind::Composition,
+                            RefTargetKind::LiveComposition,
                         ));
                     };
                     let Some(declared) = declared
@@ -988,7 +989,7 @@ impl<'a> BindingIndex<'a> {
             .iter()
             .filter_map(|(name, entry)| match entry.target {
                 BindingTarget::Schema(schema) => Some((name.as_str(), schema)),
-                BindingTarget::Composition(_)
+                BindingTarget::LiveComposition(_)
                 | BindingTarget::ModuleCall(_)
                 | BindingTarget::Argument(_)
                 | BindingTarget::UpstreamState(_) => None,
@@ -1455,24 +1456,35 @@ pub struct ResolvedBindings {
 /// Slices and maps are borrowed: the constructor reads them once and
 /// stores owned copies internally, so the caller retains ownership
 /// without forcing a clone at the API boundary.
-pub struct PreApplyInputs<'a> {
+pub struct LivePreApplyInputs<'a> {
     pub managed: &'a [Resource],
-    pub compositions: &'a [Composition],
+    pub compositions: &'a [LiveComposition],
     pub managed_current: &'a HashMap<ResourceId, PlanInputCurrent>,
     pub data_source_values: &'a DataSourceValues,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub wait_aliases: &'a [WaitAliasSpec],
 }
 
+/// Saved-plan counterpart of [`LivePreApplyInputs`]. The distinct type keeps
+/// value-only saved compositions out of validation and live-expansion seams.
+pub struct SavedPreApplyInputs<'a> {
+    pub managed: &'a [SavedResource],
+    pub compositions: &'a [SavedComposition],
+    pub managed_current: &'a HashMap<ResourceId, PlanInputCurrent>,
+    pub data_source_values: &'a DataSourceValues<SavedModuleSource>,
+    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub wait_aliases: &'a [WaitAliasSpec],
+}
+
 /// Inputs available while data-source queries are still being resolved.
 ///
-/// This is deliberately distinct from [`PreApplyInputs`]: data sources in
+/// This is deliberately distinct from [`LivePreApplyInputs`]: data sources in
 /// this view contribute only their authored input attributes and are always
 /// incomplete. Once provider reads have been classified, all plan/apply
 /// binding construction must cross the total [`DataSourceValues`] boundary.
-pub struct PreDataSourceReadInputs<'a> {
+pub struct LivePreDataSourceReadInputs<'a> {
     pub managed: &'a [Resource],
-    pub compositions: &'a [Composition],
+    pub compositions: &'a [LiveComposition],
     pub data_sources: &'a [crate::resource::DataSource],
     pub managed_current: &'a HashMap<ResourceId, PlanInputCurrent>,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
@@ -1494,7 +1506,7 @@ impl ResolvedBindings {
             .iter()
             .map(WaitAliasSpec::from)
             .collect::<Vec<_>>();
-        Self::pre_data_source_read(PreDataSourceReadInputs {
+        Self::pre_data_source_read_live(LivePreDataSourceReadInputs {
             managed: &parsed.resources,
             compositions: &parsed.compositions,
             data_sources: &parsed.data_sources,
@@ -1506,7 +1518,7 @@ impl ResolvedBindings {
 
     /// Build the explicitly incomplete value view used to resolve query
     /// inputs before provider reads run.
-    pub fn pre_data_source_read(inputs: PreDataSourceReadInputs<'_>) -> Self {
+    pub fn pre_data_source_read_live(inputs: LivePreDataSourceReadInputs<'_>) -> Self {
         let mut bindings = Self::build_managed_core(
             inputs.managed,
             inputs.managed_current,
@@ -1514,7 +1526,7 @@ impl ResolvedBindings {
             &HashMap::new(),
         );
         bindings.layer_unread_data_source_bindings(inputs.data_sources);
-        bindings.layer_compositions(inputs.compositions);
+        bindings.layer_live_compositions(inputs.compositions);
         bindings.layer_wait_aliases(inputs.wait_aliases);
         bindings
     }
@@ -1522,7 +1534,7 @@ impl ResolvedBindings {
     /// Borrowing variant for a managed view assembled from multiple owners.
     pub fn pre_data_source_read_from_managed<'a>(
         managed: impl IntoIterator<Item = &'a Resource>,
-        compositions: &[Composition],
+        compositions: &[LiveComposition],
         data_sources: &[crate::resource::DataSource],
         managed_current: &HashMap<ResourceId, PlanInputCurrent>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -1535,7 +1547,7 @@ impl ResolvedBindings {
             &HashMap::new(),
         );
         bindings.layer_unread_data_source_bindings(data_sources);
-        bindings.layer_compositions(compositions);
+        bindings.layer_live_compositions(compositions);
         bindings.layer_wait_aliases(wait_aliases);
         bindings
     }
@@ -1545,7 +1557,7 @@ impl ResolvedBindings {
     /// typed data-source outcomes and therefore exposes completed read values.
     pub fn pre_apply_from_managed<'a>(
         managed: impl IntoIterator<Item = &'a Resource>,
-        compositions: &[Composition],
+        compositions: &[LiveComposition],
         managed_current: &HashMap<ResourceId, PlanInputCurrent>,
         data_source_values: &DataSourceValues,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -1558,7 +1570,7 @@ impl ResolvedBindings {
             &HashMap::new(),
         );
         bindings.layer_data_source_bindings(data_source_values);
-        bindings.layer_compositions(compositions);
+        bindings.layer_live_compositions(compositions);
         bindings.layer_wait_aliases(wait_aliases);
         bindings
     }
@@ -1571,7 +1583,7 @@ impl ResolvedBindings {
     /// sources — plus the managed/data-source state maps, `remote_bindings`,
     /// and `wait_aliases` inputs the legacy entries took.
     ///
-    /// The required-fields `PreApplyInputs` struct turns "forgot to
+    /// The required-fields `LivePreApplyInputs` struct turns "forgot to
     /// include compositions at a new call site" into a compile error
     /// rather than a runtime symptom: any missing field on the
     /// struct-literal fails to compile, so a new pre-apply call site
@@ -1588,8 +1600,21 @@ impl ResolvedBindings {
     /// cross-file collisions by the directory loader's duplicate-
     /// declaration validation, so the order is observable only in test
     /// code that constructs colliding inputs by hand.
-    pub fn pre_apply(inputs: PreApplyInputs<'_>) -> Self {
-        Self::pre_apply_with_stability(inputs, &HashMap::new())
+    pub fn pre_apply_live(inputs: LivePreApplyInputs<'_>) -> Self {
+        Self::pre_apply_live_with_stability(inputs, &HashMap::new())
+    }
+
+    pub fn pre_apply_saved(inputs: SavedPreApplyInputs<'_>) -> Self {
+        let mut bindings = Self::build_managed_core(
+            inputs.managed,
+            inputs.managed_current,
+            inputs.remote_bindings,
+            &HashMap::new(),
+        );
+        bindings.layer_data_source_bindings(inputs.data_source_values);
+        bindings.layer_saved_compositions(inputs.compositions);
+        bindings.layer_wait_aliases(inputs.wait_aliases);
+        bindings
     }
 
     /// Build the pre-apply view with plan-derived per-resource stability.
@@ -1598,8 +1623,8 @@ impl ResolvedBindings {
     /// successfully refreshed resource. Callers which already have a plan (or
     /// the differ's pre-expansion projection) pass every mutating resource in
     /// `managed_stability`.
-    pub fn pre_apply_with_stability(
-        inputs: PreApplyInputs<'_>,
+    pub fn pre_apply_live_with_stability(
+        inputs: LivePreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
     ) -> Self {
         let mut bindings = Self::build_managed_core(
@@ -1609,7 +1634,7 @@ impl ResolvedBindings {
             managed_stability,
         );
         bindings.layer_data_source_bindings(inputs.data_source_values);
-        bindings.layer_compositions(inputs.compositions);
+        bindings.layer_live_compositions(inputs.compositions);
         bindings.layer_wait_aliases(inputs.wait_aliases);
         bindings
     }
@@ -1619,8 +1644,8 @@ impl ResolvedBindings {
     /// migration window. Wait-aliases are layered separately by the
     /// caller after data sources / compositions so a wait whose target is
     /// a data source or composition still snapshots the resolved attrs.
-    fn build_managed_core(
-        managed: &[Resource],
+    fn build_managed_core<S>(
+        managed: &[Resource<S>],
         managed_current: &HashMap<ResourceId, PlanInputCurrent>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
@@ -1633,8 +1658,8 @@ impl ResolvedBindings {
         )
     }
 
-    fn build_managed_core_from_iter<'a>(
-        managed: impl IntoIterator<Item = &'a Resource>,
+    fn build_managed_core_from_iter<'a, S: 'a>(
+        managed: impl IntoIterator<Item = &'a Resource<S>>,
         managed_current: &HashMap<ResourceId, PlanInputCurrent>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
@@ -1764,7 +1789,7 @@ impl ResolvedBindings {
     /// **Scope:** post-apply increment layering (carina#3248). The
     /// canonical caller is `state_writeback.rs`, which re-resolves
     /// compositions against post-apply state via
-    /// `resolve_virtual_refs_post_apply` and then layers them on top
+    /// `resolve_live_composition_refs_post_apply` and then layers them on top
     /// of the pre-apply binding view for export resolution. Pre-apply
     /// call sites must use [`ResolvedBindings::pre_apply`] instead —
     /// that constructor lays compositions in once at the start and makes
@@ -1780,7 +1805,7 @@ impl ResolvedBindings {
     /// Unlike `pre_apply`, this entry does **not** merge
     /// `managed_current`: compositions have no provider-side state to
     /// merge. The composition's own attribute map (as authored, after
-    /// `resolve_virtual_refs_post_apply` materialised any refs) is
+    /// `resolve_live_composition_refs_post_apply` materialised any refs) is
     /// recorded verbatim.
     ///
     /// Same-name collisions favour the composition entry (it is inserted
@@ -1794,28 +1819,45 @@ impl ResolvedBindings {
     /// hard error on a same-name collision when the post-apply layer
     /// expects to merge rather than overwrite) be added without
     /// breaking the signature.
-    pub fn layer_compositions_post_apply(
+    pub fn layer_live_compositions_post_apply(
         &mut self,
-        compositions: &[Composition],
+        compositions: &[LiveComposition],
     ) -> Result<(), String> {
-        self.layer_compositions(compositions);
+        self.layer_live_compositions(compositions);
         Ok(())
     }
 
-    fn layer_compositions(&mut self, compositions: &[Composition]) {
-        for v in compositions.iter() {
-            let Some(binding_name) = v.binding.as_ref() else {
+    pub fn layer_saved_compositions_post_apply(
+        &mut self,
+        compositions: &[SavedComposition],
+    ) -> Result<(), String> {
+        self.layer_saved_compositions(compositions);
+        Ok(())
+    }
+
+    fn layer_live_compositions(&mut self, compositions: &[LiveComposition]) {
+        self.layer_composition_views(compositions.iter().map(CompositionRuntimeRef::Live));
+    }
+
+    fn layer_saved_compositions(&mut self, compositions: &[SavedComposition]) {
+        self.layer_composition_views(compositions.iter().map(CompositionRuntimeRef::Saved));
+    }
+
+    fn layer_composition_views<'a>(
+        &mut self,
+        compositions: impl IntoIterator<Item = CompositionRuntimeRef<'a>>,
+    ) {
+        for composition in compositions {
+            let Some(binding_name) = composition.binding() else {
                 continue;
             };
-            let value_attrs: indexmap::IndexMap<String, crate::resource::Value> = v
-                .signature
-                .attributes
-                .iter()
-                .map(|(k, attr)| (k.clone(), attr.to_value()))
+            let value_attrs: indexmap::IndexMap<String, crate::resource::Value> = composition
+                .attributes()
+                .map(|(name, value)| (name.clone(), value))
                 .collect();
             let definitive_attributes = value_attrs.keys().cloned().collect();
             self.by_name.insert(
-                binding_name.clone(),
+                binding_name.to_string(),
                 ResolvedBinding {
                     attributes: crate::resource::attrs_to_hashmap(&value_attrs),
                     source: BindingValueSource::Local,
@@ -1879,7 +1921,10 @@ impl ResolvedBindings {
     /// [`ResolvedBindings::pre_apply`]. The function is `pub(crate)`
     /// so a new call site cannot recreate the carina#3252 gap by bypassing
     /// the total [`DataSourceValues`] collection.
-    pub(crate) fn layer_data_source_bindings(&mut self, data_source_values: &DataSourceValues) {
+    pub(crate) fn layer_data_source_bindings<S: Clone>(
+        &mut self,
+        data_source_values: &DataSourceValues<S>,
+    ) {
         for (d, value) in data_source_values.iter() {
             let Some(binding_name) = d.binding.as_ref() else {
                 continue;
@@ -1993,11 +2038,11 @@ impl ResolvedBindings {
     /// view. This is the authoritative post-diff refinement used by export
     /// checks and apply scheduling; it also includes cascade-generated updates
     /// that a pre-expansion differ projection cannot know about.
-    pub fn apply_plan_stability(
+    pub fn apply_plan_stability<S>(
         &mut self,
-        managed: &[Resource],
+        managed: &[Resource<S>],
         managed_current: &HashMap<ResourceId, PlanInputCurrent>,
-        plan: &crate::plan::Plan,
+        plan: &crate::plan::Plan<S>,
         schemas: &crate::schema::SchemaRegistry,
     ) {
         let stability = managed_binding_stability_from_plan(managed, plan, schemas);
@@ -2193,9 +2238,9 @@ impl ResolvedBindings {
     }
 }
 
-pub fn managed_binding_stability_from_plan(
-    managed: &[Resource],
-    plan: &crate::plan::Plan,
+pub fn managed_binding_stability_from_plan<S>(
+    managed: &[Resource<S>],
+    plan: &crate::plan::Plan<S>,
     schemas: &crate::schema::SchemaRegistry,
 ) -> HashMap<ResourceId, ManagedBindingStability> {
     use crate::effect::Effect;
@@ -2349,7 +2394,7 @@ mod tests {
         ArgumentParameter, BindingName, ResourceTypePath, TypeExpr, UntilPredicateAst,
         UpstreamState, WaitBinding, parse,
     };
-    use crate::resource::{CompositionAttribute, Signature};
+    use crate::resource::{LiveCompositionAttribute, LiveCompositionSignature};
     use crate::schema::{
         AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, TypeInSchema,
     };
@@ -2371,15 +2416,15 @@ mod tests {
         r
     }
 
-    fn composition(binding: &'static str) -> Composition {
-        Composition {
+    fn composition(binding: &'static str) -> LiveComposition {
+        LiveComposition {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", binding,
             )),
-            signature: Signature {
+            signature: LiveCompositionSignature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: indexmap::indexmap! {
-                    "target_group_arn".to_string() => CompositionAttribute::from_value(
+                    "target_group_arn".to_string() => LiveCompositionAttribute::from_value(
                         Value::Concrete(crate::resource::ConcreteValue::String(
                             "arn:example".into(),
                         )),
@@ -2392,7 +2437,7 @@ mod tests {
             dependency_bindings: Default::default(),
             module_name: "test_module".to_string(),
             instance: binding.to_string(),
-            provenance: Default::default(),
+            call_path: Default::default(),
             quoted_string_attrs: Default::default(),
         }
     }
@@ -2459,7 +2504,7 @@ let existing = read aws.ec2.Vpc {
         let entry = index
             .get("instance")
             .expect("composition binding must have a typed BindingIndex entry");
-        let BindingTarget::Composition(indexed) = entry.target else {
+        let BindingTarget::LiveComposition(indexed) = entry.target else {
             panic!("composition binding must carry a composition target");
         };
         assert!(std::ptr::eq(indexed, &parsed.compositions[0]));
@@ -2540,7 +2585,7 @@ let existing = read aws.ec2.Vpc {
         let entry = index
             .get("ready")
             .expect("wait binding must alias a composition BindingTarget");
-        let BindingTarget::Composition(indexed) = entry.target else {
+        let BindingTarget::LiveComposition(indexed) = entry.target else {
             panic!("wait binding must preserve the composition target arm");
         };
         assert!(std::ptr::eq(indexed, &parsed.compositions[0]));
@@ -2697,7 +2742,7 @@ let vpc = aws.ec2.Vpc {
         let mut output = composition("instance");
         output.signature.attributes.insert(
             "cidr".to_string(),
-            CompositionAttribute::from_value(
+            LiveCompositionAttribute::from_value(
                 Value::resource_ref("vpc".to_string(), "cidr_block", vec![]),
                 None,
             ),
@@ -2836,7 +2881,7 @@ let vpc = aws.ec2.Vpc {
                 middle.signature.attributes.clear();
                 middle.signature.attributes.insert(
                     "value".to_string(),
-                    CompositionAttribute::from_value(
+                    LiveCompositionAttribute::from_value(
                         Value::resource_ref("source".to_string(), "value", vec![]),
                         Some(declaration.clone()),
                     ),
@@ -3073,14 +3118,14 @@ let vpc = aws.ec2.Vpc {
 
     #[test]
     fn ref_type_forwarded_composition_cycle_is_unchecked() {
-        let make_forwarder = |binding: &'static str, target: &str| Composition {
+        let make_forwarder = |binding: &'static str, target: &str| LiveComposition {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", binding,
             )),
-            signature: Signature {
+            signature: LiveCompositionSignature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: indexmap::indexmap! {
-                    "out".to_string() => CompositionAttribute::from_value(
+                    "out".to_string() => LiveCompositionAttribute::from_value(
                         Value::resource_ref(target.to_string(), "out", vec![]),
                         None,
                     ),
@@ -3091,7 +3136,7 @@ let vpc = aws.ec2.Vpc {
             dependency_bindings: Default::default(),
             module_name: "cycle".to_string(),
             instance: binding.to_string(),
-            provenance: Default::default(),
+            call_path: Default::default(),
             quoted_string_attrs: Default::default(),
         };
         let mut parsed = parse("", &Default::default()).expect("parse");
@@ -3156,7 +3201,7 @@ mod resolved_bindings_tests {
         )];
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &resources,
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -3213,7 +3258,7 @@ mod resolved_bindings_tests {
         );
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &resources,
             compositions: &[],
             managed_current: &crate::resource::into_plan_input_current_map_from_states(
@@ -3274,7 +3319,7 @@ mod resolved_bindings_tests {
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let mut resources = vec![a, b];
 
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &resources,
             compositions: &[],
             managed_current: &plan_input_states,
@@ -3324,7 +3369,7 @@ mod resolved_bindings_tests {
         );
         remote.insert("network".to_string(), network_attrs);
 
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &resources,
             compositions: &[],
             managed_current: &crate::resource::into_plan_input_current_map_from_states(
@@ -3361,7 +3406,7 @@ mod resolved_bindings_tests {
         let states: HashMap<ResourceId, State> = HashMap::new();
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &resources,
             compositions: &[],
             managed_current: &crate::resource::into_plan_input_current_map_from_states(
@@ -3402,7 +3447,7 @@ mod resolved_bindings_tests {
             .collect(),
         );
 
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &resources,
             compositions: &[],
             managed_current: &crate::resource::into_plan_input_current_map_from_states(
@@ -3460,7 +3505,7 @@ mod resolved_bindings_tests {
         );
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &resources,
             compositions: &[],
             managed_current: &crate::resource::into_plan_input_current_map_from_states(
@@ -3612,7 +3657,7 @@ mod resolved_bindings_tests {
         )];
         let states: HashMap<ResourceId, State> = HashMap::new();
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let parent = ResolvedBindings::pre_apply(PreApplyInputs {
+        let parent = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &resources,
             compositions: &[],
             managed_current: &crate::resource::into_plan_input_current_map_from_states(
@@ -3717,7 +3762,7 @@ mod resolved_bindings_tests {
                 )),
             )],
         );
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[cert],
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -3748,7 +3793,7 @@ mod resolved_bindings_tests {
     /// and the existing PlanError path (not a panic) surfaces it.
     #[test]
     fn wait_alias_absent_target_creates_no_entry() {
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[],
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -3774,7 +3819,7 @@ mod resolved_bindings_tests {
             Value::Concrete(ConcreteValue::String("up-1".into())),
         );
         remote.insert("up".to_string(), attrs);
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[],
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -3801,7 +3846,7 @@ mod resolved_bindings_tests {
                 Value::Concrete(ConcreteValue::String("arn:old".into())),
             )],
         );
-        let mut resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let mut resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[cert],
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -3841,7 +3886,7 @@ mod resolved_bindings_tests {
                 Value::Concrete(ConcreteValue::String("arn:shared".into())),
             )],
         );
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[cert],
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -3927,7 +3972,7 @@ mod resolved_bindings_tests {
                 },
         );
 
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[],
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -3971,7 +4016,7 @@ mod resolved_bindings_tests {
         data_source.binding = Some("lookup".to_string());
         let states = HashMap::from([(id.clone(), State::not_found(id))]);
 
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[],
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -4012,13 +4057,13 @@ mod resolved_bindings_tests {
             ),
         )]);
 
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[],
             compositions: &[],
-            managed_current: &crate::resource::into_plan_input_current_map(
-                HashMap::new(),
-                &crate::schema::SchemaRegistry::new(),
-                &[],
+            managed_current: &crate::resource::into_plan_input_current_map::<
+                crate::resource::ModuleSource,
+            >(
+                HashMap::new(), &crate::schema::SchemaRegistry::new(), &[]
             ),
             data_source_values: &test_data_source_values(&[data_source], &data_source_states),
             remote_bindings: &HashMap::new(),
@@ -4072,7 +4117,7 @@ mod resolved_bindings_tests {
             },
         );
 
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[],
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -4123,7 +4168,7 @@ mod resolved_bindings_tests {
             ),
         );
 
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[],
             compositions: &[],
             managed_current: &HashMap::new(),
@@ -4302,7 +4347,7 @@ let chosen = if true { "primary" } else { "fallback" }
 
         // Value-side: `ResolvedBindings` does NOT carry an entry for
         // `chosen`, so a `ResourceRef` to `chosen.foo` cannot resolve.
-        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+        let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &parsed.resources,
             compositions: &[],
             managed_current: &HashMap::new(),

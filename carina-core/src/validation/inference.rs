@@ -250,7 +250,7 @@ pub fn bindings_from_parsed<E>(parsed: &crate::parser::File<E>) -> InferenceBind
 pub fn bindings_from_parts(
     resources: &[crate::resource::Resource],
     data_sources: &[crate::resource::DataSource],
-    compositions: &[crate::resource::Composition],
+    compositions: &[crate::resource::LiveComposition],
     upstream_states: &[crate::parser::UpstreamState],
 ) -> InferenceBindings {
     let mut out = InferenceBindings::new();
@@ -2083,11 +2083,11 @@ mod tests {
         // `vpc_id` here stands in for the module-exposed attribute that
         // points at the inner role's schema attribute. carina#3181:
         // compositions are a distinct typestate in `compositions`.
-        let mut virt_attrs: indexmap::IndexMap<String, crate::resource::CompositionAttribute> =
+        let mut virt_attrs: indexmap::IndexMap<String, crate::resource::LiveCompositionAttribute> =
             indexmap::IndexMap::new();
         virt_attrs.insert(
             "role_id".to_string(),
-            crate::resource::CompositionAttribute::from_value(
+            crate::resource::LiveCompositionAttribute::from_value(
                 Value::resource_ref(
                     "github_actions_carina.role".to_string(),
                     "vpc_id".to_string(),
@@ -2096,11 +2096,11 @@ mod tests {
                 None,
             ),
         );
-        let virt = crate::resource::Composition {
+        let virt = crate::resource::LiveComposition {
             id: crate::resource::ResolvedResourceId::new(
                 crate::resource::ResourceId::with_identity("_virtual", "github_actions_carina"),
             ),
-            signature: crate::resource::Signature {
+            signature: crate::resource::LiveCompositionSignature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,
                 pending_constraints: Vec::new(),
@@ -2109,7 +2109,7 @@ mod tests {
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "github_module".to_string(),
             instance: "github_actions_carina".to_string(),
-            provenance: Default::default(),
+            call_path: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         };
         parsed.compositions.push(virt); // allow: direct — fixture test inspection

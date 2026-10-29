@@ -2505,8 +2505,8 @@ fn attributes_contain_redacted_secret<'a>(values: impl Iterator<Item = &'a Value
     values.into_iter().any(contains_redacted_secret)
 }
 
-fn deferred_template_contains_redacted_secret(
-    template: &crate::parser::DeferredForExpression,
+fn deferred_template_contains_redacted_secret<S>(
+    template: &crate::parser::DeferredForExpression<S>,
 ) -> bool {
     let crate::parser::DeferredForExpression {
         file: _file,
@@ -2524,7 +2524,7 @@ fn deferred_template_contains_redacted_secret(
         || attributes_contain_redacted_secret(template_resource.attributes.values())
 }
 
-pub(crate) fn effect_contains_redacted_secret(effect: &crate::effect::Effect) -> bool {
+pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<S>) -> bool {
     use crate::effect::Effect;
 
     match effect {
@@ -3544,10 +3544,10 @@ pub fn redact_secrets_in_resource_using_evaluated(
 }
 
 /// Restore every placeholder in a resource from a freshly evaluated resource.
-pub fn rehydrate_resource_secrets(
-    saved: &crate::resource::Resource,
-    evaluated: &crate::resource::Resource,
-) -> Result<crate::resource::Resource, SecretRehydrationSiteError> {
+pub fn rehydrate_resource_secrets<S: Clone, T>(
+    saved: &crate::resource::Resource<S>,
+    evaluated: &crate::resource::Resource<T>,
+) -> Result<crate::resource::Resource<S>, SecretRehydrationSiteError> {
     let mut resource = saved.clone();
     for (key, saved_value) in &saved.attributes {
         if let Some(value) = rehydrate_secret_entry(
@@ -3592,10 +3592,10 @@ pub fn redact_secrets_in_data_source_using_evaluated(
     })
 }
 
-pub fn rehydrate_data_source_secrets(
-    saved: &crate::resource::DataSource,
-    evaluated: &crate::resource::DataSource,
-) -> Result<crate::resource::DataSource, SecretRehydrationSiteError> {
+pub fn rehydrate_data_source_secrets<S: Clone, T>(
+    saved: &crate::resource::DataSource<S>,
+    evaluated: &crate::resource::DataSource<T>,
+) -> Result<crate::resource::DataSource<S>, SecretRehydrationSiteError> {
     let mut resource = saved.clone();
     for (key, saved_value) in &saved.attributes {
         if let Some(value) = rehydrate_secret_entry(
@@ -3611,7 +3611,7 @@ pub fn rehydrate_data_source_secrets(
 }
 
 /// Redact all secrets in a
-/// [`Composition`](crate::resource::Composition) (carina#3248).
+/// [`LiveComposition`](crate::resource::LiveComposition) (carina#3248).
 ///
 /// compositions are now persisted in saved plan files (`PlanFile`
 /// version `4`) so the saved-plan apply path can rebuild the same
@@ -3623,10 +3623,10 @@ pub fn rehydrate_data_source_secrets(
 /// The `IndexMap<String, Value>` shape (vs `HashMap` for managed
 /// resources) is preserved so the user-authored attribute order
 /// survives redaction.
-pub fn redact_secrets_in_virtual(
-    resource: &crate::resource::Composition,
-) -> Result<crate::resource::Composition, SerializationError> {
-    let arguments: Result<indexmap::IndexMap<String, crate::resource::CompositionArgument>, _> =
+pub fn redact_secrets_in_live_composition(
+    resource: &crate::resource::LiveComposition,
+) -> Result<crate::resource::LiveComposition, SerializationError> {
+    let arguments: Result<indexmap::IndexMap<String, crate::resource::LiveCompositionArgument>, _> =
         resource
             .signature
             .arguments
@@ -3636,26 +3636,61 @@ pub fn redact_secrets_in_virtual(
                     .map(|rv| (k.clone(), argument.with_value(rv)))
             })
             .collect();
-    let attributes: Result<indexmap::IndexMap<String, crate::resource::CompositionAttribute>, _> =
-        resource
-            .signature
-            .attributes
-            .iter()
-            .map(|(k, attr)| {
-                redact_secrets_in_value(&attr.to_value())
-                    .map(|value| (k.clone(), attr.with_value(value)))
-            })
-            .collect();
+    let attributes: Result<
+        indexmap::IndexMap<String, crate::resource::LiveCompositionAttribute>,
+        _,
+    > = resource
+        .signature
+        .attributes
+        .iter()
+        .map(|(k, attr)| {
+            redact_secrets_in_value(&attr.to_value())
+                .map(|value| (k.clone(), attr.with_value(value)))
+        })
+        .collect();
     let mut out = resource.clone();
     out.signature.arguments = arguments?;
     out.signature.attributes = attributes?;
     Ok(out)
 }
 
-pub fn rehydrate_composition_secrets(
-    saved: &crate::resource::Composition,
-    evaluated: &crate::resource::Composition,
-) -> Result<crate::resource::Composition, SecretRehydrationSiteError> {
+pub fn redact_secrets_in_saved_composition(
+    resource: &crate::resource::SavedComposition,
+) -> Result<crate::resource::SavedComposition, SerializationError> {
+    let arguments: Result<
+        indexmap::IndexMap<String, crate::resource::SavedCompositionArgument>,
+        _,
+    > = resource
+        .signature
+        .arguments
+        .iter()
+        .map(|(name, argument)| {
+            redact_secrets_in_value(argument.value())
+                .map(|value| (name.clone(), argument.with_value(value)))
+        })
+        .collect();
+    let attributes: Result<
+        indexmap::IndexMap<String, crate::resource::SavedCompositionAttribute>,
+        _,
+    > = resource
+        .signature
+        .attributes
+        .iter()
+        .map(|(name, attribute)| {
+            redact_secrets_in_value(&attribute.to_value())
+                .map(|value| (name.clone(), attribute.with_value(value)))
+        })
+        .collect();
+    let mut redacted = resource.clone();
+    redacted.signature.arguments = arguments?;
+    redacted.signature.attributes = attributes?;
+    Ok(redacted)
+}
+
+pub fn rehydrate_saved_composition_secrets(
+    saved: &crate::resource::SavedComposition,
+    evaluated: &crate::resource::LiveComposition,
+) -> Result<crate::resource::SavedComposition, SecretRehydrationSiteError> {
     let mut out = saved.clone();
     for (key, saved_argument) in &saved.signature.arguments {
         let value = rehydrate_secret_entry(
@@ -3664,7 +3699,7 @@ pub fn rehydrate_composition_secrets(
                 .signature
                 .arguments
                 .get(key)
-                .map(crate::resource::CompositionArgument::value),
+                .map(crate::resource::LiveCompositionArgument::value),
             format!("{}.arguments.{key}", saved.id),
             SecretRehydrationCandidate::Evaluated,
         )?;
@@ -3680,7 +3715,7 @@ pub fn rehydrate_composition_secrets(
             .signature
             .attributes
             .get(key)
-            .map(crate::resource::CompositionAttribute::to_value);
+            .map(crate::resource::LiveCompositionAttribute::to_value);
         let value = rehydrate_secret_entry(
             &saved_value,
             evaluated_value.as_ref(),
@@ -3946,7 +3981,7 @@ pub fn redact_secrets_in_plan(
     redact_secrets_in_plan_with_desired_and_historical(plan, &HashMap::new(), &HashMap::new())
 }
 
-fn create_effect_ids(plan: &crate::plan::Plan) -> Vec<Option<crate::resource::ResourceId>> {
+fn create_effect_ids<S>(plan: &crate::plan::Plan<S>) -> Vec<Option<crate::resource::ResourceId>> {
     plan.effects()
         .iter()
         .map(|effect| match effect {
@@ -4058,13 +4093,13 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
 /// resources/data sources. Historical state is restored separately from the
 /// single verified provider-read pass by
 /// [`rehydrate_plan_historical_secrets_from_verified_states`].
-pub fn rehydrate_plan_desired_secrets(
-    plan: &crate::plan::Plan,
+pub fn rehydrate_plan_desired_secrets<S: Clone>(
+    plan: &crate::plan::Plan<S>,
     resources: &HashMap<crate::resource::ResourceId, crate::resource::Resource>,
     data_sources: &HashMap<crate::resource::ResourceId, crate::resource::DataSource>,
     import_identifiers: &HashMap<crate::resource::ResourceId, Value>,
     deferred_templates: &[crate::parser::DeferredForExpression],
-) -> Result<crate::plan::Plan, SecretRehydrationSiteError> {
+) -> Result<crate::plan::Plan<S>, SecretRehydrationSiteError> {
     use crate::effect::{DeferredReplacePayload, Effect};
 
     let mut out = plan.clone();
@@ -4160,10 +4195,10 @@ pub fn rehydrate_plan_desired_secrets(
     Ok(out)
 }
 
-fn rehydrate_deferred_template(
-    saved: &crate::parser::DeferredForExpression,
-    candidates: &[crate::parser::DeferredForExpression],
-) -> Result<crate::parser::DeferredForExpression, SecretRehydrationSiteError> {
+fn rehydrate_deferred_template<S: Clone, T>(
+    saved: &crate::parser::DeferredForExpression<S>,
+    candidates: &[crate::parser::DeferredForExpression<T>],
+) -> Result<crate::parser::DeferredForExpression<S>, SecretRehydrationSiteError> {
     let has_placeholder = deferred_template_contains_redacted_secret(saved);
     if !has_placeholder {
         return Ok(saved.clone());
@@ -4231,11 +4266,11 @@ fn rehydrate_deferred_template(
 /// each plan placeholder has the same hash as the corresponding saved-state
 /// placeholder, while the latter supplies the plaintext shape produced by the
 /// single Argon2 verification pass. This deliberately performs no hashing.
-pub fn rehydrate_plan_historical_secrets_from_verified_states(
-    plan: &crate::plan::Plan,
+pub fn rehydrate_plan_historical_secrets_from_verified_states<S: Clone>(
+    plan: &crate::plan::Plan<S>,
     redacted_states: &HashMap<crate::resource::ResourceId, crate::resource::State>,
     verified_states: &HashMap<crate::resource::ResourceId, crate::resource::State>,
-) -> Result<crate::plan::Plan, SecretRehydrationSiteError> {
+) -> Result<crate::plan::Plan<S>, SecretRehydrationSiteError> {
     use crate::effect::Effect;
 
     fn restore_verified_value(
@@ -5785,12 +5820,12 @@ fn canonicalize_to_string_list(value: Value) -> Value {
 /// through another borrow, so identity code can require this type as
 /// evidence that the canonicalize pass already ran.
 #[derive(Debug)]
-pub struct CanonicalizedResources<'a> {
-    resources: &'a mut [crate::resource::Resource],
+pub struct CanonicalizedResources<'a, S = crate::resource::ModuleSource> {
+    resources: &'a mut [crate::resource::Resource<S>],
 }
 
-impl<'a> CanonicalizedResources<'a> {
-    pub fn as_mut_slice(&mut self) -> &mut [crate::resource::Resource] {
+impl<'a, S> CanonicalizedResources<'a, S> {
+    pub fn as_mut_slice(&mut self) -> &mut [crate::resource::Resource<S>] {
         self.resources
     }
 }
@@ -5952,10 +5987,10 @@ pub(crate) fn canonicalize_state_attribute_map_with_schema<Attributes>(
 /// Call this once after `resolver::resolve_refs_*` and before the
 /// differ runs, so every `Resource` flowing into the plan / state /
 /// provider boundary carries the canonical shape. See #2481, #2511.
-pub fn canonicalize_resources_with_schemas<'a>(
-    resources: &'a mut [crate::resource::Resource],
+pub fn canonicalize_resources_with_schemas<'a, S>(
+    resources: &'a mut [crate::resource::Resource<S>],
     registry: &crate::schema::SchemaRegistry,
-) -> Result<CanonicalizedResources<'a>, EnumCanonicalizationError> {
+) -> Result<CanonicalizedResources<'a, S>, EnumCanonicalizationError> {
     for resource in resources.iter_mut() {
         if let Some(schema) = registry.get_for(resource) {
             canonicalize_desired_attribute_map_with_schema(
@@ -5980,8 +6015,8 @@ pub fn canonicalize_resources_with_schemas<'a>(
 /// Guest output is provider/state text, so strings resolve only by literal API
 /// membership or a declared alias. Dotted strings are never reinterpreted as
 /// namespaced DSL identifiers.
-pub fn canonicalize_normalized_resources_with_schemas(
-    resources: &mut [crate::resource::Resource],
+pub fn canonicalize_normalized_resources_with_schemas<S>(
+    resources: &mut [crate::resource::Resource<S>],
     registry: &crate::schema::SchemaRegistry,
 ) -> Result<(), EnumCanonicalizationError> {
     for resource in resources.iter_mut() {
@@ -6139,8 +6174,8 @@ pub fn canonicalize_provider_configs_with_schemas(
 /// authored `read` inputs, so `EnumIdentifier` uses authored-DSL semantics. Unknown
 /// non-enum values pass through, while an identifier without a resolvable
 /// schema is rejected (carina#3181, carina#3740).
-pub fn canonicalize_data_sources_with_schemas(
-    data_sources: &mut [crate::resource::DataSource],
+pub fn canonicalize_data_sources_with_schemas<S>(
+    data_sources: &mut [crate::resource::DataSource<S>],
     registry: &crate::schema::SchemaRegistry,
 ) -> Result<(), EnumCanonicalizationError> {
     for data_source in data_sources.iter_mut() {
@@ -6597,7 +6632,7 @@ mod tests {
     }
 
     /// `UnknownReason::Display` flows into the user-facing error from
-    /// `format_plan_save_error` / `SerializationError::Display`. Pin
+    /// `map_plan_save_error` / `SerializationError::Display`. Pin
     /// the wording so a future regression does not silently degrade
     /// the diagnostic.
     #[test]
@@ -8394,7 +8429,7 @@ mod tests {
 
     #[test]
     fn canonicalize_resources_with_schemas_keeps_deferred_enum_expressions_in_static_parity() {
-        use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+        use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
         use crate::resource::InterpolationPart;
         use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 
@@ -8449,7 +8484,7 @@ mod tests {
         let managed = vec![source];
         let current_states = std::collections::HashMap::new();
         let remote_bindings = std::collections::HashMap::new();
-        let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &managed,
             compositions: &[],
             managed_current: &current_states,
@@ -10295,38 +10330,39 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_secrets_in_virtual_redacts_attribute_secrets() {
+    fn test_redact_secrets_in_live_composition_redacts_attribute_secrets() {
         // carina#3248: compositions are now persisted in saved plans, so
         // a literal secret authored inside a module's `attributes { ... }`
         // block (which lands as a `Value::Secret` in the composition's
         // attribute map) must be redacted before serialization, the
         // same way managed-resource attributes are redacted.
-        use crate::resource::CompositionAttribute;
-        use crate::resource::{Composition, ResourceId, Signature};
+        use crate::resource::LiveCompositionAttribute;
+        use crate::resource::{LiveComposition, LiveCompositionSignature, ResourceId};
         use std::collections::{BTreeSet, HashSet};
-        let mut attrs: indexmap::IndexMap<String, CompositionAttribute> = indexmap::IndexMap::new();
+        let mut attrs: indexmap::IndexMap<String, LiveCompositionAttribute> =
+            indexmap::IndexMap::new();
         attrs.insert(
             "non_secret".to_string(),
-            CompositionAttribute::from_value(
+            LiveCompositionAttribute::from_value(
                 Value::Concrete(ConcreteValue::String("kept".into())),
                 None,
             ),
         );
         attrs.insert(
             "secret_field".to_string(),
-            CompositionAttribute::from_value(
+            LiveCompositionAttribute::from_value(
                 Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                     ConcreteValue::String("plaintext-must-not-leak".into()),
                 )))),
                 None,
             ),
         );
-        let virt = Composition {
+        let virt = LiveComposition {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual",
                 "module_instance",
             )),
-            signature: Signature {
+            signature: LiveCompositionSignature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: attrs,
                 pending_constraints: Vec::new(),
@@ -10335,11 +10371,11 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
             module_name: "m".to_string(),
             instance: "module_instance".to_string(),
-            provenance: Default::default(),
+            call_path: Default::default(),
             quoted_string_attrs: HashSet::new(),
         };
 
-        let redacted = redact_secrets_in_virtual(&virt).expect("redact virtual");
+        let redacted = redact_secrets_in_live_composition(&virt).expect("redact virtual");
 
         // The non-secret attribute survives verbatim.
         assert_eq!(
@@ -10366,7 +10402,7 @@ mod tests {
             other => panic!("expected redacted secret, got: {:?}", other),
         }
 
-        // The rest of the Composition (id, binding, etc.) is
+        // The rest of the LiveComposition (id, binding, etc.) is
         // preserved verbatim.
         assert_eq!(redacted.binding.as_deref(), Some("module_instance"));
         assert_eq!(redacted.id.resource_type, "_virtual");

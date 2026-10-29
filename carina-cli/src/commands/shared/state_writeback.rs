@@ -17,8 +17,8 @@ use carina_core::provider::{
     AppliedIdentifier, InFlightCreate, InFlightPersistence, ObservedCreate, PersistedAttributes,
 };
 use carina_core::resource::{
-    ConcreteValue, Current, DefaultTagKeys, ResolvedResource, ResolvedResourceId, Resource,
-    ResourceId, State, Value,
+    ConcreteValue, Current, DefaultTagKeys, ModuleSource, ResolvedResource, ResolvedResourceId,
+    Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedExportValue;
@@ -150,17 +150,17 @@ impl PostApplyStates {
 /// Owning these together prevents the background saver and final write from
 /// silently diverging on the desired resources, plan, schemas, or saved-plan
 /// secret hashes.
-pub(crate) struct ApplyStateSaveInputs {
-    sorted_resources: Vec<ResolvedResource>,
-    plan: Plan,
+pub(crate) struct ApplyStateSaveInputs<S = ModuleSource> {
+    sorted_resources: Vec<ResolvedResource<S>>,
+    plan: Plan<S>,
     schemas: SchemaRegistry,
     planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
 }
 
-impl ApplyStateSaveInputs {
+impl<S: Clone> ApplyStateSaveInputs<S> {
     pub(crate) fn new(
-        sorted_resources: Vec<ResolvedResource>,
-        plan: Plan,
+        sorted_resources: Vec<ResolvedResource<S>>,
+        plan: Plan<S>,
         schemas: SchemaRegistry,
         planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
     ) -> Self {
@@ -172,7 +172,7 @@ impl ApplyStateSaveInputs {
         }
     }
 
-    pub(crate) fn sorted_resources(&self) -> &[ResolvedResource] {
+    pub(crate) fn sorted_resources(&self) -> &[ResolvedResource<S>] {
         &self.sorted_resources
     }
 
@@ -183,7 +183,7 @@ impl ApplyStateSaveInputs {
     pub(crate) fn build_state(
         &self,
         state: StateFile,
-        result: &ExecutionResult,
+        result: &ExecutionResult<S>,
     ) -> Result<StateFile, AppError> {
         build_state_after_apply(
             ApplyStateSave {
@@ -202,20 +202,31 @@ impl ApplyStateSaveInputs {
     }
 }
 
+/// Source-driven inputs needed to resolve exports after apply.
+///
+/// Keeping these values in one bundle makes it impossible to request export
+/// resolution without both the live data-source view and live resources.
+/// The default [`Resource`] parameter is [`ModuleSource`], so saved-plan
+/// resources cannot enter the live export-resolution path.
+pub(crate) struct ExportResolutionInputs<'a> {
+    pub export_params: &'a carina_core::validation::ExportsCheckedPreApply<
+        carina_core::parser::InferredExportParam,
+    >,
+    /// Total post-read outcomes. Apply-time reads replace their deferred
+    /// entries before this reaches export resolution.
+    pub data_source_values: &'a DataSourceValues,
+    pub resources: &'a [Resource],
+}
+
 /// Input parameters for `finalize_apply`.
 ///
 /// Groups the execution result, resource data, and backend configuration
 /// needed to save state after an apply operation.
-pub(crate) struct FinalizeApplyInput<'a> {
-    pub result: &'a ExecutionResult,
+pub(crate) struct FinalizeApplyInput<'a, S = ModuleSource> {
+    pub result: &'a ExecutionResult<S>,
     pub state_base: FinalStateBase,
-    pub state_save_inputs: Arc<ApplyStateSaveInputs>,
-    /// Total post-read outcomes. Apply-time reads replace their deferred
-    /// entries before this reaches export resolution.
-    pub data_source_values: &'a DataSourceValues,
-    pub backend: &'a dyn StateBackend,
-    pub lock: StateLockRef<'a>,
-    /// `Some(params)` rebuilds `state.exports` from the source
+    pub state_save_inputs: Arc<ApplyStateSaveInputs<S>>,
+    /// `Some(inputs)` rebuilds `state.exports` from the source
     /// configuration's `exports {}` block — empty `params` clears the
     /// map (#2932). `None` preserves the existing `state.exports` and
     /// is used by `apply --plan` because saved plan files do not
@@ -223,11 +234,9 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// neither resolves nor wipes them, leaving the prior values
     /// intact for the next source-driven `carina apply` to
     /// reconcile.
-    pub export_params: Option<
-        &'a carina_core::validation::ExportsCheckedPreApply<
-            carina_core::parser::InferredExportParam,
-        >,
-    >,
+    pub export_resolution_inputs: Option<ExportResolutionInputs<'a>>,
+    pub backend: &'a dyn StateBackend,
+    pub lock: StateLockRef<'a>,
     /// Provider-aware builtin context used when post-apply bindings make a
     /// previously deferred export expression concrete.
     pub provider_context: &'a carina_core::parser::ProviderContext,
@@ -237,10 +246,10 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// at writeback, the same passthrough the plan path now applies.
     /// Empty when the configuration declares no `wait` bindings, or
     /// for the `apply --plan` path that has no source-side wait view
-    /// (paired with `export_params: None`, so no export resolution
+    /// (paired with `export_resolution_inputs: None`, so no export resolution
     /// runs there anyway).
     pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
-    /// Pre-resolve snapshot of every `Composition` in the
+    /// Pre-resolve snapshot of every `LiveComposition` in the
     /// configuration: each one carries its **authored**
     /// `ResourceRef` attribute values (e.g. `role_arn = role.arn`),
     /// not the pre-apply-resolved concrete values.
@@ -257,9 +266,9 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// that head-of-pipeline pass, so the export-resolution path
     /// (#3169 / #3177) can re-resolve compositions against the
     /// post-apply state. Empty for the `apply --plan` path, where
-    /// `export_params` is also `None` and no export resolution
+    /// `export_resolution_inputs` is also `None` and no export resolution
     /// runs.
-    pub pre_resolve_compositions: &'a [carina_core::resource::Composition],
+    pub pre_resolve_compositions: &'a [carina_core::resource::LiveComposition],
 }
 
 /// Export writeback result split by per-export outcome.
@@ -430,14 +439,14 @@ pub(crate) struct SkippedExport {
 ///    attributes win over any pre-apply managed snapshot (carina#3266).
 /// 2. Split `sorted_resources` into a managed view (Managed +
 ///    DataSource collapsed onto `Resource` by field projection)
-///    and a composition view ([`Composition::try_from`]).
+///    and a composition view ([`LiveComposition::try_from`]).
 /// 3. Build the bindings view from the managed slice via
 ///    [`ResolvedBindings::from_managed_with_state`] (#3176).
 /// 4. Re-resolve each composition's `ResourceRef`s against that view via
-///    [`resolve_virtual_refs_post_apply`] (#3175), so a composition that
+///    [`resolve_live_composition_refs_post_apply`] (#3175), so a composition that
 ///    references a Replaced managed gets the *post*-replace value.
 /// 5. Layer the re-resolved compositions onto the bindings view via
-///    `layer_compositions_post_apply` (#3176).
+///    `layer_live_compositions_post_apply` (#3176).
 /// 6. Resolve export expressions against the combined view.
 ///
 /// # Partial-apply tolerance (carina#3551 / carina#3498)
@@ -454,7 +463,7 @@ pub(crate) struct ResolveExportValuesPostApplyInput<'a> {
         carina_core::parser::InferredExportParam,
     >,
     pub sorted_resources: &'a [Resource],
-    pub pre_resolve_compositions: &'a [carina_core::resource::Composition],
+    pub pre_resolve_compositions: &'a [carina_core::resource::LiveComposition],
     pub post_apply_states: &'a PostApplyStates,
     pub schemas: &'a SchemaRegistry,
     pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
@@ -468,7 +477,7 @@ pub(crate) fn resolve_export_values_post_apply(
     AppError,
 > {
     use carina_core::binding_index::ResolvedBindings;
-    use carina_core::resolver::resolve_virtual_refs_post_apply;
+    use carina_core::resolver::resolve_live_composition_refs_post_apply;
 
     // Step 1: the post-apply state view was assembled by
     // [`PostApplyStates::from_current_and_state`] before this call.
@@ -481,7 +490,7 @@ pub(crate) fn resolve_export_values_post_apply(
     // resolver below can pick up the post-apply state values for
     // any managed sibling that was Replaced during apply
     // (#3169 / #3177).
-    let mut compositions: Vec<carina_core::resource::Composition> =
+    let mut compositions: Vec<carina_core::resource::LiveComposition> =
         input.pre_resolve_compositions.to_vec();
 
     // Step 3: build the bindings view from the managed slice plus
@@ -491,32 +500,33 @@ pub(crate) fn resolve_export_values_post_apply(
     // post-apply state in Step 4; only after that re-resolution can
     // they be layered into the bindings view. We use `pre_apply`
     // with `compositions: &[]` here, then call
-    // `layer_compositions_post_apply` once the re-resolution is done.
+    // `layer_live_compositions_post_apply` once the re-resolution is done.
     // (carina#3181, carina#3248)
     let plan_input_current = carina_core::resource::into_plan_input_current_map(
         input.post_apply_states.managed_current().clone(),
         input.schemas,
         input.sorted_resources,
     );
-    let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
-        managed: input.sorted_resources,
-        compositions: &[],
-        managed_current: &plan_input_current,
-        data_source_values: input.post_apply_states.data_source_values(),
-        remote_bindings: &HashMap::new(),
-        wait_aliases: input.wait_aliases,
-    });
+    let mut bindings =
+        ResolvedBindings::pre_apply_live(carina_core::binding_index::LivePreApplyInputs {
+            managed: input.sorted_resources,
+            compositions: &[],
+            managed_current: &plan_input_current,
+            data_source_values: input.post_apply_states.data_source_values(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: input.wait_aliases,
+        });
 
     // Step 4: re-resolve each composition's attributes against the
     // post-apply bindings view. After this, a composition's
     // `role_arn = role.arn` no longer holds the pre-apply
     // `ResourceRef`; it holds the post-apply concrete value.
-    resolve_virtual_refs_post_apply(&mut compositions, &bindings)?;
+    resolve_live_composition_refs_post_apply(&mut compositions, &bindings)?;
 
     // Step 5: layer the re-resolved compositions onto the bindings view.
     // Now `exports { foo = some_module.role_arn }` resolves against
     // a binding whose `role_arn` is the post-apply value.
-    bindings.layer_compositions_post_apply(&compositions)?;
+    bindings.layer_live_compositions_post_apply(&compositions)?;
 
     // Step 6: resolve the export expressions against the combined
     // view. The input is already checked at the pre-apply boundary, but a
@@ -585,13 +595,13 @@ pub(crate) fn materialize_exports(
     })
 }
 
-pub(crate) struct ApplyStateSave<'a> {
+pub(crate) struct ApplyStateSave<'a, S = ModuleSource> {
     pub state_file: StateFile,
-    pub sorted_resources: &'a [ResolvedResource],
-    pub runtime_synthesized_resources: &'a [ResolvedResource],
+    pub sorted_resources: &'a [ResolvedResource<S>],
+    pub runtime_synthesized_resources: &'a [ResolvedResource<S>],
     pub managed_current: &'a HashMap<ResourceId, Current>,
     pub applied_states: &'a HashMap<ResourceId, Applied>,
-    pub plan: &'a Plan,
+    pub plan: &'a Plan<S>,
     pub successfully_deleted: &'a HashSet<DeletedInstanceKey>,
     pub failed_refreshes: &'a HashSet<ResourceId>,
     pub schemas: &'a SchemaRegistry,
@@ -615,8 +625,8 @@ pub(crate) struct ApplyStateSave<'a> {
 /// final typed move operation merges every source-side deposed generation
 /// not deleted by this apply into `to`, then drops the stale `from` row. See
 /// carina#3170 for the overwrite bug class this prevents.
-pub(crate) struct WritebackPlan<'a> {
-    upserts: indexmap::IndexMap<ResourceId, PlannedUpsert<'a>>,
+pub(crate) struct WritebackPlan<'a, S = ModuleSource> {
+    upserts: indexmap::IndexMap<ResourceId, PlannedUpsert<'a, S>>,
     deposes: Vec<PlannedDepose>,
     remove_deposed: Vec<PlannedRemoveDeposed>,
     clear_currents: HashSet<ResolvedResourceId>,
@@ -629,8 +639,8 @@ pub(crate) struct WritebackPlan<'a> {
 /// makes the "every upsert has a desired resource" invariant
 /// representable in the type — there is no separate lookup that can
 /// miss.
-struct PlannedUpsert<'a> {
-    resource: &'a ResolvedResource,
+struct PlannedUpsert<'a, S = ModuleSource> {
+    resource: &'a ResolvedResource<S>,
     source: UpsertSource<'a>,
 }
 
@@ -709,8 +719,8 @@ enum ReplacementOutcome {
     KeepOld,
 }
 
-enum ReplacementCreateResult<'upsert, 'resource> {
-    Upsert(&'upsert PlannedUpsert<'resource>),
+enum ReplacementCreateResult<'upsert, 'resource, S = ModuleSource> {
+    Upsert(&'upsert PlannedUpsert<'resource, S>),
     Ended,
     Absent,
 }
@@ -733,7 +743,7 @@ impl From<WritebackConflict> for AppError {
     }
 }
 
-impl<'a> WritebackPlan<'a> {
+impl<'a, S> WritebackPlan<'a, S> {
     fn new() -> Self {
         Self {
             upserts: indexmap::IndexMap::new(),
@@ -767,7 +777,7 @@ impl<'a> WritebackPlan<'a> {
     /// `UpsertCleanupOverlap`.
     fn add_upsert(
         &mut self,
-        resource: &'a ResolvedResource,
+        resource: &'a ResolvedResource<S>,
         source: UpsertSource<'a>,
     ) -> Result<(), WritebackConflict> {
         let id = resource.resolved_id();
@@ -891,9 +901,9 @@ fn identifier_was_successfully_deleted(
     ))
 }
 
-fn classify_replacement_outcome(
+fn classify_replacement_outcome<S>(
     delete: ReplacementDeleteInput<'_>,
-    create_result: ReplacementCreateResult<'_, '_>,
+    create_result: ReplacementCreateResult<'_, '_, S>,
     state_file: &StateFile,
     managed_current: &HashMap<ResourceId, Current>,
     moved_origins: &MovedOrigins,
@@ -956,11 +966,11 @@ fn classify_replacement_outcome(
     }
 }
 
-fn replacement_create_result<'upsert, 'resource>(
+fn replacement_create_result<'upsert, 'resource, S>(
     id: &ResourceId,
-    upserts: &'upsert indexmap::IndexMap<ResourceId, PlannedUpsert<'resource>>,
+    upserts: &'upsert indexmap::IndexMap<ResourceId, PlannedUpsert<'resource, S>>,
     applied_states: &HashMap<ResourceId, Applied>,
-) -> ReplacementCreateResult<'upsert, 'resource> {
+) -> ReplacementCreateResult<'upsert, 'resource, S> {
     if let Some(upsert) = upserts.get(id) {
         return ReplacementCreateResult::Upsert(upsert);
     }
@@ -978,9 +988,9 @@ fn replacement_create_result<'upsert, 'resource>(
     }
 }
 
-fn planned_depose(
+fn planned_depose<S>(
     delete: ReplacementDeleteInput<'_>,
-    desired_resource: &ResolvedResource,
+    desired_resource: &ResolvedResource<S>,
     schema: Option<&ResourceSchema>,
     state_file: &StateFile,
     managed_current: &HashMap<ResourceId, Current>,
@@ -1045,8 +1055,8 @@ fn planned_depose(
     }
 }
 
-fn delete_input_from_effect<'a>(
-    effect: &'a Effect,
+fn delete_input_from_effect<'a, S>(
+    effect: &'a Effect<S>,
     previous_attributes: Option<ReplacementPreviousAttributesForStateWriteback<'a>>,
 ) -> Option<ReplacementDeleteInput<'a>> {
     let Effect::Delete {
@@ -1080,7 +1090,7 @@ fn delete_input_from_deferred(delete: &DeferredReplaceDelete) -> ReplacementDele
     }
 }
 
-fn create_side_upsert_ids(plan: &Plan) -> HashSet<ResourceId> {
+fn create_side_upsert_ids<S>(plan: &Plan<S>) -> HashSet<ResourceId> {
     let mut ids = HashSet::new();
     for effect in plan.effects() {
         match effect {
@@ -1111,9 +1121,9 @@ fn create_side_upsert_ids(plan: &Plan) -> HashSet<ResourceId> {
     ids
 }
 
-fn plan_displaced_identifier_deposes(
-    wb: &mut WritebackPlan<'_>,
-    input: &DecomposeInput<'_, '_>,
+fn plan_displaced_identifier_deposes<S>(
+    wb: &mut WritebackPlan<'_, S>,
+    input: &DecomposeInput<'_, '_, S>,
     moved_origins: &MovedOrigins,
 ) {
     let create_side_ids = create_side_upsert_ids(input.plan);
@@ -1198,28 +1208,30 @@ fn plan_displaced_identifier_deposes(
 /// and `DeferredReplace`, then registers ordinary cleanups for
 /// `Delete` / `Remove` / `Move`'s `from`. `Effect::Move` deliberately
 /// does **not** touch the `to` slot — that is Phase 1's job.
-struct DecomposeInput<'a, 's> {
+struct DecomposeInput<'a, 's, S = ModuleSource> {
     state_file: &'s StateFile,
-    sorted_resources: &'a [ResolvedResource],
-    runtime_synthesized_resources: &'a [ResolvedResource],
+    sorted_resources: &'a [ResolvedResource<S>],
+    runtime_synthesized_resources: &'a [ResolvedResource<S>],
     managed_current: &'a HashMap<ResourceId, Current>,
     applied_states: &'a HashMap<ResourceId, Applied>,
-    plan: &'a Plan,
+    plan: &'a Plan<S>,
     successfully_deleted: &'a HashSet<DeletedInstanceKey>,
     failed_refreshes: &'a HashSet<ResourceId>,
     schemas: &'a SchemaRegistry,
 }
 
 #[cfg(test)]
-fn decompose<'a>(input: DecomposeInput<'a, '_>) -> Result<WritebackPlan<'a>, WritebackConflict> {
+fn decompose<'a, S>(
+    input: DecomposeInput<'a, '_, S>,
+) -> Result<WritebackPlan<'a, S>, WritebackConflict> {
     let moved_origins = MovedOrigins::from_plan(input.plan);
     decompose_with_moved_origins(input, &moved_origins)
 }
 
-fn decompose_with_moved_origins<'a>(
-    input: DecomposeInput<'a, '_>,
+fn decompose_with_moved_origins<'a, S>(
+    input: DecomposeInput<'a, '_, S>,
     moved_origins: &MovedOrigins,
-) -> Result<WritebackPlan<'a>, WritebackConflict> {
+) -> Result<WritebackPlan<'a, S>, WritebackConflict> {
     let state_file = input.state_file;
     let sorted_resources = input.sorted_resources;
     let runtime_synthesized_resources = input.runtime_synthesized_resources;
@@ -1235,9 +1247,9 @@ fn decompose_with_moved_origins<'a>(
         wb.add_remove_deposed(id.clone(), key.clone());
     }
 
-    fn add_applied<'a>(
-        wb: &mut WritebackPlan<'a>,
-        resource: &'a ResolvedResource,
+    fn add_applied<'a, S>(
+        wb: &mut WritebackPlan<'a, S>,
+        resource: &'a ResolvedResource<S>,
         applied: &'a Applied,
     ) -> Result<(), WritebackConflict> {
         match applied {
@@ -1353,8 +1365,8 @@ fn decompose_with_moved_origins<'a>(
     Ok(wb)
 }
 
-pub(crate) fn build_state_after_apply(
-    save: ApplyStateSave<'_>,
+pub(crate) fn build_state_after_apply<S: Clone>(
+    save: ApplyStateSave<'_, S>,
     planned_secret_hashes: Option<&HashMap<ResourceId, PersistedAttributes>>,
 ) -> Result<StateFile, AppError> {
     let ApplyStateSave {
@@ -1812,18 +1824,14 @@ mod apply_state_save_tests {
     }
 
     fn plan_with_name_override(id: &ResourceId, temp_value: &str, original_value: &str) -> Plan {
-        serde_json::from_value(serde_json::json!({
-            "effects": [],
-            "permanent_name_overrides": [
-                {
-                    "resource_id": id,
-                    "attribute": "name",
-                    "temp_value": temp_value,
-                    "original_value": original_value
-                }
-            ]
-        }))
-        .expect("plan with permanent name override should deserialize")
+        let mut plan = Plan::new();
+        plan.fixture_add_permanent_name_override(
+            ResolvedResourceId::new(id.clone()),
+            "name",
+            temp_value,
+            Some(original_value.to_string()),
+        );
+        plan
     }
 
     fn applied_name_state(id: &ResourceId, name: &str) -> State {
@@ -2238,7 +2246,9 @@ mod apply_state_save_tests {
             resource.id.clone(),
             state.build_state_for_resource(&resource.id),
         )]);
-        let plan_input = carina_core::resource::into_plan_input_current_map(current, schemas, &[]);
+        let plan_input = carina_core::resource::into_plan_input_current_map::<
+            carina_core::resource::ModuleSource,
+        >(current, schemas, &[]);
         let saved_attrs = state.build_saved_attrs().lift(schemas);
         create_plan(
             std::slice::from_ref(&resolved(resource.clone())),
@@ -4912,15 +4922,17 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let plan: Plan =
-            serde_json::from_value(plan_json).expect("replacement metadata should deserialize");
+        let plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
+            .expect("replacement metadata should deserialize");
+        let saved_desired =
+            carina_core::resource::SavedResolvedResource::from(resolved(desired.clone()));
         let successfully_deleted =
             HashSet::from([DeletedInstanceKey::current(delete_id, "vpc-old")]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
                 state_file,
-                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                sorted_resources: std::slice::from_ref(&saved_desired),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(create_id, complete_create(applied_state))]),
@@ -5086,13 +5098,15 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let plan: Plan =
-            serde_json::from_value(plan_json).expect("replacement metadata should deserialize");
+        let plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
+            .expect("replacement metadata should deserialize");
+        let saved_desired =
+            carina_core::resource::SavedResolvedResource::from(resolved(desired.clone()));
 
         let state = build_state_after_apply(
             ApplyStateSave {
                 state_file,
-                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                sorted_resources: std::slice::from_ref(&saved_desired),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(id, complete_create(applied_state))]),
@@ -5207,15 +5221,17 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let plan: Plan =
-            serde_json::from_value(plan_json).expect("replacement metadata should deserialize");
+        let plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
+            .expect("replacement metadata should deserialize");
+        let saved_desired =
+            carina_core::resource::SavedResolvedResource::from(resolved(desired.clone()));
         let successfully_deleted =
             HashSet::from([DeletedInstanceKey::current(id.clone(), "old-record-id")]);
 
         let state = build_state_after_apply(
             ApplyStateSave {
                 state_file,
-                sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
+                sorted_resources: std::slice::from_ref(&saved_desired),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
                 applied_states: &HashMap::from([(id, complete_create(applied_state))]),

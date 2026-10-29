@@ -14,7 +14,7 @@ use crate::resource::{Resource, Value};
 ///
 /// Both sources are always merged because partial resolution can cause
 /// ResourceRef bindings to differ from the original direct dependencies.
-pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
+pub fn get_resource_dependencies<S>(resource: &Resource<S>) -> HashSet<String> {
     let mut deps = HashSet::new();
     for value in resource.attributes.values() {
         collect_dependencies(value, &mut deps);
@@ -35,21 +35,27 @@ pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
     deps
 }
 
-/// Dependency-binding collection for a [`Composition`](crate::resource::Composition).
+/// Dependency-binding collection for a [`LiveComposition`](crate::resource::LiveComposition).
 ///
-/// `Composition` has no `directives` field — synthetic IR nodes
+/// `LiveComposition` has no `directives` field — synthetic IR nodes
 /// never carry `depends_on`. The collection therefore reduces to
 /// "attributes' ResourceRefs ∪ `dependency_bindings`", which is the
 /// same first-two-thirds of [`get_resource_dependencies`].
-pub fn get_composition_dependencies(virt: &crate::resource::Composition) -> HashSet<String> {
+pub fn get_composition_dependencies(virt: &crate::resource::LiveComposition) -> HashSet<String> {
+    get_composition_runtime_dependencies(crate::resource::CompositionRuntimeRef::Live(virt))
+}
+
+pub(crate) fn get_composition_runtime_dependencies(
+    composition: crate::resource::CompositionRuntimeRef<'_>,
+) -> HashSet<String> {
     let mut deps = HashSet::new();
-    for attr in virt.signature.attributes.values() {
+    for (_name, value) in composition.attributes() {
         // The Forwarded/Derived split (#3294) is a typed
         // classification; dependency collection still walks the
         // underlying `Value` shape, so reify and recurse.
-        collect_dependencies(&attr.to_value(), &mut deps);
+        collect_dependencies(&value, &mut deps);
     }
-    for name in &virt.dependency_bindings {
+    for name in composition.dependency_bindings() {
         deps.insert(name.clone());
     }
     deps
@@ -62,7 +68,9 @@ pub fn get_composition_dependencies(virt: &crate::resource::Composition) -> Hash
 /// `dependency_bindings` ∪ `directives.depends_on`" — structurally the
 /// same union [`get_resource_dependencies`] computes for a managed
 /// resource.
-pub fn get_data_source_dependencies(data_source: &crate::resource::DataSource) -> HashSet<String> {
+pub fn get_data_source_dependencies<S>(
+    data_source: &crate::resource::DataSource<S>,
+) -> HashSet<String> {
     let mut deps = HashSet::new();
     for value in data_source.attributes.values() {
         collect_dependencies(value, &mut deps);
@@ -101,10 +109,10 @@ pub(crate) fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
 ///
 /// Takes a [`ResourceRef`](crate::parser::ResourceRef) so the resolver
 /// can compute the snapshot for any node kind ([`Resource`],
-/// [`DataSource`], [`Composition`](crate::resource::Composition))
+/// [`DataSource`], [`LiveComposition`](crate::resource::LiveComposition))
 /// uniformly (carina#3181 / #3308).
-pub fn get_resource_value_ref_dependencies(
-    resource: crate::parser::ResourceRef<'_>,
+pub fn get_resource_value_ref_dependencies<S>(
+    resource: crate::parser::ResourceRef<'_, S>,
 ) -> HashSet<String> {
     let mut deps = HashSet::new();
     let attrs = resource.attributes();
@@ -267,30 +275,30 @@ mod tests {
 
     #[test]
     fn test_get_composition_dependencies_collects_attrs_and_deps() {
-        use crate::resource::{Composition, Signature};
+        use crate::resource::{LiveComposition, LiveCompositionSignature};
         use indexmap::IndexMap;
         use std::collections::BTreeSet;
 
         // Build a composition whose attributes carry a ResourceRef and
         // whose `dependency_bindings` carries a separate entry.
         // Both must end up in the merged set.
-        let mut attributes: IndexMap<String, crate::resource::CompositionAttribute> =
+        let mut attributes: IndexMap<String, crate::resource::LiveCompositionAttribute> =
             IndexMap::new();
         attributes.insert(
             "role_arn".to_string(),
-            crate::resource::CompositionAttribute::from_value(
+            crate::resource::LiveCompositionAttribute::from_value(
                 Value::resource_ref("role".to_string(), "arn", vec![]),
                 None,
             ),
         );
         let mut dep_bindings = BTreeSet::new();
         dep_bindings.insert("explicit_dep".to_string());
-        let virt = Composition {
+        let virt = LiveComposition {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual.module",
                 "v",
             )),
-            signature: Signature {
+            signature: LiveCompositionSignature {
                 arguments: IndexMap::new(),
                 attributes,
                 pending_constraints: Vec::new(),
@@ -299,7 +307,7 @@ mod tests {
             dependency_bindings: dep_bindings,
             module_name: "m".to_string(),
             instance: "v".to_string(),
-            provenance: Default::default(),
+            call_path: Default::default(),
             quoted_string_attrs: Default::default(),
         };
 

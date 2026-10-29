@@ -2,7 +2,7 @@
 //! IR node kinds.
 //!
 //! Carina's IR has three sibling node types — [`Resource`],
-//! [`DataSource`], [`Composition`] — that the `#3287` series splits by
+//! [`DataSource`], [`LiveComposition`] — that the `#3287` series splits by
 //! lifecycle (CRUD vs read-only vs module-call expansion). `GraphNode`
 //! is the owned single-type umbrella over them. It carries an instance
 //! of *one* variant; functions that want to receive any kind of node
@@ -20,11 +20,9 @@
 //!   templates are only meaningful while the parser still holds them.
 //!
 //! Conversion: see [`GraphNode::as_ref`] and the
-//! `From<Resource>` / `From<DataSource>` / `From<Composition>` impls.
+//! `From<Resource>` / `From<DataSource>` / `From<LiveComposition>` impls.
 
-use serde::{Deserialize, Serialize};
-
-use super::{Composition, DataSource, Resource, ResourceId};
+use super::{DataSource, LiveComposition, Resource, ResourceId};
 
 /// An owned IR node — either a resource (CRUD), data source (read), or
 /// composition (module-call expansion).
@@ -38,11 +36,11 @@ use super::{Composition, DataSource, Resource, ResourceId};
 /// To inspect a `GraphNode` without taking ownership, call
 /// [`GraphNode::as_ref`] which returns a borrowing
 /// [`ResourceRef`](crate::parser::ResourceRef).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GraphNode {
     Resource(Resource),
     DataSource(DataSource),
-    Composition(Composition),
+    LiveComposition(LiveComposition),
 }
 
 impl GraphNode {
@@ -51,13 +49,13 @@ impl GraphNode {
         match self {
             GraphNode::Resource(r) => &r.id,
             GraphNode::DataSource(d) => &d.id,
-            GraphNode::Composition(c) => &c.id,
+            GraphNode::LiveComposition(c) => &c.id,
         }
     }
 
     /// The id of the underlying node, wrapped in the appropriate
     /// [`NodeId`](super::NodeId) variant: `Persistent` for `Resource`
-    /// / `DataSource`, `Ephemeral` for `Composition`.
+    /// / `DataSource`, `Ephemeral` for `LiveComposition`.
     ///
     /// Use this when a caller needs an id whose typestate reflects
     /// "may be looked up in state" — and the caller does not already
@@ -68,7 +66,7 @@ impl GraphNode {
         match self {
             GraphNode::Resource(r) => super::NodeId::Persistent(r.persistent_id()),
             GraphNode::DataSource(d) => super::NodeId::Persistent(d.persistent_id()),
-            GraphNode::Composition(c) => super::NodeId::Ephemeral(c.ephemeral_id()),
+            GraphNode::LiveComposition(c) => super::NodeId::Ephemeral(c.ephemeral_id()),
         }
     }
 
@@ -82,9 +80,9 @@ impl GraphNode {
         matches!(self, GraphNode::DataSource(_))
     }
 
-    /// Whether this node is a [`Composition`] (module-call expansion variant).
+    /// Whether this node is a [`LiveComposition`] (module-call expansion variant).
     pub fn is_composition(&self) -> bool {
-        matches!(self, GraphNode::Composition(_))
+        matches!(self, GraphNode::LiveComposition(_))
     }
 
     /// Borrow the underlying resource if this is a `Resource` variant.
@@ -103,10 +101,10 @@ impl GraphNode {
         }
     }
 
-    /// Borrow the underlying composition if this is a `Composition` variant.
-    pub fn as_composition(&self) -> Option<&Composition> {
+    /// Borrow the underlying composition if this is a `LiveComposition` variant.
+    pub fn as_composition(&self) -> Option<&LiveComposition> {
         match self {
-            GraphNode::Composition(c) => Some(c),
+            GraphNode::LiveComposition(c) => Some(c),
             _ => None,
         }
     }
@@ -124,9 +122,9 @@ impl From<DataSource> for GraphNode {
     }
 }
 
-impl From<Composition> for GraphNode {
-    fn from(c: Composition) -> Self {
-        GraphNode::Composition(c)
+impl From<LiveComposition> for GraphNode {
+    fn from(c: LiveComposition) -> Self {
+        GraphNode::LiveComposition(c)
     }
 }
 
@@ -162,9 +160,9 @@ mod tests {
     fn graph_node_from_composition_round_trip() {
         use indexmap::IndexMap;
         use std::collections::{BTreeSet, HashSet};
-        let c = Composition {
+        let c = LiveComposition {
             id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "m")),
-            signature: super::super::Signature {
+            signature: super::super::LiveCompositionSignature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
                 pending_constraints: Vec::new(),
@@ -173,7 +171,7 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
             module_name: "m".to_string(),
             instance: "i".to_string(),
-            provenance: Default::default(),
+            call_path: Default::default(),
             quoted_string_attrs: HashSet::new(),
         };
         let id = c.id.clone();

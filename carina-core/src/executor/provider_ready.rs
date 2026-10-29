@@ -16,12 +16,15 @@ use thiserror::Error;
 use crate::binding_index::ResolvedBindings;
 use crate::executor::normalized::apply_desired_normalization;
 pub use crate::module_resolver::ModuleConstraintFailure;
-use crate::module_resolver::evaluate_pending_constraints;
+use crate::module_resolver::{
+    evaluate_live_pending_constraints, evaluate_saved_pending_constraints,
+};
 use crate::parser::{ProviderConfig, ResolvedProviderConfig};
 use crate::provider::{CreateRequest, ProviderFactory, ProviderNormalizer, UpdateRequest};
 use crate::resource::{
-    Composition, ConcreteValue, DataSource, DeferredValue, ResolvedDataSource, ResolvedResource,
-    Resource, ResourceId, Value,
+    ConcreteValue, DataSource, DeferredValue, LiveComposition, ProviderDataSource,
+    ProviderModuleSource, ProviderResource, ResolvedDataSource, ResolvedResource, Resource,
+    ResourceId, SavedComposition, Value,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeError};
 use crate::value::SerializationError;
@@ -58,10 +61,10 @@ impl<T> Deref for ProviderReady<T> {
 }
 
 /// A fully resolved managed resource whose known value constraints have run.
-pub type ProviderReadyResource = ProviderReady<ResolvedResource>;
+pub type ProviderReadyResource = ProviderReady<ResolvedResource<ProviderModuleSource>>;
 
 /// A fully resolved data source whose known input constraints have run.
-pub type ProviderReadyDataSource = ProviderReady<ResolvedDataSource>;
+pub type ProviderReadyDataSource = ProviderReady<ResolvedDataSource<ProviderModuleSource>>;
 
 /// Provider configuration attributes whose schema-known enum leaves are in
 /// host-resolved API spelling.
@@ -255,15 +258,42 @@ impl std::error::Error for ModuleConstraintGateError {}
 /// from emitting the exact same already-reported violation a second time; it
 /// is never consulted to skip evaluation.
 pub struct ModuleConstraintGate {
-    compositions: Vec<Composition>,
+    compositions: ModuleConstraintCompositions,
     reported_failures: Mutex<HashSet<ModuleConstraintFailure>>,
 }
 
+enum ModuleConstraintCompositions {
+    Live(Vec<LiveComposition>),
+    Saved(Vec<SavedComposition>),
+}
+
 impl ModuleConstraintGate {
-    pub fn new(compositions: &[Composition]) -> Self {
+    pub fn from_live_compositions(compositions: &[LiveComposition]) -> Self {
         Self {
-            compositions: compositions.to_vec(),
+            compositions: ModuleConstraintCompositions::Live(compositions.to_vec()),
             reported_failures: Mutex::new(HashSet::new()),
+        }
+    }
+
+    pub fn from_saved_compositions(compositions: &[SavedComposition]) -> Self {
+        Self {
+            compositions: ModuleConstraintCompositions::Saved(compositions.to_vec()),
+            reported_failures: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn evaluate(
+        &self,
+        bindings: &ResolvedBindings,
+        terminal: bool,
+    ) -> Vec<ModuleConstraintFailure> {
+        match &self.compositions {
+            ModuleConstraintCompositions::Live(compositions) => {
+                evaluate_live_pending_constraints(compositions, bindings, terminal)
+            }
+            ModuleConstraintCompositions::Saved(compositions) => {
+                evaluate_saved_pending_constraints(compositions, bindings, terminal)
+            }
         }
     }
 
@@ -279,7 +309,7 @@ impl ModuleConstraintGate {
     /// be pending when a consumer of X runs if Y is unknown. It is evaluated
     /// when Y becomes known at a later gate, or rejected by the terminal sweep.
     pub fn check(&self, bindings: &ResolvedBindings) -> Result<(), ModuleConstraintGateError> {
-        let failures = evaluate_pending_constraints(&self.compositions, bindings, false);
+        let failures = self.evaluate(bindings, false);
         if failures.is_empty() {
             return Ok(());
         }
@@ -316,8 +346,7 @@ impl ModuleConstraintGate {
         bindings: &ResolvedBindings,
         report_unresolved: bool,
     ) -> Result<(), ModuleConstraintGateError> {
-        let failures =
-            evaluate_pending_constraints(&self.compositions, bindings, report_unresolved);
+        let failures = self.evaluate(bindings, report_unresolved);
         self.report_new(failures)
     }
 
@@ -343,14 +372,14 @@ impl ModuleConstraintGate {
 
 impl ProviderReadyResource {
     /// Borrow the provider-facing resource payload.
-    pub fn as_resource(&self) -> &Resource {
+    pub fn as_resource(&self) -> &ProviderResource {
         self.0.as_resource()
     }
 }
 
 impl ProviderReadyDataSource {
     /// Borrow the provider-facing data-source payload.
-    pub fn as_data_source(&self) -> &DataSource {
+    pub fn as_data_source(&self) -> &ProviderDataSource {
         self.0.as_inner()
     }
 }
@@ -631,8 +660,8 @@ pub async fn prepare_provider_ready_resource(
 /// effect. This prevents provider normalization performed during planning
 /// from being mistaken for user input while still rerunning cross-attribute
 /// validators when at least one input became known now.
-pub(super) async fn prepare_provider_ready_resource_after_resolution(
-    input: ResolvedCheckInput<Resource>,
+pub(super) async fn prepare_provider_ready_resource_after_resolution<S: Clone>(
+    input: ResolvedCheckInput<Resource<S>>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     prepare_provider_ready_resource_with_value_check(input, context).await
@@ -646,8 +675,8 @@ enum ResourceValueCheck {
     },
 }
 
-async fn prepare_provider_ready_resource_with_value_check(
-    input: ResolvedCheckInput<Resource>,
+async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
+    input: ResolvedCheckInput<Resource<S>>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     let ResolvedCheckInput {
@@ -689,7 +718,9 @@ async fn prepare_provider_ready_resource_with_value_check(
     .await?;
     let resource = normalized.into_resource();
     crate::resource::assert_resource_fully_resolved(&resource)?;
-    Ok(ProviderReady(ResolvedResource::new(resource)))
+    Ok(ProviderReady(ResolvedResource::new(
+        resource.into_provider_resource(),
+    )))
 }
 
 /// Validate and prepare a data source for provider dispatch.
@@ -714,8 +745,8 @@ pub fn prepare_provider_ready_data_source(
 /// authored inputs and derived which attributes became known during apply.
 /// Plan-normalized literal attributes are deliberately outside that check
 /// scope because they already passed the plan-time authored-value gate.
-pub(super) fn prepare_provider_ready_data_source_after_resolution(
-    input: ResolvedCheckInput<DataSource>,
+pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
+    input: ResolvedCheckInput<DataSource<S>>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyDataSource, ProviderPreparationError> {
     let ResolvedCheckInput {
@@ -755,7 +786,9 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution(
     for value in value.attributes.values() {
         crate::resource::assert_value_fully_resolved(value)?;
     }
-    Ok(ProviderReady(ResolvedDataSource::new(value)))
+    Ok(ProviderReady(ResolvedDataSource::new(
+        value.into_provider_data_source(),
+    )))
 }
 
 /// Prepare a checked create request through the provider-boundary gate.
@@ -768,9 +801,9 @@ pub async fn prepare_create_request(
 }
 
 /// Look up the schema required to construct an update request.
-pub(super) fn managed_update_schema<'a>(
+pub(super) fn managed_update_schema<'a, S>(
     schemas: &'a SchemaRegistry,
-    resource: &Resource,
+    resource: &Resource<S>,
 ) -> Result<&'a ResourceSchema, ProviderPreparationError> {
     schemas
         .get_for(resource)
@@ -877,7 +910,7 @@ mod provider_config_tests {
         let id = resource.id.clone();
         let from = crate::resource::State::existing(id.clone(), HashMap::new());
         let bindings = ResolvedBindings::default();
-        let module_gate = ModuleConstraintGate::new(&[]);
+        let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = SchemaRegistry::new();
         let context = ProviderPreparationContext::new(
             &bindings,
