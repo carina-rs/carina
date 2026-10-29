@@ -78,7 +78,6 @@ use crate::wiring::{
     create_normalizers_from_configs_with_ctx, create_providers_from_configs_with_ctx,
     get_provider_with_ctx, module_constraint_plan_errors, prepare_data_sources_for_plan,
     prepare_default_provider_ready_config, read_managed_state_with_retry,
-    reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
     reconcile_late_anonymous_identities, refresh_loaded_orphan_with_retry,
     refresh_loaded_resource_with_retry,
 };
@@ -1609,11 +1608,11 @@ async fn run_apply_with_observer_factory(
     Ok(())
 }
 
-fn reload_apply_configuration_after_bootstrap<R>(
+fn reload_apply_configuration_after_bootstrap(
     path: &Path,
     base_dir: &Path,
     provider_context: &ProviderContext,
-    validated_config: ValidatedConfig<R>,
+    validated_config: ValidatedConfig,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> Result<ValidatedConfig, AppError> {
     let reloaded = load_configuration_with_config(
@@ -1691,9 +1690,6 @@ struct SourceApplyPersistExports {
 }
 
 struct SourceApplyExecuted {
-    _validated_config: ValidatedConfig<
-        crate::wiring::ExpandedCanonicalResources<carina_core::parser::InferredExportParam>,
-    >,
     result: ExecutionResult,
     cancelled: bool,
     resources_finished: Instant,
@@ -1771,7 +1767,6 @@ async fn run_apply_locked_owned(
         lock,
         cancel,
         async |cancel, mid_run_writer| {
-            let (ctx, canonical_resources) = validated_config.context_and_resources_mut();
             if let Some(state) = state_file.as_ref() {
                 check_legacy_name_overrides(
                     state,
@@ -1780,36 +1775,11 @@ async fn run_apply_locked_owned(
                 )?;
             }
 
-            reconcile_canonical_prefixed_names(canonical_resources, &state_file);
-            let parsed = canonical_resources.parsed();
             let crate::wiring::StateBlockResolution {
                 claims: state_block_claims,
                 targets: resolved_state_block_targets,
-            } = crate::wiring::resolve_state_blocks(
-                &parsed.state_blocks,
-                &state_file,
-                &parsed.resources,
-                ctx.schemas(),
-            );
-            if let Some(sf) = state_file.as_ref() {
-                canonical_resources.reconcile_anonymous_module_instances(
-                    &|provider, resource_type| {
-                        sf.resources_by_type(provider, resource_type)
-                            .into_iter()
-                            .map(|r| r.identity.to_string())
-                            .collect()
-                    },
-                    &state_block_claims,
-                );
-            }
-            if let Some(sf) = state_file.as_mut() {
-                reconcile_canonical_anonymous_identifiers_with_ctx(
-                    ctx,
-                    canonical_resources,
-                    sf,
-                    &state_block_claims,
-                )?;
-            }
+            } = validated_config.reconcile_identities_with_state(&mut state_file)?;
+            let (ctx, canonical_resources) = validated_config.context_and_resources();
             let parsed = canonical_resources.parsed();
             let provider_inputs =
                 load_apply_provider_inputs(parsed, project_dir, provider_context).await?;
@@ -2478,7 +2448,6 @@ async fn run_apply_locked_owned(
 
             Ok(SourceApplyAfterHeartbeat::Executed(Box::new(
                 SourceApplyExecuted {
-                    _validated_config: validated_expansion,
                     result,
                     cancelled,
                     resources_finished,
@@ -2539,7 +2508,6 @@ async fn run_apply_locked_owned(
             }
             SourceApplyAfterHeartbeat::Executed(context) => {
                 let SourceApplyExecuted {
-                    _validated_config,
                     result,
                     cancelled,
                     resources_finished,
@@ -2841,14 +2809,15 @@ async fn prepare_saved_plan_secret_candidates(
         crate::wiring::DeferredForWarningPolicy::Suppress,
     )?;
 
-    let (wiring, expanded_canonical_resources) = validated_expansion.context_and_resources_mut();
-    let normalizers =
-        create_normalizers_from_configs_with_ctx(wiring, provider_inputs.configs()).await?;
-    expanded_canonical_resources
+    let normalizers = create_normalizers_from_configs_with_ctx(
+        validated_expansion.context(),
+        provider_inputs.configs(),
+    )
+    .await?;
+    validated_expansion
         .prepare_desired_side_for_plan(
             provider_inputs.configs().as_provider_configs(),
             &normalizers,
-            wiring.schemas(),
         )
         .await
         .map_err(AppError::Provider)?;

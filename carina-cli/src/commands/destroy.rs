@@ -55,16 +55,15 @@ use crate::commands::shared::progress::{
 };
 use crate::commands::shared::retry::is_retryable_delete_error;
 use crate::commands::shared::state_writeback::{
-    DestroyStateWrite, DestroyedInstance, apply_destroy_to_state, apply_name_overrides,
-    build_orphan_resource,
+    DestroyStateWrite, DestroyedInstance, apply_destroy_to_state, build_orphan_resource,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
 use crate::display::{format_destroy_plan_with_delete_instances, format_effect};
 use crate::error::{AppError, DestroyDependencyAnalysisError};
 use crate::wiring::{
-    ProviderLoad, ValidatedConfig, get_provider_with_ctx, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_prefixed_names, refresh_loaded_orphan_with_retry, refresh_loaded_resource_with_retry,
+    ProviderLoad, ValidatedConfig, get_provider_with_ctx, refresh_loaded_orphan_with_retry,
+    refresh_loaded_resource_with_retry,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -214,7 +213,6 @@ async fn run_destroy_locked_owned(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> LockCommandOutcome<Result<(), AppError>> {
-    let (ctx, parsed) = validated_config.context_and_resources_mut();
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the destroy lock before any short-circuit
     // (e.g. "No resources to destroy.") returns — see
@@ -237,7 +235,7 @@ async fn run_destroy_locked_owned(
         backend.as_ref(),
         lock.as_ref(),
         &mut state_file,
-        &parsed.data_sources,
+        &validated_config.resources().data_sources,
     )
     .await
     {
@@ -251,43 +249,8 @@ async fn run_destroy_locked_owned(
         lock,
         cancel,
         async |cancel, mid_run_writer| {
-
-    reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    let state_block_claims = crate::wiring::resolve_state_block_claims(
-        &parsed.state_blocks,
-        &state_file,
-        &parsed.resources,
-        ctx.schemas(),
-    );
-    if let Some(sf) = state_file.as_ref() {
-        carina_core::module_resolver::reconcile_anonymous_module_instances(
-            &mut parsed.resources,
-            &mut parsed.compositions,
-            &|provider, resource_type| {
-                sf.resources_by_type(provider, resource_type)
-                    .into_iter()
-                    .map(|r| r.identity.to_string())
-                    .collect()
-            },
-            &state_block_claims,
-        );
-    }
-    if let Some(sf) = state_file.as_mut() {
-        reconcile_anonymous_identifiers_with_ctx(
-            ctx,
-            &mut parsed.resources,
-            &parsed.data_sources,
-            sf,
-            &state_block_claims,
-        )?;
-    }
-    // destroy operates on the existing state-only resource set and does not run the
-    // differ. The state-side name_overrides are the only thing destroy needs from
-    // this surface; the full resolver -> override -> bindings rebuild ->
-    // second-pass resolver sequence is unnecessary here. Sub-PR B leaves this
-    // call site as-is for that reason. See
-    // notes/specs/2026-06-28-issue-3625-cbd-decompose-clean-design.md Phase 5 T5.8.
-    apply_name_overrides(&mut parsed.resources, &state_file);
+    validated_config.reconcile_for_destroy(&mut state_file)?;
+    let (ctx, parsed) = validated_config.context_and_resources();
 
     let provider_inputs = load_and_resolve_provider_configs(
         parsed,
@@ -1275,7 +1238,7 @@ async fn run_destroy_locked_owned(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_destroy_locked(
-    parsed: &mut carina_core::parser::InferredFile,
+    parsed: carina_core::parser::InferredFile,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     protected_bucket: Option<String>,
@@ -1303,7 +1266,7 @@ async fn run_destroy_locked(
         }
     };
     let validated_config =
-        match providers.validate_evaluated_config(parsed.clone(), base_dir, true, &[], &[]) {
+        match providers.validate_evaluated_config(parsed, base_dir, true, &[], &[]) {
             Ok(validated_config) => validated_config,
             Err(error) => {
                 return finish_lock_command(
@@ -2168,7 +2131,7 @@ mod tests {
         let backend =
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
         run_destroy_locked(
-            &mut parsed,
+            parsed,
             true,
             std::sync::Arc::from(backend),
             None,
@@ -2203,7 +2166,7 @@ mod tests {
             unresolved_attributes: Default::default(),
             binding: None,
         };
-        let mut parsed = carina_core::parser::InferredFile {
+        let parsed = carina_core::parser::InferredFile {
             providers: vec![provider_config.clone(), provider_config],
             ..Default::default()
         };
@@ -2215,7 +2178,7 @@ mod tests {
         assert!(lock_path.exists(), "fixture must hold the lock");
 
         let error = run_destroy_locked(
-            &mut parsed,
+            parsed,
             true,
             Arc::clone(&backend),
             None,
@@ -2239,7 +2202,7 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_provider_resolution_reports_referenced_missing_upstream_state() {
-        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        let (_temp, downstream, parsed) = provider_upstream_fixture();
         std::fs::remove_file(
             downstream
                 .parent()
@@ -2252,7 +2215,7 @@ mod tests {
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
 
         let error = match run_destroy_locked(
-            &mut parsed,
+            parsed,
             true,
             std::sync::Arc::from(backend),
             None,
@@ -2280,11 +2243,11 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_allows_default_tags_referencing_local_computed_attributes() {
-        let (_temp, base_dir, mut parsed) = provider_default_tags_local_resource_fixture();
+        let (_temp, base_dir, parsed) = provider_default_tags_local_resource_fixture();
         let backend = crate::commands::local_backend_for_test(base_dir.join("state.json"));
 
         run_destroy_locked(
-            &mut parsed,
+            parsed,
             true,
             std::sync::Arc::from(backend),
             None,
@@ -2302,11 +2265,11 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_ignores_missing_upstream_referenced_only_by_default_tags() {
-        let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
+        let (_temp, base_dir, parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = crate::commands::local_backend_for_test(base_dir.join("state.json"));
 
         run_destroy_locked(
-            &mut parsed,
+            parsed,
             true,
             std::sync::Arc::from(backend),
             None,

@@ -6,9 +6,13 @@
 //! and mints a [`ValidatedConfig`], which owns both the validated resources and
 //! their [`ValidatedWiring`]. Identity preparation, planning, execution, and
 //! plan recording accept that owner rather than an independently selectable
-//! context and resource value. Validation therefore cannot load independently,
-//! and every downstream use observes the exact context and resources that
-//! crossed the same minting transition.
+//! context and resource value. Production code may inspect the owner's
+//! resources, but cannot take ownership of, replace, or mutably borrow them;
+//! concrete owner methods perform the permitted in-place reconciliation and
+//! normalization steps, while consuming transitions carry the same wiring into
+//! the next owner state. Validation therefore cannot load independently, and
+//! every downstream use observes the exact context and resources that crossed
+//! the same minting transition.
 //!
 //! Calling `ProviderLoad::load` twice remains possible. It cannot create the
 //! former divergence: each result must itself be validated or artifact-verified
@@ -16,7 +20,8 @@
 //! Production command paths call the loader once; formatting calls its separate
 //! loader once per provider-declaring directory and receives schemas rather
 //! than a context. `carina_core` can still construct a raw canonical pair, but
-//! no carina-cli planning, execution, or recording entry point accepts one.
+//! no carina-cli planning, execution, or recording entry point accepts one,
+//! and a raw pair cannot replace the resources inside an existing owner.
 //!
 //! ```compile_fail,E0603
 //! let providers = Vec::new();
@@ -460,6 +465,18 @@ impl ValidationPipelineAccess {
     fn new() -> Self {
         Self { _private: () }
     }
+
+    /// Resolve both configuration snapshots inside the sealed validation
+    /// pipeline. The capability cannot be constructed outside this module, so
+    /// no other crate path can obtain an unowned canonical pair from this API.
+    pub(crate) fn resolve_config_names<E>(
+        &self,
+        ctx: &WiringContext,
+        parsed: carina_core::parser::File<E>,
+        unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
+    ) -> Result<CanonicalResourcePair<E>, Vec<AppError>> {
+        resolve_config_names_with_ctx(ctx, parsed, unresolved)
+    }
 }
 
 /// Provider wiring retained inside [`ValidatedConfig`] after a concrete
@@ -503,6 +520,33 @@ pub struct ValidatedWiring {
 ///     resources: CanonicalResourcePair<InferredExportParam>,
 /// ) {
 ///     let _ = contents.record(&resources);
+/// }
+/// ```
+///
+/// Validated resources cannot be replaced while retaining their original
+/// wiring owner:
+///
+/// ```compile_fail,E0614
+/// use carina_cli::wiring::ValidatedConfig;
+/// use carina_core::parser::InferredFile;
+///
+/// fn replace_resources(mut config: ValidatedConfig<InferredFile>, other: InferredFile) {
+///     *config = other;
+/// }
+/// ```
+///
+/// Two owners cannot swap their validated resources independently of their
+/// wiring:
+///
+/// ```compile_fail,E0614
+/// use carina_cli::wiring::ValidatedConfig;
+/// use carina_core::parser::InferredFile;
+///
+/// fn swap_resources(
+///     mut first: ValidatedConfig<InferredFile>,
+///     mut second: ValidatedConfig<InferredFile>,
+/// ) {
+///     std::mem::swap(&mut *first, &mut *second);
 /// }
 /// ```
 pub struct ValidatedConfig<R = CanonicalResourcePair<carina_core::parser::InferredExportParam>> {
@@ -1022,6 +1066,8 @@ impl<R> ValidatedConfig<R> {
         self.wiring.context()
     }
 
+    /// Borrow the validated resources without allowing them to be detached or
+    /// replaced independently of their wiring owner.
     pub(crate) fn resources(&self) -> &R {
         &self.resources
     }
@@ -1032,40 +1078,6 @@ impl<R> ValidatedConfig<R> {
     /// resources while substituting a context from another provider load.
     pub(crate) fn context_and_resources(&self) -> (&WiringContext, &R) {
         (self.wiring.context(), &self.resources)
-    }
-
-    /// Mutably borrow the resources together with the context that validated
-    /// them.
-    pub(crate) fn context_and_resources_mut(&mut self) -> (&WiringContext, &mut R) {
-        (self.wiring.context(), &mut self.resources)
-    }
-
-    /// Revalidate the post-bootstrap configuration against the same provider
-    /// load and replace the previously validated resource snapshot atomically.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn revalidate_config_pair(
-        self,
-        parsed: carina_core::parser::InferredFile,
-        unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-        base_dir: &Path,
-        skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
-        duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
-    ) -> Result<ValidatedConfig, AppError> {
-        let resources = resolve_config_pair_with_context(
-            self.wiring.context(),
-            &HashMap::new(),
-            parsed,
-            unresolved,
-            base_dir,
-            skip_resource_validation,
-            prior_inference_errors,
-            duplicate_declarations,
-        )?;
-        Ok(ValidatedConfig {
-            wiring: self.wiring,
-            resources,
-        })
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -1158,17 +1170,210 @@ impl<R> ValidatedConfig<R> {
     }
 }
 
-impl<R> std::ops::Deref for ValidatedConfig<R> {
-    type Target = R;
-
-    fn deref(&self) -> &Self::Target {
-        &self.resources
+impl ValidatedConfig<CanonicalResourcePair<carina_core::parser::InferredExportParam>> {
+    /// Revalidate the post-bootstrap configuration against this same provider
+    /// load, consuming the old canonical pair into its replacement owner.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn revalidate_config_pair(
+        self,
+        parsed: carina_core::parser::InferredFile,
+        unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
+        base_dir: &Path,
+        skip_resource_validation: bool,
+        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
+        duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
+    ) -> Result<ValidatedConfig, AppError> {
+        let Self {
+            wiring,
+            resources: _,
+        } = self;
+        let resources = resolve_config_pair_with_context(
+            wiring.context(),
+            &HashMap::new(),
+            parsed,
+            unresolved,
+            base_dir,
+            skip_resource_validation,
+            prior_inference_errors,
+            duplicate_declarations,
+        )?;
+        Ok(ValidatedConfig { wiring, resources })
     }
 }
 
-impl<R> std::ops::DerefMut for ValidatedConfig<R> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.resources
+impl<E> ValidatedConfig<CanonicalResourcePair<E>> {
+    /// Apply the state-aware identity reconciliation sequence to this owner's
+    /// canonical pair without exposing a mutable pair to the caller.
+    pub(crate) fn reconcile_identities_with_state(
+        &mut self,
+        state_file: &mut Option<StateFile>,
+    ) -> Result<StateBlockResolution, AppError> {
+        let Self { wiring, resources } = self;
+        let ctx = wiring.context();
+        reconcile_canonical_prefixed_names(resources, state_file);
+        let parsed = resources.parsed();
+        let state_blocks = resolve_state_blocks(
+            &parsed.state_blocks,
+            state_file,
+            &parsed.resources,
+            ctx.schemas(),
+        );
+        if let Some(state) = state_file.as_ref() {
+            resources.reconcile_anonymous_module_instances(
+                &|provider, resource_type| {
+                    state
+                        .resources_by_type(provider, resource_type)
+                        .into_iter()
+                        .map(|resource| resource.identity.to_string())
+                        .collect()
+                },
+                &state_blocks.claims,
+            );
+        }
+        if let Some(state) = state_file.as_mut() {
+            reconcile_canonical_anonymous_identifiers_with_ctx(
+                ctx,
+                resources,
+                state,
+                &state_blocks.claims,
+            )?;
+        }
+        Ok(state_blocks)
+    }
+
+    /// Fixture-only identity preparation that still mutates through the owner.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn compute_anonymous_identifiers_for_fixture(
+        &mut self,
+        providers: &[ProviderConfig],
+    ) -> Result<Vec<AppError>, AppError> {
+        let Self { wiring, resources } = self;
+        compute_canonical_pair_anonymous_identifiers_with_ctx(
+            wiring.context(),
+            resources,
+            providers,
+        )
+    }
+}
+
+impl ValidatedConfig<carina_core::parser::InferredFile> {
+    /// Integration-test read view of the evaluated configuration. Mutation
+    /// remains confined to the owner's concrete transition methods.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn evaluated_resources_for_test(&self) -> &carina_core::parser::InferredFile {
+        &self.resources
+    }
+
+    /// Reconcile the evaluated destroy view against state without releasing a
+    /// mutable file from the owner.
+    pub(crate) fn reconcile_for_destroy(
+        &mut self,
+        state_file: &mut Option<StateFile>,
+    ) -> Result<(), AppError> {
+        self.reconcile_evaluated_identities(state_file, true)
+    }
+
+    /// Reconcile the evaluated state-refresh view against state without
+    /// applying module-instance reconciliation, preserving its existing
+    /// command semantics.
+    pub(crate) fn reconcile_for_state_refresh(
+        &mut self,
+        state_file: &mut Option<StateFile>,
+    ) -> Result<(), AppError> {
+        self.reconcile_evaluated_identities(state_file, false)
+    }
+
+    fn reconcile_evaluated_identities(
+        &mut self,
+        state_file: &mut Option<StateFile>,
+        reconcile_modules: bool,
+    ) -> Result<(), AppError> {
+        let Self { wiring, resources } = self;
+        let ctx = wiring.context();
+        reconcile_prefixed_names(&mut resources.resources, state_file);
+        let state_block_claims = resolve_state_block_claims(
+            &resources.state_blocks,
+            state_file,
+            &resources.resources,
+            ctx.schemas(),
+        );
+        if reconcile_modules && let Some(state) = state_file.as_ref() {
+            module_resolver::reconcile_anonymous_module_instances(
+                &mut resources.resources,
+                &mut resources.compositions,
+                &|provider, resource_type| {
+                    state
+                        .resources_by_type(provider, resource_type)
+                        .into_iter()
+                        .map(|resource| resource.identity.to_string())
+                        .collect()
+                },
+                &state_block_claims,
+            );
+        }
+        if let Some(state) = state_file.as_mut() {
+            reconcile_anonymous_identifiers_with_ctx(
+                ctx,
+                &mut resources.resources,
+                &resources.data_sources,
+                state,
+                &state_block_claims,
+            )?;
+        }
+        crate::commands::shared::state_writeback::apply_name_overrides(
+            &mut resources.resources,
+            state_file,
+        );
+        Ok(())
+    }
+}
+
+impl<E: Clone> ValidatedConfig<carina_core::parser::File<E>> {
+    /// Run the address-preserving state-refresh expansion through this owner,
+    /// keeping the mutated file bound to its validating wiring.
+    pub(crate) async fn expand_refresh_and_lift_states<P: Provider + ProviderNormalizer>(
+        &mut self,
+        inputs: ValidatedExpandRefreshAndLiftInputs<'_, '_, P>,
+    ) -> Result<ExpandedRefreshState<()>, AppError> {
+        let Self { wiring, resources } = self;
+        let ValidatedExpandRefreshAndLiftInputs {
+            provider,
+            expansion,
+            warning_policy,
+            remote_bindings,
+            state_file,
+            saved_dep_bindings,
+            refresh_phase,
+        } = inputs;
+        expand_refresh_and_lift_states(
+            resources,
+            ExpandRefreshAndLiftInputs {
+                provider,
+                expansion,
+                warning_policy,
+                remote_bindings,
+                state_file,
+                saved_dep_bindings,
+                refresh_phase,
+                schemas: wiring.context().schemas(),
+            },
+        )
+        .await
+    }
+}
+
+impl<E> ValidatedConfig<ExpandedCanonicalResources<E>> {
+    /// Normalize the expanded desired side using only the schemas retained by
+    /// this owner.
+    pub(crate) async fn prepare_desired_side_for_plan(
+        &mut self,
+        provider_configs: &[ProviderConfig],
+        normalizer: &dyn ProviderNormalizer,
+    ) -> carina_core::provider::ProviderResult<()> {
+        let Self { wiring, resources } = self;
+        resources
+            .prepare_desired_side_for_plan(provider_configs, normalizer, wiring.context().schemas())
+            .await
     }
 }
 
@@ -1616,6 +1821,13 @@ fn lift_validation_result(res: Result<(), String>) -> Vec<AppError> {
     split_validation_message(&joined)
 }
 
+fn block_name_errors<T: fmt::Display>(conflicts: impl IntoIterator<Item = T>) -> Vec<AppError> {
+    conflicts
+        .into_iter()
+        .map(|conflict| AppError::Validation(conflict.to_string()))
+        .collect()
+}
+
 fn prefixed_validation_messages(joined: &str, prefix: impl std::fmt::Display) -> Vec<AppError> {
     split_validation_message(joined)
         .into_iter()
@@ -1822,39 +2034,19 @@ pub(crate) fn resolve_file_names_with_ctx<E>(
 ) -> Vec<AppError> {
     let mut errors = resolve_file_block_names_with_schemas(parsed, ctx.schemas())
         .err()
-        .map(|conflicts| {
-            conflicts
-                .into_iter()
-                .map(|conflict| AppError::Validation(conflict.to_string()))
-                .collect::<Vec<_>>()
-        })
+        .map(block_name_errors)
         .unwrap_or_default();
     errors.extend(resolve_attr_prefixes_with_ctx(ctx, &mut parsed.resources));
     errors
 }
 
-#[cfg(test)]
-pub(crate) fn resolve_config_block_names_with_ctx_for_test<E>(
+fn resolve_config_names_with_ctx<E>(
     ctx: &WiringContext,
     parsed: carina_core::parser::File<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> Result<CanonicalResourcePair<E>, Vec<AppError>> {
     carina_core::schema::resolve_config_block_names_with_schemas(parsed, unresolved, ctx.schemas())
-        .map_err(|conflicts| {
-            conflicts
-                .into_iter()
-                .map(|conflict| AppError::Validation(conflict.to_string()))
-                .collect()
-        })
-}
-
-#[cfg(test)]
-pub(crate) fn resolve_config_names_with_ctx_for_test<E>(
-    ctx: &WiringContext,
-    parsed: carina_core::parser::File<E>,
-    unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> Result<CanonicalResourcePair<E>, Vec<AppError>> {
-    resolve_config_block_names_with_ctx_for_test(ctx, parsed, unresolved)?
+        .map_err(block_name_errors)?
         .resolve_attr_prefixes(ctx.schemas())
         .map_err(|error| split_validation_message(&error))
 }
@@ -3864,7 +4056,7 @@ impl<E> ExpandedCanonicalResources<E> {
         &self.resources
     }
 
-    pub(crate) async fn prepare_desired_side_for_plan(
+    async fn prepare_desired_side_for_plan(
         &mut self,
         provider_configs: &[ProviderConfig],
         normalizer: &dyn ProviderNormalizer,
@@ -4307,10 +4499,9 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
 /// level — same closure pattern as
 /// [`PostApplyStates`](crate::commands::shared::state_writeback::PostApplyStates).
 /// Every call site that needs a post-expansion view of `sorted_resources`
-/// (apply `run_apply_locked`, refresh `run_state_refresh_locked`) MUST
-/// obtain it via [`expand_refresh_and_lift_states`] or
-/// [`expand_canonical_refresh_and_lift_states`], and those constructors perform
-/// the complete post-expansion sequence:
+/// (apply `run_apply_locked`, refresh `run_state_refresh_locked`) must obtain it
+/// through the corresponding [`ValidatedConfig`] owner transition. Those
+/// transitions perform the complete post-expansion sequence:
 ///
 /// 1. `expand_same_config_deferred_for` — synthesise for-loop children
 ///    and re-sort the augmented set.
@@ -4389,7 +4580,7 @@ pub(crate) struct ValidatedExpandedRefreshState<E> {
 ///
 /// The unit resource witness makes the raw-file variant distinct from the
 /// canonical plan/apply result at the type level.
-pub(crate) async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormalizer>(
+async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormalizer>(
     parsed: &mut carina_core::parser::File<E>,
     inputs: ExpandRefreshAndLiftInputs<'_, '_, P>,
 ) -> Result<ExpandedRefreshState<()>, AppError> {

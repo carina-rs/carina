@@ -46,12 +46,11 @@ use crate::commands::plan::{
 use crate::commands::shared::finalize::release_lock_after_execute;
 use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
 use crate::commands::shared::progress::{ProgressBackend, ProgressSink, RefreshPhase};
-use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
+use crate::commands::shared::state_writeback::SkippedExports;
 use crate::error::AppError;
 use crate::wiring::{
     AddressedDataSourceReadInputs, ProviderLoad, ValidatedConfig, get_provider_with_ctx,
-    prepare_default_provider_ready_config, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_prefixed_names, refresh_loaded_orphan_with_retry,
+    prepare_default_provider_ready_config, refresh_loaded_orphan_with_retry,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -1053,7 +1052,7 @@ pub async fn run_state_refresh(
 
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
-    let mut validated_config = providers.validate_evaluated_config(
+    let validated_config = providers.validate_evaluated_config(
         parsed,
         base_dir,
         true,
@@ -1093,7 +1092,7 @@ pub async fn run_state_refresh(
     };
 
     let op_result = run_state_refresh_locked(
-        &mut validated_config,
+        validated_config,
         backend.as_ref(),
         state_lock.as_ref(),
         base_dir,
@@ -1115,14 +1114,13 @@ pub async fn run_state_refresh(
 }
 
 pub(crate) async fn run_state_refresh_locked(
-    validated_config: &mut ValidatedConfig<carina_core::parser::InferredFile>,
+    mut validated_config: ValidatedConfig<carina_core::parser::InferredFile>,
     backend: &dyn StateBackend,
     lock: StateLockRef<'_>,
     base_dir: &std::path::Path,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
-    let (ctx, parsed) = validated_config.context_and_resources_mut();
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the refresh lock before the "no
     // resources" short-circuit returns — see
@@ -1134,7 +1132,7 @@ pub(crate) async fn run_state_refresh_locked(
         backend,
         lock,
         &mut state_file,
-        &parsed.data_sources,
+        &validated_config.resources().data_sources,
     )
     .await?;
 
@@ -1148,29 +1146,8 @@ pub(crate) async fn run_state_refresh_locked(
         return Ok(());
     }
 
-    reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    let state_block_claims = crate::wiring::resolve_state_block_claims(
-        &parsed.state_blocks,
-        &state_file,
-        &parsed.resources,
-        ctx.schemas(),
-    );
-    if let Some(sf) = state_file.as_mut() {
-        reconcile_anonymous_identifiers_with_ctx(
-            ctx,
-            &mut parsed.resources,
-            &parsed.data_sources,
-            sf,
-            &state_block_claims,
-        )?;
-    }
-    // state is a read-only inspection command and does not run the differ. The
-    // state-side name_overrides are sufficient for this narrow display path; the
-    // full resolver -> override -> bindings rebuild -> second-pass resolver
-    // sequence is unnecessary here. Sub-PR B leaves this call site as-is for
-    // that reason. See
-    // notes/specs/2026-06-28-issue-3625-cbd-decompose-clean-design.md Phase 5 T5.8.
-    apply_name_overrides(&mut parsed.resources, &state_file);
+    validated_config.reconcile_for_state_refresh(&mut state_file)?;
+    let (ctx, parsed) = validated_config.context_and_resources();
 
     let provider_inputs = load_and_resolve_provider_configs(
         parsed,
@@ -1341,9 +1318,8 @@ pub(crate) async fn run_state_refresh_locked(
         residual_deferred_for: _,
         deferred_create_targets: _,
         printed_warnings: _,
-    } = crate::wiring::expand_refresh_and_lift_states(
-        parsed,
-        crate::wiring::ExpandRefreshAndLiftInputs {
+    } = validated_config
+        .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
             provider: &provider,
             expansion: &mut prepared_expansion,
             warning_policy: crate::wiring::DeferredForWarningPolicy::Print,
@@ -1351,10 +1327,9 @@ pub(crate) async fn run_state_refresh_locked(
             state_file: &state_file,
             saved_dep_bindings: &saved_dep_bindings,
             refresh_phase: &refresh_phase,
-            schemas: ctx.schemas(),
-        },
-    )
-    .await?;
+        })
+        .await?;
+    let (ctx, parsed) = validated_config.context_and_resources();
     let sorted_resources = resorted;
     let crate::wiring::PreparedDeferredForExpansionParts {
         mut managed_current,
@@ -2419,7 +2394,7 @@ mod tests {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
-        let mut validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test(
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -2429,7 +2404,7 @@ mod tests {
         let backend = non_empty_refresh_backend("test");
 
         run_state_refresh_locked(
-            &mut validated_config,
+            validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &downstream,
@@ -2465,14 +2440,14 @@ mod tests {
             });
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
-        let mut validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test(
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
             &provider_configs,
         );
         let backend = non_empty_refresh_backend("test");
         run_state_refresh_locked(
-            &mut validated_config,
+            validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &downstream,
@@ -2496,7 +2471,7 @@ mod tests {
         .unwrap();
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
-        let mut validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test(
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
             &provider_configs,
@@ -2504,7 +2479,7 @@ mod tests {
         let backend = non_empty_refresh_backend("test");
 
         let error = match run_state_refresh_locked(
-            &mut validated_config,
+            validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &downstream,
@@ -2549,12 +2524,12 @@ mod tests {
         let backend =
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &downstream).unwrap();
-        let mut validated_config = providers
+        let validated_config = providers
             .validate_evaluated_config(parsed, &downstream, true, &[], &[])
             .unwrap();
 
         run_state_refresh_locked(
-            &mut validated_config,
+            validated_config,
             backend.as_ref(),
             StateLock::disabled_for_test().as_ref(),
             &downstream,
@@ -2571,12 +2546,12 @@ mod tests {
         let (_temp, base_dir, parsed) = provider_default_tags_local_resource_fixture();
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
-        let mut validated_config = providers
+        let validated_config = providers
             .validate_evaluated_config(parsed, &base_dir, true, &[], &[])
             .unwrap();
 
         run_state_refresh_locked(
-            &mut validated_config,
+            validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &base_dir,
@@ -2593,12 +2568,12 @@ mod tests {
         let (_temp, base_dir, parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
-        let mut validated_config = providers
+        let validated_config = providers
             .validate_evaluated_config(parsed, &base_dir, true, &[], &[])
             .unwrap();
 
         run_state_refresh_locked(
-            &mut validated_config,
+            validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &base_dir,
@@ -3039,7 +3014,7 @@ mod tests {
         let (trigger, cancel) = root.with_graceful_shutdown_trigger();
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_configs = parsed.providers.clone();
-        let mut validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test(
             parsed,
             vec![Box::new(CancellingDataSourceRefreshFactory {
                 reads: reads.clone(),
@@ -3050,7 +3025,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
 
         let error = run_state_refresh_locked(
-            &mut validated_config,
+            validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             temp.path(),
@@ -3129,7 +3104,7 @@ mod tests {
         let backend = ModuleConstraintRefreshBackend { state };
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_configs = parsed.providers.clone();
-        let mut validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test(
             parsed,
             vec![Box::new(ModuleConstraintRefreshFactory {
                 reads: reads.clone(),
@@ -3139,7 +3114,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
 
         run_state_refresh_locked(
-            &mut validated_config,
+            validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             temp.path(),
@@ -3206,7 +3181,7 @@ mod tests {
         let backend = ModuleConstraintRefreshBackend { state };
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_configs = parsed.providers.clone();
-        let mut validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test(
             parsed,
             vec![Box::new(ModuleConstraintRefreshFactory { reads })],
             &provider_configs,
@@ -3214,7 +3189,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
 
         run_state_refresh_locked(
-            &mut validated_config,
+            validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             temp.path(),
@@ -3561,7 +3536,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_expansion_hydrates_lifted_saved_enum_attrs() {
-        let mut parsed = parse_file(
+        let parsed = parse_file(
             r#"
                 let source = aws.service.Source {
                     name = "source"
@@ -3636,25 +3611,23 @@ mod tests {
             .upsert_resource(child_state)
             .expect("test state setup must be valid");
 
+        let widget_schema = (ResourceSchema::new("service.Widget").attribute(
+            AttributeSchema::optional(
+                "status",
+                AttributeType::enum_(
+                    carina_core::schema::enum_identity("Status", Some("aws.service.Widget")),
+                    Some(vec!["Enabled".to_string()]),
+                    vec![("Enabled".to_string(), "enabled".to_string())],
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid");
         let mut schemas = SchemaRegistry::new();
-        schemas.insert(
-            "aws",
-            (ResourceSchema::new("service.Widget").attribute(
-                AttributeSchema::optional(
-                    "status",
-                    AttributeType::enum_(
-                        carina_core::schema::enum_identity("Status", Some("aws.service.Widget")),
-                        Some(vec!["Enabled".to_string()]),
-                        vec![("Enabled".to_string(), "enabled".to_string())],
-                        None,
-                        None,
-                    ),
-                )
-                .build(),
-            ))
-            .validate()
-            .expect("schema fixture must be valid"),
-        );
+        schemas.insert("aws", widget_schema.clone());
 
         let desired_ids = sorted_resources
             .iter()
@@ -3691,9 +3664,14 @@ mod tests {
             .seal(carina_core::data_source_value::DataSourceValues::empty());
         let progress = ProgressBackend::plain(std::io::sink());
         let refresh_phase = RefreshPhase::start(&progress);
-        let expanded = crate::wiring::expand_refresh_and_lift_states(
-            &mut parsed,
-            crate::wiring::ExpandRefreshAndLiftInputs {
+        let mut validated_config = ValidatedConfig::from_factories_with_additional_schemas_for_test(
+            parsed,
+            Vec::new(),
+            &[],
+            [("aws".to_string(), widget_schema)],
+        );
+        let expanded = validated_config
+            .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
                 provider: &provider,
                 expansion: &mut prepared_expansion,
                 warning_policy: crate::wiring::DeferredForWarningPolicy::Suppress,
@@ -3701,11 +3679,9 @@ mod tests {
                 state_file: &state_file,
                 saved_dep_bindings: &HashMap::new(),
                 refresh_phase: &refresh_phase,
-                schemas: &schemas,
-            },
-        )
-        .await
-        .expect("refresh expansion should succeed");
+            })
+            .await
+            .expect("refresh expansion should succeed");
         let crate::wiring::PreparedDeferredForExpansionParts {
             managed_current: current_states,
             orphans,

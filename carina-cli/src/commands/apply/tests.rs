@@ -79,15 +79,19 @@ fn canonical_unresolved_for_test(
     parsed: &carina_core::parser::InferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> carina_core::override_aware::CanonicalResourcePair<carina_core::parser::InferredExportParam> {
-    crate::wiring::resolve_config_block_names_with_ctx_for_test(
-        ctx,
+    carina_core::schema::resolve_config_block_names_with_schemas(
         parsed.clone(),
         unresolved.clone(),
+        ctx.schemas(),
     )
     .unwrap_or_else(|errors| {
         panic!(
             "test block-name resolution failed: {}",
-            super::super::collapse_errors(errors)
+            errors
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
         )
     })
 }
@@ -1389,8 +1393,8 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     let parsed = loaded.parsed;
     let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &downstream).unwrap();
     let unresolved_parsed = loaded.unresolved_parsed;
-    let wiring =
-        ValidatedConfig::from_wiring_for_test(ValidatedWiring::from_load_for_test(providers), ());
+    let wiring = ValidatedWiring::from_load_for_test(providers);
+    let validated_config = validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed);
     let stale_inputs =
         load_apply_provider_inputs(&parsed, &downstream, &ProviderContext::default())
             .await
@@ -1409,7 +1413,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
         &downstream,
         &downstream,
         &ProviderContext::default(),
-        wiring,
+        validated_config,
         unresolved_parsed,
     )
     .expect("bootstrap reload must succeed");
@@ -1420,7 +1424,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
                 received_role_arn: Arc::clone(&received_role_arn),
             },
         )],
-        &reloaded.parsed().providers,
+        &reloaded.resources().parsed().providers,
     );
     let backend = Arc::<dyn StateBackend>::from(crate::commands::local_backend_for_test(
         downstream.join("apply.state.json"),
@@ -1484,15 +1488,16 @@ inner { x = a }
     .expect("load unresolved bootstrap snapshot");
     let providers =
         ProviderLoad::load(&user_dirs, &loaded.parsed.providers, fixture.path()).unwrap();
-    let wiring =
-        ValidatedConfig::from_wiring_for_test(ValidatedWiring::from_load_for_test(providers), ());
+    let wiring = ValidatedWiring::from_load_for_test(providers);
+    let validated_config =
+        validated_apply_config_for_test(&wiring, &loaded.parsed, &loaded.unresolved_parsed);
     let unresolved = loaded.unresolved_parsed;
 
     let error = reload_apply_configuration_after_bootstrap(
         fixture.path(),
         fixture.path(),
         &ProviderContext::default(),
-        wiring,
+        validated_config,
         unresolved,
     )
     .expect_err("apply bootstrap reload must retain the reference-type gate");
@@ -1567,16 +1572,15 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
         .expect("load unresolved bootstrap snapshot");
         let providers =
             ProviderLoad::load(&user_dirs, &loaded.parsed.providers, fixture.path()).unwrap();
-        let wiring = ValidatedConfig::from_wiring_for_test(
-            ValidatedWiring::from_load_for_test(providers),
-            (),
-        );
+        let wiring = ValidatedWiring::from_load_for_test(providers);
+        let validated_config =
+            validated_apply_config_for_test(&wiring, &loaded.parsed, &loaded.unresolved_parsed);
         let unresolved = loaded.unresolved_parsed;
         let error = reload_apply_configuration_after_bootstrap(
             fixture.path(),
             fixture.path(),
             &ProviderContext::default(),
-            wiring,
+            validated_config,
             unresolved,
         )
         .expect_err("apply bootstrap reload must reject module-output type mismatch");
@@ -2654,6 +2658,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
 
     assert_eq!(
         plan_ctx
+            .resources()
             .data_sources
             .iter()
             .map(|data_source| data_source.id.identity_str().expect("resolved identity"))
@@ -2662,6 +2667,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         "the expanded module data source must be in the planning set"
     );
     let consumer = plan_ctx
+        .resources()
         .plan
         .effects()
         .iter()
@@ -4676,7 +4682,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
     .expect("post-apply plan should succeed");
 
     assert!(
-        !plan_ctx.plan.has_mutations(),
+        !plan_ctx.resources().plan.has_mutations(),
         "post-apply plan must be idempotent"
     );
     assert_eq!(
@@ -4792,9 +4798,9 @@ let nat = mock.ec2.NatGateway {{
     .await
     .expect("plan after create should succeed");
     assert!(
-        !clean_plan.plan.has_mutations(),
+        !clean_plan.resources().plan.has_mutations(),
         "the first refresh plan must ignore the read-only canonical tags default: {:#?}",
-        clean_plan.plan
+        clean_plan.resources().plan
     );
 
     std::fs::write(fixture.config_path().join("main.crn"), config("two"))
@@ -4851,9 +4857,9 @@ let nat = mock.ec2.NatGateway {{
     .await
     .expect("plan after sibling update should succeed");
     assert!(
-        !final_plan.plan.has_mutations(),
+        !final_plan.resources().plan.has_mutations(),
         "changing only the sibling must leave the IGW clean: {:#?}",
-        final_plan.plan,
+        final_plan.resources().plan,
     );
 }
 
@@ -4979,15 +4985,20 @@ let igw = mock.ec2.InternetGateway {{{tags}
     .await
     .expect("retry plan should succeed");
     assert!(
-        retry.plan.effects().iter().any(|effect| matches!(
-            effect,
-            carina_core::effect::Effect::Update {
-                changed_attributes,
-                ..
-            } if changed_attributes.iter().any(|key| key == "tags")
-        )),
+        retry
+            .resources()
+            .plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(
+                effect,
+                carina_core::effect::Effect::Update {
+                    changed_attributes,
+                    ..
+                } if changed_attributes.iter().any(|key| key == "tags")
+            )),
         "the next plan must retry the failed tags removal: {:#?}",
-        retry.plan,
+        retry.resources().plan,
     );
 }
 
@@ -5117,15 +5128,20 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     .expect("the removal plan should succeed");
     let attribute = case.top_level_attribute();
     assert!(
-        removal_plan.plan.effects().iter().any(|effect| matches!(
-            effect,
-            carina_core::effect::Effect::Update {
-                changed_attributes,
-                ..
-            } if changed_attributes.iter().any(|key| key == attribute)
-        )),
+        removal_plan
+            .resources()
+            .plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(
+                effect,
+                carina_core::effect::Effect::Update {
+                    changed_attributes,
+                    ..
+                } if changed_attributes.iter().any(|key| key == attribute)
+            )),
         "an Applied row must initially plan the nested removal: {:#?}",
-        removal_plan.plan,
+        removal_plan.resources().plan,
     );
 
     let error = run_apply_locked(
@@ -5192,16 +5208,21 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     .await
     .expect("retry plan should succeed");
     assert!(
-        retry.plan.effects().iter().any(|effect| matches!(
-            effect,
-            carina_core::effect::Effect::Update {
-                changed_attributes,
-                ..
-            } if changed_attributes.iter().any(|key| key == attribute)
-        )),
+        retry
+            .resources()
+            .plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(
+                effect,
+                carina_core::effect::Effect::Update {
+                    changed_attributes,
+                    ..
+                } if changed_attributes.iter().any(|key| key == attribute)
+            )),
         "the next plan must retry the failed nested removal; explicit={:#?}, plan={:#?}",
         row["explicit"],
-        retry.plan,
+        retry.resources().plan,
     );
 
     if !complete_retry {
@@ -5262,9 +5283,9 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     .await
     .expect("plan after the successful retry should succeed");
     assert!(
-        !final_plan.plan.has_mutations(),
+        !final_plan.resources().plan.has_mutations(),
         "the Applied write must converge: {:#?}",
-        final_plan.plan
+        final_plan.resources().plan
     );
 }
 

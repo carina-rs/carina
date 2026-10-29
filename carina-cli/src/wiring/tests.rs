@@ -2387,6 +2387,7 @@ let shared = read test.shared.Type {}
     )
     .await
     .expect("managed orphan and same-id data source must coexist through planning");
+    let plan_context = plan_context.resources();
 
     let summary = plan_context.plan.summary();
     assert_eq!(summary.read, 1);
@@ -5705,7 +5706,7 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
     };
     let unresolved = evaluated.clone();
 
-    let canonical_unresolved = resolve_config_block_names_with_ctx_for_test(
+    let canonical_unresolved = resolve_config_names_with_ctx(
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -5767,7 +5768,7 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
     };
     let unresolved = evaluated.clone();
 
-    let errors = resolve_config_block_names_with_ctx_for_test(
+    let errors = resolve_config_names_with_ctx(
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -5803,7 +5804,7 @@ fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
     };
     let unresolved = evaluated.clone();
 
-    let canonical = resolve_config_names_with_ctx_for_test(
+    let canonical = resolve_config_names_with_ctx(
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -9244,6 +9245,7 @@ exports { team_prefix: String = "x" }"#,
         )
         .await
         .expect("resolved-value violations must be represented by the plan");
+        let plan = plan.resources();
 
         assert_eq!(plan.plan.errors().len(), 1, "{:#?}", plan.plan.errors());
         match &plan.plan.errors()[0].kind {
@@ -9319,6 +9321,7 @@ exports { team_prefix: String = "x" }"#,
         )
         .await
         .expect("module violations must be represented by the plan");
+        let plan = plan.resources();
 
         assert_eq!(
             reads.load(Ordering::SeqCst),

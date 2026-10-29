@@ -402,30 +402,16 @@ pub(crate) enum ConfigNameResolution {
     Paired(Box<UnresolvedConfigSnapshot>),
 }
 
+/// Internal result of the sealed validation pipeline.
+///
+/// The paired form is built only through [`crate::wiring::ValidationPipelineAccess`]
+/// and is immediately captured by the consuming provider-load transition.
+/// After that owner is minted, production code can change its resources only
+/// through concrete [`crate::wiring::ValidatedConfig`] methods or consuming
+/// owner transitions.
 pub(crate) enum ResolvedConfig<'a> {
     Evaluated(&'a mut carina_core::parser::InferredFile),
     Paired(Box<CanonicalResourcePair<carina_core::parser::InferredExportParam>>),
-}
-
-/// Resolve the evaluated and authored snapshots into the one canonical pair
-/// that may leave validation.
-///
-/// Keeping this constructor private prevents crate code from pairing arbitrary
-/// resources with a context and bypassing the [`ValidatedConfig`] transition.
-fn resolve_config_names_with_ctx<E>(
-    ctx: &WiringContext,
-    parsed: carina_core::parser::File<E>,
-    unresolved: UnresolvedConfigSnapshot,
-) -> Result<CanonicalResourcePair<E>, Vec<AppError>> {
-    carina_core::schema::resolve_config_block_names_with_schemas(parsed, unresolved, ctx.schemas())
-        .map_err(|conflicts| {
-            conflicts
-                .into_iter()
-                .map(|conflict| AppError::Validation(conflict.to_string()))
-                .collect::<Vec<_>>()
-        })?
-        .resolve_attr_prefixes(ctx.schemas())
-        .map_err(|error| split_validation_message(&error))
 }
 
 impl ResolvedConfig<'_> {
@@ -462,7 +448,7 @@ impl ResolvedConfig<'_> {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_and_resolve_errors_inner<'a>(
-    _access: &crate::wiring::ValidationPipelineAccess,
+    access: &crate::wiring::ValidationPipelineAccess,
     parsed: &'a mut carina_core::parser::InferredFile,
     base_dir: &Path,
     ctx: &WiringContext,
@@ -697,7 +683,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
             ResolvedConfig::Evaluated(parsed)
         }
         ConfigNameResolution::Paired(unresolved) => {
-            match resolve_config_names_with_ctx(ctx, std::mem::take(parsed), *unresolved) {
+            match access.resolve_config_names(ctx, std::mem::take(parsed), *unresolved) {
                 Ok(pair) => ResolvedConfig::Paired(Box::new(pair)),
                 Err(name_errors) => {
                     errors.extend(name_errors);

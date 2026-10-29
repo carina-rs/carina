@@ -31,8 +31,6 @@ use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     LateAnonymousIdentityInputs, LoadedProviderFactory, PlanPreparationError, PlanPreprocessor,
     ProviderLoad, ValidatedConfig, add_deferred_create_effects,
-    compute_canonical_pair_anonymous_identifiers_with_ctx,
-    reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
     reconcile_late_anonymous_identities,
 };
 
@@ -302,53 +300,24 @@ where
         &provider_configs,
         fixture_schemas(),
     );
-    let (wiring, canonical_resources) = validated_config.context_and_resources_mut();
     if fixture_pathbuf
         .file_name()
         .is_some_and(|name| name == "moved_claims_precede_heuristics")
     {
         // This fixture writes moved.to as the literal schema-derived anonymous
         // hash name, so compute the desired anonymous id before claims resolve.
-        let providers = provider_configs.clone();
-        let errors = compute_canonical_pair_anonymous_identifiers_with_ctx(
-            wiring,
-            canonical_resources,
-            &providers,
-        )
-        .unwrap();
+        let errors = validated_config
+            .compute_anonymous_identifiers_for_fixture(&provider_configs)
+            .unwrap();
         assert!(errors.is_empty(), "{errors:?}");
     }
-    reconcile_canonical_prefixed_names(canonical_resources, &state_file);
-    let parsed = canonical_resources.parsed();
     let crate::wiring::StateBlockResolution {
         claims: state_block_claims,
         targets: resolved_state_block_targets,
-    } = crate::wiring::resolve_state_blocks(
-        &parsed.state_blocks,
-        &state_file,
-        &parsed.resources,
-        wiring.schemas(),
-    );
-    if let Some(sf) = state_file.as_ref() {
-        canonical_resources.reconcile_anonymous_module_instances(
-            &|provider, resource_type| {
-                sf.resources_by_type(provider, resource_type)
-                    .into_iter()
-                    .map(|r| r.identity.to_string())
-                    .collect()
-            },
-            &state_block_claims,
-        );
-    }
-    if let Some(sf) = state_file.as_mut() {
-        reconcile_canonical_anonymous_identifiers_with_ctx(
-            wiring,
-            canonical_resources,
-            sf,
-            &state_block_claims,
-        )
+    } = validated_config
+        .reconcile_identities_with_state(&mut state_file)
         .expect("fixture state identities must remain unique");
-    }
+    let (wiring, canonical_resources) = validated_config.context_and_resources();
     let parsed = canonical_resources.parsed();
 
     // carina#3181: `parsed.resources` is managed-only; data sources live

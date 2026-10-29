@@ -54,7 +54,6 @@ use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     LoadedProviderArtifact, ProviderLoad, ValidatedConfig, WiringContext,
     create_plan_from_parsed_with_upstream_with_ctx, provider_factory_source,
-    reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -3700,38 +3699,10 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
     provider_context: &ProviderContext,
     upstream_policy: UpstreamMissingStatePolicy,
 ) -> Result<PreparedPlanIdentityData, AppError> {
-    let (wiring, canonical_resources) = validated_config.context_and_resources_mut();
-    reconcile_canonical_prefixed_names(canonical_resources, state_file);
-    let parsed = canonical_resources.parsed();
-    let state_blocks = crate::wiring::resolve_state_blocks(
-        &parsed.state_blocks,
-        state_file,
-        &parsed.resources,
-        wiring.schemas(),
-    );
-    if let Some(state) = state_file.as_ref() {
-        canonical_resources.reconcile_anonymous_module_instances(
-            &|provider, resource_type| {
-                state
-                    .resources_by_type(provider, resource_type)
-                    .into_iter()
-                    .map(|resource| resource.identity.to_string())
-                    .collect()
-            },
-            &state_blocks.claims,
-        );
-    }
-    if let Some(state) = state_file.as_mut() {
-        reconcile_canonical_anonymous_identifiers_with_ctx(
-            wiring,
-            canonical_resources,
-            state,
-            &state_blocks.claims,
-        )?;
-    }
+    let state_blocks = validated_config.reconcile_identities_with_state(state_file)?;
 
     let provider_inputs = load_and_resolve_provider_configs(
-        canonical_resources.parsed(),
+        validated_config.resources().parsed(),
         base_dir,
         provider_context,
         upstream_policy,

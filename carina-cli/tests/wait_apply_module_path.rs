@@ -522,7 +522,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .expect("expand stage must succeed");
 
     let ctx = wiring.context();
-    let parsed = &*wiring;
+    let parsed = wiring.evaluated_resources_for_test();
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources).expect("topo sort");
 
     let mut current_states: HashMap<ResourceId, Current> = HashMap::new();
