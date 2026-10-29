@@ -5835,7 +5835,7 @@ fn if_value_expr_preserves_pending_bare_use_in_a_typed_resource_sink() {
             .uses()
             .any(|use_site| { use_site.name == "network" && use_site.path.root_name() == "name" })
     );
-    assert_eq!(parsed.bare_binding_uses().pending_slots().len(), 1);
+    assert_eq!(parsed.bare_binding_uses().pending_slots().count(), 1);
 }
 
 #[test]
@@ -14318,7 +14318,7 @@ mock.test.Consumer { name = authored_name }"#,
             declaration: crate::schema::BindingKind::Let
         }
     ));
-    assert!(parsed.bare_binding_uses().pending_slots().is_empty());
+    assert!(parsed.bare_binding_uses().pending_slots().next().is_none());
 }
 
 #[test]
@@ -14422,7 +14422,6 @@ fn assert_bare_handle_is_pending_for_typed_resource_value(source: &str, binding:
         parsed
             .bare_binding_uses()
             .pending_slots()
-            .iter()
             .any(|slot| slot.owner == use_site.owner && slot.path.root_name() == "name"),
         "the omitted attribute must retain a typed pending slot",
     );
@@ -14490,7 +14489,7 @@ let child = child_module { values = [vpc] }"#,
         [AttributePathSegment::Attribute(argument), AttributePathSegment::ListIndex(0)]
             if argument == "values"
     ));
-    assert_eq!(parsed.bare_binding_uses().pending_slots().len(), 1);
+    assert_eq!(parsed.bare_binding_uses().pending_slots().count(), 1);
 }
 
 #[test]
@@ -14567,7 +14566,7 @@ let child = child_module { parent = (vpc) }
             .bare_handle_error()
             .is_some_and(|message| message.contains("'vpc' is a resource"))
     );
-    assert!(parsed.bare_binding_uses().pending_slots().is_empty());
+    assert!(parsed.bare_binding_uses().pending_slots().next().is_none());
 }
 
 #[test]

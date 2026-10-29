@@ -1381,6 +1381,7 @@ pub(crate) enum BareBindingSource {
 pub(crate) struct ParsedBareBindingUse {
     pub(crate) authored: BareBindingUse,
     pub(crate) source: BareBindingSource,
+    pub(crate) pending_slot: Option<PendingValueSlot>,
 }
 
 /// Opaque parsed-file side data for bare binding provenance and pending sinks.
@@ -1388,9 +1389,7 @@ pub(crate) struct ParsedBareBindingUse {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParsedBindingUses {
     records: Vec<ParsedBareBindingUse>,
-    pending_slots: Vec<PendingValueSlot>,
     record_indices_by_owner: HashMap<BindingUseOwnerKey, Vec<usize>>,
-    pending_indices_by_owner: HashMap<BindingUseOwnerKey, Vec<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1416,29 +1415,23 @@ impl ParsedBindingUses {
         pending_slot: Option<PendingValueSlot>,
     ) {
         let owner = BindingUseOwnerKey::from(&authored.owner);
+        let pending_slot = pending_slot.filter(|candidate| {
+            !self
+                .records
+                .iter()
+                .filter_map(|record| record.pending_slot.as_ref())
+                .any(|slot| slot == candidate)
+        });
         let index = self.records.len();
-        self.records.push(ParsedBareBindingUse { authored, source });
+        self.records.push(ParsedBareBindingUse {
+            authored,
+            source,
+            pending_slot,
+        });
         self.record_indices_by_owner
             .entry(owner)
             .or_default()
             .push(index);
-        if let Some(slot) = pending_slot {
-            self.reserve(slot);
-        }
-    }
-
-    fn reserve(&mut self, slot: PendingValueSlot) {
-        let owner = BindingUseOwnerKey::from(&slot.owner);
-        let indices = self.pending_indices_by_owner.entry(owner).or_default();
-        if indices
-            .iter()
-            .any(|index| self.pending_slots[*index] == slot)
-        {
-            return;
-        }
-        let index = self.pending_slots.len();
-        self.pending_slots.push(slot);
-        indices.push(index);
     }
 
     pub(crate) fn records(&self) -> &[ParsedBareBindingUse] {
@@ -1449,22 +1442,21 @@ impl ParsedBindingUses {
         self.records.iter().map(|record| &record.authored)
     }
 
-    pub fn pending_slots(&self) -> &[PendingValueSlot] {
-        &self.pending_slots
-    }
-
-    #[cfg(test)]
-    pub(crate) fn orphan_pending_slots_for_test(&mut self) {
-        self.records.clear();
-        self.record_indices_by_owner.clear();
+    pub fn pending_slots(&self) -> impl Iterator<Item = &PendingValueSlot> {
+        self.records
+            .iter()
+            .filter_map(|record| record.pending_slot.as_ref())
     }
 
     pub(crate) fn has_pending_slot_for(&self, use_site: &BareBindingUse) -> bool {
-        self.pending_indices_by_owner
+        self.record_indices_by_owner
             .get(&BindingUseOwnerKey::from(&use_site.owner))
             .is_some_and(|indices| {
                 indices.iter().any(|index| {
-                    self.pending_slots[*index].path.root_name() == use_site.path.root_name()
+                    self.records[*index]
+                        .pending_slot
+                        .as_ref()
+                        .is_some_and(|slot| slot.path.root_name() == use_site.path.root_name())
                 })
             })
     }
@@ -1479,21 +1471,14 @@ impl ParsedBindingUses {
                     unreachable!("resource owner index points to a module argument")
                 };
                 *address = ResourceAddress::new(to.clone());
+                if let Some(slot) = &mut self.records[*index].pending_slot {
+                    let BindingUseOwner::Resource(address) = &mut slot.owner else {
+                        unreachable!("resource record has a module-argument pending slot")
+                    };
+                    *address = ResourceAddress::new(to.clone());
+                }
             }
             self.record_indices_by_owner
-                .entry(to_key.clone())
-                .or_default()
-                .extend(indices);
-        }
-        if let Some(indices) = self.pending_indices_by_owner.remove(&from) {
-            for index in &indices {
-                let BindingUseOwner::Resource(address) = &mut self.pending_slots[*index].owner
-                else {
-                    unreachable!("resource pending index points to a module argument")
-                };
-                *address = ResourceAddress::new(to.clone());
-            }
-            self.pending_indices_by_owner
                 .entry(to_key)
                 .or_default()
                 .extend(indices);
@@ -1511,22 +1496,14 @@ impl ParsedBindingUses {
                     unreachable!("module-call owner index points to a resource")
                 };
                 *call = to.clone();
+                if let Some(slot) = &mut self.records[*index].pending_slot {
+                    let BindingUseOwner::ModuleArgument { call, .. } = &mut slot.owner else {
+                        unreachable!("module-call record has a resource pending slot")
+                    };
+                    *call = to.clone();
+                }
             }
             self.record_indices_by_owner
-                .entry(to_key.clone())
-                .or_default()
-                .extend(indices);
-        }
-        if let Some(indices) = self.pending_indices_by_owner.remove(&from) {
-            for index in &indices {
-                let BindingUseOwner::ModuleArgument { call, .. } =
-                    &mut self.pending_slots[*index].owner
-                else {
-                    unreachable!("module-call pending index points to a resource")
-                };
-                *call = to.clone();
-            }
-            self.pending_indices_by_owner
                 .entry(to_key)
                 .or_default()
                 .extend(indices);
@@ -1534,16 +1511,8 @@ impl ParsedBindingUses {
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
-        let record_offset = self.records.len();
-        self.records.extend(other.records);
-        for (owner, indices) in other.record_indices_by_owner {
-            self.record_indices_by_owner
-                .entry(owner)
-                .or_default()
-                .extend(indices.into_iter().map(|index| index + record_offset));
-        }
-        for slot in other.pending_slots {
-            self.reserve(slot);
+        for record in other.records {
+            self.record(record.authored, record.source, record.pending_slot);
         }
     }
 }

@@ -855,6 +855,21 @@ impl AppError {
     }
 }
 
+/// Render an error and every typed source once, one diagnostic per line.
+///
+/// Callers add presentation such as the CLI's `Error:` prefix at their own
+/// boundary. Keeping traversal here also lets collected validation errors
+/// retain the same source detail as directly returned command errors.
+pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut messages = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(current) = source {
+        messages.push(current.to_string());
+        source = current.source();
+    }
+    messages.join("\n")
+}
+
 impl From<String> for AppError {
     fn from(s: String) -> Self {
         AppError::Config(s)
@@ -1086,8 +1101,12 @@ mod tests {
             .expect("bare structural binding finding");
         let app_err = AppError::BindingUse(Box::new(finding));
 
-        assert!(app_err.to_string().contains("test.crn:"));
+        assert!(app_err.to_string().contains("test.crn"));
         assert!(app_err.to_string().contains("at line 2"));
+        assert!(
+            !app_err.to_string().contains("'source' is a resource"),
+            "the transparent wrapper must keep the typed source out of Display",
+        );
         let resolution = std::error::Error::source(&app_err)
             .expect("the transparent AppError must retain the typed resolution source");
         assert!(

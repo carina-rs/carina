@@ -811,8 +811,31 @@ fn parse_directory_with_overrides_impl(
     let semantic_files = if preserve_failed_user_calls {
         parsed_files
             .iter()
-            .map(|(path, resolved)| (path.clone(), resolved.parsed.clone()))
-            .collect()
+            .map(|(path, resolved)| {
+                let mut semantic = resolved.parsed.clone();
+                // Pass 2 echoes directory seeds into every file's variable
+                // map. They provide parse context but are not authored by this
+                // file, so do not evaluate a sibling's declaration under this
+                // file's diagnostic location.
+                semantic
+                    .variables
+                    .retain(|name, _| resolved.local_variable_names.contains(name));
+                semantic
+                    .parser_binding_metadata
+                    .retain(|name| resolved.local_variable_names.contains(name));
+                parser::resolve_resource_refs_for_diagnostics(&mut semantic, config).map_err(
+                    |error| {
+                        let located = LocatedParseError::in_file(path, error);
+                        DirectoryParseFailure::Parse {
+                            location: located.source_file.clone().unwrap_or_else(|| path.clone()),
+                            source_file: located.source_file,
+                            error: located.error,
+                        }
+                    },
+                )?;
+                Ok((path.clone(), semantic))
+            })
+            .collect::<Result<Vec<_>, DirectoryParseFailure>>()?
     } else {
         Vec::new()
     };
@@ -2271,6 +2294,40 @@ awscc.ec2.SecurityGroup {
         assert_eq!(
             consumer,
             &Value::Concrete(crate::resource::ConcreteValue::String("fallback".into()))
+        );
+    }
+
+    #[test]
+    fn diagnostic_semantic_file_resolves_function_argument_from_sibling_let() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_path = temp.path().join("main.crn");
+        fs::write(
+            &main_path,
+            "let target = test.test.resource {\n  mode = upper(sibling_mode)\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("values.crn"),
+            "provider test {}\nlet sibling_mode = \"invalid\"\n",
+        )
+        .unwrap();
+
+        let directory = parse_directory_with_overrides_and_diagnostics(
+            temp.path(),
+            &ProviderContext::default(),
+            &HashMap::new(),
+        )
+        .expect("directory parse");
+        let semantic = directory.semantic_file(&main_path).expect("semantic file");
+        let mode = semantic
+            .iter_all_resources()
+            .find(|resource| resource.binding() == Some("target"))
+            .and_then(|resource| resource.attributes().get("mode").cloned())
+            .expect("target.mode");
+
+        assert_eq!(
+            mode,
+            Value::Concrete(crate::resource::ConcreteValue::String("INVALID".into()))
         );
     }
 

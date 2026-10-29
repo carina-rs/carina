@@ -177,6 +177,13 @@ fn lsp_message_multiset(
 
 fn cli_located_message_multiset(diagnostics: &[String]) -> BTreeMap<String, usize> {
     message_multiset(diagnostics.iter().map(|diagnostic| {
+        if let Some((context, message)) = diagnostic.split_once('\n')
+            && context
+                .rsplit_once(" at line ")
+                .is_some_and(|(_, line)| line.parse::<usize>().is_ok())
+        {
+            return message;
+        }
         let message = diagnostic
             .split_once(": ")
             .map_or(diagnostic.as_str(), |(_, message)| message);

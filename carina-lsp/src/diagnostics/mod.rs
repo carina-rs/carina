@@ -4,7 +4,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -641,7 +641,6 @@ impl DiagnosticEngine {
             let pending_resource_sinks = parsed
                 .bare_binding_uses()
                 .pending_slots()
-                .iter()
                 .filter_map(|slot| match &slot.owner {
                     carina_core::parser::BindingUseOwner::Resource(address) => Some((
                         address.resource_id().clone(),
@@ -658,9 +657,7 @@ impl DiagnosticEngine {
                 let Some(range) = parser_span_range(doc, finding.use_site.span) else {
                     continue;
                 };
-                let severity = match finding.severity() {
-                    carina_core::validation::BindingUseSeverity::Error => DiagnosticSeverity::ERROR,
-                };
+                let severity = DiagnosticSeverity::ERROR;
                 if let Some(type_error) = finding.error.type_error()
                     && let Some(mut diagnostic) =
                         build_enum_diagnostic_from_error(type_error, Some(range))
@@ -767,6 +764,16 @@ impl DiagnosticEngine {
                     .iter_all_resources()
                     .collect::<Vec<carina_core::parser::ResourceRef<'_>>>()
             });
+            let mut anonymous_resource_lines = HashMap::<(String, String), VecDeque<u32>>::new();
+            if let Ok(spans) = carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
+            {
+                for authored in spans {
+                    anonymous_resource_lines
+                        .entry((authored.provider, authored.resource_type))
+                        .or_default()
+                        .push_back(authored.span.start_line.saturating_sub(1) as u32);
+                }
+            }
             // Check resource types — include for-body template resources so
             // attribute/type/enum validation fires inside `for` loops too.
             for (resource_index, rref) in parsed.iter_all_resources().enumerate() {
@@ -783,24 +790,14 @@ impl DiagnosticEngine {
                 // Directory-aware semantic ASTs can expand a sibling-backed
                 // `for` before the buffer-only AST does, so positional
                 // resource indexes are not a stable join key. Named bindings
-                // are parser-enforced identities; anonymous resources fall
-                // back to the buffer value because they have no such key.
+                // are parser-enforced identities. Anonymous resources have no
+                // stable cross-AST key and therefore keep the buffer value.
                 let semantic_resource_attributes = semantic_file.and_then(|parsed| {
                     rref.binding()
                         .and_then(|binding| {
                             parsed
                                 .iter_all_resources()
                                 .find(|candidate| candidate.binding() == Some(binding))
-                        })
-                        .or_else(|| {
-                            // `semantic_file` is already narrowed to the
-                            // current authored file, so anonymous direct
-                            // resources retain source order even though the
-                            // directory-wide expanded graph does not.
-                            rref.binding()
-                                .is_none()
-                                .then(|| parsed.iter_all_resources().nth(resource_index))
-                                .flatten()
                         })
                         .map(|candidate| candidate.attributes())
                 });
@@ -817,10 +814,24 @@ impl DiagnosticEngine {
                 };
                 let provider = &resource_id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource_id.resource_type);
+                let authored_direct_start = match rref {
+                    ResourceRef::Resource(resource) if resource.binding.is_none() => {
+                        anonymous_resource_lines
+                            .get_mut(&(provider.to_string(), resource_id.resource_type.clone()))
+                            .and_then(VecDeque::pop_front)
+                    }
+                    _ => None,
+                };
                 // Source-range hint for attribute position lookups. Without
                 // this, a `for`-body diagnostic like `mode = "aaa"` would
                 // anchor on the first top-level `mode =` in the file.
-                let scope = resource_source_range(doc, ctx, provider, &resource_id.resource_type);
+                let scope = resource_source_range(
+                    doc,
+                    ctx,
+                    provider,
+                    &resource_id.resource_type,
+                    authored_direct_start,
+                );
 
                 if resource_schema().is_none() {
                     let provider_loaded = self.provider_names.contains(&provider.to_string());
@@ -962,8 +973,7 @@ impl DiagnosticEngine {
                         let typecheck_value = if matches!(
                             attr_value,
                             Value::Deferred(DeferredValue::Coalesce { .. })
-                        ) || attr_value != authored_attr_value
-                        {
+                        ) {
                             attr_value
                         } else {
                             semantic_resource_attributes
@@ -1877,8 +1887,9 @@ impl DiagnosticEngine {
 ///
 /// - For `Deferred(for_expr)` the scope starts at the `for` line and ends
 ///   at the closing brace of the for expression.
-/// - For `Direct` we locate the `provider.resource_type` token and scan
-///   forward from there.
+/// - For an authored anonymous `Direct` resource, the parser-derived start
+///   line selects that exact declaration. Other direct resources fall back to
+///   locating the `provider.resource_type` token.
 ///
 /// Returns `None` when the block can't be located (e.g., during partial
 /// parses). Callers that fall back to `None` get document-wide search —
@@ -1889,6 +1900,7 @@ fn resource_source_range(
     ctx: carina_core::parser::ResourceContext<'_>,
     provider: &str,
     resource_type: &str,
+    authored_direct_start: Option<u32>,
 ) -> Option<(u32, u32)> {
     use carina_core::parser::ResourceContext;
     let text = doc.text();
@@ -1898,12 +1910,16 @@ fn resource_source_range(
         // `DeferredForExpression.line` is 1-indexed (pest line_col). Convert to 0-indexed.
         ResourceContext::Deferred(d) => d.line.saturating_sub(1) as u32,
         ResourceContext::Direct => {
-            let pattern = format!("{}.{}", provider, resource_type);
-            let (idx, _) = lines
-                .iter()
-                .enumerate()
-                .find(|(_, l)| l.contains(pattern.as_str()))?;
-            idx as u32
+            if let Some(start) = authored_direct_start {
+                start
+            } else {
+                let pattern = format!("{}.{}", provider, resource_type);
+                let (idx, _) = lines
+                    .iter()
+                    .enumerate()
+                    .find(|(_, l)| l.contains(pattern.as_str()))?;
+                idx as u32
+            }
         }
     };
 

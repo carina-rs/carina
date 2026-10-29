@@ -267,7 +267,7 @@ pub(crate) fn collapse_errors(errors: Vec<AppError>) -> AppError {
     AppError::Validation(
         errors
             .iter()
-            .map(ToString::to_string)
+            .map(|error| crate::error::format_error_with_source_chain(error))
             .collect::<Vec<_>>()
             .join("\n"),
     )
@@ -430,17 +430,10 @@ fn extend_binding_use_errors(
     errors: &mut Vec<AppError>,
     report: &carina_core::validation::BindingUseReport,
 ) {
-    if !report.invariant_errors().is_empty() {
-        errors.push(AppError::BindingUseReport(Box::new(report.clone())));
-        return;
-    }
     errors.extend(
         report
             .findings()
             .iter()
-            .filter(|finding| {
-                finding.severity() == carina_core::validation::BindingUseSeverity::Error
-            })
             .cloned()
             .map(|finding| AppError::BindingUse(Box::new(finding))),
     );

@@ -103,11 +103,12 @@ test.Target { resource_type = VPC }
     let error = providers
         .validate_evaluated_config(loaded.parsed, fixture.path(), true, &[], &[])
         .expect_err("skip_resource_validation must not mint ValidationReady for a pending slot");
+    let rendered = crate::error::format_error_with_source_chain(&error);
     assert!(
-        error.to_string().contains(
+        rendered.contains(
             "`VPC` was interpreted as the `let` binding; if you meant the enum `ResourceType` value, write `test.Target.ResourceType.vpc`"
         ),
-        "unexpected validation error: {error}",
+        "unexpected validation error: {rendered}",
     );
 }
 

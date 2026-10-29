@@ -1615,7 +1615,7 @@ inner { x = a }
         unresolved,
     )
     .expect_err("apply bootstrap reload must retain the reference-type gate");
-    let message = error.to_string();
+    let message = crate::error::format_error_with_source_chain(&error);
     assert!(
         message.contains("Type mismatch: expected Int, got String (from a)")
             && message.contains("outer/main.crn")

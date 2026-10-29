@@ -738,11 +738,11 @@ fn seeded_bare_structural_binding_is_a_typed_pending_slot() {
         crate::parser::BareBindingKind::Structural { .. }
     ));
     assert_eq!(use_site.path.root_name(), "bucket_name");
-    assert_eq!(parsed.bare_binding_uses().pending_slots().len(), 1);
+    assert_eq!(parsed.bare_binding_uses().pending_slots().count(), 1);
 }
 
 #[test]
-fn orphaned_pending_binding_slot_cannot_mint_a_resolved_file() {
+fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
     let src = r#"
         let _ = aws.s3.Bucket {
             bucket_name = role
@@ -754,37 +754,33 @@ fn orphaned_pending_binding_slot_cannot_mint_a_resolved_file() {
         )),
         "role",
     );
-    let mut parsed = crate::parser::parse_with_seeded_bindings(
+    let parsed = crate::parser::parse_with_seeded_bindings(
         src,
         &crate::parser::ProviderContext::default(),
         &[crate::parser::BindingSeed::typed_structural(
             "role", &handle,
         )],
     )
-    .expect("a seeded structural handle creates a pending slot");
-    assert_eq!(parsed.bare_binding_uses().pending_slots().len(), 1);
-    parsed.parsed_binding_uses.orphan_pending_slots_for_test();
-    assert_eq!(parsed.bare_binding_uses().uses().len(), 0);
-
+    .expect("a seeded structural handle reaches typed validation");
     let schemas = SchemaRegistry::new();
     let provider_context = ProviderContext::default();
     let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
-    let report = resolve_bare_binding_uses(parsed, &schemas, &provider_context, &module_signatures)
-        .expect_err("an uncovered pending slot must not mint ResolvedFile");
+    let context =
+        ValidationTypeContext::new(&parsed, &schemas, &provider_context, &module_signatures);
+    let report = check_bare_binding_uses(&parsed, &context);
+    let finding = report.findings().first().expect("binding-use finding");
+    let detail = finding.error.to_string();
 
-    assert!(!report.is_ready());
-    assert_eq!(report.invariant_errors().len(), 1);
+    assert!(finding.to_string().contains("at line 3"));
     assert!(
-        std::error::Error::source(&report)
-            .and_then(|source| source.downcast_ref::<BindingUseInvariantError>())
-            .is_some(),
-        "the report must preserve the typed invariant error in its source chain",
+        !finding.to_string().contains(&detail),
+        "Display must not duplicate its Error::source(): {finding}",
     );
+    let source = std::error::Error::source(finding).expect("typed resolution source");
+    assert_eq!(source.to_string(), detail);
     assert!(
-        report
-            .to_string()
-            .contains("please report this internal consistency error"),
-        "the invariant failure should remain actionable if it reaches a user: {report}",
+        source.source().is_none(),
+        "a terminal resolution diagnostic must not repeat its own Display",
     );
 }
 
