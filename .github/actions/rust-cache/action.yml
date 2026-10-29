@@ -10,10 +10,11 @@ inputs:
 runs:
   using: composite
   steps:
-    # rust-cache does not automatically hash the root virtual manifest, including
-    # its [profile.*] settings. It already hashes .cargo/config.toml,
-    # rust-toolchain(.toml), and Cargo.lock.
+    # rust-cache's shared-key replaces key, so include the root Cargo.toml hash in
+    # whichever one applies. The hash is in rust-cache's restore prefix, so each
+    # root manifest change forces one full rebuild; rust-cache has no input for
+    # hashing extra files outside that prefix.
     - uses: Swatinem/rust-cache@v2
       with:
-        key: ${{ hashFiles('Cargo.toml') }}
-        shared-key: ${{ inputs.shared-key }}
+        key: ${{ inputs.shared-key == '' && hashFiles('Cargo.toml') || '' }}
+        shared-key: ${{ inputs.shared-key != '' && format('{0}-{1}', inputs.shared-key, hashFiles('Cargo.toml')) || '' }}
