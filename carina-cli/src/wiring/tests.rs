@@ -62,9 +62,8 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         ..Default::default()
     };
 
-    let mut parsed = invalid_config();
     let evaluated_error = match incomplete_load().validate_evaluated_config(
-        &mut parsed,
+        invalid_config(),
         Path::new("."),
         true,
         &[],
@@ -990,9 +989,9 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         ctx.schemas(),
     )
     .expect("test block-name resolution must succeed");
+    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
     create_plan_from_parsed_with_upstream_with_ctx(
-        &wiring,
-        canonical_resources,
+        validated,
         provider_configs,
         state_file,
         refresh,
@@ -1002,7 +1001,7 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         resolved_state_block_targets,
     )
     .await
-    .map(ExpandedPlanContext::into_context)
+    .map(ValidatedConfig::into_context_for_test)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1862,9 +1861,9 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
     );
     let ctx = wiring.context();
     let canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
     let result = create_plan_from_parsed_with_upstream_with_ctx(
-        &wiring,
-        canonical_resources,
+        validated,
         &provider_configs,
         &None,
         false,
@@ -2351,10 +2350,10 @@ let shared = read test.shared.Type {}
         parsed.resources.clone(), // allow: direct — plan-time reconciliation
         ctx.schemas(),
     );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
 
     let plan_context = create_plan_from_parsed_with_upstream_with_ctx(
-        &wiring,
-        canonical_resources,
+        validated,
         &provider_configs,
         &state_file,
         true,
@@ -4769,9 +4768,9 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         unresolved_parsed.resources.clone(), // allow: direct — plan-time reconciliation
         ctx.schemas(),
     );
+    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
     let plan_ctx = create_plan_from_parsed_with_upstream_with_ctx(
-        &wiring,
-        canonical_resources,
+        validated,
         &provider_configs,
         &Some(state_file),
         false,
@@ -4782,7 +4781,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     )
     .await
     .expect("plan should build");
-    let plan_ctx = plan_ctx.into_context();
+    let plan_ctx = plan_ctx.into_context_for_test();
 
     let subnet_create = plan_ctx
         .plan
@@ -5683,7 +5682,7 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
     };
     let unresolved = evaluated.clone();
 
-    let canonical_unresolved = resolve_config_block_names_with_ctx(
+    let canonical_unresolved = resolve_config_block_names_with_ctx_for_test(
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -5745,7 +5744,7 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
     };
     let unresolved = evaluated.clone();
 
-    let errors = resolve_config_block_names_with_ctx(
+    let errors = resolve_config_block_names_with_ctx_for_test(
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -5781,7 +5780,7 @@ fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
     };
     let unresolved = evaluated.clone();
 
-    let canonical = resolve_config_names_with_ctx(
+    let canonical = resolve_config_names_with_ctx_for_test(
         &ctx,
         evaluated,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -9199,9 +9198,9 @@ exports { team_prefix: String = "x" }"#,
         )
         .expect("test provider configs must resolve");
         let canonical_resources = canonical_pair(&parsed, unresolved_resources, ctx.schemas());
+        let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
-            &wiring,
-            canonical_resources,
+            validated,
             &provider_configs,
             &None,
             true,
@@ -9274,9 +9273,9 @@ exports { team_prefix: String = "x" }"#,
         )
         .expect("test provider configs must resolve");
         let canonical_resources = canonical_pair(&parsed, Vec::new(), ctx.schemas());
+        let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
-            &wiring,
-            canonical_resources,
+            validated,
             &provider_configs,
             &None,
             true,

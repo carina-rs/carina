@@ -11,7 +11,6 @@ use carina_core::data_source_value::DataSourceValue;
 use carina_core::detail_rows::HistoricalDisplayAttributes;
 use carina_core::differ::rebind_current_for_move;
 use carina_core::effect::{Effect, EffectGeneration};
-use carina_core::override_aware::CanonicalResourcePair;
 #[cfg(test)]
 use carina_core::parser::ProviderConfig;
 use carina_core::parser::{
@@ -53,7 +52,7 @@ use crate::plan_image::{
 };
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
-    LoadedProviderArtifact, ProviderLoad, ValidatedWiring, WiringContext,
+    LoadedProviderArtifact, ProviderLoad, ValidatedConfig, WiringContext,
     create_plan_from_parsed_with_upstream_with_ctx, provider_factory_source,
     reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
 };
@@ -328,8 +327,9 @@ mod recorded_provider_artifact_tests {
 ///
 /// This type is intentionally not a saved-plan wire type. Constructing these
 /// public fields does not produce a writable [`PlanFile`]; callers must consume
-/// the contents through [`PlanFileContents::record`] so the referenced schemas
-/// and loaded provider artifacts are captured together.
+/// the contents through [`PlanFileContents::record`] with the validated-config
+/// owner so the referenced schemas and loaded provider artifacts are captured
+/// from the exact context that planned those resources.
 ///
 /// ```compile_fail,E0451
 /// use carina_cli::commands::plan::PlanFile;
@@ -945,9 +945,24 @@ impl Deref for PlanFile {
 
 impl PlanFileContents {
     /// Atomically bind these contents to the schemas and provider artifacts
-    /// loaded in the planning context.
-    pub fn record(self, wiring: &ValidatedWiring) -> Result<PlanFile, ProviderEvidenceError> {
-        let ctx = wiring.context();
+    /// loaded in the exact context that produced the completed plan.
+    pub fn record<E>(
+        self,
+        validated: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
+    ) -> Result<PlanFile, ProviderEvidenceError> {
+        self.record_with_context(validated.context())
+    }
+
+    /// Record hand-built plan contents in unit and integration fixtures.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn record_for_test<R>(
+        self,
+        validated: &ValidatedConfig<R>,
+    ) -> Result<PlanFile, ProviderEvidenceError> {
+        self.record_with_context(validated.context())
+    }
+
+    fn record_with_context(self, ctx: &WiringContext) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
         let evidence = ProviderEvidence::capture(&references, &self.provider_configs, ctx)?;
         Ok(PlanFile {
@@ -2473,7 +2488,8 @@ mod managed_current_serde_tests {
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         }
-        .record(&crate::wiring::ValidatedWiring::from_factories_for_test(
+        .record_for_test(&crate::wiring::ValidatedConfig::from_factories_for_test(
+            (),
             Vec::new(),
             &[],
         ))
@@ -2641,7 +2657,8 @@ mod managed_current_serde_tests {
             to: ResolvedResourceId::new(destination.clone()),
         });
         let plan = contents
-            .record(&crate::wiring::ValidatedWiring::from_factories_for_test(
+            .record_for_test(&crate::wiring::ValidatedConfig::from_factories_for_test(
+                (),
                 Vec::new(),
                 &[],
             ))
@@ -2712,13 +2729,57 @@ impl std::error::Error for PlanSaveError {}
 
 fn build_plan_file<E>(
     path: &Path,
+    provider_configs: &ResolvedProviderConfigs,
+    backend_config: Option<BackendConfig>,
+    state_file: &Option<StateFile>,
+    validated_plan: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
+) -> Result<PlanFile, PlanSaveError> {
+    let ctx = validated_plan.resources();
+    let parsed = ctx.parsed();
+    build_plan_file_contents(
+        path,
+        parsed,
+        provider_configs,
+        backend_config,
+        state_file,
+        ctx,
+    )?
+    .record(validated_plan)
+    .map_err(PlanSaveError::from)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn build_plan_file_from_parts<E, R>(
+    path: &Path,
     parsed: &carina_core::parser::File<E>,
     provider_configs: &ResolvedProviderConfigs,
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
-    wiring: &ValidatedWiring,
+    validated_config: &ValidatedConfig<R>,
 ) -> Result<PlanFile, PlanSaveError> {
+    build_plan_file_contents(
+        path,
+        parsed,
+        provider_configs,
+        backend_config,
+        state_file,
+        ctx,
+    )?
+    .record_for_test(validated_config)
+    .map_err(PlanSaveError::from)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_plan_file_contents<E>(
+    path: &Path,
+    parsed: &carina_core::parser::File<E>,
+    provider_configs: &ResolvedProviderConfigs,
+    backend_config: Option<BackendConfig>,
+    state_file: &Option<StateFile>,
+    ctx: &crate::wiring::PlanContext,
+) -> Result<PlanFileContents, PlanSaveError> {
     assert_eq!(
         ctx.data_sources.len(),
         parsed.data_sources.len(),
@@ -3015,7 +3076,7 @@ fn build_plan_file<E>(
             })
             .collect(),
     };
-    contents.record(wiring).map_err(PlanSaveError::from)
+    Ok(contents)
 }
 
 /// Format a failure from `build_plan_file` into the CLI's
@@ -3191,7 +3252,7 @@ pub async fn run_plan(
 
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
-    let (wiring, mut canonical_resources) = providers.validate_config_pair(
+    let mut validated_config = providers.validate_config_pair(
         parsed,
         loaded.unresolved_parsed,
         base_dir,
@@ -3199,7 +3260,7 @@ pub async fn run_plan(
         &inference_errors,
         &duplicate_declarations,
     )?;
-    let parsed = canonical_resources.parsed();
+    let parsed = validated_config.resources().parsed();
 
     let plan_backend = resolve_backend_for_read(
         base_dir,
@@ -3336,15 +3397,13 @@ pub async fn run_plan(
             },
         provider_inputs,
     } = prepare_plan_identity_and_provider_inputs(
-        &mut canonical_resources,
+        &mut validated_config,
         &mut state_file,
         base_dir,
         provider_context,
         UpstreamMissingStatePolicy::Lenient,
-        &wiring,
     )
     .await?;
-    let ctx_wiring = wiring.context();
     if !refresh {
         eprintln!(
             "{}",
@@ -3356,9 +3415,8 @@ pub async fn run_plan(
     // `create_plan_from_parsed_with_upstream_with_ctx` (post-refresh), which also
     // prints post-expansion warnings and returns the still-unresolved
     // loops via `ctx.residual_deferred_for`.
-    let ctx = create_plan_from_parsed_with_upstream_with_ctx(
-        &wiring,
-        canonical_resources,
+    let validated_plan = create_plan_from_parsed_with_upstream_with_ctx(
+        validated_config,
         provider_inputs.configs(),
         &state_file,
         refresh,
@@ -3368,6 +3426,8 @@ pub async fn run_plan(
         &resolved_state_block_targets,
     )
     .await?;
+    let ctx_wiring = validated_plan.context();
+    let ctx = validated_plan.resources();
     let parsed = ctx.parsed();
     // TOCTOU drift detection (#3111). `plan` took no state lock, so a
     // concurrent apply/destroy may have written state while the diff
@@ -3469,12 +3529,10 @@ pub async fn run_plan(
         // instead of a panic backtrace.
         let plan_file = build_plan_file(
             path,
-            parsed,
             provider_inputs.configs(),
             plan_file_backend_config.clone(),
             &state_file,
-            &ctx,
-            &wiring,
+            &validated_plan,
         )
         .map_err(|e| format_plan_save_error(&e, "--json"))?;
         let json_str = serde_json::to_string_pretty(&plan_file)
@@ -3529,12 +3587,10 @@ pub async fn run_plan(
     let plan_output = if out.is_some() {
         let plan_file = build_plan_file(
             path,
-            parsed,
             provider_inputs.configs(),
             plan_file_backend_config.clone(),
             &state_file,
-            &ctx,
-            &wiring,
+            &validated_plan,
         )
         .map_err(|e| format_plan_save_error(&e, "--out"))?;
         let json_out = carina_core::utils::pretty_with_newline(&plan_file)
@@ -3637,14 +3693,13 @@ pub(crate) struct PreparedPlanIdentityData {
 }
 
 pub(crate) async fn prepare_plan_identity_and_provider_inputs(
-    canonical_resources: &mut CanonicalResourcePair<carina_core::parser::InferredExportParam>,
+    validated_config: &mut ValidatedConfig,
     state_file: &mut Option<StateFile>,
     base_dir: &Path,
     provider_context: &ProviderContext,
     upstream_policy: UpstreamMissingStatePolicy,
-    validated_wiring: &ValidatedWiring,
 ) -> Result<PreparedPlanIdentityData, AppError> {
-    let wiring = validated_wiring.context();
+    let (wiring, canonical_resources) = validated_config.context_and_resources_mut();
     reconcile_canonical_prefixed_names(canonical_resources, state_file);
     let parsed = canonical_resources.parsed();
     let state_blocks = crate::wiring::resolve_state_blocks(
@@ -5296,14 +5351,14 @@ mod run_plan_out_tests {
         )
         .unwrap();
 
-        let saved = build_plan_file(
+        let saved = build_plan_file_from_parts(
             &path,
             &parsed,
             &provider_configs,
             None,
             &Some(state_file),
             &ctx,
-            &ValidatedWiring::from_factories_for_test(Vec::new(), &[]),
+            &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
         )
         .expect("saved plan should serialize");
         let Effect::Create(created_effect) = &saved.plan.effects()[0] else {
@@ -5661,14 +5716,14 @@ mod run_plan_out_tests {
             &ProviderContext::default(),
         )
         .unwrap();
-        let plan_file = build_plan_file(
+        let plan_file = build_plan_file_from_parts(
             &path,
             &parsed,
             &provider_configs,
             None,
             &None,
             &ctx,
-            &ValidatedWiring::from_factories_for_test(Vec::new(), &[]),
+            &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
         )
         .expect("saved plan should serialize");
 
@@ -5746,14 +5801,14 @@ mod run_plan_out_tests {
             &ProviderContext::default(),
         )
         .unwrap();
-        let plan_file = build_plan_file(
+        let plan_file = build_plan_file_from_parts(
             &path,
             &parsed,
             &provider_configs,
             None,
             &None,
             &ctx,
-            &ValidatedWiring::from_factories_for_test(Vec::new(), &[]),
+            &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
         )
         .expect("saved plan should serialize prepared compositions");
 
@@ -5802,14 +5857,14 @@ mod run_plan_out_tests {
         )
         .unwrap();
 
-        let error = build_plan_file(
+        let error = build_plan_file_from_parts(
             &path,
             &parsed,
             &provider_configs,
             None,
             &None,
             &ctx,
-            &ValidatedWiring::from_factories_for_test(Vec::new(), &[]),
+            &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
         )
         .expect_err("a secret-bearing upstream snapshot must be rejected")
         .to_string();
@@ -5858,9 +5913,9 @@ mod run_plan_out_tests {
             residual_deferred_for: Vec::new(),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
-        let wiring = ValidatedWiring::from_factories_for_test(Vec::new(), &[configured]);
+        let wiring = ValidatedConfig::from_factories_for_test((), Vec::new(), &[configured]);
 
-        let error = build_plan_file(
+        let error = build_plan_file_from_parts(
             &path,
             &parsed,
             &provider_configs,

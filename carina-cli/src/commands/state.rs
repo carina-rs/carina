@@ -49,7 +49,7 @@ use crate::commands::shared::progress::{ProgressBackend, ProgressSink, RefreshPh
 use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
 use crate::error::AppError;
 use crate::wiring::{
-    AddressedDataSourceReadInputs, ProviderLoad, ValidatedWiring, get_provider_with_ctx,
+    AddressedDataSourceReadInputs, ProviderLoad, ValidatedConfig, get_provider_with_ctx,
     prepare_default_provider_ready_config, reconcile_anonymous_identifiers_with_ctx,
     reconcile_prefixed_names, refresh_loaded_orphan_with_retry,
 };
@@ -887,7 +887,7 @@ async fn run_state_bucket_delete(
     )?;
     let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
 
     let backend_config = parsed
         .backend
@@ -911,8 +911,8 @@ async fn run_state_bucket_delete(
     // resolved provider values needed for construction can wait until after
     // confirmation.
     let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
-    let wiring = providers.validate_evaluated_config(
-        &mut parsed,
+    let validated_config = providers.validate_evaluated_config(
+        parsed,
         base_dir,
         true,
         &inference_errors,
@@ -947,11 +947,18 @@ async fn run_state_bucket_delete(
 
     let provider_name = selection.provider_name();
     let resource_type = selection.resource_type();
-    let provider_inputs =
-        load_state_bucket_delete_provider_inputs(&parsed, base_dir, provider_context).await?;
-    let bucket_provider =
-        create_state_bucket_delete_provider(&wiring, provider_inputs.configs(), provider_name)
-            .await?;
+    let provider_inputs = load_state_bucket_delete_provider_inputs(
+        validated_config.resources(),
+        base_dir,
+        provider_context,
+    )
+    .await?;
+    let bucket_provider = create_state_bucket_delete_provider(
+        &validated_config,
+        provider_inputs.configs(),
+        provider_name,
+    )
+    .await?;
 
     // First, try to empty the bucket (delete all objects and versions)
     println!();
@@ -1010,12 +1017,12 @@ async fn load_state_bucket_delete_provider_inputs<E>(
     .await
 }
 
-async fn create_state_bucket_delete_provider(
-    wiring: &ValidatedWiring,
+async fn create_state_bucket_delete_provider<R>(
+    validated_config: &ValidatedConfig<R>,
     provider_configs: &carina_core::parser::ResolvedProviderConfigs,
     provider_name: &str,
 ) -> Result<Box<dyn carina_core::provider::Provider>, AppError> {
-    let ctx = wiring.context();
+    let ctx = validated_config.context();
     let factory = provider_mod::find_factory(ctx.factories(), provider_name)
         .ok_or_else(|| format!("No provider factory found for '{provider_name}'"))?;
     let config = prepare_default_provider_ready_config(factory, provider_name, provider_configs)?;
@@ -1039,20 +1046,23 @@ pub async fn run_state_refresh(
     )?;
     let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::load(&parsed.providers, base_dir)?;
-    let wiring = providers.validate_evaluated_config(
-        &mut parsed,
+    let mut validated_config = providers.validate_evaluated_config(
+        parsed,
         base_dir,
         true,
         &inference_errors,
         &duplicate_declarations,
     )?;
 
-    let verified_backend =
-        verify_for_mutation(path, parsed.backend.as_ref(), DriftCommand::RefreshState)?;
+    let verified_backend = verify_for_mutation(
+        path,
+        validated_config.resources().backend.as_ref(),
+        DriftCommand::RefreshState,
+    )?;
 
     // Create backend
     let backend: Box<dyn StateBackend> = verified_backend
@@ -1080,13 +1090,12 @@ pub async fn run_state_refresh(
     };
 
     let op_result = run_state_refresh_locked(
-        &mut parsed,
+        &mut validated_config,
         backend.as_ref(),
         state_lock.as_ref(),
         base_dir,
         provider_context,
         cancel.clone(),
-        &wiring,
     )
     .await;
 
@@ -1103,15 +1112,14 @@ pub async fn run_state_refresh(
 }
 
 pub(crate) async fn run_state_refresh_locked(
-    parsed: &mut carina_core::parser::InferredFile,
+    validated_config: &mut ValidatedConfig<carina_core::parser::InferredFile>,
     backend: &dyn StateBackend,
     lock: StateLockRef<'_>,
     base_dir: &std::path::Path,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
-    wiring: &ValidatedWiring,
 ) -> Result<(), AppError> {
-    let ctx = wiring.context();
+    let (ctx, parsed) = validated_config.context_and_resources_mut();
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the refresh lock before the "no
     // resources" short-circuit returns — see
@@ -2405,24 +2413,25 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_resolves_provider_config_from_upstream_state_before_construction() {
-        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        let (_temp, downstream, parsed) = provider_upstream_fixture();
         let received_role_arn = Arc::new(Mutex::new(None));
-        let wiring = ValidatedWiring::from_factories_for_test(
+        let provider_configs = parsed.providers.clone();
+        let mut validated_config = ValidatedConfig::from_factories_for_test(
+            parsed,
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
-            &parsed.providers,
+            &provider_configs,
         );
         let backend = non_empty_refresh_backend("test");
 
         run_state_refresh_locked(
-            &mut parsed,
+            &mut validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &downstream,
             &ProviderContext::default(),
             ShutdownToken::running(),
-            &wiring,
         )
         .await
         .expect("state refresh must construct the provider from resolved upstream attributes");
@@ -2452,19 +2461,20 @@ mod tests {
                 source: PathBuf::from("../unrelated"),
             });
         let received_role_arn = Arc::new(Mutex::new(None));
-        let wiring = ValidatedWiring::from_factories_for_test(
+        let provider_configs = parsed.providers.clone();
+        let mut validated_config = ValidatedConfig::from_factories_for_test(
+            parsed,
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
-            &parsed.providers,
+            &provider_configs,
         );
         let backend = non_empty_refresh_backend("test");
         run_state_refresh_locked(
-            &mut parsed,
+            &mut validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &downstream,
             &ProviderContext::default(),
             ShutdownToken::running(),
-            &wiring,
         )
         .await
         .expect("state refresh must not load an upstream unused by provider configuration");
@@ -2472,7 +2482,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_provider_resolution_reports_referenced_missing_upstream_state() {
-        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        let (_temp, downstream, parsed) = provider_upstream_fixture();
         std::fs::remove_file(
             downstream
                 .parent()
@@ -2482,20 +2492,21 @@ mod tests {
         )
         .unwrap();
         let received_role_arn = Arc::new(Mutex::new(None));
-        let wiring = ValidatedWiring::from_factories_for_test(
+        let provider_configs = parsed.providers.clone();
+        let mut validated_config = ValidatedConfig::from_factories_for_test(
+            parsed,
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
-            &parsed.providers,
+            &provider_configs,
         );
         let backend = non_empty_refresh_backend("test");
 
         let error = match run_state_refresh_locked(
-            &mut parsed,
+            &mut validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &downstream,
             &ProviderContext::default(),
             ShutdownToken::running(),
-            &wiring,
         )
         .await
         {
@@ -2522,7 +2533,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_without_downstream_state_ignores_missing_provider_upstream() {
-        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        let (_temp, downstream, parsed) = provider_upstream_fixture();
         std::fs::remove_file(
             downstream
                 .parent()
@@ -2534,18 +2545,17 @@ mod tests {
         let backend =
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
         let providers = ProviderLoad::load(&parsed.providers, &downstream).unwrap();
-        let wiring = providers
-            .validate_evaluated_config(&mut parsed, &downstream, true, &[], &[])
+        let mut validated_config = providers
+            .validate_evaluated_config(parsed, &downstream, true, &[], &[])
             .unwrap();
 
         run_state_refresh_locked(
-            &mut parsed,
+            &mut validated_config,
             backend.as_ref(),
             StateLock::disabled_for_test().as_ref(),
             &downstream,
             &ProviderContext::default(),
             ShutdownToken::running(),
-            &wiring,
         )
         .await
         .expect("state refresh must return before resolving providers when no local state exists");
@@ -2553,21 +2563,20 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_allows_default_tags_referencing_local_computed_attributes() {
-        let (_temp, base_dir, mut parsed) = provider_default_tags_local_resource_fixture();
+        let (_temp, base_dir, parsed) = provider_default_tags_local_resource_fixture();
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&parsed.providers, &base_dir).unwrap();
-        let wiring = providers
-            .validate_evaluated_config(&mut parsed, &base_dir, true, &[], &[])
+        let mut validated_config = providers
+            .validate_evaluated_config(parsed, &base_dir, true, &[], &[])
             .unwrap();
 
         run_state_refresh_locked(
-            &mut parsed,
+            &mut validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &base_dir,
             &ProviderContext::default(),
             ShutdownToken::running(),
-            &wiring,
         )
         .await
         .expect("state refresh must defer provider default tags until resource normalization");
@@ -2575,21 +2584,20 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_ignores_missing_upstream_referenced_only_by_default_tags() {
-        let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
+        let (_temp, base_dir, parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&parsed.providers, &base_dir).unwrap();
-        let wiring = providers
-            .validate_evaluated_config(&mut parsed, &base_dir, true, &[], &[])
+        let mut validated_config = providers
+            .validate_evaluated_config(parsed, &base_dir, true, &[], &[])
             .unwrap();
 
         run_state_refresh_locked(
-            &mut parsed,
+            &mut validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &base_dir,
             &ProviderContext::default(),
             ShutdownToken::running(),
-            &wiring,
         )
         .await
         .expect("state refresh must not load upstream state used only by default tags");
@@ -2606,7 +2614,8 @@ mod tests {
         .await
         .expect("state bucket delete provider inputs must resolve");
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = ValidatedWiring::from_factories_for_test(
+        let ctx = ValidatedConfig::from_factories_for_test(
+            (),
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
@@ -2667,7 +2676,8 @@ mod tests {
         .await
         .expect("bucket delete must not load tag-only upstream state");
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = ValidatedWiring::from_factories_for_test(
+        let ctx = ValidatedConfig::from_factories_for_test(
+            (),
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
@@ -2711,7 +2721,8 @@ mod tests {
         .await
         .expect("deferred default tags must not block bucket provider construction");
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = ValidatedWiring::from_factories_for_test(
+        let ctx = ValidatedConfig::from_factories_for_test(
+            (),
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
             })],
@@ -3021,23 +3032,24 @@ mod tests {
         let root = ShutdownToken::running();
         let (trigger, cancel) = root.with_graceful_shutdown_trigger();
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let wiring = ValidatedWiring::from_factories_for_test(
+        let provider_configs = parsed.providers.clone();
+        let mut validated_config = ValidatedConfig::from_factories_for_test(
+            parsed,
             vec![Box::new(CancellingDataSourceRefreshFactory {
                 reads: reads.clone(),
                 trigger,
             })],
-            &parsed.providers,
+            &provider_configs,
         );
         let temp = tempfile::tempdir().unwrap();
 
         let error = run_state_refresh_locked(
-            &mut parsed,
+            &mut validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             temp.path(),
             &ProviderContext::default(),
             cancel,
-            &wiring,
         )
         .await
         .expect_err("graceful cancellation must interrupt state refresh");
@@ -3110,22 +3122,23 @@ mod tests {
             .unwrap();
         let backend = ModuleConstraintRefreshBackend { state };
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let wiring = ValidatedWiring::from_factories_for_test(
+        let provider_configs = parsed.providers.clone();
+        let mut validated_config = ValidatedConfig::from_factories_for_test(
+            parsed,
             vec![Box::new(ModuleConstraintRefreshFactory {
                 reads: reads.clone(),
             })],
-            &parsed.providers,
+            &provider_configs,
         );
         let temp = tempfile::tempdir().unwrap();
 
         run_state_refresh_locked(
-            &mut parsed,
+            &mut validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             temp.path(),
             &ProviderContext::default(),
             ShutdownToken::running(),
-            &wiring,
         )
         .await
         .expect("an unrelated module constraint must not block a data-source read");
@@ -3186,20 +3199,21 @@ mod tests {
             .unwrap();
         let backend = ModuleConstraintRefreshBackend { state };
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let wiring = ValidatedWiring::from_factories_for_test(
+        let provider_configs = parsed.providers.clone();
+        let mut validated_config = ValidatedConfig::from_factories_for_test(
+            parsed,
             vec![Box::new(ModuleConstraintRefreshFactory { reads })],
-            &parsed.providers,
+            &provider_configs,
         );
         let temp = tempfile::tempdir().unwrap();
 
         run_state_refresh_locked(
-            &mut parsed,
+            &mut validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
             temp.path(),
             &ProviderContext::default(),
             ShutdownToken::running(),
-            &wiring,
         )
         .await
         .expect("an unrelated module constraint cannot block an absent data-source phase");

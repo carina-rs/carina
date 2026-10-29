@@ -508,7 +508,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     )
     .expect("load should succeed");
     let inference_errors = loaded.inference_errors;
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
 
     let providers = ProviderLoad::for_test(
@@ -518,10 +518,11 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         &parsed.providers,
     );
     let wiring = providers
-        .validate_evaluated_config(&mut parsed, base_dir, true, &inference_errors, &[])
+        .validate_evaluated_config(parsed, base_dir, true, &inference_errors, &[])
         .expect("expand stage must succeed");
 
     let ctx = wiring.context();
+    let parsed = &*wiring;
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources).expect("topo sort");
 
     let mut current_states: HashMap<ResourceId, Current> = HashMap::new();

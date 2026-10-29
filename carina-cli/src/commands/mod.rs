@@ -41,15 +41,14 @@ use crate::module_walk::ModuleWalk;
 use crate::wiring::ProviderLoad;
 use crate::wiring::{
     WiringContext, compute_anonymous_identifiers_with_ctx,
-    compute_canonical_pair_anonymous_identifiers_with_ctx, resolve_config_names_with_ctx,
-    resolve_file_names_with_ctx, validate_deferred_populate_refs_with_ctx,
-    validate_depends_on_with_ctx, validate_module_attribute_refs_after_expansion_failure,
-    validate_module_calls_with_imported, validate_module_internal_ref_types,
-    validate_no_backend_in_modules, validate_no_empty_interpolations,
-    validate_no_exports_in_modules, validate_no_provider_in_modules,
-    validate_no_state_blocks_in_modules, validate_no_upstream_states_in_modules,
-    validate_provider_region_with_ctx, validate_resources_with_ctx,
-    validate_wait_bindings_with_ctx,
+    compute_canonical_pair_anonymous_identifiers_with_ctx, resolve_file_names_with_ctx,
+    validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
+    validate_module_attribute_refs_after_expansion_failure, validate_module_calls_with_imported,
+    validate_module_internal_ref_types, validate_no_backend_in_modules,
+    validate_no_empty_interpolations, validate_no_exports_in_modules,
+    validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
+    validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
+    validate_resources_with_ctx, validate_wait_bindings_with_ctx,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -373,8 +372,8 @@ pub fn validate_and_resolve_with_provider_load_for_test(
 ///
 /// The `&ProviderLoad` privately owns both the factory context and
 /// per-provider diagnostics used to build the report. This helper neither
-/// performs another load nor exposes a context or mints
-/// [`ValidatedWiring`](crate::wiring::ValidatedWiring).
+/// performs another load nor exposes a context or mints a
+/// [`ValidatedConfig`](crate::wiring::ValidatedConfig).
 /// Production commands use the consuming validation methods on
 /// [`ProviderLoad`] or the report-only loader instead.
 #[cfg(any(test, feature = "test-utils"))]
@@ -405,6 +404,27 @@ pub(crate) enum ConfigNameResolution {
 pub(crate) enum ResolvedConfig<'a> {
     Evaluated(&'a mut carina_core::parser::InferredFile),
     Paired(Box<CanonicalResourcePair<carina_core::parser::InferredExportParam>>),
+}
+
+/// Resolve the evaluated and authored snapshots into the one canonical pair
+/// that may leave validation.
+///
+/// Keeping this constructor private prevents crate code from pairing arbitrary
+/// resources with a context and bypassing the [`ValidatedConfig`] transition.
+fn resolve_config_names_with_ctx<E>(
+    ctx: &WiringContext,
+    parsed: carina_core::parser::File<E>,
+    unresolved: UnresolvedConfigSnapshot,
+) -> Result<CanonicalResourcePair<E>, Vec<AppError>> {
+    carina_core::schema::resolve_config_block_names_with_schemas(parsed, unresolved, ctx.schemas())
+        .map_err(|conflicts| {
+            conflicts
+                .into_iter()
+                .map(|conflict| AppError::Validation(conflict.to_string()))
+                .collect::<Vec<_>>()
+        })?
+        .resolve_attr_prefixes(ctx.schemas())
+        .map_err(|error| split_validation_message(&error))
 }
 
 impl ResolvedConfig<'_> {
@@ -441,6 +461,7 @@ impl ResolvedConfig<'_> {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_and_resolve_errors_inner<'a>(
+    _access: &crate::wiring::ValidationPipelineAccess,
     parsed: &'a mut carina_core::parser::InferredFile,
     base_dir: &Path,
     ctx: &WiringContext,

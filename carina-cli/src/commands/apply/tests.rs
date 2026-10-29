@@ -79,13 +79,17 @@ fn canonical_unresolved_for_test(
     parsed: &carina_core::parser::InferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> carina_core::override_aware::CanonicalResourcePair<carina_core::parser::InferredExportParam> {
-    crate::wiring::resolve_config_block_names_with_ctx(ctx, parsed.clone(), unresolved.clone())
-        .unwrap_or_else(|errors| {
-            panic!(
-                "test block-name resolution failed: {}",
-                super::super::collapse_errors(errors)
-            )
-        })
+    crate::wiring::resolve_config_block_names_with_ctx_for_test(
+        ctx,
+        parsed.clone(),
+        unresolved.clone(),
+    )
+    .unwrap_or_else(|errors| {
+        panic!(
+            "test block-name resolution failed: {}",
+            super::super::collapse_errors(errors)
+        )
+    })
 }
 
 fn canonical_resources_for_test(
@@ -102,6 +106,15 @@ fn canonical_resources_for_test(
         schemas,
     )
     .expect("test block-name resolution must succeed")
+}
+
+fn validated_apply_config_for_test(
+    wiring: &ValidatedWiring,
+    parsed: &carina_core::parser::InferredFile,
+    unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
+) -> ValidatedConfig {
+    let resources = canonical_unresolved_for_test(wiring.context(), parsed, unresolved);
+    ValidatedConfig::from_wiring_ref_for_test(wiring, resources)
 }
 
 macro_rules! unexpected_resume_create {
@@ -312,12 +325,13 @@ where
 }
 
 fn record_with_test_context(contents: PlanFileContents) -> PlanFile {
-    let ctx = ValidatedWiring::from_factories_for_test(
+    let ctx = ValidatedConfig::from_factories_for_test(
+        (),
         Vec::new(),
         contents.provider_configs.as_provider_configs(),
     );
     contents
-        .record(&ctx)
+        .record_for_test(&ctx)
         .expect("test plan provider evidence must be valid")
 }
 
@@ -326,13 +340,14 @@ fn record_with_test_schemas(contents: PlanFileContents, schemas: &SchemaRegistry
         .iter()
         .map(|(provider, _resource_type, _kind, schema)| (provider.to_string(), schema.clone()))
         .collect::<Vec<_>>();
-    let ctx = ValidatedWiring::from_factories_with_additional_schemas_for_test(
+    let ctx = ValidatedConfig::from_factories_with_additional_schemas_for_test(
+        (),
         Vec::new(),
         contents.provider_configs.as_provider_configs(),
         additional_schemas,
     );
     contents
-        .record(&ctx)
+        .record_for_test(&ctx)
         .expect("test plan provider evidence must be valid")
 }
 
@@ -796,15 +811,20 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     }
-    .record(&ValidatedWiring::from_factories_for_test(Vec::new(), &[]))
+    .record_for_test(&ValidatedConfig::from_factories_for_test(
+        (),
+        Vec::new(),
+        &[],
+    ))
     .expect("test plan provider evidence must be valid");
 
     let mut plan_file = plan_file
         .reload_in_flight_from_locked_state(None)
         .expect("test plan should cross the locked-state reload boundary");
-    let result = rehydrate_desired_plan_file(
+    let result = rehydrate_desired_plan_file_from_parts(
         &mut plan_file,
-        &candidates,
+        candidates.parsed(),
+        candidates.provider_inputs(),
         ApplyTarget::SavedPlan {
             plan_file: Path::new("plan.json"),
             source_dir: tmp.path(),
@@ -1014,7 +1034,8 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         unresolved_attributes: IndexMap::new(),
         binding: None,
     };
-    let planning_context = ValidatedWiring::from_factories_for_test(
+    let planning_context = ValidatedConfig::from_factories_for_test(
+        (),
         vec![Box::new(FailBCreateFactory)],
         std::slice::from_ref(&provider_config),
     );
@@ -1039,7 +1060,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     }
-    .record(&planning_context)
+    .record_for_test(&planning_context)
     .expect("planning context must record provider evidence");
     let plan_path = project.path().join("plan.json");
     std::fs::write(
@@ -1106,7 +1127,8 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
         binding: None,
     };
     let provider_configs = vec![provider_config.clone(), provider_config];
-    let planning_context = ValidatedWiring::from_factories_for_test(
+    let planning_context = ValidatedConfig::from_factories_for_test(
+        (),
         vec![Box::new(FailBCreateFactory)],
         &provider_configs,
     );
@@ -1131,7 +1153,7 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     }
-    .record(&planning_context)
+    .record_for_test(&planning_context)
     .expect("planning context must record provider evidence");
     let state_path = project.path().join("state.json");
     let lock_path = state_path.with_extension("lock");
@@ -1230,7 +1252,8 @@ async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
         .await
         .expect("bootstrap provider inputs must resolve");
     let received_role_arn = Arc::new(Mutex::new(None));
-    let ctx = ValidatedWiring::from_factories_for_test(
+    let ctx = ValidatedConfig::from_factories_for_test(
+        (),
         vec![Box::new(
             crate::provider_upstream_test_support::ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -1352,7 +1375,8 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     let parsed = loaded.parsed;
     let providers = ProviderLoad::load(&parsed.providers, &downstream).unwrap();
     let unresolved_parsed = loaded.unresolved_parsed;
-    let wiring = ValidatedWiring::from_load_for_test(providers);
+    let wiring =
+        ValidatedConfig::from_wiring_for_test(ValidatedWiring::from_load_for_test(providers), ());
     let stale_inputs =
         load_apply_provider_inputs(&parsed, &downstream, &ProviderContext::default())
             .await
@@ -1371,7 +1395,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
         &downstream,
         &downstream,
         &ProviderContext::default(),
-        &wiring,
+        wiring,
         unresolved_parsed,
     )
     .expect("bootstrap reload must succeed");
@@ -1388,8 +1412,9 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
         downstream.join("apply.state.json"),
     ));
 
+    let reloaded =
+        ValidatedConfig::from_wiring_for_test(ctx, reloaded.into_resources_for_fixture());
     run_apply_locked_canonical(
-        &ctx,
         reloaded,
         true,
         backend,
@@ -1443,14 +1468,15 @@ inner { x = a }
     )
     .expect("load unresolved bootstrap snapshot");
     let providers = ProviderLoad::load(&loaded.parsed.providers, fixture.path()).unwrap();
-    let wiring = ValidatedWiring::from_load_for_test(providers);
+    let wiring =
+        ValidatedConfig::from_wiring_for_test(ValidatedWiring::from_load_for_test(providers), ());
     let unresolved = loaded.unresolved_parsed;
 
     let error = reload_apply_configuration_after_bootstrap(
         fixture.path(),
         fixture.path(),
         &ProviderContext::default(),
-        &wiring,
+        wiring,
         unresolved,
     )
     .expect_err("apply bootstrap reload must retain the reference-type gate");
@@ -1523,13 +1549,16 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
         )
         .expect("load unresolved bootstrap snapshot");
         let providers = ProviderLoad::load(&loaded.parsed.providers, fixture.path()).unwrap();
-        let wiring = ValidatedWiring::from_load_for_test(providers);
+        let wiring = ValidatedConfig::from_wiring_for_test(
+            ValidatedWiring::from_load_for_test(providers),
+            (),
+        );
         let unresolved = loaded.unresolved_parsed;
         let error = reload_apply_configuration_after_bootstrap(
             fixture.path(),
             fixture.path(),
             &ProviderContext::default(),
-            &wiring,
+            wiring,
             unresolved,
         )
         .expect_err("apply bootstrap reload must reject module-output type mismatch");
@@ -2224,9 +2253,7 @@ async fn run_apply_cascade_fixture(
     );
     let observer_factory = fixture.observer_factory();
     run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -2593,9 +2620,9 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
     let ctx = wiring.context();
     let provider_configs = resolved_provider_configs(&parsed);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
+    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
-        &wiring,
-        canonical_resources,
+        validated,
         &provider_configs,
         &None,
         true,
@@ -2645,7 +2672,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
 #[tokio::test]
 async fn apply_reads_module_data_source_and_resolves_consumer_interpolation() {
     let (fixture, shared) = module_data_source_fixture();
-    let (mut parsed, unresolved_parsed) =
+    let (parsed, unresolved_parsed) =
         load_and_resolve_module_data_source_fixture(&fixture, &shared);
     let wiring = ValidatedWiring::from_factories_for_test(
         vec![Box::new(ApplyTimeReadFactory {
@@ -2656,9 +2683,7 @@ async fn apply_reads_module_data_source_and_resolves_consumer_interpolation() {
     let observer_factory = fixture.observer_factory();
 
     run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -2745,9 +2770,7 @@ let lookup = read mock.iam.Roles {{
     let observer_factory = fixture.observer_factory();
 
     let error = run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -3452,7 +3475,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
 #[tokio::test]
 async fn live_apply_noop_rejects_unconsumed_module_constraint() {
     let fixture = ApplyCancellationFixture::new();
-    let mut parsed = carina_core::parser::InferredFile {
+    let parsed = carina_core::parser::InferredFile {
         compositions: vec![saved_module_composition(
             Value::resource_ref("missing", "value", vec![]),
             "bad",
@@ -3466,9 +3489,7 @@ async fn live_apply_noop_rejects_unconsumed_module_constraint() {
     let observer_factory = fixture.observer_factory();
 
     let error = run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -3734,14 +3755,15 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
         &SchemaRegistry::new(),
     )
     .expect("fixture must load");
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let providers =
         ProviderLoad::load(&parsed.providers, base_dir).expect("mock provider must load");
-    let wiring = providers
-        .validate_evaluated_config(
-            &mut parsed,
+    let validated_config = providers
+        .validate_config_pair(
+            parsed,
+            unresolved_parsed,
             base_dir,
             false,
             &loaded.inference_errors,
@@ -3752,10 +3774,8 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
     let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
     let backend = fixture.lock_loss_backend_handle();
 
-    let error = run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+    let error = run_apply_locked_canonical(
+        validated_config,
         true,
         backend.clone(),
         StateLock::held(lock),
@@ -3990,9 +4010,7 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
     let wiring = ValidatedWiring::from_factories_for_test(vec![Box::new(FailBCreateFactory)], &[]);
     let observer_factory = fixture.observer_factory();
     let err = run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -4075,9 +4093,7 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
     let observer_factory = fixture.observer_factory();
 
     run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -4167,9 +4183,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
 
     let observer_factory = fixture.observer_factory();
     let err = run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -4238,9 +4252,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
 
     let observer_factory = fixture.observer_factory();
     let err = run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -4477,9 +4489,7 @@ awscc.ec2.Subnet {{
 
     let observer_factory = fixture.observer_factory();
     run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -4546,9 +4556,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
     let observer_factory = fixture.observer_factory();
 
     run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -4616,9 +4624,9 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
 
     let provider_configs = resolved_provider_configs(&parsed);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
+    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
-        &wiring,
-        canonical_resources,
+        validated,
         &provider_configs,
         &state_file,
         true,
@@ -4695,11 +4703,9 @@ let nat = mock.ec2.NatGateway {{
         (parsed, loaded.unresolved_parsed)
     };
 
-    let (mut parsed, unresolved_parsed) = load();
+    let (parsed, unresolved_parsed) = load();
     run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -4735,9 +4741,9 @@ let nat = mock.ec2.NatGateway {{
     let provider_configs = resolved_provider_configs(&parsed);
     let step1_state = Some(step1_state);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
+    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
     let clean_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
-        &wiring,
-        canonical_resources,
+        validated,
         &provider_configs,
         &step1_state,
         true,
@@ -4756,11 +4762,9 @@ let nat = mock.ec2.NatGateway {{
 
     std::fs::write(fixture.config_path().join("main.crn"), config("two"))
         .expect("update sibling configuration");
-    let (mut parsed, unresolved_parsed) = load();
+    let (parsed, unresolved_parsed) = load();
     run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -4796,9 +4800,9 @@ let nat = mock.ec2.NatGateway {{
     let provider_configs = resolved_provider_configs(&parsed);
     let step2_state = Some(step2_state);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
+    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
     let final_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
-        &wiring,
-        canonical_resources,
+        validated,
         &provider_configs,
         &step2_state,
         true,
@@ -4873,11 +4877,9 @@ let igw = mock.ec2.InternetGateway {{{tags}
         (parsed, loaded.unresolved_parsed)
     };
 
-    let (mut parsed, unresolved_parsed) = load();
+    let (parsed, unresolved_parsed) = load();
     run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -4893,11 +4895,9 @@ let igw = mock.ec2.InternetGateway {{{tags}
 
     std::fs::write(fixture.config_path().join("main.crn"), config(false))
         .expect("remove tags from desired configuration");
-    let (mut parsed, unresolved_parsed) = load();
+    let (parsed, unresolved_parsed) = load();
     let error = run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -4928,9 +4928,9 @@ let igw = mock.ec2.InternetGateway {{{tags}
     let provider_configs = resolved_provider_configs(&parsed);
     let saved = Some(saved);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
+    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
     let retry = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
-        &wiring,
-        canonical_resources,
+        validated,
         &provider_configs,
         &saved,
         true,
@@ -5040,11 +5040,9 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         (parsed, loaded.unresolved_parsed)
     };
 
-    let (mut parsed, unresolved_parsed) = load();
+    let (parsed, unresolved_parsed) = load();
     run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -5063,13 +5061,13 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         case.config(&state_path, false),
     )
     .expect("remove the nested field from desired configuration");
-    let (mut parsed, unresolved_parsed) = load();
+    let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let before_failure = Some(fixture.read_state().await);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
+    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
     let removal_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
-        &wiring,
-        canonical_resources,
+        validated,
         &provider_configs,
         &before_failure,
         true,
@@ -5094,9 +5092,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     );
 
     let error = run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -5145,9 +5141,9 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let provider_configs = resolved_provider_configs(&parsed);
     let saved = Some(saved);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
+    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
     let retry = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
-        &wiring,
-        canonical_resources,
+        validated,
         &provider_configs,
         &saved,
         true,
@@ -5178,11 +5174,9 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     shared
         .allow_internet_gateway_updates
         .store(true, Ordering::SeqCst);
-    let (mut parsed, unresolved_parsed) = load();
+    let (parsed, unresolved_parsed) = load();
     run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -5217,9 +5211,9 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
+    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
     let final_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
-        &wiring,
-        canonical_resources,
+        validated,
         &provider_configs,
         &Some(applied),
         true,
@@ -5323,9 +5317,7 @@ let consumer = mock.iam.Role {{
     let observer_factory = fixture.observer_factory();
 
     run_apply_locked(
-        &wiring,
-        &mut parsed,
-        &unresolved_parsed,
+        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -9131,8 +9123,9 @@ mod saved_plan_version_tests {
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         }
-        .record(
-            &crate::wiring::ValidatedWiring::from_factories_with_additional_schemas_for_test(
+        .record_for_test(
+            &crate::wiring::ValidatedConfig::from_factories_with_additional_schemas_for_test(
+                (),
                 Vec::new(),
                 &[],
                 schemas

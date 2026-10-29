@@ -30,7 +30,7 @@ use crate::commands::plan::compute_export_diffs;
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     LateAnonymousIdentityInputs, LoadedProviderFactory, PlanPreparationError, PlanPreprocessor,
-    ProviderLoad, ValidatedWiring, add_deferred_create_effects,
+    ProviderLoad, ValidatedConfig, add_deferred_create_effects,
     compute_canonical_pair_anonymous_identifiers_with_ctx,
     reconcile_canonical_anonymous_identifiers_with_ctx, reconcile_canonical_prefixed_names,
     reconcile_late_anonymous_identities,
@@ -269,7 +269,7 @@ where
         &parsed.providers,
         fixture_validation_enum_schemas(&fixture_pathbuf),
     );
-    let (_validation_wiring, mut canonical_resources) = validation_providers
+    let validation_config = validation_providers
         .validate_config_pair(
             parsed,
             unresolved_parsed,
@@ -279,7 +279,8 @@ where
             &duplicate_declarations,
         )
         .unwrap_or_else(|error| panic!("fixture validation failed: {error}"));
-    let parsed = canonical_resources.parsed();
+    let canonical_resources = validation_config.into_resources_for_fixture();
+    let provider_configs = canonical_resources.parsed().providers.clone();
     let mut state_file: Option<StateFile> = if state_path.exists() {
         let json = std::fs::read_to_string(&state_path).unwrap();
         // Go through check_and_migrate so v5 fixtures (with the legacy
@@ -295,28 +296,29 @@ where
     // This fixture intentionally uses a second, fuller schema context for
     // planning; the test-only constructor marks that separately assembled
     // context as the fixture's validated execution wiring.
-    let wiring = ValidatedWiring::for_fixture_with_additional_schemas(
+    let mut validated_config = ValidatedConfig::for_fixture_with_additional_schemas(
+        canonical_resources,
         load_factories(fixture_provider_factories(&fixture_pathbuf)),
-        &parsed.providers,
+        &provider_configs,
         fixture_schemas(),
     );
-    let wiring = wiring.context();
+    let (wiring, canonical_resources) = validated_config.context_and_resources_mut();
     if fixture_pathbuf
         .file_name()
         .is_some_and(|name| name == "moved_claims_precede_heuristics")
     {
         // This fixture writes moved.to as the literal schema-derived anonymous
         // hash name, so compute the desired anonymous id before claims resolve.
-        let providers = parsed.providers.clone();
+        let providers = provider_configs.clone();
         let errors = compute_canonical_pair_anonymous_identifiers_with_ctx(
             wiring,
-            &mut canonical_resources,
+            canonical_resources,
             &providers,
         )
         .unwrap();
         assert!(errors.is_empty(), "{errors:?}");
     }
-    reconcile_canonical_prefixed_names(&mut canonical_resources, &state_file);
+    reconcile_canonical_prefixed_names(canonical_resources, &state_file);
     let parsed = canonical_resources.parsed();
     let crate::wiring::StateBlockResolution {
         claims: state_block_claims,
@@ -341,7 +343,7 @@ where
     if let Some(sf) = state_file.as_mut() {
         reconcile_canonical_anonymous_identifiers_with_ctx(
             wiring,
-            &mut canonical_resources,
+            canonical_resources,
             sf,
             &state_block_claims,
         )
@@ -357,7 +359,7 @@ where
         sf.remove_legacy_data_source_rows(&data_sources);
     }
     let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new(
-        &canonical_resources,
+        canonical_resources,
         &state_file,
         wiring.schemas(),
     )
@@ -465,7 +467,7 @@ where
     .expect("fixture managed binding stability must resolve");
     let (mut override_aware_resources, unresolved_override_aware_resources) =
         OverrideAwareResources::build_pair_with_stability(
-            &canonical_resources,
+            canonical_resources,
             state_file.as_ref(),
             carina_core::binding_index::PreApplyInputs {
                 managed: &[],
@@ -672,10 +674,9 @@ where
     );
 
     let prepared_expansion = reconciled_expansion.seal(data_source_values);
-    let (expanded_canonical_resources, deferred_for_expansion) = prepared_expansion
-        .expand(
-            canonical_resources,
-            wiring.schemas(),
+    let (validated_expansion, deferred_for_expansion) = validated_config
+        .expand_deferred_for(
+            &prepared_expansion,
             &remote_bindings,
             crate::wiring::DeferredForWarningPolicy::Print,
         )
@@ -689,6 +690,7 @@ where
         wait_aliases: _,
         moved_pairs,
     } = prepared_expansion.into_parts();
+    let (wiring, expanded_canonical_resources) = validated_expansion.context_and_resources();
     let parsed = expanded_canonical_resources.parsed();
     let deferred_create_targets: Vec<_> = deferred_for_expansion
         .deferred_create_targets
