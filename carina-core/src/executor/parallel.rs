@@ -929,9 +929,12 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
     // the caller can persist the results already folded into `applied_states`.
     // Every effect that reached EffectStarted receives a terminal event before
     // state persistence; queued but never-polled futures are omitted.
-    let interrupted_count = in_flight.abandon(observer);
-    if interrupted_count > 0 {
-        accumulated.mutate(|result| result.interrupted_count += interrupted_count);
+    // Every loop exit passes through this point, so the total includes both
+    // cleanup abandonment and any release-mode fail-safe interruptions that
+    // were emitted while processing a completed future.
+    let total_interrupted_count = in_flight.abandon(observer);
+    if total_interrupted_count > 0 {
+        accumulated.mutate(|result| result.interrupted_count += total_interrupted_count);
     }
     accumulated.publish_if_dirty(&input.checkpoint_sink);
     let refresh_cancelled = match cleanup_loop.step() {

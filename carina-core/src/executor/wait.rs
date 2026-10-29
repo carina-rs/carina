@@ -314,6 +314,7 @@ struct InterruptedEffect<S> {
 struct InterruptedRegistry<S> {
     abandoning: bool,
     effects: Vec<InterruptedEffect<S>>,
+    fail_safe_count: usize,
 }
 
 impl<S> Default for InterruptedRegistry<S> {
@@ -321,6 +322,7 @@ impl<S> Default for InterruptedRegistry<S> {
         Self {
             abandoning: false,
             effects: Vec::new(),
+            fail_safe_count: 0,
         }
     }
 }
@@ -446,6 +448,7 @@ impl<S> Drop for StartedEffect<'_, S> {
             });
             return;
         }
+        registry.fail_safe_count += 1;
         drop(registry);
 
         debug_assert!(
@@ -519,7 +522,7 @@ impl<'fut, R, S> WaitAwareInFlight<'fut, R, S> {
     }
 
     /// Drop every unresolved future, emit its interruptions in effect-index
-    /// order, and return the number emitted.
+    /// order, and return those plus any fail-safe interruptions emitted earlier.
     pub(super) fn abandon(self, observer: &dyn ExecutionObserver<S>) -> usize {
         let interrupted_registry = Arc::clone(&self.interrupted);
         interrupted_registry
@@ -527,14 +530,17 @@ impl<'fut, R, S> WaitAwareInFlight<'fut, R, S> {
             .expect("interrupted effect registry poisoned")
             .abandoning = true;
         drop(self);
-        let mut interrupted = std::mem::take(
-            &mut interrupted_registry
+        let (mut interrupted, fail_safe_count) = {
+            let mut registry = interrupted_registry
                 .lock()
-                .expect("interrupted effect registry poisoned")
-                .effects,
-        );
+                .expect("interrupted effect registry poisoned");
+            (
+                std::mem::take(&mut registry.effects),
+                std::mem::take(&mut registry.fail_safe_count),
+            )
+        };
         interrupted.sort_by_key(|entry| entry.idx);
-        let count = interrupted.len();
+        let count = fail_safe_count + interrupted.len();
         for InterruptedEffect {
             effect, progress, ..
         } in interrupted
@@ -1005,6 +1011,34 @@ mod tests {
                     .push((effect.resource_id().clone(), watched_attrs));
             }
         }
+    }
+
+    #[test]
+    fn fail_safe_interruption_is_included_in_abandon_count() {
+        let observer = NoopWaitObserver;
+        let in_flight: WaitAwareInFlight<'_, (), crate::resource::ModuleSource> =
+            WaitAwareInFlight::new();
+        let start = InFlightStart {
+            idx: 1,
+            interrupted: Arc::clone(&in_flight.interrupted),
+        };
+        let effect = wait_effect(Duration::from_secs(60), Duration::from_secs(5));
+        let started = start.emit_started(
+            &observer,
+            &effect,
+            ProgressInfo {
+                completed: 1,
+                total: 1,
+            },
+        );
+
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(started)));
+
+        assert!(
+            dropped.is_err(),
+            "debug builds must catch the invariant violation"
+        );
+        assert_eq!(in_flight.abandon(&observer), 1);
     }
 
     #[test]
