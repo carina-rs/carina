@@ -478,8 +478,11 @@ where
             );
         }
     }
-    let module_gate =
-        carina_core::executor::ModuleConstraintGate::from_live_compositions(&parsed.compositions);
+    // Fixtures have no provider/upstream I/O phase. Only loops rooted in the
+    // loaded managed-state view can materialize here; keep every other loop as
+    // a display residual instead of turning it into an executable deferred
+    // create. This stays fixture-only because production must retain those
+    // deferred creates for apply-time expansion.
     let managed_bindings: HashSet<String> = expansion_prelude
         .sorted_resources()
         .iter()
@@ -525,101 +528,122 @@ where
             .enable_all()
             .build()
             .expect("failed to build tokio runtime for post-expansion plan construction");
-        rt.block_on(validated_expansion.finish_post_expansion_plan(
-            crate::wiring::PostExpansionPlanEnvironment {
-                data_sources: &data_sources,
-                provider: &provider_router,
-                normalizer: &provider_router,
-                provider_configs: raw_provider_configs,
-                remote_bindings: &remote_bindings,
-                state_file: &state_file,
-                state_block_claims: &state_block_claims,
-                resolved_state_block_targets: &resolved_state_block_targets,
-                module_gate: &module_gate,
-                preparation_errors: None,
-            },
-        ))
+        rt.block_on(
+            validated_expansion.finish_post_expansion_plan::<crate::wiring::PlanMode>(
+                crate::wiring::PostExpansionPlanEnvironment {
+                    data_sources: &data_sources,
+                    provider: &provider_router,
+                    normalizer: &provider_router,
+                    provider_configs: raw_provider_configs,
+                    remote_bindings: &remote_bindings,
+                    state_file: &state_file,
+                    state_block_claims: &state_block_claims,
+                    resolved_state_block_targets: &resolved_state_block_targets,
+                    preparation_errors: None,
+                },
+            ),
+        )
         .expect("fixture post-expansion plan construction must succeed")
-        .into_resources_for_fixture()
     };
-    let crate::wiring::PostExpansionPlan {
-        residual_deferred_for,
-        plan,
-        resources,
-        compositions,
-        managed_current,
-        data_source_values,
-        moved_origins,
-        prev_explicit,
-        ..
-    } = post_expansion;
-    let moved_hints = detect_moved_block_hints(&plan, &managed_current, &schemas);
-    let Some(crate::wiring::PostExpansionResolvedResources {
-        resolved: resolved_resources,
-        unresolved: unresolved_resources,
-    }) = resources
-    else {
-        return FixturePlan {
-            plan,
-            moved_hints,
-            // Error plans abort before resolved-resource and export consumers.
-            desired_resources: Vec::new(),
-            unresolved_resources: Vec::new(),
-            compositions,
-            managed_current,
-            data_source_states: data_source_values.read_states_map(),
-            state_file,
-            schemas,
-            moved_origins,
-            deferred_for_expressions: residual_deferred_for,
-            export_params,
-            resolved_export_params: carina_core::validation::check_export_values_pre_apply(
-                &[],
-                &carina_core::binding_index::ResolvedBindings::default(),
-                &carina_core::parser::ProviderContext::default(),
+    match post_expansion {
+        crate::wiring::PostExpansionOutcome::Diagnostics(diagnostics) => {
+            let crate::wiring::PostExpansionArtifacts {
+                expanded_resources: _,
+                residual_deferred_for,
+                plan,
+                compositions,
+                data_sources: _,
+                managed_current,
+                data_source_values,
+                moved_origins,
+                prev_explicit,
+                wait_aliases: _,
+            } = diagnostics.into_artifacts();
+            let moved_hints = detect_moved_block_hints(&plan, &managed_current, &schemas);
+            FixturePlan {
+                plan,
+                moved_hints,
+                // Error plans abort before resolved-resource and export consumers.
+                desired_resources: Vec::new(),
+                unresolved_resources: Vec::new(),
+                compositions,
+                managed_current,
+                data_source_states: data_source_values.read_states_map(),
+                state_file,
+                schemas,
+                moved_origins,
+                deferred_for_expressions: residual_deferred_for,
+                export_params,
+                resolved_export_params: carina_core::validation::check_export_values_pre_apply(
+                    &[],
+                    &carina_core::binding_index::ResolvedBindings::default(),
+                    &carina_core::parser::ProviderContext::default(),
+                )
+                .expect("empty exports are checked"),
+                prev_explicit,
+                expansion_trace,
+            }
+        }
+        crate::wiring::PostExpansionOutcome::Planned(crate::wiring::PostExpansionPlan {
+            artifacts,
+            resources:
+                crate::wiring::PostExpansionResolvedResources {
+                    resolved: resolved_resources,
+                    unresolved: unresolved_resources,
+                },
+        }) => {
+            let crate::wiring::PostExpansionArtifacts {
+                expanded_resources: _,
+                residual_deferred_for,
+                plan,
+                compositions,
+                data_sources: _,
+                managed_current,
+                data_source_values,
+                moved_origins,
+                prev_explicit,
+                wait_aliases: _,
+            } = artifacts;
+            let moved_hints = detect_moved_block_hints(&plan, &managed_current, &schemas);
+            let resources_for_exports = resolved_resources
+                .iter()
+                .map(|resource| resource.as_inner().clone())
+                .collect::<Vec<_>>();
+            let provider_context = carina_core::parser::ProviderContext::default();
+            let resolved_export_params = crate::commands::plan::check_exports_pre_apply(
+                crate::commands::plan::CheckExportsPreApplyInput {
+                    export_params: &export_params,
+                    resources: &resources_for_exports,
+                    compositions: &compositions,
+                    managed_current: &managed_current,
+                    data_source_values: &data_source_values,
+                    state_file: state_file.as_ref(),
+                    plan: &plan,
+                    schemas: &schemas,
+                    wait_aliases: &export_wait_aliases,
+                    provider_context: &provider_context,
+                },
             )
-            .expect("empty exports are checked"),
-            prev_explicit,
-            expansion_trace,
-        };
-    };
-    let resources_for_exports = resolved_resources
-        .iter()
-        .map(|resource| resource.as_inner().clone())
-        .collect::<Vec<_>>();
-    let provider_context = carina_core::parser::ProviderContext::default();
-    let resolved_export_params = crate::commands::plan::check_exports_pre_apply(
-        crate::commands::plan::CheckExportsPreApplyInput {
-            export_params: &export_params,
-            resources: &resources_for_exports,
-            compositions: &compositions,
-            managed_current: &managed_current,
-            data_source_values: &data_source_values,
-            state_file: state_file.as_ref(),
-            plan: &plan,
-            schemas: &schemas,
-            wait_aliases: &export_wait_aliases,
-            provider_context: &provider_context,
-        },
-    )
-    .expect("fixture exports must resolve without secrets");
+            .expect("fixture exports must resolve without secrets");
 
-    FixturePlan {
-        plan,
-        moved_hints,
-        desired_resources: resolved_resources,
-        unresolved_resources,
-        compositions,
-        managed_current,
-        data_source_states: data_source_values.into_read_states(),
-        state_file,
-        schemas,
-        moved_origins,
-        deferred_for_expressions: residual_deferred_for,
-        export_params,
-        resolved_export_params,
-        prev_explicit,
-        expansion_trace,
+            FixturePlan {
+                plan,
+                moved_hints,
+                desired_resources: resolved_resources,
+                unresolved_resources,
+                compositions,
+                managed_current,
+                data_source_states: data_source_values.into_read_states(),
+                state_file,
+                schemas,
+                moved_origins,
+                deferred_for_expressions: residual_deferred_for,
+                export_params,
+                resolved_export_params,
+                prev_explicit,
+                expansion_trace,
+            }
+        }
     }
 }
 
