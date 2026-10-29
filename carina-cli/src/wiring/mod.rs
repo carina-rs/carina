@@ -2910,10 +2910,44 @@ async fn normalize_prior_data_source_values(
     Ok(())
 }
 
+/// One or more plan diagnostics.
+///
+/// The inner vector is private and no mutable access is exposed, so every
+/// value permanently retains the non-empty invariant established by
+/// [`TryFrom`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct NonEmptyPlanErrors(Vec<PlanError>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("plan diagnostics cannot be empty")]
+pub struct EmptyPlanErrors;
+
+impl TryFrom<Vec<PlanError>> for NonEmptyPlanErrors {
+    type Error = EmptyPlanErrors;
+
+    fn try_from(errors: Vec<PlanError>) -> Result<Self, Self::Error> {
+        if errors.is_empty() {
+            Err(EmptyPlanErrors)
+        } else {
+            Ok(Self(errors))
+        }
+    }
+}
+
+impl NonEmptyPlanErrors {
+    pub fn as_slice(&self) -> &[PlanError] {
+        &self.0
+    }
+
+    fn into_vec(self) -> Vec<PlanError> {
+        self.0
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PlanPreparationError {
     #[error("plan validation failed")]
-    Plan(Vec<PlanError>),
+    Plan(NonEmptyPlanErrors),
     #[error(transparent)]
     Provider(#[from] ProviderError),
 }
@@ -3046,10 +3080,15 @@ fn append_resolved_value_constraint_errors(
     }
 }
 
+/// Convert newly reported module failures into diagnostics.
+///
+/// The gate deliberately returns an error with no failures when the same
+/// violation was already reported at an earlier provider boundary. That case
+/// is not a new diagnostic outcome, so it becomes `None` here.
 pub(crate) fn module_constraint_plan_errors(
     error: carina_core::executor::ModuleConstraintGateError,
-) -> Vec<PlanError> {
-    error
+) -> Option<NonEmptyPlanErrors> {
+    let errors: Vec<PlanError> = error
         .failures()
         .iter()
         .cloned()
@@ -3059,7 +3098,8 @@ pub(crate) fn module_constraint_plan_errors(
                 PlanErrorKind::ModuleConstraint(failure.diagnostic),
             )
         })
-        .collect()
+        .collect();
+    NonEmptyPlanErrors::try_from(errors).ok()
 }
 
 impl<'a> PlanPreprocessor<'a> {
@@ -3095,10 +3135,12 @@ impl<'a> PlanPreprocessor<'a> {
             data_sources,
             data_source_origins,
         );
-        if let Err(error) = module_gate.check(resources.bindings()) {
-            errors.extend(module_constraint_plan_errors(error));
+        if let Err(error) = module_gate.check(resources.bindings())
+            && let Some(module_errors) = module_constraint_plan_errors(error)
+        {
+            errors.extend(module_errors.into_vec());
         }
-        if !errors.is_empty() {
+        if let Ok(errors) = NonEmptyPlanErrors::try_from(errors) {
             return Err(PlanPreparationError::Plan(errors));
         }
 
@@ -4919,9 +4961,34 @@ pub(crate) struct ChildrenPending {
     printed_warnings: bool,
 }
 
-/// Proof that every expanded child was refreshed, restored from cached state,
-/// or explicitly marked absent.
-pub(crate) struct ChildrenSettled;
+struct LiveChildrenSettled;
+struct CachedChildrenSettled;
+struct AbsentChildrenSettled;
+
+enum PlanChildrenSettlementKind {
+    Live,
+    Cached,
+    Absent,
+}
+
+/// Proof accepted by the plan path. The private kind records which of its
+/// three permitted prior-state transitions produced the view.
+pub(crate) struct PlanChildrenSettled(PlanChildrenSettlementKind);
+
+enum ApplyChildrenSettlementKind {
+    Live,
+    Absent,
+}
+
+/// Proof accepted by live apply. Cached restoration is unrepresentable.
+pub(crate) struct ApplyChildrenSettled(ApplyChildrenSettlementKind);
+
+mod children_settlement {
+    pub trait Sealed {}
+}
+
+impl children_settlement::Sealed for PlanChildrenSettled {}
+impl children_settlement::Sealed for ApplyChildrenSettled {}
 
 /// Canonical resources, state, and expansion metadata produced together by
 /// [`PreparedDeferredForExpansion::expand_for_plan`].
@@ -4943,6 +5010,15 @@ struct PostExpansionPlanData<E> {
 pub(crate) struct PostExpansionPlanView<E, C> {
     data: PostExpansionPlanData<E>,
     children: C,
+}
+
+impl<E, C> PostExpansionPlanView<E, C> {
+    fn replace_children<D>(self, children: D) -> PostExpansionPlanView<E, D> {
+        PostExpansionPlanView {
+            data: self.data,
+            children,
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -4971,24 +5047,24 @@ impl<E> PostExpansionPlanView<E, ChildrenPending> {
     async fn settle_children_live(
         self,
         inputs: LiveExpandedChildrenInputs<'_, '_>,
-    ) -> Result<PostExpansionPlanView<E, ChildrenSettled>, AppError> {
+    ) -> Result<PostExpansionPlanView<E, LiveChildrenSettled>, AppError> {
         let Self { mut data, children } = self;
         settle_expanded_children_live(&mut data, children, inputs).await?;
         Ok(PostExpansionPlanView {
             data,
-            children: ChildrenSettled,
+            children: LiveChildrenSettled,
         })
     }
 
     async fn settle_children_from_cache(
         self,
         inputs: CachedExpandedChildrenInputs<'_>,
-    ) -> Result<PostExpansionPlanView<E, ChildrenSettled>, AppError> {
+    ) -> Result<PostExpansionPlanView<E, CachedChildrenSettled>, AppError> {
         let Self { mut data, children } = self;
         settle_expanded_children_from_cache(&mut data, children, inputs).await?;
         Ok(PostExpansionPlanView {
             data,
-            children: ChildrenSettled,
+            children: CachedChildrenSettled,
         })
     }
 
@@ -4996,13 +5072,39 @@ impl<E> PostExpansionPlanView<E, ChildrenPending> {
         self,
         schemas: &SchemaRegistry,
         refresh_phase: Option<&RefreshPhase<'_>>,
-    ) -> PostExpansionPlanView<E, ChildrenSettled> {
+    ) -> PostExpansionPlanView<E, AbsentChildrenSettled> {
         let Self { mut data, children } = self;
         settle_expanded_children_absent(&mut data, children, schemas, refresh_phase);
         PostExpansionPlanView {
             data,
-            children: ChildrenSettled,
+            children: AbsentChildrenSettled,
         }
+    }
+}
+
+impl<E> PostExpansionPlanView<E, LiveChildrenSettled> {
+    fn into_plan_settled(self) -> PostExpansionPlanView<E, PlanChildrenSettled> {
+        self.replace_children(PlanChildrenSettled(PlanChildrenSettlementKind::Live))
+    }
+
+    fn into_apply_settled(self) -> PostExpansionPlanView<E, ApplyChildrenSettled> {
+        self.replace_children(ApplyChildrenSettled(ApplyChildrenSettlementKind::Live))
+    }
+}
+
+impl<E> PostExpansionPlanView<E, CachedChildrenSettled> {
+    fn into_plan_settled(self) -> PostExpansionPlanView<E, PlanChildrenSettled> {
+        self.replace_children(PlanChildrenSettled(PlanChildrenSettlementKind::Cached))
+    }
+}
+
+impl<E> PostExpansionPlanView<E, AbsentChildrenSettled> {
+    fn into_plan_settled(self) -> PostExpansionPlanView<E, PlanChildrenSettled> {
+        self.replace_children(PlanChildrenSettled(PlanChildrenSettlementKind::Absent))
+    }
+
+    fn into_apply_settled(self) -> PostExpansionPlanView<E, ApplyChildrenSettled> {
+        self.replace_children(ApplyChildrenSettled(ApplyChildrenSettlementKind::Absent))
     }
 }
 
@@ -5050,14 +5152,42 @@ pub(crate) trait PostExpansionMode: post_expansion_mode::Sealed + Sized {
     fn build_resources(inputs: PostExpansionResourceInputs<'_>) -> Self::Resources;
 }
 
+/// Settlement capability required by one post-expansion consumer mode.
+///
+/// The sealed implementations below are the only legal pairings: plan accepts
+/// all three transitions, while apply can receive only live or absent state.
+pub(crate) trait ChildrenSettledFor<M: PostExpansionMode>:
+    children_settlement::Sealed
+{
+    fn consume(self);
+}
+
+impl ChildrenSettledFor<PlanMode> for PlanChildrenSettled {
+    fn consume(self) {
+        match self.0 {
+            PlanChildrenSettlementKind::Live
+            | PlanChildrenSettlementKind::Cached
+            | PlanChildrenSettlementKind::Absent => {}
+        }
+    }
+}
+
+impl ChildrenSettledFor<ApplyMode> for ApplyChildrenSettled {
+    fn consume(self) {
+        match self.0 {
+            ApplyChildrenSettlementKind::Live | ApplyChildrenSettlementKind::Absent => {}
+        }
+    }
+}
+
 /// Inputs available after deferred-`for` expansion and any child refreshes.
 ///
 /// This plan-construction seam is shared by production `plan`, live `apply`,
 /// and the provider-less fixture planner. Provider behavior enters through the
 /// two traits; this seam itself has no fixture-specific branches.
-pub(crate) struct PostExpansionPlanInput<'a, E> {
+pub(crate) struct PostExpansionPlanInput<'a, E, S> {
     pub context: &'a WiringContext,
-    pub expansion: PostExpansionPlanView<E, ChildrenSettled>,
+    pub expansion: PostExpansionPlanView<E, S>,
     pub environment: PostExpansionPlanEnvironment<'a>,
 }
 
@@ -5070,7 +5200,7 @@ pub(crate) struct PostExpansionPlanEnvironment<'a> {
     pub state_file: &'a Option<StateFile>,
     pub state_block_claims: &'a StateBlockClaims,
     pub resolved_state_block_targets: &'a ResolvedStateBlockTargets,
-    pub preparation_errors: Option<Vec<PlanError>>,
+    pub preparation_errors: Option<NonEmptyPlanErrors>,
 }
 
 /// Successfully resolved resource views retained for plan consumers.
@@ -5218,15 +5348,16 @@ pub(crate) struct PostExpansionPlan<M: PostExpansionMode, R> {
 /// need to construct their command-specific error context.
 pub(crate) struct PostExpansionDiagnostics<R> {
     artifacts: PostExpansionArtifacts<R>,
+    errors: NonEmptyPlanErrors,
 }
 
 impl<R> PostExpansionDiagnostics<R> {
-    fn new(artifacts: PostExpansionArtifacts<R>) -> Self {
-        Self { artifacts }
+    fn new(artifacts: PostExpansionArtifacts<R>, errors: NonEmptyPlanErrors) -> Self {
+        Self { artifacts, errors }
     }
 
-    pub(crate) fn plan(&self) -> &Plan {
-        &self.artifacts.plan
+    pub(crate) fn errors(&self) -> &NonEmptyPlanErrors {
+        &self.errors
     }
 
     pub(crate) fn into_artifacts(self) -> PostExpansionArtifacts<R> {
@@ -5252,8 +5383,10 @@ impl<M: PostExpansionMode, R> PostExpansionOutcome<M, R> {
                 resources,
             }),
             Self::Diagnostics(diagnostics) => {
+                let PostExpansionDiagnostics { artifacts, errors } = diagnostics;
                 PostExpansionOutcome::Diagnostics(PostExpansionDiagnostics::new(
-                    diagnostics.into_artifacts().map_expanded_resources(map),
+                    artifacts.map_expanded_resources(map),
+                    errors,
                 ))
             }
         }
@@ -5263,7 +5396,7 @@ impl<M: PostExpansionMode, R> PostExpansionOutcome<M, R> {
 /// Build a plan from the exact resource/state view that crossed deferred-`for`
 /// expansion.
 pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
-    input: PostExpansionPlanInput<'_, E>,
+    input: PostExpansionPlanInput<'_, E, impl ChildrenSettledFor<M>>,
 ) -> Result<PostExpansionOutcome<M, ExpandedCanonicalResources<E>>, AppError> {
     let PostExpansionPlanInput {
         context,
@@ -5281,10 +5414,8 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         resolved_state_block_targets,
         preparation_errors,
     } = environment;
-    let PostExpansionPlanView {
-        data,
-        children: ChildrenSettled,
-    } = expansion;
+    let PostExpansionPlanView { data, children } = expansion;
+    children.consume();
     let PostExpansionPlanData {
         expanded_resources,
         sorted_resources,
@@ -5376,7 +5507,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             PlanPreparationError::Provider(error) => return Err(AppError::Provider(error)),
         };
         let mut plan = Plan::new();
-        for error in errors {
+        for error in errors.as_slice().iter().cloned() {
             plan.add_error(error);
         }
         let moved_origins = addressed
@@ -5397,7 +5528,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             wait_aliases,
         };
         return Ok(PostExpansionOutcome::Diagnostics(
-            PostExpansionDiagnostics::new(artifacts),
+            PostExpansionDiagnostics::new(artifacts, errors),
         ));
     }
 
@@ -5559,7 +5690,7 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
         self,
         normalizer: &dyn ProviderNormalizer,
         state_file: &StateFile,
-    ) -> Result<ValidatedConfig<PostExpansionPlanView<E, ChildrenSettled>>, AppError> {
+    ) -> Result<ValidatedConfig<PostExpansionPlanView<E, PlanChildrenSettled>>, AppError> {
         let Self { wiring, resources } = self;
         let ValidationReady { inner, origin } = resources;
         let settled = inner
@@ -5568,7 +5699,8 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
                 state_file,
                 schemas: wiring.context().schemas(),
             })
-            .await?;
+            .await?
+            .into_plan_settled();
         Ok(ValidatedConfig {
             wiring,
             resources: ValidationReady {
@@ -5581,10 +5713,12 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn settle_expanded_children_absent(
         self,
-    ) -> ValidatedConfig<PostExpansionPlanView<E, ChildrenSettled>> {
+    ) -> ValidatedConfig<PostExpansionPlanView<E, PlanChildrenSettled>> {
         let Self { wiring, resources } = self;
         let ValidationReady { inner, origin } = resources;
-        let settled = inner.settle_children_absent(wiring.context().schemas(), None);
+        let settled = inner
+            .settle_children_absent(wiring.context().schemas(), None)
+            .into_plan_settled();
         ValidatedConfig {
             wiring,
             resources: ValidationReady {
@@ -5595,13 +5729,15 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
     }
 }
 
-impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenSettled>> {
+impl<E, S> ValidatedConfig<PostExpansionPlanView<E, S>> {
     /// Run the shared plan seam while retaining the exact wiring that validated
     /// and expanded the canonical resource pair.
     pub(crate) async fn finish_post_expansion_plan<M: PostExpansionMode>(
         self,
         environment: PostExpansionPlanEnvironment<'_>,
     ) -> Result<PostExpansionOutcome<M, ValidatedConfig<ExpandedCanonicalResources<E>>>, AppError>
+    where
+        S: ChildrenSettledFor<M>,
     {
         let Self { wiring, resources } = self;
         let ValidationReady {
@@ -6051,7 +6187,7 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
 /// [`PostApplyStates`](crate::commands::shared::state_writeback::PostApplyStates).
 /// State refresh obtains this through its [`ValidatedConfig`] owner
 /// transition. Plan and apply instead use
-/// [`PostExpansionPlanView<E, ChildrenSettled>`], whose marker proves the same
+/// [`PostExpansionPlanView`], whose settlement marker proves the same
 /// child-state transition occurred before plan construction. The live
 /// transitions perform the complete post-expansion sequence:
 ///
@@ -6070,14 +6206,8 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
 /// The constructor mutates all three prior-state owners in place. Keeping them
 /// inside this operation prevents state refresh from transforming only one
 /// part of prior state.
-#[non_exhaustive]
-pub struct ExpandedRefreshState {
-    pub sorted_resources: Vec<Resource>,
-    pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
-    pub deferred_create_targets: Vec<DeferredCreateTarget>,
-    pub new_child_ids: HashSet<ResourceId>,
-    pub refreshable_child_ids: RefreshableChildIds,
-    pub printed_warnings: bool,
+pub(crate) struct ExpandedRefreshState {
+    pub(crate) sorted_resources: Vec<Resource>,
 }
 
 /// Shared inputs for the refresh-and-lift constructors.
@@ -6162,7 +6292,7 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
 >(
     validated: ValidatedConfig<CanonicalResourcePair<E>>,
     inputs: ValidatedCanonicalExpandRefreshAndLiftInputs<'_, '_, P>,
-) -> Result<ValidatedConfig<PostExpansionPlanView<E, ChildrenSettled>>, AppError> {
+) -> Result<ValidatedConfig<PostExpansionPlanView<E, ApplyChildrenSettled>>, AppError> {
     let ValidatedConfig {
         wiring,
         resources: canonical_resources,
@@ -6197,8 +6327,11 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
                             normalizer: provider,
                         })
                         .await?
+                        .into_apply_settled()
                 } else {
-                    pending.settle_children_absent(schemas, Some(refresh_phase))
+                    pending
+                        .settle_children_absent(schemas, Some(refresh_phase))
+                        .into_apply_settled()
                 };
                 Ok::<_, AppError>(settled)
             })
@@ -6282,9 +6415,9 @@ async fn refresh_expanded_children_live(
         )
         .await?;
 
-        // Phase 2.5: carry saved attributes into newly read children. This is
-        // the same hydration step used by `run_apply_locked_owned`; keeping it
-        // inside this transition prevents plan and apply from diverging.
+        // Phase 2.5: carry saved attributes into newly read children. Keeping
+        // hydration in the shared live transition prevents plan and apply from
+        // diverging.
         hydrate_prior_data_source_values(
             &mut addressed.managed_current,
             data_source_values,
@@ -6378,10 +6511,10 @@ async fn finish_expanded_refresh_state<
 ) -> Result<ExpandedRefreshState, AppError> {
     let DeferredForExpansion {
         sorted_resources,
-        residual_deferred_for,
+        residual_deferred_for: _,
         #[cfg(test)]
             residual_warnings: _,
-        deferred_create_targets,
+        deferred_create_targets: _,
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
@@ -6424,20 +6557,7 @@ async fn finish_expanded_refresh_state<
         );
     }
 
-    let ChildrenPending {
-        new_child_ids,
-        refreshable_child_ids,
-        printed_warnings,
-    } = children;
-
-    Ok(ExpandedRefreshState {
-        sorted_resources,
-        residual_deferred_for,
-        deferred_create_targets,
-        new_child_ids,
-        refreshable_child_ids,
-        printed_warnings,
-    })
+    Ok(ExpandedRefreshState { sorted_resources })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6660,7 +6780,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         .await?;
     let refresh_module_constraint_errors = phase2
         .module_constraint_error
-        .map(module_constraint_plan_errors);
+        .and_then(module_constraint_plan_errors);
     let data_source_values = phase2.values;
     let prepared_expansion = reconciled_expansion.seal(data_source_values);
 
@@ -6675,30 +6795,28 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     )?;
     let child_saved_dep_bindings = HashMap::new();
     let plan_expansion = match (refresh_phase.as_ref(), state_file.as_ref()) {
-        (Some(refresh_phase), Some(state_file)) => {
-            pending_expansion
-                .settle_children_live(LiveExpandedChildrenInputs {
-                    provider: &provider,
-                    normalizer: &provider,
-                    state_file,
-                    saved_dep_bindings: &child_saved_dep_bindings,
-                    refresh_phase,
-                    schemas: ctx.schemas(),
-                })
-                .await?
-        }
-        (None, Some(state_file)) => {
-            pending_expansion
-                .settle_children_from_cache(CachedExpandedChildrenInputs {
-                    normalizer: &provider,
-                    state_file,
-                    schemas: ctx.schemas(),
-                })
-                .await?
-        }
-        (_, None) => {
-            pending_expansion.settle_children_absent(ctx.schemas(), refresh_phase.as_ref())
-        }
+        (Some(refresh_phase), Some(state_file)) => pending_expansion
+            .settle_children_live(LiveExpandedChildrenInputs {
+                provider: &provider,
+                normalizer: &provider,
+                state_file,
+                saved_dep_bindings: &child_saved_dep_bindings,
+                refresh_phase,
+                schemas: ctx.schemas(),
+            })
+            .await?
+            .into_plan_settled(),
+        (None, Some(state_file)) => pending_expansion
+            .settle_children_from_cache(CachedExpandedChildrenInputs {
+                normalizer: &provider,
+                state_file,
+                schemas: ctx.schemas(),
+            })
+            .await?
+            .into_plan_settled(),
+        (_, None) => pending_expansion
+            .settle_children_absent(ctx.schemas(), refresh_phase.as_ref())
+            .into_plan_settled(),
     };
 
     drop(refresh_phase);

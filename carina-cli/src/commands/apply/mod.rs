@@ -1931,7 +1931,7 @@ async fn run_apply_locked_owned(
                 .await?;
             let refresh_module_constraint_errors = phase2
                 .module_constraint_error
-                .map(module_constraint_plan_errors);
+                .and_then(module_constraint_plan_errors);
             let data_source_values = phase2.values;
             let prepared_expansion = reconciled_expansion.seal(data_source_values);
 

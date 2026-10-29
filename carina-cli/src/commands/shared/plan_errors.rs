@@ -25,7 +25,7 @@ impl<R> crate::wiring::PostExpansionDiagnostics<R> {
     /// command error that must abort apply. There is deliberately no success
     /// branch: receiving this type already selected the diagnostic outcome.
     pub(crate) fn render_and_abort(&self) -> AppError {
-        render_plan_errors(self.plan().errors())
+        render_plan_errors(self.errors().as_slice())
     }
 }
 

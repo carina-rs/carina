@@ -157,7 +157,7 @@ fn output_text(output: &Output) -> String {
 }
 
 #[test]
-fn live_apply_plan_matches_plan_for_state_materialized_deferred_for_child() {
+fn live_apply_and_cached_plan_match_refreshing_plan_for_state_materialized_child() {
     let project = Project::new(
         r#"let cert = mock.test.deferred_source {
   name = "certificate"
@@ -199,8 +199,12 @@ let validation_records = for rule in cert.generated_rules {
     );
 
     let plan = project.run(&["plan", "."]);
-    project.assert_success("plan", &plan);
+    project.assert_success("refreshing plan", &plan);
     let plan_text = output_text(&plan);
+
+    let cached_plan = project.run(&["plan", "--refresh=false", "."]);
+    project.assert_success("cached-state plan", &cached_plan);
+    let cached_plan_text = output_text(&cached_plan);
 
     let apply = project.run(&["apply", "--auto-approve", "--lock=false", "."]);
     project.assert_success("live apply", &apply);
@@ -208,7 +212,11 @@ let validation_records = for rule in cert.generated_rules {
 
     let child_line = "mock.test.resource validation_records[0]";
     let update_summary = "Plan: 0 to add, 1 to change, 0 to destroy.";
-    for (label, rendered) in [("plan", &plan_text), ("apply", &apply_text)] {
+    for (label, rendered) in [
+        ("refreshing plan", &plan_text),
+        ("cached-state plan", &cached_plan_text),
+        ("apply", &apply_text),
+    ] {
         assert!(
             rendered.contains(child_line) && rendered.contains("'before' → 'after'"),
             "{label} did not materialize the deferred-for child:\n{rendered}",
@@ -216,6 +224,10 @@ let validation_records = for rule in cert.generated_rules {
         assert!(
             rendered.contains(update_summary),
             "{label} did not produce the same child update:\n{rendered}",
+        );
+        assert!(
+            !rendered.contains("Plan: 1 to add"),
+            "{label} produced a phantom child create:\n{rendered}",
         );
     }
     assert_eq!(
