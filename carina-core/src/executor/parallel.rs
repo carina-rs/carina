@@ -14,8 +14,8 @@ use crate::resource::{ResourceId, ResourceIdentity};
 use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
 use super::basic::{
-    BasicEffectCtx, ExecutionState, count_actionable_effects, execute_basic_effect,
-    process_basic_result, refresh_pending_states, resolve_data_source,
+    BasicEffectCompletion, BasicEffectCtx, ExecutionState, count_actionable_effects,
+    execute_basic_effect, process_basic_result, refresh_pending_states, resolve_data_source,
 };
 use super::deferred_dispatch::{
     DeferredAnonymousIdentityGuard, PureMetaCtx, report_deferred_create_failure,
@@ -23,7 +23,7 @@ use super::deferred_dispatch::{
 use super::provider_ready::ProviderPreparationContext;
 use super::replace::SingleEffectResult;
 use super::scheduler::{
-    FailureView, PureMetaOutcome, SchedulerDeps, dependency_failed_reason, failure_binding_name,
+    FailureView, PureMetaOutcome, SchedulerDeps, dependency_failed_reason, failure_display_name,
     try_dispatch_pure_meta, wait_dependency_failed_reason,
 };
 use super::wait::{
@@ -126,45 +126,17 @@ pub(super) fn apply_deferred_replace_delete_deps<S>(
             continue;
         };
 
-        if matches!(
-            payload.template.target,
-            crate::parser::DeferredForTarget::Unbound { .. }
-        ) {
-            if !deps_of.contains_key(&delete_idx) {
-                continue;
-            }
-            for (other_gate_idx, effect) in effects.iter().enumerate() {
-                let template = match effect {
-                    Effect::DeferredCreate { template, .. } => template.as_ref(),
-                    Effect::DeferredReplace(other) => other.template.as_ref(),
-                    _ => continue,
-                };
-                if !matches!(
-                    template.target,
-                    crate::parser::DeferredForTarget::Unbound { .. }
-                ) || template.template_resource.id.provider
-                    != payload.template.template_resource.id.provider
-                    || template.template_resource.id.resource_type
-                        != payload.template.template_resource.id.resource_type
-                    || template.template_resource.id.provider_instance
-                        != payload.template.template_resource.id.provider_instance
-                {
-                    continue;
-                }
-                // Anonymous children may reuse a persisted generated address.
-                // Every matching runtime gate therefore waits for the one
-                // owner of the absorbed delete before materializing children.
-                deps_of
-                    .entry(other_gate_idx)
-                    .or_default()
-                    .insert(delete_idx);
-            }
-            continue;
-        }
-
         if deps_of.contains_key(&delete_idx) {
+            // The gate owns its absorbed rows. A failed or skipped gate must
+            // therefore skip the deletes instead of destroying live state
+            // before the replacement shape is known.
             deps_of.entry(delete_idx).or_default().insert(gate_idx);
         }
+
+        let is_unbound = matches!(
+            payload.template.target,
+            crate::parser::DeferredForTarget::Unbound { .. }
+        );
 
         let Some(delete_id) = effects.get(delete_idx).map(Effect::resource_id) else {
             continue;
@@ -173,13 +145,25 @@ pub(super) fn apply_deferred_replace_delete_deps<S>(
             let Effect::Create(resource) = effect else {
                 continue;
             };
-            if resource.id != *delete_id {
+            let same_live_id = resource.id == *delete_id;
+            let replaces_legacy_loop_row = is_unbound
+                && resource.id.provider == delete_id.provider
+                && resource.id.resource_type == delete_id.resource_type
+                && resource.id.provider_instance == delete_id.provider_instance
+                && resource.id.identity().is_some_and(|identity| {
+                    resource
+                        .loop_provenance
+                        .legacy_candidates(identity)
+                        .iter()
+                        .any(|legacy| delete_id.identity_str() == Some(legacy.exact_state_name()))
+                });
+            if !same_live_id && !replaces_legacy_loop_row {
                 continue;
             }
             // DeferredReplace materializes the replacement create after the
             // delete placeholder is already in the scheduler. The generic
             // same-identity rule would otherwise order create after delete.
-            if let Some(create_deps) = deps_of.get_mut(&create_idx) {
+            if same_live_id && let Some(create_deps) = deps_of.get_mut(&create_idx) {
                 create_deps.remove(&delete_idx);
             }
             deps_of.entry(delete_idx).or_default().insert(create_idx);
@@ -409,7 +393,7 @@ pub(super) async fn execute_effects_sequential<
     let mut idx_to_binding: HashMap<usize, String> = effects
         .iter()
         .enumerate()
-        .filter_map(|(idx, effect)| failure_binding_name(effect).map(|b| (idx, b)))
+        .filter_map(|(idx, effect)| failure_display_name(effect).map(|b| (idx, b)))
         .collect();
 
     // Track which effect indices have completed (successfully or not)
@@ -598,7 +582,7 @@ pub(super) async fn execute_effects_sequential<
                                     result.runtime_synthesized_resources.push(resource.clone());
                                 });
                             }
-                            if let Some(binding) = failure_binding_name(&child) {
+                            if let Some(binding) = failure_display_name(&child) {
                                 idx_to_binding.insert(child_idx, binding);
                             }
                             effects.push(child);
@@ -948,7 +932,7 @@ pub(super) async fn execute_effects_sequential<
         // Process the result and update shared state immediately
         match effect_result {
             SingleEffectResult::Basic(basic) => {
-                process_basic_result(
+                let completion = process_basic_result(
                     *basic,
                     &mut ExecutionState {
                         idx: finished_idx,
@@ -957,6 +941,16 @@ pub(super) async fn execute_effects_sequential<
                         pending_refreshes: &mut pending_refreshes,
                     },
                 );
+                if completion == BasicEffectCompletion::Deleted
+                    && let Some(Effect::Delete {
+                        id,
+                        generation: crate::effect::EffectGeneration::Current,
+                        binding: None,
+                        ..
+                    }) = effects.get(finished_idx)
+                {
+                    anonymous_identity_guard.release_completed_current_delete(id.as_inner());
+                }
             }
             SingleEffectResult::ReadNoOp => {}
             SingleEffectResult::Read {

@@ -662,7 +662,7 @@ impl DiagnosticEngine {
         configuration_root: Option<&std::path::Path>,
     ) -> Vec<Diagnostic> {
         let mut resources = directory.resources.clone();
-        let mut canonical_resources = match carina_core::value::canonicalize_resources_with_schemas(
+        let canonical_resources = match carina_core::value::canonicalize_resources_with_schemas(
             &mut resources,
             &self.schemas,
         ) {
@@ -670,7 +670,7 @@ impl DiagnosticEngine {
             Err(_) => return Vec::new(),
         };
         let identity_result = carina_core::identifier::compute_anonymous_identifiers_with_factories(
-            canonical_resources.as_mut_slice(),
+            canonical_resources,
             &directory.providers,
             &self.factories,
             &self.schemas,

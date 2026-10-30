@@ -897,15 +897,19 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
 
     let mut resources_awscc = vec![make_resource()];
     let mut resources_aws = vec![make_resource()];
+    let canonical_awscc =
+        crate::value::canonicalize_resources_with_schemas(&mut resources_awscc, &schemas).unwrap();
+    let canonical_aws =
+        crate::value::canonicalize_resources_with_schemas(&mut resources_aws, &schemas).unwrap();
     compute_anonymous_identifiers_with_provider_configs(
-        &mut resources_awscc,
+        canonical_awscc,
         &providers_awscc,
         &schemas,
         &identity_fn,
     )
     .unwrap();
     compute_anonymous_identifiers_with_provider_configs(
-        &mut resources_aws,
+        canonical_aws,
         &providers_aws,
         &schemas,
         &identity_fn,

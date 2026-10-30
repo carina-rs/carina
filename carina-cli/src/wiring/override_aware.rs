@@ -157,15 +157,12 @@ impl<E> CanonicalResourcePair<E> {
         providers: &[carina_core::parser::ProviderConfig],
         factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     ) -> Result<(), CanonicalResourceIdentityError> {
-        let mut resources = carina_core::value::canonicalize_resources_with_schemas(
+        let resources = carina_core::value::canonicalize_resources_with_schemas(
             &mut self.parsed.resources,
             registry,
         )?;
         carina_core::identifier::compute_anonymous_identifiers_with_factories(
-            resources.as_mut_slice(),
-            providers,
-            factories,
-            registry,
+            resources, providers, factories, registry,
         )
         .map_err(|error| match error {
             carina_core::identifier::AnonymousIdentityComputationError::ProviderConfig(error) => {

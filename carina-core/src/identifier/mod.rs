@@ -16,7 +16,7 @@ use crate::resource::{
 };
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use crate::validation::is_string_compatible_type;
-use crate::value::CanonicalizedProviderConfigs;
+use crate::value::{CanonicalizedProviderConfigs, CanonicalizedResources};
 
 /// Addresses claimed by operator-written state blocks. Heuristic move
 /// detectors must not consume a claimed `from` state entry nor synthesize a
@@ -505,7 +505,7 @@ pub enum AnonymousIdentityComputationError {
 /// Canonicalize provider identity inputs and assign anonymous resource IDs
 /// through the same factory lookup on every plan, editor, and apply path.
 pub fn compute_anonymous_identifiers_with_factories<S: AnonymousIdentityModuleSource>(
-    resources: &mut [Resource<S>],
+    resources: CanonicalizedResources<'_, S>,
     providers: &[ProviderConfig],
     factories: &[Box<dyn ProviderFactory>],
     registry: &SchemaRegistry,
@@ -1627,6 +1627,8 @@ pub fn compute_anonymous_identifiers_for_test(
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), AnonymousIdentityError> {
     let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
+    let resources = crate::value::canonicalize_resources_with_schemas(resources, registry)
+        .expect("anonymous-identity test resources must canonicalize");
     compute_anonymous_identifiers_with_provider_configs(
         resources,
         &providers,
@@ -1641,12 +1643,14 @@ pub fn compute_anonymous_identifiers_for_test(
 /// `identity_attributes_fn` takes a provider name and returns the list of identity attribute names
 /// for that provider (e.g., `["region"]`).
 pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityModuleSource>(
-    resources: &mut [Resource<S>],
+    resources: CanonicalizedResources<'_, S>,
     providers: &CanonicalizedProviderConfigs,
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), AnonymousIdentityError> {
     use std::hash::{Hash, Hasher};
+
+    let resources = resources.into_mut_slice();
 
     let mut module_collision_discovery = discover_loop_module_prefix_collisions(resources);
     let mut identity_errors = std::mem::take(&mut module_collision_discovery.plain_errors);
@@ -1928,6 +1932,8 @@ pub fn compute_anonymous_identifiers_with_provider_configs_for_test(
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), AnonymousIdentityError> {
     let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
+    let resources = crate::value::canonicalize_resources_with_schemas(resources, registry)
+        .expect("anonymous-identity test resources must canonicalize");
     compute_anonymous_identifiers_with_provider_configs(
         resources,
         &providers,

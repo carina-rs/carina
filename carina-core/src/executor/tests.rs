@@ -152,11 +152,12 @@ fn anonymous_deferred_collision_fixture() -> (
     SchemaRegistry,
     Resource,
 ) {
-    let parsed = crate::parser::parse(
+    let parsed = crate::parser::parse_file(
         "let upstream = upstream_state { source = '../upstream' }\n\
          for value in upstream.values {\n\
            mock.test.Child { identity_input = value }\n\
          }\n",
+        std::path::Path::new("main.crn"),
         &crate::parser::ProviderContext::default(),
     )
     .expect("unbound deferred loop parses");
@@ -9553,23 +9554,16 @@ async fn apply_time_unbound_child_collision_with_unabsorbed_state_row_is_typed_e
     );
 }
 
-#[tokio::test]
-async fn unbound_deferred_replace_deletes_anonymous_row_before_materializing_same_id() {
-    let (template, bindings, schemas, child) = anonymous_deferred_collision_fixture();
-    let child_id = child.id.clone();
-    let provider = MockProvider::new();
-    provider.push_delete(Ok(()));
-    provider.push_create(Ok(
-        State::existing(child_id.clone(), HashMap::new()).with_identifier("replacement")
-    ));
-
-    let mut plan = Plan::new();
-    plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
+fn legacy_unbound_deferred_replace(
+    template: crate::parser::DeferredForExpression,
+    legacy_id: &ResourceId,
+) -> Effect {
+    Effect::DeferredReplace(Box::new(DeferredReplacePayload {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-            id: crate::resource::ResolvedResourceId::new(child_id.clone()),
+            id: crate::resource::ResolvedResourceId::new(legacy_id.clone()),
             identifier: crate::effect::fixture_applied_identifier("existing"),
             directives: Directives::default(),
-            binding: None,
+            binding: legacy_id.identity_str().map(str::to_string),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -9577,19 +9571,34 @@ async fn unbound_deferred_replace_deletes_anonymous_row_before_materializing_sam
         .expect("fixture has one delete"),
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "__deferred_for",
-            "anonymous_delete_first",
+            "anonymous_legacy_replace",
         )),
         template: Box::new(template),
-    })));
+    }))
+}
+
+#[tokio::test]
+async fn unbound_deferred_replace_creates_children_before_deleting_legacy_rows() {
+    let (template, bindings, schemas, child) = anonymous_deferred_collision_fixture();
+    let child_id = child.id.clone();
+    let legacy_id = ResourceId::with_provider_identity("mock", "test.Child", "_values[0]", None);
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(
+        State::existing(child_id.clone(), HashMap::new()).with_identifier("replacement")
+    ));
+
+    let mut plan = Plan::new();
+    plan.add(legacy_unbound_deferred_replace(template, &legacy_id));
     let current = Current::from_state(
-        State::existing(child_id.clone(), HashMap::new()).with_identifier("existing"),
+        State::existing(legacy_id.clone(), HashMap::new()).with_identifier("existing"),
     );
     let input = ExecutionInput {
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
-        managed_current: HashMap::from([(child_id.clone(), current)]),
+        managed_current: HashMap::from([(legacy_id.clone(), current)]),
         data_source_values: ExecutableDataSourceValues::empty(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
@@ -9606,10 +9615,117 @@ async fn unbound_deferred_replace_deletes_anonymous_row_before_materializing_sam
     assert_eq!(result.failure_count, 0, "events: {:?}", observer.events());
 
     let calls = provider.calls();
-    let display_id = format!("mock.test.Child.{}", child_id.identity_str().unwrap());
     assert!(
-        call_position(&calls, "delete", &display_id) < call_position(&calls, "create", &display_id),
-        "anonymous replacement must delete before create; calls: {calls:?}",
+        call_position(&calls, "create", &child_id.to_string())
+            < call_position(&calls, "delete", &legacy_id.to_string()),
+        "anonymous children must exist before their legacy rows are deleted; calls: {calls:?}",
+    );
+}
+
+#[tokio::test]
+async fn unbound_deferred_replace_keeps_legacy_rows_when_gate_fails() {
+    let (template, _bindings, schemas, _child) = anonymous_deferred_collision_fixture();
+    let legacy_id = ResourceId::with_provider_identity("mock", "test.Child", "_values[0]", None);
+    let provider = MockProvider::new();
+    let mut plan = Plan::new();
+    plan.add(legacy_unbound_deferred_replace(template, &legacy_id));
+    let current = Current::from_state(
+        State::existing(legacy_id.clone(), HashMap::new()).with_identifier("existing"),
+    );
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::from([(legacy_id.clone(), current)]),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert_eq!(result.failure_count, 1, "events: {:?}", observer.events());
+    assert_eq!(result.skip_count, 1, "events: {:?}", observer.events());
+    assert!(provider.calls().is_empty(), "calls: {:?}", provider.calls());
+    assert!(
+        result.managed_current.contains_key(&legacy_id),
+        "the failed gate must leave the live legacy row intact"
+    );
+    let skipped = observer
+        .events()
+        .into_iter()
+        .find(|event| event.starts_with("skipped:"))
+        .expect("legacy delete must be skipped after the gate failure");
+    assert!(skipped.contains("main.crn:2"), "event: {skipped}");
+    assert!(!skipped.contains("_loop_"), "event: {skipped}");
+}
+
+#[tokio::test]
+async fn completed_plain_anonymous_delete_releases_id_for_unbound_deferred_child() {
+    let (template, bindings, schemas, child) = anonymous_deferred_collision_fixture();
+    let child_id = child.id.clone();
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(
+        State::existing(child_id.clone(), HashMap::new()).with_identifier("replacement")
+    ));
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Delete {
+        id: crate::resource::ResolvedResourceId::new(child_id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("existing"),
+        generation: EffectGeneration::Current,
+        directives: Directives::default(),
+        binding: None,
+        dependencies: HashSet::new(),
+        explicit_dependencies: HashSet::new(),
+        blocked_by_updates: HashSet::new(),
+    });
+    plan.add(Effect::DeferredCreate {
+        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "__deferred_for",
+            "anonymous_remint",
+        )),
+        template: Box::new(template),
+    });
+    let current = Current::from_state(
+        State::existing(child_id.clone(), HashMap::new()).with_identifier("existing"),
+    );
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings,
+        managed_current: HashMap::from([(child_id.clone(), current)]),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert_eq!(result.failure_count, 0, "events: {:?}", observer.events());
+    assert_eq!(result.success_count, 2, "events: {:?}", observer.events());
+    let calls = provider.calls();
+    assert!(
+        call_position(&calls, "delete", &child_id.to_string())
+            < call_position(&calls, "create", &child_id.to_string()),
+        "the old anonymous row must be deleted before the same id is re-created; calls: {calls:?}",
     );
 }
 

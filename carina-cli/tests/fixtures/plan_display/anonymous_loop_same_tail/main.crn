@@ -1,6 +1,6 @@
-provider awscc {
-  region = awscc.Region.ap_northeast_1
-}
+
+
+
 
 let xs = ['10.0.0.0/16']
 let ys = { xs = ['10.5.0.0/16'] }

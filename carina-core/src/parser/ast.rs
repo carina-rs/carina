@@ -50,10 +50,10 @@ impl DeferredForTarget {
         }
     }
 
-    pub fn display_name(&self) -> &str {
+    pub fn display_name(&self) -> String {
         match self {
-            Self::Bound { binding } => binding,
-            Self::Unbound { .. } => "<pending>",
+            Self::Bound { binding } => binding.clone(),
+            Self::Unbound { template } => template.display_name(),
         }
     }
 

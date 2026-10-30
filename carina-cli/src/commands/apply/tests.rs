@@ -8725,30 +8725,45 @@ mod apply_deferred_for_parity {
     /// `DeferredForExpansion`, not a silent parity bug
     /// (MEMORY "unit-test path ≠ apply path"). Parity twin of
     /// `wiring::tests::...::moved_target_child_is_excluded_from_refreshable_set`.
-    #[test]
-    fn apply_moved_target_child_excluded_from_refreshable_set() {
+    fn assert_apply_moved_target_child_excluded_from_refreshable_set(loop_target: &str) {
         let src = r#"
             let cert = aws.acm.Certificate {
                 domain_name       = "r.example.com"
                 validation_method = "DNS"
             }
 
-            let records = for (_, opt) in cert.domain_validation_options {
+            LOOP_TARGETfor (_, opt) in cert.domain_validation_options {
                 aws.route53.RecordSet {
                     name             = opt.resource_record.name
                     type             = "CNAME"
                     resource_records = [opt.resource_record.value]
                 }
             }
-        "#;
+        "#
+        .replacen("LOOP_TARGET", loop_target, 1);
         let parsed = parse_file(
-            src,
+            &src,
             std::path::Path::new("apply_deferred_for.crn"),
             &ProviderContext::default(),
         )
         .expect("parse");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = dvo_state(&parsed);
+        let mut schemas = carina_core::schema::SchemaRegistry::new();
+        schemas.insert(
+            "aws",
+            carina_core::schema::ResourceSchema::new("route53.RecordSet")
+                .attribute(
+                    carina_core::schema::AttributeSchema::optional(
+                        "name",
+                        carina_core::schema::AttributeType::string(),
+                    )
+                    .create_only()
+                    .build(),
+                )
+                .validate()
+                .expect("record-set schema fixture must be valid"),
+        );
 
         // No moved targets: the expanded child is refreshable.
         let baseline = crate::wiring::expand_same_config_deferred_for(
@@ -8756,9 +8771,8 @@ mod apply_deferred_for_parity {
             &sorted,
             &crate::managed_current_from_states(states.clone()),
             &DataSourceValues::empty(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &carina_core::provider::RawSavedAttrs::default()
-                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &schemas,
+            &carina_core::provider::RawSavedAttrs::default().lift(&schemas),
             &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -8777,6 +8791,17 @@ mod apply_deferred_for_parity {
             baseline.refreshable_child_ids.contains(&child_id),
             "apply: a non-moved expanded child must still be refreshed"
         );
+        let child = baseline
+            .sorted_resources
+            .iter()
+            .find(|resource| resource.id == child_id)
+            .expect("expanded child remains in the sorted resources");
+        if loop_target.is_empty() {
+            assert!(child.binding.is_none());
+            assert!(child.loop_provenance.display_origin().is_some());
+        } else {
+            assert_eq!(child.binding.as_deref(), Some("records[0]"));
+        }
 
         // Declare it a `moved` `to`: it must drop out of the refreshable
         // set so `run_apply_locked` does not clobber the migrated state.
@@ -8787,9 +8812,8 @@ mod apply_deferred_for_parity {
             &sorted,
             &crate::managed_current_from_states(states),
             &DataSourceValues::empty(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &carina_core::provider::RawSavedAttrs::default()
-                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &schemas,
+            &carina_core::provider::RawSavedAttrs::default().lift(&schemas),
             &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -8807,6 +8831,16 @@ mod apply_deferred_for_parity {
             "apply: a `moved` target child must be excluded from \
              refreshable_child_ids (carina#3141 parity with plan path)"
         );
+    }
+
+    #[test]
+    fn apply_moved_target_child_excluded_from_refreshable_set() {
+        assert_apply_moved_target_child_excluded_from_refreshable_set("let records = ");
+    }
+
+    #[test]
+    fn apply_unbound_moved_target_child_excluded_from_refreshable_set() {
+        assert_apply_moved_target_child_excluded_from_refreshable_set("");
     }
 }
 

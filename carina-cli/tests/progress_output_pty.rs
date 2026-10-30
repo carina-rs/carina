@@ -64,17 +64,27 @@ let gamma = mock.test.resource {
     }
 
     fn with_deferred_for_resources() -> Self {
+        Self::with_deferred_for_resources_target("let generated = ")
+    }
+
+    fn with_unbound_deferred_for_resources() -> Self {
+        Self::with_deferred_for_resources_target("")
+    }
+
+    fn with_deferred_for_resources_target(loop_target: &str) -> Self {
         Self::with_resources(
             r#"let source = mock.test.resource {
   name = "source"
 }
 
-let generated = for _, resource_name in (source.tags ?? {}) {
+LOOP_TARGETfor _, resource_name in (source.tags ?? {}) {
   mock.test.resource {
     name = resource_name
   }
 }
-"#,
+"#
+            .replacen("LOOP_TARGET", loop_target, 1)
+            .as_str(),
         )
     }
 
@@ -841,6 +851,34 @@ fn state_refresh_closes_post_expansion_progress_before_its_summary() {
             .screen
             .contains("mock.test.resource generated.two took"),
         "fixture must exercise the post-expansion progress backend\nscreen:\n{}",
+        output.screen,
+    );
+    assert_one_blank_line_above(&output.screen, "mock.test.resource \"source\":");
+    assert_marker_on_own_line(
+        &output.screen,
+        "State refreshed: 1 resource updated, 0 resources unchanged.",
+    );
+}
+
+#[test]
+fn state_refresh_closes_unbound_post_expansion_progress_before_its_summary() {
+    let fixture = Fixture::with_unbound_deferred_for_resources();
+    fixture.apply();
+    fixture.add_second_source_tag();
+
+    let output = fixture.run_with_streams(&["state", "refresh", "."], true, true, &[]);
+
+    assert_pty_success("carina state refresh", &output);
+    assert!(
+        output
+            .screen
+            .contains("mock.test.resource mock_test_resource_"),
+        "fixture must render an anonymous post-expansion child\nscreen:\n{}",
+        output.screen,
+    );
+    assert!(
+        !output.screen.contains("_for0"),
+        "state-refresh progress must not expose a legacy synthetic binding\nscreen:\n{}",
         output.screen,
     );
     assert_one_blank_line_above(&output.screen, "mock.test.resource \"source\":");

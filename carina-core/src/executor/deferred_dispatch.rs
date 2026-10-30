@@ -47,6 +47,9 @@ pub(super) enum DeferredCreateFailure {
     ProviderConfig {
         error: crate::value::ProviderConfigCanonicalizationError,
     },
+    EnumCanonicalization {
+        error: crate::value::EnumCanonicalizationError,
+    },
     AnonymousIdentity {
         error: crate::identifier::AnonymousIdentityError,
     },
@@ -122,6 +125,10 @@ impl DeferredAnonymousIdentityGuard {
         self.materialized.extend(batch);
         Ok(())
     }
+
+    pub(super) fn release_completed_current_delete(&mut self, id: &ResourceId) {
+        self.current.remove(id);
+    }
 }
 
 impl DeferredCreateFailure {
@@ -157,6 +164,7 @@ impl DeferredCreateFailure {
             ),
             DeferredCreateFailure::ValueAccess { error } => error.to_string(),
             DeferredCreateFailure::ProviderConfig { error } => error.to_string(),
+            DeferredCreateFailure::EnumCanonicalization { error } => error.to_string(),
             DeferredCreateFailure::AnonymousIdentity { error } => error.to_string(),
             DeferredCreateFailure::AnonymousIdentityCollision { id, occupied_by } => {
                 let owner = match occupied_by {
@@ -187,6 +195,7 @@ impl std::error::Error for DeferredCreateFailure {
         match self {
             Self::ValueAccess { error } => Some(error),
             Self::ProviderConfig { error } => Some(error),
+            Self::EnumCanonicalization { error } => Some(error),
             Self::AnonymousIdentity { error } => Some(error),
             Self::IterableAbsent { .. }
             | Self::IterableUnknown { .. }
@@ -255,8 +264,13 @@ pub(super) fn materialize_deferred_create<
         template.target,
         crate::parser::DeferredForTarget::Unbound { .. }
     ) {
-        crate::identifier::compute_anonymous_identifiers_with_factories(
+        let canonical_resources = crate::value::canonicalize_resources_with_schemas(
             &mut resources,
+            identity_inputs.schemas,
+        )
+        .map_err(|error| DeferredCreateFailure::EnumCanonicalization { error })?;
+        crate::identifier::compute_anonymous_identifiers_with_factories(
+            canonical_resources,
             identity_inputs.provider_configs,
             identity_inputs.factories,
             identity_inputs.schemas,
@@ -471,6 +485,85 @@ mod tests {
         );
         assert!(child.binding.is_none());
         assert!(child.loop_provenance.direct_origin().is_some());
+    }
+
+    #[test]
+    fn apply_time_unbound_enum_identity_matches_plan_time_canonical_identity() {
+        let parsed = crate::parser::parse_file(
+            "let upstream = upstream_state { source = '../upstream' }\n\
+             for value in upstream.values {\n\
+               mock.test.Child { mode = value }\n\
+             }\n",
+            std::path::Path::new("main.crn"),
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("deferred unbound enum loop parses");
+        let template = &parsed.deferred_for_expressions[0];
+        let iterable = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::enum_identifier("foo"),
+        )]));
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_with_completeness(
+            "upstream",
+            HashMap::from([("values".to_string(), iterable.clone())]),
+            BindingValueSource::Local,
+            BindingCompleteness::Complete,
+        );
+        let mode_type = crate::schema::AttributeType::enum_(
+            crate::schema::enum_identity("Mode", Some("mock.test.Child")),
+            Some(vec!["API_A".to_string()]),
+            vec![("API_A".to_string(), "foo".to_string())],
+            None,
+            None,
+        );
+        let schema = crate::schema::ResourceSchema::new("test.Child").attribute(
+            crate::schema::AttributeSchema::optional("mode", mode_type)
+                .create_only()
+                .build(),
+        );
+        let mut schemas = crate::schema::SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            schema.validate().expect("schema fixture must be valid"),
+        );
+        let identity_inputs = DeferredIdentityInputs {
+            provider_configs: &[],
+            factories: &[],
+            schemas: &schemas,
+        };
+
+        let runtime_children = materialize_deferred_create(template, &bindings, &identity_inputs)
+            .expect("apply-time enum child materializes");
+        let [Effect::Create(runtime_child)] = runtime_children.as_slice() else {
+            panic!("one runtime child expected");
+        };
+
+        let mut plan_time_resources = crate::parser::expand_deferred_children(
+            template,
+            &iterable,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .expect("plan-time child expands");
+        let canonical =
+            crate::value::canonicalize_resources_with_schemas(&mut plan_time_resources, &schemas)
+                .expect("plan-time child canonicalizes");
+        crate::identifier::compute_anonymous_identifiers_with_factories(
+            canonical,
+            &[],
+            &[],
+            &schemas,
+        )
+        .expect("plan-time anonymous identity computes");
+
+        assert!(matches!(
+            runtime_child.get_attr("mode"),
+            Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+                if value.api_value() == "API_A"
+        ));
+        assert_eq!(
+            runtime_child.id, plan_time_resources[0].id,
+            "apply-time hashing must consume the same canonical enum representation as planning"
+        );
     }
 
     #[test]

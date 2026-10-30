@@ -66,7 +66,10 @@ pub(super) fn try_dispatch_pure_meta<S: Clone + crate::resource::AnonymousIdenti
     }
 }
 
-pub(super) fn failure_binding_name<S>(effect: &Effect<S>) -> Option<String> {
+/// Equality-bearing key used to carry failures across scheduler phases.
+/// Unbound loops retain their stable system key here; this value must never
+/// be rendered to users.
+pub(super) fn failure_dependency_key<S>(effect: &Effect<S>) -> Option<String> {
     match effect {
         Effect::DeferredCreate { template, .. } => {
             Some(template.target.scheduler_key().to_string())
@@ -74,6 +77,15 @@ pub(super) fn failure_binding_name<S>(effect: &Effect<S>) -> Option<String> {
         Effect::DeferredReplace(payload) => {
             Some(payload.template.target.scheduler_key().to_string())
         }
+        _ => effect.binding_name(),
+    }
+}
+
+/// User-facing label for waiting and dependency-failure messages.
+pub(super) fn failure_display_name<S>(effect: &Effect<S>) -> Option<String> {
+    match effect {
+        Effect::DeferredCreate { template, .. } => Some(template.target.display_name()),
+        Effect::DeferredReplace(payload) => Some(payload.template.target.display_name()),
         _ => effect.binding_name(),
     }
 }
@@ -153,12 +165,12 @@ fn finish_scheduler_deps<S>(
 
 /// Format the user-facing skip reason for a non-Wait effect whose
 /// dependency failed. Centralizing this here keeps both schedulers
-/// (phased / parallel) and both `Named` / `Anonymous` cases in one
+/// (phased / parallel) and both `Labeled` / `Anonymous` cases in one
 /// place — adding a new variant to [`FailedDependency`] is a compile
 /// error here, not a silent message-format drift across call sites.
 pub(super) fn dependency_failed_reason(failed: &FailedDependency) -> String {
     match failed {
-        FailedDependency::Named(binding) => format!("dependency '{binding}' failed"),
+        FailedDependency::Labeled(label) => format!("dependency '{label}' failed"),
         FailedDependency::Anonymous => "dependency failed".to_string(),
     }
 }
@@ -169,7 +181,7 @@ pub(super) fn dependency_failed_reason(failed: &FailedDependency) -> String {
 /// than fabricating a binding-shaped placeholder.
 pub(super) fn wait_dependency_failed_reason(failed: &FailedDependency) -> String {
     match failed {
-        FailedDependency::Named(binding) => {
+        FailedDependency::Labeled(binding) => {
             let detail = super::wait::unsatisfiable_reason_message(
                 &super::wait::UnsatisfiableReason::DependencyFailed {
                     binding: binding.clone(),
@@ -184,17 +196,14 @@ pub(super) fn wait_dependency_failed_reason(failed: &FailedDependency) -> String
 /// A failed dependency that blocks `effects[idx]` from dispatching.
 ///
 /// The two variants are distinct concepts that callers must handle
-/// separately — they are not interchangeable strings. `Named` carries a
-/// real binding name (suitable for `"dependency '<name>' failed"` style
-/// messages); `Anonymous` means the failed dependency has no binding
-/// identity (e.g. an anonymous `Replace` whose `to.binding` is `None`),
-/// and the message must NOT fabricate a binding-shaped placeholder for
-/// it. Returning a single `String` here would force every consumer to
-/// re-derive that distinction with a `starts_with('#')` check; the
-/// enum makes the broken state unrepresentable.
+/// separately — they are not interchangeable strings. `Labeled` carries a
+/// user-facing binding or source-location label; `Anonymous` means the failed
+/// dependency has no display identity (e.g. an anonymous `Replace` whose
+/// `to.binding` is `None`). The message must not fabricate a binding-shaped
+/// placeholder for it.
 #[derive(Debug, Clone)]
 pub(super) enum FailedDependency {
-    Named(String),
+    Labeled(String),
     Anonymous,
 }
 
@@ -205,7 +214,7 @@ pub(super) struct FailureView<'a, S> {
     pub(super) effects: &'a [Effect<S>],
     pub(super) deps_of: &'a HashMap<usize, HashSet<usize>>,
     pub(super) failed_indices: &'a HashSet<usize>,
-    failed_binding_names: HashSet<String>,
+    failed_dependency_labels: HashMap<String, String>,
 }
 
 impl<'a, S> FailureView<'a, S> {
@@ -214,15 +223,21 @@ impl<'a, S> FailureView<'a, S> {
         deps_of: &'a HashMap<usize, HashSet<usize>>,
         failed_indices: &'a HashSet<usize>,
     ) -> Self {
-        let failed_binding_names = failed_indices
+        let failed_dependency_labels = failed_indices
             .iter()
-            .filter_map(|idx| effects.get(*idx).and_then(failure_binding_name))
+            .filter_map(|idx| {
+                let effect = effects.get(*idx)?;
+                Some((
+                    failure_dependency_key(effect)?,
+                    failure_display_name(effect)?,
+                ))
+            })
             .collect();
         Self {
             effects,
             deps_of,
             failed_indices,
-            failed_binding_names,
+            failed_dependency_labels,
         }
     }
 
@@ -233,9 +248,9 @@ impl<'a, S> FailureView<'a, S> {
         if let Some(deps) = self.deps_of.get(&idx)
             && let Some(&dep_idx) = deps.iter().find(|d| self.failed_indices.contains(d))
         {
-            let name = self.effects.get(dep_idx).and_then(failure_binding_name);
-            return Some(match name {
-                Some(name) => FailedDependency::Named(name),
+            let label = self.effects.get(dep_idx).and_then(failure_display_name);
+            return Some(match label {
+                Some(label) => FailedDependency::Labeled(label),
                 None => FailedDependency::Anonymous,
             });
         }
@@ -243,11 +258,64 @@ impl<'a, S> FailureView<'a, S> {
         self.effects[idx]
             .blocking_bindings()
             .into_iter()
-            .find(|binding| self.failed_binding_names.contains(binding))
-            .map(FailedDependency::Named)
+            .find_map(|binding| self.failed_dependency_labels.get(&binding).cloned())
+            .map(FailedDependency::Labeled)
     }
 
     pub(super) fn is_effectively_pre_skipped(&self, idx: usize) -> bool {
         self.find_failed_dependency(idx).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::effect::EffectGeneration;
+
+    #[test]
+    fn cross_phase_unbound_failure_uses_source_location_not_scheduler_key() {
+        let parsed = crate::parser::parse_file(
+            "let upstream = upstream_state { source = '../upstream' }\n\
+             for value in upstream.values {\n\
+               mock.test.Child { identity_input = value }\n\
+             }\n",
+            std::path::Path::new("main.crn"),
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("unbound deferred loop parses");
+        let template = parsed.deferred_for_expressions[0].clone();
+        let scheduler_key = template.target.scheduler_key().to_string();
+        assert!(scheduler_key.starts_with("_loop_"));
+
+        let effects = vec![
+            Effect::DeferredCreate {
+                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "__deferred_for",
+                    "failed_unbound_loop",
+                )),
+                template: Box::new(template),
+            },
+            Effect::Delete {
+                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "test.Child",
+                    "dependent",
+                )),
+                identifier: crate::effect::fixture_applied_identifier("dependent"),
+                generation: EffectGeneration::Current,
+                directives: crate::resource::Directives::default(),
+                binding: Some("dependent".to_string()),
+                dependencies: HashSet::new(),
+                explicit_dependencies: HashSet::from([scheduler_key]),
+                blocked_by_updates: HashSet::new(),
+            },
+        ];
+        let deps_of = HashMap::new();
+        let failed_indices = HashSet::from([0]);
+
+        let failed = FailureView::new(&effects, &deps_of, &failed_indices)
+            .find_failed_dependency(1)
+            .expect("the cross-phase dependency must be recognized");
+
+        assert!(matches!(failed, FailedDependency::Labeled(label) if label == "main.crn:2"));
     }
 }

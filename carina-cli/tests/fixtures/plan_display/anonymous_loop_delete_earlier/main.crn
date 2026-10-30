@@ -1,6 +1,6 @@
-provider awscc {
-  region = awscc.Region.ap_northeast_1
-}
+
+
+
 
 for cidr in ['10.8.0.0/16'] {
   awscc.ec2.Vpc {

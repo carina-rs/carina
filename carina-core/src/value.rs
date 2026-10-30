@@ -5853,7 +5853,7 @@ pub struct CanonicalizedResources<'a, S = crate::resource::ModuleSource> {
 }
 
 impl<'a, S> CanonicalizedResources<'a, S> {
-    pub fn as_mut_slice(&mut self) -> &mut [crate::resource::Resource<S>] {
+    pub(crate) fn into_mut_slice(self) -> &'a mut [crate::resource::Resource<S>] {
         self.resources
     }
 }

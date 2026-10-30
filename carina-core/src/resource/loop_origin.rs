@@ -184,6 +184,10 @@ impl LoopSource {
         self.system_identity.as_str()
     }
 
+    pub(crate) fn display_name(&self) -> String {
+        format!("{}:{}", self.file(), self.line())
+    }
+
     pub(crate) fn same_system_target(&self, other: &Self) -> bool {
         self.system_identity == other.system_identity
     }
@@ -619,6 +623,10 @@ impl UnboundLoopTemplate {
 
     pub(crate) fn scheduler_key(&self) -> &str {
         self.source.scheduler_key()
+    }
+
+    pub(crate) fn display_name(&self) -> String {
+        self.source.display_name()
     }
 
     pub(crate) fn same_system_target(&self, other: &Self) -> bool {

@@ -2750,11 +2750,11 @@ pub fn compute_anonymous_identifiers_with_ctx(
 
 fn compute_anonymous_identifiers_result_with_ctx(
     ctx: &WiringContext,
-    mut resources: carina_core::value::CanonicalizedResources<'_>,
+    resources: carina_core::value::CanonicalizedResources<'_>,
     providers: &[ProviderConfig],
 ) -> Result<(), AppError> {
     match identifier::compute_anonymous_identifiers_with_factories(
-        resources.as_mut_slice(),
+        resources,
         providers,
         ctx.factories(),
         ctx.schemas(),
