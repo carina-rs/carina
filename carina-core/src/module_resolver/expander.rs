@@ -1382,6 +1382,31 @@ fn prefix_module_resource(
     intra_module_bindings: &HashSet<String>,
     arguments: ArgumentSubstitutions<'_>,
 ) -> Result<Resource, ArgumentSubstitutionError> {
+    let instance_identity = ResourceIdentity::try_from(instance_prefix.to_string())
+        .expect("module instance prefix is non-empty");
+    prefix_module_resource_with_identity(
+        resource,
+        instance_prefix,
+        &instance_identity,
+        module_name,
+        module_instance_scope,
+        module_call,
+        intra_module_bindings,
+        arguments,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefix_module_resource_with_identity(
+    resource: &Resource,
+    instance_prefix: &str,
+    instance_identity: &ResourceIdentity,
+    module_name: &str,
+    module_instance_scope: &ModuleInstanceScope,
+    module_call: &CompositionCall,
+    intra_module_bindings: &HashSet<String>,
+    arguments: ArgumentSubstitutions<'_>,
+) -> Result<Resource, ArgumentSubstitutionError> {
     // Only assigned identities take the prefix here. Anonymous resources
     // stay pending so `compute_anonymous_identifiers` can later attach both
     // the hash and the instance prefix in one shot (#2516). Each module
@@ -1393,19 +1418,13 @@ fn prefix_module_resource(
         ),
     };
 
-    let instance_identity = ResourceIdentity::try_from(instance_prefix.to_string())
-        .expect("module instance prefix is non-empty");
     if let Some(origin) = new_resource.loop_provenance.direct_origin_mut() {
-        origin.prefix_legacy(&instance_identity);
-        origin.source_mut().scope_to_module(&instance_identity);
+        origin.prefix_legacy(instance_identity);
+        origin.source_mut().scope_to_module(instance_identity);
     }
     if let Some(origin) = module_call.loop_origin() {
         new_resource.loop_provenance.push_module_prefix(
-            crate::resource::LoopModulePrefixOrigin::new(
-                origin.clone(),
-                instance_identity,
-                origin.legacy_address().clone(),
-            ),
+            crate::resource::LoopModulePrefixOrigin::new(origin.clone(), instance_identity.clone()),
         );
     }
 
@@ -1774,6 +1793,8 @@ fn prefix_deferred_for_expression(
         binding,
         template_resource,
     } = d;
+    let instance_identity = ResourceIdentity::try_from(instance_prefix.to_string())
+        .expect("module instance prefix is non-empty");
 
     Ok(DeferredForExpression {
         // provenance — pass through (like WaitBinding.line)
@@ -1811,10 +1832,7 @@ fn prefix_deferred_for_expression(
             }
             crate::parser::DeferredForTarget::Unbound { template } => {
                 let mut template = template.clone();
-                let prefix =
-                    crate::resource::ResourceIdentity::try_from(instance_prefix.to_string())
-                        .expect("module instance prefix is non-empty");
-                template.prefix_for_module(&prefix);
+                template.prefix_for_module(&instance_identity);
                 crate::parser::DeferredForTarget::Unbound { template }
             }
         },
@@ -1825,9 +1843,10 @@ fn prefix_deferred_for_expression(
         binding: binding.clone(),
         // Full module-resource treatment — identical to a
         // `module.resources` entry.
-        template_resource: prefix_module_resource(
+        template_resource: prefix_module_resource_with_identity(
             template_resource,
             instance_prefix,
+            &instance_identity,
             module_name,
             module_instance_scope,
             module_call,
@@ -2988,7 +3007,6 @@ mod tests {
         provenance.push_module_prefix(crate::resource::LoopModulePrefixOrigin::new(
             origin,
             ResourceIdentity::new(current_prefix.clone()),
-            crate::resource::LegacyLoopAddress::new("_for0[0]"),
         ));
         resource.loop_provenance = provenance;
         let mut resources = vec![resource];

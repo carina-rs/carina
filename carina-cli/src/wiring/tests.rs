@@ -8282,6 +8282,56 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
 }
 
 #[test]
+fn unbound_deferred_create_absorbs_same_kind_anonymous_current_delete() {
+    let parsed = parse(
+        "let upstream = upstream_state { source = '../upstream' }\n\
+         for value in upstream.values {\n\
+           mock.test.Child { identity_input = value }\n\
+         }\n",
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("unbound deferred loop parses");
+    let target = DeferredCreateTarget::from_deferred(&parsed.deferred_for_expressions[0])
+        .expect("deferred target has a system identity");
+    let anonymous_id = ResolvedResourceId::with_provider_identity(
+        "mock",
+        "test.Child",
+        "mock_test_child_deadbeef",
+        None,
+    );
+    let mut plan = Plan::new();
+    plan.add(Effect::Delete {
+        id: anonymous_id.clone(),
+        identifier: crate::fixture_applied_identifier("old-child"),
+        generation: carina_core::effect::EffectGeneration::Current,
+        directives: Directives::default(),
+        binding: None,
+        dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: std::collections::HashSet::new(),
+    });
+
+    add_deferred_create_effects(&mut plan, &[target]);
+
+    let payload = plan
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::DeferredReplace(payload) => Some(payload),
+            _ => None,
+        })
+        .expect("anonymous current row must be owned by DeferredReplace");
+    assert_eq!(payload.deletes.len(), 1);
+    assert_eq!(payload.deletes[0].id, anonymous_id);
+    assert!(
+        plan.effects()
+            .iter()
+            .all(|effect| !matches!(effect, Effect::Delete { .. })),
+        "the anonymous delete must not race the runtime child as a standalone effect",
+    );
+}
+
+#[test]
 fn deferred_create_targets_absorb_matching_map_key_orphan_deletes() {
     let target = deferred_replace_test_target();
     let mut plan = Plan::new();

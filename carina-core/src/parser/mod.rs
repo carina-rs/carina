@@ -95,7 +95,7 @@ pub(crate) use grammar::{PreprocessedFile, preprocess_file};
 pub(crate) use blocks::module_call::parse_module_call;
 pub(crate) use blocks::resource::{
     ResourceParseTarget, parse_block_contents_with_mode, parse_read_resource_expr,
-    parse_resource_expr_for_target,
+    parse_resource_for_target,
 };
 pub(crate) use context::{ParseContext, extract_key_string, first_inner, next_pair};
 pub use expressions::for_expr::ForBinding;

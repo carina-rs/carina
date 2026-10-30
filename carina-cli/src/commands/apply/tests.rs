@@ -517,8 +517,7 @@ for account_id in orgs.accounts {
     )));
     assert!(targets.iter().any(|target| matches!(
         target,
-        carina_core::parser::DeferredForTarget::Unbound { template }
-            if template.file() == "main.crn"
+        carina_core::parser::DeferredForTarget::Unbound { .. }
     )));
 }
 

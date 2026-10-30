@@ -5848,6 +5848,86 @@ fn loop_identical_identity_inputs_renders_exact_moves() {
     );
 }
 
+#[test]
+fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
+    let fixture = tempfile::tempdir().expect("directory fixture");
+    std::fs::write(
+        fixture.path().join("bindings.crn"),
+        "let vpc = 'reserved'\n",
+    )
+    .expect("write sibling binding");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        "for cidr in ['10.0.0.0/16', '10.1.0.0/16'] {\n  mock.ec2.Vpc { identity_input = cidr }\n}\n",
+    )
+    .expect("write loop fixture");
+    let mut parsed = crate::config_loader::parse_directory(
+        fixture.path(),
+        &crate::parser::ProviderContext::default(),
+    )
+    .expect("directory parses");
+    let registry = loop_identity_registry(false);
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut parsed.resources, &[], &registry, &|_| {
+            Vec::new()
+        })
+        .expect_err("mutable-derived loop peers require a binding");
+
+    assert!(
+        error.to_string().contains("let vpc_2 = for cidr"),
+        "sibling value binding was not reserved: {error}",
+    );
+}
+
+#[test]
+fn loop_conflict_suggestion_reserves_later_value_bindings() {
+    let source = "for cidr in ['10.0.0.0/16', '10.1.0.0/16'] {\n  mock.ec2.Vpc { identity_input = cidr }\n}\nlet vpc = 'reserved'\n";
+    let mut resources = parse_loop_fixture(source, "later-binding.crn");
+    let registry = loop_identity_registry(false);
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("mutable-derived loop peers require a binding");
+
+    assert!(
+        error.to_string().contains("let vpc_2 = for cidr"),
+        "later value binding was not reserved: {error}",
+    );
+}
+
+#[test]
+fn multiple_collision_groups_choose_a_deterministic_error() {
+    let registry = loop_identity_registry(true);
+    let resource = |value: &str| {
+        Resource::pending_with_provider("mock", "ec2.Vpc", None).with_attribute(
+            "identity_input",
+            Value::Concrete(ConcreteValue::String(value.into())),
+        )
+    };
+    let fixture = vec![
+        resource("alpha"),
+        resource("alpha"),
+        resource("beta"),
+        resource("beta"),
+    ];
+    let mut messages = HashSet::new();
+
+    for _ in 0..64 {
+        let mut resources = fixture.clone();
+        let error =
+            compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+                .expect_err("both pairs collide");
+        messages.insert(error.to_string());
+    }
+
+    assert_eq!(
+        messages.len(),
+        1,
+        "HashMap iteration selected different collision groups: {messages:#?}",
+    );
+}
+
 fn resolved_single_loop_resource(provider_instance: Option<&str>) -> (Resource, SchemaRegistry) {
     let source = "for value in ['stable'] {\n  mock.ec2.Vpc {\n    identity_input = value\n  }\n}";
     let mut resources = parse_loop_fixture(source, "legacy.crn");
@@ -5876,6 +5956,60 @@ fn legacy_loop_detector_exact_match() {
         moves[0].to().identity_str(),
         resource.id.identity_str().expect("resolved destination")
     );
+}
+
+#[test]
+fn legacy_loop_detector_ignores_extra_persisted_provider_defaults() {
+    let (resource, registry) = resolved_single_loop_resource(None);
+    let mut state = loop_state_entry("_for0[0]", None, Some("stable"));
+    state
+        .create_only_values
+        .insert("provider_default".to_string(), "defaulted".to_string());
+
+    let moves = detect_legacy_loop_moves_for_test(
+        std::slice::from_ref(&resource),
+        &registry,
+        &[state],
+        &StateBlockClaims::empty(),
+        &[],
+    );
+
+    assert_eq!(
+        moves.len(),
+        1,
+        "desired stable inputs uniquely identify the row"
+    );
+}
+
+#[test]
+fn legacy_loop_detector_refuses_a_mismatching_desired_input() {
+    let (resource, registry) = resolved_single_loop_resource(None);
+    let moves = detect_legacy_loop_moves_for_test(
+        &[resource],
+        &registry,
+        &[loop_state_entry("_for0[0]", None, Some("different"))],
+        &StateBlockClaims::empty(),
+        &[],
+    );
+
+    assert!(
+        moves.is_empty(),
+        "a mismatching authored value is negative evidence"
+    );
+}
+
+#[test]
+fn moved_to_rejects_a_legacy_segment_below_a_module_prefix() {
+    let parsed = crate::parser::parse(
+        "moved {\n  from = mock.ec2.Vpc 'old'\n  to = mock.ec2.Vpc 'net._for0[0]'\n}\n",
+        &crate::parser::ProviderContext::default(),
+    )
+    .expect("moved block parses");
+
+    let errors = check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[]);
+
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].to_string().contains("net._for0[0]"));
 }
 
 #[test]
@@ -5948,13 +6082,11 @@ fn legacy_loop_detector_moves_named_and_anonymous_module_leaves() {
         .expect("seed loop origin")
         .clone();
     let current_prefix = ResourceIdentity::new("web_0123456789abcdef");
-    let legacy_prefix = outer_origin.legacy_address().clone();
     let provenance = || {
         let mut provenance = LoopProvenance::default();
         provenance.push_module_prefix(LoopModulePrefixOrigin::new(
             outer_origin.clone(),
             current_prefix.clone(),
-            legacy_prefix.clone(),
         ));
         provenance
     };

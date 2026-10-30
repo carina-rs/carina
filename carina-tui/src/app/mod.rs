@@ -703,9 +703,11 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                     r.id().identity_display().to_string()
                 }
             };
-            let name_part = effect.loop_origin().map_or(name_part.clone(), |origin| {
-                format!("{name_part}  {}", origin.display_suffix())
-            });
+            let mut name_part = name_part;
+            if let Some(origin) = effect.loop_origin() {
+                name_part.push_str("  ");
+                origin.append_display_suffix(&mut name_part);
+            }
 
             nodes[idx].resource_type = display_type.clone();
             nodes[idx].name_part = name_part.clone();
@@ -715,7 +717,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
             let mut name_part = to.identity_str().to_string();
             if let Some(origin) = effect.loop_origin() {
                 name_part.push_str("  ");
-                name_part.push_str(&origin.display_suffix());
+                origin.append_display_suffix(&mut name_part);
             }
             nodes[idx].resource_type = display_type.clone();
             nodes[idx].name_part = name_part.clone();

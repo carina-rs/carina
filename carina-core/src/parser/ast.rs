@@ -57,16 +57,6 @@ impl DeferredForTarget {
         }
     }
 
-    pub(crate) fn element_origin(
-        &self,
-        element: ForLoopElement,
-    ) -> Option<crate::resource::LoopElementOrigin> {
-        match self {
-            Self::Bound { .. } => None,
-            Self::Unbound { template } => Some(template.element_origin(element)),
-        }
-    }
-
     pub(crate) fn same_system_target(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Bound { binding: left }, Self::Bound { binding: right }) => left == right,
@@ -90,6 +80,15 @@ impl DeferredForTarget {
     pub(crate) fn set_loop_display_file(&mut self, file: &str) {
         if let Self::Unbound { template } = self {
             template.set_display_file(file);
+        }
+    }
+
+    pub(crate) fn set_loop_binding_scope(
+        &mut self,
+        binding_scope: std::sync::Arc<std::collections::BTreeSet<String>>,
+    ) {
+        if let Self::Unbound { template } = self {
+            template.set_binding_scope(binding_scope);
         }
     }
 }
@@ -2655,6 +2654,32 @@ impl<E> Default for File<E> {
 }
 
 impl<E> File<E> {
+    pub(crate) fn set_loop_binding_scope(
+        &mut self,
+        binding_scope: std::collections::BTreeSet<String>,
+    ) {
+        let binding_scope = std::sync::Arc::new(binding_scope);
+        for resource in &mut self.resources {
+            resource
+                .loop_provenance
+                .set_binding_scope(std::sync::Arc::clone(&binding_scope));
+        }
+        for call in &mut self.module_calls {
+            if let Some(origin) = call.loop_origin_mut() {
+                origin.set_binding_scope(std::sync::Arc::clone(&binding_scope));
+            }
+        }
+        for deferred in &mut self.deferred_for_expressions {
+            deferred
+                .target
+                .set_loop_binding_scope(std::sync::Arc::clone(&binding_scope));
+            deferred
+                .template_resource
+                .loop_provenance
+                .set_binding_scope(std::sync::Arc::clone(&binding_scope));
+        }
+    }
+
     pub fn bare_binding_uses(&self) -> &ParsedBindingUses {
         &self.parsed_binding_uses
     }
@@ -3204,25 +3229,18 @@ fn build_expanded_child<S: Clone>(
 ) -> Result<Resource<S>, DeferredForExpansionError> {
     let mut resource = match &deferred.target {
         DeferredForTarget::Bound { binding } => {
-            let address = match &element {
-                ForLoopElement::Index(index) => format!("{binding}[{index}]"),
-                ForLoopElement::Key(key) => crate::utils::map_key_address(binding, key),
-            };
+            let address = element.address(binding);
             let mut resource = deferred
                 .template_resource
                 .instantiate_with_identity(ResourceIdentity::new(address.clone()));
             resource.binding = Some(address);
             resource
         }
-        DeferredForTarget::Unbound { .. } => {
+        DeferredForTarget::Unbound { template } => {
             let mut resource = deferred.template_resource.instantiate();
             resource.binding = None;
-            resource.loop_provenance = crate::resource::LoopProvenance::direct(
-                deferred
-                    .target
-                    .element_origin(element)
-                    .expect("unbound target produces loop provenance"),
-            );
+            resource.loop_provenance =
+                crate::resource::LoopProvenance::direct(template.element_origin(element));
             resource
         }
     };

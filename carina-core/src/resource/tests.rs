@@ -1,5 +1,6 @@
 use super::*;
 use crate::explicit::ExplicitFields;
+use crate::parser::SourceSpan;
 
 #[test]
 fn module_argument_source_location_is_not_value_data() {
@@ -2477,6 +2478,133 @@ fn live_module_source_equality_and_hash_use_call_path_identity() {
     );
 }
 
+fn expected_stable_loop_scheduler_key(
+    file: &str,
+    start: usize,
+    end: usize,
+    kind: LoopKind,
+    module_scope: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn component(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = Sha256::new();
+    component(&mut hasher, file.as_bytes());
+    hasher.update((start as u64).to_be_bytes());
+    hasher.update((end as u64).to_be_bytes());
+    hasher.update([match kind {
+        LoopKind::For => 0,
+        LoopKind::If => 1,
+    }]);
+    match module_scope {
+        Some(scope) => {
+            hasher.update([1]);
+            component(&mut hasher, scope.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    format!("_loop_{}", hex::encode(&hasher.finalize()[..8]))
+}
+
+#[test]
+fn loop_scheduler_identity_uses_the_persisted_stable_hash_contract() {
+    let source = "for value in ['one'] { mock.test.Leaf { value = value } }";
+    let parsed = crate::parser::parse_file(
+        source,
+        std::path::Path::new("stable.crn"),
+        &crate::parser::ProviderContext::default(),
+    )
+    .expect("loop parses");
+    let origin = parsed.resources[0]
+        .loop_provenance
+        .direct_origin()
+        .expect("loop origin");
+    let span = origin.source().source_span().expect("authored span");
+
+    assert_eq!(
+        origin.source().scheduler_key(),
+        expected_stable_loop_scheduler_key(
+            "stable.crn",
+            span.start_byte(),
+            span.end_byte(),
+            LoopKind::For,
+            None,
+        ),
+    );
+}
+
+#[test]
+fn scoped_for_and_if_loop_sources_keep_distinct_system_identities() {
+    let span = SourceSpan::dummy();
+    let mut for_source = LoopSource::authored(
+        std::path::Path::new("module/main.crn"),
+        span,
+        "for value in xs {}",
+        LoopKind::For,
+    );
+    let mut if_source = LoopSource::authored(
+        std::path::Path::new("module/main.crn"),
+        span,
+        "if enabled {}",
+        LoopKind::If,
+    );
+    let scope = ResourceIdentity::new("network");
+    let for_parent = for_source.scheduler_key().to_string();
+    let if_parent = if_source.scheduler_key().to_string();
+
+    for_source.scope_to_module(&scope);
+    if_source.scope_to_module(&scope);
+
+    assert_eq!(
+        for_source.scheduler_key(),
+        expected_stable_loop_scheduler_key(
+            &for_parent,
+            for_source.line(),
+            for_source.column(),
+            LoopKind::For,
+            Some("network"),
+        ),
+    );
+    assert_eq!(
+        if_source.scheduler_key(),
+        expected_stable_loop_scheduler_key(
+            &if_parent,
+            if_source.line(),
+            if_source.column(),
+            LoopKind::If,
+            Some("network"),
+        ),
+    );
+}
+
+#[test]
+fn saved_nested_module_source_preserves_live_anonymous_scope() {
+    let outer = ModuleInstanceScope::for_call("outer", Some("outer"), "outer");
+    let child = ModuleInstanceScope::for_call("inner", Some("inner"), "inner");
+    let call = CompositionCall {
+        id: crate::parser::ModuleCallId::test_dummy_in("nested.crn"),
+        module_name: "outer".to_string(),
+        binding: Some("outer".to_string()),
+        instance: "outer".to_string(),
+        module_source: Some("./outer".to_string()),
+        module_directory: None,
+        loop_origin: None,
+    };
+    let live = ModuleSource::expanded_module(
+        "outer",
+        "outer",
+        outer.with_child(&child),
+        CompositionCallPath::direct(call),
+    );
+    let saved = SavedModuleSource::from(&live);
+
+    assert_eq!(live.anonymous_scope(), saved.anonymous_scope());
+}
+
 #[test]
 fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_types() {
     let call = CompositionCall {
@@ -2509,7 +2637,7 @@ fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_
 
     assert!(matches!(
         &decoded.module_source,
-        Some(SavedModuleSource::Module { name, instance })
+        Some(SavedModuleSource::Module { name, instance, .. })
             if name == "fixture" && instance == "instance"
     ));
     assert_eq!(
@@ -2531,7 +2659,7 @@ fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_
         serde_json::from_value(encoded.clone()).expect("deserialize saved data-source metadata");
     assert!(matches!(
         &decoded.module_source,
-        Some(SavedModuleSource::Module { name, instance })
+        Some(SavedModuleSource::Module { name, instance, .. })
             if name == "fixture" && instance == "instance"
     ));
     assert_eq!(

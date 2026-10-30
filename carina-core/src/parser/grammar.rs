@@ -37,7 +37,6 @@ impl PreprocessedFile {
         pair: &pest::iterators::Pair<'_, Rule>,
         kind: crate::resource::LoopKind,
         source_file: &std::path::Path,
-        occupied_bindings: std::collections::BTreeSet<String>,
     ) -> crate::resource::LoopSource {
         // Pest's implicit whitespace around an optional trailing clause makes
         // an `if` without `else` consume the newline after its closing brace.
@@ -46,13 +45,7 @@ impl PreprocessedFile {
         let mut range = crate::parser::SourceSpan::preprocessed_range(pair);
         range.end -= pair.as_str().len() - pair.as_str().trim_end().len();
         let span = crate::parser::SourceSpan::from_preprocessed_range(range.start, range.end, self);
-        crate::resource::LoopSource::authored(
-            source_file,
-            span,
-            self.original_slice(range),
-            kind,
-            occupied_bindings,
-        )
+        crate::resource::LoopSource::authored(source_file, span, self.original_slice(range), kind)
     }
 }
 

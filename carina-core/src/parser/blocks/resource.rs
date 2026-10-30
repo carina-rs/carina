@@ -32,7 +32,6 @@ pub(in crate::parser) fn parse_anonymous_resource(
         ResourceParseTarget::Pending { origin: None },
         preprocessed_file,
         source_file,
-        "anonymous resource",
     )
 }
 
@@ -41,31 +40,17 @@ pub(crate) enum ResourceParseTarget {
     Bound { binding: String },
 }
 
-pub(crate) fn parse_resource_expr_for_target(
+pub(crate) fn parse_resource_for_target(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     target: ResourceParseTarget,
     preprocessed_file: &crate::parser::PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<Resource, ParseError> {
-    parse_resource_for_target(
-        pair,
-        ctx,
-        target,
-        preprocessed_file,
-        source_file,
-        "resource expression",
-    )
-}
-
-fn parse_resource_for_target(
-    pair: pest::iterators::Pair<Rule>,
-    ctx: &ParseContext,
-    target: ResourceParseTarget,
-    preprocessed_file: &crate::parser::PreprocessedFile,
-    source_file: &std::path::Path,
-    context: &'static str,
-) -> Result<Resource, ParseError> {
+    let context = match pair.as_rule() {
+        Rule::anonymous_resource => "anonymous resource",
+        _ => "resource expression",
+    };
     let mut iter = pair.into_inner();
     let namespaced_type = next_pair(&mut iter, "resource type", context)?
         .as_str()
@@ -358,7 +343,7 @@ pub(crate) fn parse_resource_expr(
     preprocessed_file: &crate::parser::PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<Resource, ParseError> {
-    parse_resource_expr_for_target(
+    parse_resource_for_target(
         pair,
         ctx,
         ResourceParseTarget::Bound {

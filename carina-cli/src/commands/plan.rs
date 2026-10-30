@@ -1427,6 +1427,24 @@ impl PlanFile {
             Ok(())
         }
 
+        fn validate_deferred_template(
+            template: &carina_core::parser::SavedDeferredForExpression,
+            location: &str,
+        ) -> Result<(), String> {
+            match &template.target {
+                carina_core::parser::DeferredForTarget::Bound { binding } => {
+                    require_identity(&template.template_resource.id, location)?;
+                    if template.template_resource.id.identity_str() != Some(binding.as_str()) {
+                        return Err(format!(
+                            "Invalid saved plan: {location} identity does not match bound deferred target `{binding}`"
+                        ));
+                    }
+                    Ok(())
+                }
+                carina_core::parser::DeferredForTarget::Unbound { .. } => Ok(()),
+            }
+        }
+
         for (index, resource) in self.sorted_resources.iter().enumerate() {
             require_identity(&resource.id, &format!("sorted_resources[{index}]"))?;
         }
@@ -1548,15 +1566,14 @@ impl PlanFile {
                 }
                 Effect::DeferredCreate { id, template, .. } => {
                     require_identity(id, &location)?;
-                    // A deferred template is not a live resource address. An
-                    // unbound loop deliberately keeps its template pending
-                    // until materialization assigns each child's anonymous
-                    // identity; the field-specific format-29 codec preserves
-                    // that one allowed pending identity.
-                    let _ = template;
+                    validate_deferred_template(template, &format!("{location}.template_resource"))?;
                 }
                 Effect::DeferredReplace(payload) => {
                     require_identity(&payload.id, &location)?;
+                    validate_deferred_template(
+                        &payload.template,
+                        &format!("{location}.template_resource"),
+                    )?;
                     for (delete_index, delete) in payload.deletes.iter().enumerate() {
                         require_identity(
                             &delete.id,

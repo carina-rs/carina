@@ -5975,7 +5975,14 @@ impl ModuleCallSource {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SavedModuleSource {
     Root,
-    Module { name: String, instance: String },
+    Module {
+        name: String,
+        instance: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_description: Option<String>,
+    },
 }
 
 /// Source marker for resources after module provenance has been deliberately
@@ -6020,9 +6027,17 @@ impl AnonymousIdentityModuleSource for SavedModuleSource {
     fn anonymous_scope(&self) -> Option<(String, String)> {
         match self {
             Self::Root => None,
-            Self::Module { instance, .. } => {
-                Some((instance.clone(), format!("module instance '{instance}'")))
-            }
+            Self::Module {
+                instance,
+                scope_key,
+                scope_description,
+                ..
+            } => Some((
+                scope_key.clone().unwrap_or_else(|| instance.clone()),
+                scope_description
+                    .clone()
+                    .unwrap_or_else(|| format!("module instance '{instance}'")),
+            )),
         }
     }
 }
@@ -6041,10 +6056,19 @@ impl From<&ModuleSource> for SavedModuleSource {
     fn from(source: &ModuleSource) -> Self {
         match source {
             ModuleSource::Root => Self::Root,
-            ModuleSource::Module(module) => Self::Module {
-                name: module.name.clone(),
-                instance: module.instance.clone(),
-            },
+            ModuleSource::Module(module) => {
+                let direct_description = format!("module instance '{}'", module.instance);
+                let scope_key =
+                    (module.scope.key() != module.instance).then(|| module.scope.key().to_string());
+                let description = module.scope.description();
+                let scope_description = (description != direct_description).then_some(description);
+                Self::Module {
+                    name: module.name.clone(),
+                    instance: module.instance.clone(),
+                    scope_key,
+                    scope_description,
+                }
+            }
         }
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use crate::parser::{
     DeferredForExpansionError, DeferredForExpression, ShapeMismatch, expand_deferred_children,
 };
 use crate::resource::ResolvedResource;
+use crate::resource::ResourceId;
 
 #[derive(Clone, Copy)]
 pub(super) struct DeferredIdentityInputs<'a> {
@@ -45,6 +47,78 @@ pub(super) enum DeferredCreateFailure {
     AnonymousIdentity {
         message: String,
     },
+    AnonymousIdentityCollision {
+        id: ResourceId,
+        occupied_by: AnonymousIdentityCollisionSource,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AnonymousIdentityCollisionSource {
+    DesiredPlan,
+    CurrentState,
+    DeferredChild,
+}
+
+/// Apply-run ownership domain for IDs minted by unbound deferred loops.
+pub(super) struct DeferredAnonymousIdentityGuard {
+    desired: HashSet<ResourceId>,
+    current: HashSet<ResourceId>,
+    absorbed_current: HashSet<ResourceId>,
+    materialized: HashSet<ResourceId>,
+}
+
+impl DeferredAnonymousIdentityGuard {
+    pub(super) fn new(
+        desired: HashSet<ResourceId>,
+        current: HashSet<ResourceId>,
+        absorbed_current: HashSet<ResourceId>,
+    ) -> Self {
+        Self {
+            desired,
+            current,
+            absorbed_current,
+            materialized: HashSet::new(),
+        }
+    }
+
+    pub(super) fn admit<S>(
+        &mut self,
+        template: &DeferredForExpression<S>,
+        children: &[Effect<S>],
+    ) -> Result<(), DeferredCreateFailure> {
+        if !matches!(
+            template.target,
+            crate::parser::DeferredForTarget::Unbound { .. }
+        ) {
+            return Ok(());
+        }
+
+        let mut batch = HashSet::new();
+        for child in children {
+            let Effect::Create(resource) = child else {
+                continue;
+            };
+            let id = &resource.id;
+            let occupied_by = if self.desired.contains(id) {
+                Some(AnonymousIdentityCollisionSource::DesiredPlan)
+            } else if self.current.contains(id) && !self.absorbed_current.contains(id) {
+                Some(AnonymousIdentityCollisionSource::CurrentState)
+            } else if self.materialized.contains(id) || !batch.insert(id.clone()) {
+                Some(AnonymousIdentityCollisionSource::DeferredChild)
+            } else {
+                None
+            };
+            if let Some(occupied_by) = occupied_by {
+                return Err(DeferredCreateFailure::AnonymousIdentityCollision {
+                    id: id.clone(),
+                    occupied_by,
+                });
+            }
+        }
+        self.materialized.extend(batch);
+        Ok(())
+    }
 }
 
 impl DeferredCreateFailure {
@@ -80,6 +154,20 @@ impl DeferredCreateFailure {
             ),
             DeferredCreateFailure::ValueAccess { error } => error.to_string(),
             DeferredCreateFailure::AnonymousIdentity { message } => message.clone(),
+            DeferredCreateFailure::AnonymousIdentityCollision { id, occupied_by } => {
+                let owner = match occupied_by {
+                    AnonymousIdentityCollisionSource::DesiredPlan => "a desired plan resource",
+                    AnonymousIdentityCollisionSource::CurrentState => {
+                        "an unabsorbed current-state row"
+                    }
+                    AnonymousIdentityCollisionSource::DeferredChild => {
+                        "another apply-time deferred child"
+                    }
+                };
+                format!(
+                    "anonymous deferred-loop identity collided at `{id}`: the address is already owned by {owner}"
+                )
+            }
         }
     }
 }
@@ -143,31 +231,11 @@ pub(super) fn materialize_deferred_create<
         template.target,
         crate::parser::DeferredForTarget::Unbound { .. }
     ) {
-        let providers = crate::value::canonicalize_provider_configs_with_schemas(
-            identity_inputs.provider_configs,
-            &|provider| {
-                crate::provider::find_factory(identity_inputs.factories, provider)
-                    .map(crate::provider::ProviderFactory::provider_config_attribute_types)
-            },
-        )
-        .map_err(|error| DeferredCreateFailure::AnonymousIdentity {
-            message: error.to_string(),
-        })?;
-        crate::identifier::compute_anonymous_identifiers_with_provider_configs(
+        crate::identifier::compute_anonymous_identifiers_with_factories(
             &mut resources,
-            &providers,
+            identity_inputs.provider_configs,
+            identity_inputs.factories,
             identity_inputs.schemas,
-            &|provider| {
-                crate::provider::find_factory(identity_inputs.factories, provider)
-                    .map(|factory| {
-                        factory
-                            .identity_attributes()
-                            .into_iter()
-                            .map(str::to_string)
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            },
         )
         .map_err(|error| DeferredCreateFailure::AnonymousIdentity {
             message: error.to_string(),
@@ -206,6 +274,23 @@ pub(super) struct PureMetaCtx<'a, S> {
     pub(super) identity_inputs: DeferredIdentityInputs<'a>,
 }
 
+pub(super) fn report_deferred_create_failure<S>(
+    effect: &Effect<S>,
+    error: &DeferredCreateFailure,
+    ctx: &PureMetaCtx<'_, S>,
+) {
+    let message = error.message();
+    ctx.observer.on_event(&ExecutionEvent::EffectFailed {
+        effect,
+        error: &message,
+        duration: Duration::ZERO,
+        progress: ProgressInfo {
+            completed: ctx.completed.load(Ordering::Relaxed),
+            total: ctx.total,
+        },
+    });
+}
+
 /// Dispatch a DeferredCreate meta-effect by materializing its runtime
 /// `Effect::Create` children, or emitting the meta-effect failure event when
 /// upstream state is missing or has the wrong shape.
@@ -220,16 +305,7 @@ pub(super) fn dispatch_deferred_create<
     match materialize_deferred_create(template, bindings, &ctx.identity_inputs) {
         Ok(children) => DeferredDispatchResult::Materialized(children),
         Err(err) => {
-            let message = err.message();
-            ctx.observer.on_event(&ExecutionEvent::EffectFailed {
-                effect,
-                error: &message,
-                duration: Duration::ZERO,
-                progress: ProgressInfo {
-                    completed: ctx.completed.load(Ordering::Relaxed),
-                    total: ctx.total,
-                },
-            });
+            report_deferred_create_failure(effect, &err, ctx);
             DeferredDispatchResult::MaterializeFailed
         }
     }

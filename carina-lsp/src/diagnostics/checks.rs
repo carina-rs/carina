@@ -661,19 +661,6 @@ impl DiagnosticEngine {
         directory: &ParsedFile,
     ) -> Vec<Diagnostic> {
         let mut resources = directory.resources.clone();
-        let canonical_providers =
-            match carina_core::value::canonicalize_provider_configs_with_schemas(
-                &directory.providers,
-                &|provider_name| {
-                    self.factories
-                        .iter()
-                        .find(|factory| factory.name() == provider_name)
-                        .map(|factory| factory.provider_config_attribute_types())
-                },
-            ) {
-                Ok(providers) => providers,
-                Err(_) => return Vec::new(),
-            };
         let mut canonical_resources = match carina_core::value::canonicalize_resources_with_schemas(
             &mut resources,
             &self.schemas,
@@ -681,31 +668,20 @@ impl DiagnosticEngine {
             Ok(resources) => resources,
             Err(_) => return Vec::new(),
         };
-        let identity_result =
-            carina_core::identifier::compute_anonymous_identifiers_with_provider_configs(
-                canonical_resources.as_mut_slice(),
-                &canonical_providers,
-                &self.schemas,
-                &|provider_name| {
-                    self.factories
-                        .iter()
-                        .find(|factory| factory.name() == provider_name)
-                        .map(|factory| {
-                            factory
-                                .identity_attributes()
-                                .into_iter()
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                },
-            );
+        let identity_result = carina_core::identifier::compute_anonymous_identifiers_with_factories(
+            canonical_resources.as_mut_slice(),
+            &directory.providers,
+            &self.factories,
+            &self.schemas,
+        );
         let current_name = doc
             .source_file()
             .file_name()
             .map(|name| name.to_string_lossy());
         match identity_result {
-            Err(carina_core::identifier::AnonymousIdentityError::Loop(conflict)) => {
+            Err(carina_core::identifier::AnonymousIdentityComputationError::Identity(
+                carina_core::identifier::AnonymousIdentityError::Loop(conflict),
+            )) => {
                 if current_name.as_deref() != Some(conflict.file()) {
                     return Vec::new();
                 }

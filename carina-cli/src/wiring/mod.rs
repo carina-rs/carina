@@ -2415,26 +2415,6 @@ fn refreshed_prefix_state_info(
     )
 }
 
-/// Look up a provider's identity attributes through its factory.
-fn identity_attributes_for_provider(ctx: &WiringContext, name: &str) -> Vec<String> {
-    provider_mod::find_factory(ctx.factories(), name)
-        .map(|f| {
-            f.identity_attributes()
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn provider_config_schema_for(
-    ctx: &WiringContext,
-    provider_name: &str,
-) -> Option<carina_core::schema::ValidatedConfigSchema> {
-    provider_mod::find_factory(ctx.factories(), provider_name)
-        .map(|factory| factory.provider_config_attribute_types())
-}
-
 /// Persisted rows indexed at their effective addresses after every move that
 /// has already been applied to [`AddressedState`].
 struct AnonymousReconciliationStateView {
@@ -2635,14 +2615,27 @@ fn detect_anonymous_to_named_moves_with_ctx(
 ) -> Result<Vec<ResolvedMove>, AppError> {
     let canonical_providers = carina_core::value::canonicalize_provider_configs_with_schemas(
         providers,
-        &|provider_name| provider_config_schema_for(ctx, provider_name),
+        &|provider_name| {
+            provider_mod::find_factory(ctx.factories(), provider_name)
+                .map(ProviderFactory::provider_config_attribute_types)
+        },
     )?;
     Ok(identifier::detect_anonymous_to_named_renames(
         resources,
         ctx.schemas(),
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &canonical_providers,
-        &|name| identity_attributes_for_provider(ctx, name),
+        &|name| {
+            provider_mod::find_factory(ctx.factories(), name)
+                .map(|factory| {
+                    factory
+                        .identity_attributes()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        },
         claims,
     ))
 }
@@ -2680,9 +2673,7 @@ pub(crate) fn reconcile_late_anonymous_identities(
         ctx.schemas(),
     )?;
     let errors = compute_anonymous_identifiers_with_ctx(ctx, canonical_resources, inputs.providers);
-    if let Some(error) = errors.into_iter().next() {
-        return Err(error);
-    }
+    errors.into_iter().next().map_or(Ok(()), Err)?;
 
     let moves = inputs.state_file.map_or_else(Vec::new, |state_file| {
         let state_view =
@@ -2747,19 +2738,19 @@ pub fn compute_anonymous_identifiers_with_ctx(
     mut resources: carina_core::value::CanonicalizedResources<'_>,
     providers: &[ProviderConfig],
 ) -> Vec<AppError> {
-    let canonical_providers = match canonicalized_provider_configs_for_identifiers(ctx, providers) {
-        Ok(providers) => providers,
-        Err(error) => return vec![error],
-    };
-
-    match identifier::compute_anonymous_identifiers_with_provider_configs(
+    match identifier::compute_anonymous_identifiers_with_factories(
         resources.as_mut_slice(),
-        &canonical_providers,
+        providers,
+        ctx.factories(),
         ctx.schemas(),
-        &|name| identity_attributes_for_provider(ctx, name),
     ) {
         Ok(()) => Vec::new(),
-        Err(error) => vec![error.into()],
+        Err(identifier::AnonymousIdentityComputationError::ProviderConfig(error)) => {
+            vec![error.into()]
+        }
+        Err(identifier::AnonymousIdentityComputationError::Identity(error)) => {
+            vec![error.into()]
+        }
     }
 }
 
@@ -2768,32 +2759,16 @@ pub(crate) fn compute_canonical_pair_anonymous_identifiers_with_ctx<E>(
     resources: &mut CanonicalResourcePair<E>,
     providers: &[ProviderConfig],
 ) -> Result<Vec<AppError>, AppError> {
-    let canonical_providers = match canonicalized_provider_configs_for_identifiers(ctx, providers) {
-        Ok(providers) => providers,
-        Err(error) => return Ok(vec![error]),
-    };
-
     match resources.canonicalize_and_compute_anonymous_identifiers(
         ctx.schemas(),
-        &canonical_providers,
-        &|name| identity_attributes_for_provider(ctx, name),
+        providers,
+        ctx.factories(),
     ) {
         Ok(()) => Ok(Vec::new()),
         Err(CanonicalResourceIdentityError::EnumCanonicalization(error)) => Err(error.into()),
+        Err(CanonicalResourceIdentityError::ProviderConfig(error)) => Ok(vec![error.into()]),
         Err(CanonicalResourceIdentityError::Identity(error)) => Ok(vec![error.into()]),
     }
-}
-
-fn canonicalized_provider_configs_for_identifiers(
-    ctx: &WiringContext,
-    providers: &[ProviderConfig],
-) -> Result<carina_core::value::CanonicalizedProviderConfigs, AppError> {
-    Ok(
-        carina_core::value::canonicalize_provider_configs_with_schemas(
-            providers,
-            &|provider_name| provider_config_schema_for(ctx, provider_name),
-        )?,
-    )
 }
 
 /// Encapsulates the plan-time normalization pipeline.
@@ -5979,10 +5954,7 @@ impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
         providers: &[ProviderConfig],
     ) -> Result<(), AppError> {
         let errors = compute_canonical_pair_anonymous_identifiers_with_ctx(ctx, self, providers)?;
-        match errors.into_iter().next() {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        errors.into_iter().next().map_or(Ok(()), Err)
     }
 
     fn expand_partitioned<F>(
@@ -7563,7 +7535,7 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
                     identifier,
                     generation: EffectGeneration::Current,
                     directives,
-                    binding: Some(binding),
+                    binding,
                     dependencies,
                     explicit_dependencies,
                     blocked_by_updates,
@@ -7572,21 +7544,31 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
                     return None;
                 };
 
-                if id.resource_type == target.template.template_resource.id.resource_type
-                    && binding_matches_deferred_template(binding, &target.template.target)
+                if deletes_to_absorb.contains(id.as_inner())
+                    || id.provider != target.template.template_resource.id.provider
+                    || id.resource_type != target.template.template_resource.id.resource_type
+                    || id.provider_instance
+                        != target.template.template_resource.id.provider_instance
                 {
-                    Some(DeferredReplaceDelete {
-                        id: id.clone(),
-                        identifier: identifier.clone(),
-                        directives: directives.clone(),
-                        binding: Some(binding.clone()),
-                        dependencies: dependencies.clone(),
-                        explicit_dependencies: explicit_dependencies.clone(),
-                        blocked_by_updates: blocked_by_updates.clone(),
-                    })
-                } else {
-                    None
+                    return None;
                 }
+                let matches = match &target.template.target {
+                    carina_core::parser::DeferredForTarget::Bound { .. } => {
+                        binding.as_deref().is_some_and(|binding| {
+                            binding_matches_deferred_template(binding, &target.template.target)
+                        })
+                    }
+                    carina_core::parser::DeferredForTarget::Unbound { .. } => binding.is_none(),
+                };
+                matches.then(|| DeferredReplaceDelete {
+                    id: id.clone(),
+                    identifier: identifier.clone(),
+                    directives: directives.clone(),
+                    binding: binding.clone(),
+                    dependencies: dependencies.clone(),
+                    explicit_dependencies: explicit_dependencies.clone(),
+                    blocked_by_updates: blocked_by_updates.clone(),
+                })
             })
             .collect();
 

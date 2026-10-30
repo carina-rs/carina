@@ -86,6 +86,8 @@ pub enum CanonicalResourceIdentityError {
     #[error(transparent)]
     EnumCanonicalization(#[from] carina_core::value::EnumCanonicalizationError),
     #[error(transparent)]
+    ProviderConfig(#[from] carina_core::value::ProviderConfigCanonicalizationError),
+    #[error(transparent)]
     Identity(#[from] carina_core::identifier::AnonymousIdentityError),
 }
 
@@ -152,20 +154,27 @@ impl<E> CanonicalResourcePair<E> {
     pub fn canonicalize_and_compute_anonymous_identifiers(
         &mut self,
         registry: &carina_core::schema::SchemaRegistry,
-        providers: &carina_core::value::CanonicalizedProviderConfigs,
-        identity_attributes: &dyn Fn(&str) -> Vec<String>,
+        providers: &[carina_core::parser::ProviderConfig],
+        factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     ) -> Result<(), CanonicalResourceIdentityError> {
         let mut resources = carina_core::value::canonicalize_resources_with_schemas(
             &mut self.parsed.resources,
             registry,
         )?;
-        carina_core::identifier::compute_anonymous_identifiers_with_provider_configs(
+        carina_core::identifier::compute_anonymous_identifiers_with_factories(
             resources.as_mut_slice(),
             providers,
+            factories,
             registry,
-            identity_attributes,
         )
-        .map_err(CanonicalResourceIdentityError::Identity)
+        .map_err(|error| match error {
+            carina_core::identifier::AnonymousIdentityComputationError::ProviderConfig(error) => {
+                CanonicalResourceIdentityError::ProviderConfig(error)
+            }
+            carina_core::identifier::AnonymousIdentityComputationError::Identity(error) => {
+                CanonicalResourceIdentityError::Identity(error)
+            }
+        })
     }
 
     /// Reconcile generated prefix values against state while retaining the

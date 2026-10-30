@@ -730,7 +730,7 @@ fn node_from_effect(
 
     if let Some(origin) = effect.loop_origin() {
         label.push_str("  ");
-        label.push_str(&origin.display_suffix());
+        origin.append_display_suffix(&mut label);
     }
 
     attribute_names.sort();

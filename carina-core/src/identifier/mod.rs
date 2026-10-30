@@ -6,9 +6,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::effect::ResolvedMove;
-#[cfg(test)]
 use crate::parser::ProviderConfig;
 use crate::parser::{SourceSpan, StateBlock, StateBlockAddress};
+use crate::provider::ProviderFactory;
 use crate::resource::{
     AnonymousIdentityModuleSource, ConcreteValue, DataSource, DeferredValue, LegacyLoopAddress,
     LoopElementOrigin, PendingReRead, ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
@@ -329,7 +329,7 @@ impl std::error::Error for AttributeDerivedAnonymousResourceConflict {}
 
 /// Why one authored unbound loop cannot receive anonymous identities safely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoopConflictReason {
+pub(crate) enum LoopConflictReason {
     AttributeDerived,
     IdenticalIdentityInputs,
 }
@@ -361,16 +361,8 @@ impl LoopAnonymousIdentityConflict {
         self.origin.line()
     }
 
-    pub fn column(&self) -> usize {
-        self.origin.column()
-    }
-
     pub fn source_span(&self) -> Option<crate::parser::SourceSpan> {
         self.origin.source().source_span()
-    }
-
-    pub fn reason(&self) -> LoopConflictReason {
-        self.reason
     }
 }
 
@@ -455,6 +447,47 @@ pub enum AnonymousIdentityError {
     LegacyMoveTarget(Box<LegacyLoopMoveTargetError>),
 }
 
+/// Failure at either typed-input boundary of anonymous identity assignment.
+#[derive(Debug, thiserror::Error)]
+pub enum AnonymousIdentityComputationError {
+    #[error(transparent)]
+    ProviderConfig(#[from] crate::value::ProviderConfigCanonicalizationError),
+    #[error(transparent)]
+    Identity(#[from] AnonymousIdentityError),
+}
+
+/// Canonicalize provider identity inputs and assign anonymous resource IDs
+/// through the same factory lookup on every plan, editor, and apply path.
+pub fn compute_anonymous_identifiers_with_factories<S: AnonymousIdentityModuleSource>(
+    resources: &mut [Resource<S>],
+    providers: &[ProviderConfig],
+    factories: &[Box<dyn ProviderFactory>],
+    registry: &SchemaRegistry,
+) -> Result<(), AnonymousIdentityComputationError> {
+    let providers =
+        crate::value::canonicalize_provider_configs_with_schemas(providers, &|provider_name| {
+            crate::provider::find_factory(factories, provider_name)
+                .map(ProviderFactory::provider_config_attribute_types)
+        })?;
+    compute_anonymous_identifiers_with_provider_configs(
+        resources,
+        &providers,
+        registry,
+        &|provider_name| {
+            crate::provider::find_factory(factories, provider_name)
+                .map(|factory| {
+                    factory
+                        .identity_attributes()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        },
+    )?;
+    Ok(())
+}
+
 impl From<AttributeDerivedAnonymousResourceConflict> for AnonymousIdentityError {
     fn from(error: AttributeDerivedAnonymousResourceConflict) -> Self {
         Self::AttributeDerived(Box::new(error))
@@ -483,14 +516,6 @@ pub struct LegacyLoopMoveTargetError {
 }
 
 impl LegacyLoopMoveTargetError {
-    pub fn target(&self) -> &StateBlockAddress {
-        &self.target
-    }
-
-    pub fn replacement(&self) -> Option<&StateBlockAddress> {
-        self.replacement.as_ref()
-    }
-
     pub fn source_span(&self) -> Option<SourceSpan> {
         self.source_span
     }
@@ -542,7 +567,11 @@ pub fn check_legacy_loop_move_targets<S>(
                 return None;
             };
             let target = addresses.to();
-            if !target.name_str().starts_with('_') {
+            if !target
+                .name_str()
+                .split('.')
+                .any(|segment| segment.starts_with('_'))
+            {
                 return None;
             }
 
@@ -560,7 +589,7 @@ pub fn check_legacy_loop_move_targets<S>(
                     .loop_provenance
                     .legacy_candidates(identity)
                     .iter()
-                    .any(|(_, legacy)| legacy.exact_state_name() == target.name_str())
+                    .any(|legacy| legacy.exact_state_name() == target.name_str())
                 {
                     continue;
                 }
@@ -1244,7 +1273,7 @@ fn loop_conflict_for_members<S>(
 
         let mut occupied = seed_origin
             .source()
-            .occupied_bindings()
+            .binding_scope()
             .cloned()
             .unwrap_or_default();
         occupied.extend(
@@ -1435,7 +1464,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
     }
 
     // Detect collisions
-    let mut collisions: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut collisions: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (computed_index, (_, identifier, _)) in computed.iter().enumerate() {
         collisions
             .entry(identifier.clone())
@@ -1566,10 +1595,9 @@ fn legacy_row_stable_identity_matches(
         return None;
     }
     Some(
-        desired_values.len() == state_entry.create_only_values.len()
-            && desired_values.iter().all(|(attribute, value)| {
-                state_entry.create_only_values.get(attribute) == Some(value)
-            }),
+        desired_values
+            .iter()
+            .all(|(attribute, value)| state_entry.create_only_values.get(attribute) == Some(value)),
     )
 }
 
@@ -1622,7 +1650,7 @@ pub fn detect_legacy_loop_address_moves(
         let Some(identity) = resource.id.identity() else {
             continue;
         };
-        for (_, legacy) in resource.loop_provenance.legacy_candidates(identity) {
+        for legacy in resource.loop_provenance.legacy_candidates(identity) {
             if candidates
                 .iter()
                 .any(|candidate: &LegacyLoopMoveCandidate<'_>| {

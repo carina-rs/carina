@@ -17,7 +17,7 @@ use crate::parser::{
     LetBindingKind, LetBindingRhs, ModuleCall, ParseContext, ParseError, PreprocessedFile, Rule,
     evaluate_static_value, first_inner, if_structural_handle, is_static_value, next_pair,
     parse_expression, parse_expression_eval, parse_module_call, parse_read_resource_expr,
-    parse_resource_expr_for_target,
+    parse_resource_for_target,
 };
 use crate::resource::{ConcreteValue, DataSource, LoopKind, Resource, Value};
 
@@ -189,7 +189,7 @@ pub(crate) fn parse_if_body(
                 local_ctx.set_variable(name, value);
             }
             Rule::resource_expr => {
-                let resource = parse_resource_expr_for_target(
+                let resource = parse_resource_for_target(
                     inner,
                     &local_ctx,
                     target.if_resource_target(),
@@ -199,12 +199,8 @@ pub(crate) fn parse_if_body(
                 return Ok(IfBodyResult::Resource(Box::new(resource)));
             }
             Rule::read_resource_expr => {
-                if target.is_unbound() {
-                    return Err(ParseError::UnboundLoopRead {
-                        kind: LoopKind::If,
-                        line: target.source_line().expect("unbound target has source"),
-                        span: target.source_span().expect("unbound target has source"),
-                    });
+                if let Some(error) = target.unbound_read_error(LoopKind::If) {
+                    return Err(error);
                 }
                 let data_source = parse_read_resource_expr(
                     inner,
@@ -218,8 +214,10 @@ pub(crate) fn parse_if_body(
             Rule::module_call => {
                 let mut call =
                     parse_module_call(inner, &local_ctx, preprocessed_file, source_file)?;
-                call.binding_name =
-                    (!target.is_unbound()).then(|| target.scheduler_key().to_string());
+                call.binding_name = match target {
+                    LoopParseTarget::Bound { .. } => Some(target.scheduler_key().to_string()),
+                    LoopParseTarget::Unbound(_) => None,
+                };
                 call.set_loop_origin(target.if_origin());
                 return Ok(IfBodyResult::ModuleCall(call));
             }

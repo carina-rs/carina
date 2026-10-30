@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::parser::{SourceSpan, display_string_literal};
 
@@ -32,6 +33,15 @@ impl std::fmt::Display for LoopKind {
 pub enum ForLoopElement {
     Index(usize),
     Key(String),
+}
+
+impl ForLoopElement {
+    pub(crate) fn address(&self, base: &str) -> String {
+        match self {
+            Self::Index(index) => format!("{base}[{index}]"),
+            Self::Key(key) => crate::utils::map_key_address(base, key),
+        }
+    }
 }
 
 /// The precise branch or collection element that produced a resource.
@@ -77,7 +87,7 @@ impl LegacyLoopAddress {
 struct LoopAuthoring {
     span: SourceSpan,
     source_text: Arc<str>,
-    occupied_bindings: Arc<BTreeSet<String>>,
+    binding_scope: Arc<BTreeSet<String>>,
 }
 
 /// Source identity shared by every element produced from one unbound loop.
@@ -86,6 +96,8 @@ pub struct LoopSource {
     display_file: String,
     line: usize,
     column: usize,
+    #[serde(default = "default_loop_kind")]
+    kind: LoopKind,
     system_identity: ResourceIdentity,
     #[serde(skip, default)]
     authoring: Option<LoopAuthoring>,
@@ -96,6 +108,7 @@ impl PartialEq for LoopSource {
         self.display_file == other.display_file
             && self.line == other.line
             && self.column == other.column
+            && self.kind == other.kind
             && self.system_identity == other.system_identity
     }
 }
@@ -107,6 +120,7 @@ impl Hash for LoopSource {
         self.display_file.hash(state);
         self.line.hash(state);
         self.column.hash(state);
+        self.kind.hash(state);
         self.system_identity.hash(state);
     }
 }
@@ -117,7 +131,6 @@ impl LoopSource {
         span: SourceSpan,
         source_text: impl Into<Arc<str>>,
         kind: LoopKind,
-        occupied_bindings: BTreeSet<String>,
     ) -> Self {
         let normalized = crate::utils::normalize_source_path(source_file);
         let display_file = normalized.display().to_string();
@@ -132,11 +145,12 @@ impl LoopSource {
             display_file,
             line: span.start_line(),
             column: span.start_column(),
+            kind,
             system_identity,
             authoring: Some(LoopAuthoring {
                 span,
                 source_text: source_text.into(),
-                occupied_bindings: Arc::new(occupied_bindings),
+                binding_scope: Arc::new(BTreeSet::new()),
             }),
         }
     }
@@ -171,13 +185,20 @@ impl LoopSource {
         self.authoring.as_ref().map(|authoring| authoring.span)
     }
 
-    pub(crate) fn occupied_bindings(&self) -> Option<&BTreeSet<String>> {
+    pub(crate) fn binding_scope(&self) -> Option<&BTreeSet<String>> {
         self.authoring
             .as_ref()
-            .map(|authoring| authoring.occupied_bindings.as_ref())
+            .map(|authoring| authoring.binding_scope.as_ref())
+    }
+
+    pub(crate) fn set_binding_scope(&mut self, binding_scope: Arc<BTreeSet<String>>) {
+        if let Some(authoring) = &mut self.authoring {
+            authoring.binding_scope = binding_scope;
+        }
     }
 
     pub(crate) fn set_display_file(&mut self, file: String, kind: LoopKind) {
+        self.kind = kind;
         if let Some(span) = self.authoring.as_ref().map(|authoring| authoring.span) {
             self.system_identity =
                 loop_system_identity(&file, span.start_byte(), span.end_byte(), kind, None);
@@ -190,10 +211,14 @@ impl LoopSource {
             self.system_identity.as_str(),
             self.line,
             self.column,
-            LoopKind::For,
+            self.kind,
             Some(scope.as_str()),
         );
     }
+}
+
+const fn default_loop_kind() -> LoopKind {
+    LoopKind::For
 }
 
 fn loop_system_identity(
@@ -203,13 +228,27 @@ fn loop_system_identity(
     kind: LoopKind,
     module_scope: Option<&str>,
 ) -> ResourceIdentity {
-    let mut hasher = DefaultHasher::new();
-    file_or_parent_identity.hash(&mut hasher);
-    start.hash(&mut hasher);
-    end.hash(&mut hasher);
-    kind.hash(&mut hasher);
-    module_scope.hash(&mut hasher);
-    ResourceIdentity::new(format!("_loop_{:016x}", hasher.finish()))
+    fn component(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = Sha256::new();
+    component(&mut hasher, file_or_parent_identity.as_bytes());
+    hasher.update((start as u64).to_be_bytes());
+    hasher.update((end as u64).to_be_bytes());
+    hasher.update([match kind {
+        LoopKind::For => 0,
+        LoopKind::If => 1,
+    }]);
+    match module_scope {
+        Some(scope) => {
+            hasher.update([1]);
+            component(&mut hasher, scope.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    ResourceIdentity::new(format!("_loop_{}", hex::encode(&hasher.finalize()[..8])))
 }
 
 /// Provenance for one concrete resource emitted by an unbound `for` or `if`.
@@ -241,25 +280,31 @@ impl LoopElementOrigin {
         self.source.line()
     }
 
-    pub fn column(&self) -> usize {
-        self.source.column()
+    pub fn display_suffix(&self) -> String {
+        let mut suffix = String::new();
+        self.append_display_suffix(&mut suffix);
+        suffix
     }
 
-    pub fn display_suffix(&self) -> String {
+    pub fn append_display_suffix(&self, output: &mut String) {
+        use std::fmt::Write as _;
+
         match &self.kind {
             LoopOriginKind::For {
                 element: ForLoopElement::Index(index),
-            } => format!("(for [{index}] at {}:{})", self.file(), self.line()),
+            } => write!(output, "(for [{index}] at {}:{})", self.file(), self.line()),
             LoopOriginKind::For {
                 element: ForLoopElement::Key(key),
-            } => format!(
+            } => write!(
+                output,
                 "(for [{}] at {}:{})",
                 display_string_literal(key),
                 self.file(),
                 self.line()
             ),
-            LoopOriginKind::If => format!("(if at {}:{})", self.file(), self.line()),
+            LoopOriginKind::If => write!(output, "(if at {}:{})", self.file(), self.line()),
         }
+        .expect("writing to a String cannot fail");
     }
 
     pub(crate) fn source(&self) -> &LoopSource {
@@ -283,14 +328,13 @@ impl LoopElementOrigin {
         self.legacy = self.legacy.with_parent_prefix(prefix);
     }
 
+    pub(crate) fn set_binding_scope(&mut self, binding_scope: Arc<BTreeSet<String>>) {
+        self.source.set_binding_scope(binding_scope);
+    }
+
     pub(crate) fn rewritten_address(&self, binding: &str) -> String {
         let element_suffix = match &self.kind {
-            LoopOriginKind::For {
-                element: ForLoopElement::Index(index),
-            } => format!("[{index}]"),
-            LoopOriginKind::For {
-                element: ForLoopElement::Key(key),
-            } => crate::utils::map_key_address("", key),
+            LoopOriginKind::For { element } => element.address(""),
             LoopOriginKind::If => String::new(),
         };
         let legacy = self.legacy.exact_state_name();
@@ -308,19 +352,13 @@ impl LoopElementOrigin {
 pub(crate) struct LoopModulePrefixOrigin {
     origin: LoopElementOrigin,
     current_prefix: ResourceIdentity,
-    legacy_prefix: LegacyLoopAddress,
 }
 
 impl LoopModulePrefixOrigin {
-    pub(crate) fn new(
-        origin: LoopElementOrigin,
-        current_prefix: ResourceIdentity,
-        legacy_prefix: LegacyLoopAddress,
-    ) -> Self {
+    pub(crate) fn new(origin: LoopElementOrigin, current_prefix: ResourceIdentity) -> Self {
         Self {
             origin,
             current_prefix,
-            legacy_prefix,
         }
     }
 
@@ -337,7 +375,7 @@ impl LoopModulePrefixOrigin {
     }
 
     pub(crate) fn legacy_prefix(&self) -> &LegacyLoopAddress {
-        &self.legacy_prefix
+        self.origin.legacy_address()
     }
 
     pub(crate) fn remap_current_prefix(&mut self, from: &ResourceIdentity, to: &ResourceIdentity) {
@@ -408,13 +446,24 @@ impl LoopProvenance {
         }
     }
 
+    pub(crate) fn set_binding_scope(&mut self, binding_scope: Arc<BTreeSet<String>>) {
+        if let Some(origin) = &mut self.direct {
+            origin.set_binding_scope(Arc::clone(&binding_scope));
+        }
+        for prefix in &mut self.module_prefixes {
+            prefix
+                .origin_mut()
+                .set_binding_scope(Arc::clone(&binding_scope));
+        }
+    }
+
     pub(crate) fn legacy_candidates(
         &self,
         current_identity: &ResourceIdentity,
-    ) -> Vec<(LoopElementOrigin, LegacyLoopAddress)> {
+    ) -> Vec<LegacyLoopAddress> {
         let mut candidates = Vec::new();
         if let Some(origin) = &self.direct {
-            candidates.push((origin.as_ref().clone(), origin.legacy_address().clone()));
+            candidates.push(origin.legacy_address().clone());
         }
 
         let mut module_prefixes: Vec<_> = self.module_prefixes.iter().collect();
@@ -426,11 +475,11 @@ impl LoopProvenance {
                 prefix.current_prefix().as_str(),
                 prefix.legacy_prefix().exact_state_name(),
             ) {
-                candidates.push((prefix.origin().clone(), LegacyLoopAddress::new(legacy)));
+                candidates.push(LegacyLoopAddress::new(legacy));
             }
         }
 
-        candidates.dedup_by(|left, right| left.1 == right.1);
+        candidates.dedup();
         candidates
     }
 }
@@ -450,18 +499,6 @@ impl UnboundLoopTemplate {
         }
     }
 
-    pub fn file(&self) -> &str {
-        self.source.file()
-    }
-
-    pub fn line(&self) -> usize {
-        self.source.line()
-    }
-
-    pub fn column(&self) -> usize {
-        self.source.column()
-    }
-
     pub(crate) fn scheduler_key(&self) -> &str {
         self.source.scheduler_key()
     }
@@ -471,16 +508,24 @@ impl UnboundLoopTemplate {
     }
 
     pub(crate) fn element_origin(&self, element: ForLoopElement) -> LoopElementOrigin {
-        let legacy = match &element {
-            ForLoopElement::Index(index) => {
-                LegacyLoopAddress::new(format!("{}[{index}]", self.legacy_base.0))
-            }
-            ForLoopElement::Key(key) => LegacyLoopAddress::new(crate::utils::map_key_address(
-                self.legacy_base.exact_state_name(),
-                key,
-            )),
-        };
+        let legacy = LegacyLoopAddress::new(element.address(self.legacy_base.exact_state_name()));
         LoopElementOrigin::new(LoopOriginKind::For { element }, self.source.clone(), legacy)
+    }
+
+    pub(crate) fn if_origin(&self) -> LoopElementOrigin {
+        LoopElementOrigin::new(
+            LoopOriginKind::If,
+            self.source.clone(),
+            self.legacy_base.clone(),
+        )
+    }
+
+    pub(crate) fn unbound_read_error(&self, kind: LoopKind) -> Option<crate::parser::ParseError> {
+        Some(crate::parser::ParseError::UnboundLoopRead {
+            kind,
+            line: self.source.line(),
+            span: self.source.source_span()?,
+        })
     }
 
     pub(crate) fn matches_legacy_binding(&self, binding: &str) -> bool {
@@ -493,6 +538,10 @@ impl UnboundLoopTemplate {
     pub(crate) fn set_display_file(&mut self, file: &str) {
         self.source
             .set_display_file(file.to_string(), LoopKind::For);
+    }
+
+    pub(crate) fn set_binding_scope(&mut self, binding_scope: Arc<BTreeSet<String>>) {
+        self.source.set_binding_scope(binding_scope);
     }
 
     #[cfg(test)]

@@ -17,7 +17,9 @@ use super::basic::{
     BasicEffectCtx, ExecutionState, count_actionable_effects, execute_basic_effect,
     process_basic_result, refresh_pending_states, resolve_data_source,
 };
-use super::deferred_dispatch::PureMetaCtx;
+use super::deferred_dispatch::{
+    DeferredAnonymousIdentityGuard, PureMetaCtx, report_deferred_create_failure,
+};
 use super::provider_ready::ProviderPreparationContext;
 use super::replace::SingleEffectResult;
 use super::scheduler::{
@@ -85,6 +87,46 @@ pub(super) fn apply_deferred_replace_delete_deps<S>(
     deferred_replace_delete_deps: &[(usize, usize)],
 ) {
     for &(gate_idx, delete_idx) in deferred_replace_delete_deps {
+        let Some(Effect::DeferredReplace(payload)) = effects.get(gate_idx) else {
+            continue;
+        };
+
+        if matches!(
+            payload.template.target,
+            crate::parser::DeferredForTarget::Unbound { .. }
+        ) {
+            if !deps_of.contains_key(&delete_idx) {
+                continue;
+            }
+            for (other_gate_idx, effect) in effects.iter().enumerate() {
+                let template = match effect {
+                    Effect::DeferredCreate { template, .. } => template.as_ref(),
+                    Effect::DeferredReplace(other) => other.template.as_ref(),
+                    _ => continue,
+                };
+                if !matches!(
+                    template.target,
+                    crate::parser::DeferredForTarget::Unbound { .. }
+                ) || template.template_resource.id.provider
+                    != payload.template.template_resource.id.provider
+                    || template.template_resource.id.resource_type
+                        != payload.template.template_resource.id.resource_type
+                    || template.template_resource.id.provider_instance
+                        != payload.template.template_resource.id.provider_instance
+                {
+                    continue;
+                }
+                // Anonymous children may reuse a persisted generated address.
+                // Every matching runtime gate therefore waits for the one
+                // owner of the absorbed delete before materializing children.
+                deps_of
+                    .entry(other_gate_idx)
+                    .or_default()
+                    .insert(delete_idx);
+            }
+            continue;
+        }
+
         if deps_of.contains_key(&delete_idx) {
             deps_of.entry(delete_idx).or_default().insert(gate_idx);
         }
@@ -280,6 +322,45 @@ pub(super) async fn execute_effects_sequential<
         .provider_check_inputs
         .resource_origins()
         .unwrap_or(&empty_resource_origins);
+    let mut desired_ids = resource_origins.keys().cloned().collect::<HashSet<_>>();
+    for effect in &effects {
+        if matches!(
+            effect,
+            Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Update { .. }
+                | Effect::Import { .. }
+                | Effect::Move { .. }
+                | Effect::Wait { .. }
+        ) {
+            desired_ids.insert(effect.resource_id().clone());
+        }
+    }
+    let current_ids = accumulated
+        .result()
+        .managed_current
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let absorbed_current_ids = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::DeferredReplace(payload)
+                if matches!(
+                    payload.template.target,
+                    crate::parser::DeferredForTarget::Unbound { .. }
+                ) =>
+            {
+                Some(payload.deletes.iter())
+            }
+            _ => None,
+        })
+        .flatten()
+        .map(|delete| delete.id.as_inner().clone())
+        .collect();
+    let mut anonymous_identity_guard =
+        DeferredAnonymousIdentityGuard::new(desired_ids, current_ids, absorbed_current_ids);
     let SchedulerDeps {
         mut deps_of,
         unresolved: scheduler_dependency_errors,
@@ -459,6 +540,19 @@ pub(super) async fn execute_effects_sequential<
                     break;
                 }
                 PureMetaOutcome::Materialized(children) => {
+                    let template = match &effect {
+                        Effect::DeferredCreate { template, .. } => template.as_ref(),
+                        Effect::DeferredReplace(payload) => payload.template.as_ref(),
+                        _ => unreachable!("pure meta materialization has a deferred template"),
+                    };
+                    if let Err(error) = anonymous_identity_guard.admit(template, &children) {
+                        report_deferred_create_failure(&effect, &error, &dispatch_ctx);
+                        accumulated.mutate(|result| result.failure_count += 1);
+                        failed_indices.insert(idx);
+                        completed_indices.insert(idx);
+                        completed_synchronous_dispatch = true;
+                        break;
+                    }
                     if !children.is_empty() {
                         total += count_actionable_effects(&children);
                         for child in children {

@@ -556,10 +556,11 @@ impl<'a, S> TreeRenderContext<'a, S> {
         let attr_base = ATTR_BASE;
 
         let mut has_displayed_attrs = false;
-        let origin_note = effect
-            .loop_origin()
-            .map(|origin| format!("  {}", origin.display_suffix()))
-            .unwrap_or_default();
+        let mut origin_note = String::new();
+        if let Some(origin) = effect.loop_origin() {
+            origin_note.push_str("  ");
+            origin.append_display_suffix(&mut origin_note);
+        }
 
         // --- Resource header line ---
         match effect {
@@ -2048,7 +2049,7 @@ fn render_modified_fields(fields: &[ListOfMapsDiffField]) -> String {
 }
 
 pub fn format_effect<S>(effect: &Effect<S>) -> String {
-    let rendered = match effect {
+    let mut rendered = match effect {
         Effect::Create(r) => format!("Create {}", r.id.human()),
         Effect::ResumeCreate { resource, .. } => {
             format!("Resume create {}", resource.id.human())
@@ -2116,9 +2117,11 @@ pub fn format_effect<S>(effect: &Effect<S>) -> String {
             )
         }
     };
-    effect.loop_origin().map_or(rendered.clone(), |origin| {
-        format!("{rendered}  {}", origin.display_suffix())
-    })
+    if let Some(origin) = effect.loop_origin() {
+        rendered.push_str("  ");
+        origin.append_display_suffix(&mut rendered);
+    }
+    rendered
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 
+use crate::binding_index::BindingNameSet;
 use crate::parser::{self, File, InferredFile, ParsedFile, ProviderContext};
 use crate::resource::Value;
 use crate::schema::SchemaRegistry;
@@ -1165,6 +1166,17 @@ pub(crate) fn parse_directory_files_located(
             },
         ));
     }
+    let mut merged = ParsedFile::default();
+    for (_, file) in &out {
+        merge_parsed_file(&mut merged, file.parsed.clone());
+    }
+    let binding_scope = BindingNameSet::from_parsed(&merged)
+        .iter_names()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    for (_, file) in &mut out {
+        file.parsed.set_loop_binding_scope(binding_scope.clone());
+    }
     Ok(out)
 }
 
@@ -1222,7 +1234,7 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path) {
         warning.file = warning_file.clone();
     }
     for deferred in &mut parsed.deferred_for_expressions {
-        deferred.file = Some(display_file.clone());
+        deferred.file = warning_file.clone();
     }
 }
 
@@ -2044,6 +2056,60 @@ let _ = for unused_var in empty_list {
             stamped,
             &crn_path.display().to_string(),
             "warning.file must carry the full source path, not a bare filename",
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn resolved_directory_deferred_loop_removes_its_not_yet_available_warning() {
+        let dir = create_temp_dir("resolved_deferred_warning");
+        let crn_path = dir.join("main.crn");
+        fs::write(
+            &crn_path,
+            r#"let orgs = upstream_state { source = "../orgs" }
+
+for account_id in orgs.accounts {
+    mock.test.resource { name = account_id }
+}
+"#,
+        )
+        .unwrap();
+
+        let mut config = load_configuration(&dir).expect("directory fixture loads");
+        assert_eq!(config.parsed.deferred_for_expressions.len(), 1);
+        let deferred_line = config.parsed.deferred_for_expressions[0].line;
+        config.parsed.warnings.push(crate::parser::ParseWarning {
+            file: Some(crn_path.display().to_string()),
+            line: deferred_line,
+            kind: crate::parser::WarningKind::DeferredFor,
+            span: None,
+            message: "upstream iterable is not yet available".to_string(),
+        });
+
+        let bindings =
+            crate::binding_index::IterableBindings::from_upstream_only(HashMap::from([(
+                "orgs".to_string(),
+                HashMap::from([(
+                    "accounts".to_string(),
+                    Value::Concrete(crate::resource::ConcreteValue::List(vec![Value::Concrete(
+                        crate::resource::ConcreteValue::String("123456789012".into()),
+                    )])),
+                )]),
+            )]));
+        config
+            .parsed
+            .expand_deferred_for_expressions(&bindings)
+            .expect("resolved upstream iterable expands");
+
+        assert!(config.parsed.deferred_for_expressions.is_empty());
+        assert!(
+            config
+                .parsed
+                .warnings
+                .iter()
+                .all(|warning| warning.kind != crate::parser::WarningKind::DeferredFor),
+            "resolved loop retained stale warnings: {:?}",
+            config.parsed.warnings,
         );
         cleanup(&dir);
     }
