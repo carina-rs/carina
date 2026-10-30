@@ -488,6 +488,7 @@ pub async fn run_state_forget(
         backend.as_ref(),
         &lock,
         &address,
+        path,
         auto_approve,
         reader,
         cancel.clone(),
@@ -506,6 +507,7 @@ async fn run_state_forget_locked<R>(
     backend: &dyn StateBackend,
     lock: &LockInfo,
     address: &StateBlockAddress,
+    project_dir: &Path,
     auto_approve: bool,
     reader: R,
     cancel: ShutdownToken,
@@ -517,7 +519,9 @@ where
         crate::commands::apply::load_state_persist_if_migrated(backend, StateLockRef::Held(lock))
             .await?
             .unwrap_or_default();
-    let row = state.find_outcome_unknown(address)?;
+    let row = state
+        .find_outcome_unknown(address)
+        .map_err(|source| AppError::from_state_forget(source, project_dir))?;
 
     println!(
         "Create-outcome-unknown row: {}",
@@ -527,7 +531,6 @@ where
     if confirm_state_forget(reader, cancel, auto_approve).await?
         == StateForgetConfirmation::Cancelled
     {
-        drop(row);
         return Ok(());
     }
 
@@ -2391,6 +2394,7 @@ struct StateRefreshCounts {
     unchanged: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn diff_display_update_resource_with_provider(
     id: &ResolvedResourceId,
     fresh_current: &Current,
@@ -2760,7 +2764,7 @@ mod tests {
         let mut state = StateFile::new();
         state
             .upsert_resource(
-                ResourceState::try_applied("thing", "orphan", provider, "orphan")
+                ResourceState::try_applied("test.resource", "orphan", provider, "orphan")
                     .expect("fixture identifier is non-empty"),
             )
             .unwrap();
@@ -3225,8 +3229,11 @@ mod tests {
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
-            let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
-                vec![ResourceSchema::new("lookup").as_data_source()];
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = vec![
+                ResourceSchema::new("test.resource"),
+                ResourceSchema::new("orphan"),
+                ResourceSchema::new("lookup").as_data_source(),
+            ];
             schema_drafts
                 .into_iter()
                 .map(|schema| {
@@ -3364,8 +3371,10 @@ mod tests {
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
-            let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
-                vec![ResourceSchema::new("lookup").as_data_source()];
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = vec![
+                ResourceSchema::new("test.resource"),
+                ResourceSchema::new("lookup").as_data_source(),
+            ];
             schema_drafts
                 .into_iter()
                 .map(|schema| {
@@ -4296,8 +4305,11 @@ mod tests {
                 ("aws".to_string(), widget_schema),
             ],
         );
-        let comparison_provider =
-            crate::wiring::test_comparison_provider_router(&preview.sorted_resources);
+        let (_comparison_schemas, comparison_provider) =
+            carina_core::provider::comparison_fixture_for_test(
+                &schemas,
+                preview.sorted_resources.iter().map(|resource| &resource.id),
+            );
         validated_config
             .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
                 provider: &provider,
@@ -5596,7 +5608,7 @@ mod tests {
 
         let desired_ids = HashSet::new();
         let orphans = state.build_orphans(&desired_ids).into_plan_orphans();
-        let plan = carina_core::differ::create_plan(
+        let plan = carina_core::differ::create_plan_for_test(
             &[],
             &[],
             &carina_core::provider::ProviderRouter::new(),

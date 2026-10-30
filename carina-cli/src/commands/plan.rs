@@ -153,27 +153,34 @@ pub(crate) struct ProviderScopeMismatch {
 pub(crate) struct RecordedProviderScopes(PlanProviderScopes);
 
 impl RecordedProviderScopes {
+    #[cfg(test)]
     pub(crate) fn from_router(provider: &ProviderRouter) -> Self {
         Self(provider.provider_scopes())
     }
 
-    pub(crate) fn verify(&self, provider: &ProviderRouter) -> Result<(), ProviderScopeMismatch> {
+    fn from_router_for_instances(
+        provider: &ProviderRouter,
+        instances: &BTreeSet<ProviderInstanceKey>,
+    ) -> Self {
+        let mut scopes = provider.provider_scopes();
+        scopes.retain(|instance, _scope| instances.contains(instance));
+        Self(scopes)
+    }
+
+    pub(crate) fn verify(
+        &self,
+        provider: &ProviderRouter,
+    ) -> Result<(), Box<ProviderScopeMismatch>> {
         let initialized = provider.provider_scopes();
-        let instances = self
-            .0
-            .keys()
-            .chain(initialized.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        for instance in instances {
-            let recorded = self.0.get(&instance);
-            let current = initialized.get(&instance);
+        for instance in self.0.keys() {
+            let recorded = self.0.get(instance);
+            let current = initialized.get(instance);
             if recorded != current {
-                return Err(ProviderScopeMismatch {
-                    instance,
+                return Err(Box::new(ProviderScopeMismatch {
+                    instance: instance.clone(),
                     recorded: recorded.cloned(),
                     initialized: current.cloned(),
-                });
+                }));
             }
         }
         Ok(())
@@ -458,7 +465,14 @@ mod provider_scope_evidence_tests {
 
     #[test]
     fn saved_plan_v30_round_trips_provider_scopes() {
-        let configs = vec![provider_config("east"), provider_config("west")];
+        let mut default_config = provider_config("unused");
+        default_config.binding = None;
+        default_config.source = Some("file:///test-provider.wasm".parse().unwrap());
+        let configs = vec![
+            default_config,
+            provider_config("east"),
+            provider_config("west"),
+        ];
         let mut parsed = carina_core::parser::InferredFile::default();
         parsed.providers = configs.clone();
         let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
@@ -467,11 +481,26 @@ mod provider_scope_evidence_tests {
             &ProviderContext::default(),
         )
         .expect("provider configs resolve");
-        let wiring = ValidatedConfig::from_factories_for_test((), Vec::new(), &configs);
-        let provider = router([
+        let wiring = ValidatedConfig::from_factories_for_test(
+            (),
+            vec![Box::new(
+                crate::provider_upstream_test_support::ProviderConfigCaptureFactory {
+                    received_role_arn: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                },
+            )],
+            &configs,
+        );
+        let mut provider = router([
             ("east", available("ap-northeast-1")),
             ("west", available("us-west-2")),
         ]);
+        provider.add_provider_instance(
+            ProviderInstanceKey::new("test", None),
+            InitializedProvider::for_test(
+                Box::new(carina_provider_mock::MockProvider::new()),
+                available("ap-northeast-1"),
+            ),
+        );
 
         let plan = empty_contents(SavedProviderConfigs::from(&resolved))
             .record_for_test_with_provider(&wiring, &provider)
@@ -479,13 +508,17 @@ mod provider_scope_evidence_tests {
         let json = serde_json::to_value(&plan).expect("saved plan serializes");
         assert_eq!(json["version"], serde_json::json!(30));
         let scopes = json["provider_scopes"].as_array().unwrap();
-        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes.len(), 3);
         assert_eq!(
             scopes[0]["instance"]["provider_instance"],
-            serde_json::json!("east")
+            serde_json::Value::Null
         );
         assert_eq!(
             scopes[1]["instance"]["provider_instance"],
+            serde_json::json!("east")
+        );
+        assert_eq!(
+            scopes[2]["instance"]["provider_instance"],
             serde_json::json!("west")
         );
 
@@ -511,6 +544,19 @@ mod provider_scope_evidence_tests {
         assert_eq!(mismatch.instance.provider_instance(), Some("west"));
         assert_eq!(mismatch.recorded, Some(available("us-west-2")));
         assert_eq!(mismatch.initialized, Some(available("eu-west-1")));
+    }
+
+    #[test]
+    fn apply_scope_verification_ignores_initialized_instances_unused_by_the_plan() {
+        let recorded = RecordedProviderScopes(BTreeMap::new());
+        let initialized = router([
+            ("east", available("ap-northeast-1")),
+            ("west", available("us-west-2")),
+        ]);
+
+        recorded
+            .verify(&initialized)
+            .expect("unrecorded provider instances are unrelated to the saved plan");
     }
 }
 
@@ -994,7 +1040,7 @@ impl ProviderEvidence {
         Self::new(
             PlanSchemaFingerprints::capture(references, ctx.schemas()),
             recorded_provider_artifacts(ctx),
-            RecordedProviderScopes::from_router(provider),
+            RecordedProviderScopes::from_router_for_instances(provider, expected_instances),
             references,
             provider_configs,
             expected_instances,
@@ -1245,7 +1291,8 @@ impl TryFrom<PlanFileWire> for PlanFile {
             wait_bindings,
         };
         let references = contents.referenced_schema_types();
-        let expected_instances = contents.expected_provider_instances();
+        let available_providers = provider_artifacts.keys().cloned().collect();
+        let expected_instances = contents.expected_provider_instances(&available_providers);
         let evidence = ProviderEvidence::new(
             schema_fingerprints,
             provider_artifacts,
@@ -1282,7 +1329,14 @@ impl PlanFileContents {
         self,
         validated: &ValidatedConfig<R>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        let provider = test_provider_router(&self.expected_provider_instances());
+        let available_providers = validated
+            .context()
+            .provider_artifacts()
+            .keys()
+            .cloned()
+            .collect();
+        let provider =
+            test_provider_router(&self.expected_provider_instances(&available_providers));
         self.record_with_context(validated.context(), &provider)
     }
 
@@ -1301,7 +1355,8 @@ impl PlanFileContents {
         provider: &ProviderRouter,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
-        let expected_instances = self.expected_provider_instances();
+        let available_providers = ctx.provider_artifacts().keys().cloned().collect();
+        let expected_instances = self.expected_provider_instances(&available_providers);
         let evidence = ProviderEvidence::capture(
             &references,
             &self.provider_configs,
@@ -1325,7 +1380,13 @@ impl PlanFileContents<SavedModuleSource> {
         validated: &ValidatedConfig<R>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
-        let expected_instances = self.expected_provider_instances();
+        let available_providers = validated
+            .context()
+            .provider_artifacts()
+            .keys()
+            .cloned()
+            .collect();
+        let expected_instances = self.expected_provider_instances(&available_providers);
         let provider = test_provider_router(&expected_instances);
         let evidence = ProviderEvidence::capture(
             &references,
@@ -1461,7 +1522,10 @@ impl<S> PlanFileContents<S> {
         PlanSchemaReferences(references)
     }
 
-    fn expected_provider_instances(&self) -> BTreeSet<ProviderInstanceKey> {
+    fn expected_provider_instances(
+        &self,
+        available_providers: &BTreeSet<String>,
+    ) -> BTreeSet<ProviderInstanceKey> {
         fn insert(instances: &mut BTreeSet<ProviderInstanceKey>, id: &ResourceId) {
             instances.insert(ProviderInstanceKey::from(id));
         }
@@ -1498,7 +1562,6 @@ impl<S> PlanFileContents<S> {
                     insert(&mut instances, target_id.id().as_inner());
                 }
                 Effect::DeferredReplace(payload) => {
-                    insert(&mut instances, &payload.id);
                     insert(&mut instances, &payload.template.template_resource.id);
                     for delete in &payload.deletes {
                         insert(&mut instances, &delete.id);
@@ -1527,8 +1590,12 @@ impl<S> PlanFileContents<S> {
             insert(&mut instances, id);
         }
         if instances.is_empty() {
-            instances.insert(ProviderInstanceKey::new("", None));
+            instances.insert(ProviderInstanceKey::new(
+                carina_provider_mock::BUILTIN_PROVIDER_NAME,
+                None,
+            ));
         }
+        instances.retain(|instance| available_providers.contains(instance.provider()));
         instances
     }
 }
@@ -4256,7 +4323,7 @@ pub async fn run_plan(
         }
     }
 
-    render_plan_errors_and_abort(&ctx.plan)?;
+    render_plan_errors_and_abort(&ctx.plan, path)?;
 
     let iam_preflight_result = if check_iam {
         let result =

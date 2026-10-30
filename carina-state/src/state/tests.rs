@@ -276,6 +276,12 @@ fn outcome_unknown_lookup_rejects_normal_and_missing_rows_with_removed_hint() {
     );
     assert!(
         normal_error
+            .display_with_project_dir(std::path::Path::new("infra/production project"))
+            .to_string()
+            .contains("`carina state forget mock.test.Resource normal 'infra/production project'`")
+    );
+    assert!(
+        normal_error
             .to_string()
             .contains("removed { from = mock.test.Resource 'normal' }")
     );

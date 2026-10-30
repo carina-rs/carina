@@ -60,7 +60,7 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
-        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = Vec::new();
+        let schema_drafts = vec![carina_core::schema::ResourceSchema::new("test.resource")];
         schema_drafts
             .into_iter()
             .map(|schema| {

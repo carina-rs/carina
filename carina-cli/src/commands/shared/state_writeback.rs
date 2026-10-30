@@ -1931,7 +1931,7 @@ mod post_apply_states_tests {
 #[cfg(test)]
 mod apply_state_save_tests {
     use super::*;
-    use carina_core::differ::create_plan;
+    use carina_core::differ::create_plan_for_test as create_plan;
     use carina_core::effect::{
         DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes,
     };

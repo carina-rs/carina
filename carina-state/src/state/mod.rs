@@ -542,10 +542,12 @@ impl NotOutcomeUnknown {
             Self::Ambiguous { .. } => NotOutcomeUnknownKind::Ambiguous,
         }
     }
-}
 
-impl std::fmt::Display for NotOutcomeUnknown {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt_with_project_dir(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        project_dir: &std::path::Path,
+    ) -> std::fmt::Result {
         let (address, reason) = match self {
             Self::Missing { address } => (address, "no state row exists at this address"),
             Self::DifferentLifecycle { address } => (
@@ -570,12 +572,45 @@ impl std::fmt::Display for NotOutcomeUnknown {
                 );
             }
         };
+        let resource_type = address.display_type().to_string();
+        let forget_command = carina_core::hint::ProjectCommand::new("state forget", project_dir)
+            .with_argument(&resource_type)
+            .with_argument(address.name_str());
         let identity = carina_core::parser::display_string_literal(address.name_str());
         write!(
             f,
-            "{reason}; `carina state forget` only accepts create-outcome-unknown rows; use `removed {{ from = {} {identity} }}` for ordinary state removal",
+            "{reason}; `{forget_command}` only accepts create-outcome-unknown rows; use `removed {{ from = {} {identity} }}` for ordinary state removal",
             address.display_type(),
         )
+    }
+
+    /// Render this rejection with the exact project-scoped command that was
+    /// rejected.
+    pub fn display_with_project_dir<'a>(
+        &'a self,
+        project_dir: &'a std::path::Path,
+    ) -> impl std::fmt::Display + 'a {
+        NotOutcomeUnknownDisplay {
+            error: self,
+            project_dir,
+        }
+    }
+}
+
+struct NotOutcomeUnknownDisplay<'a> {
+    error: &'a NotOutcomeUnknown,
+    project_dir: &'a std::path::Path,
+}
+
+impl std::fmt::Display for NotOutcomeUnknownDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt_with_project_dir(f, self.project_dir)
+    }
+}
+
+impl std::fmt::Display for NotOutcomeUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.fmt_with_project_dir(f, std::path::Path::new("."))
     }
 }
 

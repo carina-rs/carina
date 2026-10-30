@@ -1460,14 +1460,16 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     state_block_claims: &StateBlockClaims,
     resolved_state_block_targets: &ResolvedStateBlockTargets,
+    fixture_factories: Vec<Box<dyn ProviderFactory>>,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
     let user_dirs = carina_core::TestUserDirs::new();
-    let (factories, _) = build_factories_from_providers(
+    let (mut factories, _) = build_factories_from_providers(
         &user_dirs,
         provider_configs.as_provider_configs(),
         base_dir,
     )?;
+    factories.extend(LoadedProviderFactory::for_test(fixture_factories));
     let wiring = ValidatedWiring::for_test(factories, provider_configs.as_provider_configs());
     let ctx = wiring.context();
     let mut unresolved = carina_core::parser::ParsedFile::default();
@@ -4662,7 +4664,6 @@ moved {
     );
     let tmp = tempfile::tempdir().expect("tempdir");
     let provider_configs = resolved_provider_configs(&parsed);
-
     let err = match create_plan_from_parsed_with_upstream_for_test(
         &parsed,
         &provider_configs,
@@ -4672,6 +4673,7 @@ moved {
         &HashMap::new(),
         &state_block_claims,
         &resolved_state_block_targets,
+        Vec::new(),
         tmp.path(),
     )
     .await
@@ -4698,6 +4700,8 @@ async fn test_plan_fails_on_removed_from_colliding_with_expanded_loop_child() {
     use carina_state::state::{ResourceState, StateFile};
 
     let source = r#"
+provider aws {}
+
 let cert = aws.acm.Certificate {
     domain_name       = "r.example.com"
     validation_method = "DNS"
@@ -4721,6 +4725,8 @@ removed {
         sf.upsert_resource(
             ResourceState::try_applied("acm.Certificate", "cert", "aws", "cert-arn")
                 .expect("fixture identifier is non-empty")
+                .with_attribute("domain_name", serde_json::json!("r.example.com"))
+                .with_attribute("validation_method", serde_json::json!("DNS"))
                 .with_attribute(
                     "domain_validation_options",
                     serde_json::json!([
@@ -4762,6 +4768,7 @@ removed {
         &HashMap::new(),
         &state_block_claims,
         &resolved_state_block_targets,
+        vec![Box::new(DeferredForCollisionFactory)],
         tmp.path(),
     )
     .await
@@ -5325,6 +5332,127 @@ fn test_plan_fails_on_rotation_shape() {
         ),
         "moved/rename pair from awscc.s3.Bucket b collides with a desired resource",
     );
+}
+
+struct DeferredForCollisionFactory;
+
+impl ProviderFactory for DeferredForCollisionFactory {
+    fn name(&self) -> &str {
+        "aws"
+    }
+
+    fn display_name(&self) -> &str {
+        "AWS deferred-for collision test provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> carina_core::provider::ProviderResult<()> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        "us-east-1".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> carina_core::provider::BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
+    > {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(MockProvider::new())))
+        })
+    }
+
+    fn create_normalizer(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> carina_core::provider::BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
+    > {
+        Box::pin(async {
+            Ok(Box::new(carina_core::provider::NoopNormalizer)
+                as Box<dyn carina_core::provider::ProviderNormalizer>)
+        })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .expect("deferred-for collision schemas must be valid")
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        let resource_record = AttributeType::struct_(
+            "ResourceRecord",
+            vec![
+                StructField::provider_populated("name", AttributeType::string()).build(),
+                StructField::provider_populated("value", AttributeType::string()).build(),
+            ],
+        );
+        let schemas = vec![
+            ResourceSchema::new("acm.Certificate")
+                .attribute(
+                    AttributeSchema::optional("domain_name", AttributeType::string())
+                        .create_only()
+                        .build(),
+                )
+                .attribute(
+                    AttributeSchema::optional("validation_method", AttributeType::string())
+                        .create_only()
+                        .build(),
+                )
+                .attribute(
+                    AttributeSchema::provider_populated(
+                        "domain_validation_options",
+                        AttributeType::list(AttributeType::struct_(
+                            "DomainValidation",
+                            vec![
+                                StructField::provider_populated("resource_record", resource_record)
+                                    .build(),
+                            ],
+                        )),
+                    )
+                    .build(),
+                ),
+            ResourceSchema::new("route53.RecordSet")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                .attribute(AttributeSchema::optional("type", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional(
+                        "resource_records",
+                        AttributeType::list(AttributeType::string()),
+                    )
+                    .build(),
+                ),
+        ];
+        schemas
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("deferred-for collision schema must be valid")
+            })
+            .collect()
+    }
 }
 
 struct AssociationCreateOnlyFactory;
@@ -6415,7 +6543,7 @@ async fn moved_blocks_plan_level_fixture_emits_five_moves_only() {
     // emission at the `create_plan_from_parsed_with_upstream_with_ctx` seam. The
     // claims-precedence ordering itself is covered by
     // `moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames`.
-    let mut source = String::new();
+    let mut source = "provider awscc {}\n".to_string();
     let mut state_file = StateFile::new();
     for idx in 0..5 {
         let old_name = format!("old_assoc_{idx}");
@@ -6473,6 +6601,7 @@ moved {{
         &HashMap::new(),
         &state_block_claims,
         &resolved_state_block_targets,
+        vec![Box::new(AssociationCreateOnlyFactory)],
         tmp.path(),
     )
     .await

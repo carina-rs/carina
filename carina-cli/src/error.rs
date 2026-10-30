@@ -79,6 +79,35 @@ impl std::fmt::Display for ProjectBackendError {
 // command, so exposing the backend error again would repeat the diagnostic.
 impl std::error::Error for ProjectBackendError {}
 
+/// A `state forget` rejection rendered with the concrete project directory
+/// available at the CLI boundary.
+#[derive(Debug)]
+pub struct ProjectStateForgetError {
+    project_dir: PathBuf,
+    source: carina_state::NotOutcomeUnknown,
+}
+
+impl ProjectStateForgetError {
+    fn new(source: carina_state::NotOutcomeUnknown, project_dir: &Path) -> Self {
+        Self {
+            project_dir: project_dir.to_path_buf(),
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for ProjectStateForgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source.display_with_project_dir(&self.project_dir), f)
+    }
+}
+
+impl std::error::Error for ProjectStateForgetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// All provider-schema differences that invalidate one saved plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedPlanSchemaMismatchError {
@@ -632,7 +661,7 @@ pub enum AppError {
     /// `state forget` was asked to remove anything other than an
     /// outcome-unknown create row.
     #[error(transparent)]
-    StateForget(#[from] carina_state::NotOutcomeUnknown),
+    StateForget(Box<ProjectStateForgetError>),
 
     /// A provider or desired value could not be encoded into one resource row.
     #[error(transparent)]
@@ -868,7 +897,7 @@ pub enum AppError {
 
     /// A saved plan was computed under a different initialized instance scope.
     #[error("{0}")]
-    SavedPlanProviderScopeMismatch(SavedPlanProviderScopeMismatchError),
+    SavedPlanProviderScopeMismatch(Box<SavedPlanProviderScopeMismatchError>),
 
     /// Apply completed with one or more partial create results.
     #[error("{0}")]
@@ -884,6 +913,13 @@ pub enum AppError {
 }
 
 impl AppError {
+    pub(crate) fn from_state_forget(
+        source: carina_state::NotOutcomeUnknown,
+        project_dir: &Path,
+    ) -> Self {
+        Self::StateForget(Box::new(ProjectStateForgetError::new(source, project_dir)))
+    }
+
     pub(crate) fn from_resource_state_encoding(
         resource: ResourceId,
         source: carina_state::ResourceStateEncodingError,

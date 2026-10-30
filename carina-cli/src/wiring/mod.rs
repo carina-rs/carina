@@ -120,8 +120,6 @@ use carina_core::parser::{
     WarningKind,
 };
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
-#[cfg(test)]
-use carina_core::provider::ProviderInstanceKey;
 use carina_core::provider::{
     self as provider_mod, AppliedIdentifier, InitializedProvider, LiftedSavedAttrs,
     NormalizerRouter, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderRouter,
@@ -3474,10 +3472,14 @@ pub(crate) async fn get_provider_with_ctx(
     }
 
     if router.is_empty() && ctx.uses_builtin_mock() {
-        // Use mock provider for other cases.
-        // Register the kind's default instance with empty kind to match
-        // resources without a provider prefix.
+        // The implicit built-in remains compatible with legacy providerless
+        // state while also owning the explicit `mock.*` addresses used by new
+        // fixtures and configurations.
         progress_sink.line("Using mock provider".cyan());
+        router.add_provider(
+            BUILTIN_PROVIDER_NAME.to_string(),
+            InitializedProvider::unavailable(Box::new(MockProvider::new())),
+        );
         router.add_provider(
             String::new(),
             InitializedProvider::unavailable(Box::new(MockProvider::new())),
@@ -3698,6 +3700,10 @@ pub async fn create_providers_from_configs_with_ctx(
     }
     if router.is_empty() && ctx.uses_builtin_mock() {
         ProgressSink::Human.line("Using mock provider".cyan());
+        router.add_provider(
+            BUILTIN_PROVIDER_NAME.to_string(),
+            InitializedProvider::unavailable(Box::new(MockProvider::new())),
+        );
         router.add_provider(
             String::new(),
             InitializedProvider::unavailable(Box::new(MockProvider::new())),
@@ -6169,7 +6175,10 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
     moved_targets: &HashSet<ResourceId>,
     already_refreshed: &HashSet<ResourceId>,
 ) -> Result<DeferredForExpansion, AppError> {
-    let comparison_provider = test_comparison_provider_router(sorted_resources);
+    let (schemas, comparison_provider) = carina_core::provider::comparison_fixture_for_test(
+        schemas,
+        sorted_resources.iter().map(|resource| &resource.id),
+    );
     let moved_pairs = moved_targets
         .iter()
         .map(|target| {
@@ -6195,27 +6204,11 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
     let mut expanded = parsed.clone();
     prepared.expand_parsed(
         &mut expanded,
-        schemas,
+        &schemas,
         remote_bindings,
         DeferredForWarningPolicy::Print,
         &comparison_provider,
     )
-}
-
-#[cfg(test)]
-pub(crate) fn test_comparison_provider_router<S>(resources: &[Resource<S>]) -> ProviderRouter {
-    let routes = resources
-        .iter()
-        .map(|resource| ProviderInstanceKey::from(&resource.id))
-        .collect::<BTreeSet<_>>();
-    let mut provider = ProviderRouter::new();
-    for route in routes {
-        provider.add_provider_instance(
-            route,
-            InitializedProvider::unavailable(Box::new(carina_provider_mock::MockProvider::new())),
-        );
-    }
-    provider
 }
 
 /// Result of the deferred-for expansion, materialised-child read,

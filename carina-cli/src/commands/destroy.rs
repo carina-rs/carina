@@ -650,7 +650,7 @@ async fn run_destroy_locked_owned(
         for error in identifier_errors {
             error_plan.add_error(error);
         }
-        render_plan_errors_and_abort(&error_plan)?;
+        render_plan_errors_and_abort(&error_plan, base_dir)?;
     }
 
     let wait_aliases = build_destroy_wait_aliases(&parsed.wait_bindings, &delete_effects);
@@ -3022,7 +3022,7 @@ mod tests {
         ));
         let message = errors[0].to_string();
         assert!(message.contains("the create may have reached the cloud"));
-        assert!(message.contains("carina state forget mock.test.Widget \"unknown\""));
+        assert!(message.contains("carina state forget mock.test.Widget unknown"));
     }
 
     #[test]

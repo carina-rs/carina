@@ -4,12 +4,14 @@
 //! No side effects occur until the Plan is applied.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
     ChangedCreateOnly, Effect, EffectWithSource, MoveAuthority, SavedEffect, TemporaryName,
 };
+use crate::hint::ProjectCommand;
 use crate::module_resolver::ModuleConstraintDiagnostic;
 use crate::name_override::NameOverride;
 use crate::provider::{AppliedIdentifier, Timestamp};
@@ -139,13 +141,15 @@ pub const fn create_outcome_unknown_absent_resolution() -> CreateOutcomeUnknownA
 }
 
 impl CreateOutcomeUnknownAbsentResolution {
-    fn hint(self, resource: &ResourceId) -> String {
+    fn hint(self, resource: &ResourceId, project_dir: &Path) -> String {
         match self {
             Self::StateForget => {
-                format!(
-                    "carina state forget {}",
-                    create_outcome_unknown_address(resource)
-                )
+                let resource_type = resource.display_type().to_string();
+                let identity = resource.identity_display().to_string();
+                ProjectCommand::new("state forget", project_dir)
+                    .with_argument(&resource_type)
+                    .with_argument(&identity)
+                    .to_string()
             }
         }
     }
@@ -225,8 +229,12 @@ impl PlanErrorKind {
     }
 }
 
-impl std::fmt::Display for PlanErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl PlanErrorKind {
+    fn fmt_with_project_dir(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        project_dir: &Path,
+    ) -> std::fmt::Result {
         match self {
             Self::PreventDestroy { action } => f.write_str(Self::prevent_destroy_message(*action)),
             Self::SchemaNotRegistered(err) => write!(f, "{err}"),
@@ -242,7 +250,8 @@ impl std::fmt::Display for PlanErrorKind {
             ),
             Self::CreateOutcomeUnknown { resource } => {
                 let address = create_outcome_unknown_address(resource);
-                let absent = create_outcome_unknown_absent_resolution().hint(resource);
+                let absent =
+                    create_outcome_unknown_absent_resolution().hint(resource, project_dir);
                 write!(
                     f,
                     "the create may have reached the cloud, but its outcome is unknown; if it exists: import {{ to = {address} id = \"…\" }}; if it doesn't: {absent}"
@@ -323,13 +332,23 @@ impl std::fmt::Display for PlanErrorKind {
                     (true, true) => write!(f, "resolved value constraint failed: {message}"),
                 }
             }
-            Self::ModuleConstraint(diagnostic) => diagnostic.fmt(f),
+            Self::ModuleConstraint(diagnostic) => std::fmt::Display::fmt(diagnostic, f),
         }
     }
 }
 
-impl std::fmt::Display for PlanError {
+impl std::fmt::Display for PlanErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.fmt_with_project_dir(f, Path::new("."))
+    }
+}
+
+impl PlanError {
+    fn fmt_with_project_dir(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        project_dir: &Path,
+    ) -> std::fmt::Result {
         match &self.kind {
             // A module constraint already names its module and authored call.
             // The synthetic `_virtual` id is internal correlation metadata,
@@ -349,9 +368,39 @@ impl std::fmt::Display for PlanError {
             | PlanErrorKind::WaitTargetIsDataSource { .. }
             | PlanErrorKind::WaitPredicateInvalid { .. }
             | PlanErrorKind::ResolvedValueConstraint { .. }) => {
-                write!(f, "{}: {kind}", self.resource_id)
+                write!(f, "{}: ", self.resource_id)?;
+                kind.fmt_with_project_dir(f, project_dir)
             }
         }
+    }
+
+    /// Render this error with project-scoped remediation commands targeting
+    /// the project that produced the plan.
+    pub fn display_with_project_dir<'a>(
+        &'a self,
+        project_dir: &'a Path,
+    ) -> impl std::fmt::Display + 'a {
+        PlanErrorDisplay {
+            error: self,
+            project_dir,
+        }
+    }
+}
+
+struct PlanErrorDisplay<'a> {
+    error: &'a PlanError,
+    project_dir: &'a Path,
+}
+
+impl std::fmt::Display for PlanErrorDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt_with_project_dir(f, self.project_dir)
+    }
+}
+
+impl std::fmt::Display for PlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.fmt_with_project_dir(f, Path::new("."))
     }
 }
 
@@ -1497,7 +1546,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "awscc.ec2.Vpc.main-vpc: the create may have reached the cloud, but its outcome is unknown; if it exists: import { to = awscc.ec2.Vpc \"main-vpc\" id = \"…\" }; if it doesn't: carina state forget awscc.ec2.Vpc \"main-vpc\""
+            "awscc.ec2.Vpc.main-vpc: the create may have reached the cloud, but its outcome is unknown; if it exists: import { to = awscc.ec2.Vpc \"main-vpc\" id = \"…\" }; if it doesn't: carina state forget awscc.ec2.Vpc main-vpc"
         );
         let import = rendered
             .split_once("if it exists: ")
@@ -1507,6 +1556,26 @@ mod tests {
 
         crate::parser::parse(import, &crate::parser::ProviderContext::default())
             .expect("the rendered single-line import form must parse");
+    }
+
+    #[test]
+    fn create_outcome_unknown_forget_hint_keeps_the_project_dir() {
+        let resource = ResourceId::with_provider_identity(
+            "awscc",
+            "ec2.Vpc",
+            "main vpc",
+            Some("management".to_string()),
+        );
+        let error = PlanError::create_outcome_unknown(resource);
+
+        assert!(
+            error
+                .display_with_project_dir(std::path::Path::new("infra/production project"))
+                .to_string()
+                .ends_with(
+                    "if it doesn't: carina state forget awscc.ec2.Vpc 'main vpc' 'infra/production project'"
+                )
+        );
     }
 
     #[test]

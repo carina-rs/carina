@@ -36,12 +36,13 @@ fn verify_saved_plan_provider_scopes(
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
     recorded.verify(provider).map_err(|mismatch| {
-        AppError::SavedPlanProviderScopeMismatch(SavedPlanProviderScopeMismatchError {
+        let mismatch = *mismatch;
+        AppError::SavedPlanProviderScopeMismatch(Box::new(SavedPlanProviderScopeMismatchError {
             instance: mismatch.instance,
             recorded: mismatch.recorded,
             initialized: mismatch.initialized,
             replan_command: apply_target.replan_command().to_string(),
-        })
+        }))
     })
 }
 

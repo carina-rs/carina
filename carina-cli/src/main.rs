@@ -303,6 +303,7 @@ enum ApplyInput<'a> {
     SavedPlan(&'a Path),
 }
 
+#[allow(clippy::result_large_err)]
 fn classify_apply_input(path: &Path) -> Result<ApplyInput<'_>, error::AppError> {
     match path.metadata() {
         Ok(metadata) if metadata.is_dir() => Ok(ApplyInput::Project(path)),
@@ -364,6 +365,7 @@ fn create_provider_context() -> carina_core::parser::ProviderContext {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn resolve_user_dirs() -> Result<carina_core::UserDirs, error::AppError> {
     // Home discovery is intentionally confined to this binary boundary and
     // invoked only by command arms that use user-owned storage.

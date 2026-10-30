@@ -278,6 +278,10 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                     .build(),
             )
             .attribute(AttributeSchema::optional("description", AttributeType::string()).build()),
+        ResourceSchema::new("iam.Roles").attribute(
+            AttributeSchema::optional("names", AttributeType::list(AttributeType::string()))
+                .build(),
+        ),
         ResourceSchema::new("iam.Roles")
             .attribute(AttributeSchema::optional("name_regex", AttributeType::string()).build())
             .attribute(

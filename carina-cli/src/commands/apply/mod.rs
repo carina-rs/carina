@@ -277,23 +277,14 @@ async fn create_checked_bootstrap_resource(
                     error: _provider_error,
                 } => Ok(Some(
                     carina_state::ResourceState::from_unknown_create_outcome(
-                        &resolved,
-                        unknown,
-                        None,
-                        schema,
-                        &comparison,
+                        &resolved, unknown, None, schema, comparison,
                     ),
                 )),
                 carina_core::provider::CreateFailureKind::Created {
                     created,
                     error: _provider_error,
                 } => carina_state::ResourceState::from_observation(
-                    &resolved,
-                    created,
-                    None,
-                    schema,
-                    None,
-                    &comparison,
+                    &resolved, created, None, schema, None, comparison,
                 )
                 .map(Some)
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source)),
@@ -301,12 +292,7 @@ async fn create_checked_bootstrap_resource(
                     pending,
                     error: _provider_error,
                 } => carina_state::ResourceState::from_in_flight(
-                    &resolved,
-                    pending,
-                    None,
-                    schema,
-                    None,
-                    &comparison,
+                    &resolved, pending, None, schema, None, comparison,
                 )
                 .map(Some)
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source)),
@@ -1198,6 +1184,7 @@ impl DriftCheckResult {
 
 /// Detect infrastructure drift and retain the single historical-secret
 /// verification pass for the saved-plan gate.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn detect_drift<S>(
     sorted_resources: &[carina_core::resource::Resource<S>],
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
@@ -2092,7 +2079,7 @@ async fn run_apply_locked_owned(
             } = match post_expansion {
                 crate::wiring::PostExpansionOutcome::Planned(planned) => planned,
                 crate::wiring::PostExpansionOutcome::Diagnostics(diagnostics) => {
-                    return Err(diagnostics.render_and_abort());
+                    return Err(diagnostics.render_and_abort(project_dir));
                 }
             };
             let crate::wiring::PostExpansionArtifacts {
@@ -2107,7 +2094,7 @@ async fn run_apply_locked_owned(
                 prev_explicit,
                 wait_aliases,
             } = artifacts;
-            render_plan_errors_and_abort(&plan)?;
+            render_plan_errors_and_abort(&plan, project_dir)?;
             #[cfg(any(test, feature = "test-utils"))]
             capture_live_apply_plan_for_test(&plan)?;
             let crate::wiring::PostExpansionApplyResources {
@@ -3428,7 +3415,7 @@ async fn run_apply_from_plan_locked_owned(
                 plan_data_sources,
                 rehydrated_plan_file.data_source_values(),
             )?;
-            render_plan_errors_and_abort(plan)?;
+            render_plan_errors_and_abort(plan, project_dir)?;
             let executable_data_source_values = data_source_values
                 .clone()
                 .into_executable()

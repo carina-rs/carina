@@ -149,7 +149,7 @@ fn assert_plan_is_blocked(project: &OutcomeUnknownProject, identity: &str) {
     );
     let expected = format!(
         "if it exists: import {{ to = mock.test.resource \"{identity}\" id = \"…\" }}; \
-         if it doesn't: carina state forget mock.test.resource \"{identity}\""
+         if it doesn't: carina state forget mock.test.resource {identity}"
     );
     assert!(
         text.contains(&expected),

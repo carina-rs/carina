@@ -1838,7 +1838,7 @@ async fn detect_drift_returns_messages_when_drift_detected() {
 /// produce a Delete effect in the plan.  This is the regression test for issue #844.
 #[test]
 fn orphaned_state_resource_produces_delete_effect() {
-    use carina_core::differ::create_plan;
+    use carina_core::differ::create_plan_for_test as create_plan;
     use std::collections::HashSet;
 
     // State file has two resources: "keep-bucket" and "removed-bucket"
@@ -2296,31 +2296,35 @@ impl StateBackend for RefreshTestBackend {
 #[tokio::test]
 async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     let user_dirs = carina_core::TestUserDirs::new();
-    // State has two resources: "keep-bucket" (in config) and "orphan-bucket" (not in config)
+    // State has two resources: "keep" (in config) and "orphan" (not in config).
+    // The fixture uses the built-in mock provider's registered managed type so
+    // every refreshed row has an owner schema.
     let mut state = StateFile::new();
     state
         .upsert_resource(
-            ResourceState::try_applied("s3.Bucket", "keep-bucket", "", "keep-bucket")
+            ResourceState::try_applied("test.resource", "keep", "mock", "keep")
                 .expect("fixture identifier is non-empty")
-                .with_attribute("bucket", json!("keep-bucket")),
+                .with_attribute("name", json!("keep")),
         )
         .expect("test state setup must be valid");
     state
         .upsert_resource(
-            ResourceState::try_applied("s3.Bucket", "orphan-bucket", "", "orphan-bucket")
+            ResourceState::try_applied("test.resource", "orphan", "mock", "orphan")
                 .expect("fixture identifier is non-empty")
-                .with_attribute("bucket", json!("orphan-bucket")),
+                .with_attribute("name", json!("orphan")),
         )
         .expect("test state setup must be valid");
 
     let backend = RefreshTestBackend::new(state);
 
-    // Config only has "keep-bucket" -- "orphan-bucket" was removed from .crn
+    // Config only has "keep" -- "orphan" was removed from .crn.
     let mut parsed = carina_core::parser::InferredFile::default();
-    parsed.resources = vec![Resource::new("s3.Bucket", "keep-bucket").with_attribute(
-        "bucket",
-        Value::Concrete(ConcreteValue::String("keep-bucket".into())),
-    )];
+    parsed.resources = vec![
+        Resource::with_provider("mock", "test.resource", "keep", None).with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("keep".into())),
+        ),
+    ];
 
     // MockProvider returns not_found for both resources (simulates external deletion)
     let lock = LockInfo::for_test("state-refresh");
@@ -2345,11 +2349,11 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
         .get_written_state()
         .expect("state should be written");
 
-    // "orphan-bucket" should have been removed from state since it was deleted externally
+    // "orphan" should have been removed from state since it was deleted externally
     // and the refresh should have visited it
     assert!(
         written
-            .find_resource("", "s3.Bucket", "orphan-bucket")
+            .find_resource("mock", "test.resource", "orphan")
             .is_none(),
         "Orphaned resource should be removed from state after refresh (issue #879)"
     );
@@ -2708,7 +2712,7 @@ fn wiring_context_activates_builtin_mock_for_implicit_fallback() {
 /// 4. Expected: no Delete effect should be generated
 #[test]
 fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
-    use carina_core::differ::create_plan;
+    use carina_core::differ::create_plan_for_test as create_plan;
 
     // State file tracks "removed-bucket" with an identifier (implies it existed in infra)
     let mut state_file = StateFile::new();
@@ -2789,7 +2793,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
 /// 3. No provider.read() calls are made
 #[test]
 fn refresh_false_uses_cached_state_from_state_file() {
-    use carina_core::differ::create_plan;
+    use carina_core::differ::create_plan_for_test as create_plan;
 
     let mut state_file = StateFile::new();
     state_file
@@ -2884,7 +2888,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
 /// directly without calling provider.read().
 #[test]
 fn refresh_false_includes_orphaned_resources_from_state_file() {
-    use carina_core::differ::create_plan;
+    use carina_core::differ::create_plan_for_test as create_plan;
 
     let mut state_file = StateFile::new();
     state_file
@@ -2952,7 +2956,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
 /// Issue #950: --refresh=false without a state file should treat all resources as new.
 #[test]
 fn refresh_false_without_state_file_treats_resources_as_new() {
-    use carina_core::differ::create_plan;
+    use carina_core::differ::create_plan_for_test as create_plan;
 
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "new-bucket", None);
     resource.set_attr(
@@ -3188,7 +3192,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
 
 #[test]
 fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
-    use carina_core::differ::create_plan;
+    use carina_core::differ::create_plan_for_test as create_plan;
     use carina_core::resource::EnumValueResolver;
     use carina_core::schema::{AttributeSchema, AttributeType, TypeIdentity};
 
@@ -3949,6 +3953,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_27_top_level_keys() {
         "plan",
         "provider_artifacts",
         "provider_configs",
+        "provider_scopes",
         "schema_fingerprints",
         "sorted_resources",
         "source_path",
@@ -4013,6 +4018,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_27_top_level_keys() {
             "wait_bindings",
             "schema_fingerprints",
             "provider_artifacts",
+            "provider_scopes",
         ]
     );
 

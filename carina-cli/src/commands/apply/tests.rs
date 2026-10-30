@@ -179,7 +179,7 @@ fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
     assert!(std::error::Error::source(&unavailable).is_none());
 
     let scope_mismatch = saved_plan_secret_preparation_error(
-        AppError::SavedPlanProviderScopeMismatch(
+        AppError::SavedPlanProviderScopeMismatch(Box::new(
             crate::error::SavedPlanProviderScopeMismatchError {
                 instance: carina_core::provider::ProviderInstanceKey::new(
                     "test",
@@ -196,7 +196,7 @@ fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
                 ),
                 replan_command: "carina plan --out reviewed-plan.json infra".to_string(),
             },
-        ),
+        )),
         target,
     );
     assert!(matches!(
@@ -6086,7 +6086,7 @@ async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
     );
     let resolved_resource = ResolvedResource::new(resource);
     let saved_attrs = state_file.build_saved_attrs().lift(&schemas);
-    let plan = carina_core::differ::create_plan(
+    let plan = carina_core::differ::create_plan_for_test(
         std::slice::from_ref(&resolved_resource),
         &[],
         &carina_core::provider::ProviderRouter::new(),
@@ -9591,7 +9591,7 @@ mod saved_plan_version_tests {
             &[],
         );
         let resolved_resource = carina_core::resource::ResolvedResource::new(resource.clone());
-        let plan = carina_core::differ::create_plan(
+        let plan = carina_core::differ::create_plan_for_test(
             std::slice::from_ref(&resolved_resource),
             &[],
             &ProviderRouter::new(),
