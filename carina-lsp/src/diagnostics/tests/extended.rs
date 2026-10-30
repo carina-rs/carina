@@ -215,6 +215,58 @@ fn anonymous_loop_moved_to_legacy_diagnostic_has_exact_range() {
 }
 
 #[test]
+fn anonymous_loop_import_to_legacy_diagnostic_has_exact_range() {
+    let source = concat!(
+        "import {\n",
+        "  to = mock.test.resource '_for0[0]'\n",
+        "  id = 'resource-existing'\n",
+        "}\n\n",
+        "for name in ['one'] {\n",
+        "  mock.test.resource {\n",
+        "    name = name\n",
+        "  }\n",
+        "}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let diagnostic = only_message_diagnostic(&diagnostics, "legacy synthetic loop address");
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(1, 7), Position::new(1, 36))
+    );
+    assert_eq!(
+        diagnostic.message,
+        concat!(
+            "The `import.to` address mock.test.resource '_for0[0]' is a legacy synthetic loop ",
+            "address and cannot be a destination. Use the current anonymous address ",
+            "mock.test.resource 'mock_test_resource_96081a11' instead.",
+        )
+    );
+}
+
+#[test]
+fn plain_anonymous_identity_collision_is_reported_on_each_authored_resource() {
+    let source = concat!(
+        "mock.test.resource { name = 'same' }\n",
+        "\n",
+        "mock.test.resource { name = 'same' }\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let collisions = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Anonymous resource identifier collision")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(collisions.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(collisions[0].range.start.line, 0);
+    assert_eq!(collisions[1].range.start.line, 2);
+}
+
+#[test]
 fn anonymous_identity_and_legacy_move_target_diagnostics_are_both_reported() {
     let source = concat!(
         "moved {\n",

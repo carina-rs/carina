@@ -4967,7 +4967,7 @@ fn parse_import_block() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.state_blocks.len(), 1);
     match &result.state_blocks[0] {
-        StateBlock::Import { to, id } => {
+        StateBlock::Import { to, to_span: _, id } => {
             assert_eq!(to.provider, "awscc");
             assert_eq!(to.resource_type, "ec2.Vpc");
             assert_eq!(to.name_str(), "main-vpc");

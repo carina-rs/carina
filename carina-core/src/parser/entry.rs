@@ -722,7 +722,11 @@ fn parse_with_seeded_bindings_inner(
                                 export_params.extend(parsed_export_params);
                             }
                             Rule::import_state_block => {
-                                state_blocks.push(parse_import_state_block(stmt, &ctx)?);
+                                state_blocks.push(parse_import_state_block(
+                                    stmt,
+                                    &ctx,
+                                    &preprocessed_file,
+                                )?);
                             }
                             Rule::removed_block => {
                                 state_blocks.push(parse_removed_block(stmt)?);

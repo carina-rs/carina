@@ -718,10 +718,11 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
             if let Some(origin) = effect.loop_origin() {
                 name_part.push_str("  ");
                 origin.append_display_suffix(&mut name_part);
+                nodes[idx].effect_label.push_str("  ");
+                origin.append_display_suffix(&mut nodes[idx].effect_label);
             }
             nodes[idx].resource_type = display_type.clone();
-            nodes[idx].name_part = name_part.clone();
-            nodes[idx].effect_label = format!("{display_type} {name_part}");
+            nodes[idx].name_part = name_part;
         } else if let Effect::Delete {
             id,
             identifier,

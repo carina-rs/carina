@@ -274,6 +274,7 @@ pub(super) fn materialize_deferred_create<
             identity_inputs.provider_configs,
             identity_inputs.factories,
             identity_inputs.schemas,
+            crate::identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
         )
         .map_err(|error| match error {
             crate::identifier::AnonymousIdentityComputationError::ProviderConfig(error) => {
@@ -552,6 +553,7 @@ mod tests {
             &[],
             &[],
             &schemas,
+            crate::identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
         )
         .expect("plan-time anonymous identity computes");
 

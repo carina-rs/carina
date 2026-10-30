@@ -421,6 +421,13 @@ pub struct AnonymousResourceIdentifierCollision {
     identifier: String,
 }
 
+impl AnonymousResourceIdentifierCollision {
+    /// Generated identity shared by the conflicting declarations.
+    pub fn identifier(&self) -> &str {
+        &self.identifier
+    }
+}
+
 impl std::fmt::Display for AnonymousResourceIdentifierCollision {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -502,6 +509,24 @@ pub enum AnonymousIdentityComputationError {
     Identity(#[from] AnonymousIdentityError),
 }
 
+/// Which anonymous-identity conflicts are policy errors at this call site.
+///
+/// Generated identifier collisions are representational failures and remain
+/// errors under both policies. Recovery commands may permit the broader
+/// mutable-attribute ambiguity so broken configuration cannot block destroy
+/// or state repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnonymousIdentityConflictPolicy {
+    RejectAttributeDerived,
+    RepresentabilityOnly,
+}
+
+impl AnonymousIdentityConflictPolicy {
+    const fn rejects_attribute_derived(self) -> bool {
+        matches!(self, Self::RejectAttributeDerived)
+    }
+}
+
 /// Canonicalize provider identity inputs and assign anonymous resource IDs
 /// through the same factory lookup on every plan, editor, and apply path.
 pub fn compute_anonymous_identifiers_with_factories<S: AnonymousIdentityModuleSource>(
@@ -509,6 +534,7 @@ pub fn compute_anonymous_identifiers_with_factories<S: AnonymousIdentityModuleSo
     providers: &[ProviderConfig],
     factories: &[Box<dyn ProviderFactory>],
     registry: &SchemaRegistry,
+    conflict_policy: AnonymousIdentityConflictPolicy,
 ) -> Result<(), AnonymousIdentityComputationError> {
     let providers =
         crate::value::canonicalize_provider_configs_with_schemas(providers, &|provider_name| {
@@ -519,6 +545,7 @@ pub fn compute_anonymous_identifiers_with_factories<S: AnonymousIdentityModuleSo
         resources,
         &providers,
         registry,
+        conflict_policy,
         &|provider_name| {
             crate::provider::find_factory(factories, provider_name)
                 .map(|factory| {
@@ -558,7 +585,23 @@ impl From<LegacyLoopMoveTargetError> for AnonymousIdentityError {
 pub struct LegacyLoopMoveTargetError {
     target: StateBlockAddress,
     replacement: Option<StateBlockAddress>,
+    destination: StateBlockDestination,
     source_span: Option<SourceSpan>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StateBlockDestination {
+    Import,
+    Moved,
+}
+
+impl StateBlockDestination {
+    const fn field_name(self) -> &'static str {
+        match self {
+            Self::Import => "import.to",
+            Self::Moved => "moved.to",
+        }
+    }
 }
 
 impl LegacyLoopMoveTargetError {
@@ -579,8 +622,9 @@ impl std::fmt::Display for LegacyLoopMoveTargetError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "The `moved.to` address {} is a legacy synthetic loop address and cannot be a \
+            "The `{}` address {} is a legacy synthetic loop address and cannot be a \
              destination.",
+            self.destination.field_name(),
             display_state_block_address(&self.target),
         )?;
         if let Some(replacement) = &self.replacement {
@@ -636,12 +680,13 @@ fn has_underscore_leading_identity_segment(identity: &str) -> bool {
     false
 }
 
-/// Reject historical synthetic loop identities as `moved.to` destinations.
+/// Reject historical synthetic loop identities as state-block destinations.
 ///
 /// A legacy identity remains valid as `moved.from`, which is how users can
-/// explicitly migrate old state to a newly bound loop. When provenance points
-/// to exactly one current resource, include that resource's resolved address
-/// in the repair text.
+/// explicitly migrate old state to a newly bound loop. It is never a valid
+/// `moved.to` or `import.to` address. When provenance points to exactly one
+/// current resource, include that resource's resolved address in the repair
+/// text.
 pub fn check_legacy_loop_move_targets<S>(
     state_blocks: &[StateBlock],
     resources: &[Resource<S>],
@@ -649,10 +694,17 @@ pub fn check_legacy_loop_move_targets<S>(
     state_blocks
         .iter()
         .filter_map(|block| {
-            let StateBlock::Moved { addresses } = block else {
-                return None;
+            let (target, destination, source_span) = match block {
+                StateBlock::Import { to, to_span, id: _ } => {
+                    (to.clone(), StateBlockDestination::Import, *to_span)
+                }
+                StateBlock::Moved { addresses } => (
+                    addresses.to(),
+                    StateBlockDestination::Moved,
+                    addresses.to_span(),
+                ),
+                StateBlock::Removed { from: _ } => return None,
             };
-            let target = addresses.to();
             let is_desired_address = resources.iter().any(|resource| {
                 resource.id.provider == target.provider
                     && resource.id.resource_type == target.resource_type
@@ -701,7 +753,8 @@ pub fn check_legacy_loop_move_targets<S>(
                     [replacement] => Some(replacement.clone()),
                     _ => None,
                 },
-                source_span: addresses.to_span(),
+                destination,
+                source_span,
             })
         })
         .collect()
@@ -1633,6 +1686,7 @@ pub fn compute_anonymous_identifiers_for_test(
         resources,
         &providers,
         registry,
+        AnonymousIdentityConflictPolicy::RejectAttributeDerived,
         identity_attributes_fn,
     )
 }
@@ -1646,6 +1700,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
     resources: CanonicalizedResources<'_, S>,
     providers: &CanonicalizedProviderConfigs,
     registry: &SchemaRegistry,
+    conflict_policy: AnonymousIdentityConflictPolicy,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), AnonymousIdentityError> {
     use std::hash::{Hash, Hasher};
@@ -1656,34 +1711,38 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
     let mut identity_errors = std::mem::take(&mut module_collision_discovery.plain_errors);
     let mut direct_conflict_sources = Vec::new();
 
-    for conflict in check_attribute_derived_anonymous_resource_conflicts(resources, registry) {
-        let members: Vec<usize> = resources
-            .iter()
-            .enumerate()
-            .filter_map(|(index, resource)| conflict.includes(resource, registry).then_some(index))
-            .collect();
-        let explained_by_module_prefix = module_prefix_collision_fully_explains_members(
-            &members,
-            resources,
-            &module_collision_discovery,
-        );
-        if !explained_by_module_prefix
-            && members
+    if conflict_policy.rejects_attribute_derived() {
+        for conflict in check_attribute_derived_anonymous_resource_conflicts(resources, registry) {
+            let members: Vec<usize> = resources
                 .iter()
-                .any(|&index| resources[index].loop_provenance.direct_origin().is_none())
-        {
-            identity_errors.push(conflict.into());
-        }
-        if !explained_by_module_prefix {
-            for origin in members
-                .iter()
-                .filter_map(|&index| resources[index].loop_provenance.direct_origin().cloned())
+                .enumerate()
+                .filter_map(|(index, resource)| {
+                    conflict.includes(resource, registry).then_some(index)
+                })
+                .collect();
+            let explained_by_module_prefix = module_prefix_collision_fully_explains_members(
+                &members,
+                resources,
+                &module_collision_discovery,
+            );
+            if !explained_by_module_prefix
+                && members
+                    .iter()
+                    .any(|&index| resources[index].loop_provenance.direct_origin().is_none())
             {
-                record_direct_loop_conflict(
-                    &mut direct_conflict_sources,
-                    LoopConflictReason::AttributeDerived,
-                    &origin,
-                );
+                identity_errors.push(conflict.into());
+            }
+            if !explained_by_module_prefix {
+                for origin in members
+                    .iter()
+                    .filter_map(|&index| resources[index].loop_provenance.direct_origin().cloned())
+                {
+                    record_direct_loop_conflict(
+                        &mut direct_conflict_sources,
+                        LoopConflictReason::AttributeDerived,
+                        &origin,
+                    );
+                }
             }
         }
     }
@@ -1938,6 +1997,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs_for_test(
         resources,
         &providers,
         registry,
+        AnonymousIdentityConflictPolicy::RejectAttributeDerived,
         identity_attributes_fn,
     )
 }

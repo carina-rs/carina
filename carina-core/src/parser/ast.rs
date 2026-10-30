@@ -1304,6 +1304,10 @@ pub enum StateBlock {
         /// Target resource address (routing-agnostic — see
         /// [`StateBlockAddress`]).
         to: StateBlockAddress,
+        /// Parser span of the authored destination address. Diagnostic-only;
+        /// saved representations retain the typed address but not source bytes.
+        #[serde(skip, default)]
+        to_span: Option<SourceSpan>,
         /// Cloud provider identifier (e.g., `"vpc-0abc123def456"`).
         ///
         /// Carried as a [`Value`] (not `String`) so a `"${X.attr}|..."`
@@ -3895,6 +3899,31 @@ mod substitute_placeholder_tests {
         assert_eq!(decoded.file, None);
         assert_eq!(decoded.line, 0);
         assert_eq!(decoded.iterable, deferred.iterable);
+    }
+
+    #[test]
+    fn unbound_deferred_target_requires_serialized_loop_kind() {
+        let parsed = crate::parser::parse(
+            "let upstream = upstream_state { source = '../upstream' }\n\
+             for value in upstream.values {\n\
+               mock.test.Child { identity_input = value }\n\
+             }\n",
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("deferred unbound loop parses");
+        let target = &parsed.deferred_for_expressions[0].target;
+        let mut json = serde_json::to_value(target).expect("serialize deferred target");
+        json["template"]["source"]
+            .as_object_mut()
+            .expect("loop source object")
+            .remove("kind");
+
+        let error = serde_json::from_value::<DeferredForTarget>(json)
+            .expect_err("format 29 requires the serialized loop kind");
+        assert!(
+            error.to_string().contains("missing field `kind`"),
+            "{error}"
+        );
     }
 
     #[test]

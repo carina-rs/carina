@@ -2672,7 +2672,12 @@ pub(crate) fn reconcile_late_anonymous_identities(
         inputs.resources.resources_mut(),
         ctx.schemas(),
     )?;
-    compute_anonymous_identifiers_result_with_ctx(ctx, canonical_resources, inputs.providers)?;
+    compute_anonymous_identifiers_result_with_ctx(
+        ctx,
+        canonical_resources,
+        inputs.providers,
+        identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+    )?;
 
     let moves = inputs.state_file.map_or_else(Vec::new, |state_file| {
         let state_view =
@@ -2737,7 +2742,22 @@ pub fn compute_anonymous_identifiers_with_ctx(
     resources: carina_core::value::CanonicalizedResources<'_>,
     providers: &[ProviderConfig],
 ) -> Vec<AppError> {
-    match compute_anonymous_identifiers_result_with_ctx(ctx, resources, providers) {
+    compute_anonymous_identifiers_with_policy_with_ctx(
+        ctx,
+        resources,
+        providers,
+        identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+    )
+}
+
+pub(crate) fn compute_anonymous_identifiers_with_policy_with_ctx(
+    ctx: &WiringContext,
+    resources: carina_core::value::CanonicalizedResources<'_>,
+    providers: &[ProviderConfig],
+    conflict_policy: identifier::AnonymousIdentityConflictPolicy,
+) -> Vec<AppError> {
+    match compute_anonymous_identifiers_result_with_ctx(ctx, resources, providers, conflict_policy)
+    {
         Ok(()) => Vec::new(),
         Err(AppError::AnonymousIdentity(error)) => error
             .into_individual_errors()
@@ -2752,12 +2772,14 @@ fn compute_anonymous_identifiers_result_with_ctx(
     ctx: &WiringContext,
     resources: carina_core::value::CanonicalizedResources<'_>,
     providers: &[ProviderConfig],
+    conflict_policy: identifier::AnonymousIdentityConflictPolicy,
 ) -> Result<(), AppError> {
     match identifier::compute_anonymous_identifiers_with_factories(
         resources,
         providers,
         ctx.factories(),
         ctx.schemas(),
+        conflict_policy,
     ) {
         Ok(()) => Ok(()),
         Err(identifier::AnonymousIdentityComputationError::ProviderConfig(error)) => {
@@ -2773,11 +2795,13 @@ fn compute_canonical_pair_anonymous_identifiers_result_with_ctx<E>(
     ctx: &WiringContext,
     resources: &mut CanonicalResourcePair<E>,
     providers: &[ProviderConfig],
+    conflict_policy: identifier::AnonymousIdentityConflictPolicy,
 ) -> Result<(), AppError> {
     match resources.canonicalize_and_compute_anonymous_identifiers(
         ctx.schemas(),
         providers,
         ctx.factories(),
+        conflict_policy,
     ) {
         Ok(()) => Ok(()),
         Err(CanonicalResourceIdentityError::EnumCanonicalization(error)) => Err(error.into()),
@@ -2788,15 +2812,31 @@ fn compute_canonical_pair_anonymous_identifiers_result_with_ctx<E>(
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn compute_canonical_pair_anonymous_identifiers_with_ctx<E>(
     ctx: &WiringContext,
     resources: &mut CanonicalResourcePair<E>,
     providers: &[ProviderConfig],
 ) -> Result<Vec<AppError>, AppError> {
+    compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx(
+        ctx,
+        resources,
+        providers,
+        identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+    )
+}
+
+pub(crate) fn compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx<E>(
+    ctx: &WiringContext,
+    resources: &mut CanonicalResourcePair<E>,
+    providers: &[ProviderConfig],
+    conflict_policy: identifier::AnonymousIdentityConflictPolicy,
+) -> Result<Vec<AppError>, AppError> {
     match resources.canonicalize_and_compute_anonymous_identifiers(
         ctx.schemas(),
         providers,
         ctx.factories(),
+        conflict_policy,
     ) {
         Ok(()) => Ok(Vec::new()),
         Err(CanonicalResourceIdentityError::EnumCanonicalization(error)) => Err(error.into()),
@@ -5991,7 +6031,12 @@ impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
         ctx: &WiringContext,
         providers: &[ProviderConfig],
     ) -> Result<(), AppError> {
-        compute_canonical_pair_anonymous_identifiers_result_with_ctx(ctx, self, providers)
+        compute_canonical_pair_anonymous_identifiers_result_with_ctx(
+            ctx,
+            self,
+            providers,
+            identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+        )
     }
 
     fn expand_partitioned<F>(
@@ -6023,7 +6068,12 @@ impl<E> DeferredExpansionTarget<E> for carina_core::parser::File<E> {
             &mut self.resources,
             ctx.schemas(),
         )?;
-        compute_anonymous_identifiers_result_with_ctx(ctx, resources, providers)
+        compute_anonymous_identifiers_result_with_ctx(
+            ctx,
+            resources,
+            providers,
+            identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+        )
     }
 
     fn expand_partitioned<F>(
@@ -7400,7 +7450,7 @@ pub fn add_state_block_effects(
 
     for block in state_blocks {
         match block {
-            StateBlock::Import { to, id } => {
+            StateBlock::Import { to, to_span: _, id } => {
                 let effective_to = resolve_import_target(to, desired_resources);
 
                 // Skip if resource already exists in state

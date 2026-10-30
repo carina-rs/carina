@@ -109,7 +109,6 @@ pub struct LoopSource {
     display_file: String,
     line: usize,
     column: usize,
-    #[serde(default = "default_loop_kind")]
     kind: LoopKind,
     system_identity: ResourceIdentity,
     #[serde(skip, default)]
@@ -252,10 +251,6 @@ impl LoopSource {
             Some(scope.as_str()),
         );
     }
-}
-
-const fn default_loop_kind() -> LoopKind {
-    LoopKind::For
 }
 
 fn loop_system_identity(

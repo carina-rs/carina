@@ -224,6 +224,18 @@ fn anonymous_loop_moved_to_legacy() {
 }
 
 #[test]
+fn anonymous_loop_import_to_legacy() {
+    assert_validate_and_plan_error(
+        "anonymous_loop_import_to_legacy",
+        concat!(
+            "The `import.to` address mock.test.resource '_for0[0]' is a legacy synthetic loop ",
+            "address and cannot be a destination. Use the current anonymous address ",
+            "mock.test.resource 'mock_test_resource_96081a11' instead.",
+        ),
+    );
+}
+
+#[test]
 fn anonymous_identity_and_legacy_move_target_errors_are_reported_together() {
     let scenario = Scenario::from_fixture("anonymous_loop_multiple_errors");
     assert_success("carina init", &scenario.carina(&["init", "."]));

@@ -441,7 +441,7 @@ fn snapshot_anonymous_loop_origin_effect_labels() {
 
     insta::assert_debug_snapshot!(labels, @r###"
     [
-        "mock.test.resource mock_test_resource_96081a11  (for [0] at main.crn:1)",
+        "mock.test.resource _for0[0] -> mock.test.resource mock_test_resource_96081a11  (for [0] at main.crn:1)",
         "mock.test.resource (name: one)  (for [0] at main.crn:1)",
     ]
     "###);

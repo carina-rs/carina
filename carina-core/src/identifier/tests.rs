@@ -905,6 +905,7 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
         canonical_awscc,
         &providers_awscc,
         &schemas,
+        AnonymousIdentityConflictPolicy::RejectAttributeDerived,
         &identity_fn,
     )
     .unwrap();
@@ -912,6 +913,7 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
         canonical_aws,
         &providers_aws,
         &schemas,
+        AnonymousIdentityConflictPolicy::RejectAttributeDerived,
         &identity_fn,
     )
     .unwrap();
@@ -6332,6 +6334,31 @@ fn moved_to_rejects_a_legacy_segment_below_a_module_prefix() {
 
     assert_eq!(errors.len(), 1);
     assert!(errors[0].to_string().contains("net._for0[0]"));
+}
+
+#[test]
+fn import_to_rejects_a_legacy_loop_address_with_the_current_replacement() {
+    let (resource, _) = resolved_single_loop_resource(None);
+    let current = resource
+        .id
+        .identity_str()
+        .expect("resolved anonymous identity")
+        .to_string();
+    let parsed = crate::parser::parse(
+        "import {\n  to = mock.ec2.Vpc '_for0[0]'\n  id = 'vpc-existing'\n}\n",
+        &crate::parser::ProviderContext::default(),
+    )
+    .expect("import block parses");
+
+    let errors = check_legacy_loop_move_targets(&parsed.state_blocks, &[resource]);
+
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].to_string(),
+        format!(
+            "The `import.to` address mock.ec2.Vpc '_for0[0]' is a legacy synthetic loop address and cannot be a destination. Use the current anonymous address mock.ec2.Vpc '{current}' instead."
+        )
+    );
 }
 
 #[test]

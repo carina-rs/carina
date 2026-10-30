@@ -14,8 +14,10 @@ use crate::parser::{ParseContext, PreprocessedFile, SourceSpan};
 pub(in crate::parser) fn parse_import_state_block(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
+    file: &PreprocessedFile,
 ) -> Result<StateBlock, ParseError> {
     let mut to: Option<StateBlockAddress> = None;
+    let mut to_span: Option<SourceSpan> = None;
     let mut id: Option<crate::resource::Value> = None;
 
     for attr in pair.into_inner() {
@@ -24,6 +26,7 @@ pub(in crate::parser) fn parse_import_state_block(
             match inner.as_rule() {
                 Rule::import_to_attr => {
                     let addr = first_inner(inner, "resource address", "import to")?;
+                    to_span = Some(SourceSpan::from_pest(&addr, file));
                     to = Some(parse_state_block_address(addr)?);
                 }
                 Rule::import_id_attr => {
@@ -46,7 +49,11 @@ pub(in crate::parser) fn parse_import_state_block(
         message: "import block requires 'id' attribute".to_string(),
     })?;
 
-    Ok(StateBlock::Import { to, id })
+    Ok(StateBlock::Import {
+        to,
+        to_span: Some(to_span.expect("parsed import.to address has a source span")),
+        id,
+    })
 }
 
 /// Parse a removed block

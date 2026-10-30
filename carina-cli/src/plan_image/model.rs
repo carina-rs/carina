@@ -801,13 +801,10 @@ fn deferred_label(
     match &template.target {
         carina_core::parser::DeferredForTarget::Bound { binding } => binding.clone(),
         carina_core::parser::DeferredForTarget::Unbound { .. } => {
-            let location = template.file.as_deref().map_or_else(
-                || template.line.to_string(),
-                |file| format!("{file}:{}", template.line),
-            );
             format!(
-                "{}.<pending> (deferred for at {location})",
-                id.display_type()
+                "{}.<pending> (deferred for at {})",
+                id.display_type(),
+                template.target.display_name(),
             )
         }
     }
@@ -1273,6 +1270,81 @@ mod tests {
 
         assert_eq!(node.note, None);
         assert!(!format!("{node:?}").contains(ITERABLE_VALUE));
+    }
+
+    #[test]
+    fn deferred_unbound_label_survives_saved_plan_serde_round_trip() {
+        let fixture = tempfile::tempdir().expect("deferred label fixture");
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            "let upstream = upstream_state { source = '../upstream' }\n\
+             for value in upstream.accounts {\n\
+               mock.test.Child { identity_input = value }\n\
+             }\n",
+        )
+        .expect("write deferred loop fixture");
+        let mut parsed = carina_core::config_loader::parse_directory(
+            fixture.path(),
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .expect("parse deferred loop fixture");
+        let template = parsed
+            .deferred_for_expressions
+            .pop()
+            .expect("fixture contains one deferred loop");
+        assert_eq!(template.target.display_name(), "main.crn:2");
+        assert!(
+            template
+                .file
+                .as_deref()
+                .is_some_and(|file| file.contains(fixture.path().to_string_lossy().as_ref())),
+            "the live diagnostic path should be machine-local before serialization"
+        );
+
+        let saved = carina_core::parser::SavedDeferredForExpression::from(template);
+        let json = serde_json::to_string(&saved).expect("serialize saved deferred template");
+        let saved: carina_core::parser::SavedDeferredForExpression =
+            serde_json::from_str(&json).expect("deserialize saved deferred template");
+        let DeferredForExpression {
+            file,
+            line,
+            header,
+            resource_type,
+            attributes,
+            target,
+            iterable,
+            binding,
+            template_resource: _,
+        } = saved;
+        let round_tripped = DeferredForExpression {
+            file,
+            line,
+            header,
+            resource_type,
+            attributes,
+            target,
+            iterable,
+            binding,
+            template_resource: Resource::pending_with_provider("mock", "test.Child", None),
+        };
+
+        let mut plan = Plan::new();
+        plan.add(Effect::DeferredCreate {
+            id: ResolvedResourceId::with_provider_identity(
+                "mock",
+                "__deferred_for",
+                "pending_accounts",
+                None,
+            ),
+            template: Box::new(round_tripped),
+        });
+        let node = node_from_effect(0, &plan.effects()[0], None, None);
+
+        assert!(
+            node.label.contains("deferred for at main.crn:2"),
+            "saved-plan label lost its display-relative origin: {}",
+            node.label,
+        );
     }
 
     #[test]

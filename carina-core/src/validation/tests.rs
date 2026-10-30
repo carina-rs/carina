@@ -519,10 +519,12 @@ fn state_block_targets_only_count_managed_resources_as_used() {
     );
     parsed.state_blocks.push(crate::parser::StateBlock::Import {
         to: crate::parser::StateBlockAddress::new("mock", "test.resource", "managed"),
+        to_span: None,
         id: Value::Concrete(ConcreteValue::String("existing-1".into())),
     });
     parsed.state_blocks.push(crate::parser::StateBlock::Import {
         to: crate::parser::StateBlockAddress::new("mock", "test.resource", "read_target"),
+        to_span: None,
         id: Value::Concrete(ConcreteValue::String("existing-2".into())),
     });
 

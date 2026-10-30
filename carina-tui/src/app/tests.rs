@@ -846,4 +846,11 @@ fn pure_move_not_suppressed() {
     // Pure move (no Update/Replace for same target) should be kept
     assert_eq!(app.nodes.len(), 1);
     assert_eq!(app.nodes[0].symbol, "->");
+    assert!(
+        app.nodes[0].effect_label.contains("old-name")
+            && app.nodes[0].effect_label.contains("->")
+            && app.nodes[0].effect_label.contains("new-name"),
+        "move search text lost its source or destination: {}",
+        app.nodes[0].effect_label,
+    );
 }

@@ -4145,6 +4145,7 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
     // is responsible for lifting routing from the matched Create.
     let state_blocks = vec![StateBlock::Import {
         to: StateBlockAddress::new("aws", "route53.RecordSet", "r.delegation_ns"),
+        to_span: None,
         id: Value::Concrete(ConcreteValue::String(
             "|hosted-zone-id|registry-dev.carina-rs.dev|NS"
                 .to_string()

@@ -40,8 +40,8 @@ use crate::module_walk::ModuleWalk;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::wiring::ProviderLoad;
 use crate::wiring::{
-    CanonicalResourcePair, WiringContext, compute_anonymous_identifiers_with_ctx,
-    compute_canonical_pair_anonymous_identifiers_with_ctx, resolve_file_names_with_ctx,
+    CanonicalResourcePair, WiringContext, compute_anonymous_identifiers_with_policy_with_ctx,
+    compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx, resolve_file_names_with_ctx,
     validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
     validate_module_attribute_refs_after_expansion_failure, validate_module_calls_with_imported,
     validate_module_internal_ref_types, validate_no_backend_in_modules,
@@ -406,6 +406,7 @@ impl ResolvedConfig<'_> {
     fn compute_anonymous_identifiers(
         &mut self,
         ctx: &WiringContext,
+        conflict_policy: carina_core::identifier::AnonymousIdentityConflictPolicy,
     ) -> Result<Vec<AppError>, AppError> {
         let providers = self.parsed().providers.clone();
         match self {
@@ -414,14 +415,20 @@ impl ResolvedConfig<'_> {
                     &mut parsed.resources,
                     ctx.schemas(),
                 )?;
-                Ok(compute_anonymous_identifiers_with_ctx(
+                Ok(compute_anonymous_identifiers_with_policy_with_ctx(
                     ctx,
                     canonical_resources,
                     &providers,
+                    conflict_policy,
                 ))
             }
             Self::Paired { resources, .. } => {
-                compute_canonical_pair_anonymous_identifiers_with_ctx(ctx, resources, &providers)
+                compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx(
+                    ctx,
+                    resources,
+                    &providers,
+                    conflict_policy,
+                )
             }
         }
     }
@@ -834,7 +841,12 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         }
     }
 
-    match resolved_config.compute_anonymous_identifiers(ctx) {
+    let identity_conflict_policy = if skip_resource_validation {
+        carina_core::identifier::AnonymousIdentityConflictPolicy::RepresentabilityOnly
+    } else {
+        carina_core::identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived
+    };
+    match resolved_config.compute_anonymous_identifiers(ctx, identity_conflict_policy) {
         Ok(identifier_errors) => errors.extend(identifier_errors),
         Err(error) => errors.push(error),
     }

@@ -905,6 +905,7 @@ fn saved_plan_import_rehydration_respects_current_provider_instance() {
     )];
     parsed.state_blocks = vec![carina_core::parser::StateBlock::Import {
         to: carina_core::parser::StateBlockAddress::new("mock", "test.resource", "example"),
+        to_span: None,
         id: string_value("provider-id"),
     }];
 
