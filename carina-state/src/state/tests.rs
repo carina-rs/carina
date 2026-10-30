@@ -232,9 +232,10 @@ fn outcome_unknown_lookup_mints_the_only_forget_handle() {
     });
     let mut state = check_and_migrate(&json.to_string()).unwrap().into_state();
     let address = StateBlockAddress::new("mock", "test.Resource", "unknown");
+    let id = ResourceId::with_provider_identity("mock", "test.Resource", "unknown", None);
 
     assert_eq!(
-        state.import_target_disposition(&address),
+        state.import_target_disposition_for_id(&id),
         ImportTargetDisposition::ReplaceCreateOutcomeUnknown
     );
     let handle = state
@@ -249,8 +250,66 @@ fn outcome_unknown_lookup_mints_the_only_forget_handle() {
             .is_none()
     );
     assert_eq!(
-        state.import_target_disposition(&address),
+        state.import_target_disposition_for_id(&id),
         ImportTargetDisposition::Vacant
+    );
+}
+
+#[test]
+fn outcome_unknown_forget_keeps_deposed_generations_in_a_shell() {
+    let json = serde_json::json!({
+        "version": 20,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "forget-unknown-create-with-deposed",
+        "carina_version": "test",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "unknown",
+            "provider": "mock",
+            "current": {
+                "kind": "create_outcome_unknown",
+                "started_at": "2026-10-23T08:00:00Z"
+            },
+            "directives": { "provider_instance": "issuing" },
+            "deposed": [{
+                "key": "00000000-0000-4000-8000-000000000001",
+                "identifier": "old-id",
+                "provider_instance": "old-route",
+                "attributes": {},
+                "dependency_bindings": ["network"]
+            }]
+        }],
+        "exports": {}
+    });
+    let mut state = check_and_migrate(&json.to_string()).unwrap().into_state();
+    let address = StateBlockAddress::new("mock", "test.Resource", "unknown");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.Resource",
+        "unknown",
+        Some("issuing".to_string()),
+    );
+
+    let forgotten = StateFile::forget(
+        state
+            .find_outcome_unknown(&address)
+            .expect("the protected row must mint a typed forget handle"),
+    );
+
+    assert!(matches!(
+        forgotten.current(),
+        CurrentInstance::CreateOutcomeUnknown { .. }
+    ));
+    let shell = state
+        .find_resource_for_id(&id)
+        .expect("forget must retain a shell for the deposed generation");
+    assert!(matches!(shell.current(), CurrentInstance::None));
+    assert_eq!(shell.deposed.len(), 1);
+    assert_eq!(shell.deposed[0].identifier, "old-id");
+    assert_eq!(
+        shell.deposed[0].provider_instance.as_deref(),
+        Some("old-route")
     );
 }
 
@@ -264,9 +323,10 @@ fn outcome_unknown_lookup_rejects_normal_and_missing_rows_with_removed_hint() {
         .unwrap();
     let normal = StateBlockAddress::new("mock", "test.Resource", "normal");
     let missing = StateBlockAddress::new("mock", "test.Resource", "missing");
+    let normal_id = ResourceId::with_provider_identity("mock", "test.Resource", "normal", None);
 
     assert_eq!(
-        state.import_target_disposition(&normal),
+        state.import_target_disposition_for_id(&normal_id),
         ImportTargetDisposition::Occupied
     );
     let normal_error = state.find_outcome_unknown(&normal).unwrap_err();

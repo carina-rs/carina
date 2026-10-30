@@ -332,6 +332,10 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
         Directives::default(),
     )]);
     let managed = ResolvedResource::collect_resolved([imported]).unwrap();
+    let (_import_effect, replacement) = Effect::import_replacing_outcome_unknown(
+        ResolvedResourceId::new(imported_id.clone()),
+        Value::Concrete(ConcreteValue::String("provider-id".into())),
+    );
 
     let plan = create_plan_with_cascades(
         &managed,
@@ -344,7 +348,7 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &[],
-        &HashSet::from([imported_id]),
+        &HashSet::from([replacement]),
     )
     .unwrap();
 

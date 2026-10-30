@@ -25,7 +25,8 @@ use carina_core::resource::{
     ConcreteValue, Resource, ResourceId, State, Value, legacy_secret_migration,
 };
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, StructField, ValidatedResourceSchema,
+    AttributeSchema, AttributeType, ResourceSchema, StructField, ValidatedConfigSchema,
+    ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 use carina_core::value::{PersistedValue, migrate_legacy_persisted_json};
 use serde::{Deserialize, Serialize};
@@ -302,6 +303,16 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                 .expect("built-in mock resource schema must be valid")
         })
         .collect()
+}
+
+/// Aggregate schema witness exposed by Carina's built-in mock provider.
+pub fn builtin_schema_witness() -> ValidatedProviderSchemaWitness {
+    ValidatedProviderSchemaWitness::new(
+        builtin_schemas(),
+        ValidatedConfigSchema::default(),
+        Default::default(),
+    )
+    .expect("built-in mock schemas form a valid provider-wide witness")
 }
 
 pub struct MockProvider {
@@ -1397,6 +1408,9 @@ mod tests {
                 .iter()
                 .any(|schema| schema.as_schema().resource_type() == "test.deferred_source")
         );
+        let witness = builtin_schema_witness();
+        assert_eq!(witness.resources().len(), schemas.len());
+        assert!(witness.reference_forms().is_empty());
     }
 
     struct EnvGuard {

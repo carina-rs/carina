@@ -48,7 +48,9 @@ use carina_core::differ::{Diff, diff};
 use carina_core::explicit::ExplicitFields;
 use carina_core::provider::{InitializedProvider, ProviderRouter};
 use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
-use carina_core::schema::{ResourceSchema, SchemaRegistry};
+use carina_core::schema::{
+    ResourceSchema, SchemaRegistry, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+};
 
 fn load_dc(name: &str) -> Value {
     let path = format!(
@@ -105,12 +107,19 @@ fn carina3122_live_distribution_readback_defaults_are_projected_away() {
     let saved = carina_core::provider::RawSavedAttrs::default()
         .lift(&carina_core::schema::SchemaRegistry::new());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "awscc",
-        ResourceSchema::new("cloudfront.Distribution")
-            .validate()
-            .expect("comparison owner schema is valid"),
-    );
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![
+            ResourceSchema::new("cloudfront.Distribution")
+                .validate()
+                .expect("comparison owner schema is valid"),
+        ],
+        ValidatedConfigSchema::default(),
+        Default::default(),
+    )
+    .expect("comparison owner witness is valid");
+    schemas
+        .insert_provider_witness("awscc", &witness)
+        .expect("comparison owner witness is consistent");
     let mut providers = ProviderRouter::new();
     providers.add_provider(
         "awscc".to_string(),

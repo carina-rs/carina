@@ -24,12 +24,25 @@ identities are rejected while decoding. The registry retains one table per
 schema owner rather than one global identity table. Owner forms also contribute
 to semantic schema fingerprint encoding v5.
 
+State format 20 adds `create_outcome_unknown`, a token-less current instance
+containing only the create's UTC `started_at` timestamp. The host writes this
+row when an initial guest create fails after at least one host-approved request
+was dispatched and no identifier or continuation was returned. Plan, apply,
+and destroy block on the row. Refresh carries it forward unchanged without a
+provider read. Recovery is explicit: import replaces it when the resource
+exists, while `carina state forget` clears only the current instance after the
+operator confirms the resource is absent; any deposed generations remain
+tracked for deletion.
+
 Saved-plan format 30 records the `reference-scope` of every loaded provider
 instance next to its provider artifact evidence. Saved-plan apply initializes
 those same provider instances and refuses a missing or different scope before
 drift reads, secret evaluation, or provider effects. The evidence is keyed by
 provider instance, not provider kind, so named instances in different regions
-or accounts remain distinct.
+or accounts remain distinct. The format also records an outcome-unknown marker
+and its `started_at` timestamp, never an identifier or continuation token.
+Apply reloads that marker under the state lock and rejects any lifecycle or
+timestamp change before provider effects run.
 
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host
@@ -141,23 +154,6 @@ State format 14 is migrated through an explicit DTO. An unfinished create is
 planned as token-free `ResumeCreate`; the token is joined from locked state
 immediately before dispatch. Only a terminal provider verdict may clear that
 row.
-
-State format 20 adds `create_outcome_unknown`, a token-less current instance
-containing only the create's UTC `started_at` timestamp. The host writes this
-row when an initial guest create fails after at least one host-approved request
-was dispatched and no identifier or continuation was returned. Plan, apply,
-and destroy block on the row. Refresh carries it forward unchanged without a
-provider read. Recovery is explicit: import replaces it when the resource
-exists, while `carina state forget` removes only this row kind after the
-operator confirms the resource is absent.
-
-Saved-plan format 30 records each loaded provider instance's `reference-scope`
-next to its artifact evidence. Apply initializes the same instance set and
-rejects a missing or different scope before drift reads or provider effects.
-The format also records an outcome-unknown marker and its `started_at`
-timestamp, never an identifier or continuation token. Apply reloads that marker
-under the state lock and rejects any lifecycle or timestamp change before
-provider effects run.
 
 Saved-plan format 21 records the address and in-flight marker, never the
 provider token. Apply reloads the envelope from locked state and rejects the

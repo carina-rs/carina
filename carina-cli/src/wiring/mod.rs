@@ -98,7 +98,7 @@ use carina_core::differ::{
 use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
 use carina_core::effect::{
     DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration, MoveAuthority,
-    NonEmptyDeletes, ResolvedMove,
+    NonEmptyDeletes, OutcomeUnknownImportReplacement, ResolvedMove,
 };
 use carina_core::executor::normalized::{
     apply_desired_normalization_slice, is_value_fully_concrete_for_expansion,
@@ -130,11 +130,13 @@ use carina_core::resource::{
     PartialReadMarker, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
     ResourceIdentity, ResourceIdentityError, State, Value,
 };
+#[cfg(any(test, feature = "test-utils"))]
+use carina_core::schema::ValidatedResourceSchema;
 #[cfg(test)]
 use carina_core::schema::{AttributeSchema, AttributeType};
 use carina_core::schema::{
     OwnerBoundResourceSchema, ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
-    ValidatedResourceSchema, resolve_file_block_names_with_schemas,
+    ValidatedProviderSchemaWitness, resolve_file_block_names_with_schemas,
 };
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_core::validation;
@@ -1686,13 +1688,26 @@ pub(crate) fn provider_factory_source(config: &ProviderConfig) -> Option<&Provid
 
 impl WiringContext {
     fn new(factories: Vec<LoadedProviderFactory>, provider_configs: &[ProviderConfig]) -> Self {
-        Self::new_with_additional_schemas(factories, provider_configs, std::iter::empty())
+        Self::new_with_schema_registry(factories, provider_configs, SchemaRegistry::new())
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     fn new_with_additional_schemas(
         loaded_factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig],
         additional_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
+    ) -> Self {
+        let mut schemas = SchemaRegistry::new();
+        for (provider, schema) in additional_schemas {
+            schemas.insert(provider, schema);
+        }
+        Self::new_with_schema_registry(loaded_factories, provider_configs, schemas)
+    }
+
+    fn new_with_schema_registry(
+        loaded_factories: Vec<LoadedProviderFactory>,
+        provider_configs: &[ProviderConfig],
+        mut schemas: SchemaRegistry,
     ) -> Self {
         let uses_builtin_mock =
             carina_provider_mock::uses_builtin_provider(provider_configs, |provider_name| {
@@ -1724,25 +1739,29 @@ impl WiringContext {
             carina_core::provider::schema_registry_and_custom_types_from_factories(Arc::clone(
                 &factories,
             ));
-        let mut schemas = SchemaRegistry::new();
-        for (provider, schema) in additional_schemas {
-            schemas.insert(provider, schema);
-        }
         schemas
             .extend(factory_schemas)
             .expect("plain additional schemas cannot conflict with factory witness forms");
         if uses_builtin_mock {
-            for schema in carina_provider_mock::builtin_schemas() {
+            let builtin = carina_provider_mock::builtin_schema_witness();
+            let missing = builtin.resources().iter().filter(|schema| {
                 let parts = schema.parts();
                 let already_registered = if matches!(parts.kind, SchemaKind::DataSource) {
                     schemas.has_data_source(BUILTIN_PROVIDER_NAME, parts.resource_type)
                 } else {
                     schemas.has_managed(BUILTIN_PROVIDER_NAME, parts.resource_type)
                 };
-                if !already_registered {
-                    schemas.insert(BUILTIN_PROVIDER_NAME, schema);
-                }
-            }
+                !already_registered
+            });
+            let missing = ValidatedProviderSchemaWitness::new(
+                missing.cloned().collect(),
+                builtin.config().clone(),
+                builtin.reference_forms().clone(),
+            )
+            .expect("the filtered built-in mock schemas remain a valid aggregate witness");
+            schemas
+                .insert_provider_witness(BUILTIN_PROVIDER_NAME, &missing)
+                .expect("the built-in mock exposes one consistent schema witness");
         }
         let mut known_providers = factories
             .iter()
@@ -7151,20 +7170,18 @@ pub fn resolve_state_blocks(
                     resolved_removed_from.push(id.into_inner());
                 }
             }
-            StateBlock::Import { to: import_to, .. } => {
+            StateBlock::Import { to: import_to, id } => {
                 let Some(resource) = import_to.find_resource(desired) else {
                     continue;
                 };
-                let disposition = state_file
-                    .as_ref()
-                    .map(|state| state.import_target_disposition_for_id(&resource.id))
-                    .unwrap_or(carina_state::ImportTargetDisposition::Vacant);
-                match disposition {
-                    carina_state::ImportTargetDisposition::Vacant
-                    | carina_state::ImportTargetDisposition::ReplaceCreateOutcomeUnknown => {
-                        to.insert(import_to.clone());
-                    }
-                    carina_state::ImportTargetDisposition::Occupied => {}
+                if state_block_import(
+                    ResolvedResourceId::new(resource.id.clone()),
+                    state_file.as_ref(),
+                    || id.clone(),
+                )
+                .is_some()
+                {
+                    to.insert(import_to.clone());
                 }
             }
         }
@@ -7290,24 +7307,58 @@ fn outcome_unknown_import_replacements(
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
     desired_resources: &[Resource],
-) -> HashSet<ResourceId> {
-    let Some(state_file) = state_file else {
-        return HashSet::new();
-    };
+) -> HashSet<OutcomeUnknownImportReplacement> {
     state_blocks
         .iter()
         .filter_map(|block| {
-            let StateBlock::Import { to, .. } = block else {
+            let StateBlock::Import { to, id } = block else {
                 return None;
             };
             let resource = to.find_resource(desired_resources)?;
-            matches!(
-                state_file.import_target_disposition_for_id(&resource.id),
-                carina_state::ImportTargetDisposition::ReplaceCreateOutcomeUnknown
-            )
-            .then(|| resource.id.clone())
+            state_block_import(
+                ResolvedResourceId::new(resource.id.clone()),
+                state_file.as_ref(),
+                || id.clone(),
+            )?
+            .outcome_unknown_replacement
         })
         .collect()
+}
+
+struct StateBlockImport {
+    effect: Effect,
+    outcome_unknown_replacement: Option<OutcomeUnknownImportReplacement>,
+}
+
+/// Resolve one import block through the single target-disposition seam.
+///
+/// A create-outcome-unknown replacement witness can leave this function only
+/// beside the `Effect::Import` for the same fully routed resource ID.
+fn state_block_import(
+    id: ResolvedResourceId,
+    state_file: Option<&StateFile>,
+    identifier: impl FnOnce() -> Value,
+) -> Option<StateBlockImport> {
+    let disposition = state_file
+        .map(|state| state.import_target_disposition_for_id(id.as_inner()))
+        .unwrap_or(carina_state::ImportTargetDisposition::Vacant);
+    match disposition {
+        carina_state::ImportTargetDisposition::Vacant => Some(StateBlockImport {
+            effect: Effect::Import {
+                id,
+                identifier: identifier(),
+            },
+            outcome_unknown_replacement: None,
+        }),
+        carina_state::ImportTargetDisposition::ReplaceCreateOutcomeUnknown => {
+            let (effect, replacement) = Effect::import_replacing_outcome_unknown(id, identifier());
+            Some(StateBlockImport {
+                effect,
+                outcome_unknown_replacement: Some(replacement),
+            })
+        }
+        carina_state::ImportTargetDisposition::Occupied => None,
+    }
 }
 
 /// Add state block effects (import/removed/moved) to the plan.
@@ -7360,49 +7411,46 @@ pub fn add_state_block_effects(
     for block in state_blocks {
         match block {
             StateBlock::Import { to, id } => {
-                let effective_to = resolve_import_target(to, desired_resources);
-
-                let disposition = state_file
-                    .as_ref()
-                    .map(|state| state.import_target_disposition_for_id(effective_to.as_inner()))
-                    .unwrap_or(carina_state::ImportTargetDisposition::Vacant);
-                let apply_import = match disposition {
-                    carina_state::ImportTargetDisposition::Vacant => true,
-                    carina_state::ImportTargetDisposition::ReplaceCreateOutcomeUnknown => true,
-                    carina_state::ImportTargetDisposition::Occupied => false,
+                // carina#3329: resolve any `${binding.attr}` segments in `id`
+                // against the same binding view as resource attributes.
+                // Deferred upstream-state refs remain typed placeholders for
+                // display and apply-time resolution.
+                let Some(import) = state_block_import(
+                    resolve_import_target(to, desired_resources),
+                    state_file.as_ref(),
+                    || {
+                        carina_core::resolver::resolve_value_for_plan(
+                            id,
+                            bindings,
+                            unresolved_upstream_bindings,
+                        )
+                    },
+                ) else {
+                    continue;
                 };
-                if apply_import {
-                    // carina#3329: resolve any `${binding.attr}` segments
-                    // in `id` against the same binding view the resource
-                    // attribute resolver uses. If the referenced binding
-                    // is a same-stack `let`, this folds the interpolation
-                    // to a `Value::Concrete(ConcreteValue::String)`; if
-                    // it is an `upstream_state` binding whose state has
-                    // not been published yet, it is stamped as
-                    // `Value::Deferred(DeferredValue::Unknown(UpstreamExport))`
-                    // for display. The pre-#3329 path stored a partially-
-                    // substituted `String` and dropped the deferred-ref
-                    // signal entirely.
-                    let resolved_id = carina_core::resolver::resolve_value_for_plan(
-                        id,
-                        bindings,
-                        unresolved_upstream_bindings,
-                    );
-                    suppress_create.insert(effective_to.as_inner().clone());
-                    if carina_core::effect::resolve_import_identifier(&resolved_id)
-                        .is_ok_and(|identifier| AppliedIdentifier::new(identifier).is_err())
-                    {
-                        plan.add_error(carina_core::plan::PlanError::new(
-                            effective_to.as_inner().clone(),
-                            carina_core::plan::PlanErrorKind::InvalidImportProviderIdentifier,
-                        ));
-                        continue;
-                    }
-                    new_effects.push(Effect::Import {
-                        id: effective_to,
-                        identifier: resolved_id,
-                    });
+                let StateBlockImport {
+                    effect,
+                    outcome_unknown_replacement: _,
+                } = import;
+                let target_id = effect.resource_id().clone();
+                let Effect::Import {
+                    identifier: resolved_id,
+                    ..
+                } = &effect
+                else {
+                    unreachable!("state_block_import always returns an Import effect")
+                };
+                suppress_create.insert(target_id.clone());
+                if carina_core::effect::resolve_import_identifier(resolved_id)
+                    .is_ok_and(|identifier| AppliedIdentifier::new(identifier).is_err())
+                {
+                    plan.add_error(carina_core::plan::PlanError::new(
+                        target_id,
+                        carina_core::plan::PlanErrorKind::InvalidImportProviderIdentifier,
+                    ));
+                    continue;
                 }
+                new_effects.push(effect);
             }
             StateBlock::Removed { from } => {
                 // `from` is parsed from `removed { from = X 'addr' }`,

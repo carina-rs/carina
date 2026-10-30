@@ -411,6 +411,34 @@ fn display_state_forget_address(address: &StateBlockAddress) -> String {
     )
 }
 
+fn format_state_forget_target(
+    address: &StateBlockAddress,
+    row: &carina_state::ResourceState,
+) -> String {
+    let mut lines = vec![
+        format!(
+            "Create-outcome-unknown row: {}",
+            display_state_forget_address(address)
+        ),
+        "This row has no provider identifier and cannot be destroyed safely.".to_string(),
+    ];
+    if !row.deposed.is_empty() {
+        lines.push(
+            "Deposed generations that will remain tracked for deletion by the next plan:"
+                .to_string(),
+        );
+        lines.extend(row.deposed.iter().map(|deposed| {
+            format!(
+                "  - identifier `{}` (generation `{}`, provider instance `{}`)",
+                deposed.identifier,
+                deposed.key,
+                deposed.provider_instance.as_deref().unwrap_or("default")
+            )
+        }));
+    }
+    lines.join("\n")
+}
+
 async fn confirm_state_forget<R>(
     reader: R,
     cancel: ShutdownToken,
@@ -523,11 +551,7 @@ where
         .find_outcome_unknown(address)
         .map_err(|source| AppError::from_state_forget(source, project_dir))?;
 
-    println!(
-        "Create-outcome-unknown row: {}",
-        display_state_forget_address(address).yellow()
-    );
-    println!("This row has no provider identifier and cannot be destroyed safely.");
+    println!("{}", format_state_forget_target(address, row.resource()));
     if confirm_state_forget(reader, cancel, auto_approve).await?
         == StateForgetConfirmation::Cancelled
     {
@@ -542,7 +566,9 @@ where
     crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
     println!(
         "{} {}",
-        "Forgot state row:".green().bold(),
+        "Forgot create-outcome-unknown current instance:"
+            .green()
+            .bold(),
         display_state_forget_address(address)
     );
     Ok(())
@@ -3718,6 +3744,52 @@ mod tests {
         .into_state()
     }
 
+    fn outcome_unknown_state_with_deposed_fixture() -> StateFile {
+        carina_state::check_and_migrate(
+            &serde_json::json!({
+                "version": StateFile::CURRENT_VERSION,
+                "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+                "serial": 4,
+                "lineage": "state-forget-deposed-test",
+                "carina_version": "test",
+                "resources": [{
+                    "resource_type": "test.Resource",
+                    "identity": "unknown",
+                    "provider": "mock",
+                    "current": {
+                        "kind": "create_outcome_unknown",
+                        "started_at": "2026-10-30T03:00:00Z"
+                    },
+                    "deposed": [{
+                        "key": "00000000-0000-4000-8000-000000000001",
+                        "identifier": "old-id",
+                        "attributes": {},
+                        "dependency_bindings": []
+                    }]
+                }],
+                "exports": {}
+            })
+            .to_string(),
+        )
+        .expect("outcome-unknown fixture with deposed generation must decode")
+        .into_state()
+    }
+
+    #[test]
+    fn state_forget_prompt_lists_deposed_generations_that_remain_tracked() {
+        let mut state = outcome_unknown_state_with_deposed_fixture();
+        let address = StateBlockAddress::new("mock", "test.Resource", "unknown");
+        let row = state
+            .find_outcome_unknown(&address)
+            .expect("the fixture must select its outcome-unknown row");
+
+        let prompt = format_state_forget_target(&address, row.resource());
+
+        assert!(prompt.contains("Deposed generations that will remain tracked"));
+        assert!(prompt.contains("identifier `old-id`"));
+        assert!(prompt.contains("generation `00000000-0000-4000-8000-000000000001`"));
+    }
+
     fn state_forget_fixture(state: &StateFile) -> CancellationFixtureBase {
         let fixture = CancellationFixtureBase::new();
         fixture.write_crn(format!(
@@ -3747,6 +3819,41 @@ mod tests {
         let persisted = fixture.read_state().await;
         assert!(persisted.resources().is_empty());
         assert_eq!(persisted.serial, 5);
+    }
+
+    #[tokio::test]
+    async fn state_forget_keeps_deposed_generation_and_next_plan_deletes_it() {
+        let fixture = state_forget_fixture(&outcome_unknown_state_with_deposed_fixture());
+
+        run_state_forget(
+            "mock.test.Resource",
+            "unknown",
+            true,
+            fixture.config_path(),
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect("the outcome-unknown current instance may be forgotten");
+
+        let persisted = fixture.read_state().await;
+        let row = persisted
+            .resources()
+            .first()
+            .expect("the deposed-only shell must remain persisted");
+        assert!(matches!(row.current(), carina_state::CurrentInstance::None));
+        assert_eq!(row.deposed.len(), 1);
+
+        let mut plan = Plan::new();
+        crate::wiring::add_deposed_delete_effects(&mut plan, &Some(persisted), &[]);
+        assert!(matches!(
+            plan.effects(),
+            [Effect::Delete {
+                identifier,
+                generation: carina_core::effect::EffectGeneration::Deposed(_),
+                ..
+            }] if identifier.as_str() == "old-id"
+        ));
     }
 
     #[tokio::test]

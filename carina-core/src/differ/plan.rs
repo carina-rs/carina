@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::deps::get_resource_dependencies;
 
-use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
+use crate::effect::{ChangedCreateOnly, Effect, OutcomeUnknownImportReplacement, TemporaryName};
 use crate::identifier::generate_random_suffix;
 use crate::parser::WaitBinding;
 use crate::plan::{
@@ -409,7 +409,7 @@ pub fn create_plan_with_cascades(
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     wait_bindings: &[WaitBinding],
-    outcome_unknown_import_replacements: &HashSet<ResourceId>,
+    outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> ProviderResult<Plan> {
     let managed_current = prior_states.materialize_current_states(managed, registry);
     let mut build = create_plan_parts(
@@ -455,7 +455,7 @@ fn create_plan_parts(
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphans: &super::Orphans,
     wait_bindings: &[WaitBinding],
-    outcome_unknown_import_replacements: &HashSet<ResourceId>,
+    outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> ProviderResult<PlanBuild> {
     let mut plan = Plan::new();
     let mut pending_replaces = HashMap::new();
@@ -1035,7 +1035,7 @@ fn cascade_dependent_updates(
     unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
-    outcome_unknown_import_replacements: &HashSet<ResourceId>,
+    outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) {
     loop {
         promote_referenced_replaces_to_cbd(plan, pending_replaces, unresolved_managed, registry);
@@ -1129,7 +1129,7 @@ fn promote_pending_replaces_for_dependents(
     unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
-    outcome_unknown_import_replacements: &HashSet<ResourceId>,
+    outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> bool {
     let ref_targets = pending_reference_targets(pending_replaces, true);
     let mut promoted = false;
@@ -1258,7 +1258,7 @@ fn promote_resource_to_pending_replace(
     ref_hints: Vec<(String, String)>,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
-    outcome_unknown_import_replacements: &HashSet<ResourceId>,
+    outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> Option<PendingReplace> {
     let (from, identifier) = if let Some(update) = take_update_from_plan(plan, &resource.id) {
         update
@@ -1324,7 +1324,7 @@ fn ensure_consumer_update(
     resource: &Resource,
     changed_attributes: &[String],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
-    outcome_unknown_import_replacements: &HashSet<ResourceId>,
+    outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> bool {
     if let Some(effect) = plan
         .effects_mut()
@@ -1387,9 +1387,12 @@ fn ensure_consumer_update(
 fn add_outcome_unknown_error(
     plan: &mut Plan,
     resource: &ResourceId,
-    outcome_unknown_import_replacements: &HashSet<ResourceId>,
+    outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) {
-    if !outcome_unknown_import_replacements.contains(resource) {
+    if !outcome_unknown_import_replacements
+        .iter()
+        .any(|replacement| replacement.resource_id() == resource)
+    {
         plan.add_error(PlanError::create_outcome_unknown(resource.clone()));
     }
 }

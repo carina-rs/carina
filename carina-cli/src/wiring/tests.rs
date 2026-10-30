@@ -4421,13 +4421,15 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
         &SchemaRegistry::new(),
     );
     assert!(resolution.claims.claims_to(&resource.id));
+    let replacements = outcome_unknown_import_replacements(
+        &state_blocks,
+        &state_file,
+        std::slice::from_ref(&resource),
+    );
+    assert_eq!(replacements.len(), 1);
     assert_eq!(
-        outcome_unknown_import_replacements(
-            &state_blocks,
-            &state_file,
-            std::slice::from_ref(&resource),
-        ),
-        std::collections::HashSet::from([resource.id.clone()]),
+        replacements.iter().next().unwrap().resource_id(),
+        &resource.id
     );
 
     let mut plan = Plan::new();

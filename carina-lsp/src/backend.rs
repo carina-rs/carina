@@ -85,9 +85,12 @@ impl ProviderState {
             factories.iter().map(|f| f.name().to_string()).collect();
         let mut known_provider_names = HashSet::new();
         if use_builtin_mock {
-            for schema in carina_provider_mock::builtin_schemas() {
-                schemas.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME, schema);
-            }
+            schemas
+                .insert_provider_witness(
+                    carina_provider_mock::BUILTIN_PROVIDER_NAME,
+                    &carina_provider_mock::builtin_schema_witness(),
+                )
+                .expect("the built-in mock exposes one consistent schema witness");
             provider_names.push(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
             known_provider_names.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
         }

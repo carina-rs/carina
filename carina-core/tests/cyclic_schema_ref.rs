@@ -29,7 +29,7 @@ use carina_core::provider::{InitializedProvider, ProviderRouter};
 use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry, StructField,
-    ValidatedConfigSchema,
+    ValidatedConfigSchema, ValidatedProviderSchemaWitness,
 };
 
 /// Build a minimal WAFv2-WebACL-shaped cyclic schema.
@@ -160,13 +160,20 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
     let saved = carina_core::provider::RawSavedAttrs::default()
         .lift(&carina_core::schema::SchemaRegistry::new());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "",
-        schema
-            .clone()
-            .validate()
-            .expect("comparison owner schema is valid"),
-    );
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![
+            schema
+                .clone()
+                .validate()
+                .expect("comparison owner schema is valid"),
+        ],
+        ValidatedConfigSchema::default(),
+        Default::default(),
+    )
+    .expect("comparison owner witness is valid");
+    schemas
+        .insert_provider_witness("", &witness)
+        .expect("comparison owner witness is consistent");
     let mut providers = ProviderRouter::new();
     providers.add_provider(
         String::new(),
@@ -216,13 +223,20 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
     let saved = carina_core::provider::RawSavedAttrs::default()
         .lift(&carina_core::schema::SchemaRegistry::new());
     let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "",
-        schema
-            .clone()
-            .validate()
-            .expect("comparison owner schema is valid"),
-    );
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![
+            schema
+                .clone()
+                .validate()
+                .expect("comparison owner schema is valid"),
+        ],
+        ValidatedConfigSchema::default(),
+        Default::default(),
+    )
+    .expect("comparison owner witness is valid");
+    schemas
+        .insert_provider_witness("", &witness)
+        .expect("comparison owner witness is consistent");
     let mut providers = ProviderRouter::new();
     providers.add_provider(
         String::new(),
@@ -290,7 +304,15 @@ fn resource_schema_validate_routes_ref_through_defs() {
     );
 
     let mut registry = SchemaRegistry::new();
-    registry.insert("aws", schema);
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![schema],
+        ValidatedConfigSchema::default(),
+        Default::default(),
+    )
+    .expect("cyclic schema provider witness is valid");
+    registry
+        .insert_provider_witness("aws", &witness)
+        .expect("cyclic schema provider witness is consistent");
     let resolver = carina_core::parser::ProviderCustomTypes::default();
     let result = registry
         .get("aws", "wafv2.WebACL", SchemaKind::Resource)

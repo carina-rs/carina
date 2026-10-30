@@ -626,6 +626,13 @@ pub struct OutcomeUnknownRow<'a> {
     index: usize,
 }
 
+impl OutcomeUnknownRow<'_> {
+    /// Borrow the exact protected row selected by the typed lookup.
+    pub fn resource(&self) -> &ResourceState {
+        &self.state.resources[self.index]
+    }
+}
+
 /// Persisted orphans classified per row for safe provider refresh.
 ///
 /// Converting to planner input preserves malformed rows as existing states
@@ -1048,26 +1055,6 @@ impl StateFile {
         })
     }
 
-    /// Classify whether import must skip, may insert, or may replace exactly
-    /// one protected outcome-unknown current instance.
-    pub fn import_target_disposition(
-        &self,
-        address: &StateBlockAddress,
-    ) -> ImportTargetDisposition {
-        let Some(row) = self.find_resource_by_state_block_address(address) else {
-            return ImportTargetDisposition::Vacant;
-        };
-        match row.current() {
-            CurrentInstance::CreateOutcomeUnknown { .. } => {
-                ImportTargetDisposition::ReplaceCreateOutcomeUnknown
-            }
-            CurrentInstance::None
-            | CurrentInstance::Applied { .. }
-            | CurrentInstance::CreateInFlight { .. }
-            | CurrentInstance::MissingIdentifier { .. } => ImportTargetDisposition::Occupied,
-        }
-    }
-
     /// Classify an import target using its complete provider route.
     pub fn import_target_disposition_for_id(&self, id: &ResourceId) -> ImportTargetDisposition {
         let Some(row) = self.find_resource_for_id(id) else {
@@ -1136,7 +1123,7 @@ impl StateFile {
     /// Deposed generations remain tracked through `remove_resource`.
     pub fn forget(row: OutcomeUnknownRow<'_>) -> ResourceState {
         let OutcomeUnknownRow { state, index } = row;
-        state.resources.remove(index)
+        state.remove_resource_at(index)
     }
 
     /// Find the persisted row addressed by a full resource ID, including its
@@ -1564,28 +1551,29 @@ impl StateFile {
         resource_type: &str,
         identity: &str,
     ) -> Option<ResourceState> {
-        if let Some(pos) = self.resources.iter().position(|r| {
+        let pos = self.resources.iter().position(|r| {
             r.provider == provider
                 && r.resource_type == resource_type
                 && r.identity.as_str() == identity
-        }) {
-            if self.resources[pos].deposed.is_empty() {
-                Some(self.resources.remove(pos))
-            } else {
-                let removed = self.resources[pos].clone();
-                let deposed = std::mem::take(&mut self.resources[pos].deposed);
-                self.resources[pos] = ResourceState::new(
-                    removed.resource_type.clone(),
-                    removed.identity.clone(),
-                    removed.provider.clone(),
-                );
-                self.resources[pos].directives.provider_instance =
-                    removed.directives.provider_instance.clone();
-                self.resources[pos].deposed = deposed;
-                Some(removed)
-            }
+        })?;
+        Some(self.remove_resource_at(pos))
+    }
+
+    fn remove_resource_at(&mut self, pos: usize) -> ResourceState {
+        if self.resources[pos].deposed.is_empty() {
+            self.resources.remove(pos)
         } else {
-            None
+            let removed = self.resources[pos].clone();
+            let deposed = std::mem::take(&mut self.resources[pos].deposed);
+            self.resources[pos] = ResourceState::new(
+                removed.resource_type.clone(),
+                removed.identity.clone(),
+                removed.provider.clone(),
+            );
+            self.resources[pos].directives.provider_instance =
+                removed.directives.provider_instance.clone();
+            self.resources[pos].deposed = deposed;
+            removed
         }
     }
 

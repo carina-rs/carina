@@ -47,7 +47,9 @@ use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{
     ConcreteValue, Current, PlanInputCurrent, ResolvedResource, Resource, ResourceId, State, Value,
 };
-use carina_core::schema::{ResourceSchema, SchemaRegistry};
+use carina_core::schema::{
+    ResourceSchema, SchemaRegistry, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+};
 
 fn empty_lifted_saved_attrs() -> carina_core::provider::LiftedSavedAttrs {
     carina_core::provider::RawSavedAttrs::default().lift(&SchemaRegistry::new())
@@ -94,12 +96,19 @@ fn fixture_schemas(resources: &[Resource]) -> SchemaRegistry {
         })
         .collect::<std::collections::BTreeSet<_>>();
     for (provider, resource_type) in owners {
-        schemas.insert(
-            provider,
-            ResourceSchema::new(resource_type)
-                .validate()
-                .expect("fixture schema is valid"),
-        );
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![
+                ResourceSchema::new(resource_type)
+                    .validate()
+                    .expect("fixture schema is valid"),
+            ],
+            ValidatedConfigSchema::default(),
+            Default::default(),
+        )
+        .expect("fixture provider witness is valid");
+        schemas
+            .insert_provider_witness(provider, &witness)
+            .expect("fixture provider witness is consistent");
     }
     schemas
 }

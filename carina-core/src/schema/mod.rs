@@ -8225,11 +8225,6 @@ impl ValidatedConfigSchema {
 /// Provider-wide reference-form declarations keyed by semantic type identity.
 pub type ReferenceForms = BTreeMap<TypeIdentity, ReferenceForm>;
 
-fn empty_reference_forms() -> &'static ReferenceForms {
-    static EMPTY: OnceLock<ReferenceForms> = OnceLock::new();
-    EMPTY.get_or_init(ReferenceForms::new)
-}
-
 /// The declaration shape attached to an identified provider type.
 ///
 /// This is distinct from [`RefinedScalarKind`]: an enum with a String base is
@@ -11954,18 +11949,13 @@ impl SchemaRegistry {
         Self::default()
     }
 
-    /// Insert a validated schema under the given provider. The `kind` field
-    /// on the schema decides which sub-map it goes into. Raw drafts cannot
-    /// cross this admission boundary:
-    ///
-    /// ```compile_fail
-    /// use carina_core::schema::{ResourceSchema, SchemaRegistry};
-    ///
-    /// let mut registry = SchemaRegistry::new();
-    /// registry.insert("test", ResourceSchema::new("test.Widget"));
-    /// ```
+    /// Insert one validated schema for test fixtures that intentionally have
+    /// no provider-wide reference forms.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
     pub fn insert(&mut self, provider: impl Into<String>, schema: ValidatedResourceSchema) {
         let provider = provider.into();
+        self.reference_forms.entry(provider.clone()).or_default();
         let key = (provider, schema.as_schema().resource_type.clone());
         match schema.as_schema().kind {
             SchemaKind::Resource => {
@@ -12056,7 +12046,7 @@ impl SchemaRegistry {
                 let reference_forms = self
                     .reference_forms
                     .get(owner)
-                    .unwrap_or_else(|| empty_reference_forms());
+                    .expect("every admitted schema owner has a reference-form table");
                 OwnerBoundResourceSchema::new(owner, schema, reference_forms)
             })
     }
