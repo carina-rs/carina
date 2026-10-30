@@ -2283,6 +2283,13 @@ impl PollAttempt {
 }
 
 /// Persisted continuation and sent-value encoding for an unfinished create.
+///
+/// The provider's `poll_after_secs` hint is deliberately not persisted. The
+/// next apply resumes immediately; the token and identifier route that resume
+/// to the same operation, and the provider's fresh pending answer drives the
+/// in-process poll loop from there. The worst case is one early status call per
+/// user-run apply, while a persisted deadline would put the wall clock into
+/// state and still need a policy for an apply that arrives early.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PendingEnvelope {
     token: PendingToken,
