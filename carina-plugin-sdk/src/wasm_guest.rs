@@ -20,6 +20,22 @@ pub fn decode_desired_resource(
     crate::DesiredResource::decode(resource, deferred)
 }
 
+/// Visit an opaque normalized resource for guest-boundary encoding.
+///
+/// This is public only because [`crate::export_provider!`] expands in the
+/// provider crate. It deliberately exposes neither the raw resource nor its
+/// attribute map.
+#[doc(hidden)]
+pub fn visit_normalized_resource<T>(
+    resource: &crate::NormalizedResource,
+    visitor: impl FnOnce(
+        &proto::ResourceId,
+        std::collections::btree_map::Iter<'_, String, proto::Value>,
+    ) -> T,
+) -> T {
+    visitor(&resource.resource.id, resource.resource.attributes.iter())
+}
+
 /// Render one error chain for protocol-v13 metadata's string-only failure
 /// channel. Each source is appended at most once even when a legacy outer
 /// display already includes its immediate source text.
@@ -1514,12 +1530,21 @@ macro_rules! export_provider {
                 })
             }
 
-            fn proto_to_wit_resource(
-                res: &proto::Resource,
+            fn normalized_to_wit_resource(
+                res: &$crate::NormalizedResource,
             ) -> Result<wit_types::ResourceDef, helpers::WasmValueEncodeError> {
-                Ok(wit_types::ResourceDef {
-                    id: proto_to_wit_resource_id(&res.id),
-                    attributes: proto_to_wit_value_map(&res.attributes)?,
+                helpers::visit_normalized_resource(res, |id, attributes| {
+                    let attributes = attributes
+                        .map(|(key, value)| {
+                            proto_to_wit_value(value)
+                                .map(|value| (key.clone(), value))
+                                .map_err(|error| error.prepend_attribute(key))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    Ok(wit_types::ResourceDef {
+                        id: proto_to_wit_resource_id(id),
+                        attributes,
+                    })
                 })
             }
 
@@ -2225,7 +2250,7 @@ macro_rules! export_provider {
                     .map_err(proto_to_wit_provider_error)?;
                     result
                         .iter()
-                        .map(proto_to_wit_resource)
+                        .map(normalized_to_wit_resource)
                         .collect::<Result<_, _>>()
                         .map_err(|error| {
                             boundary_encode_to_provider_error("normalize_desired", None, error)

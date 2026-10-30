@@ -938,12 +938,61 @@ pub enum DesiredAttribute<T> {
 /// Attribute storage and the host's deferred-name set stay private so callers
 /// cannot accidentally interpret a missing map entry as user-authored
 /// absence. Use [`DesiredResource::attribute`] or
-/// [`DesiredResource::attribute_mut`] for the required three-way query.
+/// [`DesiredResource::attribute_mut`] for one attribute, or
+/// [`DesiredResource::attributes`] to walk every known and deferred attribute.
 #[derive(Debug)]
 pub struct DesiredResource {
     resource: Resource,
     deferred: std::collections::BTreeSet<String>,
 }
+
+/// A desired resource whose normalization is complete.
+///
+/// This type is intentionally opaque. Provider implementations can create it
+/// only by calling [`DesiredResource::finish`]; the SDK's guest glue is solely
+/// responsible for encoding it onto the WASM boundary.
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{NormalizedResource, types::Resource};
+///
+/// fn expose_raw(normalized: NormalizedResource) -> Resource {
+///     let NormalizedResource { resource } = normalized;
+///     resource
+/// }
+/// ```
+#[derive(Debug)]
+pub struct NormalizedResource {
+    // Guest encoding exists only for WASM builds; host-only SDK builds still
+    // need this opaque return type in the public trait signature.
+    #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+    resource: Resource,
+}
+
+/// An attempted insertion targeted an attribute that was not absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesiredAttributeError {
+    /// The name already has a known value.
+    Known { name: String },
+    /// The host is withholding the name's unresolved value.
+    Deferred { name: String },
+}
+
+impl std::fmt::Display for DesiredAttributeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Known { name } => write!(
+                formatter,
+                "attribute '{name}' is known; insert_absent requires an absent attribute"
+            ),
+            Self::Deferred { name } => write!(
+                formatter,
+                "attribute '{name}' is deferred; insert_absent requires an absent attribute"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DesiredAttributeError {}
 
 /// Invalid `desired-resource` input received from the WASM host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1029,9 +1078,55 @@ impl DesiredResource {
         }
     }
 
-    /// Consume the typed view and return the resource sent back to the host.
-    pub fn into_resource(self) -> Resource {
-        self.resource
+    /// Iterate over every known and deferred top-level attribute.
+    ///
+    /// Absent attributes have no name to yield. Each deferred name is emitted
+    /// explicitly as [`DesiredAttribute::Deferred`].
+    pub fn attributes(&self) -> impl Iterator<Item = (&str, DesiredAttribute<&Value>)> {
+        let known = self
+            .resource
+            .attributes
+            .iter()
+            .map(|(name, value)| (name.as_str(), DesiredAttribute::Known(value)));
+        let deferred = self
+            .deferred
+            .iter()
+            .map(|name| (name.as_str(), DesiredAttribute::Deferred));
+        known.chain(deferred)
+    }
+
+    /// Insert a top-level attribute only when it is truly absent.
+    ///
+    /// Known and deferred names produce distinct typed errors. In particular,
+    /// a deferred name cannot be replaced while its value is withheld by the
+    /// host.
+    pub fn insert_absent(
+        &mut self,
+        name: impl Into<String>,
+        value: Value,
+    ) -> Result<(), DesiredAttributeError> {
+        use std::collections::btree_map::Entry;
+
+        let name = name.into();
+        if self.deferred.contains(&name) {
+            return Err(DesiredAttributeError::Deferred { name });
+        }
+        match self.resource.attributes.entry(name) {
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+                Ok(())
+            }
+            Entry::Occupied(entry) => Err(DesiredAttributeError::Known {
+                name: entry.key().clone(),
+            }),
+        }
+    }
+
+    /// Finish normalization and seal the resource for the SDK's guest glue.
+    pub fn finish(self) -> NormalizedResource {
+        NormalizedResource {
+            resource: self.resource,
+        }
     }
 }
 
@@ -1215,16 +1310,18 @@ pub trait CarinaProvider {
 
     /// Normalize desired resources (optional).
     ///
-    /// Every attribute lookup is a three-way query: known, absent, or deferred
-    /// because the host temporarily withholds unresolved values from WASM.
+    /// Every attribute lookup is a three-way query: [`DesiredAttribute::Known`],
+    /// [`DesiredAttribute::Absent`], or [`DesiredAttribute::Deferred`], because
+    /// the host temporarily withholds unresolved values from WASM. Use
+    /// [`DesiredResource::attributes`] for a generic walk,
+    /// [`DesiredResource::attribute_mut`] to edit known values, and
+    /// [`DesiredResource::insert_absent`] to add a value only when it is truly
+    /// absent. Return each resource by calling [`DesiredResource::finish`].
     fn normalize_desired(
         &self,
         resources: Vec<DesiredResource>,
-    ) -> Result<Vec<Resource>, ProviderError> {
-        Ok(resources
-            .into_iter()
-            .map(DesiredResource::into_resource)
-            .collect())
+    ) -> Result<Vec<NormalizedResource>, ProviderError> {
+        Ok(resources.into_iter().map(DesiredResource::finish).collect())
     }
 
     /// Normalize read-back state (optional).
@@ -1582,12 +1679,68 @@ mod tests {
             DesiredAttribute::Deferred
         ));
 
-        let resource = desired.into_resource();
+        let normalized = desired.finish();
         assert_eq!(
-            resource.attributes.get("known"),
+            normalized.resource.attributes.get("known"),
             Some(&Value::String("after".to_string()))
         );
-        assert!(!resource.attributes.contains_key("deferred"));
+        assert!(!normalized.resource.attributes.contains_key("deferred"));
+    }
+
+    #[test]
+    fn desired_resource_iteration_and_absent_insertion_preserve_three_way_state() {
+        let mut desired = DesiredResource::decode(
+            desired_resource(BTreeMap::from([(
+                "known".to_string(),
+                Value::String("configured".to_string()),
+            )])),
+            vec!["deferred".to_string()],
+        )
+        .expect("valid desired resource");
+
+        let states = desired
+            .attributes()
+            .map(|(name, attribute)| {
+                let state = match attribute {
+                    DesiredAttribute::Known(_) => "known",
+                    DesiredAttribute::Deferred => "deferred",
+                    DesiredAttribute::Absent => unreachable!("absent names are not iterable"),
+                };
+                (name, state)
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            states,
+            BTreeMap::from([("deferred", "deferred"), ("known", "known")])
+        );
+
+        let deferred_error = desired
+            .insert_absent("deferred", Value::String("replacement".to_string()))
+            .expect_err("a deferred attribute is not absent");
+        assert_eq!(
+            deferred_error,
+            DesiredAttributeError::Deferred {
+                name: "deferred".to_string()
+            }
+        );
+
+        let known_error = desired
+            .insert_absent("known", Value::String("replacement".to_string()))
+            .expect_err("a known attribute is not absent");
+        assert_eq!(
+            known_error,
+            DesiredAttributeError::Known {
+                name: "known".to_string()
+            }
+        );
+
+        desired
+            .insert_absent("absent", Value::String("default".to_string()))
+            .expect("an absent attribute accepts a default");
+        assert!(matches!(
+            desired.attribute("absent"),
+            DesiredAttribute::Known(Value::String(value)) if value == "default"
+        ));
     }
 
     #[test]

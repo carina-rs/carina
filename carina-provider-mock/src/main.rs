@@ -11,8 +11,8 @@ use carina_core::schema::{
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, DesiredAttribute,
-    DesiredResource, FoundRead, Pending, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict,
-    Sent, UpdateOutcome,
+    DesiredResource, FoundRead, NormalizedResource, Pending, Poll, PollVerdict, Resume, ResumeStep,
+    ResumeVerdict, Sent, UpdateOutcome,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -533,13 +533,6 @@ impl CarinaProvider for MockProcessProvider {
                 .with_description("Mock desired-normalization three-way attribute probe")
                 .validate()
                 .expect("normalization probe schema must be valid"),
-            CoreResourceSchema::new("test.normalize_deferred_collision")
-                .attribute(
-                    CoreAttributeSchema::optional("companion", CoreAttributeType::string()).build(),
-                )
-                .with_description("Mock invalid deferred-attribute return probe")
-                .validate()
-                .expect("deferred collision probe schema must be valid"),
         ]
     }
 
@@ -1235,7 +1228,7 @@ impl CarinaProvider for MockProcessProvider {
     fn normalize_desired(
         &self,
         resources: Vec<DesiredResource>,
-    ) -> Result<Vec<Resource>, ProviderError> {
+    ) -> Result<Vec<NormalizedResource>, ProviderError> {
         if let Some(resource) = resources
             .iter()
             .find(|resource| resource.id().identity == "__mock_normalize_desired_error__")
@@ -1261,21 +1254,7 @@ impl CarinaProvider for MockProcessProvider {
                 request_id: None,
             });
         }
-        Ok(resources
-            .into_iter()
-            .map(|desired| {
-                let return_deferred_attribute =
-                    desired.id().resource_type == "test.normalize_deferred_collision";
-                let mut resource = desired.into_resource();
-                if return_deferred_attribute {
-                    resource.attributes.insert(
-                        "companion".to_string(),
-                        Value::String("invalid guest replacement".to_string()),
-                    );
-                }
-                resource
-            })
-            .collect())
+        Ok(resources.into_iter().map(DesiredResource::finish).collect())
     }
 
     fn normalize_state(
