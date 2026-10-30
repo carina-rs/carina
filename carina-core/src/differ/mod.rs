@@ -900,10 +900,11 @@ fn diff_existing_state(
 /// desired before comparison, preventing false diffs when AWS returns extra
 /// fields. Requiring the paired input prevents callers from silently dropping
 /// nested write-only provenance.
-/// If the resource has both saved attributes and `prev_explicit`, the
-/// actual-state side is projected through that paired stored-value/authoring
-/// context before comparison so server-side defaults the user never wrote do
-/// not surface as diffs (refs awscc#206 and carina-provider-awscc#511). The
+/// If the resource has `prev_explicit`, the actual-state side is projected
+/// through that authoring context before comparison so server-side defaults
+/// the user never wrote do not surface as diffs (refs awscc#206 and
+/// carina-provider-awscc#511). Saved attributes anchor per-element list
+/// records when present; otherwise projection uses their legacy union. The
 /// authoring tree also drives explicit-removal detection for attributes the
 /// user previously wrote but no longer mentions.
 /// If `schema` is provided, type-aware comparison is used (e.g., Int/Float coercion,

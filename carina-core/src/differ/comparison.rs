@@ -827,10 +827,11 @@ pub(crate) fn secret_grafted_comparison_view<'a>(
 /// Find changed attributes between desired and current state.
 /// If `saved` is provided, each desired value is merged with the saved value
 /// before comparison, filling in unmanaged nested fields.
-/// If both `saved` and `prev_explicit` are provided, the actual-state side is
-/// **projected** through their paired stored-value/authoring context before
-/// comparison so server-side defaults the user never wrote do not surface as
-/// diffs (refs awscc#206). Top-level keys absent from
+/// If `prev_explicit` is provided, the actual-state side is **projected**
+/// through its authoring context before comparison so server-side defaults
+/// the user never wrote do not surface as diffs (refs awscc#206). `saved`
+/// values anchor per-element list authoring when available; otherwise lists
+/// use the legacy union projection. Top-level keys absent from
 /// `prev_explicit.children` are treated as unauthored and excluded. Stored
 /// list values also anchor the per-element records used to remove uniquely
 /// paired server-added list elements (refs carina-provider-awscc#511).
@@ -858,19 +859,18 @@ pub(super) fn find_changed_attributes(
     // Project `current` through `prev_explicit` so server-side defaults
     // the user never authored disappear before any comparison runs.
     // The projection is idempotent and shape-preserving for keys the
-    // user did author. When either half of the persisted value/authoring pair
-    // is absent (e.g. first-plan, no saved state), we keep the map
-    // unprojected: list-element records cannot be interpreted safely without
-    // the stored list whose indices they describe.
+    // user did author. Saved values anchor per-element list records when they
+    // are available. Without an anchor, projection retains every list item
+    // and applies the legacy union restriction to each one.
     //
     // `saved` undergoes the same projection so the saved-merge fallback
     // doesn't smuggle server-only fields back into `effective_desired`
     // (refs awscc#206).
     let raw_saved = saved;
-    let projection = match (raw_saved, prev_explicit) {
-        (Some(stored), Some(explicit)) => Some(ExplicitProjection::new(stored, explicit, schema)),
-        _ => None,
-    };
+    let empty_stored = HashMap::new();
+    let projection = prev_explicit.map(|explicit| {
+        ExplicitProjection::new(raw_saved.unwrap_or(&empty_stored), explicit, schema)
+    });
     let projected_current = projection.as_ref().map_or_else(
         || current.clone(),
         |projection| {

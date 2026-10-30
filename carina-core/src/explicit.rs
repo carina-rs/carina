@@ -1161,10 +1161,10 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
 /// A projection bound to the stored values that index an [`ExplicitFields`]
 /// tree.
 ///
-/// Requiring the stored attribute map in the constructor prevents callers
-/// from projecting an [`ExplicitFields::ListElements`] record without the list
-/// whose indices give those records meaning. Schema-aware list pairing uses
-/// the same equality as state writeback.
+/// The stored attribute map anchors [`ExplicitFields::ListElements`] records
+/// when the corresponding list is available. Missing or mismatched stored
+/// lists use the legacy union projection. Schema-aware list pairing uses the
+/// same equality as state writeback.
 pub struct ExplicitProjection<'a> {
     stored_attributes: &'a HashMap<String, Value>,
     explicit: &'a ExplicitFields,
@@ -1188,8 +1188,9 @@ impl<'a> ExplicitProjection<'a> {
     /// elements from `attributes`.
     ///
     /// A list element with an ambiguous or missing stored pairing is retained
-    /// intact. Shape mismatches are likewise retained, so uncertainty remains
-    /// visible rather than being guessed away.
+    /// after applying the legacy union projection. Lists whose stored
+    /// alignment is unavailable use that same fallback, so uncertainty remains
+    /// visible without resurfacing unauthored fields inside retained elements.
     pub fn project_attributes(&self, attributes: HashMap<String, Value>) -> ProjectedAttributes {
         let defs = self
             .schema
@@ -1352,17 +1353,9 @@ fn project_value(
             }
         }
         ExplicitFields::List { element } => match value {
-            Value::Concrete(ConcreteValue::List(items)) => ProjectedValue {
-                value: Value::Concrete(ConcreteValue::List(
-                    items
-                        .into_iter()
-                        .map(|item| project_legacy_value(item, element))
-                        .collect(),
-                )),
-                authoring: ProjectedAuthoring::LegacyList {
-                    element: Box::new(ProjectedAuthoring::from_unprojected(element)),
-                },
-            },
+            Value::Concrete(ConcreteValue::List(items)) => {
+                project_legacy_list_items(items, element)
+            }
             value => ProjectedValue {
                 value,
                 authoring: ProjectedAuthoring::Opaque,
@@ -1375,17 +1368,12 @@ fn project_value(
                     authoring: ProjectedAuthoring::Opaque,
                 };
             };
+            let union = union_elements(elements.iter().cloned());
             let Some(Value::Concrete(ConcreteValue::List(stored_items))) = stored else {
-                return ProjectedValue {
-                    value: Value::Concrete(ConcreteValue::List(items)),
-                    authoring: ProjectedAuthoring::UnalignedList,
-                };
+                return project_legacy_list_items(items, &union);
             };
             if elements.len() != stored_items.len() {
-                return ProjectedValue {
-                    value: Value::Concrete(ConcreteValue::List(items)),
-                    authoring: ProjectedAuthoring::UnalignedList,
-                };
+                return project_legacy_list_items(items, &union);
             }
 
             let item_type = list_element_type(attr_type, defs);
@@ -1411,8 +1399,8 @@ fn project_value(
                         projected_elements.push(projected.authoring);
                     }
                     ListElementPairing::Ambiguous | ListElementPairing::Unmatched => {
-                        projected_items.push(item);
-                        projected_elements.push(ProjectedAuthoring::Opaque);
+                        projected_items.push(project_legacy_value(item, &union));
+                        projected_elements.push(ProjectedAuthoring::from_unprojected(&union));
                     }
                 }
             }
@@ -1423,6 +1411,20 @@ fn project_value(
                 },
             }
         }
+    }
+}
+
+fn project_legacy_list_items(items: Vec<Value>, element: &ExplicitFields) -> ProjectedValue {
+    ProjectedValue {
+        value: Value::Concrete(ConcreteValue::List(
+            items
+                .into_iter()
+                .map(|item| project_legacy_value(item, element))
+                .collect(),
+        )),
+        authoring: ProjectedAuthoring::LegacyList {
+            element: Box::new(ProjectedAuthoring::from_unprojected(element)),
+        },
     }
 }
 
@@ -2905,6 +2907,129 @@ mod tests {
             })
             .collect();
         assert_eq!(sentinels, vec!["third", "first", "second"]);
+    }
+
+    fn union_projection_item(identity: &str, include_server: bool) -> Value {
+        let mut fields = IndexMap::from([
+            (
+                "identity".to_string(),
+                Value::Concrete(ConcreteValue::String(identity.to_string().into())),
+            ),
+            (
+                "authored_a".to_string(),
+                Value::Concrete(ConcreteValue::Int(1)),
+            ),
+            (
+                "authored_b".to_string(),
+                Value::Concrete(ConcreteValue::Int(2)),
+            ),
+        ]);
+        if include_server {
+            fields.insert("server".to_string(), Value::Concrete(ConcreteValue::Int(3)));
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    }
+
+    fn union_projection_element(authored_field: &str) -> ExplicitFields {
+        ExplicitFields::Struct {
+            children: HashMap::from([
+                ("identity".to_string(), ExplicitFields::Leaf),
+                (authored_field.to_string(), ExplicitFields::Leaf),
+            ]),
+        }
+    }
+
+    fn assert_union_projection_authoring(authoring: &ProjectedAuthoring) {
+        let ProjectedAuthoring::Struct { children } = authoring else {
+            panic!("the projected element must carry the unioned struct authoring");
+        };
+        assert_eq!(children.len(), 3);
+        assert!(children.contains_key("identity"));
+        assert!(children.contains_key("authored_a"));
+        assert!(children.contains_key("authored_b"));
+    }
+
+    #[test]
+    fn project_list_elements_without_alignment_uses_legacy_union_projection() {
+        let current = Value::Concrete(ConcreteValue::List(vec![
+            union_projection_item("first", true),
+            union_projection_item("second", true),
+        ]));
+        let expected = Value::Concrete(ConcreteValue::List(vec![
+            union_projection_item("first", false),
+            union_projection_item("second", false),
+        ]));
+        let explicit = ExplicitFields::ListElements {
+            elements: vec![
+                union_projection_element("authored_a"),
+                union_projection_element("authored_b"),
+            ],
+        };
+        let stored_cases = [
+            None,
+            Some(Value::Concrete(ConcreteValue::String(
+                "wrong stored shape".into(),
+            ))),
+            Some(Value::Concrete(ConcreteValue::List(vec![
+                union_projection_item("first", true),
+            ]))),
+        ];
+
+        for stored in &stored_cases {
+            let projected = project_value(
+                current.clone(),
+                stored.as_ref(),
+                &explicit,
+                None,
+                empty_defs_for_schema_walks(),
+            );
+            assert_eq!(projected.value, expected);
+
+            let ProjectedAuthoring::LegacyList { element } = projected.authoring else {
+                panic!("unaligned ListElements must use legacy-list authoring");
+            };
+            assert_union_projection_authoring(element.as_ref());
+        }
+    }
+
+    #[test]
+    fn project_list_elements_projects_ambiguous_and_unmatched_items_through_union() {
+        let duplicate = union_projection_item("duplicate", true);
+        let unmatched = union_projection_item("unmatched", true);
+        let stored = Value::Concrete(ConcreteValue::List(vec![
+            duplicate.clone(),
+            duplicate.clone(),
+        ]));
+        let current = Value::Concrete(ConcreteValue::List(vec![duplicate, unmatched]));
+        let explicit = ExplicitFields::ListElements {
+            elements: vec![
+                union_projection_element("authored_a"),
+                union_projection_element("authored_b"),
+            ],
+        };
+
+        let projected = project_value(
+            current,
+            Some(&stored),
+            &explicit,
+            None,
+            empty_defs_for_schema_walks(),
+        );
+        assert_eq!(
+            projected.value,
+            Value::Concrete(ConcreteValue::List(vec![
+                union_projection_item("duplicate", false),
+                union_projection_item("unmatched", false),
+            ]))
+        );
+
+        let ProjectedAuthoring::AlignedList { elements } = projected.authoring else {
+            panic!("paired ListElements must keep aligned authoring");
+        };
+        assert_eq!(elements.len(), 2);
+        for element in &elements {
+            assert_union_projection_authoring(element);
+        }
     }
 
     fn keyed_value(key: &str, value: &str) -> Value {

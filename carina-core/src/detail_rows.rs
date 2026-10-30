@@ -1041,12 +1041,16 @@ fn project_from_attrs(
 ) -> crate::explicit::ProjectedAttributes {
     // Project `from.attributes` through the user-authoring tree so
     // server-side default fields the user never wrote don't inflate
-    // the unchanged-count summary (refs awscc#206). Idempotent and a
-    // no-op when either authoring or its stored indexing values are absent.
-    match (stored_attributes, explicit) {
-        (Some(stored), Some(explicit)) => ExplicitProjection::new(stored, explicit, schema)
-            .project_attributes(from_attributes.clone()),
-        _ => crate::explicit::ProjectedAttributes::unprojected(from_attributes.clone(), explicit),
+    // the unchanged-count summary (refs awscc#206). Stored values anchor
+    // per-element list records when present; otherwise the projection uses
+    // the legacy union fallback.
+    let empty_stored = HashMap::new();
+    match explicit {
+        Some(explicit) => {
+            ExplicitProjection::new(stored_attributes.unwrap_or(&empty_stored), explicit, schema)
+                .project_attributes(from_attributes.clone())
+        }
+        None => crate::explicit::ProjectedAttributes::unprojected(from_attributes.clone(), None),
     }
 }
 
