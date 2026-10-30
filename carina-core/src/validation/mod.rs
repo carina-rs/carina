@@ -12,8 +12,8 @@ use indexmap::IndexMap;
 use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
-    ForBinding, ModuleCall, ModuleCallId, ProviderContext, ResourceContext, ResourceRef,
-    ResourceTypePath, SourceFileId, SourceSpan, TypeExpr,
+    ForBinding, LoadedProviderContext, ModuleCall, ModuleCallId, ProviderContext, ResourceContext,
+    ResourceRef, ResourceTypePath, SourceFileId, SourceSpan, TypeExpr,
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{
@@ -781,7 +781,7 @@ fn resolve_value_source_against_sink(
             FieldAncestry::WRITABLE,
         )
         .map_err(BindingResolutionError::Type),
-        RefSink::TypeExpr(type_expr) => typecheck::check_type_expr_value(
+        RefSink::TypeExpr(type_expr) => typecheck::check_type_expr_value_with_context(
             type_expr,
             value,
             context.provider_context,
@@ -5258,7 +5258,7 @@ impl ModuleCallChecker<'_> {
             } else {
                 typecheck::TypecheckInference::Unavailable
             };
-            if let Err(error) = typecheck::check_type_expr_value(
+            if let Err(error) = typecheck::check_type_expr_value_with_context(
                 &resolved_parameter.as_type_expr(),
                 value,
                 self.provider_context,
@@ -5893,7 +5893,7 @@ where
                     resolved_param.set_value(Some(resolved));
                     if let (Some(type_expr), Some(value)) =
                         (resolved_param.type_expr_opt(), resolved_param.value())
-                        && let Err(error) = typecheck::check_type_expr_value(
+                        && let Err(error) = typecheck::check_type_expr_value_with_context(
                             type_expr,
                             value,
                             config,
@@ -5916,13 +5916,70 @@ where
     }
 }
 
+/// An export whose declared type cannot reach provider custom-type
+/// validation.
+///
+/// The field is private so callers with an unloaded [`ProviderContext`] can
+/// only enter the provider-independent value checker after the exhaustive
+/// [`classify_export_value_check`] walk has proved that the annotation uses
+/// built-in types alone.
+pub struct ProviderIndependentExportValue<'a, P> {
+    param: &'a P,
+}
+
+/// Whether an export value can be checked without a loaded provider catalog.
+pub enum ExportValueCheckAvailability<'a, P> {
+    ProviderIndependent(ProviderIndependentExportValue<'a, P>),
+    RequiresLoadedProviderCustomTypes,
+}
+
+/// Classify an export for diagnostics contexts that explicitly have no loaded
+/// providers.
+pub fn classify_export_value_check<P>(param: &P) -> ExportValueCheckAvailability<'_, P>
+where
+    P: crate::parser::ExportParamLike,
+{
+    let provider_independent = param.type_expr_opt().is_none_or(|type_expr| {
+        matches!(
+            typecheck::classify_type_expr_value_check(type_expr),
+            typecheck::TypeExprValueCheckAvailability::ProviderIndependent(_)
+        )
+    });
+    if provider_independent {
+        ExportValueCheckAvailability::ProviderIndependent(ProviderIndependentExportValue { param })
+    } else {
+        ExportValueCheckAvailability::RequiresLoadedProviderCustomTypes
+    }
+}
+
+/// Check one export that has been proven not to contain provider custom
+/// types. This preserves built-in diagnostics for orphaned LSP buffers without
+/// treating an unloaded provider resolver as if custom-type validation had
+/// succeeded.
+pub fn check_provider_independent_export_value_pre_apply<P>(
+    export: ProviderIndependentExportValue<'_, P>,
+    bindings: &crate::binding_index::ResolvedBindings,
+    config: &ProviderContext,
+) -> Result<ExportsCheckedPreApply<P>, String>
+where
+    P: crate::parser::ExportParamLike + Clone,
+{
+    let param = export.param;
+    let display_params =
+        resolve_and_validate_export_values(std::slice::from_ref(param), bindings, config)?;
+    Ok(ExportsCheckedPreApply {
+        original_params: vec![param.clone()],
+        display_params,
+    })
+}
+
 /// Resolve every export through the pre-apply value binding graph, evaluate
 /// builtins that become concrete, and accumulate both secret-boundary and
 /// value-type errors in one pass.
 pub fn check_export_values_pre_apply<P>(
     export_params: &[P],
     bindings: &crate::binding_index::ResolvedBindings,
-    config: &ProviderContext,
+    config: &LoadedProviderContext,
 ) -> Result<ExportsCheckedPreApply<P>, String>
 where
     P: crate::parser::ExportParamLike + Clone,
@@ -5940,7 +5997,7 @@ where
 pub fn resolve_export_values_post_apply<P>(
     export_params: &ExportsCheckedPreApply<P>,
     bindings: &crate::binding_index::ResolvedBindings,
-    config: &ProviderContext,
+    config: &LoadedProviderContext,
 ) -> Result<CheckedExportValues<P>, String>
 where
     P: crate::parser::ExportParamLike + Clone,
@@ -5957,7 +6014,7 @@ where
 /// has the source type authority needed for directional checks.
 pub fn validate_attribute_params(
     attribute_params: &[crate::parser::AttributeParameter],
-    config: &ProviderContext,
+    config: &LoadedProviderContext,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
 

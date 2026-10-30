@@ -1,7 +1,7 @@
 use super::*;
 use crate::parser::{
-    ArgumentOrigin, BindingName, ModuleArgument, ParsedFile, ProviderContext, UntilPredicateAst,
-    WaitBinding,
+    ArgumentOrigin, BindingName, LoadedProviderContext, ModuleArgument, ParsedFile,
+    ProviderContext, UntilPredicateAst, WaitBinding,
 };
 use crate::resource::{
     CompositionCall, CompositionCallPath, DataSource, LiveComposition, LiveCompositionArgument,
@@ -24,7 +24,7 @@ fn rendered_typecheck_result(
     value: &Value,
     config: &ProviderContext,
 ) -> Option<String> {
-    typecheck::check_type_expr_value(
+    typecheck::check_type_expr_value_with_context(
         type_expr,
         value,
         config,
@@ -277,9 +277,19 @@ fn schema_source_is_assignable_to_lifted_sink(
         .is_assignable_to(crate::schema::TypeInSchema::schemaless(&sink))
 }
 
-fn context_with_iam_policy_arn_validator() -> ProviderContext {
+fn loaded_context_for_test(mut context: ProviderContext) -> LoadedProviderContext {
+    if !context.custom_types_loaded() {
+        context.custom_types = crate::parser::ProviderCustomTypes::loaded(
+            HashSet::new(),
+            Box::new(|_target, _value| Ok(())),
+        );
+    }
+    LoadedProviderContext::for_test(context)
+}
+
+fn context_with_iam_policy_arn_validator() -> LoadedProviderContext {
     let identity = TypeIdentity::bare("IamPolicyArn");
-    ProviderContext {
+    loaded_context_for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
@@ -307,13 +317,13 @@ fn context_with_iam_policy_arn_validator() -> ProviderContext {
             }),
         ),
         ..ProviderContext::default()
-    }
+    })
 }
 
 fn context_with_known_custom_types(
     known: HashSet<crate::parser::OwnedTypeIdentity>,
-) -> ProviderContext {
-    ProviderContext {
+) -> LoadedProviderContext {
+    loaded_context_for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             known,
             Box::new(|target, _value| {
@@ -333,19 +343,19 @@ fn context_with_known_custom_types(
             }),
         ),
         ..ProviderContext::default()
-    }
+    })
 }
 
 fn context_with_accepting_custom_type_resolver(
     known: HashSet<crate::parser::OwnedTypeIdentity>,
-) -> ProviderContext {
-    ProviderContext {
+) -> LoadedProviderContext {
+    loaded_context_for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             known,
             Box::new(|_target, _value| Ok(())),
         ),
         ..ProviderContext::default()
-    }
+    })
 }
 
 fn iam_policy_arn_type_expr() -> TypeExpr {
@@ -4046,7 +4056,7 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
     let seen = Arc::new(Mutex::new(Vec::new()));
     let seen_by_validator = Arc::clone(&seen);
     let declaration = enum_type.clone();
-    let config = ProviderContext {
+    let config = loaded_context_for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             HashSet::from([crate::parser::OwnedTypeIdentity::provider("test", identity)]),
             Box::new(move |target, value| {
@@ -4068,7 +4078,7 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         ),
         resource_types: HashSet::from([("test".to_string(), "widget".to_string())]),
         ..ProviderContext::default()
-    };
+    });
     let authored = || Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
     let mut module_parsed = empty_parsed();
     module_parsed.module_calls = vec![ModuleCall::test(
@@ -5196,7 +5206,7 @@ fn simple_annotated_plain_ref_reports_unknown_attribute_once() {
 
 fn resolve_and_validate_export_params(
     exports: &[crate::parser::InferredExportParam],
-    config: &ProviderContext,
+    config: &LoadedProviderContext,
 ) -> Result<(), String> {
     check_export_values_pre_apply(
         exports,
@@ -5204,6 +5214,60 @@ fn resolve_and_validate_export_params(
         config,
     )
     .map(|_| ())
+}
+
+#[test]
+fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_types() {
+    use crate::binding_index::ResolvedBindings;
+    use crate::parser::InferredExportParam;
+
+    let builtin = InferredExportParam {
+        name: "flag".to_string(),
+        type_expr: TypeExpr::Bool,
+        value: Some(Value::Concrete(ConcreteValue::String("not-a-bool".into()))),
+    };
+    let ExportValueCheckAvailability::ProviderIndependent(builtin) =
+        classify_export_value_check(&builtin)
+    else {
+        panic!("Bool must be provider-independent");
+    };
+    let error = check_provider_independent_export_value_pre_apply(
+        builtin,
+        &ResolvedBindings::default(),
+        &ProviderContext::default(),
+    )
+    .expect_err("built-in mismatch must still be diagnosed")
+    .to_string();
+    assert!(error.contains("expected Bool, got string"), "error={error}");
+
+    let custom = InferredExportParam {
+        name: "identifiers".to_string(),
+        type_expr: TypeExpr::List(Box::new(TypeExpr::SchemaType {
+            owned: crate::parser::OwnedTypeIdentity::provider(
+                "mock",
+                TypeIdentity::bare("RecoveryProbe"),
+            ),
+        })),
+        value: Some(Value::Concrete(ConcreteValue::StringList(vec![
+            "identifier".to_string().into(),
+        ]))),
+    };
+    assert!(matches!(
+        classify_export_value_check(&custom),
+        ExportValueCheckAvailability::RequiresLoadedProviderCustomTypes
+    ));
+
+    let builtin_custom = InferredExportParam {
+        name: "cidr".to_string(),
+        type_expr: TypeExpr::Simple("ipv4_cidr".to_string()),
+        value: Some(Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string().into(),
+        ))),
+    };
+    assert!(matches!(
+        classify_export_value_check(&builtin_custom),
+        ExportValueCheckAvailability::ProviderIndependent(_)
+    ));
 }
 
 #[test]
@@ -5268,7 +5332,7 @@ fn validate_export_params_skips_unknown_sentinel() {
     // Stage 2 (#2360): exports with `TypeExpr::Unknown` are skipped —
     // the loader's `inference_errors` channel reports the missing
     // annotation, so re-checking here would double-report.
-    let config = ProviderContext::default();
+    let config = loaded_context_for_test(ProviderContext::default());
     let exports = vec![InferredExportParam {
         name: "raw".to_string(),
         type_expr: TypeExpr::Unknown,
@@ -5282,7 +5346,7 @@ fn validate_export_params_skips_unknown_sentinel() {
 fn validate_export_params_rejects_type_mismatch() {
     use crate::parser::InferredExportParam;
 
-    let config = ProviderContext::default();
+    let config = loaded_context_for_test(ProviderContext::default());
     let exports = vec![InferredExportParam {
         name: "flag".to_string(),
         type_expr: TypeExpr::Bool,
@@ -5300,10 +5364,10 @@ fn validate_export_params_rejects_decrypt_result_as_secret_export() {
     use crate::parser::InferredExportParam;
 
     let plaintext = "hunter2SECRET";
-    let config = ProviderContext {
+    let config = loaded_context_for_test(ProviderContext {
         decryptor: Some(Box::new(move |_, _| Ok(plaintext.to_string()))),
         ..ProviderContext::default()
-    };
+    });
     let value = crate::builtins::evaluate_builtin_with_config_to_value(
         "decrypt",
         &[Value::Concrete(ConcreteValue::String("ciphertext".into()))],
@@ -5339,10 +5403,10 @@ fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
     };
     let builtin = crate::builtins::evaluate_builtin_to_value("upper", &[secret_string()])
         .expect("upper(secret(...)) must evaluate");
-    let config = ProviderContext {
+    let config = loaded_context_for_test(ProviderContext {
         decryptor: Some(Box::new(|_, _| Ok("decrypted-secret".to_string()))),
         ..ProviderContext::default()
-    };
+    });
     let decrypt = crate::builtins::evaluate_builtin_with_config_to_value(
         "decrypt",
         &[Value::Concrete(ConcreteValue::String("ciphertext".into()))],
@@ -5435,20 +5499,18 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
         type_expr: TypeExpr::String,
         value: Some(Value::resource_ref("r", "identifier", vec![])),
     }];
+    let provider_context = loaded_context_for_test(ProviderContext::default());
     let pre_apply =
-        check_export_values_pre_apply(&exports, &bindings("alpha-id"), &ProviderContext::default())
+        check_export_values_pre_apply(&exports, &bindings("alpha-id"), &provider_context)
             .expect("pre-apply export check");
     assert_eq!(
         pre_apply.display_values()[0].value,
         Some(Value::Concrete(ConcreteValue::String("alpha-id".into()))),
     );
 
-    let post_apply = resolve_export_values_post_apply(
-        &pre_apply,
-        &bindings("beta-id"),
-        &ProviderContext::default(),
-    )
-    .expect("post-apply export resolution");
+    let post_apply =
+        resolve_export_values_post_apply(&pre_apply, &bindings("beta-id"), &provider_context)
+            .expect("post-apply export resolution");
     assert_eq!(
         post_apply.as_slice()[0].value,
         Some(Value::Concrete(ConcreteValue::String("beta-id".into()))),
@@ -6509,7 +6571,7 @@ fn mode_known() -> HashSet<String> {
     known
 }
 
-fn mode_context() -> ProviderContext {
+fn mode_context() -> LoadedProviderContext {
     let identity = crate::schema::enum_identity("Mode", Some("test.r"));
     context_with_accepting_custom_type_resolver(HashSet::from([
         crate::parser::OwnedTypeIdentity::provider("test", identity),
@@ -7246,7 +7308,7 @@ fn value_contains_unresolved_ref_unwraps_secret() {
 // exercised by `carina-cli/tests/validate_unknown_custom_type_e2e.rs`.
 // ---------------------------------------------------------------------------
 
-fn enriched_context_with_iam_policy_arn() -> ProviderContext {
+fn enriched_context_with_iam_policy_arn() -> LoadedProviderContext {
     context_with_iam_policy_arn_validator()
 }
 

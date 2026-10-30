@@ -611,7 +611,7 @@ fn check_fn_arg_type(
     let value = argument.value().expect("non-handle function argument");
     let type_expr = resolved_type.as_type_expr();
 
-    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value(
+    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value_with_context(
         &type_expr,
         value,
         ctx.config,
@@ -746,7 +746,7 @@ fn check_fn_return_type(
     value: &Value,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
-    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value(
+    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value_with_context(
         type_expr,
         value,
         config,

@@ -564,7 +564,7 @@ where
     match post_expansion {
         crate::wiring::PostExpansionOutcome::Diagnostics(diagnostics) => {
             let crate::wiring::PostExpansionArtifacts {
-                expanded_resources: _,
+                expanded_resources: validated_expansion,
                 residual_deferred_for,
                 plan,
                 compositions,
@@ -593,7 +593,7 @@ where
                 resolved_export_params: carina_core::validation::check_export_values_pre_apply(
                     &[],
                     &carina_core::binding_index::ResolvedBindings::default(),
-                    &carina_core::parser::ProviderContext::default(),
+                    validated_expansion.context().provider_context(),
                 )
                 .expect("empty exports are checked"),
                 prev_explicit,
@@ -609,7 +609,7 @@ where
                 },
         }) => {
             let crate::wiring::PostExpansionArtifacts {
-                expanded_resources: _,
+                expanded_resources: validated_expansion,
                 residual_deferred_for,
                 plan,
                 compositions,
@@ -625,7 +625,6 @@ where
                 .iter()
                 .map(|resource| resource.as_inner().clone())
                 .collect::<Vec<_>>();
-            let provider_context = carina_core::parser::ProviderContext::default();
             let resolved_export_params = crate::commands::plan::check_exports_pre_apply(
                 crate::commands::plan::CheckExportsPreApplyInput {
                     export_params: &export_params,
@@ -637,7 +636,7 @@ where
                     plan: &plan,
                     schemas: &schemas,
                     wait_aliases: &export_wait_aliases,
-                    provider_context: &provider_context,
+                    provider_context: validated_expansion.context().provider_context(),
                 },
             )
             .expect("fixture exports must resolve without secrets");

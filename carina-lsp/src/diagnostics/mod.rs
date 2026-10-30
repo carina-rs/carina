@@ -155,6 +155,39 @@ pub(crate) fn carina_diagnostic_range(
     }
 }
 
+enum DiagnosticProviderContext {
+    Loaded(carina_core::parser::LoadedProviderContext),
+    Unloaded(carina_core::parser::ProviderContext),
+}
+
+impl DiagnosticProviderContext {
+    fn loaded(&self) -> Option<&carina_core::parser::LoadedProviderContext> {
+        match self {
+            Self::Loaded(context) => Some(context),
+            Self::Unloaded(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_decryptor_for_test(&mut self, decryptor: carina_core::parser::DecryptorFn) {
+        match self {
+            Self::Loaded(context) => context.set_decryptor_for_test(decryptor),
+            Self::Unloaded(context) => context.decryptor = Some(decryptor),
+        }
+    }
+}
+
+impl std::ops::Deref for DiagnosticProviderContext {
+    type Target = carina_core::parser::ProviderContext;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Loaded(context) => context.as_provider_context(),
+            Self::Unloaded(context) => context,
+        }
+    }
+}
+
 pub struct DiagnosticEngine {
     schemas: Arc<SchemaRegistry>,
     provider_names: Vec<String>,
@@ -163,7 +196,7 @@ pub struct DiagnosticEngine {
     /// Providers that failed to load: name -> error reason.
     provider_errors: HashMap<String, String>,
     /// Cached provider context with custom type validators from schemas.
-    provider_context: carina_core::parser::ProviderContext,
+    provider_context: DiagnosticProviderContext,
 }
 
 impl DiagnosticEngine {
@@ -200,16 +233,22 @@ impl DiagnosticEngine {
         // instead of having the carina#3239 fix silently masked by an
         // unrelated install failure.
         let has_loaded_providers = !provider_names.is_empty();
-        let custom_types = if has_loaded_providers {
-            carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories))
+        let provider_context = if has_loaded_providers {
+            DiagnosticProviderContext::Loaded(
+                carina_core::provider::loaded_provider_context_from_factories(
+                    &schemas,
+                    Arc::clone(&factories),
+                ),
+            )
         } else {
-            carina_core::parser::ProviderCustomTypes::default()
-        };
-        let provider_context = carina_core::parser::ProviderContext {
-            decryptor: None,
-            custom_types,
-            resource_types:
-                carina_core::parser::ProviderContext::resource_types_from_schema_registry(&schemas),
+            DiagnosticProviderContext::Unloaded(carina_core::parser::ProviderContext {
+                decryptor: None,
+                custom_types: carina_core::parser::ProviderCustomTypes::default(),
+                resource_types:
+                    carina_core::parser::ProviderContext::resource_types_from_schema_registry(
+                        &schemas,
+                    ),
+            })
         };
         Self {
             schemas,

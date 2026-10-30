@@ -312,7 +312,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .value()
                 .expect("value-shaped module argument was matched above");
             let resolved_type = resolved_parameter.as_type_expr();
-            crate::validation::typecheck::check_type_expr_value(
+            crate::validation::typecheck::check_type_expr_value_with_context(
                 &resolved_type,
                 value,
                 self.config,
@@ -1747,7 +1747,7 @@ fn check_composition_argument_type(
         return Ok(());
     }
 
-    crate::validation::typecheck::check_type_expr_value(
+    crate::validation::typecheck::check_type_expr_value_with_context(
         &resolved_parameter.as_type_expr(),
         argument.value(),
         config,

@@ -731,6 +731,88 @@ impl ProviderContext {
     }
 }
 
+/// Proof that a [`ProviderContext`] carries a loaded provider custom-type
+/// catalog.
+///
+/// Production code can obtain this witness only through
+/// [`crate::provider::loaded_provider_context_from_factories`], which builds
+/// the context from one provider-factory and schema snapshot. Value-checking
+/// APIs that can reach provider custom types accept this type so a bootstrap
+/// [`ProviderContext`] cannot be passed accidentally.
+///
+/// ```compile_fail
+/// use carina_core::parser::{LoadedProviderContext, ProviderContext};
+///
+/// let _ = LoadedProviderContext(std::sync::Arc::new(ProviderContext::default()));
+/// ```
+#[derive(Clone)]
+pub struct LoadedProviderContext(std::sync::Arc<ProviderContext>);
+
+impl LoadedProviderContext {
+    pub(crate) fn new(context: ProviderContext) -> Self {
+        assert!(
+            context.custom_types_loaded(),
+            "LoadedProviderContext requires loaded provider custom types"
+        );
+        Self(std::sync::Arc::new(context))
+    }
+
+    pub fn as_provider_context(&self) -> &ProviderContext {
+        &self.0
+    }
+
+    /// Test-only constructor for fixtures that deliberately inject a loaded
+    /// custom-type resolver without a provider factory.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(context: ProviderContext) -> Self {
+        assert!(
+            context.custom_types_loaded(),
+            "LoadedProviderContext test fixtures must use loaded custom types"
+        );
+        Self::new(context)
+    }
+
+    /// Loaded context with no registered custom types, for tests whose value
+    /// checks use only built-in types.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn empty_for_test() -> Self {
+        Self::new(ProviderContext {
+            custom_types: ProviderCustomTypes {
+                state: ProviderCustomTypeState::Loaded {
+                    known: BTreeSet::new(),
+                    resolver: Box::new(|_target, _value| Ok(())),
+                    enum_lookup: Box::new(|_owned| Ok(None)),
+                },
+            },
+            ..ProviderContext::default()
+        })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_decryptor_for_test(&mut self, decryptor: DecryptorFn) {
+        std::sync::Arc::get_mut(&mut self.0)
+            .expect("test fixture must not mutate a cloned LoadedProviderContext")
+            .decryptor = Some(decryptor);
+    }
+}
+
+impl std::ops::Deref for LoadedProviderContext {
+    type Target = ProviderContext;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_provider_context()
+    }
+}
+
+impl std::fmt::Debug for LoadedProviderContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("LoadedProviderContext")
+            .field(self.as_provider_context())
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for ProviderContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderContext")

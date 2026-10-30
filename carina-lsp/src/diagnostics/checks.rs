@@ -16,6 +16,9 @@ use carina_core::parser::{
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::suggest_similar_name;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
+use carina_core::validation::typecheck::{
+    self, TypeExprValueCheckAvailability, TypecheckInference,
+};
 
 use super::{DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic};
 
@@ -2072,26 +2075,48 @@ impl DiagnosticEngine {
 
                 if let Some(type_expr) = &attr_param.type_expr
                     && let Some(semantic_value) = semantic_view.value_for_typecheck(attr_param)
-                    && let Err(type_error) =
-                        carina_core::validation::typecheck::check_type_expr_value(
+                {
+                    let type_error = match self.provider_context.loaded() {
+                        Some(provider_context) => typecheck::check_type_expr_value(
                             type_expr,
                             semantic_value,
-                            &self.provider_context,
-                            carina_core::validation::typecheck::TypecheckInference::Available {
+                            provider_context,
+                            TypecheckInference::Available {
                                 bindings: inference_bindings,
                                 schemas: &self.schemas,
                             },
                         )
-                    && let Some((line, col)) =
-                        self.find_attributes_param_position(doc, &attr_param.name)
-                {
-                    diagnostics.push(carina_diagnostic(
-                        line,
-                        col,
-                        col + attr_param.name.len() as u32,
-                        DiagnosticSeverity::WARNING,
-                        type_error.to_string(),
-                    ));
+                        .err(),
+                        None => match typecheck::classify_type_expr_value_check(type_expr) {
+                            TypeExprValueCheckAvailability::ProviderIndependent(expected) => {
+                                typecheck::check_provider_independent_type_expr_value(
+                                    expected,
+                                    semantic_value,
+                                    &self.provider_context,
+                                    TypecheckInference::Available {
+                                        bindings: inference_bindings,
+                                        schemas: &self.schemas,
+                                    },
+                                )
+                                .err()
+                            }
+                            TypeExprValueCheckAvailability::RequiresLoadedProviderCustomTypes => {
+                                None
+                            }
+                        },
+                    };
+                    if let Some(type_error) = type_error
+                        && let Some((line, col)) =
+                            self.find_attributes_param_position(doc, &attr_param.name)
+                    {
+                        diagnostics.push(carina_diagnostic(
+                            line,
+                            col,
+                            col + attr_param.name.len() as u32,
+                            DiagnosticSeverity::WARNING,
+                            type_error.to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -2239,12 +2264,31 @@ impl DiagnosticEngine {
                     &fallback
                 }
             };
-            let message = carina_core::validation::check_export_values_pre_apply(
-                std::slice::from_ref(semantic_param),
-                value_bindings,
-                &self.provider_context,
-            )
-            .err();
+            let message = match self.provider_context.loaded() {
+                Some(provider_context) => carina_core::validation::check_export_values_pre_apply(
+                    std::slice::from_ref(semantic_param),
+                    value_bindings,
+                    provider_context,
+                )
+                .err(),
+                None => match carina_core::validation::classify_export_value_check(semantic_param) {
+                    carina_core::validation::ExportValueCheckAvailability::ProviderIndependent(
+                        export,
+                    ) => carina_core::validation::check_provider_independent_export_value_pre_apply(
+                        export,
+                        value_bindings,
+                        &self.provider_context,
+                    )
+                    .err(),
+                    carina_core::validation::ExportValueCheckAvailability::RequiresLoadedProviderCustomTypes => {
+                        // Orphaned buffers have no provider set from which to
+                        // load a custom-type catalog. The typed classification
+                        // keeps that export out of value validation entirely;
+                        // it is not accepted by an unloaded resolver.
+                        None
+                    }
+                },
+            };
             if let Some(message) = message
                 && let Some((line, col)) = self.find_exports_param_position(doc, &param.name)
             {

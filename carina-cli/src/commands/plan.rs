@@ -3634,7 +3634,7 @@ pub async fn run_plan(
         plan: &ctx.plan,
         schemas: ctx_wiring.schemas(),
         wait_aliases: &export_wait_aliases,
-        provider_context,
+        provider_context: ctx_wiring.provider_context(),
     })
     .map_err(AppError::Validation)?;
     let current_exports = state_file
@@ -3871,7 +3871,7 @@ pub(crate) struct CheckExportsPreApplyInput<'a> {
     pub plan: &'a Plan,
     pub schemas: &'a carina_core::schema::SchemaRegistry,
     pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
-    pub provider_context: &'a ProviderContext,
+    pub provider_context: &'a carina_core::parser::LoadedProviderContext,
 }
 
 /// Check export expressions against the pre-apply binding view while retaining
@@ -5207,7 +5207,7 @@ exports { region: String = "ap-northeast-1" }"#,
         let checked_exports = carina_core::validation::check_export_values_pre_apply(
             &parsed.export_params,
             &export_bindings,
-            &ProviderContext::default(),
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
         )
         .expect("downstream export resolves from upstream state");
         let export_changes = compute_export_diffs(&checked_exports, &HashMap::new());
@@ -6106,7 +6106,7 @@ mod export_diff_tests {
         carina_core::validation::check_export_values_pre_apply(
             &params,
             &carina_core::binding_index::ResolvedBindings::default(),
-            &ProviderContext::default(),
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
         )
         .expect("test exports must pass the secret boundary")
     }
@@ -6198,7 +6198,7 @@ mod export_diff_tests {
         let resolved = carina_core::validation::check_export_values_pre_apply(
             &params,
             &bindings,
-            &ProviderContext::default(),
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
         )
         .expect("plain dotted string is a valid export");
         assert_eq!(resolved.display_values()[0].value.as_ref(), Some(&value));
@@ -6231,7 +6231,7 @@ mod export_diff_tests {
         let error = carina_core::validation::check_export_values_pre_apply(
             &params,
             &bindings,
-            &ProviderContext::default(),
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
         )
         .expect_err("resolved secret reference must be rejected before display");
         assert_eq!(error, "export 'password' cannot hold a secret value");

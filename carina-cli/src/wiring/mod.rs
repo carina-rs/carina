@@ -361,7 +361,7 @@ pub struct StateBlockResolution {
 /// itself.
 pub struct WiringContext {
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
-    custom_types: carina_core::parser::ProviderCustomTypes,
+    provider_context: carina_core::parser::LoadedProviderContext,
     schemas: SchemaRegistry,
     known_providers: HashSet<String>,
     uses_builtin_mock: bool,
@@ -812,14 +812,13 @@ fn resolve_file_binding_uses<E>(
     base_dir: &Path,
     context: &WiringContext,
 ) -> Result<carina_core::validation::ResolvedFile<E>, AppError> {
-    let provider_context =
-        crate::commands::enrich_provider_context(context.schemas(), context.factories_arc());
+    let provider_context = context.provider_context().as_provider_context();
     let module_signatures =
-        module_resolver::load_resolved_module_signatures(&file, base_dir, &provider_context);
+        module_resolver::load_resolved_module_signatures(&file, base_dir, provider_context);
     carina_core::validation::resolve_bare_binding_uses(
         file,
         context.schemas(),
-        &provider_context,
+        provider_context,
         &module_signatures,
     )
     .map_err(binding_use_report_error)
@@ -1279,14 +1278,12 @@ impl<R> ValidatedConfig<R> {
     #[cfg(test)]
     pub(crate) fn from_wiring_ref_for_test(wiring: &ValidatedWiring, resources: R) -> Self {
         let factories = Arc::clone(&wiring.load.context.factories);
-        let custom_types =
-            carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
         Self {
             wiring: ValidatedWiring {
                 load: CompleteProviderLoad {
                     context: WiringContext {
                         factories,
-                        custom_types,
+                        provider_context: wiring.load.context.provider_context.clone(),
                         schemas: wiring.load.context.schemas.clone(),
                         known_providers: wiring.load.context.known_providers.clone(),
                         uses_builtin_mock: wiring.load.context.uses_builtin_mock,
@@ -1741,11 +1738,13 @@ impl WiringContext {
             known_providers.insert(BUILTIN_PROVIDER_NAME.to_string());
         }
         let factories = Arc::new(factories);
-        let custom_types =
-            carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
+        let provider_context = carina_core::provider::loaded_provider_context_from_factories(
+            &schemas,
+            Arc::clone(&factories),
+        );
         Self {
             factories,
-            custom_types,
+            provider_context,
             schemas,
             known_providers,
             uses_builtin_mock,
@@ -1783,7 +1782,11 @@ impl WiringContext {
     }
 
     pub fn custom_type_resolver(&self) -> &dyn carina_core::parser::CustomTypeResolver {
-        &self.custom_types
+        self.provider_context.custom_type_resolver()
+    }
+
+    pub fn provider_context(&self) -> &carina_core::parser::LoadedProviderContext {
+        &self.provider_context
     }
 
     pub fn schemas(&self) -> &SchemaRegistry {
@@ -3294,7 +3297,7 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
 pub(crate) fn validate_module_internal_ref_types(
     ctx: &WiringContext,
     module_walk: &ModuleWalk,
-    config: &carina_core::parser::ProviderContext,
+    config: &carina_core::parser::LoadedProviderContext,
 ) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {

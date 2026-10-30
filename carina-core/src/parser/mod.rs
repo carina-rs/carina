@@ -35,8 +35,9 @@ pub(crate) use ast::{BareBindingSource, ParsedBareBindingUse};
 pub(crate) use config::ProviderCustomTypeSource;
 pub use config::{
     CustomTypeResolver, CustomTypeValidationError, CustomTypeValidationTarget,
-    CustomTypeValidatorFn, DecryptorFn, IdentifiedCustomTypeDeclaration, NonEmptySchemaTypeOwners,
-    OwnedTypeIdentity, ProviderContext, ProviderCustomTypes, SchemaTypeOwner,
+    CustomTypeValidatorFn, DecryptorFn, IdentifiedCustomTypeDeclaration, LoadedProviderContext,
+    NonEmptySchemaTypeOwners, OwnedTypeIdentity, ProviderContext, ProviderCustomTypes,
+    SchemaTypeOwner,
 };
 #[cfg(test)]
 pub(crate) use config::{fixture_custom_type_rejection, fixture_invalid_custom_type_value};

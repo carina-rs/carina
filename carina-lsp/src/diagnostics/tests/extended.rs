@@ -261,14 +261,26 @@ fn render_value_type_error(
     type_expr: &TypeExpr,
     value: &Value,
 ) -> Option<String> {
-    carina_core::validation::typecheck::check_type_expr_value(
-        type_expr,
-        value,
-        &engine.provider_context,
-        carina_core::validation::typecheck::TypecheckInference::Unavailable,
-    )
-    .err()
-    .map(|error| error.to_string())
+    let result = match engine.provider_context.loaded() {
+        Some(provider_context) => carina_core::validation::typecheck::check_type_expr_value(
+            type_expr,
+            value,
+            provider_context,
+            carina_core::validation::typecheck::TypecheckInference::Unavailable,
+        ),
+        None => match carina_core::validation::typecheck::classify_type_expr_value_check(type_expr) {
+            carina_core::validation::typecheck::TypeExprValueCheckAvailability::ProviderIndependent(expected) =>
+                carina_core::validation::typecheck::check_provider_independent_type_expr_value(
+                    expected,
+                    value,
+                    &engine.provider_context,
+                    carina_core::validation::typecheck::TypecheckInference::Unavailable,
+                ),
+            carina_core::validation::typecheck::TypeExprValueCheckAvailability::RequiresLoadedProviderCustomTypes =>
+                panic!("test helper requires loaded providers for {type_expr}"),
+        },
+    };
+    result.err().map(|error| error.to_string())
 }
 
 fn unused_binding_names(diagnostics: &[Diagnostic]) -> Vec<String> {
@@ -4636,6 +4648,46 @@ fn exports_type_warning_for_literal_mismatch() {
         warning.is_some(),
         "Should warn about bool vs string mismatch. Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn orphan_exports_check_builtins_without_calling_unloaded_custom_types() {
+    let engine = DiagnosticEngine::new(
+        Arc::new(SchemaRegistry::new()),
+        Vec::new(),
+        Arc::new(Vec::new()),
+    );
+    let doc = create_document(
+        r#"exports {
+  flag: Bool = 'hello'
+  identifiers: list(mock.RecoveryProbe) = ['identifier']
+}
+attributes {
+  identifier: mock.RecoveryProbe = 'identifier'
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected Bool, got string")),
+        "built-in export checks must remain available: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .contains("provider custom types are not loaded")),
+        "custom exports in orphan buffers must take the typed unavailable branch: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -10873,7 +10925,9 @@ exports {
     let temp = write_tag_key_fixture(&[("main.crn", source)]);
 
     let mut engine = test_engine();
-    engine.provider_context.decryptor = Some(Box::new(|_, _| Ok("decrypted-marker".to_string())));
+    engine
+        .provider_context
+        .set_decryptor_for_test(Box::new(|_, _| Ok("decrypted-marker".to_string())));
     let diagnostics = analyze_with_buffer(&engine, temp.path(), "main.crn", source);
 
     for name in [
