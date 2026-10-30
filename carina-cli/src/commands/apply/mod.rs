@@ -3280,8 +3280,9 @@ async fn run_apply_from_plan_locked_owned(
         }
     }
 
-    let inspected_plan =
-        try_with_lock!(inspected_plan.reload_in_flight_from_locked_state(state_file.as_ref()));
+    let inspected_plan = try_with_lock!(
+        inspected_plan.reload_in_flight_from_locked_state(state_file.as_ref(), project_dir)
+    );
 
     // A typed `read` address plus an identifier-less row shape distinguishes
     // historical pre-#3181 data-source rows without erasing an identifier-

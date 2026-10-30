@@ -1184,7 +1184,9 @@ fn create_before_destroy_without_unique_name_attribute_emits_plan_error() {
         })
     );
     assert_eq!(
-        plan.errors()[0].to_string(),
+        plan.errors()[0]
+            .display_with_project_dir(std::path::Path::new("."))
+            .to_string(),
         "ec2.Vpc.my-vpc: resource type 'ec2.Vpc' does not support create_before_destroy: the replacement cannot coexist with the original"
     );
 }
@@ -3574,7 +3576,9 @@ fn unresolved_wait_enum_identifier_is_a_plan_error() {
     assert!(plan.effects().iter().all(|effect| !effect.is_wait()));
     assert_eq!(plan.errors().len(), 1);
     assert_eq!(
-        plan.errors()[0].to_string(),
+        plan.errors()[0]
+            .display_with_project_dir(std::path::Path::new("."))
+            .to_string(),
         "job.Job.job: wait `job_ready`: cannot resolve `ready` as an enum value of `job.state`; quote it to compare as a string"
     );
 }
@@ -3888,7 +3892,16 @@ let renewed = wait cert {
     );
 
     assert_eq!(plan.errors().len(), 1);
-    assert_eq!(plan.errors()[0].kind.to_string(), validation[0].message);
+    assert_eq!(
+        plan.errors()[0]
+            .display_with_project_dir(std::path::Path::new("."))
+            .to_string(),
+        format!(
+            "{}: {}",
+            plan.errors()[0].resource_id,
+            validation[0].message
+        )
+    );
     assert!(
         validation[0]
             .message
@@ -4238,7 +4251,7 @@ fn wait_with_unknown_target_emits_plan_error() {
             &plan.errors()[0].kind,
             PlanErrorKind::WaitTargetMissing { target, .. } if target == "nonexistent"
         ),
-        "error message should mention the missing target, got: {}",
+        "error should retain the missing target, got: {:?}",
         plan.errors()[0]
     );
 }

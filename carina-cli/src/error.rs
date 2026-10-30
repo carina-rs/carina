@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
+use carina_core::plan::PlanError;
 use carina_core::provider::{ProviderError, ProviderInstanceKey, ReferenceScope};
 use carina_core::resource::{ResolvedResourceId, ResourceId};
 use carina_state::BackendError;
@@ -79,6 +80,85 @@ impl std::fmt::Display for ProjectBackendError {
 // command, so exposing the backend error again would repeat the diagnostic.
 impl std::error::Error for ProjectBackendError {}
 
+/// Typed failure while reloading state-owned create status under the apply
+/// lock. This type deliberately has no plain `Display`: the plan-error branch
+/// can contain a project-scoped recovery command.
+#[derive(Debug)]
+pub(crate) enum LockedStateReloadError {
+    Config(String),
+    Plan(Box<PlanError>),
+}
+
+impl From<String> for LockedStateReloadError {
+    fn from(message: String) -> Self {
+        Self::Config(message)
+    }
+}
+
+impl From<PlanError> for LockedStateReloadError {
+    fn from(error: PlanError) -> Self {
+        Self::Plan(Box::new(error))
+    }
+}
+
+impl LockedStateReloadError {
+    pub(crate) fn display_with_project_dir<'a>(
+        &'a self,
+        project_dir: &'a Path,
+    ) -> impl std::fmt::Display + 'a {
+        LockedStateReloadErrorDisplay {
+            error: self,
+            project_dir,
+        }
+    }
+}
+
+struct LockedStateReloadErrorDisplay<'a> {
+    error: &'a LockedStateReloadError,
+    project_dir: &'a Path,
+}
+
+impl std::fmt::Display for LockedStateReloadErrorDisplay<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.error {
+            LockedStateReloadError::Config(message) => formatter.write_str(message),
+            LockedStateReloadError::Plan(error) => {
+                std::fmt::Display::fmt(&error.display_with_project_dir(self.project_dir), formatter)
+            }
+        }
+    }
+}
+
+/// A locked-state reload failure rendered with the concrete project directory
+/// available at the apply boundary.
+#[derive(Debug)]
+pub struct ProjectLockedStateReloadError {
+    project_dir: PathBuf,
+    source: LockedStateReloadError,
+}
+
+impl ProjectLockedStateReloadError {
+    fn new(source: LockedStateReloadError, project_dir: &Path) -> Self {
+        Self {
+            project_dir: project_dir.to_path_buf(),
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for ProjectLockedStateReloadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(
+            &self.source.display_with_project_dir(&self.project_dir),
+            formatter,
+        )
+    }
+}
+
+// This is the terminal rendering surface: the typed source cannot be exposed
+// without re-rendering a project-scoped command without its project path.
+impl std::error::Error for ProjectLockedStateReloadError {}
+
 /// A `state forget` rejection rendered with the concrete project directory
 /// available at the CLI boundary.
 #[derive(Debug)]
@@ -102,11 +182,9 @@ impl std::fmt::Display for ProjectStateForgetError {
     }
 }
 
-impl std::error::Error for ProjectStateForgetError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
+// Like `ProjectBackendError`, this project-aware wrapper is the terminal
+// rendering surface. Exposing its source would print the rejection twice.
+impl std::error::Error for ProjectStateForgetError {}
 
 /// All provider-schema differences that invalidate one saved plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +253,7 @@ impl std::error::Error for SavedPlanProviderArtifactMismatchError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedPlanProviderScopeMismatchError {
     pub instance: ProviderInstanceKey,
-    pub recorded: Option<ReferenceScope>,
+    pub recorded: ReferenceScope,
     pub initialized: Option<ReferenceScope>,
     pub replan_command: String,
 }
@@ -189,23 +267,25 @@ impl std::fmt::Display for SavedPlanProviderScopeMismatchError {
         write!(
             formatter,
             "Provider scope mismatch for `{instance}`: recorded {}; initialized {}.\nRe-run `{}` to produce a new saved plan before applying.",
-            reference_scope_summary(self.recorded.as_ref()),
-            reference_scope_summary(self.initialized.as_ref()),
+            reference_scope_summary(&self.recorded),
+            self.initialized
+                .as_ref()
+                .map(reference_scope_summary)
+                .unwrap_or_else(|| "missing".to_string()),
             self.replan_command,
         )
     }
 }
 
-fn reference_scope_summary(scope: Option<&ReferenceScope>) -> String {
+fn reference_scope_summary(scope: &ReferenceScope) -> String {
     match scope {
-        Some(ReferenceScope::Available(values)) => format!(
+        ReferenceScope::Available(values) => format!(
             "{}/{}/{}",
             values.partition(),
             values.region(),
             values.account()
         ),
-        Some(ReferenceScope::Unavailable) => "unavailable".to_string(),
-        None => "missing".to_string(),
+        ReferenceScope::Unavailable => "unavailable".to_string(),
     }
 }
 
@@ -668,6 +748,10 @@ pub enum AppError {
     #[error(transparent)]
     StateForget(Box<ProjectStateForgetError>),
 
+    /// Locked state no longer agrees with the saved plan's create status.
+    #[error(transparent)]
+    LockedStateReload(Box<ProjectLockedStateReloadError>),
+
     /// A provider or desired value could not be encoded into one resource row.
     #[error(transparent)]
     ResourceStateEncoding(Box<LocatedResourceStateEncodingError>),
@@ -926,6 +1010,16 @@ pub enum AppError {
 }
 
 impl AppError {
+    pub(crate) fn from_locked_state_reload(
+        source: LockedStateReloadError,
+        project_dir: &Path,
+    ) -> Self {
+        Self::LockedStateReload(Box::new(ProjectLockedStateReloadError::new(
+            source,
+            project_dir,
+        )))
+    }
+
     pub(crate) fn from_state_forget(
         source: carina_state::NotOutcomeUnknown,
         project_dir: &Path,

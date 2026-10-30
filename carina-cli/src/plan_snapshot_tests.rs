@@ -297,7 +297,11 @@ fn snapshot_resolved_value_constraint_multifile() {
         .plan
         .errors()
         .iter()
-        .map(ToString::to_string)
+        .map(|error| {
+            error
+                .display_with_project_dir(std::path::Path::new("."))
+                .to_string()
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -323,7 +327,9 @@ fn snapshot_module_constraint_plan_error() {
         }),
     );
 
-    let rendered = error.to_string();
+    let rendered = error
+        .display_with_project_dir(std::path::Path::new("."))
+        .to_string();
     assert_eq!(
         rendered,
         "module 'mod' (call 'c'): argument 'name': too long (got \"abcd\")"

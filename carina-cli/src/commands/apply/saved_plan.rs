@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::Path;
 
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::{Orphan, Orphans, restore_current_move_source};
@@ -227,6 +228,7 @@ impl ProviderBoundPlanFile {
     pub(super) fn reload_in_flight_from_locked_state(
         self,
         state_file: Option<&carina_state::StateFile>,
+        project_dir: &Path,
     ) -> Result<ReloadedProviderBoundPlanFile, AppError> {
         match self {
             Self::Verified {
@@ -245,7 +247,7 @@ impl ProviderBoundPlanFile {
                     },
                     providers,
                 })
-                .map_err(AppError::Config),
+                .map_err(|source| AppError::from_locked_state_reload(source, project_dir)),
             Self::NeedsSecretVerification {
                 plan:
                     PendingPlanFile {
@@ -264,7 +266,7 @@ impl ProviderBoundPlanFile {
                         providers,
                     },
                 )
-                .map_err(AppError::Config),
+                .map_err(|source| AppError::from_locked_state_reload(source, project_dir)),
         }
     }
 
@@ -1376,7 +1378,7 @@ mod tests {
         };
         assert_eq!(mismatch.instance.provider(), "test");
         assert_eq!(mismatch.instance.provider_instance(), Some("west"));
-        assert_eq!(mismatch.recorded, Some(available_scope("us-west-2")));
+        assert_eq!(mismatch.recorded, available_scope("us-west-2"));
         assert_eq!(mismatch.initialized, Some(available_scope("eu-west-1")));
     }
 

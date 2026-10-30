@@ -122,6 +122,12 @@ fn missing_identifier_plan_error(identity: &str) -> carina_core::plan::PlanError
     )
 }
 
+fn render_plan_error(error: &carina_core::plan::PlanError) -> String {
+    error
+        .display_with_project_dir(std::path::Path::new("."))
+        .to_string()
+}
+
 #[test]
 fn non_empty_plan_errors_reject_empty_and_preserve_order() {
     assert!(NonEmptyPlanErrors::try_from(Vec::new()).is_err());
@@ -4776,7 +4782,7 @@ fn deposed_delete_without_provider_identifier_becomes_plan_error() {
             current_identifier: None,
         }
     );
-    let message = plan.errors()[0].to_string();
+    let message = render_plan_error(&plan.errors()[0]);
     assert!(message.contains("mock.example.Widget.broken"), "{message}");
     assert!(message.contains("`removed` block"), "{message}");
     assert!(!message.contains("`import` block"), "{message}");
@@ -4806,7 +4812,7 @@ fn malformed_deposed_generation_with_healthy_current_instance_recommends_reimpor
 
     add_deposed_delete_effects(&mut plan, &Some(state_file), &[]);
 
-    let message = plan.errors()[0].to_string();
+    let message = render_plan_error(&plan.errors()[0]);
     assert!(message.contains("`removed` block"), "{message}");
     assert!(message.contains("`import` block"), "{message}");
     assert!(message.contains("current-id"), "{message}");
@@ -12329,7 +12335,9 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
 
 mod resolved_value_constraint_gate {
     use super::super::*;
-    use super::{build_override_aware_pair_for_test, canonical_pair, canonical_unresolved};
+    use super::{
+        build_override_aware_pair_for_test, canonical_pair, canonical_unresolved, render_plan_error,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use carina_core::binding_index::LivePreApplyInputs;
@@ -12841,7 +12849,7 @@ mod resolved_value_constraint_gate {
             }
             other => panic!("unexpected plan error: {other:?}"),
         }
-        let rendered = errors[0].to_string();
+        let rendered = render_plan_error(&errors[0]);
         assert!(rendered.contains(expected_type), "{rendered}");
         assert!(rendered.contains(expected_attribute), "{rendered}");
         assert!(rendered.contains("producer.value"), "{rendered}");
@@ -12869,7 +12877,7 @@ mod resolved_value_constraint_gate {
             .expect_err("resolved secret must fail its authored-value constraint");
         let rendered = errors
             .iter()
-            .map(ToString::to_string)
+            .map(render_plan_error)
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -13003,7 +13011,7 @@ mod resolved_value_constraint_gate {
             }
             other => panic!("unexpected plan error: {other:?}"),
         }
-        let rendered = errors[0].to_string();
+        let rendered = render_plan_error(&errors[0]);
         for expected in [
             "module 'checked_module' (call 'checked')",
             "value",
@@ -13316,7 +13324,7 @@ exports { team_prefix: String = "x" }"#,
         let errors = prepare_composition(vec![("value", secret)], &mut composition)
             .await
             .expect_err("invalid secret value must fail without disclosure");
-        let rendered = errors[0].to_string();
+        let rendered = render_plan_error(&errors[0]);
 
         assert!(rendered.contains("(secret)"), "{rendered}");
         assert!(!rendered.contains("\"bad\""), "{rendered}");

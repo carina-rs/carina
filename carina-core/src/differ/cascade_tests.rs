@@ -490,7 +490,9 @@ fn auto_promote_with_missing_unique_name_attribute_emits_plan_error() {
         })
     );
     assert_eq!(
-        plan.errors()[0].to_string(),
+        plan.errors()[0]
+            .display_with_project_dir(std::path::Path::new("."))
+            .to_string(),
         "ec2.Vpc.my-vpc: resource type 'ec2.Vpc' does not support create_before_destroy: the replacement cannot coexist with the original"
     );
 }

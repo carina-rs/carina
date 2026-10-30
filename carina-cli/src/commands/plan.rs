@@ -42,7 +42,7 @@ use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::ProgressSink;
 use crate::display::print_plan;
-use crate::error::AppError;
+use crate::error::{AppError, LockedStateReloadError};
 #[cfg(test)]
 use crate::plan_image::PlanImageError;
 #[cfg(test)]
@@ -145,7 +145,7 @@ pub struct RecordedProviderScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderScopeMismatch {
     pub(crate) instance: ProviderInstanceKey,
-    pub(crate) recorded: Option<ReferenceScope>,
+    pub(crate) recorded: ReferenceScope,
     pub(crate) initialized: Option<ReferenceScope>,
 }
 
@@ -173,12 +173,15 @@ impl RecordedProviderScopes {
     ) -> Result<(), Box<ProviderScopeMismatch>> {
         let initialized = provider.provider_scopes();
         for instance in self.0.keys() {
-            let recorded = self.0.get(instance);
+            let recorded = self
+                .0
+                .get(instance)
+                .expect("an iterated recorded provider scope must exist");
             let current = initialized.get(instance);
-            if recorded != current {
+            if Some(recorded) != current {
                 return Err(Box::new(ProviderScopeMismatch {
                     instance: instance.clone(),
-                    recorded: recorded.cloned(),
+                    recorded: recorded.clone(),
                     initialized: current.cloned(),
                 }));
             }
@@ -545,7 +548,7 @@ mod provider_scope_evidence_tests {
             .expect_err("one named instance changed scope");
         assert_eq!(mismatch.instance.provider(), "test");
         assert_eq!(mismatch.instance.provider_instance(), Some("west"));
-        assert_eq!(mismatch.recorded, Some(available("us-west-2")));
+        assert_eq!(mismatch.recorded, available("us-west-2"));
         assert_eq!(mismatch.initialized, Some(available("eu-west-1")));
     }
 
@@ -1863,7 +1866,7 @@ impl PlanFile {
     pub(crate) fn reload_in_flight_from_locked_state(
         self,
         state_file: Option<&StateFile>,
-    ) -> Result<UnresolvedReloadedPlanFile, String> {
+    ) -> Result<UnresolvedReloadedPlanFile, LockedStateReloadError> {
         let PlanFile {
             mut contents,
             evidence,
@@ -1907,7 +1910,7 @@ impl PlanFile {
                             return Err(carina_core::plan::PlanError::create_outcome_unknown(
                                 locked_id,
                             )
-                            .to_string());
+                            .into());
                         }
                         false
                     }
@@ -1936,9 +1939,9 @@ impl PlanFile {
                     row.directives.provider_instance.clone(),
                 );
                 if !planned_in_flight_origins.contains(&locked_id) {
-                    return Err(format!(
+                    return Err(LockedStateReloadError::Config(format!(
                         "saved plan is stale for {locked_id}: create-in-flight status changed from false to true; create a new plan before applying"
-                    ));
+                    )));
                 }
             }
         }
@@ -1956,10 +1959,12 @@ impl PlanFile {
                             .plan
                             .move_authority(persisted_id, &id)
                             .ok_or_else(|| {
-                                format!("saved plan has no move edge from {persisted_id} to {id}")
+                                LockedStateReloadError::Config(format!(
+                                    "saved plan has no move edge from {persisted_id} to {id}"
+                                ))
                             })?;
                         locked_current = rebind_current_for_move(locked_current, &authority)
-                            .map_err(|error| error.to_string())?;
+                            .map_err(|error| LockedStateReloadError::Config(error.to_string()))?;
                     }
                     let current = match (current.into_reload_kind(), locked_current) {
                         (
@@ -1967,9 +1972,9 @@ impl PlanFile {
                             locked @ Current::CreateInFlight(_),
                         ) => Box::new(locked),
                         (ReloadSavedManagedCurrent::CreateInFlightMarker, _locked) => {
-                            return Err(format!(
+                            return Err(LockedStateReloadError::Config(format!(
                                 "saved plan is stale for {id}: create-in-flight status changed from true to false; create a new plan before applying"
-                            ));
+                            )));
                         }
                         (
                             ReloadSavedManagedCurrent::CreateOutcomeUnknownMarker {
@@ -1980,17 +1985,17 @@ impl PlanFile {
                             Box::new(Current::CreateOutcomeUnknown(unknown))
                         }
                         (ReloadSavedManagedCurrent::CreateOutcomeUnknownMarker { .. }, _locked) => {
-                            return Err(format!(
+                            return Err(LockedStateReloadError::Config(format!(
                                 "saved plan is stale for {id}: create-outcome-unknown status or timestamp changed; create a new plan before applying"
-                            ));
+                            )));
                         }
                         (
                             ReloadSavedManagedCurrent::Snapshot(_saved),
                             Current::CreateInFlight(_pending),
                         ) => {
-                            return Err(format!(
+                            return Err(LockedStateReloadError::Config(format!(
                                 "saved plan is stale for {id}: create-in-flight status changed from false to true; create a new plan before applying"
-                            ));
+                            )));
                         }
                         (
                             ReloadSavedManagedCurrent::Snapshot(_saved),
@@ -1999,7 +2004,7 @@ impl PlanFile {
                             return Err(carina_core::plan::PlanError::create_outcome_unknown(
                                 unknown.id().clone(),
                             )
-                            .to_string());
+                            .into());
                         }
                         (ReloadSavedManagedCurrent::Snapshot(saved), _locked) => saved,
                     };
@@ -3472,6 +3477,13 @@ mod managed_current_serde_tests {
     };
     use carina_state::{ResourceState, StateFile};
 
+    fn reload_error_text(
+        error: &crate::error::LockedStateReloadError,
+        project_dir: &std::path::Path,
+    ) -> String {
+        error.display_with_project_dir(project_dir).to_string()
+    }
+
     fn plan_file_with_current(id: ResourceId, current: SavedManagedCurrent) -> PlanFile {
         PlanFileContents {
             version: PlanFile::CURRENT_VERSION,
@@ -3576,8 +3588,11 @@ mod managed_current_serde_tests {
         )
         .reload_in_flight_from_locked_state(Some(&locked))
         .expect_err("an unknown row appearing after planning must invalidate the plan");
+        let appeared = reload_error_text(&appeared, std::path::Path::new("infra/production"));
         assert!(appeared.contains("the create may have reached the cloud"));
-        assert!(appeared.contains("carina state forget"));
+        assert!(
+            appeared.contains("carina state forget mock.test.Resource unknown infra/production")
+        );
 
         let disappeared = plan_file_with_current(
             id,
@@ -3585,7 +3600,10 @@ mod managed_current_serde_tests {
         )
         .reload_in_flight_from_locked_state(None)
         .expect_err("an unknown row disappearing after planning must invalidate the plan");
-        assert!(disappeared.contains("status or timestamp changed"));
+        assert!(
+            reload_error_text(&disappeared, std::path::Path::new("."))
+                .contains("status or timestamp changed")
+        );
     }
 
     #[test]
@@ -3680,6 +3698,7 @@ mod managed_current_serde_tests {
         let became_in_flight = planned_absent
             .reload_in_flight_from_locked_state(Some(&locked_in_flight))
             .expect_err("absent to in-flight must invalidate the saved plan");
+        let became_in_flight = reload_error_text(&became_in_flight, std::path::Path::new("."));
         assert!(
             became_in_flight.contains("false to true"),
             "{became_in_flight}"
@@ -3690,6 +3709,7 @@ mod managed_current_serde_tests {
         let ended = planned_in_flight
             .reload_in_flight_from_locked_state(None)
             .expect_err("in-flight to absent must invalidate the saved plan");
+        let ended = reload_error_text(&ended, std::path::Path::new("."));
         assert!(ended.contains("true to false"), "{ended}");
     }
 
@@ -3731,6 +3751,7 @@ mod managed_current_serde_tests {
         let error = plan
             .reload_in_flight_from_locked_state(Some(&locked))
             .expect_err("a new in-flight address must invalidate the saved plan");
+        let error = reload_error_text(&error, std::path::Path::new("."));
         assert!(error.contains(&unexpected_id.to_string()), "{error}");
         assert!(error.contains("false to true"), "{error}");
     }

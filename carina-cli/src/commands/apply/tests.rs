@@ -562,7 +562,7 @@ fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
                     "test",
                     Some("west".to_string()),
                 ),
-                recorded: Some(carina_core::provider::ReferenceScope::Unavailable),
+                recorded: carina_core::provider::ReferenceScope::Unavailable,
                 initialized: Some(
                     carina_core::provider::ReferenceScope::available(
                         "aws",
@@ -1195,7 +1195,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
     )
     .expect("placeholder-free plan must bind its provider load");
     let reloaded = bound
-        .reload_in_flight_from_locked_state(None)
+        .reload_in_flight_from_locked_state(None, Path::new("."))
         .expect("current-state snapshot should reload");
     let ReloadedProviderBoundPlanFile::Verified { plan, providers } = reloaded else {
         panic!("placeholder-free plan changed typestate during reload")

@@ -2943,7 +2943,9 @@ mod tests {
             error.kind,
             carina_core::plan::PlanErrorKind::MissingProviderIdentifier
         );
-        let message = error.to_string();
+        let message = error
+            .display_with_project_dir(std::path::Path::new("."))
+            .to_string();
         assert!(message.contains(&resource.id.to_string()), "{message}");
         assert!(message.contains("`removed` block"), "{message}");
         assert!(message.contains("`import` block"), "{message}");
@@ -2987,7 +2989,9 @@ mod tests {
                 error.kind,
                 carina_core::plan::PlanErrorKind::DestroyCreateInFlight
             );
-            let message = error.to_string();
+            let message = error
+                .display_with_project_dir(std::path::Path::new("."))
+                .to_string();
             assert!(message.contains(&expected_id.to_string()), "{message}");
             assert!(message.contains("run apply first"), "{message}");
         }
@@ -3022,7 +3026,9 @@ mod tests {
                 ..
             }]
         ));
-        let message = errors[0].to_string();
+        let message = errors[0]
+            .display_with_project_dir(std::path::Path::new("."))
+            .to_string();
         assert!(message.contains("the create may have reached the cloud"));
         assert!(message.contains("carina state forget mock.test.Widget unknown"));
     }

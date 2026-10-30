@@ -23,6 +23,22 @@ use crate::resource::{
 pub use crate::resource::{ModuleSource, SavedModuleSource};
 
 /// Error detected while constructing a plan.
+///
+/// Rendering requires the project directory because some variants contain a
+/// project-scoped recovery command:
+///
+/// ```compile_fail
+/// use carina_core::plan::PlanError;
+/// use carina_core::resource::ResourceId;
+///
+/// let error = PlanError::create_outcome_unknown(ResourceId::with_provider_identity(
+///     "awscc",
+///     "ec2.Vpc",
+///     "main",
+///     None,
+/// ));
+/// let _ = error.to_string();
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanError {
     /// The resource that triggered the error.
@@ -357,12 +373,6 @@ impl PlanErrorKind {
     }
 }
 
-impl std::fmt::Display for PlanErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.fmt_with_project_dir(f, Path::new("."))
-    }
-}
-
 impl PlanError {
     fn fmt_with_project_dir(
         &self,
@@ -416,12 +426,6 @@ struct PlanErrorDisplay<'a> {
 impl std::fmt::Display for PlanErrorDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.error.fmt_with_project_dir(f, self.project_dir)
-    }
-}
-
-impl std::fmt::Display for PlanError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.fmt_with_project_dir(f, Path::new("."))
     }
 }
 
@@ -1231,6 +1235,20 @@ mod tests {
         DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceIdentity,
     };
 
+    fn render_plan_error_kind(kind: PlanErrorKind) -> String {
+        let error = PlanError::new(
+            ResourceId::with_provider_identity("test", "Resource", "fixture", None),
+            kind,
+        );
+        let prefix = format!("{}: ", error.resource_id);
+        error
+            .display_with_project_dir(Path::new("."))
+            .to_string()
+            .strip_prefix(&prefix)
+            .expect("ordinary plan errors include their resource address")
+            .to_string()
+    }
+
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
     }
@@ -1695,7 +1713,7 @@ mod tests {
 
         for (action, expected) in cases {
             assert_eq!(
-                PlanErrorKind::PreventDestroy { action }.to_string(),
+                render_plan_error_kind(PlanErrorKind::PreventDestroy { action }),
                 expected
             );
         }
@@ -1710,7 +1728,7 @@ mod tests {
         let expected = error.to_string();
 
         assert_eq!(
-            PlanErrorKind::SchemaNotRegistered(error).to_string(),
+            render_plan_error_kind(PlanErrorKind::SchemaNotRegistered(error)),
             expected
         );
         assert_eq!(
@@ -1728,7 +1746,7 @@ mod tests {
         let expected = error.to_string();
 
         assert_eq!(
-            PlanErrorKind::ReplacementCannotCoexist(error).to_string(),
+            render_plan_error_kind(PlanErrorKind::ReplacementCannotCoexist(error)),
             expected
         );
         assert_eq!(
@@ -1746,7 +1764,7 @@ mod tests {
             Some("management".to_string()),
         );
         let error = PlanError::create_outcome_unknown(resource);
-        let rendered = error.to_string();
+        let rendered = error.display_with_project_dir(Path::new(".")).to_string();
 
         assert_eq!(
             rendered,
@@ -1785,27 +1803,24 @@ mod tests {
     #[test]
     fn plan_error_kind_display_pins_wait_errors() {
         assert_eq!(
-            PlanErrorKind::WaitTargetMissing {
+            render_plan_error_kind(PlanErrorKind::WaitTargetMissing {
                 wait_binding: "cert_issued".to_string(),
                 target: "cert".to_string(),
-            }
-            .to_string(),
+            }),
             "wait `cert_issued`: target binding `cert` is not a known resource"
         );
         assert_eq!(
-            PlanErrorKind::WaitTargetIsDataSource {
+            render_plan_error_kind(PlanErrorKind::WaitTargetIsDataSource {
                 wait_binding: "roles_ready".to_string(),
                 target: "roles".to_string(),
-            }
-            .to_string(),
+            }),
             "wait `roles_ready`: target binding `roles` is a data source; wait targets must be managed resources"
         );
         assert_eq!(
-            PlanErrorKind::WaitPredicateInvalid {
+            render_plan_error_kind(PlanErrorKind::WaitPredicateInvalid {
                 wait_binding: "cert_issued".to_string(),
                 reason: "invalid predicate attribute path: empty attribute path".to_string(),
-            }
-            .to_string(),
+            }),
             "wait `cert_issued`: invalid predicate attribute path: empty attribute path"
         );
     }

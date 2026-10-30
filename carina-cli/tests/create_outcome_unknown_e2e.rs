@@ -92,6 +92,10 @@ fn output_text(output: &Output) -> String {
     )
 }
 
+fn stderr_text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
 fn assert_success(label: &str, output: &Output) {
     assert!(
         output.status.success(),
@@ -241,4 +245,74 @@ fn unknown_row_forget_allows_the_next_plan_to_propose_create() {
         text.contains("Plan: 1 to add, 0 to change, 1 to destroy"),
         "post-forget plan must propose the ordinary create and retain the deposed delete\n{text}"
     );
+}
+
+#[test]
+fn apply_locked_reload_keeps_project_path_in_unknown_outcome_hint() {
+    let identity = "outcome-unknown-locked-reload";
+    let project = OutcomeUnknownProject::new(identity);
+    project.initialize();
+    let plan_path = project.root.join("reviewed-plan.json");
+    let project_path = project.root.to_string_lossy().into_owned();
+    let plan_path_arg = plan_path.to_string_lossy().into_owned();
+
+    let plan = project.run(&["plan", &project_path, "--out", &plan_path_arg]);
+    assert_success("saved plan", &plan);
+    seed_unknown_state(&project, identity);
+
+    let apply = project.run(&["apply", &plan_path_arg, "--auto-approve"]);
+    assert!(
+        !apply.status.success(),
+        "locked reload must reject an outcome-unknown row that appeared after planning\n{}",
+        output_text(&apply),
+    );
+    let expected = carina_core::hint::ProjectCommand::new("state forget", &project.root)
+        .with_argument("mock.test.resource")
+        .with_argument(identity)
+        .to_string();
+    let stderr = stderr_text(&apply);
+    assert!(
+        stderr.contains(&expected),
+        "locked-reload hint lost the project path\nexpected: {expected}\n{stderr}",
+    );
+}
+
+#[test]
+fn state_forget_rejection_prints_one_project_aware_hint() {
+    let project = OutcomeUnknownProject::new("ordinary-row");
+    project.initialize();
+    assert_success(
+        "initial apply",
+        &project.run(&["apply", ".", "--auto-approve"]),
+    );
+    let state = project.read_state_json();
+    let identity = state["resources"][0]["identity"]
+        .as_str()
+        .expect("applied row has an identity");
+    let project_path = project.root.to_string_lossy().into_owned();
+
+    let forget = project.run(&[
+        "state",
+        "forget",
+        "mock.test.resource",
+        identity,
+        "--auto-approve",
+        &project_path,
+    ]);
+    assert!(
+        !forget.status.success(),
+        "ordinary state row must be rejected\n{}",
+        output_text(&forget),
+    );
+    let command = carina_core::hint::ProjectCommand::new("state forget", &project.root)
+        .with_argument("mock.test.resource")
+        .with_argument(identity)
+        .to_string();
+    let expected = format!(
+        "Error: no state row at this address is a create whose outcome is unknown; \
+         `{command}` only accepts \
+         create-outcome-unknown rows; use `removed {{ from = mock.test.resource '{identity}' }}` \
+         for ordinary state removal\n"
+    );
+    assert_eq!(stderr_text(&forget), expected);
 }
