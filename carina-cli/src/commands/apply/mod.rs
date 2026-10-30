@@ -2529,9 +2529,11 @@ fn import_identifiers_from_current_config<S>(
             continue;
         };
         if let Some(value) = parsed.state_blocks.iter().find_map(|block| match block {
-            carina_core::parser::StateBlock::Import { to, id: value }
-                if crate::wiring::resolve_import_target(to, &parsed.resources) == *id =>
-            {
+            carina_core::parser::StateBlock::Import {
+                to,
+                to_span: _,
+                id: value,
+            } if crate::wiring::resolve_import_target(to, &parsed.resources) == *id => {
                 Some(carina_core::resolver::resolve_value_for_plan(
                     value,
                     &bindings,

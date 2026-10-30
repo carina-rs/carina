@@ -52,6 +52,15 @@ pub enum ParseError {
     #[error("Invalid expression at line {line}: {message}")]
     InvalidExpression { line: usize, message: String },
 
+    #[error(
+        "Invalid {kind} expression at line {line}: an unbound {kind} cannot contain `read`; bind the {kind} expression with `let` so the data source has an address"
+    )]
+    UnboundLoopRead {
+        kind: crate::resource::LoopKind,
+        line: usize,
+        span: Option<super::SourceSpan>,
+    },
+
     /// Provider-aware parsing could not resolve a type annotation. The
     /// rendered message is deliberately separate from the typed token used by
     /// diagnostic coverage and deduplication.

@@ -1,0 +1,5 @@
+for name in ['same', 'same'] {
+  mock.test.resource {
+    name = name
+  }
+}

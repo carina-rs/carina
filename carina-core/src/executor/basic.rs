@@ -75,6 +75,18 @@ pub(super) enum BasicEffectResult {
     },
 }
 
+/// Terminal ownership outcome of a processed provider mutation.
+///
+/// In particular, `Deleted` is produced only after the provider delete has
+/// succeeded, so schedulers can release current-state identity ownership
+/// without inferring success from effect shape or completion timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BasicEffectCompletion {
+    Succeeded,
+    Failed,
+    Deleted,
+}
+
 /// A completed basic provider future that still owns the obligation to emit
 /// its one terminal effect event.
 pub(super) struct StartedBasicEffectResult<'a, S> {
@@ -595,11 +607,14 @@ fn pick_unresolved_binding_for_diagnostic<'a>(
 pub(super) fn process_basic_result<S: Clone>(
     result: StartedBasicEffectResult<'_, S>,
     exec: &mut ExecutionState<'_, S>,
-) {
-    process_basic_outcome(result.emit_terminal(), exec);
+) -> BasicEffectCompletion {
+    process_basic_outcome(result.emit_terminal(), exec)
 }
 
-fn process_basic_outcome<S: Clone>(result: BasicEffectResult, exec: &mut ExecutionState<'_, S>) {
+fn process_basic_outcome<S: Clone>(
+    result: BasicEffectResult,
+    exec: &mut ExecutionState<'_, S>,
+) -> BasicEffectCompletion {
     let idx = exec.idx;
     let failed_indices = &mut *exec.failed_indices;
     let pending_refreshes = &mut *exec.pending_refreshes;
@@ -628,6 +643,7 @@ fn process_basic_outcome<S: Clone>(result: BasicEffectResult, exec: &mut Executi
                 },
                 &state,
             );
+            BasicEffectCompletion::Succeeded
         }
         BasicEffectResult::Failure { error: _, refresh } => {
             exec.accumulator
@@ -636,6 +652,7 @@ fn process_basic_outcome<S: Clone>(result: BasicEffectResult, exec: &mut Executi
             if let Some((id, identifier)) = &refresh {
                 queue_state_refresh(pending_refreshes, id, identifier);
             }
+            BasicEffectCompletion::Failed
         }
         BasicEffectResult::ResumeSuccess {
             completed,
@@ -655,6 +672,7 @@ fn process_basic_outcome<S: Clone>(result: BasicEffectResult, exec: &mut Executi
                 Applied::Observed(std::sync::Arc::new(completed.into_observed_create())),
                 &state,
             );
+            BasicEffectCompletion::Succeeded
         }
         BasicEffectResult::ClassifiedFailure {
             error: _,
@@ -665,6 +683,7 @@ fn process_basic_outcome<S: Clone>(result: BasicEffectResult, exec: &mut Executi
                 .mutate(|accumulated| accumulated.failure_count += 1);
             failed_indices.insert(idx);
             exec.accumulator.insert_unpublished(resource_id, applied);
+            BasicEffectCompletion::Failed
         }
         BasicEffectResult::PartialSuccess {
             completed: CompletedEffect { state, request },
@@ -693,12 +712,14 @@ fn process_basic_outcome<S: Clone>(result: BasicEffectResult, exec: &mut Executi
                 },
                 &state,
             );
+            BasicEffectCompletion::Succeeded
         }
         BasicEffectResult::Deleted { instance_key } => {
             exec.accumulator.mutate(|accumulated| {
                 accumulated.success_count += 1;
                 accumulated.successfully_deleted.insert(instance_key);
             });
+            BasicEffectCompletion::Deleted
         }
     }
 }
