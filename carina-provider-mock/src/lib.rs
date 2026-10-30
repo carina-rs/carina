@@ -656,7 +656,7 @@ impl MockProvider {
                     PatchOp::Remove { key } => ("remove", key, None),
                 };
                 let value = value
-                    .map(carina_core::value::value_to_json)
+                    .map(|value| PersistedValue::encode_provider_value(value, None))
                     .transpose()
                     .map_err(|error| {
                         ProviderError::internal(format!(
