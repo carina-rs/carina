@@ -2786,6 +2786,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
         "distribution_config".to_string(),
         Value::Concrete(ConcreteValue::Map(state_dc)),
     );
+    let saved_attrs = state_attrs.clone();
     let mut id = ResourceId::with_identity("cloudfront.Distribution", "d1");
     id.provider = "awscc".to_string();
     let mut states = std::collections::HashMap::new();
@@ -2808,7 +2809,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     let result = diff_test(
         &resources[0],
         current,
-        None,
+        Some(&saved_attrs),
         Some(&prev_explicit),
         Some(&schema),
     );

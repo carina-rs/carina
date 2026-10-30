@@ -18,7 +18,7 @@ use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::data_source_value::{DataSourceValues, ExecutableDataSourceValues};
 use carina_core::differ::Orphans;
 use carina_core::executor::{
-    ExecutionCheckpointSink, ExecutionObserver, ExecutionOutcome, ExecutionResult,
+    AcceptedRequest, ExecutionCheckpointSink, ExecutionObserver, ExecutionOutcome, ExecutionResult,
     LiveExecutionInput, ProviderCheckInputs, SavedExecutionInput, UnresolvedResource,
 };
 use carina_core::plan::Plan;
@@ -217,11 +217,12 @@ async fn create_checked_bootstrap_resource(
         .await
         .map_err(AppError::from_state_bucket_preparation)?;
     let resolved = ResolvedResource::new(request.resource().as_resource().clone());
+    let accepted_request = AcceptedRequest::from_create_request(&request);
     match carina_core::executor::dispatch_create(provider, &id, request).await {
         Ok(outcome) => {
             let identifier = outcome.identifier().as_str().to_string();
             let (state, accepted_request, diagnostic) =
-                carina_core::executor::complete_create_for_writeback(outcome);
+                carina_core::executor::complete_create_for_writeback(outcome, accepted_request);
             let row = carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                 &resolved,
                 &state,

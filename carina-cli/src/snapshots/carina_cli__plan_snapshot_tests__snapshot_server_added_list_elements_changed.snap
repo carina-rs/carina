@@ -1,0 +1,12 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  ~ mock.test.server_added_list target
+      target_group_attributes:
+        ~ {value: '60' → '30', # (1 unchanged field hidden)}
+      # (1 unchanged attribute hidden)
+
+Plan: 0 to add, 1 to change, 0 to destroy.

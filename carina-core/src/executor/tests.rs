@@ -1057,6 +1057,10 @@ static AUGMENT_COMPARISON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
         .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
         .attribute(AttributeSchema::optional("size", AttributeType::float()).build())
         .attribute(
+            AttributeSchema::optional("items", AttributeType::list(AttributeType::string()))
+                .build(),
+        )
+        .attribute(
             AttributeSchema::optional(
                 "options",
                 AttributeType::struct_(
@@ -5984,6 +5988,12 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
         Value::Concrete(ConcreteValue::String("new".into())),
     );
     to_resource.set_attr("size", Value::Concrete(ConcreteValue::Float(1.0)));
+    to_resource.set_attr(
+        "items",
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("authored".into()),
+        )])),
+    );
     let mut desired_options = indexmap::IndexMap::new();
     desired_options.insert(
         "label".to_string(),
@@ -6004,6 +6014,13 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
         Value::Concrete(ConcreteValue::String("old".into())),
     );
     from_attrs.insert("size".to_string(), Value::Concrete(ConcreteValue::Int(1)));
+    from_attrs.insert(
+        "items".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("authored".into())),
+            Value::Concrete(ConcreteValue::String("provider-default".into())),
+        ])),
+    );
     let mut current_options = indexmap::IndexMap::new();
     current_options.insert(
         "label".to_string(),

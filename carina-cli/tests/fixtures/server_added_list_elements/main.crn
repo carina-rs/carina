@@ -1,0 +1,9 @@
+let target = mock.test.server_added_list {
+  name        = 'target'
+  description = 'before'
+
+  target_group_attribute {
+    key   = 'deregistration_delay.timeout_seconds'
+    value = '60'
+  }
+}

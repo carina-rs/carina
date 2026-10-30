@@ -398,6 +398,8 @@ plan-provider-prefix:
 	$(PLAN_FIXTURE) provider_prefix
 plan-module-anonymous-resource:
 	$(PLAN_FIXTURE) module_anonymous_resource
+plan-server-added-list-elements-changed:
+	$(PLAN_FIXTURE) server_added_list_elements_changed
 plan-server-default-struct-leaf:
 	$(PLAN_FIXTURE) server_default_struct_leaf
 plan-multi-instance-create:
@@ -436,7 +438,7 @@ plan-multi-instance-module:
         plan-list-struct-child-gutter plan-list-diff-added-struct-child-gutter \
         plan-destroy-list-struct-child-gutter \
         plan-pretty-long-string-list plan-pretty-short-string-list plan-provider-prefix \
-        plan-module-anonymous-resource plan-server-default-struct-leaf \
+        plan-module-anonymous-resource plan-server-added-list-elements-changed plan-server-default-struct-leaf \
         plan-multi-instance-create plan-multi-instance-module \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui \
         plan-moved-with-changes-tui plan-moved-pure-tui plan-fixtures
