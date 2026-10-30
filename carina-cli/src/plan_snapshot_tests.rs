@@ -2699,6 +2699,41 @@ fn snapshot_server_default_struct_leaf() {
     );
 }
 
+/// carina-provider-awscc#511. The persisted list contains one authored
+/// `{ key, value }` element followed by two service-added defaults. Changing
+/// the authored value must render only that element; defaults indexed by
+/// `ExplicitFields::ListElements::Unrecorded` must not appear as removals.
+#[test]
+fn snapshot_server_added_list_elements_changed() {
+    let fp = build_plan_from_fixture_name("server_added_list_elements_changed");
+    let historical = crate::commands::plan::collect_historical_display_attributes(
+        &fp.plan,
+        &fp.managed_current,
+        fp.state_file.as_ref(),
+    );
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &historical,
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &[],
+        &[],
+        Some(&fp.prev_explicit),
+        None,
+    ));
+
+    assert!(
+        output.contains("'60' → '30'"),
+        "authored change missing from plan output:\n{output}"
+    );
+    assert!(
+        !output.contains("stickiness.type") && !output.contains("load_balancing.algorithm.type"),
+        "server-added elements must not render as removals:\n{output}"
+    );
+    insta::assert_snapshot!(output);
+}
+
 /// carina#3307 + carina#3322 acceptance: when an `ExpansionTrace`
 /// records two leaf resources under a composition call site, the
 /// rendered plan groups them under a

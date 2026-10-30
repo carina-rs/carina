@@ -1115,6 +1115,7 @@ fn server_default_struct_field_does_not_appear_in_diff() {
         "lifecycle_configuration".to_string(),
         Value::Concrete(ConcreteValue::Map(current_lc)),
     );
+    let saved_attrs = current_attrs.clone();
     let current = existing_state(
         ResourceId::with_identity("s3.Bucket", "test"),
         current_attrs,
@@ -1140,7 +1141,13 @@ fn server_default_struct_field_does_not_appear_in_diff() {
         )]),
     };
 
-    let result = diff_test(&desired, &current, None, Some(&prev_explicit), None);
+    let result = diff_test(
+        &desired,
+        &current,
+        Some(&saved_attrs),
+        Some(&prev_explicit),
+        None,
+    );
     assert!(
         matches!(result, Diff::NoChange(_)),
         "Server-side default struct leaf must not surface in diff, got: {:?}",
@@ -1533,8 +1540,14 @@ fn unchanged_dsl_after_writeback_pairs_raw_saved_list_without_phantom_removal() 
         }
         Value::Concrete(ConcreteValue::Map(fields))
     };
-    let rule = |with_description: bool, with_timeout: bool| {
-        let mut fields = IndexMap::from([("cfg".to_string(), cfg(with_timeout))]);
+    let rule = |id: &str, with_description: bool, with_timeout: bool| {
+        let mut fields = IndexMap::from([
+            (
+                "id".to_string(),
+                Value::Concrete(ConcreteValue::String(id.to_string().into())),
+            ),
+            ("cfg".to_string(), cfg(with_timeout)),
+        ]);
         if with_description {
             fields.insert(
                 "desc".to_string(),
@@ -1547,26 +1560,35 @@ fn unchanged_dsl_after_writeback_pairs_raw_saved_list_without_phantom_removal() 
     let authored = Resource::new("example.Listener", "listener").with_attribute(
         "rules",
         Value::Concrete(ConcreteValue::List(vec![
-            rule(false, false),
-            rule(true, false),
+            rule("first", false, false),
+            rule("second", true, false),
         ])),
     );
     let saved_attributes = HashMap::from([(
         "rules".to_string(),
         Value::Concrete(ConcreteValue::List(vec![
-            rule(true, true),
-            rule(true, true),
+            rule("first", false, true),
+            rule("second", true, true),
+            rule("server-default", true, true),
         ])),
     )]);
-    let prior =
-        crate::explicit::build_from_resource_for_stored_values(&authored, &saved_attributes, None);
+    let sent = crate::executor::AcceptedRequest::create_for_test();
+    let sent_desired = sent.sent_desired_attributes(&authored);
+    let prior = crate::explicit::build_from_resource_for_stored_values_after_send(
+        &authored,
+        None,
+        &saved_attributes,
+        &sent_desired,
+        None,
+    );
     let ExplicitFields::Struct { children } = &prior else {
         panic!("expected resource-root Struct");
     };
     let ExplicitFields::ListElements { elements } = &children["rules"] else {
         panic!("expected stored-index-aligned ListElements");
     };
-    assert!(matches!(elements[1], ExplicitFields::Unrecorded));
+    assert_eq!(elements.len(), 3);
+    assert!(matches!(elements[2], ExplicitFields::Unrecorded));
 
     let current = existing_state(authored.id.clone(), saved_attributes.clone());
     let result = diff_test(
