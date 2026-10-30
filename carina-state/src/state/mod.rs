@@ -14,7 +14,7 @@ pub use carina_core::provider::PreviousSecretHashAuthority;
 use carina_core::provider::{
     AppliedIdentifier, CreateObservation, EmptyAppliedIdentifier, InFlightCreate,
     InFlightPersistence, NestedWriteOnlyRecord, ObservedCreate, PersistedAttributes,
-    PersistedAttributesError, RawSavedAttrs, Sent, SentAttributes, SentRecord,
+    PersistedAttributesError, RawSavedAttrs, Sent, SentDesiredAttributes, SentRecord,
     StateRowInFlightCreate, StateTransformMap, merge_previous_secret_hashes_into_provider_value,
     previous_hash,
 };
@@ -386,9 +386,10 @@ pub enum RowBasis<'a> {
     Carried,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum DesiredAuthoringBasis<'a> {
-    Sent(&'a SentAttributes),
+    Sent(SentDesiredAttributes<'a>),
+    DesiredRead,
     CarriedRead,
 }
 
@@ -2908,7 +2909,7 @@ impl ResourceState {
         }
         self.prefixes = resource.prefixes.clone();
         self.explicit = match authoring_basis {
-            DesiredAuthoringBasis::Sent(sent_attributes) => {
+            DesiredAuthoringBasis::Sent(sent_desired) => {
                 let prior_stored_attributes = existing.map(|existing| {
                     existing
                         .persisted_attributes()
@@ -2922,7 +2923,14 @@ impl ResourceState {
                     resource,
                     prior_stored_authoring,
                     stored_attributes,
-                    sent_attributes,
+                    &sent_desired,
+                    schema,
+                )
+            }
+            DesiredAuthoringBasis::DesiredRead => {
+                explicit::build_from_read_resource_for_stored_values(
+                    resource,
+                    stored_attributes,
                     schema,
                 )
             }
@@ -2983,7 +2991,7 @@ impl ResourceState {
             .resolved_desired_attributes()
             .map(|attributes| resource_with_secret_shape_union(resource, attributes));
         let writeback_resource = applied_desired.as_ref().unwrap_or(resource);
-        let sent_attributes = created.sent_attributes_for(writeback_resource);
+        let sent_desired = created.sent_desired_attributes_for(writeback_resource);
         let previous = existing.and_then(ResourceState::persisted_attributes);
         let no_observed_values = HashMap::new();
         let (observed_values, pending_reread) = match created.observation() {
@@ -3072,8 +3080,7 @@ impl ResourceState {
             nested_write_only,
             partial_read,
         };
-        let authoring_basis = sent_attributes
-            .as_ref()
+        let authoring_basis = sent_desired
             .map(DesiredAuthoringBasis::Sent)
             .unwrap_or(DesiredAuthoringBasis::CarriedRead);
         row.populate_desired_metadata(
@@ -3098,7 +3105,7 @@ impl ResourceState {
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
     ) -> Result<Self, ResourceStateEncodingError> {
-        let (persisted, sent_attributes) = match pending.persistence() {
+        let (persisted, sent_desired) = match pending.persistence() {
             InFlightPersistence::Persisted => {
                 if let Some(existing) = existing {
                     let mut row = existing.clone();
@@ -3154,7 +3161,7 @@ impl ResourceState {
                 });
                 (
                     fresh.persist(write_only, secrets),
-                    Some(fresh.sent_attributes_for(resource)),
+                    Some(fresh.sent_desired_attributes_for(resource)),
                 )
             }
         };
@@ -3165,8 +3172,7 @@ impl ResourceState {
             resource.id.provider.clone(),
         );
         row.current = CurrentInstance::CreateInFlight { pending: persisted };
-        let authoring_basis = sent_attributes
-            .as_ref()
+        let authoring_basis = sent_desired
             .map(DesiredAuthoringBasis::Sent)
             .unwrap_or(DesiredAuthoringBasis::CarriedRead);
         row.populate_desired_metadata(resource, existing, &HashMap::new(), schema, authoring_basis);
@@ -3354,8 +3360,11 @@ impl ResourceState {
             },
         };
         let authoring_basis = match row_basis {
-            RowBasis::Applied(request) => DesiredAuthoringBasis::Sent(request.sent_attributes()),
-            RowBasis::Imported | RowBasis::Carried => DesiredAuthoringBasis::CarriedRead,
+            RowBasis::Applied(request) => {
+                DesiredAuthoringBasis::Sent(request.sent_desired_attributes(writeback_resource))
+            }
+            RowBasis::Imported => DesiredAuthoringBasis::DesiredRead,
+            RowBasis::Carried => DesiredAuthoringBasis::CarriedRead,
         };
         rs.populate_desired_metadata(
             resource,

@@ -1573,11 +1573,12 @@ fn unchanged_dsl_after_writeback_pairs_raw_saved_list_without_phantom_removal() 
         ])),
     )]);
     let sent = crate::executor::AcceptedRequest::create_for_test();
+    let sent_desired = sent.sent_desired_attributes(&authored);
     let prior = crate::explicit::build_from_resource_for_stored_values_after_send(
         &authored,
         None,
         &saved_attributes,
-        sent.sent_attributes(),
+        &sent_desired,
         None,
     );
     let ExplicitFields::Struct { children } = &prior else {

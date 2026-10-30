@@ -8,7 +8,7 @@
 //! See `notes/specs/2026-05-10-explicit-fields-design.md`.
 
 use crate::diff_helpers::{list_element_type, map_entry_subtype};
-use crate::provider::SentAttributes;
+use crate::provider::SentDesiredAttributes;
 use crate::resource::{
     ConcreteValue, ListElementPairing, Resource, Value, pair_list_elements,
     pair_list_elements_with_uniqueness,
@@ -156,11 +156,14 @@ pub fn build_from_read_resource_for_stored_values<S>(
 /// Build a resource authoring tree after a provider operation sent selected
 /// top-level desired attributes.
 ///
-/// Only attributes named by `sent_attributes` use `SentDesired`, so only an
+/// Only attributes named by `sent_desired` use `SentDesired`, so only an
 /// unmatched element returned for one of those attributes can be classified
-/// as server-added. Every other attribute is rebuilt with carried-read
-/// semantics; when prior stored authoring is available, uniquely paired prior
-/// records (including genuine server defaults) are retained.
+/// as server-added. The desired values and sent membership come from the same
+/// accepted-operation evidence, preventing unresolved authored values from
+/// being paired against the provider read-back. Every other attribute is
+/// rebuilt with carried-read semantics; when prior stored authoring is
+/// available, uniquely paired prior records (including genuine server
+/// defaults) are retained.
 ///
 /// When `schema` is present, list similarity and recursive field walks use the
 /// same schema-aware equality as differ-side saved-value merging. Desired
@@ -171,7 +174,7 @@ pub fn build_from_resource_for_stored_values_after_send<S>(
     resource: &Resource<S>,
     prior_stored_authoring: Option<(&HashMap<String, Value>, &ExplicitFields)>,
     stored_attributes: &HashMap<String, Value>,
-    sent_attributes: &SentAttributes,
+    sent_desired: &SentDesiredAttributes<'_>,
     schema: Option<&ResourceSchema>,
 ) -> ExplicitFields {
     let mut rebuilt = match prior_stored_authoring {
@@ -192,8 +195,8 @@ pub fn build_from_resource_for_stored_values_after_send<S>(
     let defs = schema
         .map(|schema| &schema.defs)
         .unwrap_or(empty_defs_for_schema_walks());
-    for (key, desired) in &resource.attributes {
-        if !sent_attributes.contains(key) {
+    for (key, desired) in sent_desired.values() {
+        if !sent_desired.contains(key) {
             continue;
         }
         children.insert(
@@ -1002,12 +1005,18 @@ fn build_from_value_for_stored_value(
         Value::Concrete(ConcreteValue::List(desired_items)) => match stored {
             Some(Value::Concrete(ConcreteValue::List(stored_items))) => {
                 let item_type = list_element_type(attr_type, defs);
-                let mut elements = vec![basis.unmatched_list_element(); stored_items.len()];
-                for (desired_index, stored_index) in
-                    pair_list_elements(desired_items, stored_items, item_type, defs)
-                        .into_iter()
-                        .enumerate()
+                let pairings = pair_list_elements(desired_items, stored_items, item_type, defs);
+                if matches!(basis, StoredValueAuthoringBasis::SentDesired)
+                    && pairings.iter().any(Option::is_none)
                 {
+                    // If any sent element cannot be found in the read-back,
+                    // the pairing is not trustworthy enough to classify the
+                    // remaining stored elements as server-added. Preserve the
+                    // legacy union so all stored elements stay visible.
+                    return build_legacy_list(desired_items);
+                }
+                let mut elements = vec![basis.unmatched_list_element(); stored_items.len()];
+                for (desired_index, stored_index) in pairings.into_iter().enumerate() {
                     if let Some(stored_index) = stored_index {
                         elements[stored_index] = build_from_value_for_stored_value(
                             &desired_items[desired_index],
@@ -1507,12 +1516,13 @@ mod tests {
             .map(|stored| HashMap::from([("items".to_string(), stored)]))
             .unwrap_or_default();
         let sent = crate::executor::AcceptedRequest::create_for_test();
+        let sent_desired = sent.sent_desired_attributes(&resource);
         let ExplicitFields::Struct { mut children } =
             build_from_resource_for_stored_values_after_send(
                 &resource,
                 None,
                 &stored_attributes,
-                sent.sent_attributes(),
+                &sent_desired,
                 None,
             )
         else {
@@ -1554,11 +1564,12 @@ mod tests {
             ),
         ]);
         let create = crate::executor::AcceptedRequest::create_for_test();
+        let create_desired = create.sent_desired_attributes(&resource);
         let prior_explicit = build_from_resource_for_stored_values_after_send(
             &resource,
             None,
             &prior_stored,
-            create.sent_attributes(),
+            &create_desired,
             None,
         );
         let fresh_stored = HashMap::from([
@@ -1576,12 +1587,13 @@ mod tests {
             ),
         ]);
         let update = crate::executor::AcceptedRequest::update_for_test(&["description"], &[]);
+        let update_desired = update.sent_desired_attributes(&resource);
 
         let rebuilt = build_from_resource_for_stored_values_after_send(
             &resource,
             Some((&prior_stored, &prior_explicit)),
             &fresh_stored,
-            update.sent_attributes(),
+            &update_desired,
             None,
         );
         let ExplicitFields::Struct { children } = rebuilt else {
@@ -2370,12 +2382,13 @@ mod tests {
             Resource::new("example.Listener", "listener").with_attribute("items", desired);
         let stored_attributes = HashMap::from([("items".to_string(), stored)]);
         let sent = crate::executor::AcceptedRequest::create_for_test();
+        let sent_desired = sent.sent_desired_attributes(&resource);
 
         let ExplicitFields::Struct { children } = build_from_resource_for_stored_values_after_send(
             &resource,
             None,
             &stored_attributes,
-            sent.sent_attributes(),
+            &sent_desired,
             Some(&schema),
         ) else {
             panic!("expected resource-root Struct");
@@ -2434,11 +2447,10 @@ mod tests {
                 Some("provider-default"),
             )]))),
         );
-        let ExplicitFields::ListElements { elements } = missing else {
-            panic!("expected aligned ListElements");
+        let ExplicitFields::List { element } = missing else {
+            panic!("an unpaired sent element must use the legacy list union");
         };
-        assert_eq!(elements.len(), 1);
-        assert_struct_keys(&elements[0], &["port"]);
+        assert_struct_keys(&element, &["port", "description"]);
 
         let no_match = build_attribute_explicit(
             Value::Concrete(ConcreteValue::List(vec![rule(80, None)])),
@@ -2449,12 +2461,10 @@ mod tests {
                 )])),
             )]))),
         );
-        assert_eq!(
-            no_match,
-            ExplicitFields::ListElements {
-                elements: vec![ExplicitFields::Unrecorded]
-            }
-        );
+        let ExplicitFields::List { element } = no_match else {
+            panic!("a wholly unpaired sent list must use the legacy list union");
+        };
+        assert_struct_keys(&element, &["port"]);
 
         let duplicate = build_attribute_explicit(
             Value::Concrete(ConcreteValue::List(vec![
@@ -2471,6 +2481,27 @@ mod tests {
         };
         assert_struct_keys(&elements[0], &["port", "description"]);
         assert_struct_keys(&elements[1], &["port", "description"]);
+    }
+
+    #[test]
+    fn sent_list_with_any_unpaired_desired_element_keeps_all_stored_elements_visible() {
+        let desired = Value::Concrete(ConcreteValue::List(vec![
+            rule(80, Some("web")),
+            rule(443, None),
+        ]));
+        let stored = Value::Concrete(ConcreteValue::List(vec![
+            rule(80, Some("web")),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("provider-value".into())),
+            )]))),
+        ]));
+
+        let explicit = build_attribute_explicit(desired, Some(stored));
+        let ExplicitFields::List { element } = explicit else {
+            panic!("one unpaired sent element must invalidate per-element attribution");
+        };
+        assert_struct_keys(&element, &["port", "description"]);
     }
 
     #[test]

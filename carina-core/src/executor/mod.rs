@@ -115,7 +115,7 @@ use crate::provider::{
     AppliedIdentifier, CreateFailure, CreateFailureKind, CreateOutcome, CreateRequest,
     InFlightCreate, ObservedCreate, PartialReadDiagnostic, PatchOp, Provider, ProviderError,
     ProviderNormalizer, ProviderReadyDataSource, ResumeCreateRequest, ResumeFailure,
-    ResumeFailureKind, ResumeOutcome, SentAttributes, UpdateRequest,
+    ResumeFailureKind, ResumeOutcome, SentAttributes, SentDesiredAttributes, UpdateRequest,
 };
 use crate::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart, ModuleSource,
@@ -375,6 +375,25 @@ impl AcceptedRequest {
 
     pub fn sent_attributes(&self) -> &SentAttributes {
         &self.sent_attributes
+    }
+
+    /// Return the desired values and sent-attribute membership proven by this
+    /// accepted request. Production executor paths retain resolved values;
+    /// provider-ready bootstrap and test paths may use the supplied resource
+    /// as their already-resolved fallback.
+    pub fn sent_desired_attributes<'a, S>(
+        &'a self,
+        fallback_resource: &'a Resource<S>,
+    ) -> SentDesiredAttributes<'a> {
+        match self.resolved_desired_attributes.as_ref() {
+            Some(attributes) => {
+                SentDesiredAttributes::new(attributes.values().iter(), self.sent_attributes.clone())
+            }
+            None => SentDesiredAttributes::new(
+                fallback_resource.attributes.iter(),
+                self.sent_attributes.clone(),
+            ),
+        }
     }
 
     pub fn resolved_desired_attributes(&self) -> Option<&SecretPreservingAttributes> {

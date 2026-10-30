@@ -695,6 +695,40 @@ impl SentAttributes {
     }
 }
 
+/// Desired values paired with the send evidence from the same provider
+/// operation.
+///
+/// Keeping these together prevents state writeback from combining checked
+/// [`SentAttributes`] with an unrelated authored resource whose values may
+/// still contain unresolved expressions.
+#[derive(Debug, Clone)]
+pub struct SentDesiredAttributes<'a> {
+    attributes: Vec<(&'a String, &'a Value)>,
+    sent: SentAttributes,
+}
+
+impl<'a> SentDesiredAttributes<'a> {
+    pub(crate) fn new(
+        attributes: impl IntoIterator<Item = (&'a String, &'a Value)>,
+        sent: SentAttributes,
+    ) -> Self {
+        Self {
+            attributes: attributes.into_iter().collect(),
+            sent,
+        }
+    }
+
+    /// Provider-ready desired values retained by the accepted operation.
+    pub fn values(&self) -> impl Iterator<Item = (&String, &Value)> {
+        self.attributes.iter().map(|(key, value)| (*key, *value))
+    }
+
+    /// Whether this operation sent `attribute` with a desired value.
+    pub fn contains(&self, attribute: &str) -> bool {
+        self.sent.contains(attribute)
+    }
+}
+
 /// Per-operation request record for [`Provider::create`].
 ///
 /// Mirrors `create-request` in `wit/types.wit`.
@@ -1966,9 +2000,15 @@ impl FreshPendingCreate {
         &self.sent
     }
 
-    /// Attribute send evidence retained by this fresh continuation.
-    pub fn sent_attributes_for<S>(&self, resource: &Resource<S>) -> SentAttributes {
-        SentAttributes::from_create_sent(&self.sent, resource)
+    /// Desired values and send evidence retained by this fresh continuation.
+    pub fn sent_desired_attributes_for<'a, S>(
+        &self,
+        resource: &'a Resource<S>,
+    ) -> SentDesiredAttributes<'a> {
+        SentDesiredAttributes::new(
+            resource.attributes.iter(),
+            SentAttributes::from_create_sent(&self.sent, resource),
+        )
     }
 
     pub fn poll_after_secs(&self) -> u32 {
@@ -2363,9 +2403,17 @@ impl ObservedCreate {
         &self.sent
     }
 
-    /// Attribute send evidence retained by the accepted create observation.
-    pub fn sent_attributes_for<S>(&self, resource: &Resource<S>) -> Option<SentAttributes> {
-        self.sent.sent_attributes_for(resource)
+    /// Resolved desired values and send evidence retained by the accepted
+    /// create observation.
+    pub fn sent_desired_attributes_for<'a, S>(
+        &'a self,
+        fallback_resource: &'a Resource<S>,
+    ) -> Option<SentDesiredAttributes<'a>> {
+        let sent = self.sent.sent_attributes_for(fallback_resource)?;
+        Some(match self.resolved_desired_attributes.as_ref() {
+            Some(attributes) => SentDesiredAttributes::new(attributes.values().iter(), sent),
+            None => SentDesiredAttributes::new(fallback_resource.attributes.iter(), sent),
+        })
     }
 
     pub(crate) fn with_resolved_desired_attributes(
