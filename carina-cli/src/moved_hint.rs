@@ -698,6 +698,62 @@ mod tests {
     }
 
     #[test]
+    fn reordered_unordered_list_create_only_value_suggests_moved_block() {
+        let mut plan = Plan::new();
+        let mut prior = HashMap::new();
+        let old_id = id("old_vpc", None);
+        add_delete(
+            &mut plan,
+            &mut prior,
+            old_id.clone(),
+            CIDR,
+            EffectGeneration::Current,
+        );
+        let prior_attributes = prior
+            .get_mut(old_id.as_inner())
+            .and_then(Current::attributes_mut)
+            .expect("test prior has attributes");
+        prior_attributes.clear();
+        prior_attributes.insert(
+            "zones".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                concrete_string("zone-a"),
+                concrete_string("zone-b"),
+            ])),
+        );
+        let desired = Resource::from_id(id("vpcs[0]", None).into_inner()).with_attribute(
+            "zones",
+            Value::Concrete(ConcreteValue::List(vec![
+                concrete_string("zone-b"),
+                concrete_string("zone-a"),
+            ])),
+        );
+        plan.add(Effect::Create(ResolvedResource::new(desired)));
+
+        let schema = ResourceSchema::new(RESOURCE_TYPE)
+            .attribute(
+                AttributeSchema::optional(
+                    "zones",
+                    AttributeType::unordered_list(AttributeType::string()),
+                )
+                .create_only()
+                .build(),
+            )
+            .validate()
+            .expect("test unordered-list schema must validate");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(PROVIDER, schema);
+
+        let hints = detect_moved_block_hints(&plan, &prior, &schemas);
+
+        let [MovedBlockHint::Suggest(pair)] = hints.as_slice() else {
+            panic!("expected one suggestion, got {hints:?}");
+        };
+        assert_eq!(pair.from().identity_str(), "old_vpc");
+        assert_eq!(pair.to().identity_str(), "vpcs[0]");
+    }
+
+    #[test]
     fn differing_create_only_name_value_produces_no_hint() {
         let mut plan = Plan::new();
         let mut prior = HashMap::new();

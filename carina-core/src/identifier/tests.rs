@@ -293,6 +293,7 @@ fn route53_record_set_resource(record_type: &str) -> Resource {
 
 fn route53_state_entry(name: &str) -> AnonymousIdStateInfo {
     AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((name.to_string()).as_str()),
         provider_instance: None,
         name: name.to_string(),
         create_only_values: vec![
@@ -1069,6 +1070,7 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
     );
 
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((state_name.clone()).as_str()),
         provider_instance: None,
         name: state_name.clone(),
         create_only_values: vec![
@@ -1186,6 +1188,7 @@ fn test_reconcile_anonymous_id_after_nested_enum_create_only_hash_migration() {
     );
 
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((state_name.clone()).as_str()),
         provider_instance: None,
         name: state_name.clone(),
         create_only_values: vec![
@@ -1303,6 +1306,7 @@ fn test_reconcile_anonymous_id_after_nested_enum_no_edit_upgrade_full_match() {
     );
 
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((state_name.clone()).as_str()),
         provider_instance: None,
         name: state_name.clone(),
         create_only_values: vec![
@@ -1389,11 +1393,13 @@ fn test_reconcile_anonymous_id_nested_enum_full_match_ambiguous_skips() {
     .collect();
     let state_entries = vec![
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(("awscc_ec2_eip_4823b455".to_string()).as_str()),
             provider_instance: None,
             name: "awscc_ec2_eip_4823b455".to_string(),
             create_only_values: create_only_values.clone(),
         },
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(("awscc_ec2_eip_deadbeef".to_string()).as_str()),
             provider_instance: None,
             name: "awscc_ec2_eip_deadbeef".to_string(),
             create_only_values,
@@ -1444,6 +1450,7 @@ fn test_reconcile_anonymous_id_mixed_string_and_enum_identifier_for_enum_attribu
     );
 
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((state_name.clone()).as_str()),
         provider_instance: None,
         name: state_name.clone(),
         create_only_values: vec![
@@ -1736,6 +1743,7 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
 
     // Reconcile: state has role_name="my-role" (match) and path="/" (mismatch)
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((step1_id.clone()).as_str()),
         provider_instance: None,
         name: step1_id.clone(),
         create_only_values: vec![
@@ -1815,6 +1823,7 @@ fn full_and_partial_create_only_matches_emit_moves_without_changing_resource_ids
         .collect();
     let state_entries = vec![
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(("iam_role_11223344".to_string()).as_str()),
             provider_instance: None,
             name: "iam_role_11223344".to_string(),
             create_only_values: [
@@ -1825,6 +1834,7 @@ fn full_and_partial_create_only_matches_emit_moves_without_changing_resource_ids
             .collect(),
         },
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(("iam_role_55667788".to_string()).as_str()),
             provider_instance: Some("east".to_string()),
             name: "iam_role_55667788".to_string(),
             create_only_values: [
@@ -1906,6 +1916,7 @@ fn test_reconcile_anonymous_id_no_match_when_all_differ() {
 
     // State has completely different values
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(("iam_role_11223344".to_string()).as_str()),
         provider_instance: None,
         name: "iam_role_11223344".to_string(),
         create_only_values: vec![
@@ -1964,6 +1975,7 @@ fn test_reconcile_anonymous_id_unique_full_match_emits_move() {
 
     // State has the same values but a different ID from a previous hash scheme.
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(("iam_role_11223344".to_string()).as_str()),
         provider_instance: None,
         name: "iam_role_11223344".to_string(),
         create_only_values: vec![
@@ -2022,6 +2034,7 @@ fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
     let resources = vec![resource];
 
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(("ec2_vpc_11223344".to_string()).as_str()),
         provider_instance: None,
         name: "ec2_vpc_11223344".to_string(),
         create_only_values: vec![("cidr_block".to_string(), "10.0.0.0/16".to_string())]
@@ -2644,6 +2657,7 @@ fn association_state_entry(
     subnet_id: &str,
 ) -> AnonymousIdStateInfo {
     AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((name.to_string()).as_str()),
         provider_instance: None,
         name: name.to_string(),
         create_only_values: vec![
@@ -2679,6 +2693,7 @@ fn route_schema_with_create_only_route_table() -> ResourceSchema {
 
 fn route_state_entry(name: &str, route_table_id: &str) -> AnonymousIdStateInfo {
     AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((name.to_string()).as_str()),
         provider_instance: None,
         name: name.to_string(),
         create_only_values: vec![("route_table_id".to_string(), route_table_id.to_string())]
@@ -2710,16 +2725,25 @@ fn test_reconcile_does_not_hamming_match_standard_hash_names() {
 
     let state_entries = vec![
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(
+                ("awscc_ec2_subnet_route_table_association_aaaaaaab".to_string()).as_str(),
+            ),
             provider_instance: None,
             name: "awscc_ec2_subnet_route_table_association_aaaaaaab".to_string(),
             create_only_values: CreateOnlyValues::default(),
         },
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(
+                ("awscc_ec2_subnet_route_table_association_bbbbbbba".to_string()).as_str(),
+            ),
             provider_instance: None,
             name: "awscc_ec2_subnet_route_table_association_bbbbbbba".to_string(),
             create_only_values: CreateOnlyValues::default(),
         },
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(
+                ("awscc_ec2_subnet_route_table_association_cccccccd".to_string()).as_str(),
+            ),
             provider_instance: None,
             name: "awscc_ec2_subnet_route_table_association_cccccccd".to_string(),
             create_only_values: CreateOnlyValues::default(),
@@ -2835,6 +2859,9 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
         None,
     )];
     let simhash_state = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(
+            ("awscc_ec2_eip_0000000000000003".to_string()).as_str(),
+        ),
         provider_instance: None,
         name: "awscc_ec2_eip_0000000000000003".to_string(),
         create_only_values: CreateOnlyValues::default(),
@@ -3227,11 +3254,17 @@ fn test_reconcile_simhash_tie_refused() {
     )];
     let state_entries = vec![
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(
+                ("awscc_ec2_eip_0000000000000001".to_string()).as_str(),
+            ),
             provider_instance: None,
             name: "awscc_ec2_eip_0000000000000001".to_string(),
             create_only_values: CreateOnlyValues::default(),
         },
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(
+                ("awscc_ec2_eip_0000000000000002".to_string()).as_str(),
+            ),
             provider_instance: None,
             name: "awscc_ec2_eip_0000000000000002".to_string(),
             create_only_values: CreateOnlyValues::default(),
@@ -3426,6 +3459,7 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
 
     // Reconcile: state has the old identifier
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((old_id.clone()).as_str()),
         provider_instance: None,
         name: old_id.clone(),
         create_only_values: CreateOnlyValues::default(),
@@ -3483,6 +3517,7 @@ fn test_reconcile_anonymous_id_simhash_does_not_steal_live_entry() {
         .to_string();
 
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((live_name.clone()).as_str()),
         provider_instance: None,
         name: live_name.clone(),
         create_only_values: CreateOnlyValues::default(),
@@ -3561,6 +3596,7 @@ fn test_reconcile_anonymous_id_simhash_claims_state_entry_once() {
     );
 
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((old_name.clone()).as_str()),
         provider_instance: None,
         name: old_name.clone(),
         create_only_values: CreateOnlyValues::default(),
@@ -3608,6 +3644,7 @@ fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
 
     // State has a very different hash (flipped many bits)
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(("ec2_eip_5544332266778899".to_string()).as_str()),
         provider_instance: None,
         name: "ec2_eip_5544332266778899".to_string(),
         create_only_values: CreateOnlyValues::default(),
@@ -3688,6 +3725,7 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
         .to_string();
     let state_id = current_id.clone(); // Same id in state = no reconciliation needed
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((state_id).as_str()),
         provider_instance: None,
         name: state_id,
         create_only_values: CreateOnlyValues::default(),
@@ -3927,11 +3965,13 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
     // State has both orig and distant entries
     let state_entries = vec![
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new((orig_id.clone()).as_str()),
             provider_instance: None,
             name: orig_id.clone(),
             create_only_values: CreateOnlyValues::default(),
         },
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new((distant_id.clone()).as_str()),
             provider_instance: None,
             name: distant_id.clone(),
             create_only_values: CreateOnlyValues::default(),
@@ -4025,6 +4065,7 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
 
     // State has the exact same identifier
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((id.clone()).as_str()),
         provider_instance: None,
         name: id.clone(),
         create_only_values: CreateOnlyValues::default(),
@@ -4283,6 +4324,7 @@ fn test_reconcile_create_only_path_unaffected_by_simhash_changes() {
 
     // State with partial match (role_name matches, path differs)
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(("iam_role_11223344".to_string()).as_str()),
         provider_instance: None,
         name: "iam_role_11223344".to_string(),
         create_only_values: vec![
@@ -4460,6 +4502,9 @@ fn test_reconcile_skips_let_bound_resources() {
     // State has an unrelated entry that partially matches (same cidr_ip + ip_protocol,
     // different description). Without the fix, the named resource would be rebound.
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(
+            ("ec2_security_group_ingress_aabb1122".to_string()).as_str(),
+        ),
         provider_instance: None,
         name: "ec2_security_group_ingress_aabb1122".to_string(),
         create_only_values: vec![
@@ -4544,6 +4589,9 @@ fn test_reconcile_skips_when_multiple_partial_matches() {
     // different description). Both are valid partial matches.
     let state_entries = vec![
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(
+                ("ec2_security_group_ingress_aabb1122".to_string()).as_str(),
+            ),
             provider_instance: None,
             name: "ec2_security_group_ingress_aabb1122".to_string(),
             create_only_values: vec![
@@ -4555,6 +4603,9 @@ fn test_reconcile_skips_when_multiple_partial_matches() {
             .collect(),
         },
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(
+                ("ec2_security_group_ingress_ccdd3344".to_string()).as_str(),
+            ),
             provider_instance: None,
             name: "ec2_security_group_ingress_ccdd3344".to_string(),
             create_only_values: vec![
@@ -4698,6 +4749,7 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
 
     // Reconcile: state has the step1 identifier
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((step1_id.clone()).as_str()),
         provider_instance: None,
         name: step1_id.clone(),
         create_only_values: CreateOnlyValues::default(), // No create-only values in state either
@@ -4791,6 +4843,7 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
     // State has both resources with matching names
     let state_entries = vec![
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(("ingress_http".to_string()).as_str()),
             provider_instance: None,
             name: "ingress_http".to_string(),
             create_only_values: vec![
@@ -4802,6 +4855,7 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
             .collect(),
         },
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(("ingress_https".to_string()).as_str()),
             provider_instance: None,
             name: "ingress_https".to_string(),
             create_only_values: vec![
@@ -4865,6 +4919,9 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
     let resources = vec![resource];
 
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(
+            ("sso_instance_0ac0620303071530".to_string()).as_str(),
+        ),
         provider_instance: None,
         name: "sso_instance_0ac0620303071530".to_string(),
         create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
@@ -4946,6 +5003,9 @@ fn test_detect_rename_matches_map_create_only_attr() {
     resource.set_attr("settings".to_string(), settings.clone());
     let resources = vec![resource];
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(
+            ("awscc_test_map_identity_11111111".to_string()).as_str(),
+        ),
         provider_instance: None,
         name: "awscc_test_map_identity_11111111".to_string(),
         create_only_values: [(
@@ -4998,6 +5058,9 @@ fn test_detect_rename_matches_enum_and_int_create_only_attrs() {
     resource.set_attr("priority".to_string(), priority.clone());
     let resources = vec![resource];
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(
+            ("awscc_test_typed_identity_11111111".to_string()).as_str(),
+        ),
         provider_instance: None,
         name: "awscc_test_typed_identity_11111111".to_string(),
         create_only_values: [
@@ -5086,6 +5149,7 @@ fn test_detect_rename_matches_mixed_canonical_and_identifier_enums_in_list_and_m
         ),
     ]);
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(("awscc_ec2_eip_11111111".to_string()).as_str()),
         provider_instance: None,
         name: "awscc_ec2_eip_11111111".to_string(),
         create_only_values: CreateOnlyValues::from_state_attributes(
@@ -5192,6 +5256,7 @@ fn test_detect_rename_falls_back_to_simhash_when_state_lacks_create_only_attr() 
     );
     named.binding = Some("nat_gw".to_string());
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((anonymous_name.clone()).as_str()),
         provider_instance: None,
         name: anonymous_name.clone(),
         create_only_values: [("route_table_id".to_string(), "rtb-private".to_string())]
@@ -5308,6 +5373,7 @@ fn test_detect_rename_simhash_fallback_rejects_explicit_create_only_mismatches()
     );
     let state_entries = vec![
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new((exact_simhash_name).as_str()),
             provider_instance: None,
             name: exact_simhash_name,
             create_only_values: [("allocation_id".to_string(), "eip-a".to_string())]
@@ -5315,6 +5381,7 @@ fn test_detect_rename_simhash_fallback_rejects_explicit_create_only_mismatches()
                 .collect(),
         },
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new((nearby_simhash_name).as_str()),
             provider_instance: None,
             name: nearby_simhash_name,
             create_only_values: [("allocation_id".to_string(), "eip-b".to_string())]
@@ -5390,18 +5457,31 @@ fn test_detect_rename_invalid_enum_is_typed_unresolved_and_does_not_rename() {
         .get_for(&resource)
         .expect("resource schema exists")
         .schema();
-    let create_only_values =
-        CreateOnlyValues::of(&resource, schema.as_schema(), &|_binding| Vec::new());
-    let Some(CreateOnlyValue::Unresolved(Some(error))) = create_only_values.values.get("domain")
-    else {
-        panic!("invalid enum must retain its typed canonicalization error")
+    let resolution = canonical_or_resolved_create_only_value(
+        resource
+            .get_attr("domain")
+            .expect("domain is configured on the test resource"),
+        schema.as_schema(),
+        "domain",
+        &|_binding| Vec::new(),
+    );
+    let Err(UnresolvedReason::Type(error)) = resolution else {
+        panic!("invalid enum must return its typed canonicalization error")
     };
     assert!(matches!(
         error,
         crate::schema::TypeError::InvalidEnumVariant { .. }
     ));
 
+    let create_only_values =
+        CreateOnlyValues::of(&resource, schema.as_schema(), &|_binding| Vec::new());
+    assert!(matches!(
+        create_only_values.values.get("domain"),
+        Some(CreateOnlyValue::Unresolved)
+    ));
+
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(("awscc_ec2_eip_11111111".to_string()).as_str()),
         provider_instance: None,
         name: "awscc_ec2_eip_11111111".to_string(),
         create_only_values: [("domain".to_string(), "vpc".to_string())]
@@ -5432,6 +5512,7 @@ fn test_detect_anonymous_to_named_skips_claimed_from() {
     let resources = vec![resource];
     let state_name = "sso_instance_0ac0620303071530";
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((state_name.to_string()).as_str()),
         provider_instance: None,
         name: state_name.to_string(),
         create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
@@ -5477,6 +5558,9 @@ fn test_detect_anonymous_to_named_skips_claimed_to() {
     );
     let resources = vec![resource];
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(
+            ("sso_instance_0ac0620303071530".to_string()).as_str(),
+        ),
         provider_instance: None,
         name: "sso_instance_0ac0620303071530".to_string(),
         create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
@@ -5639,6 +5723,7 @@ fn test_detect_rename_skips_when_binding_already_in_state() {
     let resources = vec![resource];
 
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(("sso".to_string()).as_str()),
         provider_instance: None,
         name: "sso".to_string(),
         create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
@@ -5670,6 +5755,7 @@ fn test_detect_rename_existing_removed_from_binding_does_not_use_orphan() {
     let resources = vec![resource];
     let state_entries = vec![
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new((binding_name.to_string()).as_str()),
             provider_instance: None,
             name: binding_name.to_string(),
             create_only_values: [("name".to_string(), "carina-rs".to_string())]
@@ -5677,6 +5763,7 @@ fn test_detect_rename_existing_removed_from_binding_does_not_use_orphan() {
                 .collect(),
         },
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new((orphan_name.to_string()).as_str()),
             provider_instance: None,
             name: orphan_name.to_string(),
             create_only_values: [("name".to_string(), "carina-rs".to_string())]
@@ -5730,6 +5817,9 @@ fn test_detect_rename_ignores_anonymous_resources() {
     let resources = vec![resource];
 
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(
+            ("sso_instance_0ac0620303071530".to_string()).as_str(),
+        ),
         provider_instance: None,
         name: "sso_instance_0ac0620303071530".to_string(),
         create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
@@ -5762,6 +5852,9 @@ fn test_detect_rename_skips_ambiguous_matches() {
 
     let state_entries = vec![
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(
+                ("sso_instance_aaaabbbbccccdddd".to_string()).as_str(),
+            ),
             provider_instance: None,
             name: "sso_instance_aaaabbbbccccdddd".to_string(),
             create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
@@ -5769,6 +5862,9 @@ fn test_detect_rename_skips_ambiguous_matches() {
                 .collect(),
         },
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new(
+                ("sso_instance_1111222233334444".to_string()).as_str(),
+            ),
             provider_instance: None,
             name: "sso_instance_1111222233334444".to_string(),
             create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
@@ -5802,6 +5898,7 @@ fn test_detect_rename_ignores_non_hash_state_names() {
     let resources = vec![resource];
 
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(("my_custom_binding".to_string()).as_str()),
         provider_instance: None,
         name: "my_custom_binding".to_string(),
         create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
@@ -5873,6 +5970,7 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
 
     // Step 3: state still has the orphan anonymous entry.
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((anonymous_name.clone()).as_str()),
         provider_instance: None,
         name: anonymous_name.clone(),
         create_only_values: CreateOnlyValues::default(),
@@ -5957,6 +6055,7 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
     let resources = vec![let_bound];
 
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((anonymous_name).as_str()),
         provider_instance: None,
         name: anonymous_name,
         create_only_values: CreateOnlyValues::default(),
@@ -6013,11 +6112,13 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
     // exact match via the `distance < d` branch.
     let state_entries = vec![
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new((nearby_name.clone()).as_str()),
             provider_instance: None,
             name: nearby_name.clone(),
             create_only_values: CreateOnlyValues::default(),
         },
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new((exact_name.clone()).as_str()),
             provider_instance: None,
             name: exact_name.clone(),
             create_only_values: CreateOnlyValues::default(),
@@ -6067,6 +6168,7 @@ fn test_detect_rename_no_create_only_skips_8_char_hash_entries() {
 
     // 8-hex suffix (standard hash scheme), not a SimHash.
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new(("sso_instance_a3f2b1c8".to_string()).as_str()),
         provider_instance: None,
         name: "sso_instance_a3f2b1c8".to_string(),
         create_only_values: CreateOnlyValues::default(),
@@ -6112,11 +6214,13 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
     // Two state entries with the exact same name hash → same distance (0).
     let state_entries = vec![
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new((anonymous_name.clone()).as_str()),
             provider_instance: None,
             name: anonymous_name.clone(),
             create_only_values: CreateOnlyValues::default(),
         },
         AnonymousIdStateInfo {
+            origin_identity: ResourceIdentity::new((anonymous_name).as_str()),
             provider_instance: None,
             name: anonymous_name,
             create_only_values: CreateOnlyValues::default(),
@@ -6272,6 +6376,7 @@ fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_move() {
         .expect("new format starts with awscc_ prefix")
         .to_string();
     let state_entries = vec![AnonymousIdStateInfo {
+        origin_identity: ResourceIdentity::new((old_name.clone()).as_str()),
         provider_instance: None,
         name: old_name.clone(),
         create_only_values: CreateOnlyValues::default(),

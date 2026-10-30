@@ -1129,9 +1129,12 @@ pub fn compute_anonymous_identifiers_with_provider_configs_for_test(
 /// State information needed for anonymous identifier reconciliation.
 #[derive(Clone)]
 pub struct AnonymousIdStateInfo {
-    /// The resource name (anonymous identifier) stored in state
+    /// The effective resource name presented to reconciliation. This may be a
+    /// projected move target rather than the persisted row identity.
     pub name: String,
-    /// Provider-instance routing carried by the persisted state row.
+    /// The persisted row identity that owns this candidate, before projection.
+    pub origin_identity: ResourceIdentity,
+    /// Provider-instance routing carried by that persisted row.
     pub provider_instance: Option<String>,
     /// Canonical create-only attribute values selected from persisted state.
     pub create_only_values: CreateOnlyValues,
@@ -1145,7 +1148,7 @@ fn resolved_anonymous_state_id(
     ResolvedResourceId::with_provider_identity(
         provider,
         resource_type,
-        ResourceIdentity::new(entry.name.clone()),
+        entry.origin_identity.clone(),
         entry.provider_instance.clone(),
     )
 }
@@ -1192,19 +1195,20 @@ fn canonical_or_resolved_create_only_value(
     schema: &ResourceSchema,
     attribute: &str,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
-) -> Result<Option<Value>, crate::schema::TypeError> {
-    if let Some(resolved) = resolve_deferred_create_only_value(value, find_state_by_binding) {
-        let canonical = crate::value::canonicalize_state_attribute_value_with_schema(
-            resolved, schema, attribute,
-        );
-        return Ok(canonical_create_only_value_string(&canonical).map(|_| canonical));
-    }
-    let canonical = crate::value::canonicalize_desired_attribute_value_with_schema(
-        value.clone(),
-        schema,
-        attribute,
-    )?;
-    Ok(canonical_create_only_value_string(&canonical).map(|_| canonical))
+) -> Result<ResolvedCreateOnlyValue, UnresolvedReason> {
+    let canonical = if let Some(resolved) =
+        resolve_deferred_create_only_value(value, find_state_by_binding)
+    {
+        crate::value::canonicalize_state_attribute_value_with_schema(resolved, schema, attribute)
+    } else {
+        crate::value::canonicalize_desired_attribute_value_with_schema(
+            value.clone(),
+            schema,
+            attribute,
+        )
+        .map_err(UnresolvedReason::Type)?
+    };
+    ResolvedCreateOnlyValue::from_value(canonical).ok_or(UnresolvedReason::NotComparable)
 }
 
 #[derive(Clone, PartialEq)]
@@ -1253,7 +1257,13 @@ impl ResolvedCreateOnlyValue {
 #[derive(Clone, PartialEq)]
 enum CreateOnlyValue {
     Resolved(ResolvedCreateOnlyValue),
-    Unresolved(Option<crate::schema::TypeError>),
+    Unresolved,
+}
+
+#[derive(Debug)]
+enum UnresolvedReason {
+    NotComparable,
+    Type(crate::schema::TypeError),
 }
 
 /// Canonical create-only values selected by a resource schema.
@@ -1286,12 +1296,22 @@ impl CreateOnlyValues {
                         attribute,
                         find_state_by_binding,
                     ) {
-                        Ok(Some(value)) => CreateOnlyValue::Resolved(
-                            ResolvedCreateOnlyValue::from_value(value)
-                                .expect("resolved create-only values are comparison-safe"),
-                        ),
-                        Ok(None) => CreateOnlyValue::Unresolved(None),
-                        Err(error) => CreateOnlyValue::Unresolved(Some(error)),
+                        Ok(value) => CreateOnlyValue::Resolved(value),
+                        Err(error) => {
+                            match error {
+                                UnresolvedReason::NotComparable => tracing::debug!(
+                                    attribute,
+                                    reason = "value has no stable comparison form",
+                                    "create-only value is not available for identity comparison"
+                                ),
+                                UnresolvedReason::Type(error) => tracing::debug!(
+                                    attribute,
+                                    error = ?error,
+                                    "create-only value is not available for identity comparison"
+                                ),
+                            }
+                            CreateOnlyValue::Unresolved
+                        }
                     };
                     (attribute.to_string(), value)
                 })
@@ -1611,6 +1631,30 @@ pub fn reconcile_anonymous_identifiers(
     moves
 }
 
+/// Full desired-resource context plus the subset still eligible for an
+/// anonymous-to-named move in the current fixed-point pass.
+pub struct AnonymousToNamedCandidates<'a> {
+    resources: &'a [Resource],
+    eligible_ids: &'a HashSet<ResourceId>,
+}
+
+impl<'a> AnonymousToNamedCandidates<'a> {
+    /// Keep all desired addresses visible for orphan screening while limiting
+    /// move detection to `eligible_ids`.
+    pub fn new(resources: &'a [Resource], eligible_ids: &'a HashSet<ResourceId>) -> Self {
+        Self {
+            resources,
+            eligible_ids,
+        }
+    }
+
+    fn eligible(&self) -> impl Iterator<Item = &Resource> {
+        self.resources
+            .iter()
+            .filter(|resource| self.eligible_ids.contains(&resource.id))
+    }
+}
+
 /// Detect let-bound (named) resources that were previously anonymous.
 ///
 /// When a user converts an anonymous resource to a `let`-bound resource while
@@ -1645,7 +1689,7 @@ pub fn reconcile_anonymous_identifiers(
 /// An "orphaned" state entry is one whose name is not used by any current DSL
 /// resource (so it would otherwise appear as a Delete in the plan).
 pub fn detect_anonymous_to_named_renames(
-    resources: &[Resource],
+    candidates: AnonymousToNamedCandidates<'_>,
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
@@ -1656,7 +1700,7 @@ pub fn detect_anonymous_to_named_renames(
     // Collect the set of resource names currently used in the DSL per
     // (provider, resource_type). Any state entry not in this set is an orphan.
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
-    for resource in resources {
+    for resource in candidates.resources {
         let Some(identity) = resource.id.identity_str() else {
             continue;
         };
@@ -1672,7 +1716,7 @@ pub fn detect_anonymous_to_named_renames(
 
     let mut renames = Vec::new();
 
-    for resource in resources {
+    for resource in candidates.eligible() {
         // Only rename let-bound resources whose binding was previously anonymous.
         if resource.binding.is_none() {
             continue;
@@ -1785,8 +1829,12 @@ pub fn detect_anonymous_to_named_renames_for_test(
     claims: &StateBlockClaims,
 ) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
     let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
+    let candidates = resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect();
     detect_anonymous_to_named_renames(
-        resources,
+        AnonymousToNamedCandidates::new(resources, &candidates),
         registry,
         find_state_by_type,
         find_state_by_binding,

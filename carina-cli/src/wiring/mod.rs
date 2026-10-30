@@ -2523,7 +2523,8 @@ impl AnonymousReconciliationStateView {
                 .or_default()
                 .push(AnonymousIdStateInfo {
                     name: projected_name.clone(),
-                    provider_instance: projected_id.provider_instance().map(str::to_string),
+                    origin_identity: state_row_id.identity().clone(),
+                    provider_instance: state_row_id.provider_instance().map(str::to_string),
                     create_only_values,
                 });
             let projected = projected_target.is_some();
@@ -2620,6 +2621,7 @@ fn reconcile_anonymous_identifiers_with_ctx(
 fn detect_anonymous_to_named_moves_with_ctx(
     ctx: &WiringContext,
     resources: &[Resource],
+    candidates: &HashSet<ResourceId>,
     providers: &[ProviderConfig],
     state_view: &AnonymousReconciliationStateView,
     claims: &StateBlockClaims,
@@ -2629,7 +2631,7 @@ fn detect_anonymous_to_named_moves_with_ctx(
         &|provider_name| provider_config_schema_for(ctx, provider_name),
     )?;
     Ok(identifier::detect_anonymous_to_named_renames(
-        resources,
+        identifier::AnonymousToNamedCandidates::new(resources, candidates),
         ctx.schemas(),
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &|binding| state_view.entries_by_binding(claims, binding),
@@ -2649,13 +2651,18 @@ fn detect_anonymous_to_named_moves_to_fixed_point(
 ) -> Result<Vec<ResolvedMove>, AppError> {
     let mut projected_pairs = initial_moved_pairs.to_vec();
     let mut detected = Vec::new();
-    let mut iterations = 0;
+    let mut unsatisfied = resources
+        .iter()
+        .filter(|resource| resource.binding.is_some())
+        .map(|resource| resource.id.clone())
+        .collect::<HashSet<_>>();
 
-    loop {
+    while !unsatisfied.is_empty() {
         let state_view = AnonymousReconciliationStateView::new(ctx, state_file, &projected_pairs);
         let pass = detect_anonymous_to_named_moves_with_ctx(
             ctx,
             resources,
+            &unsatisfied,
             providers,
             &state_view,
             claims,
@@ -2663,12 +2670,11 @@ fn detect_anonymous_to_named_moves_to_fixed_point(
         if pass.is_empty() {
             break;
         }
-        if iterations >= resources.len() {
-            return Err(AppError::Config(
-                "anonymous-to-named rename detection did not converge".to_string(),
-            ));
-        }
-        iterations += 1;
+        let satisfied = pass
+            .iter()
+            .map(|resolved_move| resolved_move.to().as_inner())
+            .collect::<HashSet<_>>();
+        unsatisfied.retain(|resource_id| !satisfied.contains(resource_id));
         projected_pairs.extend(
             pass.iter()
                 .map(|resolved_move| (resolved_move.from().clone(), resolved_move.to().clone())),

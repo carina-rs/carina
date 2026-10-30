@@ -541,6 +541,213 @@ async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_stat
 }
 
 #[test]
+fn anonymous_to_named_fixed_point_uses_state_origin_after_undeclared_hash_projection() {
+    use carina_core::config_loader::load_configuration_with_config;
+
+    const STATE_ORIGIN: &str = "legacy_thing";
+    const PROJECTED_HASH: &str = "test_thing_22222222";
+
+    let project = tempfile::tempdir().expect("create temporary project");
+    std::fs::write(project.path().join("providers.crn"), "provider test {}\n")
+        .expect("write provider fixture");
+    std::fs::write(
+        project.path().join("main.crn"),
+        "backend local { path = \"carina.state.json\" }\n",
+    )
+    .expect("write backend fixture");
+    std::fs::write(
+        project.path().join("moves.crn"),
+        format!(
+            r#"moved {{
+  from = test.thing '{STATE_ORIGIN}'
+  to   = test.thing '{PROJECTED_HASH}'
+}}
+"#,
+        ),
+    )
+    .expect("write explicit move fixture");
+    std::fs::write(
+        project.path().join("resource.crn"),
+        r#"let typed = test.thing {
+  mode = test.thing.Mode.allow
+  priority = 7
+}
+"#,
+    )
+    .expect("write named resource fixture");
+
+    let loaded = load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load multi-file fixture");
+    let parsed = loaded.parsed;
+    assert_eq!(parsed.state_blocks.len(), 1, "fixture must parse one move");
+    let provider_configs = resolved_provider_configs(&parsed);
+    let wiring = ValidatedWiring::from_factories_for_test(
+        vec![Box::new(RawEnumStateFactory)],
+        provider_configs.as_provider_configs(),
+    );
+
+    let mut row = carina_state::state::ResourceState::try_applied(
+        "thing",
+        STATE_ORIGIN,
+        "test",
+        "provider-id",
+    )
+    .expect("typed state identifier is non-empty")
+    .with_attribute("mode", serde_json::json!("Allow"))
+    .with_attribute("priority", serde_json::json!(7));
+    row.binding = None;
+    let mut persisted = StateFile::new();
+    persisted
+        .upsert_resource(row)
+        .expect("typed state row is unique");
+    let state_path = project.path().join("carina.state.json");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
+    )
+    .expect("write real state fixture");
+    let state_file = carina_state::state::check_and_migrate(
+        &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+    )
+    .expect("decode real state fixture")
+    .into_state();
+    let state_origin =
+        ResolvedResourceId::with_provider_identity("test", "thing", STATE_ORIGIN, None);
+    let projected_hash =
+        ResolvedResourceId::with_provider_identity("test", "thing", PROJECTED_HASH, None);
+
+    let detected = detect_anonymous_to_named_moves_to_fixed_point(
+        wiring.context(),
+        &parsed.resources,
+        provider_configs.as_provider_configs(),
+        &state_file,
+        &[(state_origin.clone(), projected_hash)],
+        &StateBlockClaims::empty(),
+    )
+    .expect("projected anonymous-to-named detection must converge");
+
+    assert_eq!(detected.len(), 1, "expected one final rename: {detected:?}");
+    assert_eq!(detected[0].from(), &state_origin);
+    assert_eq!(detected[0].to().identity_str(), "typed");
+}
+
+#[tokio::test]
+async fn anonymous_to_named_two_destinations_for_one_orphan_report_move_conflict() {
+    use carina_core::config_loader::load_configuration_with_config;
+
+    const ANONYMOUS_NAME: &str = "test_thing_33333333";
+
+    let project = tempfile::tempdir().expect("create temporary project");
+    std::fs::write(project.path().join("providers.crn"), "provider test {}\n")
+        .expect("write provider fixture");
+    std::fs::write(
+        project.path().join("main.crn"),
+        "backend local { path = \"carina.state.json\" }\n",
+    )
+    .expect("write backend fixture");
+    std::fs::write(
+        project.path().join("resources.crn"),
+        r#"let first = test.thing {
+  mode = test.thing.Mode.allow
+  priority = 7
+}
+
+let second = test.thing {
+  mode = test.thing.Mode.allow
+  priority = 7
+}
+"#,
+    )
+    .expect("write competing resources fixture");
+
+    let loaded = load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load multi-file fixture");
+    let parsed = loaded.parsed;
+    let provider_configs = resolved_provider_configs(&parsed);
+    let wiring = ValidatedWiring::from_factories_for_test(
+        vec![Box::new(RawEnumStateFactory)],
+        provider_configs.as_provider_configs(),
+    );
+    let canonical_resources = canonical_pair(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        wiring.context().schemas(),
+    );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+
+    let mut row = carina_state::state::ResourceState::try_applied(
+        "thing",
+        ANONYMOUS_NAME,
+        "test",
+        "provider-id",
+    )
+    .expect("typed state identifier is non-empty")
+    .with_attribute("mode", serde_json::json!("Allow"))
+    .with_attribute("priority", serde_json::json!(7));
+    row.binding = None;
+    let mut persisted = StateFile::new();
+    persisted
+        .upsert_resource(row)
+        .expect("anonymous state row is unique");
+    let state_path = project.path().join("carina.state.json");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
+    )
+    .expect("write real state fixture");
+    let state_file = Some(
+        carina_state::state::check_and_migrate(
+            &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+        )
+        .expect("decode real state fixture")
+        .into_state(),
+    );
+
+    let error = match create_plan_from_parsed_with_upstream_with_ctx(
+        validated,
+        &provider_configs,
+        &state_file,
+        false,
+        ProgressSink::Human,
+        &HashMap::new(),
+        &StateBlockClaims::default(),
+        &ResolvedStateBlockTargets::default(),
+    )
+    .await
+    {
+        Ok(_) => panic!("two named resources must not claim one anonymous row arbitrarily"),
+        Err(error) => error,
+    };
+
+    let AppError::DetectedMoveConflict {
+        from,
+        to,
+        existing_from,
+        existing_to,
+    } = error
+    else {
+        panic!("expected a typed move conflict, got {error:?}")
+    };
+    assert_eq!(from.identity_str(), ANONYMOUS_NAME);
+    assert_eq!(existing_from.identity_str(), ANONYMOUS_NAME);
+    assert_eq!(
+        HashSet::from([
+            to.identity_str().to_string(),
+            existing_to.identity_str().to_string(),
+        ]),
+        HashSet::from(["first".to_string(), "second".to_string()]),
+    );
+}
+
+#[test]
 fn data_source_reads_select_only_the_owning_identical_anonymous_call() {
     let tmp = tempfile::tempdir().expect("temporary project");
     let module_dir = tmp.path().join("modules/query");
@@ -5398,11 +5605,22 @@ fn projected_moved_binding_resolves_for_anonymous_to_named_detection() {
     );
     let mut desired = desired_route("nat", projected_binding);
     desired.binding = Some("nat".to_string());
+    let resources = vec![desired];
+    let candidates = resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect();
     let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[(source, target)]);
 
-    let moves =
-        detect_anonymous_to_named_moves_with_ctx(&ctx, &[desired], &[], &state_view, &claims)
-            .expect("empty provider configuration is valid");
+    let moves = detect_anonymous_to_named_moves_with_ctx(
+        &ctx,
+        &resources,
+        &candidates,
+        &[],
+        &state_view,
+        &claims,
+    )
+    .expect("empty provider configuration is valid");
 
     assert_eq!(
         detected_move_identity_pairs(&moves),
@@ -5513,10 +5731,16 @@ fn resource_move_invariants_named_match_uses_state_row_routing() {
         Value::Concrete(ConcreteValue::String("logs".into())),
     );
 
+    let resources = vec![desired];
+    let candidates = resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect();
     let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
     let moves = detect_anonymous_to_named_moves_with_ctx(
         &ctx,
-        &[desired],
+        &resources,
+        &candidates,
         &[],
         &state_view,
         &StateBlockClaims::empty(),
@@ -7848,6 +8072,10 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
     named.id = ResourceId::with_provider_identity("awscc", "ec2.Route", "route", None);
     named.binding = Some("route".to_string());
     let resources = vec![named.clone()];
+    let candidates = resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect();
 
     let mut state_file = StateFile::new();
     state_file
@@ -7868,6 +8096,7 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
     let moves = detect_anonymous_to_named_moves_with_ctx(
         &ctx,
         &resources,
+        &candidates,
         &providers_aws,
         &state_view,
         &carina_core::identifier::StateBlockClaims::empty(),
