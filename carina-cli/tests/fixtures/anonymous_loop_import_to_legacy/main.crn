@@ -1,0 +1,10 @@
+import {
+  to = mock.test.resource '_for0[0]'
+  id = 'resource-existing'
+}
+
+for name in ['one'] {
+  mock.test.resource {
+    name = name
+  }
+}

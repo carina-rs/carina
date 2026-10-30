@@ -40,8 +40,8 @@ use crate::module_walk::ModuleWalk;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::wiring::ProviderLoad;
 use crate::wiring::{
-    CanonicalResourcePair, WiringContext, compute_anonymous_identifiers_with_ctx,
-    compute_canonical_pair_anonymous_identifiers_with_ctx, resolve_file_names_with_ctx,
+    CanonicalResourcePair, WiringContext, compute_anonymous_identifiers_with_policy_with_ctx,
+    compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx, resolve_file_names_with_ctx,
     validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
     validate_module_attribute_refs_after_expansion_failure, validate_module_internal_ref_types,
     validate_no_backend_in_modules, validate_no_empty_interpolations,
@@ -406,6 +406,7 @@ impl ResolvedConfig<'_> {
     fn compute_anonymous_identifiers(
         &mut self,
         ctx: &WiringContext,
+        conflict_policy: carina_core::identifier::AnonymousIdentityConflictPolicy,
     ) -> Result<Vec<AppError>, AppError> {
         let providers = self.parsed().providers.clone();
         match self {
@@ -414,14 +415,20 @@ impl ResolvedConfig<'_> {
                     &mut parsed.resources,
                     ctx.schemas(),
                 )?;
-                Ok(compute_anonymous_identifiers_with_ctx(
+                Ok(compute_anonymous_identifiers_with_policy_with_ctx(
                     ctx,
                     canonical_resources,
                     &providers,
+                    conflict_policy,
                 ))
             }
             Self::Paired { resources, .. } => {
-                compute_canonical_pair_anonymous_identifiers_with_ctx(ctx, resources, &providers)
+                compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx(
+                    ctx,
+                    resources,
+                    &providers,
+                    conflict_policy,
+                )
             }
         }
     }
@@ -856,14 +863,6 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         errors.extend(validate_wait_bindings_with_ctx(ctx, parsed));
         errors.extend(validate_deferred_populate_refs_with_ctx(ctx, parsed));
         errors.extend(
-            carina_core::identifier::check_attribute_derived_anonymous_resource_conflicts(
-                &parsed.resources,
-                ctx.schemas(),
-            )
-            .into_iter()
-            .map(|conflict| AppError::Validation(conflict.to_string())),
-        );
-        errors.extend(
             upstream_resolve_errors
                 .iter()
                 .map(|error| AppError::Validation(error.to_string())),
@@ -930,22 +929,33 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         }
     }
 
-    let anonymous_identifier_errors = match resolved_config.compute_anonymous_identifiers(ctx) {
-        Ok(errors) => errors,
-        Err(error) => {
-            errors.push(error);
-            return Err(errors);
-        }
+    let identity_conflict_policy = if skip_resource_validation {
+        carina_core::identifier::AnonymousIdentityConflictPolicy::RepresentabilityOnly
+    } else {
+        carina_core::identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived
     };
+    match resolved_config.compute_anonymous_identifiers(ctx, identity_conflict_policy) {
+        Ok(identifier_errors) => errors.extend(identifier_errors),
+        Err(error) => errors.push(error),
+    }
+    let parsed = resolved_config.parsed();
 
-    // Compute anonymous identifiers — downstream plan code assumes
-    // every resource has a stable id, so a collision error must stop
-    // the pipeline here.
-    errors.extend(anonymous_identifier_errors);
+    // Identity assignment and move-target validation are independent
+    // diagnostics. Run both before stopping so one validation pass reports
+    // every repair the operator must make.
+    errors.extend(
+        carina_core::identifier::check_legacy_loop_move_targets(
+            &parsed.state_blocks,
+            &parsed.resources,
+        )
+        .into_iter()
+        .map(|error| AppError::AnonymousIdentity(error.into())),
+    );
+    // Downstream plan code assumes every resource has a stable id, so any
+    // identity or move-target error must stop the pipeline here.
     if !errors.is_empty() {
         return Err(errors);
     }
-    let parsed = resolved_config.parsed();
 
     // Reject references to `upstream_state` fields that the upstream's
     // `exports { }` block does not declare. Gated like the other

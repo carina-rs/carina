@@ -1,0 +1,7 @@
+backend local { path = 'carina.state.json' }
+
+exports {
+  accounts: map(String) = {
+    alpha = '111111111111'
+  }
+}

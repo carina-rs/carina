@@ -1,0 +1,18 @@
+
+
+
+
+moved {
+  from = awscc.ec2.Vpc '_for0[0]'
+  to   = awscc.ec2.Vpc 'kept'
+}
+
+let kept = awscc.ec2.Vpc {
+  cidr_block = '10.0.0.0/16'
+}
+
+for cidr in ['10.9.0.0/16'] {
+  awscc.ec2.Vpc {
+    cidr_block = cidr
+  }
+}

@@ -1,5 +1,3 @@
-# The `_for{N}` address is positional and tracked in carina-rs/carina#4109.
-# Update this fixture when that address scheme changes; do not change the counter here.
 for cidr in ['10.0.0.0/16'] {
   awscc.ec2.Vpc {
     cidr_block = cidr

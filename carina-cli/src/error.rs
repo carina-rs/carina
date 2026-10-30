@@ -723,6 +723,10 @@ pub enum AppError {
     #[error("{0}")]
     Config(String),
 
+    /// Anonymous resource identity could not be assigned safely.
+    #[error(transparent)]
+    AnonymousIdentity(#[from] carina_core::identifier::AnonymousIdentityError),
+
     /// The path passed to `apply` does not exist, so its input kind is unknown.
     #[error(
         "Apply input '{}' does not exist.\n{}\nCause: {error}",

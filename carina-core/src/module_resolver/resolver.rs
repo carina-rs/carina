@@ -259,6 +259,11 @@ impl ResidualModuleResolutionError {
                     line: _,
                     message: _,
                 }
+                | ParseError::UnboundLoopRead {
+                    kind: _,
+                    line: _,
+                    span: _,
+                }
                 | ParseError::UnresolvedDeclarationType {
                     token: _,
                     line: _,
@@ -658,6 +663,10 @@ impl TypeResolutionPolicy for DeferredUpstreamTypeResolution {
 pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     /// Base directory for resolving relative imports
     pub(super) base_dir: PathBuf,
+    /// Root of the configuration being expanded. Unlike `base_dir`, this does
+    /// not change while recursively resolving nested module imports and is
+    /// therefore the stable base for user-facing source labels.
+    configuration_root: PathBuf,
     /// Cache of loaded modules: path -> ParsedFile
     pub(super) module_cache: HashMap<PathBuf, ParsedFile>,
     /// Currently resolving modules (for cycle detection)
@@ -735,8 +744,10 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         config: &'cfg ProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Self {
+        let base_dir = base_dir.as_ref().to_path_buf();
         Self {
-            base_dir: base_dir.as_ref().to_path_buf(),
+            configuration_root: base_dir.clone(),
+            base_dir,
             module_cache: HashMap::new(),
             resolving: HashSet::new(),
             imported_modules: HashMap::new(),
@@ -902,14 +913,18 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             let content = std::fs::read_to_string(&path)?;
             files.push((path, content));
         }
-        let parsed_files = crate::config_loader::parse_directory_files_located(&files, self.config)
-            .map_err(|located| match located.source_file {
-                Some(path) => ModuleError::ParseInFile {
-                    path: crate::utils::normalize_source_path(&path),
-                    error: located.error,
-                },
-                None => ModuleError::Parse(*located.error),
-            })?;
+        let parsed_files = crate::config_loader::parse_directory_files_located_from_root(
+            &files,
+            self.config,
+            &self.configuration_root,
+        )
+        .map_err(|located| match located.source_file {
+            Some(path) => ModuleError::ParseInFile {
+                path: crate::utils::normalize_source_path(&path),
+                error: located.error,
+            },
+            None => ModuleError::Parse(*located.error),
+        })?;
 
         let mut merged = ParsedFile::default();
         for (_, parsed) in parsed_files {

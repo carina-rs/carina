@@ -776,7 +776,9 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
-        binding_name: "validation_records".to_string(),
+        target: carina_core::parser::DeferredForTarget::Bound {
+            binding: "validation_records".to_string(),
+        },
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
@@ -829,7 +831,9 @@ fn deferred_validation_records_effect() -> Effect {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
-        binding_name: "validation_records".to_string(),
+        target: carina_core::parser::DeferredForTarget::Bound {
+            binding: "validation_records".to_string(),
+        },
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
@@ -1193,6 +1197,7 @@ fn format_effect_move_separates_type_and_name_with_space() {
         to: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
             "awscc", "ec2.Vpc", "vpc_b", None,
         )),
+        origin: None,
     };
     assert_eq!(
         format_effect(&effect),
@@ -2045,6 +2050,7 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
     plan.add(Effect::Move {
         from: carina_core::resource::ResolvedResourceId::new(from_id),
         to: carina_core::resource::ResolvedResourceId::new(to_id.clone()),
+        origin: None,
     });
     plan.add(Effect::Update {
         identifier: crate::fixture_applied_identifier("logs-id"),
@@ -2121,6 +2127,7 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
     plan.add(Effect::Move {
         from: carina_core::resource::ResolvedResourceId::new(from_id),
         to: carina_core::resource::ResolvedResourceId::new(to_id.clone()),
+        origin: None,
     });
     plan.add(Effect::Update {
         identifier: crate::fixture_applied_identifier("child-id"),

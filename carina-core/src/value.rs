@@ -2537,7 +2537,7 @@ fn deferred_template_contains_redacted_secret<S>(
         header: _header,
         resource_type: _resource_type,
         attributes,
-        binding_name: _binding_name,
+        target: _target,
         iterable,
         binding: _binding,
         template_resource,
@@ -2587,6 +2587,7 @@ pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<
         Effect::Move {
             from: _from,
             to: _to,
+            origin: _origin,
         } => false,
         Effect::Wait {
             identity: _identity,
@@ -3975,9 +3976,10 @@ pub fn redact_secrets_in_effect(
             identifier: redact_secrets_in_value(identifier)?,
         },
         Effect::Remove { id } => Effect::Remove { id: id.clone() },
-        Effect::Move { from, to } => Effect::Move {
+        Effect::Move { from, to, origin } => Effect::Move {
             from: from.clone(),
             to: to.clone(),
+            origin: origin.clone(),
         },
         // Wait effects carry no secret-bearing fields — `until` is a
         // typed predicate over scalar values, surface form is the
@@ -4232,13 +4234,13 @@ fn rehydrate_deferred_template<S: Clone, T>(
     let candidate = candidates
         .iter()
         .find(|candidate| {
-            candidate.binding_name == saved.binding_name
+            candidate.target.same_system_target(&saved.target)
                 && candidate.resource_type == saved.resource_type
                 && candidate.root_bindings() == saved.root_bindings()
         })
         .ok_or_else(|| {
             SecretRehydrationSiteError::new(
-                format!("deferred for {}", saved.binding_name),
+                format!("deferred for {}", saved.target.display_name()),
                 SecretRehydrationError::ShapeMismatch,
             )
         })?;
@@ -4246,7 +4248,7 @@ fn rehydrate_deferred_template<S: Clone, T>(
     if let Some(value) = rehydrate_secret_entry(
         &saved.iterable,
         Some(&candidate.iterable),
-        format!("deferred iterable {}", saved.binding_name),
+        format!("deferred iterable {}", saved.target.display_name()),
         SecretRehydrationCandidate::Evaluated,
     )? {
         out.iterable = value;
@@ -4256,7 +4258,7 @@ fn rehydrate_deferred_template<S: Clone, T>(
         if let Some(value) = rehydrate_secret_entry(
             saved_value,
             candidate.template_resource.attributes.get(key),
-            format!("deferred resource {}.{key}", saved.binding_name),
+            format!("deferred resource {}.{key}", saved.target.display_name()),
             SecretRehydrationCandidate::Evaluated,
         )? {
             *saved_value = value;
@@ -4273,7 +4275,10 @@ fn rehydrate_deferred_template<S: Clone, T>(
                 .attributes
                 .iter()
                 .find_map(|(candidate_key, value)| (candidate_key == key).then_some(value)),
-            format!("deferred display resource {}.{key}", saved.binding_name),
+            format!(
+                "deferred display resource {}.{key}",
+                saved.target.display_name()
+            ),
             SecretRehydrationCandidate::Evaluated,
         )? {
             *saved_value = value;
@@ -5848,7 +5853,7 @@ pub struct CanonicalizedResources<'a, S = crate::resource::ModuleSource> {
 }
 
 impl<'a, S> CanonicalizedResources<'a, S> {
-    pub fn as_mut_slice(&mut self) -> &mut [crate::resource::Resource<S>] {
+    pub(crate) fn into_mut_slice(self) -> &'a mut [crate::resource::Resource<S>] {
         self.resources
     }
 }
@@ -12234,6 +12239,7 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: HashSet::new(),
         }
     }
@@ -12942,7 +12948,9 @@ mod tests {
                     ("name".to_string(), placeholder.clone()),
                     ("comment".to_string(), secret),
                 ],
-                binding_name: "validation_records".to_string(),
+                target: crate::parser::DeferredForTarget::Bound {
+                    binding: "validation_records".to_string(),
+                },
                 iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
@@ -13032,7 +13040,9 @@ mod tests {
                 header: "for opt in cert.options".to_string(),
                 resource_type: "aws.route53.RecordSet".to_string(),
                 attributes: vec![("comment".to_string(), secret("stale-projection"))],
-                binding_name: "records".to_string(),
+                target: crate::parser::DeferredForTarget::Bound {
+                    binding: "records".to_string(),
+                },
                 iterable: Value::resource_ref("cert", "options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
@@ -13091,7 +13101,9 @@ mod tests {
                 ("comment".to_string(), canonical),
                 ("identifier".to_string(), display_only.clone()),
             ],
-            binding_name: "children".to_string(),
+            target: crate::parser::DeferredForTarget::Bound {
+                binding: "children".to_string(),
+            },
             iterable: Value::resource_ref("parent", "children", Vec::new()),
             binding: ForBinding::Simple("child".to_string()),
             template_resource,
