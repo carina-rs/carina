@@ -290,40 +290,57 @@ Some rules involve more than one attribute. A schema declares them as data, beca
 
 ```rust
 use carina_plugin_sdk::core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, ValidatorType,
+    AttributeSchema, AttributeType, FieldGroup, FieldGroupKind, ResourceSchema, StructField,
+    ValidatorType,
 };
 
+let notification = AttributeType::struct_with_field_groups(
+    "Notification",
+    vec![
+        StructField::optional("email", AttributeType::string()).build(),
+        StructField::optional("sms", AttributeType::string()).build(),
+        StructField::optional("immediate", AttributeType::bool()).build(),
+        StructField::optional("digest", AttributeType::bool()).build(),
+    ],
+    vec![
+        FieldGroup::at_least_one(["email", "sms"]).unwrap(),
+        FieldGroup::at_most_one(["immediate", "digest"]).unwrap(),
+    ],
+);
 let schema = ResourceSchema::new("widget")
     .attribute(AttributeSchema::optional("source_url", AttributeType::string()).build())
     .attribute(AttributeSchema::optional("source_file", AttributeType::string()).build())
+    .attribute(AttributeSchema::optional("notification", notification).build())
     .attribute(
         AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
     )
     // Exactly one of the two must be set.
-    .exclusive_required(&["source_url", "source_file"])
+    .field_group(FieldGroup::exactly_one(["source_url", "source_file"]).unwrap())
     // Reject `tags = { key = ..., value = ... }`, a common mistake for a tag list.
     .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
     .validate()
     .expect("the schema is valid");
 
 assert_eq!(
-    schema.as_schema().exclusive_required_groups(),
-    [vec!["source_url".to_string(), "source_file".to_string()]]
+    schema.as_schema().field_groups()[0].kind(),
+    FieldGroupKind::ExactlyOne
 );
 ```
 
-The host runs these checks on every configuration before planning; a configuration that sets both `source_url` and `source_file`, or neither, fails validation. `exclusive_required` can be called more than once; each group is checked on its own. `ValidatorType` lists the declared checks the host knows how to run; a check it does not list cannot be expressed in a schema.
+The host runs field groups on every configuration before planning. `ExactlyOne`, `AtLeastOne`, and `AtMostOne` count whether each named field was written, even when its value is deferred until apply. A group can constrain top-level resource attributes or fields in any `Struct`, including structs reached through lists, maps, unions, or `Ref` definitions. Each group must contain at least two distinct field names; its constructor rejects smaller groups or repeated names. Group members must be optional user inputs without defaults, and the same kind cannot be declared twice for the same member set, even in a different order. `ValidatorType` lists the other declared checks the host knows how to run.
 
 ## The validated schema
 
 `ResourceSchema` is a draft. `validate()` checks the whole draft and returns a `ValidatedResourceSchema`, the only type that `CarinaProvider::schemas` accepts. It reports every problem it finds at once, each with the schema path where it occurred:
 
 ```rust
-use carina_plugin_sdk::core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_plugin_sdk::core::schema::{
+    AttributeSchema, AttributeType, FieldGroup, ResourceSchema,
+};
 
 let error = ResourceSchema::new("widget")
     .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
-    .exclusive_required(&["name", "missing"])
+    .field_group(FieldGroup::exactly_one(["name", "missing"]).unwrap())
     .with_unique_name_attribute("also_missing")
     .validate()
     .unwrap_err();
@@ -333,7 +350,9 @@ assert!(messages.iter().any(|message| message.contains("`missing`")));
 assert!(messages.iter().any(|message| message.contains("`also_missing`")));
 ```
 
-Among other things, `validate()` rejects duplicate attribute names, references to attributes that do not exist (in `exclusive_required` and in the unique-name attribute), `exclusive_required` groups that name a provider-populated attribute, defaults that cannot be sent over the wire, enum shapes the protocol cannot carry, and the write-only placements described above. Validating the schema while building it means a mistake shows up in the provider's own tests, not when a user loads the provider.
+Among other things, `validate()` rejects duplicate attribute names, field groups that name unknown, provider-populated, required, or defaulted members at their own resource/struct level, duplicate field-group declarations, missing unique-name attributes, defaults that cannot be sent over the wire, enum shapes the protocol cannot carry, and the write-only placements described above. Struct fields do not have a default API, so the defaulted-member rule currently applies only to resource attributes. Validating the schema while building it means a mistake shows up in the provider's own tests, not when a user loads the provider.
+
+When a `Struct` is reached below a provider-populated attribute, that inherited output-only status does not invalidate field groups declared on the `Struct`. This lets one definition be reused at writable and output-only sites. Admission still rejects malformed groups, unknown members, duplicate groups, and members whose own declared mode is provider-populated or required; the host does not enforce the groups against user input on an output-only path because users cannot set that value.
 
 The provider's configuration (the attributes of the `provider` block) works the same way: `provider_config_attribute_types` returns a `ValidatedConfigSchema`, built with `ValidatedConfigSchema::validate` from a `BTreeMap` of attribute names to types.
 

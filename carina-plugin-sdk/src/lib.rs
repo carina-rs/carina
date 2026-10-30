@@ -1604,6 +1604,57 @@ mod tests {
     }
 
     #[test]
+    fn provider_schema_json_preserves_resource_and_struct_field_groups() {
+        use carina_core::schema::{
+            AttributeSchema, AttributeType, FieldGroup, ReferenceForms, ResourceSchema,
+            StructField, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+        };
+
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::optional("first", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("second", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "nested",
+                    AttributeType::struct_with_field_groups(
+                        "Nested",
+                        vec![
+                            StructField::optional("left", AttributeType::string()).build(),
+                            StructField::optional("right", AttributeType::string()).build(),
+                        ],
+                        vec![FieldGroup::at_least_one(["left", "right"]).unwrap()],
+                    ),
+                )
+                .build(),
+            )
+            .field_group(FieldGroup::exactly_one(["first", "second"]).unwrap())
+            .validate()
+            .unwrap();
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![schema],
+            ValidatedConfigSchema::default(),
+            ReferenceForms::new(),
+        )
+        .unwrap();
+
+        let json = provider_schema_to_json(&witness).unwrap();
+        let wire: protocol::types::ProviderSchemaEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            wire.resources[0].field_groups[0].kind,
+            protocol::types::FieldGroupKind::ExactlyOne
+        );
+        let protocol::types::AttributeType::Struct { field_groups, .. } =
+            &wire.resources[0].attributes["nested"].attr_type
+        else {
+            panic!("nested attribute must remain a struct");
+        };
+        assert_eq!(
+            field_groups[0].kind,
+            protocol::types::FieldGroupKind::AtLeastOne
+        );
+    }
+
+    #[test]
     fn schema_admission_rejects_a_closed_enum_transform_before_guest_serialization() {
         let error = carina_core::schema::ResourceSchema::new("test.Widget")
             .attribute(

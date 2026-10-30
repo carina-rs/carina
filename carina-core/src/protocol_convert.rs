@@ -37,12 +37,38 @@ use crate::resource::{
     ResourceIdentity, ResourceIdentityError, ResourceIdentityState, State, Value,
 };
 use crate::schema::{
-    AttributeSchema, AttributeSchemaParts, AttributeType, ConfigSchemaValidationError, InputMode,
-    RawShape, ResourceSchema, ResourceSchemaParts, ResourceSchemaValidationError,
-    ResourceValidation, SchemaKind, SchemaValidationIssueLocation, StructField, StructFieldParts,
-    TypeIdentity, UniqueNameSpec, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
-    ValidatedResourceSchema,
+    AttributeSchema, AttributeSchemaParts, AttributeType, ConfigSchemaValidationError, FieldGroup,
+    FieldGroupKind, InputMode, RawShape, ResourceSchema, ResourceSchemaParts,
+    ResourceSchemaValidationError, ResourceValidation, SchemaKind, SchemaValidationIssueLocation,
+    StructField, StructFieldParts, TypeIdentity, UniqueNameSpec, ValidatedConfigSchema,
+    ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
+
+fn field_group_to_protocol(group: &FieldGroup) -> protocol::FieldGroup {
+    protocol::FieldGroup {
+        kind: match group.kind() {
+            FieldGroupKind::ExactlyOne => protocol::FieldGroupKind::ExactlyOne,
+            FieldGroupKind::AtLeastOne => protocol::FieldGroupKind::AtLeastOne,
+            FieldGroupKind::AtMostOne => protocol::FieldGroupKind::AtMostOne,
+        },
+        fields: group.fields().to_vec(),
+    }
+}
+
+fn protocol_to_field_group(group: &protocol::FieldGroup) -> Result<FieldGroup, SchemaDecodeError> {
+    let kind = match group.kind {
+        protocol::FieldGroupKind::ExactlyOne => FieldGroupKind::ExactlyOne,
+        protocol::FieldGroupKind::AtLeastOne => FieldGroupKind::AtLeastOne,
+        protocol::FieldGroupKind::AtMostOne => FieldGroupKind::AtMostOne,
+    };
+    FieldGroup::new(kind, group.fields.clone()).map_err(|error| SchemaDecodeError::InvalidSchema {
+        detail: "field group is invalid".to_string(),
+        resource_type: None,
+        attribute_path: Vec::new(),
+        schema_issue_location: None,
+        source: Some(Box::new(error)),
+    })
+}
 
 /// A core value or type cannot be represented by the provider protocol.
 #[derive(Debug)]
@@ -443,7 +469,7 @@ pub fn resource_schema_to_protocol(
         kind,
         unique_name,
         operation_config,
-        exclusive_required,
+        field_groups,
         default_wait_timeout,
         default_wait_interval,
         defs,
@@ -493,7 +519,7 @@ pub fn resource_schema_to_protocol(
         unique_name,
         operation_config: operation_config.cloned(),
         validators,
-        exclusive_required: exclusive_required.to_vec(),
+        field_groups: field_groups.iter().map(field_group_to_protocol).collect(),
         defs,
     })
 }
@@ -751,12 +777,17 @@ pub fn attribute_type_to_protocol(
             inner: Box::new(attribute_type_to_protocol(value)?),
             key: Box::new(attribute_type_to_protocol(key)?),
         }),
-        RawShape::Struct { name, fields } => Ok(protocol::AttributeType::Struct {
+        RawShape::Struct {
+            name,
+            fields,
+            field_groups,
+        } => Ok(protocol::AttributeType::Struct {
             name: name.to_string(),
             fields: fields
                 .iter()
                 .map(struct_field_to_protocol)
                 .collect::<Result<_, _>>()?,
+            field_groups: field_groups.iter().map(field_group_to_protocol).collect(),
         }),
         RawShape::Union(members) => Ok(protocol::AttributeType::Union {
             members: members
@@ -829,7 +860,7 @@ pub fn protocol_to_resource_schema(
         unique_name,
         operation_config,
         validators,
-        exclusive_required,
+        field_groups,
         defs,
     } = schema;
 
@@ -854,9 +885,12 @@ pub fn protocol_to_resource_schema(
     if let Some(operation_config) = operation_config {
         core = core.with_operation_config(operation_config.clone());
     }
-    for group in exclusive_required {
-        let fields = group.iter().map(String::as_str).collect::<Vec<_>>();
-        core = core.exclusive_required(&fields);
+    for (index, group) in field_groups.iter().enumerate() {
+        core = core.field_group(protocol_to_field_group(group).map_err(|error| {
+            error
+                .prepend_attribute(&format!("field_groups[{index}]"))
+                .with_resource_type(resource_type)
+        })?);
     }
 
     for (name, definition) in defs {
@@ -1126,11 +1160,23 @@ pub fn protocol_to_attribute_type(
             protocol_to_attribute_type(key)?,
             protocol_to_attribute_type(inner)?,
         )),
-        protocol::AttributeType::Struct { name, fields } => Ok(AttributeType::struct_(
+        protocol::AttributeType::Struct {
+            name,
+            fields,
+            field_groups,
+        } => Ok(AttributeType::struct_with_field_groups(
             name.clone(),
             fields
                 .iter()
                 .map(protocol_to_struct_field)
+                .collect::<Result<_, _>>()?,
+            field_groups
+                .iter()
+                .enumerate()
+                .map(|(index, group)| {
+                    protocol_to_field_group(group)
+                        .map_err(|error| error.prepend_attribute(&format!("field_groups[{index}]")))
+                })
                 .collect::<Result<_, _>>()?,
         )),
         protocol::AttributeType::Union { members } => Ok(AttributeType::union(
@@ -1368,6 +1414,7 @@ fn protocol_legacy_custom_to_core(
         protocol::AttributeType::Struct {
             name: _base_name,
             fields: _base_fields,
+            field_groups: _base_field_groups,
         } => Err(SchemaDecodeError::unsupported_custom_base(
             enclosing_name,
             "Struct",
@@ -3052,6 +3099,112 @@ mod tests {
     }
 
     #[test]
+    fn field_groups_round_trip_at_resource_and_struct_scope() {
+        let nested_group = FieldGroup::at_least_one(["left", "right"]).unwrap();
+        let top_group = FieldGroup::at_most_one(["first", "second"]).unwrap();
+        let schema = ResourceSchema::new("test.Groups")
+            .attribute(AttributeSchema::optional("first", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("second", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "nested",
+                    AttributeType::struct_with_field_groups(
+                        "Nested",
+                        vec![
+                            StructField::optional("left", AttributeType::string()).build(),
+                            StructField::optional("right", AttributeType::string()).build(),
+                        ],
+                        vec![nested_group.clone()],
+                    ),
+                )
+                .build(),
+            )
+            .field_group(top_group.clone())
+            .validate()
+            .unwrap();
+
+        let wire = resource_schema_to_protocol(&schema).unwrap();
+        assert_eq!(wire.field_groups.len(), 1);
+        let protocol::AttributeType::Struct { field_groups, .. } =
+            &wire.attributes["nested"].attr_type
+        else {
+            panic!("nested attribute must remain a struct");
+        };
+        assert_eq!(field_groups.len(), 1);
+
+        let json = serde_json::to_string(&wire).unwrap();
+        let decoded_wire = serde_json::from_str(&json).unwrap();
+        let decoded = protocol_to_resource_schema(&decoded_wire).unwrap();
+        assert_eq!(decoded.parts().field_groups, &[top_group]);
+        let RawShape::Struct { field_groups, .. } =
+            decoded.parts().attributes["nested"].attr_type().raw_shape()
+        else {
+            panic!("decoded nested attribute must remain a struct");
+        };
+        assert_eq!(field_groups, &[nested_group]);
+    }
+
+    #[test]
+    fn protocol_decode_rejects_field_groups_with_fewer_than_two_fields() {
+        let schema = ResourceSchema::new("test.Groups")
+            .attribute(AttributeSchema::optional("only", AttributeType::string()).build())
+            .validate()
+            .unwrap();
+        let mut wire = resource_schema_to_protocol(&schema).unwrap();
+        for fields in [vec![], vec!["only".to_string()]] {
+            wire.field_groups = vec![protocol::FieldGroup {
+                kind: protocol::FieldGroupKind::ExactlyOne,
+                fields,
+            }];
+            let error = protocol_to_resource_schema(&wire)
+                .expect_err("invalid wire group must fail schema admission");
+            let source = std::error::Error::source(&error)
+                .expect("field-group construction error must be retained")
+                .to_string();
+            assert!(source.contains("at least two fields"), "{source}");
+        }
+
+        let mut wire = resource_schema_to_protocol(&schema).unwrap();
+        wire.attributes.get_mut("only").unwrap().attr_type = protocol::AttributeType::Struct {
+            name: "Nested".to_string(),
+            fields: vec![protocol::StructField {
+                name: "nested_only".to_string(),
+                field_type: protocol::AttributeType::String {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: None,
+                },
+                required: false,
+                description: None,
+                block_name: None,
+                provider_name: None,
+                read_only: false,
+                write_only: false,
+                deferred_populate: false,
+            }],
+            field_groups: vec![protocol::FieldGroup {
+                kind: protocol::FieldGroupKind::AtLeastOne,
+                fields: vec!["nested_only".to_string()],
+            }],
+        };
+        let error = protocol_to_resource_schema(&wire)
+            .expect_err("invalid nested wire group must fail schema admission");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("attribute 'only.field_groups[0]'"),
+            "{rendered}"
+        );
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .to_string()
+                .contains("at least two fields")
+        );
+    }
+
+    #[test]
     fn json_decode_reconstructs_every_registered_builtin_validator() {
         let positive_int = TypeIdentity::bare("PositiveInt");
         for (kind, identity) in crate::schema::builtin_validator_registry().keys() {
@@ -3117,6 +3270,7 @@ mod tests {
                 RawShape::Struct {
                     name: _name,
                     fields: _fields,
+                    field_groups: _field_groups,
                 } => panic!("unexpected Struct builtin wire shape for {identity}"),
                 RawShape::Union(_members) => {
                     panic!("unexpected Union builtin wire shape for {identity}")
@@ -3161,7 +3315,7 @@ mod tests {
             unique_name: protocol::UniqueNameSpec::Conflicting,
             operation_config: None,
             validators: Vec::new(),
-            exclusive_required: Vec::new(),
+            field_groups: Vec::new(),
             defs: Default::default(),
         };
         let json = serde_json::to_string(&wire_schema).unwrap();

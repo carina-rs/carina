@@ -10,9 +10,9 @@
 use sha2::{Digest, Sha256};
 
 use super::{
-    AttrTypeKind, AttributeSchema, AttributeType, DslTransform, InputMode,
-    OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, ResourceSchema, ResourceValidation,
-    SchemaKind, StructField, TypeIdentity, UniqueNameSpec, ValidatorType,
+    AttrTypeKind, AttributeSchema, AttributeType, DslTransform, FieldGroup, FieldGroupKind,
+    InputMode, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, ResourceSchema,
+    ResourceValidation, SchemaKind, StructField, TypeIdentity, UniqueNameSpec, ValidatorType,
 };
 use crate::resource::Value;
 
@@ -135,7 +135,7 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
         kind,
         unique_name,
         operation_config,
-        exclusive_required,
+        field_groups,
         default_wait_timeout,
         default_wait_interval,
         defs,
@@ -155,19 +155,7 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
     encode_unique_name(encoder, unique_name);
     encoder.option(operation_config.as_ref(), encode_operation_config);
 
-    let mut exclusive_required = exclusive_required
-        .iter()
-        .map(|group| {
-            let mut group = group.clone();
-            group.sort();
-            group
-        })
-        .collect::<Vec<_>>();
-    exclusive_required.sort();
-    encoder.usize(exclusive_required.len());
-    for group in exclusive_required {
-        encoder.strings(&group);
-    }
+    encode_field_groups(encoder, field_groups);
 
     encoder.option(default_wait_timeout.as_ref(), |encoder, duration| {
         encode_duration(encoder, *duration);
@@ -180,6 +168,29 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
     for (name, attribute_type) in defs {
         encoder.string(name);
         encode_attribute_type(encoder, attribute_type);
+    }
+}
+
+fn encode_field_groups(encoder: &mut CanonicalEncoder, groups: &[FieldGroup]) {
+    let mut encoded = groups
+        .iter()
+        .map(|group| {
+            let mut group_encoder = CanonicalEncoder::default();
+            group_encoder.tag(match group.kind() {
+                FieldGroupKind::ExactlyOne => 0,
+                FieldGroupKind::AtLeastOne => 1,
+                FieldGroupKind::AtMostOne => 2,
+            });
+            let mut fields = group.fields().to_vec();
+            fields.sort();
+            group_encoder.strings(&fields);
+            group_encoder.finish()
+        })
+        .collect::<Vec<_>>();
+    encoded.sort();
+    encoder.usize(encoded.len());
+    for group in encoded {
+        encoder.bytes(&group);
     }
 }
 
@@ -339,7 +350,11 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             encode_attribute_type(encoder, key);
             encode_attribute_type(encoder, value);
         }
-        AttrTypeKind::Struct { name, fields } => {
+        AttrTypeKind::Struct {
+            name,
+            fields,
+            field_groups,
+        } => {
             encoder.tag(10);
             encoder.string(name);
             let mut fields = fields.iter().collect::<Vec<_>>();
@@ -348,6 +363,7 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             for field in fields {
                 encode_struct_field(encoder, field);
             }
+            encode_field_groups(encoder, field_groups);
         }
         AttrTypeKind::Union(members) => {
             encoder.tag(11);

@@ -1523,6 +1523,20 @@ impl<'de> Deserialize<'de> for UniqueNameSpec {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldGroupKind {
+    ExactlyOne,
+    AtLeastOne,
+    AtMostOne,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FieldGroup {
+    pub kind: FieldGroupKind,
+    pub fields: Vec<String>,
+}
+
 /// Schema types for resource validation and completion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceSchema {
@@ -1538,11 +1552,9 @@ pub struct ResourceSchema {
     pub operation_config: Option<OperationConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validators: Vec<ValidatorType>,
-    /// Declarative "exactly one of" groups. Each inner vec is a group of
-    /// attribute names where exactly one must be specified. Survives
-    /// serialization across the WASM plugin boundary.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub exclusive_required: Vec<Vec<String>>,
+    /// Protocol-v13 cardinality constraints over sibling attributes.
+    /// Required even when empty so version skew fails during JSON loading.
+    pub field_groups: Vec<FieldGroup>,
     /// Named definitions reachable via [`AttributeType::Ref`] from
     /// this resource's attribute types. Empty for resources whose
     /// attribute graph contains no cycles (the common case). Mirror
@@ -1712,6 +1724,8 @@ pub enum AttributeType {
     Struct {
         name: String,
         fields: Vec<StructField>,
+        /// Required in protocol v13, including when empty.
+        field_groups: Vec<FieldGroup>,
     },
     #[serde(rename = "union")]
     Union {
@@ -1876,6 +1890,41 @@ pub struct StructField {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_v13_requires_field_groups_on_resources_and_structs() {
+        let resource_error = serde_json::from_value::<ResourceSchema>(serde_json::json!({
+            "resource_type": "test.Widget",
+            "attributes": {}
+        }))
+        .expect_err("protocol v13 resource field_groups must not default")
+        .to_string();
+        assert!(resource_error.contains("field_groups"), "{resource_error}");
+
+        let struct_error = serde_json::from_value::<AttributeType>(serde_json::json!({
+            "type": "struct",
+            "name": "Choice",
+            "fields": []
+        }))
+        .expect_err("protocol v13 struct field_groups must not default")
+        .to_string();
+        assert!(struct_error.contains("field_groups"), "{struct_error}");
+    }
+
+    #[test]
+    fn field_group_wire_shape_carries_kind_and_named_fields() {
+        let group = FieldGroup {
+            kind: FieldGroupKind::AtLeastOne,
+            fields: vec!["primary".to_string(), "fallback".to_string()],
+        };
+        assert_eq!(
+            serde_json::to_value(&group).unwrap(),
+            serde_json::json!({
+                "kind": "at_least_one",
+                "fields": ["primary", "fallback"]
+            })
+        );
+    }
 
     fn string_attr() -> AttributeType {
         AttributeType::String {
@@ -2449,6 +2498,7 @@ mod tests {
                 write_only: true,
                 deferred_populate: false,
             }],
+            field_groups: vec![],
         };
 
         let json = serde_json::to_string(&attr).unwrap();
@@ -2674,6 +2724,7 @@ mod tests {
             r#"{
                 "resource_type":"ec2.SecurityGroup",
                 "attributes":{},
+                "field_groups":[],
                 "unique_name_attribute":"group_name"
             }"#,
         )
@@ -2687,6 +2738,7 @@ mod tests {
             r#"{
                 "resource_type":"ec2.Vpc",
                 "attributes":{},
+                "field_groups":[],
                 "unique_name_attribute":null
             }"#,
         )
@@ -2696,7 +2748,8 @@ mod tests {
         let absent_schema: ResourceSchema = serde_json::from_str(
             r#"{
                 "resource_type":"ec2.Vpc",
-                "attributes":{}
+                "attributes":{},
+                "field_groups":[]
             }"#,
         )
         .unwrap();
@@ -2706,6 +2759,7 @@ mod tests {
             r#"{
                 "resource_type":"logs.LogGroup",
                 "attributes":{},
+                "field_groups":[],
                 "name_attribute":"log_group_name"
             }"#,
         )
@@ -2722,6 +2776,7 @@ mod tests {
             r#"{
                 "resource_type":"s3.Bucket",
                 "attributes":{},
+                "field_groups":[],
                 "unique_name_attribute":{"type":"attribute","value":"bucket_name"}
             }"#,
         )
@@ -2735,6 +2790,7 @@ mod tests {
             r#"{
                 "resource_type":"ec2.Vpc",
                 "attributes":{},
+                "field_groups":[],
                 "unique_name_attribute":{"type":"coexisting"}
             }"#,
         )
@@ -2745,6 +2801,7 @@ mod tests {
             r#"{
                 "resource_type":"organizations.Organization",
                 "attributes":{},
+                "field_groups":[],
                 "unique_name_attribute":{"type":"conflicting"}
             }"#,
         )
@@ -2775,7 +2832,7 @@ mod tests {
                 unique_name,
                 operation_config: None,
                 validators: vec![],
-                exclusive_required: vec![],
+                field_groups: vec![],
                 defs: std::collections::BTreeMap::new(),
             };
 
@@ -2790,6 +2847,7 @@ mod tests {
             r#"{
                 "resource_type":"s3.Bucket",
                 "attributes":{},
+                "field_groups":[],
                 "unique_name_attribute":{"type":"attribute"}
             }"#,
         )
@@ -2812,6 +2870,7 @@ mod tests {
             r#"{
                 "resource_type":"ec2.Vpc",
                 "attributes":{},
+                "field_groups":[],
                 "unique_name_attribute":{"type":"coexists"}
             }"#,
         )
@@ -2838,7 +2897,7 @@ mod tests {
             unique_name: UniqueNameSpec::Conflicting,
             operation_config: None,
             validators: vec![],
-            exclusive_required: vec![],
+            field_groups: vec![],
             defs: std::collections::BTreeMap::from([(
                 "Statement".to_string(),
                 AttributeType::Struct {
@@ -2861,6 +2920,7 @@ mod tests {
                         write_only: false,
                         deferred_populate: false,
                     }],
+                    field_groups: vec![],
                 },
             )]),
         };
@@ -2958,6 +3018,7 @@ mod tests {
                         write_only: false,
                         deferred_populate: false,
                     }],
+                    field_groups: vec![],
                 },
                 string_attr(),
             ],
@@ -3017,7 +3078,7 @@ mod tests {
 
     #[test]
     fn test_resource_schema_with_operation_config() {
-        let json = r#"{"resource_type":"ec2.tgw","attributes":{},"operation_config":{"delete_timeout_secs":1800}}"#;
+        let json = r#"{"resource_type":"ec2.tgw","attributes":{},"field_groups":[],"operation_config":{"delete_timeout_secs":1800}}"#;
         let schema: ResourceSchema = serde_json::from_str(json).unwrap();
         assert_eq!(
             schema.operation_config.unwrap().delete_timeout_secs,
@@ -3027,7 +3088,7 @@ mod tests {
 
     #[test]
     fn test_resource_schema_without_operation_config() {
-        let json = r#"{"resource_type":"ec2.Vpc","attributes":{}}"#;
+        let json = r#"{"resource_type":"ec2.Vpc","attributes":{},"field_groups":[]}"#;
         let schema: ResourceSchema = serde_json::from_str(json).unwrap();
         assert!(schema.operation_config.is_none());
     }
