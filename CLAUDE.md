@@ -569,7 +569,7 @@ A struct type represents a nested object with typed fields.
   every other updatable desired attribute that is write-only or
   write-only-bearing is re-sent as `PatchOp::Reassert` alongside the change
   (carina#3981, carina#3984). Accepted write-only values, including nested
-  leaves, are recorded in state (state v18; secrets as hashes) so plans
+  leaves, are recorded in state (since state v18; secrets as hashes) so plans
   converge.
 - **Schema field transport**: `StructField` and `AttributeSchema` cross the
   WASM boundary as JSON via the `schemas: func() -> string` WIT export. The
@@ -590,16 +590,16 @@ A struct type represents a nested object with typed fields.
   pointer-identical callbacks only as an optimization. Callback-free sibling
   declarations share the identity's callback set, and separately allocated
   callbacks from repeated type-constructor calls are valid. This is the honest
-  version-12 behavior: the wire names an identity, not a schema declaration,
+  protocol-13 behavior: the wire names an identity, not a schema declaration,
   so the identity is the guest-side type and its constraints are per provider.
-  Version-12 WIT remains
+  Protocol-13 WIT keeps
   `validate-custom-type(TypeIdentity, string)`: the guest parses canonical text
   with the binding's stored kind, and aggregate schema admission rejects an
   identity reused with another scalar kind. Resource/config schema walks pass
   the exact declared `AttributeType` to their single schema owner, so local
   structural constraints remain declaration-specific. A host-backed SDK owner
   then applies that provider's identity-level guest callback set, which may
-  include callbacks declared by sibling schemas because v12 cannot identify a
+  include callbacks declared by sibling schemas because the protocol cannot identify a
   declaration more narrowly.
   Authored annotations cannot select an owner: their `OwnedTypeIdentity`
   contains a non-empty set of every loaded schema owner declaring the semantic
@@ -616,13 +616,13 @@ A struct type represents a nested object with typed fields.
   by `(RefinedScalarKind, TypeIdentity)`, and scalar canonicalization requires
   the exact declared `AttributeType`, so an enum cannot inherit a scalar
   callback or bypass spelling resolution. Whole-schema validation rejects
-  every identified type without a scalar base and every enum shape that v12
-  cannot represent; conversion retains typed defensive errors. Version-12
+  every identified type without a scalar base and every enum shape that the protocol
+  cannot represent; conversion retains typed defensive errors. The protocol's
   `StringEnum` cannot carry a closed enum's DSL transform or non-plain-String
-  base. Protocol v12 also has no fields for attribute completions or resource
+  base. Protocol 13 also has no fields for attribute completions or resource
   wait defaults: those are host-only authoring/execution metadata and are the
   two intentional one-way omissions pinned by projection tests. The legacy
-  v12 `Custom` decoder preserves the first outer record's name as the only
+  `Custom` decoder preserves the first outer record's name as the only
   identity, including an empty name; nested `Custom.name` and primitive-base
   identities never fill it in. Enclosing String/int refinements take
   precedence over nested/base metadata, falling back to the inner metadata
@@ -636,7 +636,7 @@ A struct type represents a nested object with typed fields.
   conversion: carina-core re-exports the protocol type, carina#3907), and
   `AttributeType` conversion patterns name every variant field. The nested
   `write_only` flag is required in schema JSON (no `#[serde(default)]`), and the
-  protocol minimum remains v12, so a host and provider that disagree about it
+  protocol minimum is 13, so a host and provider that disagree about it
   fail at load instead of silently dropping nested write-only members. Adding
   a protocol field must break compilation until it is consciously carried
   across or explicitly bound and documented as unavailable on the destination
