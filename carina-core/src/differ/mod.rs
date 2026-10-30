@@ -933,10 +933,12 @@ fn diff_existing_state(
     context: &ComparisonContext<'_>,
 ) -> PresentDiff {
     let changes = comparison::find_changed_attributes_with_ignores(
-        &desired.resolved_attributes(),
-        &current.attributes,
-        saved,
-        nested_write_only,
+        comparison::AttributeValueViews::new(
+            &desired.resolved_attributes(),
+            &current.attributes,
+            saved,
+            nested_write_only,
+        ),
         prev_explicit,
         schema,
         desired.ignore_changes(),

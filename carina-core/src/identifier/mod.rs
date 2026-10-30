@@ -3091,6 +3091,24 @@ impl AnonymousToNamedRenameDetection {
     }
 }
 
+/// State indexes used while matching named resources to anonymous state rows.
+pub struct AnonymousToNamedStateLookup<'a> {
+    find_by_type: &'a dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
+    find_by_binding: &'a dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+}
+
+impl<'a> AnonymousToNamedStateLookup<'a> {
+    pub fn new(
+        find_by_type: &'a dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
+        find_by_binding: &'a dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+    ) -> Self {
+        Self {
+            find_by_type,
+            find_by_binding,
+        }
+    }
+}
+
 /// Detect let-bound (named) resources that were previously anonymous.
 ///
 /// When a user converts an anonymous resource to a `let`-bound resource while
@@ -3132,8 +3150,7 @@ pub fn detect_anonymous_to_named_renames(
     candidates: AnonymousToNamedCandidates<'_>,
     registry: &SchemaRegistry,
     comparison_provider: &ProviderRouter,
-    find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
-    find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+    state_lookup: AnonymousToNamedStateLookup<'_>,
     providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
@@ -3176,7 +3193,8 @@ pub fn detect_anonymous_to_named_renames(
         let comparison = comparison_provider.comparison_for(registry, &resource.id)?;
         let schema = schema.as_schema();
 
-        let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
+        let state_entries =
+            (state_lookup.find_by_type)(&resource.id.provider, &resource.id.resource_type);
 
         // Skip if the binding name already exists in state — nothing to rename.
         if state_entries
@@ -3197,7 +3215,7 @@ pub fn detect_anonymous_to_named_renames(
         // This is empty only when the resource configures no create-only
         // attributes. Configured-but-unresolved values remain explicit.
         let resource_co_values =
-            DesiredCreateOnlyValues::from_resource(resource, schema, find_state_by_binding);
+            DesiredCreateOnlyValues::from_resource(resource, schema, state_lookup.find_by_binding);
 
         let simhash_match = || {
             let resource_hash =
@@ -3324,8 +3342,7 @@ pub fn detect_anonymous_to_named_renames_for_test(
         AnonymousToNamedCandidates::new(resources, &candidates, &claimed_origins),
         registry,
         &comparison_provider,
-        find_state_by_type,
-        find_state_by_binding,
+        AnonymousToNamedStateLookup::new(find_state_by_type, find_state_by_binding),
         &providers,
         identity_attributes_fn,
         claims,

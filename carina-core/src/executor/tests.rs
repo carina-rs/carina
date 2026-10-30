@@ -3092,8 +3092,19 @@ async fn execute_plan_missing_update_schema_fails_before_provider_update() {
     };
     let observer = MockObserver::new();
 
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    // Deliberately bypass the convenience fixture that supplies empty schemas:
+    // this test verifies the production boundary rejects an absent schema.
+    let comparison_provider = crate::provider::ProviderRouter::new();
+    let result = completed_result(
+        execute_runtime_plan(
+            &provider,
+            &comparison_provider,
+            input.into(),
+            &observer,
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
 
     assert_eq!(result.success_count, 0);
     assert_eq!(result.failure_count, 1);
@@ -7857,25 +7868,28 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
     let orphan_state =
         State::existing(orphan_id.clone(), HashMap::new()).with_identifier("dependency-id");
     let current_states = HashMap::from([(consumer_id, consumer_state)]);
+    let base_schemas = crate::schema::SchemaRegistry::new();
+    let (schemas, comparison_provider) =
+        crate::provider::comparison_fixture_for_test(&base_schemas, std::iter::once(&desired.id));
+    let plan_input_states = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
     let desired = ResolvedResource::collect_resolved([desired]).unwrap();
     let orphans = crate::differ::Orphans::from([crate::differ::Orphan::from_state(
         orphan_state,
         Some("dependency".to_string()),
         Directives::default(),
     )]);
-    let plan_input_states = crate::resource::into_plan_input_current_map_from_states(
-        current_states,
-        &crate::schema::SchemaRegistry::new(),
-        &[],
-    );
     let plan = crate::differ::create_plan(
         &desired,
         &[],
-        &crate::provider::ProviderRouter::new(),
+        &comparison_provider,
         crate::differ::PlanPriorStates::new(&plan_input_states, &orphans),
         &HashMap::new(),
-        &crate::schema::SchemaRegistry::new(),
-        &crate::provider::RawSavedAttrs::default().lift(&crate::schema::SchemaRegistry::new()),
+        &schemas,
+        &crate::provider::RawSavedAttrs::default().lift(&schemas),
         &HashMap::new(),
         &[],
     )
@@ -8512,15 +8526,19 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         .collect::<HashMap<_, _>>();
     let unresolved = ResolvedResource::collect_resolved(authored_resources).unwrap();
     let managed = ResolvedResource::collect_resolved(managed_resources.clone()).unwrap();
+    let (schemas, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        &schemas,
+        managed.iter().map(|resource| &resource.id),
+    );
     let plan = create_plan_with_cascades(
         &managed,
         &unresolved,
         &[],
-        &crate::provider::ProviderRouter::new(),
+        &comparison_provider,
         crate::differ::PlanPriorStates::new(&plan_input_states, &crate::differ::Orphans::new()),
         &HashMap::new(),
         &schemas,
-        &crate::provider::RawSavedAttrs::default().lift(&crate::schema::SchemaRegistry::new()),
+        &crate::provider::RawSavedAttrs::default().lift(&schemas),
         &HashMap::new(),
         &[],
         &std::collections::HashSet::new(),

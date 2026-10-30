@@ -5313,6 +5313,9 @@ struct ResolvedComparisonKey {
 
 impl From<&ResourceId> for ResolvedComparisonKey {
     fn from(id: &ResourceId) -> Self {
+        // A comparison is owned by the initialized provider instance and the
+        // provider's schema for this resource type. Resource identity is not
+        // part of either context and may still be pending at pre-resolution.
         Self {
             instance: ProviderInstanceKey::from(id),
             resource_type: id.resource_type.clone(),
@@ -10721,6 +10724,61 @@ mod tests {
             crate::schema::empty_defs_for_schema_walks(),
             &context,
         ));
+    }
+
+    #[test]
+    fn comparison_context_resolves_a_pending_id_by_instance_and_resource_type() {
+        let (registry, _attr_type) = reference_form_registry("mock");
+        let mut router = ProviderRouter::new();
+        router.add_provider_instance(
+            ProviderInstanceKey::new("mock", Some("west".to_string())),
+            InitializedProvider::for_test(Box::new(MockProvider), reference_scope("us-west-2")),
+        );
+        let pending = ResourceId::pending_with_provider(
+            "mock",
+            "lambda.Permission",
+            Some("west".to_string()),
+        );
+
+        let comparison = router
+            .comparison_for(&registry, &pending)
+            .expect("pending identity is irrelevant to comparison resolution");
+
+        assert_eq!(comparison.owner_schema().owner(), "mock");
+        assert_eq!(
+            comparison.owner_schema().schema().as_schema().resource_type,
+            "lambda.Permission"
+        );
+    }
+
+    #[test]
+    fn resolved_comparison_table_reuses_a_pending_ids_type_context_after_resolution() {
+        let (registry, _attr_type) = reference_form_registry("mock");
+        let mut router = ProviderRouter::new();
+        router.add_provider_instance(
+            ProviderInstanceKey::new("mock", Some("west".to_string())),
+            InitializedProvider::for_test(Box::new(MockProvider), reference_scope("us-west-2")),
+        );
+        let pending = ResourceId::pending_with_provider(
+            "mock",
+            "lambda.Permission",
+            Some("west".to_string()),
+        );
+        let resolved = ResourceId::with_provider_identity(
+            "mock",
+            "lambda.Permission",
+            "invoke",
+            Some("west".to_string()),
+        );
+
+        let table = router
+            .resolve_comparisons(&registry, std::iter::once(&pending))
+            .expect("a pending id must pre-resolve its comparison context");
+        let comparison = table
+            .comparison_for(&resolved)
+            .expect("the resolved id must reuse the instance/type comparison");
+
+        assert_eq!(comparison.owner_schema().owner(), "mock");
     }
 
     #[test]

@@ -11915,6 +11915,7 @@ pub struct SchemaRegistry {
     managed: HashMap<(String, String), ValidatedResourceSchema>,
     data_sources: HashMap<(String, String), ValidatedResourceSchema>,
     reference_forms: BTreeMap<String, ReferenceForms>,
+    witness_backed_reference_forms: HashSet<String>,
 }
 
 /// Failure to combine owner-bound schema registry declarations.
@@ -11976,7 +11977,8 @@ impl SchemaRegistry {
     ) -> Result<(), SchemaRegistryError> {
         let provider = provider.into();
         let incoming = witness.reference_forms();
-        if let Some(existing) = self.reference_forms.get(&provider)
+        if self.witness_backed_reference_forms.contains(&provider)
+            && let Some(existing) = self.reference_forms.get(&provider)
             && existing != incoming
         {
             return Err(SchemaRegistryError::ConflictingReferenceForms {
@@ -11986,8 +11988,8 @@ impl SchemaRegistry {
             });
         }
         self.reference_forms
-            .entry(provider.clone())
-            .or_insert_with(|| incoming.clone());
+            .insert(provider.clone(), incoming.clone());
+        self.witness_backed_reference_forms.insert(provider.clone());
         for schema in witness.resources() {
             let key = (provider.clone(), schema.as_schema().resource_type.clone());
             match schema.as_schema().kind {
@@ -12003,15 +12005,19 @@ impl SchemaRegistry {
     }
 
     /// Merge another registry. Incoming resource schemas win on duplicate
-    /// resource keys. Witness-backed owner form tables must be identical.
+    /// resource keys. Witness-backed owner form tables must be identical;
+    /// fixture-only schema insertions carry no competing forms table.
     pub fn extend(&mut self, other: SchemaRegistry) -> Result<(), SchemaRegistryError> {
         let SchemaRegistry {
             managed,
             data_sources,
             reference_forms,
+            witness_backed_reference_forms,
         } = other;
         for (owner, incoming) in &reference_forms {
-            if let Some(existing) = self.reference_forms.get(owner)
+            if witness_backed_reference_forms.contains(owner)
+                && self.witness_backed_reference_forms.contains(owner)
+                && let Some(existing) = self.reference_forms.get(owner)
                 && existing != incoming
             {
                 return Err(SchemaRegistryError::ConflictingReferenceForms {
@@ -12024,7 +12030,12 @@ impl SchemaRegistry {
         self.managed.extend(managed);
         self.data_sources.extend(data_sources);
         for (owner, forms) in reference_forms {
-            self.reference_forms.entry(owner).or_insert(forms);
+            if witness_backed_reference_forms.contains(&owner) {
+                self.reference_forms.insert(owner.clone(), forms);
+                self.witness_backed_reference_forms.insert(owner);
+            } else {
+                self.reference_forms.entry(owner).or_insert(forms);
+            }
         }
         Ok(())
     }

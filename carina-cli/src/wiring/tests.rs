@@ -67,7 +67,6 @@ fn detect_legacy_loop_moves_with_ctx(
     .expect("legacy-loop comparison fixture must resolve")
 }
 
-#[allow(clippy::too_many_arguments)]
 fn detect_anonymous_to_named_moves_with_ctx(
     ctx: &WiringContext,
     resources: &[Resource],
@@ -81,12 +80,10 @@ fn detect_anonymous_to_named_moves_with_ctx(
     super::detect_anonymous_to_named_moves_with_ctx(
         ctx,
         &comparison_provider,
-        resources,
-        candidates,
+        identifier::AnonymousToNamedCandidates::new(resources, candidates, claimed_origins),
         providers,
         state_view,
         claims,
-        claimed_origins,
     )
 }
 
@@ -11067,6 +11064,12 @@ mod expand_same_config_deferred_for_tests {
         assert_eq!(
             post_filtered, pre_order,
             "re-sort must preserve the relative order of already-planned resources"
+        );
+        assert!(
+            out.sorted_resources
+                .iter()
+                .any(|resource| resource.id.to_string() == "aws.ec2.Vpc.<pending>"),
+            "comparison-only fixture schemas must not resolve or drop a pre-existing pending id"
         );
         // The two materialized Assignment children — and only those —
         // are reported as new (none of the pre-expansion ids leak in).

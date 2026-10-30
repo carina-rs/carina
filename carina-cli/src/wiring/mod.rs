@@ -2663,12 +2663,10 @@ fn detect_legacy_loop_moves_with_ctx(
 fn detect_anonymous_to_named_moves_with_ctx(
     ctx: &WiringContext,
     comparison_provider: &ProviderRouter,
-    resources: &[Resource],
-    candidates: &HashSet<ResourceId>,
+    candidates: identifier::AnonymousToNamedCandidates<'_>,
     providers: &[ProviderConfig],
     state_view: &AnonymousReconciliationStateView,
     claims: &StateBlockClaims,
-    claimed_origins: &identifier::AnonymousToNamedClaimedOrigins,
 ) -> Result<identifier::AnonymousToNamedRenameDetection, AppError> {
     let canonical_providers = carina_core::value::canonicalize_provider_configs_with_schemas(
         providers,
@@ -2678,11 +2676,13 @@ fn detect_anonymous_to_named_moves_with_ctx(
         },
     )?;
     Ok(identifier::detect_anonymous_to_named_renames(
-        identifier::AnonymousToNamedCandidates::new(resources, candidates, claimed_origins),
+        candidates,
         ctx.schemas(),
         comparison_provider,
-        &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
-        &|binding| state_view.entries_by_binding(claims, binding),
+        identifier::AnonymousToNamedStateLookup::new(
+            &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
+            &|binding| state_view.entries_by_binding(claims, binding),
+        ),
         &canonical_providers,
         &|name| {
             provider_mod::find_factory(ctx.factories(), name)
@@ -2727,12 +2727,14 @@ fn detect_anonymous_to_named_moves_to_fixed_point(
             let detection = detect_anonymous_to_named_moves_with_ctx(
                 ctx,
                 comparison_provider,
-                resources,
-                &unsatisfied,
+                identifier::AnonymousToNamedCandidates::new(
+                    resources,
+                    &unsatisfied,
+                    &claimed_origins,
+                ),
                 providers,
                 &state_view,
                 claims,
-                &claimed_origins,
             )?;
             let (pass, cross_pass_contests) = detection.into_parts();
             if !cross_pass_contests.is_empty() {
@@ -6447,10 +6449,23 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
     moved_targets: &HashSet<ResourceId>,
     already_refreshed: &HashSet<ResourceId>,
 ) -> Result<DeferredForExpansion, AppError> {
-    let (schemas, comparison_provider) = carina_core::provider::comparison_fixture_for_test(
-        schemas,
-        sorted_resources.iter().map(|resource| &resource.id),
+    // Comparison fixtures may synthesize empty schemas for resource types the
+    // focused test did not declare. Those schemas are comparison-only: feeding
+    // them into anonymous identity assignment would turn a pre-existing
+    // pending id into a generated id during expansion and make the resource
+    // look like a newly materialized loop child.
+    let identity_context = WiringContext::new_for_test_with_additional_schemas(
+        Vec::new(),
+        &parsed.providers,
+        schemas
+            .iter()
+            .map(|(provider, _, _, schema)| (provider.to_string(), schema.clone())),
     );
+    let (comparison_schemas, comparison_provider) =
+        carina_core::provider::comparison_fixture_for_test(
+            schemas,
+            sorted_resources.iter().map(|resource| &resource.id),
+        );
     let moved_pairs = moved_targets
         .iter()
         .map(|target| {
@@ -6473,17 +6488,10 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
         },
         data_source_values: data_source_values.clone(),
     });
-    let identity_context = WiringContext::new_for_test_with_additional_schemas(
-        Vec::new(),
-        &parsed.providers,
-        schemas
-            .iter()
-            .map(|(provider, _, _, schema)| (provider.to_string(), schema.clone())),
-    );
     let mut expanded = parsed.clone();
     prepared.expand_parsed(
         &mut expanded,
-        &schemas,
+        &comparison_schemas,
         remote_bindings,
         DeferredForWarningPolicy::Print,
         &comparison_provider,

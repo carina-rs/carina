@@ -2004,12 +2004,10 @@ mod apply_state_save_tests {
                 },
                 iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
-                template_resource: Resource::with_provider(
-                    "aws",
-                    "route53.Record",
-                    "validation_records",
-                    None,
-                ),
+                // Saved deferred templates are reconstructed before their
+                // runtime element identity exists. Comparison pre-resolution
+                // must key this pending id by provider instance and type.
+                template_resource: Resource::pending_with_provider("aws", "route53.Record", None),
             }),
         });
         let runtime_id = ResourceId::with_provider_identity(

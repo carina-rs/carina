@@ -547,16 +547,16 @@ fn create_plan_parts(
                             continue;
                         }
 
-                        if !resource.ignore_changes().is_empty() {
-                            if let Err(error) = crate::provider::plan_update_patch(
+                        if !resource.ignore_changes().is_empty()
+                            && let Err(error) = crate::provider::plan_update_patch(
                                 &changed_attributes,
                                 resource,
                                 &from,
                                 schema,
-                            ) {
-                                plan.add_error(PlanError::new(id, error.into()));
-                                continue;
-                            }
+                            )
+                        {
+                            plan.add_error(PlanError::new(id, error.into()));
+                            continue;
                         }
 
                         let identifier = present.identifier().clone();

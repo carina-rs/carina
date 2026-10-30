@@ -977,16 +977,42 @@ pub(super) struct AttributeChanges {
     pub ignored_readable_differences: usize,
 }
 
+pub(super) struct AttributeValueViews<'a> {
+    desired: &'a HashMap<String, Value>,
+    current: &'a HashMap<String, Value>,
+    saved: Option<&'a HashMap<String, Value>>,
+    nested_write_only: &'a NestedWriteOnlyRecord,
+}
+
+impl<'a> AttributeValueViews<'a> {
+    pub(super) fn new(
+        desired: &'a HashMap<String, Value>,
+        current: &'a HashMap<String, Value>,
+        saved: Option<&'a HashMap<String, Value>>,
+        nested_write_only: &'a NestedWriteOnlyRecord,
+    ) -> Self {
+        Self {
+            desired,
+            current,
+            saved,
+            nested_write_only,
+        }
+    }
+}
+
 pub(super) fn find_changed_attributes_with_ignores(
-    desired: &HashMap<String, Value>,
-    current: &HashMap<String, Value>,
-    saved: Option<&HashMap<String, Value>>,
-    nested_write_only: &NestedWriteOnlyRecord,
+    values: AttributeValueViews<'_>,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
     ignore_changes: &ResolvedIgnoreChanges,
     context: &ComparisonContext<'_>,
 ) -> AttributeChanges {
+    let AttributeValueViews {
+        desired,
+        current,
+        saved,
+        nested_write_only,
+    } = values;
     let mut changed = Vec::new();
 
     // Pull the cyclic-struct definition map (`Ref` targets) from the
@@ -1180,10 +1206,7 @@ pub(super) fn find_changed_attributes(
     context: &ComparisonContext<'_>,
 ) -> Vec<String> {
     find_changed_attributes_with_ignores(
-        desired,
-        current,
-        saved,
-        nested_write_only,
+        AttributeValueViews::new(desired, current, saved, nested_write_only),
         prev_explicit,
         schema,
         &ResolvedIgnoreChanges::default(),

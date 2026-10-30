@@ -34,6 +34,21 @@ fn existing_state(id: ResourceId, attributes: HashMap<String, Value>) -> State {
     State::existing(id, attributes).with_identifier(identifier)
 }
 
+fn string_wait_schemas(provider: &str) -> SchemaRegistry {
+    use crate::schema::{AttributeSchema, AttributeType};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        provider,
+        (ResourceSchema::new("acm.Certificate")
+            .attribute(AttributeSchema::optional("status", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("domain_name", AttributeType::string()).build()))
+        .validate()
+        .expect("wait fixture schema must be valid"),
+    );
+    schemas
+}
+
 fn unknown_create_outcome(id: ResourceId) -> crate::provider::UnknownCreateOutcome {
     let failure = crate::provider::CreateAttempt::new(id).outcome_unknown(
         crate::provider::EgressSent::for_test(),
@@ -2508,6 +2523,16 @@ fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
         .validate()
         .expect("schema fixture must be valid"),
     );
+    schemas.insert(
+        "",
+        (ResourceSchema::new("example.Consumer").attribute(
+            AttributeSchema::optional("producer_id", AttributeType::string())
+                .removable()
+                .build(),
+        ))
+        .validate()
+        .expect("consumer schema fixture must be valid"),
+    );
 
     let plan = create_plan(
         &[producer, consumer],
@@ -2739,6 +2764,8 @@ fn diff_no_change_without_prev_desired_keys() {
 
 #[test]
 fn create_plan_detects_attribute_removal() {
+    use crate::schema::{AttributeSchema, AttributeType};
+
     // Resource in .crn has no "tags", but current state (from AWS) has tags.
     // prev_desired_keys indicates user previously had "region" and "tags".
     let resources = vec![Resource::new("s3.Bucket", "test").with_attribute(
@@ -2770,17 +2797,31 @@ fn create_plan_detects_attribute_removal() {
         explicit_top_level(&["region", "tags"]),
     );
 
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        (ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::optional("region", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .removable()
+                    .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
+    );
+
     let plan = create_plan(
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
         &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
-            &crate::schema::SchemaRegistry::new(),
-            &[],
+            &schemas,
+            &resources,
         ),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &prev_explicit,
         &Orphans::new(),
@@ -3999,6 +4040,7 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
     let provider = HintProvider {
         hints: vec![BindingPattern::Exact("validation_records".to_string())],
     };
+    let schemas = string_wait_schemas("aws");
 
     let plan = create_plan(
         &parsed.resources,
@@ -4006,7 +4048,7 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
         &provider,
         &HashMap::new(),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &Orphans::new(),
@@ -4058,6 +4100,7 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
     let provider = HintProvider {
         hints: vec![BindingPattern::Exact("something".to_string())],
     };
+    let schemas = string_wait_schemas("");
 
     let plan = create_plan(
         &resources,
@@ -4065,7 +4108,7 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
         &provider,
         &HashMap::new(),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &Orphans::new(),
@@ -4297,6 +4340,7 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
         depends_on: vec![],
         line: 1,
     };
+    let schemas = string_wait_schemas("");
 
     let plan = create_plan(
         &resources,
@@ -4304,7 +4348,7 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
         &HintProvider { hints: Vec::new() },
         &HashMap::new(),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &Orphans::new(),
@@ -4455,6 +4499,7 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
         depends_on: vec![],
         line: 1,
     };
+    let schemas = string_wait_schemas("");
 
     let plan = create_plan(
         &resources,
@@ -4462,7 +4507,7 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
         &HintProvider { hints: Vec::new() },
         &HashMap::new(),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &Orphans::new(),
@@ -4535,6 +4580,7 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
         depends_on: vec![],
         line: 1,
     };
+    let schemas = string_wait_schemas("");
 
     let plan = create_plan(
         &resources,
@@ -4542,11 +4588,11 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
         &HintProvider { hints: Vec::new() },
         &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
-            &crate::schema::SchemaRegistry::new(),
-            &[],
+            &schemas,
+            &resources,
         ),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &Orphans::new(),

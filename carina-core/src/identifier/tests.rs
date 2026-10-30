@@ -5243,15 +5243,17 @@ fn detect_reference_form_rename(
         AnonymousToNamedCandidates::new(&resources, &candidates, &claimed_origins),
         registry,
         &comparison_provider,
-        &|provider, resource_type| {
-            claims.screen_entries(
-                provider,
-                resource_type,
-                [state_entry.clone()],
-                AnonymousIdStateInfo::name,
-            )
-        },
-        &|_binding| Vec::new(),
+        AnonymousToNamedStateLookup::new(
+            &|provider, resource_type| {
+                claims.screen_entries(
+                    provider,
+                    resource_type,
+                    [state_entry.clone()],
+                    AnonymousIdStateInfo::name,
+                )
+            },
+            &|_binding| Vec::new(),
+        ),
         &providers,
         &|_provider| Vec::new(),
         &claims,
