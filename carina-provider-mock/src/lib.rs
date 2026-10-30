@@ -25,7 +25,8 @@ use carina_core::resource::{
     ConcreteValue, Resource, ResourceId, State, Value, legacy_secret_migration,
 };
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, StructField, ValidatedResourceSchema,
+    AttributeSchema, AttributeType, ResourceSchema, StructField, ValidatedConfigSchema,
+    ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 use carina_core::value::{PersistedValue, migrate_legacy_persisted_json};
 use serde::{Deserialize, Serialize};
@@ -212,6 +213,22 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                     .create_only()
                     .build(),
             )
+            .attribute(
+                AttributeSchema::optional(
+                    "choice",
+                    AttributeType::union(vec![
+                        AttributeType::struct_(
+                            "StringChoice",
+                            vec![StructField::required("value", AttributeType::string()).build()],
+                        ),
+                        AttributeType::struct_(
+                            "IntegerChoice",
+                            vec![StructField::required("number", AttributeType::int()).build()],
+                        ),
+                    ]),
+                )
+                .build(),
+            )
             .attribute(AttributeSchema::optional("web_acl_arn", AttributeType::string()).build())
             .attribute(AttributeSchema::optional("parent", AttributeType::string()).build())
             .attribute(AttributeSchema::optional("parent_name", AttributeType::string()).build())
@@ -330,6 +347,10 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                     .build(),
             )
             .attribute(AttributeSchema::optional("description", AttributeType::string()).build()),
+        ResourceSchema::new("iam.Roles").attribute(
+            AttributeSchema::optional("names", AttributeType::list(AttributeType::string()))
+                .build(),
+        ),
         ResourceSchema::new("iam.Roles")
             .attribute(AttributeSchema::optional("name_regex", AttributeType::string()).build())
             .attribute(
@@ -350,6 +371,16 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                 .expect("built-in mock resource schema must be valid")
         })
         .collect()
+}
+
+/// Aggregate schema witness exposed by Carina's built-in mock provider.
+pub fn builtin_schema_witness() -> ValidatedProviderSchemaWitness {
+    ValidatedProviderSchemaWitness::new(
+        builtin_schemas(),
+        ValidatedConfigSchema::default(),
+        Default::default(),
+    )
+    .expect("built-in mock schemas form a valid provider-wide witness")
 }
 
 pub struct MockProvider {
@@ -1240,6 +1271,51 @@ fn append_update_trace(event: &str, resource: &str, active: Option<usize>) {
     let _ = file.write_all(line.as_bytes());
 }
 
+fn append_update_patch_log(id: &ResourceId, ops: &[PatchOp]) -> ProviderResult<()> {
+    let Some(path) = env::var_os("CARINA_MOCK_UPDATE_PATCH_LOG").map(PathBuf::from) else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            ProviderError::internal_caused_by(
+                "Failed to create mock update patch log directory",
+                error,
+            )
+        })?;
+    }
+    let operations = ops
+        .iter()
+        .map(|op| match op {
+            PatchOp::Add { key, .. } => serde_json::json!({ "op": "add", "key": key }),
+            PatchOp::Replace { key, .. } => {
+                serde_json::json!({ "op": "replace", "key": key })
+            }
+            PatchOp::Reassert { key, .. } => {
+                serde_json::json!({ "op": "reassert", "key": key })
+            }
+            PatchOp::Remove { key } => serde_json::json!({ "op": "remove", "key": key }),
+        })
+        .collect::<Vec<_>>();
+    let line = serde_json::to_string(&serde_json::json!({
+        "resource": id.to_string(),
+        "operations": operations,
+    }))
+    .map_err(|error| {
+        ProviderError::internal_caused_by("Failed to encode mock update patch log", error)
+    })?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| {
+            ProviderError::internal_caused_by("Failed to open mock update patch log", error)
+        })?;
+    file.write_all(format!("{line}\n").as_bytes())
+        .map_err(|error| {
+            ProviderError::internal_caused_by("Failed to append mock update patch log", error)
+        })
+}
+
 impl MockProvider {
     async fn read_attributes(
         &self,
@@ -1500,12 +1576,22 @@ impl Provider for MockProvider {
                 return Err(error);
             }
             Self::append_update_request_if_configured(&request)?;
+            append_update_patch_log(&id, &request.patch().ops)?;
 
-            // Apply the patch on top of `from` to construct the post-update
-            // attribute map. The mock writes only what the user changed —
-            // matching the Level 3 contract that providers MUST NOT touch
-            // unspecified fields.
-            let mut attributes = request.from().attributes.clone();
+            let _state_guard = Self::lock_state_file()?;
+            let mut states = self.load_states_for_operation()?;
+            // Apply only the requested operations to the provider's current
+            // value. In particular, a read may omit write-only leaves that
+            // still exist in the backend and must survive an unrelated patch.
+            let mut attributes = states.get(&key).map_or_else(
+                || request.from().attributes.clone(),
+                |attributes| {
+                    attributes
+                        .iter()
+                        .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
+                        .collect()
+                },
+            );
             for op in &request.patch().ops {
                 match op {
                     PatchOp::Add { key, value }
@@ -1526,8 +1612,6 @@ impl Provider for MockProvider {
             Self::add_server_list_update_out_of_band_element(&id, &mut attributes);
             Self::add_server_list_defaults(&id, &mut attributes);
 
-            let _state_guard = Self::lock_state_file()?;
-            let mut states = self.load_states_for_operation()?;
             let partial_update = self.partial_update_config_for(&id);
             let mut attrs: HashMap<String, PersistedValue> = attributes
                 .iter()
@@ -1638,6 +1722,9 @@ mod tests {
                 .iter()
                 .any(|schema| schema.as_schema().resource_type() == "test.deferred_source")
         );
+        let witness = builtin_schema_witness();
+        assert_eq!(witness.resources().len(), schemas.len());
+        assert!(witness.reference_forms().is_empty());
     }
 
     struct EnvGuard {
@@ -1703,7 +1790,9 @@ mod tests {
         let request = carina_core::executor::prepare_create_request(resource, &preparation)
             .await
             .expect("mock test resource should pass create preparation");
-        carina_core::executor::dispatch_create(provider, &id, request).await
+        let (create, _cancellation) =
+            carina_core::executor::dispatch_create(provider, &id, request);
+        create.await
     }
 
     fn persist_pending_for_resume(pending: &InFlightCreate) -> InFlightCreate {
@@ -1747,6 +1836,9 @@ mod tests {
             }
             carina_core::resource::Current::MissingIdentifier(state) => {
                 panic!("resume fixture loaded without an identifier: {state:?}")
+            }
+            carina_core::resource::Current::CreateOutcomeUnknown(unknown) => {
+                panic!("resume fixture loaded as outcome unknown: {unknown:?}")
             }
         }
     }
@@ -1826,6 +1918,12 @@ mod tests {
                 (expected, Err(CreateFailureKind::InFlight { pending, error })) => {
                     panic!("expected {expected}, got in flight {pending:?}: {error}")
                 }
+                (expected, Err(CreateFailureKind::OutcomeUnknown { unknown, error })) => {
+                    panic!(
+                        "expected {expected}, got outcome unknown for {}: {error}",
+                        unknown.id()
+                    )
+                }
             }
             drop(mode_guard);
         }
@@ -1854,6 +1952,12 @@ mod tests {
             Err(CreateFailureKind::Untracked(error)) => panic!("expected pending, got {error}"),
             Err(CreateFailureKind::Created { created, error }) => {
                 panic!("expected pending, got {created:?}: {error}")
+            }
+            Err(CreateFailureKind::OutcomeUnknown { unknown, error }) => {
+                panic!(
+                    "expected pending, got outcome unknown for {}: {error}",
+                    unknown.id()
+                )
             }
         };
         drop(create_mode);

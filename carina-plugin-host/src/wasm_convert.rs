@@ -28,6 +28,7 @@ use carina_core::schema::{
 };
 use carina_core::schema::{
     ValidatedConfigSchema as CoreValidatedConfigSchema,
+    ValidatedProviderSchemaWitness as CoreValidatedProviderSchemaWitness,
     ValidatedResourceSchema as CoreValidatedResourceSchema,
 };
 use carina_core::value::{PERSISTED_SECRET_KEY, SerializationContext, SerializationError};
@@ -268,10 +269,12 @@ impl std::error::Error for WasmAppliedStateDecodeError {}
 /// `Value::Deferred(DeferredValue::ResourceRef)`, `Value::Deferred(DeferredValue::Interpolation)`, and
 /// `Value::Deferred(DeferredValue::FunctionCall)` / `Unavailable`. The scoped transport wrapper in
 /// `WasmProviderNormalizer::normalize_desired` strips ref/Unknown-bearing
-/// attributes before conversion and restores them after the guest call, so
-/// reaching any of these arms is a producer-side bug — the diagnostic
-/// identifies which variant leaked. See RFC #2371 stage 2 (#2378) for
-/// `Unknown` and #2387 for `ResourceRef` / `Interpolation` / `FunctionCall`.
+/// attributes before conversion, reports their top-level names through the
+/// WIT `desired-resource.deferred` field, and restores their values after the
+/// guest call. Reaching any of these arms is therefore a producer-side bug —
+/// the diagnostic identifies which variant leaked. See RFC #2371 stage 2
+/// (#2378) for `Unknown` and #2387 for `ResourceRef` / `Interpolation` /
+/// `FunctionCall`.
 ///
 /// `Value::Deferred(DeferredValue::Secret(inner))` is encoded as the `secret-val` WIT variant
 /// (#2390): the inner is JSON-encoded the same way `list-val` / `map-val`
@@ -1142,11 +1145,14 @@ impl DeletePendingOperation {
 
 pub(crate) type DecodedCreateStep =
     proto::CreateStep<HashMap<String, CoreValue>, CorePartialReadDiagnostic, proto::PendingToken>;
-pub(crate) type DecodedCreateVerdict = proto::CreateVerdict<CoreReadOutcome, CoreProviderError>;
-pub(crate) type DecodedPollVerdict = proto::PollVerdict<CoreReadOutcome, CoreProviderError>;
+pub(crate) type DecodedCreateVerdict =
+    proto::CreateVerdict<CoreReadOutcome, proto::PendingToken, CoreProviderError>;
+pub(crate) type DecodedPollVerdict =
+    proto::PollVerdict<CoreReadOutcome, proto::PendingToken, CoreProviderError>;
 pub(crate) type DecodedResumeStep =
     proto::ResumeStep<HashMap<String, CoreValue>, CorePartialReadDiagnostic, proto::PendingToken>;
-pub(crate) type DecodedResumeVerdict = proto::ResumeVerdict<CoreReadOutcome, CoreProviderError>;
+pub(crate) type DecodedResumeVerdict =
+    proto::ResumeVerdict<CoreReadOutcome, proto::PendingToken, CoreProviderError>;
 type DecodedCreatedState = DecodedIssued<(proto::AppliedIdentifier, HashMap<String, CoreValue>)>;
 
 /// Result of decoding a create-bearing WIT value after its provider
@@ -1317,6 +1323,44 @@ fn wit_to_core_pending_create(
     })
 }
 
+fn wit_to_core_resume_pending(
+    pending: wit::ResumePending,
+    id: &CoreResourceId,
+) -> Result<proto::ResumePending<proto::PendingToken>, WasmAppliedStateDecodeError> {
+    let wit::ResumePending {
+        operation,
+        identifier,
+    } = pending;
+    let wit::PendingOperation {
+        token,
+        poll_after_secs,
+    } = operation;
+    let identifier = identifier
+        .map(|identifier| decode_create_identifier(identifier, id))
+        .transpose()?;
+    Ok(proto::ResumePending {
+        token: proto::PendingToken::new(token),
+        identifier,
+        poll_after_secs,
+    })
+}
+
+pub(crate) fn wit_to_core_reference_scope(
+    scope: wit::ReferenceScope,
+) -> Result<proto::ReferenceScope, proto::ReferenceScopeError> {
+    match scope {
+        wit::ReferenceScope::Available(values) => {
+            let wit::ReferenceScopeValues {
+                partition,
+                region,
+                account,
+            } = values;
+            proto::ReferenceScope::available(partition, region, account)
+        }
+        wit::ReferenceScope::Unavailable => Ok(proto::ReferenceScope::Unavailable),
+    }
+}
+
 fn wit_to_core_observation(
     observation: wit::Observation,
     id: &CoreResourceId,
@@ -1421,6 +1465,16 @@ pub(crate) fn wit_to_core_create_verdict(
         wit::CreateVerdict::Discarded(error) => Ok(DecodedIssued::Decoded(
             proto::CreateVerdict::Discarded(wit_to_core_provider_error(error)),
         )),
+        wit::CreateVerdict::InFlight(in_flight) => {
+            let wit::CreateInFlight { pending, error } = in_flight;
+            let pending = wit_to_core_pending_create(pending, id)?;
+            Ok(DecodedIssued::Decoded(proto::CreateVerdict::InFlight(
+                proto::CreateInFlight {
+                    pending,
+                    error: wit_to_core_provider_error(error),
+                },
+            )))
+        }
     }
 }
 
@@ -1440,6 +1494,16 @@ pub(crate) fn wit_to_core_poll_verdict(
         wit::PollVerdict::Undetermined(error) => Ok(DecodedIssued::Decoded(
             proto::PollVerdict::Undetermined(wit_to_core_provider_error(error)),
         )),
+        wit::PollVerdict::InFlight(in_flight) => {
+            let wit::CreateInFlight { pending, error } = in_flight;
+            let pending = wit_to_core_pending_create(pending, id)?;
+            Ok(DecodedIssued::Decoded(proto::PollVerdict::InFlight(
+                proto::CreateInFlight {
+                    pending,
+                    error: wit_to_core_provider_error(error),
+                },
+            )))
+        }
     }
 }
 
@@ -1456,26 +1520,9 @@ pub(crate) fn wit_to_core_resume_step(
                 })
             })
         }
-        wit::ResumeStep::Pending(pending) => {
-            let wit::ResumePending {
-                operation,
-                identifier,
-            } = pending;
-            let wit::PendingOperation {
-                token,
-                poll_after_secs,
-            } = operation;
-            let identifier = identifier
-                .map(|identifier| decode_create_identifier(identifier, id))
-                .transpose()?;
-            Ok(DecodedIssued::Decoded(proto::ResumeStep::Pending(
-                proto::ResumePending {
-                    token: proto::PendingToken::new(token),
-                    identifier,
-                    poll_after_secs,
-                },
-            )))
-        }
+        wit::ResumeStep::Pending(pending) => wit_to_core_resume_pending(pending, id)
+            .map(proto::ResumeStep::Pending)
+            .map(DecodedIssued::Decoded),
         wit::ResumeStep::Resent(step) => {
             wit_to_core_create_step(step, id).map(|decoded| decoded.map(proto::ResumeStep::Resent))
         }
@@ -1527,6 +1574,16 @@ pub(crate) fn wit_to_core_resume_verdict(
         wit::ResumeVerdict::Undetermined(error) => Ok(DecodedIssued::Decoded(
             proto::ResumeVerdict::Undetermined(wit_to_core_provider_error(error)),
         )),
+        wit::ResumeVerdict::InFlight(in_flight) => {
+            let wit::ResumeInFlight { pending, error } = in_flight;
+            let pending = wit_to_core_resume_pending(pending, id)?;
+            Ok(DecodedIssued::Decoded(proto::ResumeVerdict::InFlight(
+                proto::ResumeInFlight {
+                    pending,
+                    error: wit_to_core_provider_error(error),
+                },
+            )))
+        }
         wit::ResumeVerdict::Resent(verdict) => wit_to_core_create_verdict(verdict, id)
             .map(|decoded| decoded.map(proto::ResumeVerdict::Resent)),
     }
@@ -1844,6 +1901,18 @@ pub fn json_to_schemas(json: &str) -> Result<Vec<CoreValidatedResourceSchema>, S
         .map_err(SchemaDecodeError::protocol_conversion)
 }
 
+/// Deserialize the provider schema envelope and admit it together with the
+/// separately exported provider-config witness.
+pub fn json_to_provider_schema(
+    json: &str,
+    config: CoreValidatedConfigSchema,
+) -> Result<CoreValidatedProviderSchemaWitness, SchemaDecodeError> {
+    let envelope: proto::ProviderSchemaEnvelope =
+        serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
+    carina_core::protocol_convert::protocol_to_provider_schema_witness(&envelope, config)
+        .map_err(SchemaDecodeError::protocol_conversion)
+}
+
 /// Deserialize a JSON-encoded `BTreeMap<String, AttributeType>` from a WASM
 /// guest and convert it to core `AttributeType` values.
 pub fn json_to_attribute_types(json: &str) -> Result<CoreValidatedConfigSchema, SchemaDecodeError> {
@@ -1910,6 +1979,176 @@ mod tests {
             current = source.source();
         }
         rendered.join(" -> ")
+    }
+
+    #[test]
+    fn reference_scope_transport_preserves_both_closed_variants() {
+        let available = wit::ReferenceScope::Available(wit::ReferenceScopeValues {
+            partition: "aws".to_string(),
+            region: "ap-northeast-1".to_string(),
+            account: "123456789012".to_string(),
+        });
+        assert_eq!(
+            wit_to_core_reference_scope(available).expect("valid scope must cross the boundary"),
+            proto::ReferenceScope::available("aws", "ap-northeast-1", "123456789012")
+                .expect("fixture scope is valid")
+        );
+        assert_eq!(
+            wit_to_core_reference_scope(wit::ReferenceScope::Unavailable)
+                .expect("unavailable is always valid"),
+            proto::ReferenceScope::Unavailable
+        );
+    }
+
+    #[test]
+    fn reference_scope_transport_rejects_invalid_guest_values() {
+        let invalid = wit::ReferenceScope::Available(wit::ReferenceScopeValues {
+            partition: "aws{name}".to_string(),
+            region: String::new(),
+            account: "123456789012".to_string(),
+        });
+
+        assert_eq!(
+            wit_to_core_reference_scope(invalid).unwrap_err(),
+            proto::ReferenceScopeError::ContainsBrace {
+                field: proto::ReferenceScopeField::Partition,
+            }
+        );
+    }
+
+    #[test]
+    fn in_flight_verdict_arms_cross_the_wit_protocol_boundary() {
+        let id = CoreResourceId::with_identity("test", "example");
+        let pending_create = |token: &str| wit::PendingCreate {
+            operation: wit::PendingOperation {
+                token: token.to_string(),
+                poll_after_secs: 7,
+            },
+            identifier: Some("resource-123".to_string()),
+            sent: wit::SentAttributes::Only(vec!["name".to_string()]),
+        };
+
+        let create = wit_to_core_create_verdict(
+            wit::CreateVerdict::InFlight(wit::CreateInFlight {
+                pending: pending_create("create-token"),
+                error: wit_internal_error("create interrupted"),
+            }),
+            &id,
+        )
+        .expect("create in-flight payload must decode");
+        let create = match create {
+            DecodedIssued::Decoded(verdict) => verdict,
+            DecodedIssued::CreatedReadFailed(failure) => {
+                panic!("in-flight create became a created-read failure: {failure:?}")
+            }
+        };
+        let create = match create {
+            proto::CreateVerdict::InFlight(in_flight) => in_flight,
+            proto::CreateVerdict::Untracked(error) => {
+                panic!("in-flight create became untracked: {error}")
+            }
+            proto::CreateVerdict::Created(created) => {
+                panic!("in-flight create became created: {created:?}")
+            }
+            proto::CreateVerdict::Discarded(error) => {
+                panic!("in-flight create became discarded: {error}")
+            }
+        };
+        let proto::CreateInFlight { pending, error } = create;
+        assert_eq!(pending.token.expose_for_provider_call(), "create-token");
+        assert_eq!(
+            pending
+                .identifier
+                .as_ref()
+                .map(proto::AppliedIdentifier::as_str),
+            Some("resource-123")
+        );
+        assert_eq!(pending.sent, proto::Sent::only(["name"]));
+        assert_eq!(pending.poll_after_secs, 7);
+        assert!(error.to_string().contains("create interrupted"));
+
+        let poll = wit_to_core_poll_verdict(
+            wit::PollVerdict::InFlight(wit::CreateInFlight {
+                pending: pending_create("poll-token"),
+                error: wit_internal_error("poll interrupted"),
+            }),
+            &id,
+        )
+        .expect("poll in-flight payload must decode");
+        let poll = match poll {
+            DecodedIssued::Decoded(verdict) => verdict,
+            DecodedIssued::CreatedReadFailed(failure) => {
+                panic!("in-flight poll became a created-read failure: {failure:?}")
+            }
+        };
+        let poll = match poll {
+            proto::PollVerdict::InFlight(in_flight) => in_flight,
+            proto::PollVerdict::Untracked(error) => {
+                panic!("in-flight poll became untracked: {error}")
+            }
+            proto::PollVerdict::Created(created) => {
+                panic!("in-flight poll became created: {created:?}")
+            }
+            proto::PollVerdict::Discarded(error) => {
+                panic!("in-flight poll became discarded: {error}")
+            }
+            proto::PollVerdict::Undetermined(error) => {
+                panic!("in-flight poll became undetermined: {error}")
+            }
+        };
+        let proto::CreateInFlight { pending, error } = poll;
+        assert_eq!(pending.token.expose_for_provider_call(), "poll-token");
+        assert!(error.to_string().contains("poll interrupted"));
+
+        let resume = wit_to_core_resume_verdict(
+            wit::ResumeVerdict::InFlight(wit::ResumeInFlight {
+                pending: wit::ResumePending {
+                    operation: wit::PendingOperation {
+                        token: "resume-token".to_string(),
+                        poll_after_secs: 11,
+                    },
+                    identifier: Some("resource-456".to_string()),
+                },
+                error: wit_internal_error("resume interrupted"),
+            }),
+            &id,
+        )
+        .expect("resume in-flight payload must decode");
+        let resume = match resume {
+            DecodedIssued::Decoded(verdict) => verdict,
+            DecodedIssued::CreatedReadFailed(failure) => {
+                panic!("in-flight resume became a created-read failure: {failure:?}")
+            }
+        };
+        let resume = match resume {
+            proto::ResumeVerdict::InFlight(in_flight) => in_flight,
+            proto::ResumeVerdict::Untracked(error) => {
+                panic!("in-flight resume became untracked: {error}")
+            }
+            proto::ResumeVerdict::Created(created) => {
+                panic!("in-flight resume became created: {created:?}")
+            }
+            proto::ResumeVerdict::Discarded(error) => {
+                panic!("in-flight resume became discarded: {error}")
+            }
+            proto::ResumeVerdict::Undetermined(error) => {
+                panic!("in-flight resume became undetermined: {error}")
+            }
+            proto::ResumeVerdict::Resent(verdict) => {
+                panic!("in-flight resume became resent: {verdict:?}")
+            }
+        };
+        let proto::ResumeInFlight { pending, error } = resume;
+        assert_eq!(pending.token.expose_for_provider_call(), "resume-token");
+        assert_eq!(
+            pending
+                .identifier
+                .as_ref()
+                .map(proto::AppliedIdentifier::as_str),
+            Some("resource-456")
+        );
+        assert_eq!(pending.poll_after_secs, 11);
+        assert!(error.to_string().contains("resume interrupted"));
     }
 
     #[test]
@@ -2190,11 +2429,20 @@ mod tests {
                 )
                 .validate()
                 .expect("generated portable witness must validate");
-            let guest_json = carina_plugin_sdk::schemas_to_json(&[schema])
+            let guest_witness = carina_core::schema::ValidatedProviderSchemaWitness::new(
+                vec![schema],
+                carina_core::schema::ValidatedConfigSchema::default(),
+                Default::default(),
+            )
+            .unwrap();
+            let guest_json = carina_plugin_sdk::provider_schema_to_json(&guest_witness)
                 .expect("typed SDK witness must serialize");
-            let host_witnesses =
-                json_to_schemas(&guest_json).expect("host must decode SDK schema JSON");
-            let host_json = carina_plugin_sdk::schemas_to_json(&host_witnesses)
+            let host_witness = json_to_provider_schema(
+                &guest_json,
+                carina_core::schema::ValidatedConfigSchema::default(),
+            )
+            .expect("host must decode SDK schema JSON");
+            let host_json = carina_plugin_sdk::provider_schema_to_json(&host_witness)
                 .expect("host witness must serialize through the same seam");
 
             assert_eq!(
@@ -2203,6 +2451,42 @@ mod tests {
                 "portable JSON projection changed for generated case {index}"
             );
         }
+    }
+
+    #[test]
+    fn host_provider_schema_decode_retains_reference_forms() {
+        use carina_core::schema::{
+            AttributeSchema, AttributeType, ReferenceForm, ReferenceForms, ReferenceTemplate,
+            ResourceSchema, TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+        };
+
+        let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional(
+                    "name",
+                    AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let form = ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:service:{region}:{account}:widget/{name}",
+            )
+            .unwrap(),
+        };
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![schema],
+            ValidatedConfigSchema::default(),
+            ReferenceForms::from([(identity.clone(), form.clone())]),
+        )
+        .unwrap();
+        let json = carina_plugin_sdk::provider_schema_to_json(&witness).unwrap();
+
+        let decoded = json_to_provider_schema(&json, ValidatedConfigSchema::default()).unwrap();
+        assert_eq!(decoded.reference_forms().get(&identity), Some(&form));
     }
 
     #[test]
@@ -2264,9 +2548,16 @@ mod tests {
             .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
             .validate()
             .expect("SDK resource fixture must validate");
-        let schema_json = carina_plugin_sdk::schemas_to_json(&[schema]).unwrap();
-        let decoded = json_to_schemas(&schema_json).expect("typed resource witness must load");
-        let resource_record = decoded[0]
+        let witness = carina_core::schema::ValidatedProviderSchemaWitness::new(
+            vec![schema],
+            ValidatedConfigSchema::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let schema_json = carina_plugin_sdk::provider_schema_to_json(&witness).unwrap();
+        let decoded = json_to_provider_schema(&schema_json, ValidatedConfigSchema::default())
+            .expect("typed resource witness must load");
+        let resource_record = decoded.resources()[0]
             .effective_node_at_path(&[
                 "domain_validation_options".to_string(),
                 "resource_record".to_string(),
@@ -2275,7 +2566,7 @@ mod tests {
         assert!(resource_record.is_read_only());
         assert!(resource_record.is_deferred_populate());
         assert_eq!(
-            decoded[0]
+            decoded.resources()[0]
                 .effective_attribute("settings")
                 .expect("settings attribute survives SDK/host JSON")
                 .keyed_partial_update()
@@ -3378,10 +3669,11 @@ mod tests {
     /// #2387: `Value::Deferred(DeferredValue::ResourceRef)` reaching `core_to_wit_value` is a
     /// stage-2 invariant violation now — the scoped strip-and-restore wrapper
     /// in `WasmProviderNormalizer::normalize_desired` removes any attribute
-    /// that recursively contains a `ResourceRef` before this boundary. The
-    /// converter returns `Err(UnresolvedResourceRef)` so a regression
-    /// surfaces as a typed error at the call site instead of a
-    /// debug-format string silently flowing into the provider.
+    /// that recursively contains a `ResourceRef` before this boundary and
+    /// marks its top-level name deferred for the guest. The converter returns
+    /// `Err(UnresolvedResourceRef)` so a regression surfaces as a typed error
+    /// at the call site instead of a debug-format string silently flowing into
+    /// the provider.
     #[test]
     fn resource_ref_returns_err_in_core_to_wit_value() {
         use carina_core::resource::AccessPath;
@@ -4214,21 +4506,21 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v12_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 12);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 12);
+    fn test_protocol_version_range_is_v13_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 13);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 13);
     }
 
     #[test]
-    fn test_check_protocol_version_rejects_v11_provider() {
+    fn test_check_protocol_version_rejects_v12_provider() {
         let error = check_protocol_version(
-            r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":11}"#,
+            r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":12}"#,
         )
-        .expect_err("a v12 host must reject a v11 provider");
+        .expect_err("a v13 host must reject a v12 provider");
 
         assert!(error.contains("provider 'old'"));
-        assert!(error.contains("protocol version 11"));
-        assert!(error.contains("requires at least version 12"));
+        assert!(error.contains("protocol version 12"));
+        assert!(error.contains("requires at least version 13"));
     }
 
     #[test]
@@ -4635,7 +4927,7 @@ mod tests {
                 }
             }]"#,
         )
-        .expect_err("protocol v12 schema JSON must declare nested write_only");
+        .expect_err("protocol v13 schema JSON must declare nested write_only");
 
         let rendered = render_error_chain(&err);
         assert!(rendered.contains("schema JSON parse error"));

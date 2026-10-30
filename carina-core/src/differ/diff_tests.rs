@@ -3,6 +3,23 @@ use super::{create_plan_for_tests as create_plan, *};
 use crate::resource::ConcreteValue;
 use indexmap::IndexMap;
 
+fn diff_test(
+    desired: &Resource,
+    current: &State,
+    saved: Option<&HashMap<String, Value>>,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+) -> Diff {
+    super::diff_test(
+        desired,
+        current,
+        saved,
+        prev_explicit,
+        schema,
+        &super::exact_comparison_context_for_tests(),
+    )
+}
+
 fn existing_state(id: ResourceId, attributes: HashMap<String, Value>) -> State {
     let identifier = id
         .identity_str()

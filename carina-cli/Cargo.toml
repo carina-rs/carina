@@ -17,7 +17,7 @@ name = "plan-fixture"
 path = "examples/plan-fixture.rs"
 
 [features]
-test-utils = ["carina-provider-resolver/test-utils"]
+test-utils = ["carina-core/test-utils", "carina-provider-resolver/test-utils"]
 
 [dependencies]
 carina-core = { path = "../carina-core" }

@@ -2,10 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use carina_core::effect::{Effect, EffectGeneration};
-use carina_core::identifier::canonical_create_only_value_string;
+use carina_core::identifier::{DesiredCreateOnlyValues, StateCreateOnlyValues};
 use carina_core::plan::Plan;
+use carina_core::provider::{ComparisonResolutionError, ProviderRouter};
 use carina_core::resource::{Current, ResolvedResource, ResolvedResourceId, ResourceId, Value};
-use carina_core::schema::{EffectiveAttribute, SchemaRegistry};
+use carina_core::schema::{SchemaRegistry, ValidatedResourceSchema};
 use colored::Colorize;
 
 /// One plan-time suggestion. Rendering belongs to this typed value rather
@@ -206,7 +207,8 @@ pub fn detect_moved_block_hints<S>(
     plan: &Plan<S>,
     prior: &HashMap<ResourceId, Current>,
     schemas: &SchemaRegistry,
-) -> MovedBlockHints {
+    comparison_provider: &ProviderRouter,
+) -> Result<MovedBlockHints, ComparisonResolutionError> {
     let mut replacement_creates = HashSet::new();
     let mut replacement_deletes = HashSet::new();
     for replacement in plan.replace_display_info() {
@@ -243,13 +245,13 @@ pub fn detect_moved_block_hints<S>(
             | Effect::DeferredReplace(_) => None,
         })
         .collect::<Vec<_>>();
-    let created = plan
-        .effects()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, effect)| match effect {
+    let mut created = Vec::new();
+    for (index, effect) in plan.effects().iter().enumerate() {
+        match effect {
             Effect::Create(resource) if !replacement_creates.contains(&index) => {
-                create_candidate(resource, schemas)
+                if let Some(candidate) = create_candidate(resource, schemas, comparison_provider)? {
+                    created.push(candidate);
+                }
             }
             Effect::Create(_)
             | Effect::Read { .. }
@@ -262,9 +264,9 @@ pub fn detect_moved_block_hints<S>(
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
             | Effect::DeferredCreate { .. }
-            | Effect::DeferredReplace(_) => None,
-        })
-        .collect::<Vec<_>>();
+            | Effect::DeferredReplace(_) => {}
+        }
+    }
 
     let mut destroyed_to_created = vec![Vec::new(); destroyed.len()];
     let mut created_to_destroyed = vec![Vec::new(); created.len()];
@@ -348,12 +350,12 @@ pub fn detect_moved_block_hints<S>(
     }
     components.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-    MovedBlockHints(
+    Ok(MovedBlockHints(
         components
             .into_iter()
             .map(|(_sort_key, hint)| hint)
             .collect(),
-    )
+    ))
 }
 
 struct DestroyCandidate<'a> {
@@ -363,12 +365,9 @@ struct DestroyCandidate<'a> {
 
 struct CreateCandidate<'schema> {
     id: ResolvedResourceId,
-    create_only_values: Vec<CreateOnlyValue<'schema>>,
-}
-
-struct CreateOnlyValue<'schema> {
-    attribute: EffectiveAttribute<'schema>,
-    desired: String,
+    schema: &'schema ValidatedResourceSchema,
+    comparison: carina_core::differ::ComparisonContext<'schema>,
+    create_only_values: DesiredCreateOnlyValues,
 }
 
 enum GraphNode {
@@ -381,6 +380,7 @@ fn current_attributes(current: &Current) -> Option<&HashMap<String, Value>> {
         Current::Absent(state) => Some(&state.state().attributes),
         Current::Present(present) => Some(&present.state().attributes),
         Current::CreateInFlight(_pending) => None,
+        Current::CreateOutcomeUnknown(_unknown) => None,
         Current::MissingIdentifier(state) => Some(&state.state().attributes),
     }
 }
@@ -388,32 +388,31 @@ fn current_attributes(current: &Current) -> Option<&HashMap<String, Value>> {
 fn create_candidate<'schema, S>(
     created: &ResolvedResource<S>,
     schemas: &'schema SchemaRegistry,
-) -> Option<CreateCandidate<'schema>> {
-    let schema = schemas.get_for(created.as_resource())?.schema();
-    let create_only_attributes = schema.as_schema().create_only_attributes();
-    if create_only_attributes.is_empty() {
-        return None;
+    comparison_provider: &'schema ProviderRouter,
+) -> Result<Option<CreateCandidate<'schema>>, ComparisonResolutionError> {
+    let Some(schema) = schemas
+        .get_for(created.as_resource())
+        .map(|schema| schema.schema())
+    else {
+        return Ok(None);
+    };
+    let comparison = comparison_provider.comparison_for(schemas, &created.as_resource().id)?;
+    let create_only_values = DesiredCreateOnlyValues::without_binding_resolution(
+        created.as_resource(),
+        schema.as_schema(),
+    );
+    if !create_only_values.has_configured_values()
+        || !create_only_values.all_configured_values_resolved()
+    {
+        return Ok(None);
     }
 
-    let mut create_only_values = Vec::new();
-    for attribute in create_only_attributes {
-        let Some(desired_value) = created.get_attr(attribute) else {
-            continue;
-        };
-        let desired_value = canonical_create_only_value_string(desired_value)?;
-        create_only_values.push(CreateOnlyValue {
-            attribute: schema.effective_attribute(attribute)?,
-            desired: desired_value,
-        });
-    }
-    if create_only_values.is_empty() {
-        return None;
-    }
-
-    Some(CreateCandidate {
+    Ok(Some(CreateCandidate {
         id: created.resolved_id(),
+        schema,
+        comparison: *comparison.context(),
         create_only_values,
-    })
+    }))
 }
 
 /// Match only the create-only attributes set on the desired resource.
@@ -428,21 +427,13 @@ fn resources_match(destroyed: &DestroyCandidate<'_>, created: &CreateCandidate<'
         return false;
     }
 
-    for create_only in &created.create_only_values {
-        let Some(prior_value) = destroyed
-            .attributes
-            .get(create_only.attribute.name())
-            .cloned()
-            .map(|value| create_only.attribute.canonicalize_state(value))
-            .and_then(|value| canonical_create_only_value_string(&value))
-        else {
-            return false;
-        };
-        if create_only.desired != prior_value {
-            return false;
-        }
-    }
-    true
+    let prior_values =
+        StateCreateOnlyValues::from_state_attributes(created.schema, destroyed.attributes);
+    created.create_only_values.all_match(
+        &prior_values,
+        created.schema.as_schema(),
+        &created.comparison,
+    )
 }
 
 fn render_address(id: &ResolvedResourceId) -> String {
@@ -494,12 +485,31 @@ mod tests {
         AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
     };
 
-    use super::{MovedBlockHint, detect_moved_block_hints};
+    use super::{
+        MovedBlockHint, MovedBlockHints,
+        detect_moved_block_hints as detect_moved_block_hints_with_provider,
+    };
 
     const PROVIDER: &str = "awscc";
     const RESOURCE_TYPE: &str = "ec2.Vpc";
     const CREATE_ONLY_ATTRIBUTE: &str = "cidr_block";
     const CIDR: &str = "10.0.0.0/16";
+
+    fn detect_moved_block_hints<S>(
+        plan: &Plan<S>,
+        prior: &HashMap<ResourceId, Current>,
+        schemas: &SchemaRegistry,
+    ) -> MovedBlockHints {
+        let (_, comparison_provider) = carina_core::provider::comparison_fixture_for_test(
+            schemas,
+            plan.effects().iter().filter_map(|effect| match effect {
+                Effect::Create(resource) => Some(&resource.as_resource().id),
+                _ => None,
+            }),
+        );
+        detect_moved_block_hints_with_provider(plan, prior, schemas, &comparison_provider)
+            .expect("moved-hint comparison fixture must resolve")
+    }
 
     fn identity(value: &str) -> ResourceIdentity {
         ResourceIdentity::try_from(value.to_string()).expect("test identity must be non-empty")
@@ -740,6 +750,62 @@ mod tests {
         let hints = detect_moved_block_hints(&plan, &prior, &schemas);
 
         assert!(matches!(hints.as_slice(), [MovedBlockHint::Suggest(_)]));
+    }
+
+    #[test]
+    fn reordered_unordered_list_create_only_value_suggests_moved_block() {
+        let mut plan = Plan::new();
+        let mut prior = HashMap::new();
+        let old_id = id("old_vpc", None);
+        add_delete(
+            &mut plan,
+            &mut prior,
+            old_id.clone(),
+            CIDR,
+            EffectGeneration::Current,
+        );
+        let prior_attributes = prior
+            .get_mut(old_id.as_inner())
+            .and_then(Current::attributes_mut)
+            .expect("test prior has attributes");
+        prior_attributes.clear();
+        prior_attributes.insert(
+            "zones".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                concrete_string("zone-a"),
+                concrete_string("zone-b"),
+            ])),
+        );
+        let desired = Resource::from_id(id("vpcs[0]", None).into_inner()).with_attribute(
+            "zones",
+            Value::Concrete(ConcreteValue::List(vec![
+                concrete_string("zone-b"),
+                concrete_string("zone-a"),
+            ])),
+        );
+        plan.add(Effect::Create(ResolvedResource::new(desired)));
+
+        let schema = ResourceSchema::new(RESOURCE_TYPE)
+            .attribute(
+                AttributeSchema::optional(
+                    "zones",
+                    AttributeType::unordered_list(AttributeType::string()),
+                )
+                .create_only()
+                .build(),
+            )
+            .validate()
+            .expect("test unordered-list schema must validate");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(PROVIDER, schema);
+
+        let hints = detect_moved_block_hints(&plan, &prior, &schemas);
+
+        let [MovedBlockHint::Suggest(pair)] = hints.as_slice() else {
+            panic!("expected one suggestion, got {hints:?}");
+        };
+        assert_eq!(pair.from().identity_str(), "old_vpc");
+        assert_eq!(pair.to().identity_str(), "vpcs[0]");
     }
 
     #[test]

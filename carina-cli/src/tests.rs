@@ -6,17 +6,23 @@ use indexmap::IndexMap;
 
 use serde_json::json;
 
-use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
+use carina_core::data_source_value::{
+    DataSourceValue, DataSourceValues, ExecutableDataSourceValues,
+};
 use carina_core::effect::{Effect, ReleasedListKey, ReleasedListKeys};
-use carina_core::executor::{AcceptedRequest, Applied};
-use carina_core::parser::{ParsedFile, ProviderConfig, ProviderContext};
+use carina_core::executor::{
+    AcceptedRequest, Applied, ExecutionCheckpointSink, ExecutionEvent, ExecutionObserver,
+    ExecutionOutcome, LiveExecutionInput, ProviderCheckInputs,
+};
+use carina_core::parser::{LoadedProviderContext, ParsedFile, ProviderConfig, ProviderContext};
 use carina_core::plan::Plan;
 use carina_core::provider::{
-    AppliedIdentifier, BoxFuture, ProviderError, ProviderResult, ReadOutcome,
+    AppliedIdentifier, AppliedState, BoxFuture, NoopNormalizer, ProviderError, ProviderResult,
+    ReadOutcome, UpdateOutcome,
 };
 use carina_core::resource::{
-    ConcreteValue, Current, DataSource, DeferredValue, Directives, ResolvedDataSource,
-    ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
+    ConcreteValue, Current, DataSource, DeferredValue, Directives, ParsedIgnorePath,
+    ResolvedDataSource, ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
@@ -28,7 +34,7 @@ use carina_state::{
 };
 
 use crate::commands::apply::{
-    ApplyResult, ApplyTarget, detect_drift, finalize_apply, refresh_pending_states,
+    ApplyResult, ApplyTarget, detect_drift_for_test, finalize_apply, refresh_pending_states,
     save_state_locked,
 };
 use crate::commands::plan::{
@@ -53,6 +59,10 @@ use std::sync::Mutex;
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+fn loaded_provider_context() -> LoadedProviderContext {
+    LoadedProviderContext::empty_for_test()
 }
 
 #[test]
@@ -103,7 +113,7 @@ test.Target { resource_type = VPC }
     );
 
     let error = providers
-        .validate_evaluated_config(loaded.parsed, fixture.path(), true, &[], &[])
+        .validate_evaluated_config(loaded.parsed, fixture.path(), true, &[])
         .expect_err("skip_resource_validation must not mint ValidationReady for a pending slot");
     let rendered = crate::error::format_error_with_source_chain(&error);
     assert!(
@@ -146,10 +156,21 @@ impl ProviderFactory for EvidenceTestFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
-            Ok(Box::new(carina_provider_mock::MockProvider::new()) as Box<dyn Provider>)
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(carina_provider_mock::MockProvider::new())))
         })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -190,7 +211,7 @@ fn record_test_plan(contents: PlanFileContents, providers: &[&str]) -> PlanFile 
 }
 
 fn final_state_save_inputs(sorted_resources: &[ResolvedResource]) -> Arc<ApplyStateSaveInputs> {
-    Arc::new(ApplyStateSaveInputs::new(
+    Arc::new(ApplyStateSaveInputs::new_for_test(
         sorted_resources.to_vec(),
         Plan::new(),
         SchemaRegistry::new(),
@@ -222,9 +243,21 @@ fn checked_exports(
     carina_core::validation::check_export_values_pre_apply(
         params,
         &carina_core::binding_index::ResolvedBindings::default(),
-        &ProviderContext::default(),
+        &loaded_provider_context(),
     )
     .expect("test exports must pass the secret boundary")
+}
+
+fn fixture_unchecked_export_static_type() -> carina_core::static_type::ExportStaticType {
+    carina_core::static_type::ExportStaticType::Inferred(
+        carina_core::static_type::StaticType::Unchecked(
+            carina_core::static_type::InferredUncheckedReason::NotInferable(
+                carina_core::static_type::NotInferableReason::SchemaUnavailable {
+                    binding: "test fixture".to_string(),
+                },
+            ),
+        ),
+    )
 }
 
 fn saved_provider_configs(
@@ -243,6 +276,7 @@ fn saved_provider_configs(
 
 struct TestProvider {
     read_results: HashMap<(String, String), Result<State, String>>,
+    update_result: Option<AppliedState>,
 }
 
 impl TestProvider {
@@ -257,7 +291,17 @@ impl TestProvider {
     fn with_read_result(id: &ResourceId, identifier: &str, result: Result<State, String>) -> Self {
         let mut read_results = HashMap::new();
         read_results.insert((id.to_string(), identifier.to_string()), result);
-        Self { read_results }
+        Self {
+            read_results,
+            update_result: None,
+        }
+    }
+
+    fn with_update_state(state: AppliedState) -> Self {
+        Self {
+            read_results: HashMap::new(),
+            update_result: Some(state),
+        }
     }
 }
 
@@ -322,7 +366,11 @@ impl Provider for TestProvider {
         _identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
-        Box::pin(async { Err(ProviderError::internal("unexpected update")) })
+        let state = self
+            .update_result
+            .clone()
+            .expect("missing update state for test provider");
+        Box::pin(async move { Ok(UpdateOutcome::Success { state }) })
     }
 
     fn delete(
@@ -341,6 +389,166 @@ impl Provider for TestProvider {
     ) -> ProviderResult<Vec<String>> {
         Ok(Vec::new())
     }
+}
+
+struct NoopExecutionObserver;
+
+impl ExecutionObserver for NoopExecutionObserver {
+    fn on_event(&self, _event: &ExecutionEvent<'_>) {}
+}
+
+#[tokio::test]
+async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps_create_record() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("password", AttributeType::string())
+                    .write_only()
+                    .build(),
+            )
+            .validate()
+            .expect("write-only fixture schema is valid"),
+    );
+
+    let ignored_password: ParsedIgnorePath = serde_json::from_value(serde_json::json!({
+        "segments": [{ "kind": "attribute", "value": "password" }]
+    }))
+    .expect("valid ignored password path");
+    let resource = |comment: &str| {
+        let mut resource = Resource::with_provider("mock", "test.resource", "ignored", None)
+            .with_attribute(
+                "comment",
+                Value::Concrete(ConcreteValue::String(comment.into())),
+            )
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String("create-time".into())),
+            );
+        resource.directives.ignore_changes = vec![ignored_password.clone()];
+        resource
+    };
+
+    let created = ResolvedResource::resolve_with_schemas(resource("before"), &schemas)
+        .expect("create resource resolves ignore_changes");
+    let updated = ResolvedResource::resolve_with_schemas(resource("after"), &schemas)
+        .expect("update resource resolves ignore_changes");
+    let id = updated.id.clone();
+    let schema = schemas
+        .get_for(updated.as_resource())
+        .expect("fixture schema is registered")
+        .schema()
+        .as_schema();
+
+    let create_request = AcceptedRequest::create_for_test();
+    let create_state = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "comment".to_string(),
+            Value::Concrete(ConcreteValue::String("before".into())),
+        )]),
+    )
+    .with_identifier("provider-id");
+    let created_row = ResourceState::from_provider_state_for_resource_and_schema(
+        &created,
+        &create_state,
+        None,
+        Some(schema),
+        RowBasis::Applied(&create_request),
+        None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
+    )
+    .expect("create-time row records the unobserved write-only value");
+    let mut existing = StateFile::new();
+    existing
+        .upsert_resource(created_row)
+        .expect("create-time row is valid");
+
+    let from = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "comment".to_string(),
+            Value::Concrete(ConcreteValue::String("before".into())),
+        )]),
+    )
+    .with_identifier("provider-id");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(from),
+        identifier: AppliedIdentifier::new("provider-id").expect("non-empty identifier"),
+        to: updated.clone(),
+        changed_attributes: vec!["comment".to_string()],
+    });
+    let provider = TestProvider::with_update_state(
+        AppliedState::new(
+            id.clone(),
+            "provider-id",
+            HashMap::from([(
+                "comment".to_string(),
+                Value::Concrete(ConcreteValue::String("after".into())),
+            )]),
+        )
+        .expect("non-empty applied identifier"),
+    );
+    let outcome = carina_core::executor::execute_live_plan_for_test(
+        &provider,
+        LiveExecutionInput {
+            plan: &plan,
+            provider_check_inputs: ProviderCheckInputs::Authored,
+            compositions: &[],
+            bindings: Default::default(),
+            managed_current: HashMap::new(),
+            data_source_values: ExecutableDataSourceValues::empty(),
+            normalizer: &NoopNormalizer,
+            provider_configs: &[],
+            factories: &[],
+            schemas: &schemas,
+            parallelism: std::num::NonZeroUsize::new(1).expect("one is non-zero"),
+            precompleted_success_count: 0,
+            checkpoint_sink: ExecutionCheckpointSink::noop(),
+        },
+        &NoopExecutionObserver,
+        carina_core::shutdown::ShutdownToken::running(),
+    )
+    .await;
+    let ExecutionOutcome::Completed(execution) = outcome else {
+        panic!("uncancelled update must complete");
+    };
+    let Some(Applied::Complete { request, .. }) = execution.applied_states.get(&id) else {
+        panic!("successful update must retain accepted-request evidence");
+    };
+    assert!(request.sent_attributes().contains("comment"));
+    assert!(
+        !request.sent_attributes().contains("password"),
+        "an ignored write-only attribute omitted from the patch is not sent"
+    );
+
+    let saved = build_state_after_apply(
+        ApplyStateSave {
+            state_file: existing,
+            sorted_resources: std::slice::from_ref(&updated),
+            runtime_synthesized_resources: &[],
+            managed_current: &HashMap::new(),
+            applied_states: &execution.applied_states,
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        },
+        None,
+    )
+    .expect("accepted update writes state");
+    let password = saved
+        .find_resource_for_id(&id)
+        .and_then(ResourceState::persisted_attributes)
+        .and_then(|attributes| attributes.get("password"));
+    assert_eq!(
+        password,
+        Some(Value::Concrete(ConcreteValue::String("create-time".into()))),
+        "writeback must retain the last accepted create-time write-only value"
+    );
 }
 
 #[tokio::test]
@@ -744,7 +952,9 @@ fn plan_file_serde_round_trip() {
         }),
         "a decoded plan must keep module metadata attached to its saved resource",
     );
-    let Effect::Create(resource) = &deserialized.plan.effects()[0] else {
+    let carina_core::effect::UnresolvedSavedEffect::Create(resource) =
+        &deserialized.plan.effects()[0]
+    else {
         panic!("fixture effect must remain a create");
     };
     assert_eq!(
@@ -757,7 +967,7 @@ fn plan_file_serde_round_trip() {
         }),
         "a decoded plan effect must retain its saved module-source type",
     );
-    let Effect::ReleaseListKeys {
+    let carina_core::effect::UnresolvedSavedEffect::ReleaseListKeys {
         attribute,
         key_field,
         keys,
@@ -1391,6 +1601,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
         None,
         RowBasis::Applied(&AcceptedRequest::create_for_test()),
         None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
     )
     .unwrap();
 
@@ -1446,6 +1657,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
         carina_core::resource::Current::Absent(_state) => None,
         carina_core::resource::Current::MissingIdentifier(_state) => None,
         carina_core::resource::Current::CreateInFlight(_pending) => None,
+        carina_core::resource::Current::CreateOutcomeUnknown(_unknown) => None,
     };
     assert_eq!(
         identifier,
@@ -1521,6 +1733,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
         None,
         RowBasis::Applied(&AcceptedRequest::create_for_test()),
         None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
     )
     .unwrap();
     let mut state_file = StateFile::new();
@@ -1573,6 +1786,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
         carina_core::resource::Current::Absent(_state) => None,
         carina_core::resource::Current::MissingIdentifier(_state) => None,
         carina_core::resource::Current::CreateInFlight(_pending) => None,
+        carina_core::resource::Current::CreateOutcomeUnknown(_unknown) => None,
     };
     assert!(
         identifier.is_some(),
@@ -1591,7 +1805,7 @@ async fn detect_drift_errors_when_resource_missing_from_planned_states() {
     // planned_states is empty - resource is missing
     let planned_states = Vec::new();
 
-    let result = detect_drift(
+    let result = detect_drift_for_test(
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
@@ -1632,7 +1846,7 @@ async fn detect_drift_returns_none_when_no_drift() {
     let provider = TestProvider::with_read_state(&id, identifier, state.clone());
     let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), state)];
 
-    let result = detect_drift(
+    let result = detect_drift_for_test(
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
@@ -1645,6 +1859,89 @@ async fn detect_drift_returns_none_when_no_drift() {
     .expect("drift check succeeds");
 
     assert!(result.drift_messages().is_none(), "Should detect no drift");
+}
+
+#[tokio::test]
+async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
+    use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
+    use carina_core::schema::{
+        ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity, ValidatedConfigSchema,
+        ValidatedProviderSchemaWitness,
+    };
+
+    let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
+    let schema = ResourceSchema::new("lambda.Permission").attribute(
+        AttributeSchema::optional(
+            "function_name",
+            AttributeType::refined_string(Some(identity.clone()), None, None, None),
+        )
+        .build(),
+    );
+    let forms = ReferenceForms::from([(
+        identity,
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:lambda:{region}:{account}:function:{name}",
+            )
+            .expect("valid reference template"),
+        },
+    )]);
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![schema.validate().expect("valid schema")],
+        ValidatedConfigSchema::default(),
+        forms,
+    )
+    .expect("valid provider schema witness");
+    let mut schemas = SchemaRegistry::new();
+    schemas
+        .insert_provider_witness("aws", &witness)
+        .expect("fixture owner has one validated witness");
+
+    let resource = Resource::with_provider("aws", "lambda.Permission", "invoke", None);
+    let id = resource.id.clone();
+    let identifier = "permission-id";
+    let planned = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "function_name".to_string(),
+            Value::Concrete(ConcreteValue::String("processor".into())),
+        )]),
+    )
+    .with_identifier(identifier);
+    let actual = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "function_name".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "arn:aws:lambda:us-east-1:123456789012:function:processor".into(),
+            )),
+        )]),
+    )
+    .with_identifier(identifier);
+    let mut provider = ProviderRouter::new();
+    provider.add_provider(
+        "aws".to_string(),
+        InitializedProvider::for_test(
+            Box::new(TestProvider::with_read_state(&id, identifier, actual)),
+            ReferenceScope::available("aws", "us-east-1", "123456789012")
+                .expect("fixture scope is valid"),
+        ),
+    );
+
+    let result = crate::commands::apply::detect_drift(
+        &[resource],
+        &[ReloadedCurrentStateEntry::managed(id, planned)],
+        &MovedOrigins::from_plan(&Plan::new()),
+        &provider,
+        &provider,
+        None,
+        &schemas,
+        ApplyTarget::Project(std::path::Path::new(".")),
+    )
+    .await
+    .expect("reference-equivalent drift check succeeds");
+
+    assert_eq!(result.drift_messages(), None);
 }
 
 #[tokio::test]
@@ -1703,7 +2000,7 @@ async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file
         .expect("schema fixture must be valid"),
     );
 
-    let result = detect_drift(
+    let result = detect_drift_for_test(
         &[resource],
         &[ReloadedCurrentStateEntry::managed(id.clone(), planned)],
         &MovedOrigins::from_plan(&Plan::new()),
@@ -1732,7 +2029,7 @@ async fn detect_drift_uses_identifier_carried_by_present_current() {
         carina_core::resource::fixture_present_current(planned, identifier),
     )];
 
-    let result = detect_drift(
+    let result = detect_drift_for_test(
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
@@ -1775,7 +2072,7 @@ async fn detect_drift_returns_messages_when_drift_detected() {
     let provider = TestProvider::with_read_state(&id, identifier, actual);
     let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), planned)];
 
-    let result = detect_drift(
+    let result = detect_drift_for_test(
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
@@ -1796,7 +2093,7 @@ async fn detect_drift_returns_messages_when_drift_detected() {
 /// produce a Delete effect in the plan.  This is the regression test for issue #844.
 #[test]
 fn orphaned_state_resource_produces_delete_effect() {
-    use carina_core::differ::create_plan;
+    use carina_core::differ::create_plan_for_test as create_plan;
     use std::collections::HashSet;
 
     // State file has two resources: "keep-bucket" and "removed-bucket"
@@ -2005,10 +2302,10 @@ async fn lock_released_on_write_state_failure() {
                 export_params: &checked_exports(&[]),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -2155,10 +2452,10 @@ async fn finalize_apply_uses_write_state_locked() {
                 export_params: &checked_exports(&[]),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -2254,38 +2551,42 @@ impl StateBackend for RefreshTestBackend {
 #[tokio::test]
 async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     let user_dirs = carina_core::TestUserDirs::new();
-    // State has two resources: "keep-bucket" (in config) and "orphan-bucket" (not in config)
+    // State has two resources: "keep" (in config) and "orphan" (not in config).
+    // The fixture uses the built-in mock provider's registered managed type so
+    // every refreshed row has an owner schema.
     let mut state = StateFile::new();
     state
         .upsert_resource(
-            ResourceState::try_applied("s3.Bucket", "keep-bucket", "", "keep-bucket")
+            ResourceState::try_applied("test.resource", "keep", "mock", "keep")
                 .expect("fixture identifier is non-empty")
-                .with_attribute("bucket", json!("keep-bucket")),
+                .with_attribute("name", json!("keep")),
         )
         .expect("test state setup must be valid");
     state
         .upsert_resource(
-            ResourceState::try_applied("s3.Bucket", "orphan-bucket", "", "orphan-bucket")
+            ResourceState::try_applied("test.resource", "orphan", "mock", "orphan")
                 .expect("fixture identifier is non-empty")
-                .with_attribute("bucket", json!("orphan-bucket")),
+                .with_attribute("name", json!("orphan")),
         )
         .expect("test state setup must be valid");
 
     let backend = RefreshTestBackend::new(state);
 
-    // Config only has "keep-bucket" -- "orphan-bucket" was removed from .crn
+    // Config only has "keep" -- "orphan" was removed from .crn.
     let mut parsed = carina_core::parser::InferredFile::default();
-    parsed.resources = vec![Resource::new("s3.Bucket", "keep-bucket").with_attribute(
-        "bucket",
-        Value::Concrete(ConcreteValue::String("keep-bucket".into())),
-    )];
+    parsed.resources = vec![
+        Resource::with_provider("mock", "test.resource", "keep", None).with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("keep".into())),
+        ),
+    ];
 
     // MockProvider returns not_found for both resources (simulates external deletion)
     let lock = LockInfo::for_test("state-refresh");
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[], &[])
+        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
         .unwrap();
     let result = run_state_refresh_locked(
         validated_config,
@@ -2303,11 +2604,11 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
         .get_written_state()
         .expect("state should be written");
 
-    // "orphan-bucket" should have been removed from state since it was deleted externally
+    // "orphan" should have been removed from state since it was deleted externally
     // and the refresh should have visited it
     assert!(
         written
-            .find_resource("", "s3.Bucket", "orphan-bucket")
+            .find_resource("mock", "test.resource", "orphan")
             .is_none(),
         "Orphaned resource should be removed from state after refresh (issue #879)"
     );
@@ -2335,7 +2636,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[], &[])
+        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
         .unwrap();
 
     let result = run_state_refresh_locked(
@@ -2404,7 +2705,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[], &[])
+        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
         .unwrap();
 
     let result = run_state_refresh_locked(
@@ -2502,10 +2803,10 @@ async fn finalize_apply_without_lock_uses_write_state() {
                 export_params: &checked_exports(&[]),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: state_lock.as_ref(),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -2530,7 +2831,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
 
 #[tokio::test]
 async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -2568,7 +2869,7 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
     };
     let export_params = vec![InferredExportParam {
         name: "answer".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("lookup", "answer"),
         })),
@@ -2588,10 +2889,10 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
                 export_params: &checked_exports(&export_params),
                 data_source_values: &data_source_values,
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -2666,7 +2967,7 @@ fn wiring_context_activates_builtin_mock_for_implicit_fallback() {
 /// 4. Expected: no Delete effect should be generated
 #[test]
 fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
-    use carina_core::differ::create_plan;
+    use carina_core::differ::create_plan_for_test as create_plan;
 
     // State file tracks "removed-bucket" with an identifier (implies it existed in infra)
     let mut state_file = StateFile::new();
@@ -2747,7 +3048,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
 /// 3. No provider.read() calls are made
 #[test]
 fn refresh_false_uses_cached_state_from_state_file() {
-    use carina_core::differ::create_plan;
+    use carina_core::differ::create_plan_for_test as create_plan;
 
     let mut state_file = StateFile::new();
     state_file
@@ -2787,6 +3088,9 @@ fn refresh_false_uses_cached_state_from_state_file() {
         Current::MissingIdentifier(state) => state.state(),
         Current::CreateInFlight(pending) => {
             panic!("fixture unexpectedly loaded an in-flight create: {pending:?}")
+        }
+        Current::CreateOutcomeUnknown(unknown) => {
+            panic!("fixture unexpectedly loaded an unknown create outcome: {unknown:?}")
         }
     };
     assert!(cached_state.exists, "State should exist from state file");
@@ -2839,7 +3143,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
 /// directly without calling provider.read().
 #[test]
 fn refresh_false_includes_orphaned_resources_from_state_file() {
-    use carina_core::differ::create_plan;
+    use carina_core::differ::create_plan_for_test as create_plan;
 
     let mut state_file = StateFile::new();
     state_file
@@ -2907,7 +3211,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
 /// Issue #950: --refresh=false without a state file should treat all resources as new.
 #[test]
 fn refresh_false_without_state_file_treats_resources_as_new() {
-    use carina_core::differ::create_plan;
+    use carina_core::differ::create_plan_for_test as create_plan;
 
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "new-bucket", None);
     resource.set_attr(
@@ -3143,7 +3447,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
 
 #[test]
 fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
-    use carina_core::differ::create_plan;
+    use carina_core::differ::create_plan_for_test as create_plan;
     use carina_core::resource::EnumValueResolver;
     use carina_core::schema::{AttributeSchema, AttributeType, TypeIdentity};
 
@@ -4044,6 +4348,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_27_top_level_keys() {
         "plan",
         "provider_artifacts",
         "provider_configs",
+        "provider_scopes",
         "schema_fingerprints",
         "sorted_resources",
         "source_path",
@@ -4108,6 +4413,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_27_top_level_keys() {
             "wait_bindings",
             "schema_fingerprints",
             "provider_artifacts",
+            "provider_scopes",
         ]
     );
 
@@ -4312,7 +4618,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
         &carina_core::schema::SchemaRegistry::new(),
         &[],
         &std::collections::HashMap::new(),
-        &ProviderContext::default(),
+        &loaded_provider_context(),
     )
     .await;
 
@@ -4329,7 +4635,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
 
 #[tokio::test]
 async fn persist_exports_only_writes_state_with_new_exports() {
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::InferredExportParam;
     use carina_core::resource::{ConcreteValue, Value};
 
     let captured = Arc::new(Mutex::new(None));
@@ -4340,7 +4646,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
 
     let export_params = vec![InferredExportParam {
         name: "account_id".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Concrete(ConcreteValue::String(
             "123456789012".into(),
         ))),
@@ -4357,7 +4663,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
         &carina_core::schema::SchemaRegistry::new(),
         &[],
         &std::collections::HashMap::new(),
-        &ProviderContext::default(),
+        &loaded_provider_context(),
     )
     .await;
 
@@ -4377,7 +4683,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
 
 #[tokio::test]
 async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -4389,7 +4695,7 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
     state_in.insert_export_json_for_test("role_arn", serde_json::json!("prior-arn"));
     let export_params = vec![InferredExportParam {
         name: "role_arn".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("role", "web_acl_arn"),
         })),
@@ -4406,7 +4712,7 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
         &carina_core::schema::SchemaRegistry::new(),
         &[],
         &HashMap::new(),
-        &ProviderContext::default(),
+        &loaded_provider_context(),
     )
     .await;
 
@@ -4482,10 +4788,10 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
                 export_params: &checked_exports(&[]),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -4549,7 +4855,6 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
             export_resolution_inputs: None,
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -4574,7 +4879,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
 
 #[tokio::test]
 async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved() {
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -4621,14 +4926,14 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     let export_params = vec![
         InferredExportParam {
             name: "ax".to_string(),
-            type_expr: TypeExpr::Unknown,
+            static_type: fixture_unchecked_export_static_type(),
             value: Some(Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("a", "id"),
             })),
         },
         InferredExportParam {
             name: "bx".to_string(),
-            type_expr: TypeExpr::Unknown,
+            static_type: fixture_unchecked_export_static_type(),
             value: Some(Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("b", "id"),
             })),
@@ -4646,10 +4951,10 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
                 export_params: &checked_exports(&export_params),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &export_resources,
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -4737,7 +5042,9 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
     };
     let export_params = vec![InferredExportParam {
         name: "broken".to_string(),
-        type_expr: TypeExpr::Float,
+        static_type: carina_core::static_type::ExportStaticType::Inferred(
+            carina_core::static_type::StaticType::Known(TypeExpr::Float),
+        ),
         value: Some(Value::Concrete(ConcreteValue::Float(f64::NAN))),
     }];
 
@@ -4752,10 +5059,10 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
                 export_params: &checked_exports(&export_params),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &export_resources,
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },

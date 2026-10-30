@@ -10,10 +10,15 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use tokio::sync::Notify;
 
 use carina_provider_protocol::types as protocol_types;
 pub use carina_provider_protocol::types::{
-    AppliedIdentifier, EmptyAppliedIdentifier, PendingToken, Sent,
+    AppliedIdentifier, EmptyAppliedIdentifier, PendingToken, ReferenceScope, ReferenceScopeError,
+    ReferenceScopeField, ReferenceScopeValues, Sent,
 };
 use carina_provider_protocol::types::{
     ProviderError as WireProviderError, ProviderErrorKind as WireProviderErrorKind,
@@ -30,7 +35,7 @@ use crate::resource::{
 use crate::resource::{DataSource, RedactedSecretHash};
 use crate::schema::{
     AttributeType, LeafPath, RawShape, RefinedScalarKind, ResourceSchema, SchemaRegistry, Shape,
-    TypeIdentity, ValidatedConfigSchema, ValidatedResourceSchema,
+    TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 use crate::value::{
     PersistedListView, PersistedValue, PersistedValueDecodeError, PersistedView, SerializationError,
@@ -820,9 +825,9 @@ impl UpdateRequest {
         changed_attributes: &[String],
         resource: &ProviderReadyResource,
         schema: &ResourceSchema,
-    ) -> Self {
-        let patch = build_update_patch(changed_attributes, resource, &from, schema);
-        Self { from, patch }
+    ) -> Result<Self, IgnoredWriteOnlyValueError> {
+        let patch = build_update_patch(changed_attributes, resource, &from, schema)?;
+        Ok(Self { from, patch })
     }
 
     /// Current provider-side state.
@@ -876,6 +881,32 @@ pub enum PatchOp {
     Reassert { key: String, value: Value },
     /// User removed a key that previously appeared in the desired state.
     Remove { key: String },
+}
+
+/// Sending a top-level value would overwrite an ignored write-only leaf whose
+/// current provider value cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "resource '{resource}' cannot send attribute '{attribute}' because ignored write-only path '{path}' must be preserved, but its current value cannot be known"
+)]
+pub struct IgnoredWriteOnlyValueError {
+    resource: Box<ResourceId>,
+    attribute: String,
+    path: Box<crate::resource::ParsedIgnorePath>,
+}
+
+impl IgnoredWriteOnlyValueError {
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource
+    }
+
+    pub fn attribute(&self) -> &str {
+        &self.attribute
+    }
+
+    pub fn path(&self) -> &crate::resource::ParsedIgnorePath {
+        &self.path
+    }
 }
 
 impl PatchOp {
@@ -935,56 +966,119 @@ pub fn build_update_patch(
     to: &ProviderReadyResource,
     from: &State,
     schema: &ResourceSchema,
-) -> UpdatePatch {
+) -> Result<UpdatePatch, IgnoredWriteOnlyValueError> {
+    plan_update_patch(changed_attributes, to.as_inner(), from, schema)
+}
+
+/// Decide every update operation from one resolved desired/current pair.
+/// Planning discards the returned patch after validating it; apply retains it
+/// as the provider request payload.
+pub(crate) fn plan_update_patch<S>(
+    changed_attributes: &[String],
+    to: &crate::resource::ResolvedResource<S>,
+    from: &State,
+    schema: &ResourceSchema,
+) -> Result<UpdatePatch, IgnoredWriteOnlyValueError> {
+    let ignore_changes = to.ignore_changes();
     let to = to.as_resource();
     let mut patched_keys = HashSet::new();
-    let mut ops = changed_attributes
-        .iter()
-        .filter_map(|key| {
-            let value = to.attributes.get(key);
-            let in_from = from.attributes.contains_key(key);
-            if value.is_none() && !in_from {
-                return None;
-            }
-            if !patched_keys.insert(key.clone()) {
-                return None;
-            }
-            match (value, in_from) {
-                (Some(value), false) => Some(PatchOp::Add {
-                    key: key.clone(),
-                    value: value.clone(),
-                }),
-                (Some(value), true) => Some(PatchOp::Replace {
-                    key: key.clone(),
-                    value: value.clone(),
-                }),
-                (None, true) => Some(PatchOp::Remove { key: key.clone() }),
-                (None, false) => None,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    if ops.is_empty() {
-        return UpdatePatch { ops };
+    let mut ops = Vec::new();
+    for key in changed_attributes {
+        if ignore_changes.ignores_whole_attribute(key) {
+            continue;
+        }
+        let value = to.attributes.get(key);
+        let in_from = from.attributes.contains_key(key);
+        if value.is_none() && !in_from {
+            continue;
+        }
+        if !patched_keys.insert(key.clone()) {
+            continue;
+        }
+        if value.is_some()
+            && let Some(path) = ignore_changes
+                .for_attribute(key)
+                .find(|path| path.is_write_only())
+        {
+            return Err(ignored_write_only_error(&to.id, key, path));
+        }
+        let sent_value = value.map(|value| {
+            ignore_changes.with_observed_readable_leaves(key, value, from.attributes.get(key))
+        });
+        match (sent_value, in_from) {
+            (Some(value), false) => ops.push(PatchOp::Add {
+                key: key.clone(),
+                value,
+            }),
+            (Some(value), true) => ops.push(PatchOp::Replace {
+                key: key.clone(),
+                value,
+            }),
+            (None, true) => ops.push(PatchOp::Remove { key: key.clone() }),
+            (None, false) => {}
+        }
     }
 
-    let mut reasserts = to
-        .attributes
-        .iter()
-        .filter_map(|(key, value)| {
-            let attribute = schema.attributes.get(key)?;
-            ((attribute.write_only || schema.write_only_bearing(key))
-                && !attribute.create_only
-                && !patched_keys.contains(key))
-            .then(|| PatchOp::Reassert {
-                key: key.clone(),
-                value: value.clone(),
-            })
-        })
-        .collect::<Vec<_>>();
+    if ops.is_empty() {
+        return Ok(UpdatePatch { ops });
+    }
+
+    let mut reasserts = Vec::new();
+    for (key, value) in &to.attributes {
+        let Some(attribute) = schema.attributes.get(key) else {
+            continue;
+        };
+        if (!attribute.write_only && !schema.write_only_bearing(key))
+            || attribute.create_only
+            || patched_keys.contains(key)
+        {
+            continue;
+        }
+        let ignored_write_only = ignore_changes
+            .for_attribute(key)
+            .filter(|path| path.is_write_only())
+            .collect::<Vec<_>>();
+        if attribute.write_only {
+            if ignore_changes.ignores_whole_attribute(key) {
+                continue;
+            }
+            if let Some(path) = ignored_write_only.first() {
+                return Err(ignored_write_only_error(&to.id, key, path));
+            }
+        } else if !ignored_write_only.is_empty() {
+            let desired_write_only = schema.write_only_leaf_projection(key, value);
+            if desired_write_only
+                .iter()
+                .all(|(leaf, _, _)| ignore_changes.ignores_leaf(key, leaf))
+            {
+                continue;
+            }
+            return Err(ignored_write_only_error(&to.id, key, ignored_write_only[0]));
+        }
+        reasserts.push(PatchOp::Reassert {
+            key: key.clone(),
+            value: ignore_changes.with_observed_readable_leaves(
+                key,
+                value,
+                from.attributes.get(key),
+            ),
+        });
+    }
     reasserts.sort_by(|left, right| left.key().cmp(right.key()));
     ops.extend(reasserts);
-    UpdatePatch { ops }
+    Ok(UpdatePatch { ops })
+}
+
+fn ignored_write_only_error(
+    resource: &ResourceId,
+    attribute: &str,
+    path: &crate::resource::ResolvedIgnorePath,
+) -> IgnoredWriteOnlyValueError {
+    IgnoredWriteOnlyValueError {
+        resource: Box::new(resource.clone()),
+        attribute: attribute.to_string(),
+        path: Box::new(path.authored().clone()),
+    }
 }
 
 /// Return type for async operations
@@ -2256,6 +2350,9 @@ enum EncodedStateRowCurrent {
         envelope: EncodedPendingEnvelope,
         started_at: Timestamp,
     },
+    CreateOutcomeUnknown {
+        started_at: Timestamp,
+    },
     #[serde(other)]
     Other,
 }
@@ -2561,6 +2658,35 @@ impl StateRowInFlightCreate {
     }
 }
 
+/// Loader-produced binding of an outcome-unknown timestamp to its containing
+/// state-row address.
+#[derive(Debug)]
+pub struct StateRowUnknownCreateOutcome(UnknownCreateOutcome);
+
+impl StateRowUnknownCreateOutcome {
+    pub fn into_inner(self) -> UnknownCreateOutcome {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for StateRowUnknownCreateOutcome {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let row = EncodedStateRowWithCurrent::deserialize(deserializer)?;
+        let EncodedStateRowCurrent::CreateOutcomeUnknown { started_at } = row.current else {
+            return Err(serde::de::Error::custom(
+                "state row does not contain an outcome-unknown create",
+            ));
+        };
+        let id = ResourceId::with_provider_identity(
+            row.provider,
+            row.resource_type,
+            row.identity,
+            row.directives.provider_instance,
+        );
+        Ok(Self(UnknownCreateOutcome::new(id, started_at)))
+    }
+}
+
 impl<'de> Deserialize<'de> for StateRowInFlightCreate {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let row = EncodedStateRowWithCurrent::deserialize(deserializer)?;
@@ -2770,10 +2896,382 @@ impl InFlightCreate {
     }
 }
 
+/// Proof that no outgoing request was dispatched during one guest call.
+///
+/// The field is private so only the host-owned call recorder can mint this
+/// witness.
+#[derive(Debug)]
+pub struct NoEgress(());
+
+/// Proof that at least one outgoing request was dispatched during one guest
+/// call.
+///
+/// The field is private so providers cannot upgrade an ordinary failure to an
+/// outcome-unknown failure without the host's observation.
+#[derive(Debug)]
+pub struct EgressSent(());
+
+impl EgressSent {
+    /// Construct an egress witness in cross-crate tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn for_test() -> Self {
+        Self(())
+    }
+}
+
+/// Host observation for exactly one guest call.
+#[derive(Debug)]
+pub enum CallEgress {
+    None(NoEgress),
+    Sent(EgressSent),
+}
+
+/// Cloneable handle installed by the host for one guest call.
+///
+/// Clones retain the identity of the call that minted them. A delayed request
+/// therefore cannot mark a later call's recorder.
+#[derive(Clone, Debug)]
+pub struct CallEgressRecorder {
+    state: Arc<CallEgressState>,
+}
+
+#[derive(Debug)]
+struct CallEgressState {
+    dispatched: AtomicBool,
+    pending: AtomicUsize,
+    settled: Notify,
+}
+
+/// One outgoing request whose host policy and dispatch decision is pending.
+///
+/// Dropping the guard records that the request was not dispatched. The host
+/// consumes it with [`PendingCallEgress::dispatched`] immediately before
+/// handing an approved request to the HTTP transport.
+#[derive(Debug)]
+#[must_use = "pending egress is settled when dispatched, rejected, or dropped"]
+pub struct PendingCallEgress {
+    recorder: CallEgressRecorder,
+    settled: bool,
+}
+
+impl CallEgressRecorder {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(CallEgressState {
+                dispatched: AtomicBool::new(false),
+                pending: AtomicUsize::new(0),
+                settled: Notify::new(),
+            }),
+        }
+    }
+
+    /// Start tracking a request before its asynchronous destination checks.
+    ///
+    /// The returned guard belongs to this call's recorder. Policy rejection,
+    /// DNS failure, and task cancellation leave it undispatched.
+    pub fn begin_request(&self) -> PendingCallEgress {
+        self.state.pending.fetch_add(1, Ordering::AcqRel);
+        PendingCallEgress {
+            recorder: self.clone(),
+            settled: false,
+        }
+    }
+
+    fn mark_dispatched(&self) {
+        self.state.dispatched.store(true, Ordering::Release);
+        self.state.settled.notify_one();
+    }
+
+    async fn settled_snapshot(&self) -> CallEgress {
+        loop {
+            let settled = self.state.settled.notified();
+            let pending = self.state.pending.load(Ordering::Acquire);
+            if self.state.dispatched.load(Ordering::Acquire) {
+                return CallEgress::Sent(EgressSent(()));
+            }
+            if pending == 0 {
+                return CallEgress::None(NoEgress(()));
+            }
+            settled.await;
+        }
+    }
+
+    fn may_have_dispatched(&self) -> bool {
+        self.state.pending.load(Ordering::Acquire) > 0
+            || self.state.dispatched.load(Ordering::Acquire)
+    }
+}
+
+impl PendingCallEgress {
+    /// Record that this host-approved request is being dispatched.
+    pub fn dispatched(mut self) {
+        self.recorder.mark_dispatched();
+        self.settle();
+    }
+
+    /// Record that this request did not leave the host.
+    pub fn not_dispatched(mut self) {
+        self.settle();
+    }
+
+    fn settle(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        let previous = self.recorder.state.pending.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous > 0, "a pending egress guard settles exactly once");
+        if previous == 1 {
+            self.recorder.state.settled.notify_one();
+        }
+    }
+}
+
+impl Drop for PendingCallEgress {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
+/// Address and start time retained when a create may have reached the cloud
+/// but returned no identifier or continuation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownCreateOutcome {
+    id: ResourceId,
+    started_at: Timestamp,
+}
+
+impl Serialize for UnknownCreateOutcome {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Encoded<'a> {
+            started_at: &'a Timestamp,
+        }
+
+        Encoded {
+            started_at: &self.started_at,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl UnknownCreateOutcome {
+    fn new(id: ResourceId, started_at: Timestamp) -> Self {
+        Self { id, started_at }
+    }
+
+    pub fn id(&self) -> &ResourceId {
+        &self.id
+    }
+
+    pub fn started_at(&self) -> &Timestamp {
+        &self.started_at
+    }
+
+    pub(crate) fn rebind_for_move(&mut self, id: ResourceId) {
+        self.id = id;
+    }
+}
+
+#[derive(Debug)]
+struct CreateCallCancellationReporter {
+    sender: mpsc::Sender<CancelledCreateReport>,
+}
+
+/// The only two states a dropped started guest create can report.
+#[derive(Debug)]
+pub(crate) enum CancelledCreateReport {
+    Untracked,
+    OutcomeUnknown(UnknownCreateOutcome),
+}
+
+/// Executor-owned receiver for a classified create failure emitted when a
+/// started guest call is dropped during cleanup.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct CreateCallCancellationReceiver {
+    receiver: mpsc::Receiver<CancelledCreateReport>,
+}
+
+impl CreateCallCancellationReceiver {
+    pub(crate) fn drain(&self) -> Vec<CancelledCreateReport> {
+        self.receiver.try_iter().collect()
+    }
+}
+
+/// A guest create call that has started and therefore must be finished or
+/// reported as cancelled.
+#[derive(Debug)]
+pub struct StartedGuestCreateCall {
+    inner: Option<GuestCreateCallInner>,
+}
+
+#[derive(Debug)]
+struct GuestCreateCallInner {
+    attempt: CreateAttempt,
+    recorder: CallEgressRecorder,
+}
+
+impl StartedGuestCreateCall {
+    pub fn egress_recorder(&self) -> CallEgressRecorder {
+        self.inner
+            .as_ref()
+            .expect("a started guest create call owns its inner state")
+            .recorder
+            .clone()
+    }
+
+    pub fn finish(mut self) -> FinishedGuestCreateCall {
+        let inner = self
+            .inner
+            .take()
+            .expect("a started guest create call owns its inner state");
+        FinishedGuestCreateCall { inner: Some(inner) }
+    }
+}
+
+impl Drop for StartedGuestCreateCall {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        report_cancelled_guest_create(inner.attempt, inner.recorder.may_have_dispatched());
+    }
+}
+
+/// A completed guest call whose returned boundary value has not yet been
+/// decoded.
+#[derive(Debug)]
+pub struct FinishedGuestCreateCall {
+    inner: Option<GuestCreateCallInner>,
+}
+
+impl FinishedGuestCreateCall {
+    pub async fn failed(mut self, error: ProviderError) -> GuestCallFailure {
+        let egress = self
+            .inner
+            .as_ref()
+            .expect("a finished guest create call owns its inner state")
+            .recorder
+            .settled_snapshot()
+            .await;
+        let GuestCreateCallInner {
+            attempt,
+            recorder: _recorder,
+        } = self
+            .inner
+            .take()
+            .expect("a finished guest create call owns its inner state");
+        GuestCallFailure {
+            inner: Some(GuestCallFailureInner {
+                attempt,
+                egress,
+                error,
+            }),
+        }
+    }
+
+    /// Decode the complete guest result before releasing the provider-facing
+    /// attempt. A decode error is classified against this call's egress
+    /// record inside this method.
+    pub async fn decode<T, U>(
+        mut self,
+        value: T,
+        decode: impl FnOnce(T) -> Result<U, ProviderError>,
+    ) -> Result<DecodedGuestCreateCall<U>, CreateFailure> {
+        match decode(value) {
+            Ok(value) => {
+                let inner = self
+                    .inner
+                    .take()
+                    .expect("a finished guest create call owns its inner state");
+                Ok(DecodedGuestCreateCall {
+                    attempt: inner.attempt,
+                    value,
+                })
+            }
+            Err(error) => Err(self.failed(error).await.classify()),
+        }
+    }
+}
+
+impl Drop for FinishedGuestCreateCall {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        report_cancelled_guest_create(inner.attempt, inner.recorder.may_have_dispatched());
+    }
+}
+
+/// Fully decoded guest result paired with the only attempt that may interpret
+/// the provider-declared step or verdict.
+#[derive(Debug)]
+pub struct DecodedGuestCreateCall<T> {
+    attempt: CreateAttempt,
+    value: T,
+}
+
+impl<T> DecodedGuestCreateCall<T> {
+    pub fn into_parts(self) -> (CreateAttempt, T) {
+        (self.attempt, self.value)
+    }
+}
+
+/// A guest-call failure that cannot expose its bare provider error. It must be
+/// consumed through [`GuestCallFailure::classify`].
+#[derive(Debug)]
+pub struct GuestCallFailure {
+    inner: Option<GuestCallFailureInner>,
+}
+
+#[derive(Debug)]
+struct GuestCallFailureInner {
+    attempt: CreateAttempt,
+    egress: CallEgress,
+    error: ProviderError,
+}
+
+impl GuestCallFailure {
+    pub fn classify(mut self) -> CreateFailure {
+        let GuestCallFailureInner {
+            attempt,
+            egress,
+            error,
+        } = self
+            .inner
+            .take()
+            .expect("a guest call failure owns its inner state");
+        match egress {
+            CallEgress::None(_no_egress) => attempt.untracked(error),
+            CallEgress::Sent(sent) => attempt.outcome_unknown(sent, error),
+        }
+    }
+}
+
+fn report_cancelled_guest_create(attempt: CreateAttempt, may_have_dispatched: bool) {
+    let CreateAttempt {
+        id,
+        started_at,
+        cancellation,
+    } = attempt;
+    let report = if may_have_dispatched {
+        CancelledCreateReport::OutcomeUnknown(UnknownCreateOutcome::new(id, started_at))
+    } else {
+        CancelledCreateReport::Untracked
+    };
+    let _send_result = cancellation.sender.send(report);
+}
+
 /// Inspectable classification carried by an opaque [`CreateFailure`].
 #[derive(Debug)]
 pub enum CreateFailureKind {
     Untracked(ProviderError),
+    OutcomeUnknown {
+        unknown: UnknownCreateOutcome,
+        error: ProviderError,
+    },
     Created {
         created: ObservedCreate,
         error: ProviderError,
@@ -2806,6 +3304,10 @@ impl std::fmt::Display for CreateFailure {
             CreateFailureKind::Untracked(_error) => {
                 f.write_str("create failed before it could be tracked")
             }
+            CreateFailureKind::OutcomeUnknown {
+                unknown: _unknown,
+                error: _error,
+            } => f.write_str("create outcome is unknown after a request left the provider"),
             CreateFailureKind::Created {
                 created: _created,
                 error: _error,
@@ -2822,6 +3324,10 @@ impl std::error::Error for CreateFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self.kind() {
             CreateFailureKind::Untracked(error) => Some(error),
+            CreateFailureKind::OutcomeUnknown {
+                unknown: _unknown,
+                error,
+            } => Some(error),
             CreateFailureKind::Created {
                 created: _created,
                 error,
@@ -2850,6 +3356,10 @@ impl CreateFailure {
     pub fn provider_error(&self) -> &ProviderError {
         match self.kind() {
             CreateFailureKind::Untracked(error) => error,
+            CreateFailureKind::OutcomeUnknown {
+                unknown: _unknown,
+                error,
+            } => error,
             CreateFailureKind::Created {
                 created: _created,
                 error,
@@ -2858,19 +3368,6 @@ impl CreateFailure {
                 pending: _pending,
                 error,
             } => error,
-        }
-    }
-
-    /// Convert a classified failure from a create begun by `resend` into the
-    /// corresponding resume failure. Only a real create typestate can produce
-    /// the `Untracked` input that becomes `Ended` here.
-    fn into_resent(self) -> ResumeFailure {
-        match self.into_kind() {
-            CreateFailureKind::Untracked(error) => ResumeFailure::ended_from_verdict(error),
-            CreateFailureKind::Created { created, error } => ResumeFailure::created(created, error),
-            CreateFailureKind::InFlight { pending, error } => {
-                ResumeFailure::in_flight(pending, error)
-            }
         }
     }
 
@@ -2884,6 +3381,13 @@ impl CreateFailure {
 
     pub(crate) fn untracked_at_dispatch(error: ProviderError) -> Self {
         Self::from_kind(CreateFailureKind::Untracked(error))
+    }
+
+    pub(crate) fn outcome_unknown_at_dispatch(
+        unknown: UnknownCreateOutcome,
+        error: ProviderError,
+    ) -> Self {
+        Self::from_kind(CreateFailureKind::OutcomeUnknown { unknown, error })
     }
 }
 
@@ -3104,28 +3608,54 @@ impl ResumeFailure {
 ///     error: ProviderError,
 /// ) -> CreateFailure {
 ///     let _issued = attempt.issued(identifier, Sent::AllRequestAttributes);
-///     CreateAttempt::new(ResourceId::new("p", "t", "n")).untracked(error)
+///     CreateAttempt::new(ResourceId::new("p", "t", "n")).0.untracked(error)
 /// }
 /// ```
 #[derive(Debug)]
 pub struct CreateAttempt {
     id: ResourceId,
+    started_at: Timestamp,
+    cancellation: CreateCallCancellationReporter,
 }
 
 impl CreateAttempt {
-    pub(crate) fn new(id: ResourceId) -> Self {
-        Self { id }
+    pub(crate) fn new(id: ResourceId) -> (Self, CreateCallCancellationReceiver) {
+        let (sender, receiver) = mpsc::channel();
+        (
+            Self {
+                id,
+                started_at: Timestamp::now(),
+                cancellation: CreateCallCancellationReporter { sender },
+            },
+            CreateCallCancellationReceiver { receiver },
+        )
     }
 
     /// Construct an initial-create witness in cross-crate tests.
     #[cfg(feature = "test-utils")]
     #[doc(hidden)]
     pub fn for_test(id: ResourceId) -> Self {
-        Self::new(id)
+        Self::new(id).0
     }
 
     pub fn untracked(self, error: ProviderError) -> CreateFailure {
         CreateFailure::from_kind(CreateFailureKind::Untracked(error))
+    }
+
+    pub fn outcome_unknown(self, _sent: EgressSent, error: ProviderError) -> CreateFailure {
+        CreateFailure::from_kind(CreateFailureKind::OutcomeUnknown {
+            unknown: UnknownCreateOutcome::new(self.id, self.started_at),
+            error,
+        })
+    }
+
+    pub fn start_guest_call(self) -> StartedGuestCreateCall {
+        StartedGuestCreateCall {
+            inner: Some(GuestCreateCallInner {
+                attempt: self,
+                recorder: CallEgressRecorder::new(),
+            }),
+        }
     }
 
     pub fn issued(self, identifier: AppliedIdentifier, sent: Sent) -> IssuedCreate {
@@ -3133,19 +3663,12 @@ impl CreateAttempt {
             id: self.id,
             identifier,
             sent,
-            started_at: None,
+            started_at: Some(self.started_at),
         }
     }
 
     pub fn pending(self, token: PendingToken, sent: Sent, poll_after_secs: u32) -> PendingCreate {
-        PendingCreate::new(
-            self.id,
-            token,
-            None,
-            sent,
-            poll_after_secs,
-            Timestamp::now(),
-        )
+        PendingCreate::new(self.id, token, None, sent, poll_after_secs, self.started_at)
     }
 }
 
@@ -3572,7 +4095,12 @@ impl ResentCreateAttempt {
     }
 
     pub fn issued(self, identifier: AppliedIdentifier, sent: Sent) -> ResentIssuedCreate {
-        ResentIssuedCreate(CreateAttempt::new(self.previous.id().clone()).issued(identifier, sent))
+        ResentIssuedCreate(IssuedCreate {
+            id: self.previous.id().clone(),
+            identifier,
+            sent,
+            started_at: Some(Timestamp::now()),
+        })
     }
 
     pub fn pending(
@@ -3581,10 +4109,13 @@ impl ResentCreateAttempt {
         sent: Sent,
         poll_after_secs: u32,
     ) -> ResentPendingCreate {
-        ResentPendingCreate(CreateAttempt::new(self.previous.id().clone()).pending(
+        ResentPendingCreate(PendingCreate::new(
+            self.previous.id().clone(),
             token,
+            None,
             sent,
             poll_after_secs,
+            Timestamp::now(),
         ))
     }
 }
@@ -3618,7 +4149,16 @@ impl ResentIssuedCreate {
     }
 
     pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
-        self.0.failed(observation, error).into_resent()
+        let IssuedCreate {
+            id,
+            identifier,
+            sent,
+            started_at: _started_at,
+        } = self.0;
+        ResumeFailure::created(
+            ObservedCreate::new(id, identifier, observation, SentRecord::Request(sent)),
+            error,
+        )
     }
 
     pub fn discarded(self, error: ProviderError) -> ResumeFailure {
@@ -3643,7 +4183,15 @@ impl ResentFinishingCreate {
     }
 
     pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
-        self.0.failed(observation, error).into_resent()
+        let FinishingCreate {
+            id,
+            identifier,
+            sent,
+        } = self.0;
+        ResumeFailure::created(
+            ObservedCreate::new(id, identifier, observation, SentRecord::Request(sent)),
+            error,
+        )
     }
 
     pub fn discarded(self, error: ProviderError) -> ResumeFailure {
@@ -3687,7 +4235,11 @@ impl ResentPendingCreate {
     }
 
     pub fn untracked(self, error: ProviderError) -> ResumeFailure {
-        self.0.untracked(error).into_resent()
+        if self.0.identifier().is_some() {
+            InFlightCreate::from_pending(self.0).into_resume_failure(error)
+        } else {
+            ResumeFailure::ended_from_verdict(error)
+        }
     }
 }
 
@@ -4227,20 +4779,33 @@ impl ProviderNormalizer for NoopNormalizer {
     }
 }
 
-/// The routing identity shared by provider dispatch and host-owned default-tag
-/// normalization.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ProviderRouteKey {
+/// The exact initialized provider instance selected for a resource operation.
+///
+/// The provider kind alone is insufficient: named instances of one provider
+/// kind may initialize in different regions or accounts and therefore carry
+/// different reference-comparison scopes.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct ProviderInstanceKey {
     provider: String,
     provider_instance: Option<String>,
 }
 
-impl ProviderRouteKey {
-    fn new(provider: impl Into<String>, provider_instance: Option<String>) -> Self {
+impl ProviderInstanceKey {
+    pub fn new(provider: impl Into<String>, provider_instance: Option<String>) -> Self {
         Self {
             provider: provider.into(),
             provider_instance,
         }
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn provider_instance(&self) -> Option<&str> {
+        self.provider_instance.as_deref()
     }
 
     fn matches(&self, id: &ResourceId) -> bool {
@@ -4248,13 +4813,13 @@ impl ProviderRouteKey {
     }
 }
 
-impl From<&ProviderConfig> for ProviderRouteKey {
+impl From<&ProviderConfig> for ProviderInstanceKey {
     fn from(config: &ProviderConfig) -> Self {
         Self::new(config.name.clone(), config.binding.clone())
     }
 }
 
-impl From<&ResourceId> for ProviderRouteKey {
+impl From<&ResourceId> for ProviderInstanceKey {
     fn from(id: &ResourceId) -> Self {
         Self::new(id.provider.clone(), id.provider_instance.clone())
     }
@@ -4391,7 +4956,7 @@ pub fn merge_default_tags<S>(
         return Ok(());
     }
 
-    let route = ProviderRouteKey::from(config);
+    let route = ProviderInstanceKey::from(config);
     for resource in resources.iter_mut() {
         if !route.matches(&resource.id) {
             continue;
@@ -4444,6 +5009,198 @@ pub fn merge_default_tags<S>(
     Ok(())
 }
 
+/// The opaque result of initializing one provider instance.
+///
+/// Native providers can state honestly that no reference scope is available.
+/// An available scope requires the one-shot mint that core passes into the
+/// factory initialization step.
+pub struct InitializeOutcome {
+    reference_scope: ReferenceScope,
+}
+
+/// Raw provider plus the opaque outcome of its initialization transition.
+pub struct ProviderInitialization {
+    provider: Box<dyn Provider>,
+    outcome: InitializeOutcome,
+}
+
+impl ProviderInitialization {
+    fn into_parts(self) -> (Box<dyn Provider>, InitializeOutcome) {
+        (self.provider, self.outcome)
+    }
+}
+
+impl InitializeOutcome {
+    pub fn unavailable() -> Self {
+        Self {
+            reference_scope: ReferenceScope::Unavailable,
+        }
+    }
+
+    pub fn with_provider(self, provider: Box<dyn Provider>) -> ProviderInitialization {
+        ProviderInitialization {
+            provider,
+            outcome: self,
+        }
+    }
+}
+
+/// One-shot capability supplied only while a provider factory initializes an
+/// instance. Its private field prevents callers from minting an available
+/// initialization outcome outside that transition.
+#[doc(hidden)]
+pub struct InitializeOutcomeMint {
+    _private: (),
+}
+
+impl InitializeOutcomeMint {
+    fn new() -> Self {
+        Self { _private: () }
+    }
+
+    pub fn available(
+        self,
+        partition: impl Into<String>,
+        region: impl Into<String>,
+        account: impl Into<String>,
+    ) -> Result<InitializeOutcome, ReferenceScopeError> {
+        ReferenceScope::available(partition, region, account)
+            .map(|reference_scope| InitializeOutcome { reference_scope })
+    }
+}
+
+/// A provider implementation paired with the outcome returned by that exact
+/// initialized instance.
+///
+/// The fields are private so a routed provider cannot exist without an
+/// explicit scope. Comparison contexts borrow this witness rather than a raw
+/// provider, which makes scope selection part of the type-level call path.
+///
+/// Downstream code cannot pair an arbitrary provider with an available scope:
+///
+/// ```compile_fail
+/// use carina_core::provider::{
+///     InitializeOutcomeMint, InitializedProvider, Provider,
+/// };
+///
+/// fn forge(provider: Box<dyn Provider>) -> InitializedProvider {
+///     let mint = InitializeOutcomeMint { _private: () };
+///     let outcome = mint.available("aws", "us-east-1", "123456789012");
+///     InitializedProvider::new(provider, outcome)
+/// }
+/// ```
+pub struct InitializedProvider {
+    provider: Box<dyn Provider>,
+    reference_scope: ReferenceScope,
+}
+
+impl InitializedProvider {
+    pub(crate) fn new(provider: Box<dyn Provider>, outcome: InitializeOutcome) -> Self {
+        Self {
+            provider,
+            reference_scope: outcome.reference_scope,
+        }
+    }
+
+    /// Construct a native provider that cannot use reference-form
+    /// equivalence. Available scope is paired only by core after the factory
+    /// initialization transition.
+    pub fn unavailable(provider: Box<dyn Provider>) -> Self {
+        Self::new(provider, InitializeOutcome::unavailable())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(provider: Box<dyn Provider>, reference_scope: ReferenceScope) -> Self {
+        Self {
+            provider,
+            reference_scope,
+        }
+    }
+
+    pub fn reference_scope(&self) -> &ReferenceScope {
+        &self.reference_scope
+    }
+
+    pub fn provider(&self) -> &(dyn Provider + 'static) {
+        self.provider.as_ref()
+    }
+}
+
+/// Provider normalizers without CRUD-capable initialized instances.
+///
+/// Normalizer-only loading returns this type. It deliberately has no API that
+/// can mint a [`crate::differ::ComparisonContext`].
+pub struct NormalizerRouter {
+    normalizers: Vec<(String, Box<dyn ProviderNormalizer>)>,
+}
+
+impl Default for NormalizerRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NormalizerRouter {
+    pub fn new() -> Self {
+        Self {
+            normalizers: Vec::new(),
+        }
+    }
+
+    pub fn add_normalizer(
+        &mut self,
+        provider_name: impl Into<String>,
+        ext: Box<dyn ProviderNormalizer>,
+    ) {
+        self.normalizers.push((provider_name.into(), ext));
+    }
+}
+
+impl ProviderNormalizer for NormalizerRouter {
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [ProviderResource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            for (provider_name, ext) in &self.normalizers {
+                ext.normalize_desired(resources)
+                    .await
+                    .map_err(|error| error.for_provider(provider_name.clone()))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn normalize_state<'a>(
+        &'a self,
+        current_states: &'a mut StateTransformMap,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            for (provider_name, ext) in &self.normalizers {
+                ext.normalize_state(current_states)
+                    .await
+                    .map_err(|error| error.for_provider(provider_name.clone()))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn hydrate_read_state<'a>(
+        &'a self,
+        current_states: &'a mut StateTransformMap,
+        saved_attrs: &'a SavedAttrs,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            for (provider_name, ext) in &self.normalizers {
+                ext.hydrate_read_state(current_states, saved_attrs)
+                    .await
+                    .map_err(|error| error.for_provider(provider_name.clone()))?;
+            }
+            Ok(())
+        })
+    }
+}
+
 /// A provider that routes operations to the correct sub-provider
 /// based on the resource's `(provider, provider_instance)` pair.
 ///
@@ -4454,8 +5211,264 @@ pub fn merge_default_tags<S>(
 ///   `let <name> = provider <kind> { ... }` and selected via
 ///   `directives { provider = <name> }`.
 pub struct ProviderRouter {
-    providers: HashMap<ProviderRouteKey, Box<dyn Provider>>,
-    normalizers: Vec<(String, Box<dyn ProviderNormalizer>)>,
+    providers: HashMap<ProviderInstanceKey, InitializedProvider>,
+    normalizers: NormalizerRouter,
+}
+
+/// Why an initialized provider comparison could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComparisonResolutionError {
+    MissingResourceSchema { id: ResourceId },
+    UnknownProviderInstance { instance: ProviderInstanceKey },
+    SchemaOwnerMismatch { id: ResourceId, owner: String },
+    ComparisonNotResolvedAtApplyStart { id: ResourceId },
+}
+
+impl std::fmt::Display for ComparisonResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingResourceSchema { id } => {
+                write!(formatter, "missing managed resource schema for `{id}`")
+            }
+            Self::UnknownProviderInstance { instance } => match instance.provider_instance() {
+                Some(binding) => write!(
+                    formatter,
+                    "unknown provider instance `{binding}` for kind `{}`",
+                    instance.provider(),
+                ),
+                None => write!(
+                    formatter,
+                    "unknown default provider instance for kind `{}`",
+                    instance.provider(),
+                ),
+            },
+            Self::SchemaOwnerMismatch { id, owner } => write!(
+                formatter,
+                "resource `{id}` routes to provider `{}` but its schema is owned by `{owner}`",
+                id.provider,
+            ),
+            Self::ComparisonNotResolvedAtApplyStart { id } => write!(
+                formatter,
+                "comparison for `{id}` was not resolved before provider mutation began"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ComparisonResolutionError {}
+
+impl From<ComparisonResolutionError> for ProviderError {
+    fn from(error: ComparisonResolutionError) -> Self {
+        ProviderError::internal_caused_by("Failed to resolve resource comparison", error)
+    }
+}
+
+/// One owner schema paired with the initialized provider context that may
+/// compare values under that schema.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedComparison<'a> {
+    owner_schema: crate::schema::OwnerBoundResourceSchema<'a>,
+    context: crate::differ::ComparisonContext<'a>,
+}
+
+impl<'a> ResolvedComparison<'a> {
+    pub fn owner_schema(self) -> crate::schema::OwnerBoundResourceSchema<'a> {
+        self.owner_schema
+    }
+
+    pub fn context(&self) -> &crate::differ::ComparisonContext<'a> {
+        &self.context
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ResolvedComparisonKey {
+    instance: ProviderInstanceKey,
+    resource_type: String,
+}
+
+impl From<&ResourceId> for ResolvedComparisonKey {
+    fn from(id: &ResourceId) -> Self {
+        // A comparison is owned by the initialized provider instance and the
+        // provider's schema for this resource type. Resource identity is not
+        // part of either context and may still be pending at pre-resolution.
+        Self {
+            instance: ProviderInstanceKey::from(id),
+            resource_type: id.resource_type.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedComparisonData {
+    owner: String,
+    schema: ValidatedResourceSchema,
+    reference_forms: crate::schema::ReferenceForms,
+    scope: ReferenceScope,
+}
+
+/// Apply-start witness containing every comparison state writeback may need.
+///
+/// Its constructor resolves provider routing and schema ownership before any
+/// provider mutation begins. Writeback can therefore borrow comparisons from
+/// this table without performing another fallible route or schema lookup.
+#[derive(Debug, Clone)]
+pub struct ResolvedComparisonTable {
+    entries: HashMap<ResolvedComparisonKey, ResolvedComparisonData>,
+}
+
+impl ResolvedComparisonTable {
+    pub fn comparison_for(
+        &self,
+        id: &ResourceId,
+    ) -> Result<ResolvedComparison<'_>, ComparisonResolutionError> {
+        let key = ResolvedComparisonKey::from(id);
+        let data = self.entries.get(&key).ok_or_else(|| {
+            ComparisonResolutionError::ComparisonNotResolvedAtApplyStart { id: id.clone() }
+        })?;
+        let owner_schema = crate::schema::OwnerBoundResourceSchema::new(
+            &data.owner,
+            &data.schema,
+            &data.reference_forms,
+        );
+        Ok(ResolvedComparison {
+            owner_schema,
+            context: crate::differ::ComparisonContext::from_scope_and_forms(
+                &data.scope,
+                &data.reference_forms,
+            ),
+        })
+    }
+}
+
+/// Build the complete schema/router pair used by comparison-focused tests.
+///
+/// Every requested resource type receives an empty schema when the fixture did
+/// not declare one, and every provider route receives an unavailable-scope
+/// initialized provider. Tests therefore exercise the production comparison
+/// resolver without duplicating schema admission or route setup.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn comparison_fixture_for_test<'a>(
+    registry: &SchemaRegistry,
+    ids: impl IntoIterator<Item = &'a ResourceId>,
+) -> (SchemaRegistry, ProviderRouter) {
+    comparison_fixture_with_scope_for_test(registry, ids, ReferenceScope::Unavailable)
+}
+
+/// Build a comparison fixture with one explicit scope for every requested
+/// route. Reference-form tests use this to exercise the production resolver
+/// without constructing a dispatch-capable provider.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn comparison_fixture_with_scope_for_test<'a>(
+    registry: &SchemaRegistry,
+    ids: impl IntoIterator<Item = &'a ResourceId>,
+    reference_scope: ReferenceScope,
+) -> (SchemaRegistry, ProviderRouter) {
+    let ids = ids.into_iter().cloned().collect::<Vec<_>>();
+    let mut registry = registry.clone();
+    let missing_schemas = ids
+        .iter()
+        .filter(|id| {
+            registry
+                .get(
+                    &id.provider,
+                    &id.resource_type,
+                    crate::schema::SchemaKind::Resource,
+                )
+                .is_none()
+        })
+        .map(|id| (id.provider.clone(), id.resource_type.clone()))
+        .collect::<BTreeSet<_>>();
+    for (owner, resource_type) in missing_schemas {
+        registry.insert(
+            owner,
+            crate::schema::ResourceSchema::new(resource_type)
+                .validate()
+                .expect("empty comparison fixture schema must validate"),
+        );
+    }
+
+    let routes = ids
+        .iter()
+        .map(ProviderInstanceKey::from)
+        .collect::<BTreeSet<_>>();
+    let mut router = ProviderRouter::new();
+    for route in routes {
+        router.add_provider_instance(
+            route,
+            InitializedProvider::for_test(
+                Box::new(ComparisonFixtureProvider),
+                reference_scope.clone(),
+            ),
+        );
+    }
+    (registry, router)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+struct ComparisonFixtureProvider;
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Provider for ComparisonFixtureProvider {
+    fn name(&self) -> &str {
+        "comparison-fixture"
+    }
+
+    fn read(
+        &self,
+        _id: &ResourceId,
+        _identifier: &AppliedIdentifier,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
+        Box::pin(async { panic!("comparison fixture must not dispatch read") })
+    }
+
+    fn read_data_source(
+        &self,
+        _resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { panic!("comparison fixture must not dispatch data-source read") })
+    }
+
+    fn create(
+        &self,
+        _id: &ResourceId,
+        _request: CreateRequest,
+        _attempt: CreateAttempt,
+    ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+        Box::pin(async { panic!("comparison fixture must not dispatch create") })
+    }
+
+    fn resume_create(
+        &self,
+        _request: ResumeCreateRequest,
+    ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
+        Box::pin(async { panic!("comparison fixture must not dispatch resume-create") })
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &AppliedIdentifier,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+        Box::pin(async { panic!("comparison fixture must not dispatch update") })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &AppliedIdentifier,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { panic!("comparison fixture must not dispatch delete") })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> ProviderResult<Vec<String>> {
+        panic!("comparison fixture must not dispatch permission lookup")
+    }
 }
 
 impl Default for ProviderRouter {
@@ -4468,22 +5481,33 @@ impl ProviderRouter {
     pub fn new() -> Self {
         Self {
             providers: HashMap::new(),
-            normalizers: Vec::new(),
+            normalizers: NormalizerRouter::new(),
         }
     }
 
     /// Register the kind's default instance (resources with
     /// `provider_instance = None` route here).
-    pub fn add_provider(&mut self, kind: String, provider: Box<dyn Provider>) {
+    pub fn add_provider(&mut self, kind: String, provider: InitializedProvider) {
         self.providers
-            .insert(ProviderRouteKey::new(kind, None), provider);
+            .insert(ProviderInstanceKey::new(kind, None), provider);
     }
 
     /// Register a provider under the same route derived from its config by
     /// host-owned normalization.
-    pub fn add_provider_config(&mut self, config: &ProviderConfig, provider: Box<dyn Provider>) {
+    pub fn add_provider_config(&mut self, config: &ProviderConfig, provider: InitializedProvider) {
         self.providers
-            .insert(ProviderRouteKey::from(config), provider);
+            .insert(ProviderInstanceKey::from(config), provider);
+    }
+
+    /// Register an already-initialized provider under an explicit instance
+    /// route. Native hosts and test harnesses use this when no parsed provider
+    /// block exists to carry the route.
+    pub fn add_provider_instance(
+        &mut self,
+        key: ProviderInstanceKey,
+        provider: InitializedProvider,
+    ) {
+        self.providers.insert(key, provider);
     }
 
     pub fn add_normalizer(
@@ -4491,16 +5515,19 @@ impl ProviderRouter {
         provider_name: impl Into<String>,
         ext: Box<dyn ProviderNormalizer>,
     ) {
-        self.normalizers.push((provider_name.into(), ext));
+        self.normalizers.add_normalizer(provider_name, ext);
     }
 
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
     }
 
-    fn get_provider_or_error(&self, id: &ResourceId) -> ProviderResult<&dyn Provider> {
-        let key = ProviderRouteKey::from(id);
-        self.providers.get(&key).map(|p| p.as_ref()).ok_or_else(|| {
+    fn get_initialized_provider_or_error(
+        &self,
+        id: &ResourceId,
+    ) -> ProviderResult<&InitializedProvider> {
+        let key = ProviderInstanceKey::from(id);
+        self.providers.get(&key).ok_or_else(|| {
             ProviderError::internal(match &id.provider_instance {
                 Some(binding) => format!(
                     "Unknown provider instance: {} (kind={})",
@@ -4508,6 +5535,101 @@ impl ProviderRouter {
                 ),
                 None => format!("Unknown provider: {}", id.provider),
             })
+        })
+    }
+
+    fn get_provider_or_error(&self, id: &ResourceId) -> ProviderResult<&dyn Provider> {
+        self.get_initialized_provider_or_error(id)
+            .map(InitializedProvider::provider)
+    }
+
+    /// Return the exact scope of every initialized provider instance.
+    pub fn provider_scopes(&self) -> BTreeMap<ProviderInstanceKey, ReferenceScope> {
+        self.providers
+            .iter()
+            .map(|(key, provider)| (key.clone(), provider.reference_scope().clone()))
+            .collect()
+    }
+
+    /// Mint the comparison context for one resource and its owner-bound
+    /// schema. Both the instance route and schema owner must agree.
+    pub fn comparison_context_for<'a>(
+        &'a self,
+        id: &ResourceId,
+        schema: crate::schema::OwnerBoundResourceSchema<'a>,
+    ) -> ProviderResult<crate::differ::ComparisonContext<'a>> {
+        self.resolve_comparison(id, schema)
+            .map(|resolved| resolved.context)
+            .map_err(ProviderError::from)
+    }
+
+    /// Resolve the owner schema and initialized provider comparison context in
+    /// one typed step.
+    pub fn comparison_for<'a>(
+        &'a self,
+        registry: &'a SchemaRegistry,
+        id: &ResourceId,
+    ) -> Result<ResolvedComparison<'a>, ComparisonResolutionError> {
+        let schema = registry
+            .get(
+                &id.provider,
+                &id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .ok_or_else(|| ComparisonResolutionError::MissingResourceSchema { id: id.clone() })?;
+        self.resolve_comparison(id, schema)
+    }
+
+    /// Resolve every resource comparison required by one apply before the
+    /// executor can mutate provider state.
+    pub fn resolve_comparisons<'i>(
+        &self,
+        registry: &SchemaRegistry,
+        ids: impl IntoIterator<Item = &'i ResourceId>,
+    ) -> Result<ResolvedComparisonTable, ComparisonResolutionError> {
+        let mut entries = HashMap::new();
+        for id in ids {
+            let resolved = self.comparison_for(registry, id)?;
+            let owner_schema = resolved.owner_schema();
+            let key = ResolvedComparisonKey::from(id);
+            let provider = self.providers.get(&key.instance).ok_or_else(|| {
+                ComparisonResolutionError::UnknownProviderInstance {
+                    instance: key.instance.clone(),
+                }
+            })?;
+            entries.insert(
+                key,
+                ResolvedComparisonData {
+                    owner: owner_schema.owner().to_string(),
+                    schema: owner_schema.schema().clone(),
+                    reference_forms: owner_schema.reference_forms().clone(),
+                    scope: provider.reference_scope().clone(),
+                },
+            );
+        }
+        Ok(ResolvedComparisonTable { entries })
+    }
+
+    fn resolve_comparison<'a>(
+        &'a self,
+        id: &ResourceId,
+        schema: crate::schema::OwnerBoundResourceSchema<'a>,
+    ) -> Result<ResolvedComparison<'a>, ComparisonResolutionError> {
+        let key = ProviderInstanceKey::from(id);
+        if key.provider() != schema.owner() {
+            return Err(ComparisonResolutionError::SchemaOwnerMismatch {
+                id: id.clone(),
+                owner: schema.owner().to_string(),
+            });
+        }
+        let provider = self.providers.get(&key).ok_or_else(|| {
+            ComparisonResolutionError::UnknownProviderInstance {
+                instance: key.clone(),
+            }
+        })?;
+        Ok(ResolvedComparison {
+            owner_schema: schema,
+            context: crate::differ::ComparisonContext::from_initialized_provider(provider, schema),
         })
     }
 }
@@ -4610,31 +5732,14 @@ impl ProviderNormalizer for ProviderRouter {
         &'a self,
         resources: &'a mut [ProviderResource],
     ) -> BoxFuture<'a, ProviderResult<()>> {
-        Box::pin(async move {
-            // Sequential, never concurrent: normalizers are not
-            // commutative, and `resources` is re-borrowed per iteration
-            // across the `.await`.
-            for (provider_name, ext) in &self.normalizers {
-                ext.normalize_desired(resources)
-                    .await
-                    .map_err(|error| error.for_provider(provider_name.clone()))?;
-            }
-            Ok(())
-        })
+        self.normalizers.normalize_desired(resources)
     }
 
     fn normalize_state<'a>(
         &'a self,
         current_states: &'a mut StateTransformMap,
     ) -> BoxFuture<'a, ProviderResult<()>> {
-        Box::pin(async move {
-            for (provider_name, ext) in &self.normalizers {
-                ext.normalize_state(current_states)
-                    .await
-                    .map_err(|error| error.for_provider(provider_name.clone()))?;
-            }
-            Ok(())
-        })
+        self.normalizers.normalize_state(current_states)
     }
 
     fn hydrate_read_state<'a>(
@@ -4642,14 +5747,8 @@ impl ProviderNormalizer for ProviderRouter {
         current_states: &'a mut StateTransformMap,
         saved_attrs: &'a SavedAttrs,
     ) -> BoxFuture<'a, ProviderResult<()>> {
-        Box::pin(async move {
-            for (provider_name, ext) in &self.normalizers {
-                ext.hydrate_read_state(current_states, saved_attrs)
-                    .await
-                    .map_err(|error| error.for_provider(provider_name.clone()))?;
-            }
-            Ok(())
-        })
+        self.normalizers
+            .hydrate_read_state(current_states, saved_attrs)
     }
 }
 
@@ -5105,7 +6204,22 @@ pub trait ProviderFactory: Send + Sync {
         &self,
         binding: Option<&str>,
         config: &ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>>;
+        initialize_outcome: InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>>;
+
+    /// Run the factory initialization transition and pair its raw provider
+    /// with the opaque outcome inside core.
+    fn create_initialized_provider(
+        &self,
+        binding: Option<&str>,
+        config: &ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+        let created = self.create_provider(binding, config, InitializeOutcomeMint::new());
+        Box::pin(async move {
+            let (provider, outcome) = created.await?.into_parts();
+            Ok(InitializedProvider::new(provider, outcome))
+        })
+    }
 
     /// Create a normalizer instance from configuration attributes.
     ///
@@ -5124,6 +6238,13 @@ pub trait ProviderFactory: Send + Sync {
 
     /// Get all resource schemas for this provider.
     fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema>;
+
+    /// Return the provider-level aggregate schema witness.
+    ///
+    /// Registry ownership, custom-type recognition, and reference forms must
+    /// all be derived from this one snapshot rather than reloading the three
+    /// declaration sources independently.
+    fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness;
 
     /// Attribute names (beyond schema create-only properties) that contribute
     /// to anonymous resource identity. For example, AWS providers return
@@ -5154,17 +6275,109 @@ pub fn find_factory<'a>(
         .map(|f| f.as_ref())
 }
 
-/// Collect all resource schemas from the given factories into a [`SchemaRegistry`].
+/// A schema registry constructed from a completed provider-factory load.
 ///
-/// Each schema is inserted under the factory's `name()` plus `schema.kind`,
-/// so a given `(provider, resource_type)` pair may have both a `Managed`
-/// and a `DataSource` entry registered side by side.
+/// The private field and absence of `Default`/raw-registry conversions prevent
+/// bootstrap registries from being relabeled as provider-loaded. Supplemental
+/// schemas (for example, the built-in mock provider) are admitted only while
+/// this proof is minted from the loaded factory collection.
+#[derive(Debug, Clone)]
+pub struct ProviderLoadedSchemaRegistry {
+    schemas: std::sync::Arc<SchemaRegistry>,
+}
+
+impl ProviderLoadedSchemaRegistry {
+    fn from_registry(schemas: SchemaRegistry) -> Self {
+        Self {
+            schemas: std::sync::Arc::new(schemas),
+        }
+    }
+
+    /// Borrow the provider-loaded registry.
+    pub fn schemas(&self) -> &SchemaRegistry {
+        &self.schemas
+    }
+
+    /// Share the exact registry carried by this proof with read-only consumers.
+    pub fn schemas_arc(&self) -> std::sync::Arc<SchemaRegistry> {
+        std::sync::Arc::clone(&self.schemas)
+    }
+
+    /// Erase the provider-loaded proof for consumers that need only a registry.
+    pub fn into_registry(self) -> SchemaRegistry {
+        std::sync::Arc::try_unwrap(self.schemas).unwrap_or_else(|shared| shared.as_ref().clone())
+    }
+
+    /// Construct provider-loaded schema evidence for cross-crate fixtures.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(schemas: SchemaRegistry) -> Self {
+        Self::from_registry(schemas)
+    }
+}
+
+/// Provider factories and both proofs minted from one captured load.
+///
+/// Production consumers retain this bundle so schema evidence and the loaded
+/// custom-type context cannot be supplied from separate construction paths.
+pub struct LoadedProviderSnapshot {
+    factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>>,
+    schemas: ProviderLoadedSchemaRegistry,
+    provider_context: crate::parser::LoadedProviderContext,
+}
+
+impl LoadedProviderSnapshot {
+    pub fn factories(&self) -> &[Box<dyn ProviderFactory>] {
+        &self.factories
+    }
+
+    pub fn factories_arc(&self) -> std::sync::Arc<Vec<Box<dyn ProviderFactory>>> {
+        std::sync::Arc::clone(&self.factories)
+    }
+
+    pub fn schemas(&self) -> &ProviderLoadedSchemaRegistry {
+        &self.schemas
+    }
+
+    pub fn schema_registry(&self) -> &SchemaRegistry {
+        self.schemas.schemas()
+    }
+
+    pub fn provider_context(&self) -> &crate::parser::LoadedProviderContext {
+        &self.provider_context
+    }
+
+    /// Build a deliberately synthetic loaded snapshot for cross-crate tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(
+        schemas: SchemaRegistry,
+        factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>>,
+    ) -> Self {
+        let provider_context =
+            crate::parser::LoadedProviderContext::new(crate::parser::ProviderContext {
+                decryptor: None,
+                custom_types: provider_custom_types_from_factories(std::sync::Arc::clone(
+                    &factories,
+                )),
+                resource_types: crate::parser::ProviderContext::resource_types_from_schema_registry(
+                    &schemas,
+                ),
+            });
+        Self {
+            factories,
+            schemas: ProviderLoadedSchemaRegistry::from_registry(schemas),
+            provider_context,
+        }
+    }
+}
+
+/// Collect all resource schemas from the given factories into a [`SchemaRegistry`].
 pub fn collect_schemas(factories: &[Box<dyn ProviderFactory>]) -> SchemaRegistry {
     let mut registry = SchemaRegistry::new();
     for factory in factories {
-        for schema in factory.schemas() {
-            registry.insert(factory.name(), schema);
-        }
+        let witness = factory.schema_witness();
+        registry
+            .insert_provider_witness(factory.name(), &witness)
+            .expect("each schema owner must expose one consistent validated witness");
     }
     registry
 }
@@ -5243,109 +6456,6 @@ fn collect_type_names_from_type(
         RawShape::Ref(_) => {}
         RawShape::Bool | RawShape::Duration => {}
     }
-}
-
-fn visit_identified_types(
-    attribute_type: &AttributeType,
-    visitor: &mut dyn FnMut(&TypeIdentity, &AttributeType),
-) {
-    match attribute_type.raw_shape() {
-        RawShape::String {
-            identity: Some(identity),
-            pattern: _,
-            length: _,
-            validate: _,
-            to_dsl: _,
-        }
-        | RawShape::Int {
-            identity: Some(identity),
-            range: _,
-            validate: _,
-        }
-        | RawShape::Float {
-            identity: Some(identity),
-            range: _,
-            validate: _,
-        }
-        | RawShape::Enum {
-            identity,
-            base: _,
-            values: _,
-            dsl_aliases: _,
-            validate: _,
-            to_dsl: _,
-        } => visitor(identity, attribute_type),
-        RawShape::List {
-            element_type,
-            ordered: _,
-            length: _,
-        } => visit_identified_types(element_type, visitor),
-        RawShape::Map { key, value } => {
-            visit_identified_types(key, visitor);
-            visit_identified_types(value, visitor);
-        }
-        RawShape::Struct { name: _, fields } => {
-            for field in fields {
-                visit_identified_types(&field.field_type, visitor);
-            }
-        }
-        RawShape::Union(members) => {
-            for member in members {
-                visit_identified_types(member, visitor);
-            }
-        }
-        RawShape::String {
-            identity: None,
-            pattern: _,
-            length: _,
-            validate: _,
-            to_dsl: _,
-        }
-        | RawShape::Int {
-            identity: None,
-            range: _,
-            validate: _,
-        }
-        | RawShape::Float {
-            identity: None,
-            range: _,
-            validate: _,
-        }
-        | RawShape::Bool
-        | RawShape::Duration
-        | RawShape::Ref(_) => {}
-    }
-}
-
-/// Enumerate identified declarations in a stable schema-defined order.
-///
-/// Resource schemas retain caller slice order. Within each resource, roots are
-/// read from the schema's canonical-name `BTreeMap`, nested
-/// list/map/struct/union members retain their structural declaration order,
-/// and named definitions follow in their `BTreeMap` order. Provider-config
-/// roots come last in their canonical-name `BTreeMap` order. The returned
-/// `Vec` is the ordered authority for dispatch and owner indexes; callers must
-/// not reconstruct this walk from other containers.
-fn identified_types_from_witnesses(
-    schemas: &[ValidatedResourceSchema],
-    config: &ValidatedConfigSchema,
-) -> Vec<(TypeIdentity, AttributeType)> {
-    let mut declarations = Vec::new();
-    let mut collect = |identity: &TypeIdentity, attribute_type: &AttributeType| {
-        declarations.push((identity.clone(), attribute_type.clone()));
-    };
-    for schema in schemas {
-        for attribute in schema.effective_attributes() {
-            visit_identified_types(attribute.field_type(), &mut collect);
-        }
-        for definition in schema.parts().defs.values() {
-            visit_identified_types(definition, &mut collect);
-        }
-    }
-    for attribute_type in config.parts().values() {
-        visit_identified_types(attribute_type, &mut collect);
-    }
-    declarations
 }
 
 fn local_custom_validator(
@@ -5520,12 +6630,51 @@ impl fmt::Debug for CustomTypeDispatchTable {
 }
 
 impl CustomTypeDispatchTable {
+    /// Build guest dispatch from an aggregate provider-schema witness.
+    ///
+    /// Scalar-kind conflicts and missing bridge kinds cannot reach this seam:
+    /// they are rejected before the witness can be constructed.
+    pub fn from_provider_schema(witness: &ValidatedProviderSchemaWitness) -> Self {
+        let mut bindings = HashMap::<TypeIdentity, CustomTypeDispatchBinding>::new();
+        for (identity, declaration) in witness.identified_declarations() {
+            let kind = identified_custom_type_scalar_kind(&declaration)
+                .expect("validated provider schema guarantees a scalar bridge kind");
+            let callback = local_custom_validator(&declaration).cloned();
+            match bindings.entry(identity) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(CustomTypeDispatchBinding {
+                        scalar_kind: kind,
+                        callbacks: callback.into_iter().collect(),
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let binding = entry.get_mut();
+                    assert_eq!(
+                        binding.scalar_kind, kind,
+                        "validated provider schema guarantees one scalar kind per identity"
+                    );
+                    if let Some(callback) = callback
+                        && !binding
+                            .callbacks
+                            .iter()
+                            .any(|existing| std::sync::Arc::ptr_eq(existing, &callback))
+                    {
+                        binding.callbacks.push(callback);
+                    }
+                }
+            }
+        }
+        Self { bindings }
+    }
+
     pub fn build(
         schemas: &[ValidatedResourceSchema],
         config: &ValidatedConfigSchema,
     ) -> Result<Self, CustomTypeDispatchTableError> {
         let mut bindings = HashMap::<TypeIdentity, CustomTypeDispatchBinding>::new();
-        for (identity, declaration) in identified_types_from_witnesses(schemas, config) {
+        for (identity, declaration) in
+            crate::schema::identified_declarations_from_witnesses(schemas, config)
+        {
             let Some(kind) = identified_custom_type_scalar_kind(&declaration) else {
                 return Err(CustomTypeDispatchTableError::MissingScalarKind { identity });
             };
@@ -5630,6 +6779,23 @@ struct OwnerCustomTypeIndex {
     declarations: BTreeMap<TypeIdentity, Vec<AttributeType>>,
 }
 
+struct ProviderFactorySchemaSnapshot {
+    name: String,
+    witness: ValidatedProviderSchemaWitness,
+}
+
+fn capture_provider_factory_schema_snapshot(
+    factories: &[Box<dyn ProviderFactory>],
+) -> Vec<ProviderFactorySchemaSnapshot> {
+    factories
+        .iter()
+        .map(|factory| ProviderFactorySchemaSnapshot {
+            name: factory.name().to_string(),
+            witness: factory.schema_witness(),
+        })
+        .collect()
+}
+
 pub(crate) trait ProviderFactorySource: Send + Sync {
     fn as_factories(&self) -> &[Box<dyn ProviderFactory>];
 }
@@ -5659,7 +6825,12 @@ where
     F: ProviderFactorySource,
 {
     pub(crate) fn new(factories: F) -> Self {
-        let index = build_owner_custom_type_index(factories.as_factories());
+        let snapshot = capture_provider_factory_schema_snapshot(factories.as_factories());
+        let index = build_owner_custom_type_index(&snapshot);
+        Self { factories, index }
+    }
+
+    fn with_index(factories: F, index: BTreeMap<String, OwnerCustomTypeIndex>) -> Self {
         Self { factories, index }
     }
 
@@ -5767,20 +6938,18 @@ where
 }
 
 fn build_owner_custom_type_index(
-    factories: &[Box<dyn ProviderFactory>],
+    snapshot: &[ProviderFactorySchemaSnapshot],
 ) -> BTreeMap<String, OwnerCustomTypeIndex> {
-    factories
+    snapshot
         .iter()
         .enumerate()
         .map(|(factory_index, factory)| {
-            let schemas = factory.schemas();
-            let config = factory.provider_config_attribute_types();
             let mut declarations = BTreeMap::<TypeIdentity, Vec<AttributeType>>::new();
-            for (identity, declaration) in identified_types_from_witnesses(&schemas, &config) {
+            for (identity, declaration) in factory.witness.identified_declarations() {
                 declarations.entry(identity).or_default().push(declaration);
             }
             (
-                factory.name().to_string(),
+                factory.name.clone(),
                 OwnerCustomTypeIndex {
                     factory_index,
                     declarations,
@@ -5798,6 +6967,41 @@ pub fn provider_custom_types_from_factories(
 ) -> crate::parser::ProviderCustomTypes {
     let resolver = FactoryCustomTypeResolver::new(factories);
     crate::parser::ProviderCustomTypes::from_source(resolver)
+}
+
+/// Capture provider schemas once and mint the loaded context and schema proof
+/// shared by validation, planning, apply, state writeback, and the LSP.
+///
+/// Returning one retained bundle makes it impossible for production callers
+/// to pair proofs produced by different provider/schema snapshots.
+pub fn loaded_provider_snapshot_from_factories(
+    factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>>,
+    mut schemas: SchemaRegistry,
+) -> LoadedProviderSnapshot {
+    let snapshot = capture_provider_factory_schema_snapshot(&factories);
+    for factory in &snapshot {
+        schemas
+            .insert_provider_witness(&factory.name, &factory.witness)
+            .expect("each schema owner must expose one consistent validated witness");
+    }
+    let custom_types =
+        crate::parser::ProviderCustomTypes::from_source(FactoryCustomTypeResolver::with_index(
+            std::sync::Arc::clone(&factories),
+            build_owner_custom_type_index(&snapshot),
+        ));
+    let provider_context =
+        crate::parser::LoadedProviderContext::new(crate::parser::ProviderContext {
+            decryptor: None,
+            custom_types,
+            resource_types: crate::parser::ProviderContext::resource_types_from_schema_registry(
+                &schemas,
+            ),
+        });
+    LoadedProviderSnapshot {
+        factories,
+        schemas: ProviderLoadedSchemaRegistry::from_registry(schemas),
+        provider_context,
+    }
 }
 
 fn validate_custom_type_annotation(
@@ -6006,6 +7210,10 @@ impl Provider for Box<dyn Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn initialized(provider: impl Provider + 'static) -> InitializedProvider {
+        InitializedProvider::unavailable(Box::new(provider))
+    }
 
     #[test]
     fn schema_derived_guest_dispatch_restores_the_typed_scalar() {
@@ -6230,7 +7438,7 @@ mod tests {
 
             let table =
                 CustomTypeDispatchTable::build(&[schema], &ValidatedConfigSchema::default())
-                    .expect("v12 dispatch combines every callback attached to one identity");
+                    .expect("v13 dispatch combines every callback attached to one identity");
             let error = table
                 .dispatch(&identity, "value")
                 .expect_err("the first rejecting callback must stop dispatch");
@@ -6351,6 +7559,15 @@ mod tests {
             "config-only custom type fixture"
         }
 
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
+        }
+
         fn schemas(&self) -> Vec<ValidatedResourceSchema> {
             Vec::new()
         }
@@ -6383,7 +7600,8 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &crate::executor::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
             Box::pin(async { Err(ProviderError::internal("not used")) })
         }
     }
@@ -6411,6 +7629,99 @@ mod tests {
             &Value::Concrete(ConcreteValue::String("https://example.test".into())),
         )
         .expect("the same factory source must drive recognition and resolution");
+    }
+
+    struct SnapshotCountingFactory {
+        schema_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ProviderFactory for SnapshotCountingFactory {
+        fn name(&self) -> &str {
+            "snapshot"
+        }
+
+        fn display_name(&self) -> &str {
+            "snapshot fixture"
+        }
+
+        fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+            vec![
+                ResourceSchema::new("test.Item")
+                    .attribute(
+                        crate::schema::AttributeSchema::optional(
+                            "identifier",
+                            AttributeType::refined_string(
+                                Some(TypeIdentity::new(Some("test"), ["item"], "Identifier")),
+                                None,
+                                None,
+                                None,
+                            ),
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .expect("snapshot fixture schema must validate"),
+            ]
+        }
+
+        fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
+            self.schema_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .expect("snapshot fixture must expose one valid aggregate witness")
+        }
+
+        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+            ValidatedConfigSchema::default()
+        }
+
+        fn validate_config(
+            &self,
+            _attributes: &CanonicalProviderConfigAttributes,
+        ) -> ProviderResult<()> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "test".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &crate::executor::ProviderReadyConfig,
+            _initialize_outcome: InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+            Box::pin(async { Err(ProviderError::internal("not used")) })
+        }
+    }
+
+    #[test]
+    fn loaded_provider_snapshot_mints_both_proofs_from_one_schema_capture() {
+        let schema_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>> =
+            std::sync::Arc::new(vec![Box::new(SnapshotCountingFactory {
+                schema_calls: std::sync::Arc::clone(&schema_calls),
+            })]);
+
+        let snapshot = loaded_provider_snapshot_from_factories(factories, SchemaRegistry::new());
+
+        assert_eq!(
+            schema_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "schema evidence and the custom-type index must share one capture"
+        );
+        assert_eq!(snapshot.schema_registry().len(), 1);
+        assert!(snapshot.provider_context().known_custom_types().contains(
+            &crate::parser::OwnedTypeIdentity::provider(
+                "snapshot",
+                TypeIdentity::new(Some("test"), ["item"], "Identifier"),
+            )
+        ));
     }
 
     #[test]
@@ -6456,7 +7767,7 @@ mod tests {
             .expect("same-kind declarations remain a valid resource schema");
 
         let table = CustomTypeDispatchTable::build(&[schema], &ValidatedConfigSchema::default())
-            .expect("pointer-identical validators are one v12 dispatch binding");
+            .expect("pointer-identical validators are one v13 dispatch binding");
         table
             .dispatch(&identity, "value")
             .expect("the shared callback accepts the value");
@@ -6604,8 +7915,9 @@ mod tests {
         use std::error::Error as _;
 
         let id = ResourceId::with_provider_identity("test", "widget", "example", None);
-        let failure =
-            CreateAttempt::new(id).untracked(ProviderError::api_error("leaf create failure"));
+        let failure = CreateAttempt::new(id)
+            .0
+            .untracked(ProviderError::api_error("leaf create failure"));
 
         assert_eq!(
             failure.to_string(),
@@ -6615,6 +7927,120 @@ mod tests {
             failure.source().map(ToString::to_string).as_deref(),
             Some("leaf create failure")
         );
+    }
+
+    #[tokio::test]
+    async fn guest_create_failure_after_egress_is_outcome_unknown() {
+        let id = ResourceId::with_provider_identity("test", "widget", "example", None);
+        let started = CreateAttempt::new(id.clone()).0.start_guest_call();
+        started.egress_recorder().begin_request().dispatched();
+
+        let failure = started
+            .finish()
+            .failed(ProviderError::internal("guest trapped"))
+            .await
+            .classify();
+
+        let CreateFailureKind::OutcomeUnknown { unknown, error } = failure.into_kind() else {
+            panic!("a sent guest call must not be classified as untracked")
+        };
+        assert_eq!(unknown.id(), &id);
+        assert_eq!(error.to_string(), "guest trapped");
+    }
+
+    #[tokio::test]
+    async fn guest_create_failure_without_egress_is_untracked() {
+        let id = ResourceId::with_provider_identity("test", "widget", "example", None);
+        let failure = CreateAttempt::new(id)
+            .0
+            .start_guest_call()
+            .finish()
+            .failed(ProviderError::internal("guest trapped"))
+            .await
+            .classify();
+
+        let CreateFailureKind::Untracked(error) = failure.into_kind() else {
+            panic!("a guest call with no dispatched request must remain untracked")
+        };
+        assert_eq!(error.to_string(), "guest trapped");
+    }
+
+    #[tokio::test]
+    async fn guest_decode_failure_waits_for_pending_egress_decision() {
+        let id = ResourceId::with_provider_identity("test", "widget", "example", None);
+        let started = CreateAttempt::new(id).0.start_guest_call();
+        let pending = started.egress_recorder().begin_request();
+        let classification = tokio::spawn(async move {
+            started
+                .finish()
+                .decode((), |()| {
+                    Err::<(), _>(ProviderError::internal("malformed guest result"))
+                })
+                .await
+                .expect_err("the guest result must fail decoding")
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !classification.is_finished(),
+            "classification must wait for the host's dispatch decision"
+        );
+        pending.not_dispatched();
+
+        let failure = classification.await.expect("classification task");
+        let CreateFailureKind::Untracked(error) = failure.into_kind() else {
+            panic!("a host-denied pending request must not count as egress")
+        };
+        assert_eq!(error.to_string(), "malformed guest result");
+    }
+
+    #[test]
+    fn outcome_unknown_requires_the_egress_sent_witness() {
+        let id = ResourceId::with_provider_identity("test", "widget", "example", None);
+        let failure = CreateAttempt::new(id.clone()).0.outcome_unknown(
+            EgressSent::for_test(),
+            ProviderError::internal("returned value could not be decoded"),
+        );
+
+        let CreateFailureKind::OutcomeUnknown { unknown, error } = failure.into_kind() else {
+            panic!("the egress witness must mint an outcome-unknown failure")
+        };
+        assert_eq!(unknown.id(), &id);
+        assert_eq!(error.to_string(), "returned value could not be decoded");
+    }
+
+    #[test]
+    fn dropped_started_guest_create_reports_only_the_two_cancellation_states() {
+        let sent_id = ResourceId::with_provider_identity("test", "widget", "sent", None);
+        let (attempt, receiver) = CreateAttempt::new(sent_id.clone());
+        let started = attempt.start_guest_call();
+        started.egress_recorder().begin_request().dispatched();
+        drop(started);
+        let reports = receiver.drain();
+        let [CancelledCreateReport::OutcomeUnknown(unknown)] = reports.as_slice() else {
+            panic!("a dropped call after dispatch must report one unknown outcome")
+        };
+        assert_eq!(unknown.id(), &sent_id);
+
+        let unsent_id = ResourceId::with_provider_identity("test", "widget", "unsent", None);
+        let (attempt, receiver) = CreateAttempt::new(unsent_id);
+        drop(attempt.start_guest_call());
+        assert!(matches!(
+            receiver.drain().as_slice(),
+            [CancelledCreateReport::Untracked]
+        ));
+
+        let pending_id = ResourceId::with_provider_identity("test", "widget", "pending", None);
+        let (attempt, receiver) = CreateAttempt::new(pending_id.clone());
+        let started = attempt.start_guest_call();
+        let pending = started.egress_recorder().begin_request();
+        drop(started);
+        let reports = receiver.drain();
+        let [CancelledCreateReport::OutcomeUnknown(unknown)] = reports.as_slice() else {
+            panic!("a dropped call with an unresolved dispatch must report one unknown outcome")
+        };
+        assert_eq!(unknown.id(), &pending_id);
+        pending.not_dispatched();
     }
 
     #[test]
@@ -7933,7 +9359,7 @@ mod tests {
         // The router must route read_data_source to the underlying provider
         // so that overrides work across provider boundaries.
         let mut router = ProviderRouter::new();
-        router.add_provider("input-aware".to_string(), Box::new(InputAwareProvider));
+        router.add_provider("input-aware".to_string(), initialized(InputAwareProvider));
 
         let mut resource =
             DataSource::with_provider("input-aware", "identitystore.user", "mizzy", None);
@@ -7955,14 +9381,12 @@ mod tests {
         let provider = MockProvider;
         let resource = Resource::new("test", "example");
         let id = resource.id.clone();
-        let state = crate::executor::dispatch_create(
+        let (create, _cancellation) = crate::executor::dispatch_create(
             &provider,
             &id,
             CreateRequest::checked(resolved_for_test(resource)),
-        )
-        .await
-        .unwrap()
-        .into_state_for_writeback();
+        );
+        let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
     }
@@ -7970,7 +9394,7 @@ mod tests {
     #[tokio::test]
     async fn provider_router_dispatches_read_by_provider_name() {
         let mut router = ProviderRouter::new();
-        router.add_provider("mock".to_string(), Box::new(MockProvider));
+        router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let identifier = fixture_applied_identifier("mock-id");
@@ -8025,18 +9449,16 @@ mod tests {
     #[tokio::test]
     async fn provider_router_dispatches_create_by_provider_name() {
         let mut router = ProviderRouter::new();
-        router.add_provider("mock".to_string(), Box::new(MockProvider));
+        router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let resource = Resource::with_provider("mock", "test", "example", None);
         let id = resource.id.clone();
-        let state = crate::executor::dispatch_create(
+        let (create, _cancellation) = crate::executor::dispatch_create(
             &router,
             &id,
             CreateRequest::checked(resolved_for_test(resource)),
-        )
-        .await
-        .unwrap()
-        .into_state_for_writeback();
+        );
+        let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
     }
@@ -8533,7 +9955,7 @@ mod tests {
         let to = resolved_for_test(to);
         let schema = ResourceSchema::new("test");
         let changed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let patch = build_update_patch(&changed, &to, &from, &schema);
+        let patch = build_update_patch(&changed, &to, &from, &schema).expect("valid patch");
         assert_eq!(patch.ops.len(), 3);
 
         let by_key: HashMap<&str, &PatchOp> = patch.ops.iter().map(|op| (op.key(), op)).collect();
@@ -8615,6 +10037,264 @@ mod tests {
         (schema, value)
     }
 
+    fn nested_struct_write_only_patch_fixture() -> (ResourceSchema, Value) {
+        use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+        let schema = ResourceSchema::new("test")
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "default_actions",
+                    AttributeType::struct_(
+                        "Action",
+                        vec![
+                            StructField::optional(
+                                "authenticate_oidc_config",
+                                AttributeType::struct_(
+                                    "AuthenticateOidcConfig",
+                                    vec![
+                                        StructField::optional("issuer", AttributeType::string())
+                                            .build(),
+                                        StructField::optional(
+                                            "client_secret",
+                                            AttributeType::string(),
+                                        )
+                                        .write_only()
+                                        .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            );
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "authenticate_oidc_config".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "issuer".to_string(),
+                    patch_test_value("https://issuer.example.com"),
+                ),
+                (
+                    "client_secret".to_string(),
+                    Value::Deferred(DeferredValue::Secret(Box::new(patch_test_value(
+                        "client-secret",
+                    )))),
+                ),
+            ]))),
+        )])));
+        (schema, value)
+    }
+
+    fn ignored_path(parts: &[&str]) -> crate::resource::ParsedIgnorePath {
+        crate::resource::ParsedIgnorePath::new(
+            parts
+                .iter()
+                .map(|part| {
+                    crate::resource::ParsedIgnorePathSegment::Attribute((*part).to_string())
+                })
+                .collect(),
+        )
+    }
+
+    fn ready_with_ignored_path(
+        mut resource: Resource,
+        schema: &ResourceSchema,
+        path: crate::resource::ParsedIgnorePath,
+    ) -> ProviderReadyResource {
+        resource.directives.ignore_changes = vec![path];
+        let mut registry = crate::schema::SchemaRegistry::new();
+        registry.insert(
+            "",
+            schema
+                .clone()
+                .validate()
+                .expect("ignore_changes patch schema must be valid"),
+        );
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let context = crate::executor::ProviderPreparationContext::new(
+            &bindings,
+            &gate,
+            &[],
+            &NoopNormalizer,
+            &[],
+            &registry,
+        );
+        futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
+            resource, &context,
+        ))
+        .expect("ignore_changes path must resolve during provider preparation")
+    }
+
+    #[test]
+    fn ignored_nested_write_only_leaf_prevents_parent_reassert() {
+        let (schema, default_actions) = nested_struct_write_only_patch_fixture();
+        let from = State::existing(
+            ResourceId::with_identity("test", "example"),
+            HashMap::from([
+                ("description".to_string(), patch_test_value("before")),
+                (
+                    "default_actions".to_string(),
+                    schema.strip_write_only_leaves("default_actions", &default_actions),
+                ),
+            ]),
+        );
+        let to = ready_with_ignored_path(
+            Resource::new("test", "example")
+                .with_attribute("description", patch_test_value("after"))
+                .with_attribute("default_actions", default_actions),
+            &schema,
+            ignored_path(&[
+                "default_actions",
+                "authenticate_oidc_config",
+                "client_secret",
+            ]),
+        );
+
+        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema)
+            .expect("fully ignored write-only leaves need no reassertion");
+
+        assert!(matches!(
+            &patch.ops[..],
+            [PatchOp::Replace { key, .. }] if key == "description"
+        ));
+    }
+
+    #[test]
+    fn plan_and_apply_use_the_same_update_patch_decision() {
+        let (schema, default_actions) = nested_struct_write_only_patch_fixture();
+        let from = State::existing(
+            ResourceId::with_identity("test", "example"),
+            HashMap::from([
+                ("description".to_string(), patch_test_value("before")),
+                (
+                    "default_actions".to_string(),
+                    schema.strip_write_only_leaves("default_actions", &default_actions),
+                ),
+            ]),
+        );
+        let to = ready_with_ignored_path(
+            Resource::new("test", "example")
+                .with_attribute("description", patch_test_value("after"))
+                .with_attribute("default_actions", default_actions),
+            &schema,
+            ignored_path(&[
+                "default_actions",
+                "authenticate_oidc_config",
+                "client_secret",
+            ]),
+        );
+        let changed = ["description".to_string()];
+
+        let planned = plan_update_patch(&changed, to.as_inner(), &from, &schema)
+            .expect("planning must accept the patch");
+        let applied = build_update_patch(&changed, &to, &from, &schema)
+            .expect("apply must accept the same patch");
+
+        assert_eq!(planned.ops, applied.ops);
+    }
+
+    #[test]
+    fn ignored_readable_leaf_uses_observed_value_when_sibling_is_sent() {
+        use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+        let schema = ResourceSchema::new("test").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("version", AttributeType::string()).build(),
+                        StructField::optional("memory", AttributeType::int()).build(),
+                    ],
+                ),
+            )
+            .build(),
+        );
+        let struct_value = |version: &str, memory: i64| {
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                ("version".to_string(), patch_test_value(version)),
+                (
+                    "memory".to_string(),
+                    Value::Concrete(ConcreteValue::Int(memory)),
+                ),
+            ])))
+        };
+        let from = State::existing(
+            ResourceId::with_identity("test", "example"),
+            HashMap::from([("config".to_string(), struct_value("external", 128))]),
+        );
+        let to = ready_with_ignored_path(
+            Resource::new("test", "example")
+                .with_attribute("config", struct_value("recorded", 256)),
+            &schema,
+            ignored_path(&["config", "version"]),
+        );
+
+        let patch = build_update_patch(&["config".to_string()], &to, &from, &schema)
+            .expect("readable ignored leaf can be filled from the read");
+        let PatchOp::Replace { value, .. } = &patch.ops[0] else {
+            panic!("expected config replacement: {:?}", patch.ops);
+        };
+        let Value::Concrete(ConcreteValue::Map(config)) = value else {
+            panic!("expected config map")
+        };
+        assert_eq!(config["version"], patch_test_value("external"));
+        assert_eq!(config["memory"], Value::Concrete(ConcreteValue::Int(256)));
+    }
+
+    #[test]
+    fn sending_parent_of_ignored_write_only_leaf_is_a_typed_error() {
+        use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+        let schema = ResourceSchema::new("test").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("secret", AttributeType::string())
+                            .write_only()
+                            .build(),
+                        StructField::optional("memory", AttributeType::int()).build(),
+                    ],
+                ),
+            )
+            .build(),
+        );
+        let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("secret".to_string(), patch_test_value("recorded")),
+            (
+                "memory".to_string(),
+                Value::Concrete(ConcreteValue::Int(256)),
+            ),
+        ])));
+        let observed = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "memory".to_string(),
+            Value::Concrete(ConcreteValue::Int(128)),
+        )])));
+        let from = State::existing(
+            ResourceId::with_identity("test", "example"),
+            HashMap::from([("config".to_string(), observed)]),
+        );
+        let to = ready_with_ignored_path(
+            Resource::new("test", "example").with_attribute("config", desired),
+            &schema,
+            ignored_path(&["config", "secret"]),
+        );
+
+        let error = build_update_patch(&["config".to_string()], &to, &from, &schema)
+            .expect_err("the current ignored write-only value is unknowable");
+
+        assert_eq!(error.resource_id(), &to.id);
+        assert_eq!(error.attribute(), "config");
+        assert_eq!(error.path().to_string(), "config.secret");
+        assert!(error.to_string().contains("current value cannot be known"));
+    }
+
     #[test]
     fn nested_write_only_record_sent_skips_non_bearing_keys() {
         use crate::schema::{AttributeSchema, AttributeType, StructField};
@@ -8678,7 +10358,8 @@ mod tests {
             .expect("fixture includes default_actions")
             .clone();
 
-        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema);
+        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema)
+            .expect("valid reassert patch");
 
         assert!(matches!(
             &patch.ops[..],
@@ -8737,7 +10418,8 @@ mod tests {
                     .build(),
             );
 
-        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema);
+        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema)
+            .expect("valid write-only patch");
 
         assert!(matches!(
             &patch.ops[0],
@@ -8797,7 +10479,8 @@ mod tests {
             &to,
             &from,
             &schema,
-        );
+        )
+        .expect("valid changed write-only patch");
 
         assert!(matches!(
             &patch.ops[0],
@@ -8832,9 +10515,15 @@ mod tests {
                 .build(),
         );
 
-        assert!(build_update_patch(&[], &to, &from, &schema).ops.is_empty());
+        assert!(
+            build_update_patch(&[], &to, &from, &schema)
+                .expect("empty patch is valid")
+                .ops
+                .is_empty()
+        );
         assert!(
             build_update_patch(&["absent".to_string()], &to, &from, &schema)
+                .expect("absent patch is valid")
                 .ops
                 .is_empty(),
             "a changed key absent from both sides must be dropped and cannot trigger reassertion"
@@ -8849,7 +10538,10 @@ mod tests {
             Resource::new("test", "nested").with_attribute("default_actions", default_actions),
         );
         assert!(
-            build_update_patch(&[], &to, &from, &schema).ops.is_empty(),
+            build_update_patch(&[], &to, &from, &schema)
+                .expect("empty nested patch is valid")
+                .ops
+                .is_empty(),
             "a write-only-bearing attribute cannot create a reassert-only patch"
         );
     }
@@ -8898,7 +10590,8 @@ mod tests {
 
                             let from = State::existing(id, from_attributes);
                             let desired = resolved_for_test(desired);
-                            let patch = build_update_patch(&changed, &desired, &from, &schema);
+                            let patch = build_update_patch(&changed, &desired, &from, &schema)
+                                .expect("generated fixture has no ignored paths");
                             let patch_keys: Vec<&str> =
                                 patch.ops.iter().map(PatchOp::key).collect();
                             let unique: std::collections::HashSet<_> =
@@ -8971,13 +10664,14 @@ mod tests {
     #[tokio::test]
     async fn provider_router_dispatches_update_by_provider_name() {
         let mut router = ProviderRouter::new();
-        router.add_provider("mock".to_string(), Box::new(MockProvider));
+        router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let from = State::existing(id.clone(), HashMap::new());
         let ready = resolved_for_test(Resource::with_provider("mock", "test", "example", None));
         let schema = crate::schema::ResourceSchema::new("test");
-        let request = UpdateRequest::checked(from, &[], &ready, &schema);
+        let request = UpdateRequest::checked(from, &[], &ready, &schema)
+            .expect("fixture has no ignored write-only paths");
         let identifier =
             AppliedIdentifier::new("mock-id-123").expect("fixture identifier is non-empty");
         let state = router
@@ -8991,7 +10685,7 @@ mod tests {
     #[tokio::test]
     async fn provider_router_dispatches_delete_by_provider_name() {
         let mut router = ProviderRouter::new();
-        router.add_provider("mock".to_string(), Box::new(MockProvider));
+        router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let request = DeleteRequest::default();
@@ -9087,7 +10781,7 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_provider(
             "mock".to_string(),
-            Box::new(TaggedProvider { tag: "default" }),
+            initialized(TaggedProvider { tag: "default" }),
         );
         let named_config = ProviderConfig {
             name: "mock".to_string(),
@@ -9099,7 +10793,7 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: Some("us".to_string()),
         };
-        router.add_provider_config(&named_config, Box::new(TaggedProvider { tag: "us" }));
+        router.add_provider_config(&named_config, initialized(TaggedProvider { tag: "us" }));
 
         let default_id = ResourceId::with_provider_identity("mock", "test", "a", None);
         let identifier = fixture_applied_identifier("mock-id");
@@ -9127,10 +10821,223 @@ mod tests {
         );
     }
 
+    fn reference_form_registry(owner: &str) -> (crate::schema::SchemaRegistry, AttributeType) {
+        use crate::schema::{
+            AttributeSchema, ReferenceForm, ReferenceForms, ReferenceTemplate, ResourceSchema,
+            ValidatedProviderSchemaWitness,
+        };
+
+        let identity = TypeIdentity::new(Some(owner), ["lambda", "Function"], "Name");
+        let attr_type = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let schema = ResourceSchema::new("lambda.Permission")
+            .attribute(AttributeSchema::optional("function_name", attr_type.clone()).build())
+            .validate()
+            .expect("fixture schema must validate");
+        let forms = ReferenceForms::from([(
+            identity,
+            ReferenceForm::Template {
+                long: ReferenceTemplate::new(
+                    "arn:{partition}:lambda:{region}:{account}:function:{name}",
+                )
+                .expect("fixture reference template must validate"),
+            },
+        )]);
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![schema],
+            ValidatedConfigSchema::default(),
+            forms,
+        )
+        .expect("fixture provider schema must validate");
+        let mut registry = crate::schema::SchemaRegistry::new();
+        registry
+            .insert_provider_witness(owner, &witness)
+            .expect("fixture owner has one validated witness");
+        (registry, attr_type)
+    }
+
+    fn reference_scope(region: &str) -> ReferenceScope {
+        ReferenceScope::available("aws", region, "123456789012").expect("fixture scope is valid")
+    }
+
+    fn string_value(value: &str) -> Value {
+        Value::Concrete(ConcreteValue::String(value.into()))
+    }
+
+    #[test]
+    fn comparison_context_routes_by_provider_kind_and_named_instance() {
+        let (registry, attr_type) = reference_form_registry("mock");
+        let schema = registry
+            .get(
+                "mock",
+                "lambda.Permission",
+                crate::schema::SchemaKind::Resource,
+            )
+            .expect("fixture schema must be registered");
+        let mut router = ProviderRouter::new();
+        router.add_provider_instance(
+            ProviderInstanceKey::new("mock", Some("east".to_string())),
+            InitializedProvider::for_test(Box::new(MockProvider), reference_scope("us-east-1")),
+        );
+        router.add_provider_instance(
+            ProviderInstanceKey::new("mock", Some("west".to_string())),
+            InitializedProvider::for_test(Box::new(MockProvider), reference_scope("us-west-2")),
+        );
+        let id = ResourceId::with_provider_identity(
+            "mock",
+            "lambda.Permission",
+            "invoke",
+            Some("west".to_string()),
+        );
+
+        let context = router
+            .comparison_context_for(&id, schema)
+            .expect("the named provider instance must supply its scope");
+        let name = string_value("processor");
+        let west_arn = string_value("arn:aws:lambda:us-west-2:123456789012:function:processor");
+        let east_arn = string_value("arn:aws:lambda:us-east-1:123456789012:function:processor");
+        assert!(crate::differ::type_aware_equal(
+            &name,
+            &west_arn,
+            Some(&attr_type),
+            crate::schema::empty_defs_for_schema_walks(),
+            &context,
+        ));
+        assert!(!crate::differ::type_aware_equal(
+            &name,
+            &east_arn,
+            Some(&attr_type),
+            crate::schema::empty_defs_for_schema_walks(),
+            &context,
+        ));
+    }
+
+    #[test]
+    fn comparison_context_resolves_a_pending_id_by_instance_and_resource_type() {
+        let (registry, _attr_type) = reference_form_registry("mock");
+        let mut router = ProviderRouter::new();
+        router.add_provider_instance(
+            ProviderInstanceKey::new("mock", Some("west".to_string())),
+            InitializedProvider::for_test(Box::new(MockProvider), reference_scope("us-west-2")),
+        );
+        let pending = ResourceId::pending_with_provider(
+            "mock",
+            "lambda.Permission",
+            Some("west".to_string()),
+        );
+
+        let comparison = router
+            .comparison_for(&registry, &pending)
+            .expect("pending identity is irrelevant to comparison resolution");
+
+        assert_eq!(comparison.owner_schema().owner(), "mock");
+        assert_eq!(
+            comparison.owner_schema().schema().as_schema().resource_type,
+            "lambda.Permission"
+        );
+    }
+
+    #[test]
+    fn resolved_comparison_table_reuses_a_pending_ids_type_context_after_resolution() {
+        let (registry, _attr_type) = reference_form_registry("mock");
+        let mut router = ProviderRouter::new();
+        router.add_provider_instance(
+            ProviderInstanceKey::new("mock", Some("west".to_string())),
+            InitializedProvider::for_test(Box::new(MockProvider), reference_scope("us-west-2")),
+        );
+        let pending = ResourceId::pending_with_provider(
+            "mock",
+            "lambda.Permission",
+            Some("west".to_string()),
+        );
+        let resolved = ResourceId::with_provider_identity(
+            "mock",
+            "lambda.Permission",
+            "invoke",
+            Some("west".to_string()),
+        );
+
+        let table = router
+            .resolve_comparisons(&registry, std::iter::once(&pending))
+            .expect("a pending id must pre-resolve its comparison context");
+        let comparison = table
+            .comparison_for(&resolved)
+            .expect("the resolved id must reuse the instance/type comparison");
+
+        assert_eq!(comparison.owner_schema().owner(), "mock");
+    }
+
+    #[test]
+    fn comparison_context_rejects_a_schema_owned_by_another_provider() {
+        let (registry, _attr_type) = reference_form_registry("mock");
+        let schema = registry
+            .get(
+                "mock",
+                "lambda.Permission",
+                crate::schema::SchemaKind::Resource,
+            )
+            .expect("fixture schema must be registered");
+        let router = ProviderRouter::new();
+        let id = ResourceId::with_provider_identity(
+            "other",
+            "lambda.Permission",
+            "invoke",
+            Some("west".to_string()),
+        );
+
+        let error = match router.comparison_context_for(&id, schema) {
+            Ok(_) => panic!("a provider must not compare through another owner's form table"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("routes to provider `other` but its schema is owned by `mock`")
+        );
+    }
+
+    #[test]
+    fn comparison_resolution_reports_missing_schema_as_typed_error() {
+        let mut router = ProviderRouter::new();
+        router.add_provider(
+            "mock".to_string(),
+            InitializedProvider::for_test(Box::new(MockProvider), ReferenceScope::Unavailable),
+        );
+        let registry = crate::schema::SchemaRegistry::new();
+        let id = ResourceId::with_provider_identity("mock", "lambda.Permission", "invoke", None);
+
+        let error = router
+            .comparison_for(&registry, &id)
+            .expect_err("a comparison requires the owner's managed schema");
+        assert!(matches!(
+            error,
+            ComparisonResolutionError::MissingResourceSchema { id: actual } if actual == id
+        ));
+    }
+
+    #[test]
+    fn resolved_comparison_table_reports_an_unresolved_id_without_panicking() {
+        let router = ProviderRouter::new();
+        let registry = crate::schema::SchemaRegistry::new();
+        let table = router
+            .resolve_comparisons(&registry, std::iter::empty())
+            .expect("an empty apply-start comparison set is valid");
+        let id = ResourceId::with_provider_identity("mock", "test.Widget", "late", None);
+
+        let error = table
+            .comparison_for(&id)
+            .expect_err("a writeback-only id must return a typed pre-resolution error");
+
+        assert!(matches!(
+            error,
+            ComparisonResolutionError::ComparisonNotResolvedAtApplyStart { id: actual }
+                if actual == id
+        ));
+    }
+
     #[tokio::test]
     async fn provider_router_unknown_named_instance_errors_with_binding() {
         let mut router = ProviderRouter::new();
-        router.add_provider("mock".to_string(), Box::new(MockProvider));
+        router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let id =
             ResourceId::with_provider_identity("mock", "test", "x", Some("missing".to_string()));
@@ -9177,7 +11084,8 @@ mod tests {
                 &self,
                 _binding: Option<&str>,
                 _config: &ProviderReadyConfig,
-            ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+                _initialize_outcome: crate::provider::InitializeOutcomeMint,
+            ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
                 Box::pin(async {
                     Err(ProviderError::invalid_input(
                         "AWS account ID '019115212452' is not in the provider's \
@@ -9186,6 +11094,15 @@ mod tests {
                     ))
                 })
             }
+            fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+                crate::schema::ValidatedProviderSchemaWitness::new(
+                    self.schemas(),
+                    self.provider_config_attribute_types(),
+                    Default::default(),
+                )
+                .unwrap()
+            }
+
             fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
                 Vec::new()
             }
@@ -9198,7 +11115,7 @@ mod tests {
         let config =
             crate::executor::prepare_provider_ready_config(&factory, resolved_config.as_ref())
                 .unwrap();
-        let result = factory.create_provider(None, &config).await;
+        let result = factory.create_initialized_provider(None, &config).await;
         let err = match result {
             Ok(_) => panic!("create_provider must surface the init error"),
             Err(e) => e,
@@ -9262,13 +11179,26 @@ mod tests {
                 &self,
                 binding: Option<&str>,
                 _config: &ProviderReadyConfig,
-            ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+                _initialize_outcome: crate::provider::InitializeOutcomeMint,
+            ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
                 self.calls
                     .lock()
                     .unwrap()
                     .push(binding.map(|s| s.to_string()));
-                Box::pin(async { Ok(Box::new(MockProvider) as Box<dyn Provider>) })
+                Box::pin(async {
+                    Ok(InitializeOutcome::unavailable()
+                        .with_provider(Box::new(MockProvider) as Box<dyn Provider>))
+                })
             }
+            fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+                crate::schema::ValidatedProviderSchemaWitness::new(
+                    self.schemas(),
+                    self.provider_config_attribute_types(),
+                    Default::default(),
+                )
+                .unwrap()
+            }
+
             fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
                 Vec::new()
             }
@@ -9281,10 +11211,16 @@ mod tests {
         let config =
             crate::executor::prepare_provider_ready_config(&factory, resolved_config.as_ref())
                 .unwrap();
-        let _ = factory.create_provider(None, &config).await.unwrap();
-        let _ = factory.create_provider(Some("us"), &config).await.unwrap();
         let _ = factory
-            .create_provider(Some("tokyo"), &config)
+            .create_initialized_provider(None, &config)
+            .await
+            .unwrap();
+        let _ = factory
+            .create_initialized_provider(Some("us"), &config)
+            .await
+            .unwrap();
+        let _ = factory
+            .create_initialized_provider(Some("tokyo"), &config)
             .await
             .unwrap();
 
@@ -9516,7 +11452,7 @@ mod tests {
         }
 
         let mut router = ProviderRouter::new();
-        router.add_provider("normalizing".to_string(), Box::new(NormalizingProvider));
+        router.add_provider("normalizing".to_string(), initialized(NormalizingProvider));
         router.add_normalizer("normalizing", Box::new(TestNormalizer));
 
         let peer_ref = Value::resource_ref("peer", "identifier", Vec::new());

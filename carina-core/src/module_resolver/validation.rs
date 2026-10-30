@@ -1315,7 +1315,7 @@ mod tests {
         let declarations = vec![
             ArgumentParameter {
                 name: "x".to_string(),
-                type_expr: TypeExpr::Int,
+                static_type: TypeExpr::Int,
                 default: None,
                 description: None,
                 validations: vec![ValidationBlock::dummy(
@@ -1329,7 +1329,7 @@ mod tests {
             },
             ArgumentParameter {
                 name: "y".to_string(),
-                type_expr: TypeExpr::Int,
+                static_type: TypeExpr::Int,
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -1361,7 +1361,7 @@ mod tests {
 
         let declarations = vec![ArgumentParameter {
             name: "name".to_string(),
-            type_expr: TypeExpr::String,
+            static_type: TypeExpr::String,
             default: None,
             description: None,
             validations: vec![ValidationBlock::dummy(
@@ -1439,9 +1439,18 @@ mod tests {
         });
         let expected =
             format!("module 'mod' (call 'c'): argument 'name': bad name (got 'abc'); {detail}");
+        let plan_error = crate::plan::PlanError::new(
+            crate::resource::ResourceId::with_identity("_virtual", "c"),
+            plan_error,
+        );
 
         assert_eq!(resolver_error.to_string(), expected);
         assert_eq!(apply_failure.to_string(), expected);
-        assert_eq!(plan_error.to_string(), expected);
+        assert_eq!(
+            plan_error
+                .display_with_project_dir(std::path::Path::new("."))
+                .to_string(),
+            expected
+        );
     }
 }

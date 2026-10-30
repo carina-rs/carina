@@ -3,13 +3,20 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+use carina_core::UserDirs;
 use carina_core::hint::ProjectCommand;
 use carina_core::parser::ProviderConfig;
-use carina_provider_resolver::{LockMode, ProviderInstallLock, resolve_all};
+use carina_provider_resolver::{
+    FixtureRegistryHttp, LockMode, ProviderInstallLock, resolve_all,
+    resolve_all_with_fixture_registry, sha256_file,
+};
 use indexmap::IndexMap;
 
 const PROVIDER: &str = "registry.carina-rs.dev/carina-rs/aws";
 const HOST: &str = "registry.carina-rs.dev";
+const FIXTURE_VERSION: &str = "0.5.0";
+const FIXTURE_ARTIFACT_URL: &str = "https://downloads.example.test/aws.wasm";
+const FIXTURE_ARTIFACT: &[u8] = b"registry sequence notice fixture";
 
 fn write_protected_lock(base_dir: &Path) {
     fs::write(
@@ -187,7 +194,7 @@ transparency_log_present = false
 fn write_current_signer_lock(base_dir: &Path) {
     fs::write(
         base_dir.join("carina-providers.lock"),
-        r#"version = 4
+        r#"version = 5
 
 [registry_host."registry.carina-rs.dev"]
 discovery_pin_present = true
@@ -233,6 +240,114 @@ fn registry_provider_config() -> ProviderConfig {
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     }
+}
+
+fn fixture_artifact_sha256() -> String {
+    let artifact = tempfile::NamedTempFile::new().unwrap();
+    fs::write(artifact.path(), FIXTURE_ARTIFACT).unwrap();
+    sha256_file(artifact.path()).unwrap()
+}
+
+fn registry_fixture(sequence: Option<u64>) -> FixtureRegistryHttp {
+    registry_fixture_with_observations(sequence, None, false)
+}
+
+fn registry_fixture_with_observations(
+    sequence: Option<u64>,
+    valid_until: Option<&str>,
+    yanked: bool,
+) -> FixtureRegistryHttp {
+    let mut listing = serde_json::json!({
+        "versions": [{"version": FIXTURE_VERSION, "protocols": ["1"]}]
+    });
+    if yanked {
+        listing["versions"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "version": "0.4.0",
+                "protocols": ["1"],
+                "yanked": true
+            }));
+    }
+    if let Some(sequence) = sequence {
+        listing["sequence"] = serde_json::json!(sequence);
+    }
+    if let Some(valid_until) = valid_until {
+        listing["valid_until"] = serde_json::json!(valid_until);
+    }
+    let shasum = fixture_artifact_sha256();
+    FixtureRegistryHttp::default()
+        .json(
+            "https://registry.carina-rs.dev/.well-known/carina.json",
+            r#"{"providers.v1":"/v1/providers/"}"#,
+        )
+        .json(
+            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions",
+            serde_json::to_vec(&listing).unwrap(),
+        )
+        .json(
+            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            format!(
+                r#"{{"protocols":["1"],"filename":"aws.wasm","download_url":"{FIXTURE_ARTIFACT_URL}","shasum":"{shasum}","shasum_authored_by":"registry"}}"#
+            ),
+        )
+        .downloadable_bytes(FIXTURE_ARTIFACT_URL, FIXTURE_ARTIFACT.to_vec())
+}
+
+fn write_unsigned_anchored_lock(base_dir: &Path, sequence: u64) {
+    let shasum = fixture_artifact_sha256();
+    fs::write(
+        base_dir.join("carina-providers.lock"),
+        format!(
+            r#"version = 5
+
+[registry_host."registry.carina-rs.dev"]
+discovery_pin_present = true
+
+[registry_host."registry.carina-rs.dev".discovery_values]
+"providers.v1" = "https://registry.carina-rs.dev/v1/providers/"
+
+[[provider]]
+name = "aws"
+source = "carina-rs/aws"
+mode = "version"
+version = "{FIXTURE_VERSION}"
+sha256 = "{shasum}"
+
+[provider.registry]
+resolved_hostname = "registry.carina-rs.dev"
+sequence_present = true
+sequence = {sequence}
+sequence_anchor_established = true
+sequence_anchor = {sequence}
+valid_until_present = false
+signature_state = "not_required"
+transparency_log_present = false
+"#
+        ),
+    )
+    .unwrap();
+}
+
+fn resolve_with_fixture(base_dir: &Path, user_dirs: &UserDirs, http: &FixtureRegistryHttp) {
+    let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+    resolve_all_with_fixture_registry(
+        user_dirs,
+        &install_lock,
+        &[registry_provider_config()],
+        LockMode::Normal,
+        http,
+    )
+    .unwrap();
+}
+
+fn run_child_test(test_name: &str, child_env: &str) -> Output {
+    Command::new(std::env::current_exe().unwrap())
+        .args([test_name, "--exact", "--nocapture"])
+        .env(child_env, "1")
+        .output()
+        .unwrap()
 }
 
 fn carina(base_dir: &Path, operation: &str, force: bool, input: &str) -> Output {
@@ -340,12 +455,12 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
         );
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(
-            stderr.contains("Provider lock format migration: version 2 -> version 4"),
+            stderr.contains("Provider lock format migration: version 2 -> version 5"),
             "{operation}: {stderr}"
         );
         assert_eq!(
             stderr
-                .matches("Provider lock format migration: version 2 -> version 4")
+                .matches("Provider lock format migration: version 2 -> version 5")
                 .count(),
             1,
             "{operation} must report migration exactly once: {stderr}"
@@ -373,7 +488,7 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
         );
 
         let saved = fs::read_to_string(dir.path().join("carina-providers.lock")).unwrap();
-        assert!(saved.starts_with("version = 4\n"), "{operation}: {saved}");
+        assert!(saved.starts_with("version = 5\n"), "{operation}: {saved}");
         assert!(
             saved.contains("discovery_pin_present = false"),
             "{operation}: {saved}"
@@ -426,6 +541,10 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
                     saved.contains("sequence_anchor_established = false"),
                     "{saved}"
                 );
+                assert!(
+                    saved.contains("sequence_anchor_reset_pending = true"),
+                    "{saved}"
+                );
                 assert!(saved.contains("signature_state = \"required_legacy\""));
                 assert!(saved.contains("legacy_certificate_identity = \"identity-a\""));
             }
@@ -470,7 +589,7 @@ fn v1_lock_migration_keeps_discovery_repin_reachable() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    let header = "Provider lock format migration: version 1 -> version 4";
+    let header = "Provider lock format migration: version 1 -> version 5";
     assert_eq!(stderr.matches(header).count(), 1, "{stderr}");
     assert!(
         stderr.contains("Discarding v1 pinned discovery API base"),
@@ -478,7 +597,7 @@ fn v1_lock_migration_keeps_discovery_repin_reachable() {
     );
 
     let saved = fs::read_to_string(dir.path().join("carina-providers.lock")).unwrap();
-    assert!(saved.starts_with("version = 4\n"), "{saved}");
+    assert!(saved.starts_with("version = 5\n"), "{saved}");
     assert!(!saved.contains("migration_pending_discovery_pin"));
     assert!(saved.contains("sequence = 7"), "{saved}");
     assert!(saved.contains("signature_state = \"required_legacy\""));
@@ -499,7 +618,7 @@ fn v1_discovery_repin_previews_and_clears_every_pending_pin_for_the_host() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(
         stderr
-            .matches("Provider lock format migration: version 1 -> version 4")
+            .matches("Provider lock format migration: version 1 -> version 5")
             .count(),
         1,
         "{stderr}"
@@ -515,7 +634,7 @@ fn v1_discovery_repin_previews_and_clears_every_pending_pin_for_the_host() {
     );
 
     let saved = fs::read_to_string(dir.path().join("carina-providers.lock")).unwrap();
-    assert!(saved.starts_with("version = 4\n"), "{saved}");
+    assert!(saved.starts_with("version = 5\n"), "{saved}");
     assert!(
         !saved.contains("migration_pending_discovery_pin"),
         "{saved}"
@@ -537,7 +656,7 @@ fn v1_discovery_repin_preview_folds_the_complete_migration_report() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    let header = "Provider lock format migration: version 1 -> version 4";
+    let header = "Provider lock format migration: version 1 -> version 5";
     assert_eq!(stderr.matches(header).count(), 1, "{stderr}");
     assert!(
         stderr.contains(
@@ -594,7 +713,7 @@ fn init_reports_v2_lock_migration_once_before_authorization_error() {
         "migration-pending discovery must remain blocked"
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    let header = "Provider lock format migration: version 2 -> version 4";
+    let header = "Provider lock format migration: version 2 -> version 5";
     assert!(stderr.contains(header), "{stderr}");
     let repin_command =
         ProjectCommand::new("providers repin-discovery", dir.path()).with_argument(HOST);
@@ -638,7 +757,7 @@ fn init_reports_v1_lock_migration_once_before_authorization_error() {
         "migration-pending discovery must remain blocked"
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    let header = "Provider lock format migration: version 1 -> version 4";
+    let header = "Provider lock format migration: version 1 -> version 5";
     assert!(stderr.contains(header), "{stderr}");
     assert_eq!(
         stderr.matches(header).count(),
@@ -919,6 +1038,13 @@ fn rebootstrap_prints_and_clears_both_freshness_values_only() {
     assert!(stderr.contains("Discarding sequence anchor: 5"), "{stderr}");
     assert!(!stdout.contains("Discarding"), "{stdout}");
     assert!(!stdout.contains("Enter provider source"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Registry freshness reset. Run `{}` to establish a new reference point (or record that the registry serves no sequence).",
+            ProjectCommand::new("init", dir.path())
+        )),
+        "{stdout}"
+    );
 
     let lock_path = dir.path().join("carina-providers.lock");
     carina_provider_resolver::LockFile::load(dir.path())
@@ -929,6 +1055,10 @@ fn rebootstrap_prints_and_clears_both_freshness_values_only() {
     assert!(saved.contains("sequence_present = false"), "{saved}");
     assert!(
         saved.contains("sequence_anchor_established = false"),
+        "{saved}"
+    );
+    assert!(
+        saved.contains("sequence_anchor_reset_pending = true"),
         "{saved}"
     );
     assert!(!saved.contains("sequence = "), "{saved}");
@@ -947,6 +1077,186 @@ fn rebootstrap_prints_and_clears_both_freshness_values_only() {
         "{saved}"
     );
     assert!(saved.contains("transparency_log_present = true"), "{saved}");
+}
+
+#[test]
+fn first_contact_prints_registry_sequence_anchor_notice_once() {
+    const CHILD_ENV: &str = "CARINA_TEST_FIRST_CONTACT_SEQUENCE_ANCHOR_NOTICE";
+    const TEST_NAME: &str = "first_contact_prints_registry_sequence_anchor_notice_once";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let project = tempfile::tempdir().unwrap();
+        let user_root = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_root.path());
+        let http = registry_fixture(Some(11));
+
+        resolve_with_fixture(project.path(), &user_dirs, &http);
+        resolve_with_fixture(project.path(), &user_dirs, &http);
+
+        let saved = fs::read_to_string(project.path().join("carina-providers.lock")).unwrap();
+        assert!(saved.contains("sequence_anchor = 11"), "{saved}");
+        return;
+    }
+
+    let output = run_child_test(TEST_NAME, CHILD_ENV);
+    assert!(output.status.success(), "child test failed: {output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let notice = "carina: established registry sequence anchor for carina-rs/aws: 11";
+    assert_eq!(stderr.matches(notice).count(), 1, "{stderr}");
+}
+
+#[test]
+fn rebootstrap_next_resolution_prints_registry_sequence_anchor_notice_once() {
+    const CHILD_ENV: &str = "CARINA_TEST_REBOOTSTRAP_SEQUENCE_ANCHOR_NOTICE";
+    const TEST_NAME: &str =
+        "rebootstrap_next_resolution_prints_registry_sequence_anchor_notice_once";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let project = tempfile::tempdir().unwrap();
+        write_unsigned_anchored_lock(project.path(), 5);
+        let recovery = carina(project.path(), "re-bootstrap", true, "");
+        assert!(
+            recovery.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&recovery.stdout),
+            String::from_utf8_lossy(&recovery.stderr)
+        );
+
+        let user_root = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_root.path());
+        let http = registry_fixture(Some(11));
+        resolve_with_fixture(project.path(), &user_dirs, &http);
+        resolve_with_fixture(project.path(), &user_dirs, &http);
+
+        let saved = fs::read_to_string(project.path().join("carina-providers.lock")).unwrap();
+        assert!(saved.contains("sequence_anchor = 11"), "{saved}");
+        return;
+    }
+
+    let output = run_child_test(TEST_NAME, CHILD_ENV);
+    assert!(output.status.success(), "child test failed: {output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let notice = "carina: established registry sequence anchor for carina-rs/aws: 11";
+    assert_eq!(stderr.matches(notice).count(), 1, "{stderr}");
+}
+
+#[test]
+fn rebootstrap_sequence_less_listing_prints_no_reference_point_notice() {
+    const CHILD_ENV: &str = "CARINA_TEST_REBOOTSTRAP_NO_SEQUENCE_NOTICE";
+    const TEST_NAME: &str = "rebootstrap_sequence_less_listing_prints_no_reference_point_notice";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let project = tempfile::tempdir().unwrap();
+        write_unsigned_anchored_lock(project.path(), 5);
+        let recovery = carina(project.path(), "re-bootstrap", true, "");
+        assert!(
+            recovery.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&recovery.stdout),
+            String::from_utf8_lossy(&recovery.stderr)
+        );
+
+        let user_root = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_root.path());
+        let http = registry_fixture(None);
+        resolve_with_fixture(project.path(), &user_dirs, &http);
+        resolve_with_fixture(project.path(), &user_dirs, &http);
+
+        let saved = fs::read_to_string(project.path().join("carina-providers.lock")).unwrap();
+        assert!(
+            saved.contains("sequence_anchor_established = false"),
+            "{saved}"
+        );
+        return;
+    }
+
+    let output = run_child_test(TEST_NAME, CHILD_ENV);
+    assert!(output.status.success(), "child test failed: {output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let notice = "carina: registry listing for carina-rs/aws has no sequence; no reference point established";
+    assert_eq!(stderr.matches(notice).count(), 1, "{stderr}");
+    assert!(
+        !stderr.contains("carina: established registry sequence anchor"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn sequence_less_registry_first_contact_prints_no_reference_point_notice_once() {
+    const CHILD_ENV: &str = "CARINA_TEST_FIRST_CONTACT_NO_SEQUENCE_NOTICE";
+    const TEST_NAME: &str =
+        "sequence_less_registry_first_contact_prints_no_reference_point_notice_once";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let project = tempfile::tempdir().unwrap();
+        let user_root = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_root.path());
+        let http = registry_fixture(None);
+
+        for _ in 0..3 {
+            resolve_with_fixture(project.path(), &user_dirs, &http);
+        }
+
+        let saved = fs::read_to_string(project.path().join("carina-providers.lock")).unwrap();
+        assert!(
+            saved.contains("sequence_anchor_established = false"),
+            "{saved}"
+        );
+        assert!(!saved.contains("sequence_anchor_reset_pending"), "{saved}");
+        return;
+    }
+
+    let output = run_child_test(TEST_NAME, CHILD_ENV);
+    assert!(output.status.success(), "child test failed: {output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let notice = "carina: registry listing for carina-rs/aws has no sequence; no reference point established";
+    assert_eq!(stderr.matches(notice).count(), 1, "{stderr}");
+    assert!(
+        !stderr.contains("carina: established registry sequence anchor"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn sequence_less_first_contact_with_persisted_observations_prints_notice_once() {
+    const CHILD_ENV: &str = "CARINA_TEST_FIRST_CONTACT_OBSERVATION_NOTICE";
+    const TEST_NAME: &str =
+        "sequence_less_first_contact_with_persisted_observations_prints_notice_once";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        for http in [
+            registry_fixture_with_observations(None, Some("2999-01-01T00:00:00Z"), false),
+            registry_fixture_with_observations(None, None, true),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let user_root = tempfile::tempdir().unwrap();
+            let user_dirs = UserDirs::under(user_root.path());
+
+            // No version constraint makes resolution validate the listing
+            // during selection and again before pinning the artifact.
+            resolve_with_fixture(project.path(), &user_dirs, &http);
+            assert_eq!(
+                http.requested_urls()
+                    .iter()
+                    .filter(|url| url.ends_with("/carina-rs/aws/versions"))
+                    .count(),
+                2,
+                "first contact must exercise the double-fetch path"
+            );
+            resolve_with_fixture(project.path(), &user_dirs, &http);
+        }
+        return;
+    }
+
+    let output = run_child_test(TEST_NAME, CHILD_ENV);
+    assert!(output.status.success(), "child test failed: {output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let notice = "carina: registry listing for carina-rs/aws has no sequence; no reference point established";
+    assert_eq!(
+        stderr.matches(notice).count(),
+        2,
+        "valid_until and yanked first contacts must each announce exactly once: {stderr}"
+    );
 }
 
 #[test]

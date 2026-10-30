@@ -70,7 +70,7 @@ fn build_module_signature() -> FileSignature {
         &ProviderContext::default(),
     )
     .unwrap();
-    FileSignature::from_parsed_file_with_name(&parsed, "web_tier")
+    FileSignature::from_parsed_file_with_name(&parsed, "web_tier", &ProviderContext::default())
 }
 
 fn build_root_config_signature() -> FileSignature {
@@ -96,7 +96,7 @@ fn build_root_config_signature() -> FileSignature {
         &ProviderContext::default(),
     )
     .unwrap();
-    FileSignature::from_parsed_file_with_name(&parsed, "main")
+    FileSignature::from_parsed_file_with_name(&parsed, "main", &ProviderContext::default())
 }
 
 #[test]

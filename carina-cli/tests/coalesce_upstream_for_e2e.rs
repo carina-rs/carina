@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use carina_cli::commands::plan::PlanFile;
-use carina_core::effect::Effect;
+use carina_core::effect::UnresolvedSavedEffect as Effect;
 use carina_core::resource::{ConcreteValue, Value};
 
 fn run_cli(dir: &Path, args: &[&str]) -> Output {

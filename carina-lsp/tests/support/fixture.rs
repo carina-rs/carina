@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
+use carina_core::provider::{BoxFuture, ProviderFactory, ProviderResult};
 use carina_core::resource::Value;
 use carina_core::schema::{
     ResourceSchema, SchemaRegistry, ValidatedConfigSchema, ValidatedResourceSchema,
@@ -49,8 +49,18 @@ impl ProviderFactory for SchemaFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         unimplemented!("schema fixture factories are never instantiated")
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<ValidatedResourceSchema> {
@@ -111,7 +121,15 @@ pub fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
         .into_iter()
         .collect();
     let factories = factories_for(&schemas);
-    DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(factories))
+    if provider_names.is_empty() {
+        DiagnosticEngine::without_loaded_provider_schemas()
+    } else {
+        let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+            Arc::new(factories),
+            SchemaRegistry::new(),
+        );
+        DiagnosticEngine::new(Arc::new(loaded_providers), provider_names)
+    }
 }
 
 /// Wrap one `ResourceSchema` in a `SchemaRegistry` registered under the

@@ -130,19 +130,13 @@ pub async fn run_destroy(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
-    let validated_config = providers.validate_evaluated_config(
-        parsed,
-        base_dir,
-        true,
-        &inference_errors,
-        &duplicate_declarations,
-    )?;
+    let validated_config =
+        providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
     let verified_backend = verify_for_mutation(
         path,
@@ -308,6 +302,15 @@ async fn run_destroy_locked_owned(
     )
     .await?;
 
+    // Select the initialized provider before address reconciliation so every
+    // create-only comparison uses the owning instance's reference scope.
+    let provider = get_provider_with_ctx(
+        ctx,
+        provider_inputs.configs(),
+        ProgressSink::Human,
+    )
+    .await?;
+
     // Collect all resources (managed + orphans) before sorting.
     // We use the unsorted list for state reads, then sort once at the end.
     let mut all_resources = crate::wiring::DeferredForExpansionPrelude::new_for_state_refresh(
@@ -317,6 +320,7 @@ async fn run_destroy_locked_owned(
     )?
     .detect_moves(
         ctx,
+        &provider,
         &parsed.data_sources,
         provider_inputs.configs().as_provider_configs(),
         &state_block_claims,
@@ -329,14 +333,6 @@ async fn run_destroy_locked_owned(
             "Warning: using cached managed-resource state (--refresh=false). The plan may not reflect actual managed infrastructure.".yellow()
         );
     }
-
-    // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(
-        ctx,
-        provider_inputs.configs(),
-        ProgressSink::Human,
-    )
-    .await?;
 
     // Build managed current state -- either from the provider or the state file.
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
@@ -540,6 +536,7 @@ async fn run_destroy_locked_owned(
                     Current::Absent(_state) => false,
                     Current::Present(_present) => true,
                     Current::CreateInFlight(_pending) => true,
+                    Current::CreateOutcomeUnknown(_unknown) => true,
                     Current::MissingIdentifier(_state) => true,
                 };
                 if exists
@@ -589,6 +586,7 @@ async fn run_destroy_locked_owned(
                     Current::Absent(_state) => false,
                     Current::Present(_present) => true,
                     Current::CreateInFlight(_pending) => true,
+                    Current::CreateOutcomeUnknown(_unknown) => true,
                     Current::MissingIdentifier(_state) => true,
                 });
             if !exists {
@@ -648,7 +646,7 @@ async fn run_destroy_locked_owned(
         for error in identifier_errors {
             error_plan.add_error(error);
         }
-        render_plan_errors_and_abort(&error_plan)?;
+        render_plan_errors_and_abort(&error_plan, base_dir)?;
     }
 
     let wait_aliases = build_destroy_wait_aliases(&parsed.wait_bindings, &delete_effects);
@@ -703,8 +701,9 @@ async fn run_destroy_locked_owned(
         format_destroy_plan_with_delete_instances(
             &destroy_plan,
             DetailLevel::Full,
-            &historical_display
-        )
+            &historical_display,
+            &provider,
+        )?
     );
 
     // Show protected resources
@@ -1332,21 +1331,20 @@ async fn run_destroy_locked(
             .await;
         }
     };
-    let validated_config =
-        match providers.validate_evaluated_config(parsed, base_dir, true, &[], &[]) {
-            Ok(validated_config) => validated_config,
-            Err(error) => {
-                return finish_lock_command(
-                    backend.as_ref(),
-                    LockCommandOutcome::Kept {
-                        result: Err(error),
-                        lock,
-                    },
-                    &cancel,
-                )
-                .await;
-            }
-        };
+    let validated_config = match providers.validate_evaluated_config(parsed, base_dir, true, &[]) {
+        Ok(validated_config) => validated_config,
+        Err(error) => {
+            return finish_lock_command(
+                backend.as_ref(),
+                LockCommandOutcome::Kept {
+                    result: Err(error),
+                    lock,
+                },
+                &cancel,
+            )
+            .await;
+        }
+    };
     let outcome = run_destroy_locked_owned(
         validated_config,
         auto_approve,
@@ -1621,6 +1619,10 @@ fn build_destroy_delete_effects(
                     resource.id.clone(),
                     carina_core::plan::PlanErrorKind::DestroyCreateInFlight,
                 ));
+                continue;
+            }
+            Some(Current::CreateOutcomeUnknown(unknown)) => {
+                errors.push(PlanError::create_outcome_unknown(unknown.id().clone()));
                 continue;
             }
             None => {
@@ -2528,13 +2530,7 @@ mod tests {
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base_dir)
             .expect("mock provider must load");
         let validated_config = providers
-            .validate_evaluated_config(
-                parsed,
-                base_dir,
-                true,
-                &loaded.inference_errors,
-                &loaded.duplicate_declarations,
-            )
+            .validate_evaluated_config(parsed, base_dir, true, &loaded.duplicate_declarations)
             .expect("fixture must validate");
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
         let backend = fixture.lock_loss_backend_handle();
@@ -2944,7 +2940,9 @@ mod tests {
             error.kind,
             carina_core::plan::PlanErrorKind::MissingProviderIdentifier
         );
-        let message = error.to_string();
+        let message = error
+            .display_with_project_dir(std::path::Path::new("."))
+            .to_string();
         assert!(message.contains(&resource.id.to_string()), "{message}");
         assert!(message.contains("`removed` block"), "{message}");
         assert!(message.contains("`import` block"), "{message}");
@@ -2988,10 +2986,48 @@ mod tests {
                 error.kind,
                 carina_core::plan::PlanErrorKind::DestroyCreateInFlight
             );
-            let message = error.to_string();
+            let message = error
+                .display_with_project_dir(std::path::Path::new("."))
+                .to_string();
             assert!(message.contains(&expected_id.to_string()), "{message}");
             assert!(message.contains("run apply first"), "{message}");
         }
+    }
+
+    #[test]
+    fn destroy_rejects_create_outcome_unknown_with_resolution_hint() {
+        let resource = Resource::with_provider("mock", "test.Widget", "unknown", None);
+        let failure = carina_core::provider::CreateAttempt::for_test(resource.id.clone())
+            .outcome_unknown(
+                carina_core::provider::EgressSent::for_test(),
+                carina_core::provider::ProviderError::api_error("guest trapped"),
+            );
+        let carina_core::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } =
+            failure.into_kind()
+        else {
+            panic!("the egress witness must mint an unknown outcome")
+        };
+        let current_states = HashMap::from([(
+            resource.id.clone(),
+            Current::create_outcome_unknown(unknown),
+        )]);
+
+        let (effects, errors) =
+            build_destroy_delete_effects(&[&resource], &current_states, None, &HashSet::new());
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            errors.as_slice(),
+            [carina_core::plan::PlanError {
+                kind: carina_core::plan::PlanErrorKind::CreateOutcomeUnknown { .. },
+                ..
+            }]
+        ));
+        let message = errors[0]
+            .display_with_project_dir(std::path::Path::new("."))
+            .to_string();
+        assert!(message.contains("the create may have reached the cloud"));
+        assert!(message.contains("carina state forget mock.test.Widget unknown"));
     }
 
     #[test]

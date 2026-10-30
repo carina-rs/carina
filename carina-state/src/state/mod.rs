@@ -2,7 +2,7 @@
 
 use carina_core::binding_index::SecretPreservingAttributes;
 use carina_core::deps::get_resource_dependencies;
-use carina_core::differ::Orphan;
+use carina_core::differ::{ComparisonContext, Orphan};
 use carina_core::effect::{MoveAuthority, ReleaseListKeysEffect};
 use carina_core::executor::{AcceptedRequest, AcceptedRequestKind};
 use carina_core::explicit::{self, ExplicitFields};
@@ -15,15 +15,15 @@ use carina_core::provider::{
     AppliedIdentifier, CreateObservation, EmptyAppliedIdentifier, InFlightCreate,
     InFlightPersistence, NestedWriteOnlyRecord, ObservedCreate, PersistedAttributes,
     PersistedAttributesError, RawSavedAttrs, Sent, SentDesiredAttributes, SentRecord,
-    StateRowInFlightCreate, StateTransformMap, merge_previous_secret_hashes_into_provider_value,
-    previous_hash,
+    StateRowInFlightCreate, StateRowUnknownCreateOutcome, StateTransformMap, UnknownCreateOutcome,
+    merge_previous_secret_hashes_into_provider_value, previous_hash,
 };
 pub use carina_core::resource::DeposedKey;
 #[cfg(test)]
 use carina_core::resource::Resource;
 use carina_core::resource::{
     ConcreteValue, Current, DataSource, Directives, PartialReadMarker, PendingReRead,
-    ResolvedResource, ResourceId, ResourceIdentity, State, Value,
+    PersistedDirectives, ResolvedResource, ResourceId, ResourceIdentity, State, Value,
 };
 use carina_core::schema::{
     FieldName, ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys,
@@ -505,6 +505,116 @@ pub struct StateFile {
     pub exports: HashMap<String, PersistedExportValue>,
 }
 
+/// Classification used by import planning without weakening the general
+/// "occupied state rows make import a no-op" rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportTargetDisposition {
+    Vacant,
+    ReplaceCreateOutcomeUnknown,
+    Occupied,
+}
+
+/// Why an address could not produce the proof required by `state forget`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotOutcomeUnknownKind {
+    Missing,
+    DifferentLifecycle,
+}
+
+/// Typed rejection from [`StateFile::find_outcome_unknown`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotOutcomeUnknown {
+    Missing { address: StateBlockAddress },
+    DifferentLifecycle { address: StateBlockAddress },
+}
+
+impl NotOutcomeUnknown {
+    pub fn kind(&self) -> NotOutcomeUnknownKind {
+        match self {
+            Self::Missing { .. } => NotOutcomeUnknownKind::Missing,
+            Self::DifferentLifecycle { .. } => NotOutcomeUnknownKind::DifferentLifecycle,
+        }
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Missing { .. } => "no state row exists at this address",
+            Self::DifferentLifecycle { .. } => {
+                "no state row at this address is a create whose outcome is unknown"
+            }
+        }
+    }
+
+    fn fmt_with_project_dir(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        project_dir: &std::path::Path,
+    ) -> std::fmt::Result {
+        let address = match self {
+            Self::Missing { address } | Self::DifferentLifecycle { address } => address,
+        };
+        let reason = self.reason();
+        let resource_type = address.display_type().to_string();
+        let forget_command = carina_core::hint::ProjectCommand::new("state forget", project_dir)
+            .with_argument(&resource_type)
+            .with_argument(address.name_str());
+        let identity = carina_core::parser::display_string_literal(address.name_str());
+        write!(
+            f,
+            "{reason}; `{forget_command}` only accepts create-outcome-unknown rows; use `removed {{ from = {} {identity} }}` for ordinary state removal",
+            address.display_type(),
+        )
+    }
+
+    /// Render this rejection with the exact project-scoped command that was
+    /// rejected.
+    pub fn display_with_project_dir<'a>(
+        &'a self,
+        project_dir: &'a std::path::Path,
+    ) -> impl std::fmt::Display + 'a {
+        NotOutcomeUnknownDisplay {
+            error: self,
+            project_dir,
+        }
+    }
+}
+
+struct NotOutcomeUnknownDisplay<'a> {
+    error: &'a NotOutcomeUnknown,
+    project_dir: &'a std::path::Path,
+}
+
+impl std::fmt::Display for NotOutcomeUnknownDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt_with_project_dir(f, self.project_dir)
+    }
+}
+
+impl std::fmt::Display for NotOutcomeUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+impl std::error::Error for NotOutcomeUnknown {}
+
+/// Exclusive proof that one row currently has an outcome-unknown create.
+///
+/// The mutable borrow prevents the state file from changing between lookup
+/// and consumption, and the fields are private so callers cannot forge it.
+#[derive(Debug)]
+pub struct OutcomeUnknownRow<'a> {
+    state: &'a mut StateFile,
+    index: usize,
+}
+
+impl OutcomeUnknownRow<'_> {
+    /// Borrow the exact protected row selected by the typed lookup.
+    pub fn resource(&self) -> &ResourceState {
+        &self.state.resources[self.index]
+    }
+}
+
 /// Persisted orphans classified per row for safe provider refresh.
 ///
 /// Converting to planner input preserves malformed rows as existing states
@@ -521,6 +631,7 @@ impl LoadedOrphans {
             Current::Absent(state) => state.state().id.clone(),
             Current::Present(present) => present.state().id.clone(),
             Current::CreateInFlight(pending) => pending.id().clone(),
+            Current::CreateOutcomeUnknown(unknown) => unknown.id().clone(),
             Current::MissingIdentifier(state) => state.state().id.clone(),
         };
         self.by_id.insert(id, orphan);
@@ -782,7 +893,8 @@ impl StateFile {
     /// v19: Replaced the partial-read marker's untyped detail with a typed
     ///      pending re-read reason. The v18 migration classifies legacy
     ///      details as incomplete reads.
-    pub const CURRENT_VERSION: u32 = 19;
+    /// v20: Added a token-less create-outcome-unknown current instance.
+    pub const CURRENT_VERSION: u32 = 20;
 
     /// State file version that introduced the independent exports version.
     /// This value is fixed forever.
@@ -925,12 +1037,70 @@ impl StateFile {
         })
     }
 
+    /// Classify an import target using its complete provider route.
+    pub fn import_target_disposition_for_id(&self, id: &ResourceId) -> ImportTargetDisposition {
+        let Some(row) = self.find_resource_for_id(id) else {
+            return ImportTargetDisposition::Vacant;
+        };
+        match row.current() {
+            CurrentInstance::CreateOutcomeUnknown { .. } => {
+                ImportTargetDisposition::ReplaceCreateOutcomeUnknown
+            }
+            CurrentInstance::None
+            | CurrentInstance::Applied { .. }
+            | CurrentInstance::CreateInFlight { .. }
+            | CurrentInstance::MissingIdentifier { .. } => ImportTargetDisposition::Occupied,
+        }
+    }
+
+    /// Borrow the state file through a proof that `address` currently names
+    /// an outcome-unknown create. No other lifecycle can mint this handle.
+    ///
+    /// State loading and mutation enforce one row per
+    /// `(provider, resource_type, identity)` tuple. Provider routing is row
+    /// metadata rather than another persisted identity axis, so this
+    /// routing-agnostic address can match at most one row.
+    pub fn find_outcome_unknown(
+        &mut self,
+        address: &StateBlockAddress,
+    ) -> Result<OutcomeUnknownRow<'_>, NotOutcomeUnknown> {
+        let Some(index) = self.resources.iter().position(|row| {
+            let resource_id = Self::id_for_resource_state(row);
+            address.matches_resource_id(&resource_id)
+        }) else {
+            return Err(NotOutcomeUnknown::Missing {
+                address: address.clone(),
+            });
+        };
+        if matches!(
+            self.resources[index].current(),
+            CurrentInstance::CreateOutcomeUnknown { .. }
+        ) {
+            Ok(OutcomeUnknownRow { state: self, index })
+        } else {
+            Err(NotOutcomeUnknown::DifferentLifecycle {
+                address: address.clone(),
+            })
+        }
+    }
+
+    /// Consume the only typed authorization for forgetting an unknown create.
+    /// Deposed generations remain tracked through `remove_resource`.
+    pub fn forget(row: OutcomeUnknownRow<'_>) -> ResourceState {
+        let OutcomeUnknownRow { state, index } = row;
+        state.remove_resource_at(index)
+    }
+
     /// Find the persisted row addressed by a full resource ID, including its
     /// provider-instance routing dimension.
     pub fn find_resource_for_id(&self, id: &ResourceId) -> Option<&ResourceState> {
         let identity = id.identity_str()?;
-        self.find_resource(&id.provider, &id.resource_type, identity)
-            .filter(|row| row.directives.provider_instance == id.provider_instance)
+        self.resources.iter().find(|row| {
+            row.provider == id.provider
+                && row.resource_type == id.resource_type
+                && row.identity.as_str() == identity
+                && row.directives.provider_instance == id.provider_instance
+        })
     }
 
     /// Find all resources matching a provider and resource type
@@ -1059,7 +1229,7 @@ impl StateFile {
         let mut directives_map = HashMap::new();
         for rs in &self.resources {
             let id = Self::id_for_resource_state(rs);
-            directives_map.insert(id, rs.directives.clone());
+            directives_map.insert(id, Directives::from(&rs.directives));
         }
         directives_map
     }
@@ -1099,7 +1269,9 @@ impl StateFile {
         self.resources.retain(|row| {
             matches!(
                 row.current(),
-                CurrentInstance::Applied { .. } | CurrentInstance::CreateInFlight { .. }
+                CurrentInstance::Applied { .. }
+                    | CurrentInstance::CreateInFlight { .. }
+                    | CurrentInstance::CreateOutcomeUnknown { .. }
             ) || !data_source_ids.contains(&Self::id_for_resource_state(row))
         });
         original_len - self.resources.len()
@@ -1220,6 +1392,9 @@ impl StateFile {
             CurrentInstance::CreateInFlight { pending } => {
                 Current::create_in_flight(pending.clone())
             }
+            CurrentInstance::CreateOutcomeUnknown { unknown } => {
+                Current::create_outcome_unknown(unknown.clone())
+            }
             CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes: _write_only_attributes,
@@ -1251,13 +1426,18 @@ impl StateFile {
             let orphan = match self.build_state_for_resource(&id) {
                 Current::Absent(_state) => continue,
                 Current::Present(present) => {
-                    Orphan::present(present, rs.binding.clone(), rs.directives.clone())
+                    Orphan::present(present, rs.binding.clone(), (&rs.directives).into())
                 }
                 Current::CreateInFlight(pending) => {
-                    Orphan::create_in_flight(pending, rs.binding.clone(), rs.directives.clone())
+                    Orphan::create_in_flight(pending, rs.binding.clone(), (&rs.directives).into())
                 }
+                Current::CreateOutcomeUnknown(unknown) => Orphan::create_outcome_unknown(
+                    unknown,
+                    rs.binding.clone(),
+                    (&rs.directives).into(),
+                ),
                 Current::MissingIdentifier(state) => {
-                    Orphan::missing_identifier(state, rs.binding.clone(), rs.directives.clone())
+                    Orphan::missing_identifier(state, rs.binding.clone(), (&rs.directives).into())
                 }
             };
             loaded.insert(orphan);
@@ -1336,28 +1516,29 @@ impl StateFile {
         resource_type: &str,
         identity: &str,
     ) -> Option<ResourceState> {
-        if let Some(pos) = self.resources.iter().position(|r| {
+        let pos = self.resources.iter().position(|r| {
             r.provider == provider
                 && r.resource_type == resource_type
                 && r.identity.as_str() == identity
-        }) {
-            if self.resources[pos].deposed.is_empty() {
-                Some(self.resources.remove(pos))
-            } else {
-                let removed = self.resources[pos].clone();
-                let deposed = std::mem::take(&mut self.resources[pos].deposed);
-                self.resources[pos] = ResourceState::new(
-                    removed.resource_type.clone(),
-                    removed.identity.clone(),
-                    removed.provider.clone(),
-                );
-                self.resources[pos].directives.provider_instance =
-                    removed.directives.provider_instance.clone();
-                self.resources[pos].deposed = deposed;
-                Some(removed)
-            }
+        })?;
+        Some(self.remove_resource_at(pos))
+    }
+
+    fn remove_resource_at(&mut self, pos: usize) -> ResourceState {
+        if self.resources[pos].deposed.is_empty() {
+            self.resources.remove(pos)
         } else {
-            None
+            let removed = self.resources[pos].clone();
+            let deposed = std::mem::take(&mut self.resources[pos].deposed);
+            self.resources[pos] = ResourceState::new(
+                removed.resource_type.clone(),
+                removed.identity.clone(),
+                removed.provider.clone(),
+            );
+            self.resources[pos].directives.provider_instance =
+                removed.directives.provider_instance.clone();
+            self.resources[pos].deposed = deposed;
+            removed
         }
     }
 
@@ -1910,9 +2091,19 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             } else {
                 None
             };
-            let migrated_content = migrated_v18
+            let pre_outcome_unknown_migration = migrated_v18
                 .as_deref()
                 .unwrap_or(pre_partial_read_migration);
+            let migrated_v19 = if v <= 19 {
+                Some(migrate_v19_create_outcome_unknown(
+                    pre_outcome_unknown_migration,
+                )?)
+            } else {
+                None
+            };
+            let migrated_content = migrated_v19
+                .as_deref()
+                .unwrap_or(pre_outcome_unknown_migration);
             let mut state = StateFile::from_json_str(migrated_content)
                 .map_err(|error| map_state_file_decode_error(error, Some(v)))?;
             // v5 → v6: lift the flat `desired_keys: Vec<String>` field
@@ -2139,6 +2330,12 @@ pub enum CurrentInstance {
         #[serde(flatten)]
         pending: InFlightCreate,
     },
+    /// A create may have reached the cloud, but yielded neither an identifier
+    /// nor a resumable continuation.
+    CreateOutcomeUnknown {
+        #[serde(flatten)]
+        unknown: UnknownCreateOutcome,
+    },
     /// A legacy current instance whose provider identifier is absent.
     MissingIdentifier {
         attributes: PersistedAttributes,
@@ -2165,6 +2362,9 @@ enum EncodedCurrentInstance {
     },
     CreateInFlight {
         envelope: serde_json::Value,
+        started_at: serde_json::Value,
+    },
+    CreateOutcomeUnknown {
         started_at: serde_json::Value,
     },
     MissingIdentifier {
@@ -2208,7 +2408,7 @@ pub struct ResourceState {
     pub protected: bool,
     /// Carina-side directives persisted from the DSL `directives` block.
     #[serde(default)]
-    pub directives: Directives,
+    pub directives: PersistedDirectives,
     /// Attribute prefixes used to generate names (e.g., {"bucket_name": "my-app-"})
     #[serde(default)]
     pub prefixes: HashMap<String, String>,
@@ -2248,15 +2448,21 @@ pub struct ResourceState {
 #[derive(Debug)]
 pub struct WritableResourceState(ResourceState);
 
-/// An attempted writable projection that retained its in-flight row.
+/// An attempted writable projection that retained a protected non-writable
+/// lifecycle row.
 #[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug)]
-pub struct CreateInFlightResourceState(Box<ResourceState>);
+pub enum NonWritableResourceState {
+    CreateInFlight(Box<ResourceState>),
+    CreateOutcomeUnknown(Box<ResourceState>),
+}
 
 #[cfg(any(test, feature = "test-utils"))]
-impl CreateInFlightResourceState {
+impl NonWritableResourceState {
     pub fn into_inner(self) -> ResourceState {
-        *self.0
+        match self {
+            Self::CreateInFlight(row) | Self::CreateOutcomeUnknown(row) => *row,
+        }
     }
 }
 
@@ -2285,7 +2491,7 @@ struct EncodedResourceState {
     #[serde(default)]
     protected: bool,
     #[serde(default)]
-    directives: Directives,
+    directives: PersistedDirectives,
     #[serde(default)]
     prefixes: HashMap<String, String>,
     #[serde(default)]
@@ -2327,6 +2533,14 @@ impl<'de> Deserialize<'de> for ResourceState {
                     .map_err(serde::de::Error::custom)?
                     .into_inner();
                 CurrentInstance::CreateInFlight { pending }
+            }
+            EncodedCurrentInstance::CreateOutcomeUnknown {
+                started_at: _started_at,
+            } => {
+                let unknown = serde_json::from_value::<StateRowUnknownCreateOutcome>(row)
+                    .map_err(serde::de::Error::custom)?
+                    .into_inner();
+                CurrentInstance::CreateOutcomeUnknown { unknown }
             }
             EncodedCurrentInstance::MissingIdentifier {
                 attributes,
@@ -2499,7 +2713,9 @@ impl ResourceState {
         match &self.current {
             CurrentInstance::Applied { attributes, .. }
             | CurrentInstance::MissingIdentifier { attributes, .. } => Some(attributes),
-            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => None,
+            CurrentInstance::None
+            | CurrentInstance::CreateInFlight { .. }
+            | CurrentInstance::CreateOutcomeUnknown { .. } => None,
         }
     }
 
@@ -2508,6 +2724,7 @@ impl ResourceState {
             CurrentInstance::Applied { identifier, .. } => Some(identifier),
             CurrentInstance::None
             | CurrentInstance::CreateInFlight { .. }
+            | CurrentInstance::CreateOutcomeUnknown { .. }
             | CurrentInstance::MissingIdentifier { .. } => None,
         }
     }
@@ -2522,7 +2739,9 @@ impl ResourceState {
                 write_only_attributes,
                 ..
             } => write_only_attributes,
-            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => &[],
+            CurrentInstance::None
+            | CurrentInstance::CreateInFlight { .. }
+            | CurrentInstance::CreateOutcomeUnknown { .. } => &[],
         }
     }
 
@@ -2535,7 +2754,9 @@ impl ResourceState {
             | CurrentInstance::MissingIdentifier {
                 nested_write_only, ..
             } => nested_write_only,
-            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => {
+            CurrentInstance::None
+            | CurrentInstance::CreateInFlight { .. }
+            | CurrentInstance::CreateOutcomeUnknown { .. } => {
                 static EMPTY: NestedWriteOnlyRecord = NestedWriteOnlyRecord::new();
                 &EMPTY
             }
@@ -2546,7 +2767,9 @@ impl ResourceState {
         match &self.current {
             CurrentInstance::Applied { partial_read, .. }
             | CurrentInstance::MissingIdentifier { partial_read, .. } => partial_read.as_ref(),
-            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => None,
+            CurrentInstance::None
+            | CurrentInstance::CreateInFlight { .. }
+            | CurrentInstance::CreateOutcomeUnknown { .. } => None,
         }
     }
 
@@ -2563,9 +2786,9 @@ impl ResourceState {
     /// deposed generations. This controls removal of an empty shell only; it
     /// must not be used to classify [`CurrentInstance::None`] while loading.
     fn is_deposed_only_shell(&self) -> bool {
-        let shell_directives = Directives {
+        let shell_directives = PersistedDirectives {
             provider_instance: self.directives.provider_instance.clone(),
-            ..Directives::default()
+            ..PersistedDirectives::default()
         };
         matches!(self.current, CurrentInstance::None)
             && !self.deposed.is_empty()
@@ -2598,6 +2821,9 @@ impl ResourceState {
             CurrentInstance::CreateInFlight { .. } => {
                 panic!("cannot add resource attributes to an in-flight row")
             }
+            CurrentInstance::CreateOutcomeUnknown { .. } => {
+                panic!("cannot add resource attributes to an outcome-unknown row")
+            }
         }
     }
 
@@ -2613,7 +2839,9 @@ impl ResourceState {
                 write_only_attributes,
                 ..
             } => *write_only_attributes = value,
-            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => {
+            CurrentInstance::None
+            | CurrentInstance::CreateInFlight { .. }
+            | CurrentInstance::CreateOutcomeUnknown { .. } => {
                 panic!("test fixture has no attribute-bearing current instance")
             }
         }
@@ -2625,7 +2853,9 @@ impl ResourceState {
         match &mut self.current {
             CurrentInstance::Applied { partial_read, .. }
             | CurrentInstance::MissingIdentifier { partial_read, .. } => *partial_read = value,
-            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => {
+            CurrentInstance::None
+            | CurrentInstance::CreateInFlight { .. }
+            | CurrentInstance::CreateOutcomeUnknown { .. } => {
                 panic!("test fixture has no attribute-bearing current instance")
             }
         }
@@ -2687,6 +2917,10 @@ impl ResourceState {
                 "status": "create_in_flight",
                 "started_at": pending.started_at().as_str(),
             }),
+            CurrentInstance::CreateOutcomeUnknown { unknown } => serde_json::json!({
+                "status": "create_outcome_unknown",
+                "started_at": unknown.started_at().as_str(),
+            }),
             CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes: _write_only_attributes,
@@ -2734,7 +2968,7 @@ impl ResourceState {
             current: CurrentInstance::None,
             deposed: Vec::new(),
             protected: false,
-            directives: Directives::default(),
+            directives: PersistedDirectives::default(),
             prefixes: HashMap::new(),
             name_overrides: HashMap::new(),
             explicit: ExplicitFields::default(),
@@ -2790,19 +3024,27 @@ impl ResourceState {
     /// ```
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
-    pub fn into_writable(self) -> Result<WritableResourceState, CreateInFlightResourceState> {
+    pub fn into_writable(self) -> Result<WritableResourceState, NonWritableResourceState> {
         match self.current {
             CurrentInstance::CreateInFlight { .. } => {
-                Err(CreateInFlightResourceState(Box::new(self)))
+                Err(NonWritableResourceState::CreateInFlight(Box::new(self)))
             }
-            _ => Ok(WritableResourceState(self)),
+            CurrentInstance::CreateOutcomeUnknown { .. } => Err(
+                NonWritableResourceState::CreateOutcomeUnknown(Box::new(self)),
+            ),
+            CurrentInstance::None
+            | CurrentInstance::Applied { .. }
+            | CurrentInstance::MissingIdentifier { .. } => Ok(WritableResourceState(self)),
         }
     }
 
     pub fn refreshable(&self) -> Option<RefreshableResourceState<'_>> {
         match self.current {
-            CurrentInstance::CreateInFlight { .. } => None,
-            _ => Some(RefreshableResourceState(self)),
+            CurrentInstance::CreateInFlight { .. }
+            | CurrentInstance::CreateOutcomeUnknown { .. } => None,
+            CurrentInstance::None
+            | CurrentInstance::Applied { .. }
+            | CurrentInstance::MissingIdentifier { .. } => Some(RefreshableResourceState(self)),
         }
     }
 
@@ -2993,12 +3235,13 @@ impl ResourceState {
         stored_attributes: &HashMap<String, Value>,
         schema: Option<&ResourceSchema>,
         authoring_basis: DesiredAuthoringBasis<'_>,
+        comparison: &ComparisonContext<'_>,
     ) {
         if let Some(existing) = existing {
             self.protected = existing.protected;
             self.name_overrides = existing.name_overrides.clone();
         }
-        self.directives = resource.directives.clone();
+        self.directives = PersistedDirectives::from(&resource.directives);
         if self.directives.provider_instance.is_none() {
             self.directives.provider_instance = resource.id.provider_instance.clone();
         }
@@ -3020,6 +3263,7 @@ impl ResourceState {
                     stored_attributes,
                     &sent_desired,
                     schema,
+                    comparison,
                 )
             }
             DesiredAuthoringBasis::DesiredRead => {
@@ -3027,6 +3271,7 @@ impl ResourceState {
                     resource,
                     stored_attributes,
                     schema,
+                    comparison,
                 )
             }
             DesiredAuthoringBasis::CarriedRead => Self::carried_explicit_for_stored_values(
@@ -3034,6 +3279,7 @@ impl ResourceState {
                 existing,
                 stored_attributes,
                 schema,
+                comparison,
             ),
         };
         self.binding = resource.binding.clone();
@@ -3048,12 +3294,14 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         stored_attributes: &HashMap<String, Value>,
         schema: Option<&ResourceSchema>,
+        comparison: &ComparisonContext<'_>,
     ) -> ExplicitFields {
         let Some(existing) = existing else {
             return explicit::build_from_read_resource_for_stored_values(
                 resource,
                 stored_attributes,
                 schema,
+                comparison,
             );
         };
         let prior_stored_attributes = existing
@@ -3066,6 +3314,7 @@ impl ResourceState {
             &existing.explicit,
             stored_attributes,
             schema,
+            comparison,
         )
     }
 
@@ -3081,6 +3330,7 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
+        comparison: &ComparisonContext<'_>,
     ) -> Result<Self, ResourceStateEncodingError> {
         let applied_desired = created
             .resolved_desired_attributes()
@@ -3184,6 +3434,7 @@ impl ResourceState {
             &stored_attributes,
             schema,
             authoring_basis,
+            comparison,
         );
         Ok(row)
     }
@@ -3199,6 +3450,7 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
+        comparison: &ComparisonContext<'_>,
     ) -> Result<Self, ResourceStateEncodingError> {
         let (persisted, sent_desired) = match pending.persistence() {
             InFlightPersistence::Persisted => {
@@ -3231,6 +3483,7 @@ impl ResourceState {
                             resource,
                             &HashMap::new(),
                             schema,
+                            comparison,
                         );
                     }
                     return Ok(row);
@@ -3270,8 +3523,48 @@ impl ResourceState {
         let authoring_basis = sent_desired
             .map(DesiredAuthoringBasis::Sent)
             .unwrap_or(DesiredAuthoringBasis::CarriedRead);
-        row.populate_desired_metadata(resource, existing, &HashMap::new(), schema, authoring_basis);
+        row.populate_desired_metadata(
+            resource,
+            existing,
+            &HashMap::new(),
+            schema,
+            authoring_basis,
+            comparison,
+        );
         Ok(row)
+    }
+
+    /// Build the token-less protected row for a create whose cloud outcome is
+    /// unknown. Existing host metadata and deposed generations are retained.
+    pub fn from_unknown_create_outcome<S>(
+        resource: &ResolvedResource<S>,
+        unknown: &UnknownCreateOutcome,
+        existing: Option<&ResourceState>,
+        schema: Option<&ResourceSchema>,
+        comparison: &ComparisonContext<'_>,
+    ) -> Self {
+        let mut row = existing.cloned().unwrap_or_else(|| {
+            Self::new(
+                &resource.id.resource_type,
+                resource.identity().clone(),
+                resource.id.provider.clone(),
+            )
+        });
+        row.provider = resource.id.provider.clone();
+        row.resource_type = resource.id.resource_type.clone();
+        row.identity = resource.identity().clone();
+        row.current = CurrentInstance::CreateOutcomeUnknown {
+            unknown: unknown.clone(),
+        };
+        row.populate_desired_metadata(
+            resource,
+            existing,
+            &HashMap::new(),
+            schema,
+            DesiredAuthoringBasis::DesiredRead,
+            comparison,
+        );
+        row
     }
 
     /// Build a `ResourceState` from a desired resource, provider-returned
@@ -3294,6 +3587,7 @@ impl ResourceState {
         schema: Option<&ResourceSchema>,
         row_basis: RowBasis<'_>,
         preferred_hashes: Option<&PersistedAttributes>,
+        comparison: &ComparisonContext<'_>,
     ) -> Result<Self, ResourceStateEncodingError> {
         // The resource carried by a saved plan still contains deferred expressions.
         // Once an operation has run, secret protection must follow the provider-ready
@@ -3467,6 +3761,7 @@ impl ResourceState {
             &state.attributes,
             schema,
             authoring_basis,
+            comparison,
         );
         Ok(rs)
     }
@@ -3495,7 +3790,7 @@ struct ResourceStateV14CurrentDto {
     #[serde(default)]
     protected: bool,
     #[serde(default)]
-    directives: Directives,
+    directives: PersistedDirectives,
     #[serde(default)]
     prefixes: HashMap<String, String>,
     #[serde(default)]
@@ -3531,9 +3826,9 @@ fn migrate_v14_current_instance(content: &str) -> Result<String, BackendError> {
                     "Failed to migrate state file from v14: {error}"
                 ))
             })?;
-        let shell_directives = Directives {
+        let shell_directives = PersistedDirectives {
             provider_instance: legacy.directives.provider_instance.clone(),
-            ..Directives::default()
+            ..PersistedDirectives::default()
         };
         let is_deposed_only_shell = legacy.identifier.is_none()
             && !legacy.deposed.is_empty()
@@ -3685,13 +3980,25 @@ fn migrate_v18_partial_read_reason(content: &str) -> Result<String, BackendError
             }),
         );
     }
-    root["version"] = serde_json::json!(StateFile::CURRENT_VERSION);
+    root["version"] = serde_json::json!(19);
     root.as_object_mut()
         .expect("a state file root validated as an object")
         .entry("exports_version".to_string())
         .or_insert_with(|| serde_json::json!(PublishedExports::CURRENT_VERSION));
     serde_json::to_string(&root).map_err(|error| {
         BackendError::InvalidState(format!("Failed to migrate state file from v18: {error}"))
+    })
+}
+
+/// v19 → v20: reserve the token-less create-outcome-unknown current kind.
+/// Existing resource rows need no structural rewrite.
+fn migrate_v19_create_outcome_unknown(content: &str) -> Result<String, BackendError> {
+    let mut root: serde_json::Value = serde_json::from_str(content).map_err(|error| {
+        BackendError::InvalidState(format!("Failed to migrate state file from v19: {error}"))
+    })?;
+    root["version"] = serde_json::json!(StateFile::CURRENT_VERSION);
+    serde_json::to_string(&root).map_err(|error| {
+        BackendError::InvalidState(format!("Failed to migrate state file from v19: {error}"))
     })
 }
 
@@ -3855,7 +4162,9 @@ fn migrate_v10_reserved_attributes(state: &mut StateFile) {
             | CurrentInstance::MissingIdentifier { attributes, .. } => {
                 attributes.retain_keys(|key| !key.starts_with('_'));
             }
-            CurrentInstance::None | CurrentInstance::CreateInFlight { .. } => {}
+            CurrentInstance::None
+            | CurrentInstance::CreateInFlight { .. }
+            | CurrentInstance::CreateOutcomeUnknown { .. } => {}
         }
         for deposed in &mut resource.deposed {
             deposed.attributes.retain_keys(|key| !key.starts_with('_'));

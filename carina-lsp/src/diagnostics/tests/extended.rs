@@ -580,14 +580,21 @@ fn render_value_type_error(
     type_expr: &TypeExpr,
     value: &Value,
 ) -> Option<String> {
-    carina_core::validation::typecheck::check_type_expr_value(
-        type_expr,
-        value,
-        &engine.provider_context,
-        carina_core::validation::typecheck::TypecheckInference::Unavailable,
-    )
-    .err()
-    .map(|error| error.to_string())
+    let result = match engine.provider_context.loaded() {
+        Some(provider_context) => carina_core::validation::typecheck::check_type_expr_value(
+            type_expr,
+            value,
+            provider_context,
+            carina_core::validation::typecheck::TypecheckInference::Unavailable,
+        ),
+        None => carina_core::validation::typecheck::check_type_expr_value_providerless(
+            type_expr,
+            value,
+            &engine.provider_context,
+            carina_core::validation::typecheck::TypecheckInference::Unavailable,
+        ),
+    };
+    result.err().map(|error| error.to_string())
 }
 
 fn unused_binding_names(diagnostics: &[Diagnostic]) -> Vec<String> {
@@ -1225,11 +1232,7 @@ mock.test.resource {
 
 #[test]
 fn missing_provider_schema_suppresses_attribute_derived_identity_conflict() {
-    let engine = DiagnosticEngine::new(
-        std::sync::Arc::new(SchemaRegistry::new()),
-        vec![],
-        std::sync::Arc::new(vec![]),
-    );
+    let engine = DiagnosticEngine::without_loaded_provider_schemas();
     let source = r#"awscc.iam.role {
   role_name = "one"
 }
@@ -1957,11 +1960,7 @@ fn list_item_type_validation() {
         schema.validate().expect("schema fixture must be valid"),
     );
 
-    let engine = DiagnosticEngine::new(
-        Arc::new(schemas),
-        vec!["test".to_string()],
-        Arc::new(vec![]),
-    );
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["test".to_string()]);
 
     // Use bare identifiers (`tcp`, `invalid_protocol`) rather than
     // quoted strings — under carina#2986 strict mode, an enum attribute
@@ -2124,7 +2123,8 @@ fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
         name: "test".to_string(),
         schemas: vec![schema.clone()],
     })];
-    let core_resolver = provider_mod::provider_custom_types_from_factories(Arc::new(factories));
+    let core_resolver =
+        carina_core::provider::provider_custom_types_from_factories(Arc::new(factories));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("test", schema);
     let core_errors = schemas
@@ -4064,9 +4064,8 @@ fn warning_when_provider_loaded_but_schema_missing() {
     // Provider is loaded but doesn't have a schema for this resource type.
     // Should show WARNING (not ERROR), not "Unknown resource type".
     let engine = DiagnosticEngine::new(
-        Arc::new(SchemaRegistry::new()),
+        loaded_test_providers(SchemaRegistry::new()),
         vec!["awscc".to_string()],
-        Arc::new(vec![]),
     );
     let doc = create_document(
         r#"awscc.iam.role {
@@ -4102,7 +4101,7 @@ fn warning_when_provider_loaded_but_schema_missing() {
 
 #[test]
 fn error_when_provider_has_no_loaded_schema_for_file_configuration() {
-    let engine = DiagnosticEngine::new(Arc::new(SchemaRegistry::new()), vec![], Arc::new(vec![]));
+    let engine = DiagnosticEngine::without_loaded_provider_schemas();
     let doc = create_document(
         r#"awscc.iam.role {
   role_name = 'test'
@@ -4142,13 +4141,27 @@ fn error_when_provider_has_no_loaded_schema_for_file_configuration() {
 }
 
 #[test]
+fn export_inference_without_loaded_providers_does_not_report_provider_checked_failure() {
+    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let doc = create_document("exports {\n  value = missing.attribute\n}\n");
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("type annotation required")),
+        "the no-provider path must not mint provider-schema inference evidence: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn no_undefined_resource_for_namespaced_enum_value() {
     // provider_names includes "awscc", so awscc.xxx.yyy.EnumType.VALUE
     // should NOT be flagged as "Undefined resource"
     let engine = DiagnosticEngine::new(
-        Arc::new(SchemaRegistry::new()),
+        loaded_test_providers(SchemaRegistry::new()),
         vec!["awscc".to_string()],
-        Arc::new(vec![]),
     );
     let doc = create_document(
         r#"awscc.organizations.organization {
@@ -4177,11 +4190,8 @@ fn no_undefined_resource_for_declared_but_uninstalled_provider() {
     // used to be flagged as `Undefined resource: 'awscc'. Define it with 'let
     // awscc = aws...'` — which is both wrong (awscc is a namespace, not a let
     // binding) and actively misleading (following the fix breaks valid DSL).
-    let engine = DiagnosticEngine::new(
-        Arc::new(SchemaRegistry::new()),
-        vec![], // nothing installed — simulates missing .carina/
-        Arc::new(vec![]),
-    );
+    // Nothing installed — simulates missing .carina/.
+    let engine = DiagnosticEngine::without_loaded_provider_schemas();
     let doc = create_document(
         r#"provider awscc {
   region = awscc.Region.ap_northeast_1
@@ -4207,7 +4217,7 @@ fn undefined_resource_still_fires_when_identifier_is_not_a_declared_provider() {
     // binding diagnostics. When the root identifier is not a declared provider
     // and not a defined binding, the existing "Undefined resource" message
     // should still fire.
-    let engine = DiagnosticEngine::new(Arc::new(SchemaRegistry::new()), vec![], Arc::new(vec![]));
+    let engine = DiagnosticEngine::without_loaded_provider_schemas();
     let doc = create_document(
         r#"provider awscc {
   region = totally_unknown.some_attr
@@ -4268,11 +4278,7 @@ fn map_key_validation_warns_on_invalid_key() {
         schema.validate().expect("schema fixture must be valid"),
     );
 
-    let engine = DiagnosticEngine::new(
-        Arc::new(schemas),
-        vec!["test".to_string()],
-        Arc::new(vec![]),
-    );
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["test".to_string()]);
 
     // Invalid condition key "unknown_op"
     let doc = create_document(
@@ -4959,6 +4965,92 @@ fn exports_type_warning_for_literal_mismatch() {
 }
 
 #[test]
+fn orphan_exports_check_builtins_without_calling_unloaded_custom_types() {
+    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let doc = create_document(
+        r#"exports {
+  flag: Bool = 'hello'
+  identifiers: list(mock.RecoveryProbe) = ['identifier']
+}
+attributes {
+  identifier: mock.RecoveryProbe = 'identifier'
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected Bool, got string")),
+        "built-in export checks must remain available: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .contains("provider custom types are not loaded")),
+        "custom leaves in orphan buffers must not call the unloaded resolver: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn orphan_export_dotted_unresolved_literal_mismatch_warns_without_loaded_providers() {
+    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let doc = create_document(
+        r#"exports {
+  x: aws.AccountId = 42
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == Some(DiagnosticSeverity::WARNING)
+                && diagnostic
+                    .message
+                    .contains("expected aws.AccountId, got int")
+        }),
+        "providerless dotted export annotations must retain literal mismatch warnings: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn orphan_attribute_nested_dotted_unresolved_shape_mismatch_warns_without_loaded_providers() {
+    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let doc = create_document(
+        r#"attributes {
+  x: map(aws.AccountId) = ['a']
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == Some(DiagnosticSeverity::WARNING)
+                && diagnostic
+                    .message
+                    .contains("expected map(aws.AccountId), got list")
+        }),
+        "providerless nested dotted attribute annotations must retain shape mismatch warnings: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn exports_type_warning_multiline_vs_oneline() {
     let engine = test_engine();
     // Multi-line (before format)
@@ -5075,9 +5167,8 @@ fn exports_referencing_module_call_attribute_does_not_require_annotation() {
     // so inference sees the call as a `Virtual` composition and derives
     // the declared attribute through that post-expansion surface.
     let engine = DiagnosticEngine::new(
-        Arc::new(SchemaRegistry::new()),
+        loaded_test_providers(SchemaRegistry::new()),
         vec!["awscc".to_string()],
-        Arc::new(vec![]),
     );
     let tmp = tempfile::tempdir().unwrap();
     let module_dir = tmp.path().join("github_module");
@@ -5229,11 +5320,10 @@ let selected = parts[secret("hunter2")]
 }
 
 #[test]
-fn module_call_export_typo_is_reported_once_after_lsp_expansion() {
+fn module_call_export_typo_reports_attached_inference_failure_once_after_lsp_expansion() {
     let engine = DiagnosticEngine::new(
-        Arc::new(SchemaRegistry::new()),
+        loaded_test_providers(SchemaRegistry::new()),
         vec!["awscc".to_string()],
-        Arc::new(vec![]),
     );
     let tmp = tempfile::tempdir().unwrap();
     let module_dir = tmp.path().join("github_module");
@@ -5254,25 +5344,14 @@ fn module_call_export_typo_is_reported_once_after_lsp_expansion() {
     std::fs::write(base.join("exports.crn"), exports).unwrap();
 
     let diagnostics = analyze_with_buffer(&engine, &base, "exports.crn", exports);
-    let typo_diagnostics: Vec<_> = diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic.message.contains("role_ar")
-                && diagnostic
-                    .message
-                    .to_ascii_lowercase()
-                    .contains("unknown attribute")
-        })
-        .collect();
-
     assert_eq!(
-        typo_diagnostics.len(),
+        diagnostics.len(),
         1,
-        "post-expansion inference and the existence walk must not duplicate the typo: {:?}",
-        diagnostics
-            .iter()
-            .map(|diagnostic| &diagnostic.message)
-            .collect::<Vec<_>>(),
+        "post-expansion inference and the existence walk must not duplicate the typo: {diagnostics:#?}",
+    );
+    assert_eq!(
+        diagnostics[0].message,
+        "export 'role_arn': type annotation required: unknown attribute `role_ar` on `github_actions_carina`",
     );
 }
 
@@ -5574,6 +5653,32 @@ let sg = aws.ec2.SecurityGroup {
 }
 
 #[test]
+fn consumer_attribute_resolution_marks_unnameable_type_unchecked() {
+    let parsed = carina_core::parser::parse_file(
+        "attributes {\n  out: missing.types.Identifier = 'value'\n}\n",
+        std::path::Path::new("module.crn"),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("open-module fixture must parse");
+    let parameters = carina_core::validation::resolve_attribute_static_types_for_consumer(
+        &parsed.attribute_params,
+        &carina_core::parser::ProviderContext::default(),
+    );
+
+    assert!(matches!(
+        &parameters[0].static_type,
+        Some(carina_core::static_type::StaticType::Unchecked(reason))
+            if reason.original()
+                == &TypeExpr::DottedUnresolved(
+                    carina_core::parser::ResourceTypePath::new(
+                        "missing",
+                        "types.Identifier",
+                    ),
+                )
+    ));
+}
+
+#[test]
 fn module_call_findings_render_parser_key_and_call_ranges() {
     let fixture = tempfile::tempdir().expect("module-call range fixture");
     let child = fixture.path().join("child");
@@ -5718,6 +5823,13 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
         }
     }
 
+    fn consumer_type(type_expr: TypeExpr) -> carina_core::static_type::ConsumerStaticType {
+        carina_core::validation::resolve_consumer_static_type_for_signature(
+            &type_expr,
+            &carina_core::parser::ProviderContext::default(),
+        )
+    }
+
     fn composition(binding: &'static str, call_binding: &str) -> LiveComposition {
         let source_file = std::path::PathBuf::from(format!("/{call_binding}.crn"));
         let parsed = carina_core::parser::parse_file(
@@ -5767,7 +5879,7 @@ let first = unrelated { }
         "sg".to_string(),
         LiveCompositionAttribute::from_value(
             Value::Concrete(ConcreteValue::String("sg-123".into())),
-            Some(schema_type("ec2.SecurityGroup")),
+            Some(consumer_type(schema_type("ec2.SecurityGroup"))),
         ),
     );
     let mut consumer = composition("consumer", "missing-consumer-call");
@@ -5775,7 +5887,7 @@ let first = unrelated { }
         "vpc_id".to_string(),
         LiveCompositionArgument::from_value(
             Value::resource_ref("source", "missing", vec![]),
-            schema_type("ec2.Vpc"),
+            consumer_type(schema_type("ec2.Vpc")),
             ArgumentOrigin::Defaulted,
         ),
     );
@@ -6523,13 +6635,26 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
     let path = fixture.path().join("main.crn");
     let document = create_document_at(source, path.clone());
     let resolver_input = document.parsed().expect("root parse").clone();
-    let report = carina_core::module_resolver::resolve_modules_with_diagnostics(
-        &resolver_input,
-        fixture.path(),
-        &engine.provider_context,
-        &engine.schemas,
-        &[],
-    );
+    let report = match &engine.provider_context {
+        DiagnosticProviderContext::Loaded(provider_context) => {
+            carina_core::module_resolver::resolve_modules_with_diagnostics(
+                &resolver_input,
+                fixture.path(),
+                provider_context,
+                &engine.schemas,
+                &[],
+            )
+        }
+        DiagnosticProviderContext::Unloaded(provider_context) => {
+            carina_core::module_resolver::resolve_modules_with_providerless_diagnostics(
+                &resolver_input,
+                fixture.path(),
+                provider_context,
+                &engine.schemas,
+                &[],
+            )
+        }
+    };
     let residuals = match report {
         carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
             panic!(
@@ -7542,9 +7667,8 @@ let instance = outer {
 #[test]
 fn no_undefined_resource_for_sibling_binding_in_exports() {
     let engine = DiagnosticEngine::new(
-        Arc::new(SchemaRegistry::new()),
+        loaded_test_providers(SchemaRegistry::new()),
         vec!["awscc".to_string()],
-        Arc::new(vec![]),
     );
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("downstream");
@@ -11193,7 +11317,9 @@ exports {
     let temp = write_tag_key_fixture(&[("main.crn", source)]);
 
     let mut engine = test_engine();
-    engine.provider_context.decryptor = Some(Box::new(|_, _| Ok("decrypted-marker".to_string())));
+    engine
+        .provider_context
+        .set_decryptor_for_test(Box::new(|_, _| Ok("decrypted-marker".to_string())));
     let diagnostics = analyze_with_buffer(&engine, temp.path(), "main.crn", source);
 
     for name in [

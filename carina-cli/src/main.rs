@@ -303,6 +303,7 @@ enum ApplyInput<'a> {
     SavedPlan(&'a Path),
 }
 
+#[allow(clippy::result_large_err)]
 fn classify_apply_input(path: &Path) -> Result<ApplyInput<'_>, error::AppError> {
     match path.metadata() {
         Ok(metadata) if metadata.is_dir() => Ok(ApplyInput::Project(path)),
@@ -364,6 +365,7 @@ fn create_provider_context() -> carina_core::parser::ProviderContext {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn resolve_user_dirs() -> Result<carina_core::UserDirs, error::AppError> {
     // Home discovery is intentionally confined to this binary boundary and
     // invoked only by command arms that use user-owned storage.
@@ -810,7 +812,7 @@ mod error_format_tests {
         }
         let provider_context = carina_core::parser::ProviderContext::default();
         let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
-        let context = carina_core::validation::ValidationTypeContext::new(
+        let context = carina_core::validation::ValidationTypeContext::new_providerless(
             &parsed,
             &schemas,
             &provider_context,
@@ -1356,6 +1358,36 @@ mod error_format_tests {
             }
             _ => panic!("expected force-unlock command"),
         }
+    }
+
+    #[test]
+    fn state_forget_hint_shape_parses_with_auto_approve() {
+        let cli = Cli::try_parse_from([
+            "carina",
+            "state",
+            "forget",
+            "awscc.ec2.Vpc",
+            "main-vpc",
+            "--auto-approve",
+        ])
+        .expect("the plan hint's state-forget command must be copy-pasteable");
+
+        let Commands::State { command } = cli.command else {
+            panic!("expected state command");
+        };
+        let StateCommands::Forget {
+            resource_type,
+            identity,
+            auto_approve,
+            path,
+        } = command
+        else {
+            panic!("expected state forget command");
+        };
+        assert_eq!(resource_type, "awscc.ec2.Vpc");
+        assert_eq!(identity, "main-vpc");
+        assert!(auto_approve);
+        assert_eq!(path, PathBuf::from("."));
     }
 
     #[test]

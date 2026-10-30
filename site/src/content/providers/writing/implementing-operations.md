@@ -56,8 +56,9 @@ pub trait Api {
 // The SDK's trait returns `ProviderError` by value; match its allowance.
 #![allow(clippy::result_large_err)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
+use carina_plugin_sdk::core::schema::ReferenceForms;
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending, Poll,
@@ -79,11 +80,30 @@ impl<A: Api> CarinaProvider for WidgetProvider<A> {
     type UpdateToken = Never;
     type DeleteToken = Never;
 
+    fn reference_forms(&self) -> ReferenceForms {
+        ReferenceForms::new()
+    }
+
+    fn initialize(
+        &mut self,
+        _attrs: &BTreeMap<String, Value>,
+    ) -> Result<ReferenceScope, String> {
+        Ok(ReferenceScope::Unavailable)
+    }
+
     // info, schemas, and the operations below
 }
 ```
 
 `CreateToken` is defined below. Updates and deletes finish in one call, so their token types are `Never`.
+
+When an initialized instance knows its reference namespace, return
+`ReferenceScope::available(partition, region, account)` from `initialize`.
+It returns `ReferenceScopeError` when a value is empty or contains `{` or `}`;
+map that error to `String` for the trait method. Return
+`ReferenceScope::Unavailable` when the namespace is not known; under
+`Unavailable`, the provider's reference forms are inert and do not expand
+short names during comparison.
 
 The component exports one concrete type, for example `export_provider!(WidgetProvider<HttpApi>, http)` with your real client as `HttpApi`; the `http` form also needs `wasi = "0.14"` in the `wasm32` dependencies, as the Overview explains. `export_provider!` builds the provider with `Default`, so that type needs a `Default` implementation, written in the same crate as `WidgetProvider` (Rust's orphan rule rejects it in a separate binary crate), and the client should take its endpoint and credentials in `initialize`, from the `provider` block. Remember that the host only lets requests reach AWS hosts today; see the [Overview](/providers/writing/overview/#what-a-provider-is).
 
@@ -199,7 +219,7 @@ fn create(
     _id: &ResourceId,
     request: CreateRequest,
     attempt: CreateAttempt,
-) -> Result<CreateStep<CreateToken>, CreateVerdict> {
+) -> Result<CreateStep<CreateToken>, CreateVerdict<CreateToken>> {
     // Nothing has been sent yet, so a bad request is untracked.
     let (name, size) = match desired(&request.resource) {
         Ok(values) => values,
@@ -257,7 +277,7 @@ fn poll_create(
     id: &ResourceId,
     request: CreateRequest,
     poll: Poll<CreateToken>,
-) -> Result<CreateStep<CreateToken>, PollVerdict> {
+) -> Result<CreateStep<CreateToken>, PollVerdict<CreateToken>> {
     let (attempt, token) = match poll {
         Poll::Unissued(attempt, token) => (attempt, token),
         // The widget's ID is known and the create has finished; only
@@ -280,7 +300,13 @@ fn poll_create(
         CreateToken::Starting { client_token } => {
             let (name, size) = match desired(&request.resource) {
                 Ok(values) => values,
-                Err(err) => return Err(attempt.undetermined(err)),
+                Err(err) => {
+                    return Err(attempt.preserve(
+                        CreateToken::Starting { client_token },
+                        5,
+                        err,
+                    ));
+                }
             };
             match self.api.start_create(&client_token, &name, size) {
                 Ok(operation) => Ok(attempt.pending(CreateToken::Operation(operation), 5)),
@@ -288,7 +314,11 @@ fn poll_create(
                 // nothing: the API may refuse a reused client token, for
                 // example because the configuration changed in between.
                 Err(err @ ApiError::Rejected(_)) => {
-                    Err(attempt.undetermined(api_error("widget.Create", err)))
+                    Err(attempt.preserve(
+                        CreateToken::Starting { client_token },
+                        5,
+                        api_error("widget.Create", err),
+                    ))
                 }
                 Err(_) => Ok(attempt.pending(CreateToken::Starting { client_token }, 5)),
             }
@@ -303,7 +333,11 @@ fn poll_create(
                 Ok(identifier) => Ok(attempt
                     .issued(identifier)
                     .pending(CreateToken::Operation(operation), 0)),
-                Err(err) => Err(attempt.undetermined(err)),
+                Err(err) => Err(attempt.preserve(
+                    CreateToken::Operation(operation),
+                    5,
+                    err,
+                )),
             },
             // The provider reported an identifier, then the operation failed.
             // The read-back observation says whether the widget exists.
@@ -321,7 +355,11 @@ fn poll_create(
                         .failed(observation, error(ProviderErrorKind::ApiError, reason))
                         .into())
                 }
-                Err(err) => Err(attempt.undetermined(err)),
+                Err(err) => Err(attempt.preserve(
+                    CreateToken::Operation(operation),
+                    5,
+                    err,
+                )),
             },
             Ok(CreateStatus::Failed { id: None, reason }) => {
                 Err(attempt.untracked(error(ProviderErrorKind::ApiError, reason)))
@@ -335,13 +373,13 @@ fn poll_create(
 
 A `Starting` token retries the create with the same client token. Because the API treats the retry as the same request, it either starts the create now or returns the operation the first call started, so the provider does not create a second widget or claim one it did not create. That holds only while the API still remembers the client token; many APIs forget idempotency keys after a day or so.
 
-A rejected retry is `undetermined`, not `untracked`. The first call may have created the widget, and the API can refuse the reused token for reasons of its own, for example because the configuration changed before a later apply resumed the create. Any other failure keeps the attempt pending.
+A rejected retry is `preserve`, not `untracked`. The first call may have created the widget, and the API can refuse the reused token for reasons of its own, for example because the configuration changed before a later apply resumed the create. `preserve` carries the same continuation plus the error, so Carina keeps the attempt while surfacing why this poll stopped. Any other failure keeps the attempt pending.
 
 When the operation finishes, the provider calls `attempt.issued(identifier)` and returns `pending` once more. That records the identifier right away, and the next poll goes to the `Poll::Issued` arm, which reads the widget back and finishes with `succeeded`. A read that fails stays pending instead of turning a healthy widget into a failed create.
 
-A create for which the provider reported an identifier is `failed` with that identifier, so Carina records the identifier plus only observed or sent values, and the next plan re-checks it. `failed` also takes an `Observation`: what the provider saw when it read the widget, either `Observation::Read` with the read outcome or `Observation::ReadFailed` with the read error. The observation passed to `failed` says whether the resource was found and supplies any observed state Carina can record. `failed` returns a `CreateVerdict`, and `.into()` turns it into the `PollVerdict` that `poll_create` returns.
+A create for which the provider reported an identifier is `failed` with that identifier, so Carina records the identifier plus only observed or sent values, and the next plan re-checks it. `failed` also takes an `Observation`: what the provider saw when it read the widget, either `Observation::Read` with the read outcome or `Observation::ReadFailed` with the read error. The observation passed to `failed` says whether the resource was found and supplies any observed state Carina can record. `failed` returns a `CreateVerdict<CreateToken>`, and `.into()` turns it into the `PollVerdict<CreateToken>` that `poll_create` returns.
 
-Two outcomes after `issued` are not used here. `partial` finishes a create whose read-back was incomplete, with a `PartialReadDiagnostic` naming the missing attributes. `discarded` reports that the provider deleted the resource it had just created, so Carina keeps no record of it. A create that failed without producing a widget is `untracked`. When the status call itself fails, the operation is still there, so the provider polls again. `undetermined` is for the cases where the provider cannot tell what happened, such as the rejected retry or an empty identifier from the API. Carina keeps an undetermined attempt in state, and every later apply resumes and polls it again, so use it when a later poll might settle the create, not as a way to give up.
+Two outcomes after `issued` are not used here. `partial` finishes a create whose read-back was incomplete, with a `PartialReadDiagnostic` naming the missing attributes. `discarded` reports that the provider deleted the resource it had just created, so Carina keeps no record of it. A create that failed without producing a widget is `untracked`. When the status call itself fails, the operation is still there, so the provider polls again. When a provider call has a usable continuation but also needs to report an error, `preserve` returns the error-bearing in-flight verdict. Provider code does not produce `undetermined`; guest transport glue reserves that wire arm for a request or token it cannot decode, when it has no newer continuation to return.
 
 ## resume_create
 
@@ -351,7 +389,7 @@ fn resume_create(
     id: &ResourceId,
     _request: CreateRequest,
     resume: Resume<CreateToken>,
-) -> Result<ResumeStep<CreateToken>, ResumeVerdict> {
+) -> Result<ResumeStep<CreateToken>, ResumeVerdict<CreateToken>> {
     match resume {
         // Carina was interrupted after the attempt started. Keep
         // polling where it left off.
@@ -467,7 +505,9 @@ A schema with `kind: SchemaKind::DataSource` declares a data source. The host ca
 
 ## Other trait methods
 
-`required_permissions` feeds the IAM preflight check that `carina plan --check-iam` runs, which warns about missing AWS IAM actions before an apply. Return an empty list unless your provider manages AWS resources. `normalize_desired`, `normalize_state` and `hydrate_read_state` are optional hooks for providers whose API changes values on the way in or out. Their default implementations return the values unchanged, so implement them only when you need them.
+`reference_forms` is required; return `ReferenceForms::new()` when the provider declares no short-to-long reference forms. `required_permissions` feeds the IAM preflight check that `carina plan --check-iam` runs, which warns about missing AWS IAM actions before an apply. Return an empty list unless your provider manages AWS resources. `normalize_desired`, `normalize_state` and `hydrate_read_state` are optional hooks for providers whose API changes values on the way in or out. Their default implementations return the values unchanged, so implement them only when you need them.
+
+Desired normalization has a three-way attribute contract. `DesiredResource::attribute` and `attributes` distinguish a `Known` value from an `Absent` attribute and a `Deferred` value that the host withheld until its dependency resolves. A deferred attribute is not absent: mutate only `Known` values, use `insert_absent` when adding a default, and return the opaque result from `finish`. This prevents normalization from replacing a deferred value by treating its missing map entry as user-authored absence.
 
 ## Next steps
 

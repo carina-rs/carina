@@ -1,7 +1,7 @@
 use super::*;
 use carina_core::binding_index::LivePreApplyInputs;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
-use carina_core::effect::Effect;
+use carina_core::effect::{Effect, UnresolvedSavedEffect};
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
     PatchOp, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
@@ -18,9 +18,12 @@ use carina_core::schema::{
 use carina_state::{DeposedInstance, DeposedKey, NameOverride, ResourceState};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[path = "tests/cancellation_fixture.rs"]
 mod cancellation_fixture;
@@ -42,7 +45,6 @@ fn validate_with_test_factories(
     skip_resource_validation: bool,
     factories: Vec<Box<dyn ProviderFactory>>,
     load_errors: HashMap<String, String>,
-    prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Vec<AppError> {
     let providers = crate::wiring::ProviderLoad::for_test_with_load_errors(
@@ -55,7 +57,6 @@ fn validate_with_test_factories(
         base_dir,
         &providers,
         skip_resource_validation,
-        prior_inference_errors,
         duplicate_declarations,
     )
 }
@@ -133,6 +134,420 @@ macro_rules! unexpected_resume_create {
     };
 }
 
+fn mock_http_wasm_path() -> Option<PathBuf> {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    [
+        "carina_provider_mock_http.wasm",
+        "carina-provider-mock-http.wasm",
+    ]
+    .into_iter()
+    .map(|name| workspace_root.join("target/wasm32-wasip2/debug").join(name))
+    .find(|path| path.exists())
+}
+
+fn spawn_mock_http_server(
+    expected_requests: usize,
+) -> Option<(SocketAddr, std::thread::JoinHandle<Vec<usize>>)> {
+    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
+            return None;
+        }
+    };
+    let address = listener.local_addr().expect("loopback listener address");
+    listener
+        .set_nonblocking(true)
+        .expect("set loopback listener nonblocking");
+    let server = std::thread::spawn(move || {
+        let mut request_sizes = Vec::with_capacity(expected_requests);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while request_sizes.len() < expected_requests {
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "server accept timed out");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("server accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set server read timeout");
+            let mut request = vec![0_u8; 32 * 1024];
+            let bytes_read = stream.read(&mut request).expect("read dispatched request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write HTTP response");
+            request_sizes.push(bytes_read);
+        }
+        request_sizes
+    });
+    Some((address, server))
+}
+
+fn mock_http_resource(identity: &str, address: SocketAddr, behavior: &str) -> Resource {
+    Resource::with_provider(
+        "mock_http",
+        "test.send_phase",
+        ResourceIdentity::try_from(identity.to_string()).expect("non-empty fixture identity"),
+        None,
+    )
+    .with_attribute(
+        "url",
+        Value::Concrete(ConcreteValue::String(
+            format!("http://phase-test.invalid:{}/", address.port()).into(),
+        )),
+    )
+    .with_attribute(
+        "method",
+        Value::Concrete(ConcreteValue::String("POST".into())),
+    )
+    .with_attribute(
+        "body",
+        Value::Concrete(ConcreteValue::String("x".repeat(16 * 1024).into())),
+    )
+    .with_attribute(
+        "create_behavior",
+        Value::Concrete(ConcreteValue::String(behavior.to_string().into())),
+    )
+}
+
+fn mock_http_ready_config(
+    factory: &dyn ProviderFactory,
+) -> carina_core::provider::ProviderReadyConfig {
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.providers.push(carina_core::parser::ProviderConfig {
+        name: factory.name().to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    });
+    let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
+        &parsed,
+        &HashMap::new(),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("mock HTTP provider config must resolve");
+    carina_core::executor::prepare_provider_ready_config(
+        factory,
+        resolved.iter().next().expect("one provider config"),
+    )
+    .expect("mock HTTP provider config must validate")
+}
+
+fn mock_http_replacement_schema() -> carina_core::schema::ValidatedResourceSchema {
+    ResourceSchema::new("test.send_phase")
+        .attribute(AttributeSchema::required("url", AttributeType::string()).build())
+        .attribute(AttributeSchema::required("method", AttributeType::string()).build())
+        .attribute(AttributeSchema::required("body", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::provider_populated("send_phase", AttributeType::string()).build(),
+        )
+        .attribute(
+            AttributeSchema::optional("create_behavior", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .with_coexisting_replacement()
+        .validate()
+        .expect("mock HTTP replacement schema must validate")
+}
+
+struct OutcomeUnknownExecutionObserver;
+
+impl carina_core::executor::ExecutionObserver for OutcomeUnknownExecutionObserver {
+    fn on_event(&self, _event: &carina_core::executor::ExecutionEvent<'_>) {}
+}
+
+async fn execute_mock_http_plan(
+    provider: &ProviderRouter,
+    factories: &[Box<dyn ProviderFactory>],
+    schemas: &SchemaRegistry,
+    plan: &Plan,
+    managed_current: HashMap<ResourceId, carina_core::resource::Current>,
+) -> carina_core::executor::ExecutionResult {
+    let outcome = carina_core::executor::execute_live_plan(
+        provider,
+        carina_core::executor::LiveExecutionInput {
+            plan,
+            provider_check_inputs: carina_core::executor::ProviderCheckInputs::Authored,
+            compositions: &[],
+            bindings: Default::default(),
+            managed_current,
+            data_source_values: carina_core::data_source_value::ExecutableDataSourceValues::empty(),
+            normalizer: &NoopNormalizer,
+            provider_configs: &[],
+            factories,
+            schemas,
+            parallelism: std::num::NonZeroUsize::new(1).expect("one is non-zero"),
+            precompleted_success_count: 0,
+            checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::noop(),
+        },
+        &OutcomeUnknownExecutionObserver,
+        carina_core::shutdown::ShutdownToken::running(),
+    )
+    .await;
+    let carina_core::executor::ExecutionOutcome::Completed(result) = outcome else {
+        panic!("an uncancelled mock HTTP execution must complete");
+    };
+    result
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recovery_state() {
+    let Some(wasm_path) = mock_http_wasm_path() else {
+        eprintln!(
+            "SKIP: mock HTTP WASM binary not found; build carina-provider-mock-http for wasm32-wasip2"
+        );
+        return;
+    };
+    let Some((server_address, server)) = spawn_mock_http_server(2) else {
+        return;
+    };
+    let cache = tempfile::tempdir().expect("create WASM cache directory");
+    let wasm_bytes = std::fs::read(wasm_path).expect("read mock HTTP WASM provider");
+    let fresh_verified = carina_provider_resolver::VerifiedLoad::for_test(
+        &wasm_bytes,
+        carina_provider_resolver::ProviderLoadIdentity::for_test(
+            "mock_http",
+            carina_provider_resolver::ProviderTrustClass::Untrusted,
+        ),
+    );
+    let fresh_factory = carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
+        fresh_verified,
+        cache.path(),
+    )
+    .await
+    .expect("load mock HTTP WASM provider")
+    .with_http_test_route("phase-test.invalid", server_address);
+    let fresh_ready = mock_http_ready_config(&fresh_factory);
+    let fresh_initialized = fresh_factory
+        .create_initialized_provider(None, &fresh_ready)
+        .await
+        .expect("initialize mock HTTP provider");
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(fresh_factory)];
+    let mut schemas = carina_core::provider::collect_schemas(&factories);
+    schemas.insert("mock_http", mock_http_replacement_schema());
+    let mut fresh_provider = ProviderRouter::new();
+    fresh_provider.add_provider("mock_http".to_string(), fresh_initialized);
+
+    let fresh_resource = mock_http_resource("fresh-trap", server_address, "trap_after_send");
+    let fresh_id = fresh_resource.id.clone();
+    let fresh_resources = vec![ResolvedResource::new(fresh_resource)];
+    let mut fresh_plan = Plan::new();
+    fresh_plan.add(Effect::Create(fresh_resources[0].clone()));
+    let fresh_result = execute_mock_http_plan(
+        &fresh_provider,
+        &factories,
+        &schemas,
+        &fresh_plan,
+        HashMap::new(),
+    )
+    .await;
+    let fresh_entry = fresh_result.applied_states.get(&fresh_id);
+    assert!(
+        matches!(
+            fresh_entry,
+            Some(carina_core::executor::Applied::CreateOutcomeUnknown(unknown))
+                if unknown.id() == &fresh_id
+        ),
+        "{fresh_entry:?}"
+    );
+    let fresh_state = build_state_after_apply(
+        ApplyStateSave {
+            state_file: StateFile::new(),
+            sorted_resources: &fresh_resources,
+            runtime_synthesized_resources: &fresh_result.runtime_synthesized_resources,
+            managed_current: &fresh_result.managed_current,
+            applied_states: &fresh_result.applied_states,
+            plan: &fresh_plan,
+            successfully_deleted: &fresh_result.successfully_deleted,
+            failed_refreshes: &fresh_result.failed_refreshes,
+            schemas: &schemas,
+        },
+        None,
+    )
+    .expect("fresh unknown outcome must be written to state");
+    assert!(matches!(
+        fresh_state
+            .find_resource_for_id(&fresh_id)
+            .expect("fresh state row")
+            .current(),
+        carina_state::CurrentInstance::CreateOutcomeUnknown { .. }
+    ));
+
+    // A guest trap permanently poisons its configured runtime instance. Use a
+    // separately loaded factory so this half exercises replacement handling,
+    // not the poisoned instance's fail-fast path.
+    let replacement_verified = carina_provider_resolver::VerifiedLoad::for_test(
+        &wasm_bytes,
+        carina_provider_resolver::ProviderLoadIdentity::for_test(
+            "mock_http",
+            carina_provider_resolver::ProviderTrustClass::Untrusted,
+        ),
+    );
+    let replacement_factory = carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
+        replacement_verified,
+        cache.path(),
+    )
+    .await
+    .expect("load replacement mock HTTP WASM provider")
+    .with_http_test_route("phase-test.invalid", server_address);
+    let replacement_ready = mock_http_ready_config(&replacement_factory);
+    let replacement_initialized = replacement_factory
+        .create_initialized_provider(None, &replacement_ready)
+        .await
+        .expect("initialize replacement mock HTTP provider");
+    let mut replacement_provider = ProviderRouter::new();
+    replacement_provider.add_provider("mock_http".to_string(), replacement_initialized);
+
+    let mut desired = mock_http_resource("replacement-trap", server_address, "trap_after_send");
+    desired.directives.create_before_destroy = true;
+    let replacement_id = desired.id.clone();
+    let old_resource = mock_http_resource("replacement-trap", server_address, "normal");
+    let old_state = State::existing(
+        replacement_id.clone(),
+        old_resource.attributes.into_iter().collect(),
+    )
+    .with_identifier("old-applied-id");
+    let current_states = HashMap::from([(replacement_id.clone(), old_state)]);
+    let replacement_resources = vec![ResolvedResource::new(desired)];
+    let replacement_raw_resources = replacement_resources
+        .iter()
+        .map(|resource| resource.as_resource().clone())
+        .collect::<Vec<_>>();
+    let plan_input_current = crate::plan_input_current_from_states(
+        current_states.clone(),
+        &schemas,
+        &replacement_raw_resources,
+    );
+    let replacement_plan = carina_core::differ::create_plan(
+        &replacement_resources,
+        &[],
+        &replacement_provider,
+        carina_core::differ::PlanPriorStates::new(
+            &plan_input_current,
+            &carina_core::differ::Orphans::new(),
+        ),
+        &HashMap::new(),
+        &schemas,
+        &crate::empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &[],
+    )
+    .expect("create-only behavior change must plan a replacement");
+    assert!(
+        replacement_plan
+            .replace_display_info()
+            .next()
+            .is_some_and(|replacement| replacement.create_before_destroy),
+        "fixture must be a create-before-destroy replacement: {:?}",
+        replacement_plan.effects()
+    );
+
+    let mut initial_state = StateFile::new();
+    let old_url = format!("http://phase-test.invalid:{}/", server_address.port());
+    let old_row = ResourceState::try_applied(
+        "test.send_phase",
+        "replacement-trap",
+        "mock_http",
+        "old-applied-id",
+    )
+    .expect("old identifier is valid")
+    .with_attribute("url", serde_json::json!(old_url))
+    .with_attribute("method", serde_json::json!("POST"))
+    .with_attribute("body", serde_json::json!("x".repeat(16 * 1024)))
+    .with_attribute("create_behavior", serde_json::json!("normal"));
+    initial_state
+        .upsert_resource(old_row)
+        .expect("insert old applied state");
+
+    let replacement_result = execute_mock_http_plan(
+        &replacement_provider,
+        &factories,
+        &schemas,
+        &replacement_plan,
+        crate::managed_current_from_states(current_states),
+    )
+    .await;
+    let replacement_entry = replacement_result.applied_states.get(&replacement_id);
+    assert!(
+        matches!(
+            replacement_entry,
+            Some(carina_core::executor::Applied::CreateOutcomeUnknown(unknown))
+                if unknown.id() == &replacement_id
+        ),
+        "{replacement_entry:?}"
+    );
+    let mut replacement_state = build_state_after_apply(
+        ApplyStateSave {
+            state_file: initial_state,
+            sorted_resources: &replacement_resources,
+            runtime_synthesized_resources: &replacement_result.runtime_synthesized_resources,
+            managed_current: &replacement_result.managed_current,
+            applied_states: &replacement_result.applied_states,
+            plan: &replacement_plan,
+            successfully_deleted: &replacement_result.successfully_deleted,
+            failed_refreshes: &replacement_result.failed_refreshes,
+            schemas: &schemas,
+        },
+        None,
+    )
+    .expect("replacement unknown outcome must be written to state");
+    let replacement_row = replacement_state
+        .find_resource_for_id(&replacement_id)
+        .expect("replacement state row");
+    assert!(matches!(
+        replacement_row.current(),
+        carina_state::CurrentInstance::CreateOutcomeUnknown { .. }
+    ));
+    assert!(
+        replacement_row
+            .deposed
+            .iter()
+            .any(|generation| generation.identifier == "old-applied-id"),
+        "the old applied identifier must remain as a deposed generation"
+    );
+
+    let address = carina_core::parser::StateBlockAddress::new(
+        "mock_http",
+        "test.send_phase",
+        "replacement-trap",
+    );
+    let forgotten = replacement_state
+        .find_outcome_unknown(&address)
+        .expect("replacement row must authorize outcome-unknown forget");
+    StateFile::forget(forgotten);
+    let shell = replacement_state
+        .find_resource_for_id(&replacement_id)
+        .expect("forget must retain the deposed shell");
+    assert!(matches!(
+        shell.current(),
+        carina_state::CurrentInstance::None
+    ));
+    assert!(
+        shell
+            .deposed
+            .iter()
+            .any(|generation| generation.identifier == "old-applied-id"),
+        "state forget must keep the old deposed generation"
+    );
+
+    let request_sizes = server.join().expect("loopback server must finish");
+    assert_eq!(request_sizes.len(), 2);
+    assert!(
+        request_sizes.iter().all(|size| *size > 0),
+        "both guest creates must dispatch HTTP bytes: {request_sizes:?}"
+    );
+}
+
 #[test]
 fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
     let target = ApplyTarget::SavedPlan {
@@ -178,6 +593,32 @@ fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
         "{unavailable_rendered}"
     );
     assert!(std::error::Error::source(&unavailable).is_none());
+
+    let scope_mismatch = saved_plan_secret_preparation_error(
+        AppError::SavedPlanProviderScopeMismatch(Box::new(
+            crate::error::SavedPlanProviderScopeMismatchError {
+                instance: carina_core::provider::ProviderInstanceKey::new(
+                    "test",
+                    Some("west".to_string()),
+                ),
+                recorded: carina_core::provider::ReferenceScope::Unavailable,
+                initialized: Some(
+                    carina_core::provider::ReferenceScope::available(
+                        "aws",
+                        "us-west-2",
+                        "123456789012",
+                    )
+                    .expect("fixture scope is valid"),
+                ),
+                replan_command: "carina plan --out reviewed-plan.json infra".to_string(),
+            },
+        )),
+        target,
+    );
+    assert!(matches!(
+        scope_mismatch,
+        AppError::SavedPlanProviderScopeMismatch(_)
+    ));
 
     let serialization = saved_plan_secret_rehydration_error(
         carina_core::value::SecretRehydrationSiteError::new(
@@ -247,6 +688,9 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
         carina_core::resource::Current::CreateInFlight(_) => {
             panic!("legacy fixture must not produce an in-flight create")
         }
+        carina_core::resource::Current::CreateOutcomeUnknown(_) => {
+            panic!("legacy fixture must not produce an unknown create outcome")
+        }
     };
     assert_eq!(
         planned_state.attributes.keys().collect::<Vec<_>>(),
@@ -258,7 +702,7 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
         "legacy".to_string(),
         HashMap::from([("name".to_string(), string_value("kept"))]),
     );
-    let result = detect_drift(
+    let result = detect_drift_for_test(
         &[resource],
         &[crate::commands::plan::ReloadedCurrentStateEntry::managed(
             id,
@@ -361,7 +805,7 @@ fn record_with_builtin_mock_schemas(contents: PlanFileContents) -> PlanFile {
 }
 
 #[test]
-fn plan_format_31_round_trip_preserves_loop_provenance_and_deferred_targets() {
+fn current_plan_format_round_trip_includes_format_29_loop_provenance_and_deferred_targets() {
     let parsed = carina_core::parser::parse_file(
         r#"
 let orgs = upstream_state { source = "../orgs" }
@@ -475,13 +919,16 @@ for account_id in orgs.accounts {
         wait_bindings: Vec::new(),
     });
 
-    let encoded = serde_json::to_value(&plan_file).expect("serialize format-31 plan");
-    assert_eq!(encoded["version"], serde_json::json!(31));
+    let encoded = serde_json::to_value(&plan_file).expect("serialize current-format plan");
+    assert_eq!(
+        encoded["version"],
+        serde_json::json!(PlanFile::CURRENT_VERSION)
+    );
     let decoded: PlanFile =
-        serde_json::from_value(encoded).expect("deserialize format-31 saved plan");
+        serde_json::from_value(encoded).expect("deserialize current-format saved plan");
     let decoded = decoded.into_contents();
 
-    assert_eq!(decoded.version, 31);
+    assert_eq!(decoded.version, PlanFile::CURRENT_VERSION);
     assert_eq!(
         decoded.sorted_resources[0]
             .loop_provenance
@@ -495,7 +942,7 @@ for account_id in orgs.accounts {
         .effects()
         .iter()
         .find_map(|effect| match effect {
-            Effect::Move { origin, .. } => origin.as_ref(),
+            UnresolvedSavedEffect::Move { origin, .. } => origin.as_ref(),
             _ => None,
         })
         .expect("Move origin after round-trip");
@@ -506,7 +953,7 @@ for account_id in orgs.accounts {
         .effects()
         .iter()
         .filter_map(|effect| match effect {
-            Effect::DeferredCreate { template, .. } => Some(&template.target),
+            UnresolvedSavedEffect::DeferredCreate { template, .. } => Some(&template.target),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -787,7 +1234,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
     )
     .expect("placeholder-free plan must bind its provider load");
     let reloaded = bound
-        .reload_in_flight_from_locked_state(None)
+        .reload_in_flight_from_locked_state(None, Path::new("."))
         .expect("current-state snapshot should reload");
     let ReloadedProviderBoundPlanFile::Verified { plan, providers } = reloaded else {
         panic!("placeholder-free plan changed typestate during reload")
@@ -812,9 +1259,21 @@ fn checked_exports(
     carina_core::validation::check_export_values_pre_apply(
         params,
         &carina_core::binding_index::ResolvedBindings::default(),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
     )
     .expect("test exports must pass the secret boundary")
+}
+
+fn fixture_unchecked_export_static_type() -> carina_core::static_type::ExportStaticType {
+    carina_core::static_type::ExportStaticType::Inferred(
+        carina_core::static_type::StaticType::Unchecked(
+            carina_core::static_type::InferredUncheckedReason::NotInferable(
+                carina_core::static_type::NotInferableReason::SchemaUnavailable {
+                    binding: "test fixture".to_string(),
+                },
+            ),
+        ),
+    )
 }
 
 fn resolve_and_materialize_exports_for_test(
@@ -841,7 +1300,10 @@ fn deserialize_saved_provider_configs(
 fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
     LiveCompositionArgument::from_value(
         value,
-        carina_core::parser::TypeExpr::String,
+        carina_core::validation::resolve_consumer_static_type_for_signature(
+            &carina_core::parser::TypeExpr::String,
+            &carina_core::parser::ProviderContext::default(),
+        ),
         carina_core::parser::ArgumentOrigin::Defaulted,
     )
 }
@@ -989,7 +1451,9 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
 
     let mut plan_file = plan_file
         .reload_in_flight_from_locked_state(None)
-        .expect("test plan should cross the locked-state reload boundary");
+        .expect("test plan should cross the locked-state reload boundary")
+        .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
+        .expect("test plan should cross schema resolution");
     let result = rehydrate_desired_plan_file_from_parts(
         &mut plan_file,
         candidates.parsed(),
@@ -1269,8 +1733,12 @@ impl ProviderFactory for FailBCreateFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-        Box::pin(async { Ok(Box::new(FailBCreateProvider) as Box<dyn Provider>) })
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(FailBCreateProvider)))
+        })
     }
 
     fn create_normalizer(
@@ -1279,6 +1747,15 @@ impl ProviderFactory for FailBCreateFactory {
         _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -1999,9 +2476,13 @@ impl ProviderFactory for ApplyTimeReadFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         let shared = self.shared.clone();
-        Box::pin(async move { Ok(Box::new(ApplyTimeReadProvider { shared }) as Box<dyn Provider>) })
+        Box::pin(async move {
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(ApplyTimeReadProvider { shared })))
+        })
     }
 
     fn create_normalizer(
@@ -2010,6 +2491,15 @@ impl ProviderFactory for ApplyTimeReadFactory {
         _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -2163,9 +2653,13 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         let shared = self.shared.clone();
-        Box::pin(async move { Ok(Box::new(ApplyCascadeProvider { shared }) as Box<dyn Provider>) })
+        Box::pin(async move {
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(ApplyCascadeProvider { shared })))
+        })
     }
 
     fn create_normalizer(
@@ -2174,6 +2668,15 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
         _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -2551,7 +3054,6 @@ async fn run_apply_cascade_fixture(
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -2893,7 +3395,6 @@ fn load_and_resolve_module_data_source_fixture(
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -3056,7 +3557,6 @@ let lookup = read mock.iam.Roles {{
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(validation_errors.is_empty(), "{validation_errors:?}");
@@ -4098,7 +4598,6 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
             unresolved_parsed,
             base_dir,
             false,
-            &loaded.inference_errors,
             &loaded.duplicate_declarations,
         )
         .expect("fixture must validate");
@@ -4338,7 +4837,6 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
         false,
         vec![Box::new(FailBCreateFactory)],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -4415,7 +4913,6 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -4510,7 +5007,6 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -4579,7 +5075,6 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -4804,7 +5299,6 @@ awscc.ec2.Subnet {{
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -4891,7 +5385,6 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -4944,7 +5437,6 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -5045,7 +5537,6 @@ let nat = mock.ec2.NatGateway {{
                 shared: shared.clone(),
             })],
             HashMap::new(),
-            &loaded.inference_errors,
             &loaded.duplicate_declarations,
         );
         assert!(
@@ -5219,7 +5710,6 @@ let igw = mock.ec2.InternetGateway {{{tags}
                 shared: shared.clone(),
             })],
             HashMap::new(),
-            &loaded.inference_errors,
             &loaded.duplicate_declarations,
         );
         assert!(
@@ -5387,7 +5877,6 @@ async fn assert_failed_nested_pending_removal_is_replanned(
                 shared: shared.clone(),
             })],
             HashMap::new(),
-            &loaded.inference_errors,
             &loaded.duplicate_declarations,
         );
         assert!(
@@ -5668,7 +6157,6 @@ let consumer = mock.iam.Role {{
             shared: shared.clone(),
         })],
         HashMap::new(),
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
     assert!(
@@ -6007,7 +6495,7 @@ async fn bootstrap_declared_state_bucket(
     let parsed = carina_core::parser::InferredFile::default();
     let provider_configs = empty_resolved_provider_configs();
 
-    create_checked_bootstrap_resource(
+    create_checked_bootstrap_resource_for_test(
         provider,
         resource.clone(),
         BootstrapCreateContext {
@@ -6181,7 +6669,7 @@ async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
     );
     let resolved_resource = ResolvedResource::new(resource);
     let saved_attrs = state_file.build_saved_attrs().lift(&schemas);
-    let plan = carina_core::differ::create_plan(
+    let plan = carina_core::differ::create_plan_for_test(
         std::slice::from_ref(&resolved_resource),
         &[],
         &carina_core::provider::ProviderRouter::new(),
@@ -6275,7 +6763,7 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
     let parsed = carina_core::parser::InferredFile::default();
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
-    let error = create_checked_bootstrap_resource(
+    let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
@@ -6345,7 +6833,7 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
 
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
-    let error = create_checked_bootstrap_resource(
+    let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
@@ -6398,7 +6886,7 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
 
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
-    let result = create_checked_bootstrap_resource(
+    let result = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
@@ -6446,7 +6934,7 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
 
-    let error = create_checked_bootstrap_resource(
+    let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
@@ -6531,7 +7019,7 @@ async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
 
-    let error = create_checked_bootstrap_resource(
+    let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
@@ -6621,7 +7109,7 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
 
-    let error = create_checked_bootstrap_resource(
+    let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
@@ -6686,7 +7174,7 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
     );
     let provider_configs = empty_resolved_provider_configs();
 
-    let error = create_checked_bootstrap_resource(
+    let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
@@ -7139,6 +7627,7 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
         &saved,
         Some(&prev_explicit),
         Some(&schema),
+        &carina_core::differ::exact_comparison_context_for_tests(),
     );
 
     assert!(
@@ -7820,7 +8309,7 @@ fn format_duration_zero() {
 
 #[test]
 fn resolve_exports_resolves_cross_file_resource_refs() {
-    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
+    use carina_core::parser::InferredExportParam as ExportParameter;
     use carina_core::resource::Value;
 
     // Build a state file with a resource that has a binding and attributes
@@ -7851,7 +8340,7 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
     // parser-produced ResourceRef shape.
     let export_params = vec![ExportParameter {
         name: "account_id".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::resource_ref(
             "registry_prod".to_string(),
             "account_id".to_string(),
@@ -7880,7 +8369,7 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()
@@ -7904,7 +8393,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
     // identity and never lands in `state.resources`, so an export
     // referencing `<module_call>.<attr>` failed with
     // `unresolved reference <call>.<attr>`.
-    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
+    use carina_core::parser::InferredExportParam as ExportParameter;
     use carina_core::resource::{AccessPath, DeferredValue, LiveComposition, Value};
 
     let state = {
@@ -7970,7 +8459,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
 
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("github_actions_carina", "role_arn"),
         })),
@@ -7989,7 +8478,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()
@@ -8017,7 +8506,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
     // through `ResourceRef` recursion before bottoming out at the real
     // role's `arn` from state. Pins the resolver's transitive walk so a
     // regression that broke after a single hop would surface.
-    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
+    use carina_core::parser::InferredExportParam as ExportParameter;
     use carina_core::resource::{AccessPath, DeferredValue, LiveComposition, Value};
 
     let state = {
@@ -8097,7 +8586,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
 
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("outer", "public_role_arn"),
         })),
@@ -8117,7 +8606,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()
@@ -8178,7 +8667,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // mutated composition's stale concrete attribute and return
     // OLD_ARN. With the fix in place, the pre-resolve snapshot
     // kicks in and re-resolves against the post-apply state.
-    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
+    use carina_core::parser::InferredExportParam as ExportParameter;
     use carina_core::resolver::resolve_managed_refs_with_state_and_remote;
     use carina_core::resource::{
         AccessPath, ConcreteValue, DeferredValue, LiveComposition, ResourceId,
@@ -8295,7 +8784,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
 
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("carina_module", "role_arn"),
         })),
@@ -8314,7 +8803,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()
@@ -8356,7 +8845,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     // Without the fix, `resolve_export_values_post_apply` returns an empty map (no
     // entry for the export) instead of the NEW arn — exports stays
     // at the pre-apply literal in production.
-    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
+    use carina_core::parser::InferredExportParam as ExportParameter;
     use carina_core::resource::{
         AccessPath, ConcreteValue, DataSource, DeferredValue, ResourceId, State as ResourceState,
         Value,
@@ -8409,7 +8898,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     // The export: `exports { admin_access_role_arns = admin_access_roles.arns }`.
     let export_params = vec![ExportParameter {
         name: "admin_access_role_arns".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("admin_access_roles", "arns"),
         })),
@@ -8431,7 +8920,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()
@@ -8550,7 +9039,54 @@ mod apply_deferred_for_parity {
     use carina_core::data_source_value::DataSourceValues;
     use carina_core::parser::{ProviderContext, parse_file};
     use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+    };
     use std::collections::HashMap;
+
+    fn comparison_schemas() -> SchemaRegistry {
+        let certificate = ResourceSchema::new("acm.Certificate")
+            .attribute(
+                AttributeSchema::optional("domain_name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "domain_validation_options",
+                    AttributeType::list(AttributeType::struct_(
+                        "DomainValidation",
+                        vec![
+                            StructField::provider_populated(
+                                "resource_record",
+                                AttributeType::struct_(
+                                    "ResourceRecord",
+                                    vec![
+                                        StructField::provider_populated(
+                                            "name",
+                                            AttributeType::string(),
+                                        )
+                                        .build(),
+                                        StructField::provider_populated(
+                                            "value",
+                                            AttributeType::string(),
+                                        )
+                                        .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("comparison schema must be valid");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("aws", certificate);
+        schemas
+    }
 
     fn dvo_state(parsed: &carina_core::parser::ParsedFile) -> HashMap<ResourceId, State> {
         let cert = parsed
@@ -8573,6 +9109,10 @@ mod apply_deferred_for_parity {
             Value::Concrete(ConcreteValue::Map(rr)),
         );
         let mut attrs = HashMap::new();
+        attrs.insert(
+            "domain_name".to_string(),
+            Value::Concrete(ConcreteValue::String("r.example.com".into())),
+        );
         attrs.insert(
             "domain_validation_options".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -8616,6 +9156,7 @@ mod apply_deferred_for_parity {
         .expect("parse");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = dvo_state(&parsed);
+        let schemas = comparison_schemas();
 
         // This is the exact function `run_apply_locked` calls
         // post-refresh (carina#3132 PR-2). Reaching it through the
@@ -8625,9 +9166,8 @@ mod apply_deferred_for_parity {
             &sorted,
             &crate::managed_current_from_states(states),
             &DataSourceValues::empty(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &carina_core::provider::RawSavedAttrs::default()
-                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &schemas,
+            &carina_core::provider::RawSavedAttrs::default().lift(&schemas),
             &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -8848,8 +9388,11 @@ mod apply_deferred_for_parity {
 #[cfg(test)]
 mod saved_plan_version_tests {
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 29 persists anonymous
-    //! loop provenance, typed deferred targets, and Move origins (carina#4109).
+    //! `carina plan` is the supported migration. Version 32 adds mandatory
+    //! provider-instance reference scopes and the create-outcome-unknown marker
+    //! for provider protocol v13. Version 31 persists authored ignore paths;
+    //! version 30 was never emitted. Version 29 persists anonymous loop
+    //! provenance, typed deferred targets, and Move origins (carina#4109).
     //! Version 26 persists exact provider artifact identities (carina#4045);
     //! version 25 persists total data-source outcomes (carina#3993); version 24
     //! removed the wait target schema kind (carina#3916), and version 23 added
@@ -8946,12 +9489,11 @@ mod saved_plan_version_tests {
     }
 
     #[tokio::test]
-    async fn version_30_plan_is_rejected_before_payload_decoding() {
+    async fn previous_plan_version_is_rejected_before_payload_decoding() {
         let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("previous-plan.json");
-        let previous = 30;
-        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 31);
+        let previous = crate::commands::plan::PlanFile::CURRENT_VERSION - 1;
         let old_plan = serde_json::json!({
             "version": previous,
             "timestamp": "2026-10-29T00:00:00Z",
@@ -9720,7 +10262,7 @@ mod saved_plan_version_tests {
             &[],
         );
         let resolved_resource = carina_core::resource::ResolvedResource::new(resource.clone());
-        let plan = carina_core::differ::create_plan(
+        let plan = carina_core::differ::create_plan_for_test(
             std::slice::from_ref(&resolved_resource),
             &[],
             &ProviderRouter::new(),

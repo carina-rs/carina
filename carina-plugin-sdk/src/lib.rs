@@ -58,15 +58,17 @@ pub fn parse_resource_id_string(key: &str) -> carina_provider_protocol::types::R
     }
 }
 
-use carina_core::schema::{ValidatedConfigSchema, ValidatedResourceSchema};
+use carina_core::schema::{
+    ReferenceForms, ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+};
 use carina_provider_protocol::types::{
     AppliedIdentifier, AppliedState, CompletionValue, CreateRequest, DeleteRequest, PersistedState,
-    PersistedValue, ProviderError, ProviderInfo, ReadOutcome, ReadRequest, Resource, ResourceId,
-    State, TypeIdentity, UpdateRequest, Value,
+    PersistedValue, ProviderError, ProviderInfo, ReadOutcome, ReadRequest, ReferenceScope,
+    Resource, ResourceId, State, TypeIdentity, UpdateRequest, Value,
 };
 use std::collections::{BTreeMap, HashMap};
 
-/// Failure while projecting validated SDK schemas onto version-12 JSON.
+/// Failure while projecting validated SDK schemas onto version-13 JSON.
 #[derive(Debug)]
 pub enum SchemaSerializationError {
     Convert(carina_core::protocol_convert::ProtocolConvertError),
@@ -91,20 +93,20 @@ impl std::error::Error for SchemaSerializationError {
     }
 }
 
-/// Serialize validated resource schemas through the core protocol seam.
-/// Raw drafts cannot enter this API:
+/// Serialize one aggregate provider-schema witness through the core protocol
+/// seam. Raw drafts or independently sourced tables cannot enter this API:
 ///
 /// ```compile_fail
 /// use carina_core::schema::ResourceSchema;
-/// use carina_plugin_sdk::schemas_to_json;
+/// use carina_plugin_sdk::provider_schema_to_json;
 ///
 /// let drafts = vec![ResourceSchema::new("test.Widget")];
-/// let _ = schemas_to_json(&drafts);
+/// let _ = provider_schema_to_json(&drafts);
 /// ```
-pub fn schemas_to_json(
-    schemas: &[ValidatedResourceSchema],
+pub fn provider_schema_to_json(
+    witness: &ValidatedProviderSchemaWitness,
 ) -> Result<String, SchemaSerializationError> {
-    let protocol = carina_core::protocol_convert::resource_schemas_to_protocol(schemas.iter())
+    let protocol = carina_core::protocol_convert::provider_schema_to_protocol(witness)
         .map_err(SchemaSerializationError::Convert)?;
     serde_json::to_string(&protocol).map_err(SchemaSerializationError::Json)
 }
@@ -134,38 +136,42 @@ pub fn provider_config_schema_to_json(
 /// different primitive scalar kind anywhere in the provider's resource or
 /// config schemas.
 pub struct ProviderSchemaCache {
-    schemas: Vec<ValidatedResourceSchema>,
-    config: ValidatedConfigSchema,
+    witness: ValidatedProviderSchemaWitness,
     custom_type_dispatch: carina_core::provider::CustomTypeDispatchTable,
 }
 
 impl ProviderSchemaCache {
     pub fn from_provider<P: CarinaProvider + ?Sized>(
         provider: &P,
-    ) -> Result<Self, carina_core::provider::CustomTypeDispatchTableError> {
-        let schemas = provider.schemas();
+    ) -> Result<Self, carina_core::schema::ProviderSchemaValidationError> {
+        let resources = provider.schemas();
         let config = provider.provider_config_attribute_types();
+        let reference_forms = provider.reference_forms();
+        let witness = ValidatedProviderSchemaWitness::new(resources, config, reference_forms)?;
         let custom_type_dispatch =
-            carina_core::provider::CustomTypeDispatchTable::build(&schemas, &config)?;
+            carina_core::provider::CustomTypeDispatchTable::from_provider_schema(&witness);
         Ok(Self {
-            schemas,
-            config,
+            witness,
             custom_type_dispatch,
         })
     }
 
     pub fn schemas(&self) -> &[ValidatedResourceSchema] {
-        &self.schemas
+        self.witness.resources()
     }
 
     pub fn config(&self) -> &ValidatedConfigSchema {
-        &self.config
+        self.witness.config()
+    }
+
+    pub fn witness(&self) -> &ValidatedProviderSchemaWitness {
+        &self.witness
     }
 }
 
 /// Dispatch one identity bridge call through the cached table.
 ///
-/// The validated provider schemas determine the scalar kind. The version-12
+/// The validated provider schemas determine the scalar kind. The version-13
 /// guest ABI deliberately carries only the identity and canonical text.
 pub fn dispatch_custom_type_validation(
     cache: &ProviderSchemaCache,
@@ -209,7 +215,11 @@ pub enum BindingPattern {
 /// well under the host's per-call hard timeout; providers must never run an
 /// in-call waiter. A poll may return another `Pending`. The host supplies the
 /// original request on every poll, so `token` must contain only opaque
-/// continuation metadata and must never contain request or secret data.
+/// continuation metadata and must never contain request or secret data. A
+/// token must also serialize as finite JSON. If an initial create has already
+/// dispatched work but its identifier-less token cannot cross the WASM
+/// boundary, the guest traps so the host can classify the attempt from its
+/// per-call egress record instead of erasing it as untracked.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Pending<T> {
     pub token: T,
@@ -230,7 +240,7 @@ pub use carina_provider_protocol::types::{PendingToken, Sent};
 ///     attempt: CreateAttempt,
 ///     identifier: AppliedIdentifier,
 ///     error: ProviderError,
-/// ) -> CreateVerdict {
+/// ) -> CreateVerdict<()> {
 ///     let _issued = attempt.issued(identifier, Sent::AllRequestAttributes);
 ///     CreateAttempt::new().untracked(error)
 /// }
@@ -243,7 +253,7 @@ impl CreateAttempt {
         Self(())
     }
 
-    pub fn untracked(self, error: ProviderError) -> CreateVerdict {
+    pub fn untracked<T>(self, error: ProviderError) -> CreateVerdict<T> {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::Untracked(
             error,
         ))
@@ -263,6 +273,26 @@ impl CreateAttempt {
             },
         ))
     }
+
+    pub fn preserve<T>(
+        self,
+        token: T,
+        sent: Sent,
+        poll_after_secs: u32,
+        error: ProviderError,
+    ) -> CreateVerdict<T> {
+        CreateVerdict(carina_provider_protocol::types::CreateVerdict::InFlight(
+            carina_provider_protocol::types::CreateInFlight {
+                pending: carina_provider_protocol::types::PendingCreate {
+                    token,
+                    identifier: None,
+                    sent,
+                    poll_after_secs,
+                },
+                error,
+            },
+        ))
+    }
 }
 
 /// Poll typestate for a create that has not issued an identifier.
@@ -271,6 +301,17 @@ impl CreateAttempt {
 /// use carina_plugin_sdk::{PollAttempt, Sent};
 ///
 /// let _ = PollAttempt::from_sent(Sent::AllRequestAttributes);
+/// ```
+///
+/// Transport decode failures are classified by guest glue, not provider code:
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{PollAttempt, PollVerdict};
+/// use carina_plugin_sdk::types::ProviderError;
+///
+/// fn classify(attempt: PollAttempt, error: ProviderError) -> PollVerdict<()> {
+///     attempt.undetermined(error)
+/// }
 /// ```
 #[derive(Debug)]
 pub struct PollAttempt {
@@ -282,14 +323,8 @@ impl PollAttempt {
         Self { sent }
     }
 
-    pub fn untracked(self, error: ProviderError) -> PollVerdict {
+    pub fn untracked<T>(self, error: ProviderError) -> PollVerdict<T> {
         PollVerdict(carina_provider_protocol::types::PollVerdict::Untracked(
-            error,
-        ))
-    }
-
-    pub fn undetermined(self, error: ProviderError) -> PollVerdict {
-        PollVerdict(carina_provider_protocol::types::PollVerdict::Undetermined(
             error,
         ))
     }
@@ -308,6 +343,25 @@ impl PollAttempt {
                 identifier: None,
                 sent: self.sent,
                 poll_after_secs,
+            },
+        ))
+    }
+
+    pub fn preserve<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        error: ProviderError,
+    ) -> PollVerdict<T> {
+        PollVerdict(carina_provider_protocol::types::PollVerdict::InFlight(
+            carina_provider_protocol::types::CreateInFlight {
+                pending: carina_provider_protocol::types::PendingCreate {
+                    token,
+                    identifier: None,
+                    sent: self.sent,
+                    poll_after_secs,
+                },
+                error,
             },
         ))
     }
@@ -347,6 +401,25 @@ impl IssuedCreate {
         ))
     }
 
+    pub fn preserve<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        error: ProviderError,
+    ) -> CreateVerdict<T> {
+        CreateVerdict(carina_provider_protocol::types::CreateVerdict::InFlight(
+            carina_provider_protocol::types::CreateInFlight {
+                pending: carina_provider_protocol::types::PendingCreate {
+                    token,
+                    identifier: Some(self.identifier),
+                    sent: self.sent,
+                    poll_after_secs,
+                },
+                error,
+            },
+        ))
+    }
+
     pub fn succeeded<T>(self, attributes: BTreeMap<String, Value>) -> CreateStep<T> {
         CreateStep(carina_provider_protocol::types::CreateStep::Success {
             identifier: self.identifier,
@@ -368,11 +441,11 @@ impl IssuedCreate {
         )
     }
 
-    pub fn failed(
+    pub fn failed<T>(
         self,
         observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
         error: ProviderError,
-    ) -> CreateVerdict {
+    ) -> CreateVerdict<T> {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::Created(
             carina_provider_protocol::types::CreatedFailure {
                 identifier: self.identifier,
@@ -383,7 +456,7 @@ impl IssuedCreate {
         ))
     }
 
-    pub fn discarded(self, error: ProviderError) -> CreateVerdict {
+    pub fn discarded<T>(self, error: ProviderError) -> CreateVerdict<T> {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::Discarded(
             error,
         ))
@@ -420,11 +493,11 @@ impl FinishingCreate {
         )
     }
 
-    pub fn failed(
+    pub fn failed<T>(
         self,
         observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
         error: ProviderError,
-    ) -> CreateVerdict {
+    ) -> CreateVerdict<T> {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::Created(
             carina_provider_protocol::types::CreatedFailure {
                 identifier: self.identifier,
@@ -435,7 +508,7 @@ impl FinishingCreate {
         ))
     }
 
-    pub fn discarded(self, error: ProviderError) -> CreateVerdict {
+    pub fn discarded<T>(self, error: ProviderError) -> CreateVerdict<T> {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::Discarded(
             error,
         ))
@@ -457,14 +530,10 @@ impl ResumeAttempt {
         Self(())
     }
 
-    pub fn untracked(self, error: ProviderError) -> ResumeVerdict {
+    pub fn untracked<T>(self, error: ProviderError) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Untracked(
             error,
         ))
-    }
-
-    pub fn undetermined(self, error: ProviderError) -> ResumeVerdict {
-        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Undetermined(error))
     }
 
     pub fn issued(self, identifier: AppliedIdentifier) -> ResumedCreate {
@@ -477,6 +546,24 @@ impl ResumeAttempt {
                 token,
                 identifier: None,
                 poll_after_secs,
+            },
+        ))
+    }
+
+    pub fn preserve<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        error: ProviderError,
+    ) -> ResumeVerdict<T> {
+        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::InFlight(
+            carina_provider_protocol::types::ResumeInFlight {
+                pending: carina_provider_protocol::types::ResumePending {
+                    token,
+                    identifier: None,
+                    poll_after_secs,
+                },
+                error,
             },
         ))
     }
@@ -549,6 +636,24 @@ impl ResumedCreate {
         ))
     }
 
+    pub fn preserve<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        error: ProviderError,
+    ) -> ResumeVerdict<T> {
+        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::InFlight(
+            carina_provider_protocol::types::ResumeInFlight {
+                pending: carina_provider_protocol::types::ResumePending {
+                    token,
+                    identifier: Some(self.identifier),
+                    poll_after_secs,
+                },
+                error,
+            },
+        ))
+    }
+
     pub fn completed<T>(self, read: FoundRead) -> ResumeStep<T> {
         ResumeStep(carina_provider_protocol::types::ResumeStep::Completed {
             identifier: self.identifier,
@@ -556,11 +661,11 @@ impl ResumedCreate {
         })
     }
 
-    pub fn failed(
+    pub fn failed<T>(
         self,
         observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
         error: ProviderError,
-    ) -> ResumeVerdict {
+    ) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Created(
             carina_provider_protocol::types::ResumedFailure {
                 identifier: self.identifier,
@@ -570,7 +675,7 @@ impl ResumedCreate {
         ))
     }
 
-    pub fn discarded(self, error: ProviderError) -> ResumeVerdict {
+    pub fn discarded<T>(self, error: ProviderError) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Discarded(
             error,
         ))
@@ -591,11 +696,11 @@ impl FinishingResume {
         })
     }
 
-    pub fn failed(
+    pub fn failed<T>(
         self,
         observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
         error: ProviderError,
-    ) -> ResumeVerdict {
+    ) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Created(
             carina_provider_protocol::types::ResumedFailure {
                 identifier: self.identifier,
@@ -605,7 +710,7 @@ impl FinishingResume {
         ))
     }
 
-    pub fn discarded(self, error: ProviderError) -> ResumeVerdict {
+    pub fn discarded<T>(self, error: ProviderError) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Discarded(
             error,
         ))
@@ -655,12 +760,12 @@ impl<T> CreateStep<T> {
     }
 }
 
-pub type ProtocolCreateVerdict =
-    carina_provider_protocol::types::CreateVerdict<ReadOutcome, ProviderError>;
-pub type ProtocolPollVerdict =
-    carina_provider_protocol::types::PollVerdict<ReadOutcome, ProviderError>;
-pub type ProtocolResumeVerdict =
-    carina_provider_protocol::types::ResumeVerdict<ReadOutcome, ProviderError>;
+pub type ProtocolCreateVerdict<T> =
+    carina_provider_protocol::types::CreateVerdict<ReadOutcome, T, ProviderError>;
+pub type ProtocolPollVerdict<T> =
+    carina_provider_protocol::types::PollVerdict<ReadOutcome, T, ProviderError>;
+pub type ProtocolResumeVerdict<T> =
+    carina_provider_protocol::types::ResumeVerdict<ReadOutcome, T, ProviderError>;
 
 /// SDK verdict from the initial create call.
 ///
@@ -670,7 +775,7 @@ pub type ProtocolResumeVerdict =
 /// ```compile_fail
 /// use carina_plugin_sdk::{CreateVerdict, types::{ProviderError, ProviderErrorKind}};
 ///
-/// fn classify() -> Result<(), CreateVerdict> {
+/// fn classify() -> Result<(), CreateVerdict<()>> {
 ///     Err::<(), ProviderError>(ProviderError {
 ///         kind: ProviderErrorKind::Internal,
 ///         message: "failed".to_string(),
@@ -691,15 +796,15 @@ pub type ProtocolResumeVerdict =
 /// ```compile_fail
 /// use carina_plugin_sdk::{CreateVerdict, types::ProviderError};
 ///
-/// fn bypass(error: ProviderError) -> CreateVerdict {
+/// fn bypass(error: ProviderError) -> CreateVerdict<()> {
 ///     CreateVerdict::Untracked(error)
 /// }
 /// ```
 #[derive(Debug)]
-pub struct CreateVerdict(ProtocolCreateVerdict);
+pub struct CreateVerdict<T>(ProtocolCreateVerdict<T>);
 
-impl CreateVerdict {
-    fn into_protocol(self) -> ProtocolCreateVerdict {
+impl<T> CreateVerdict<T> {
+    fn into_protocol(self) -> ProtocolCreateVerdict<T> {
         self.0
     }
 }
@@ -709,21 +814,21 @@ impl CreateVerdict {
 /// ```compile_fail
 /// use carina_plugin_sdk::{PollVerdict, ProtocolPollVerdict};
 ///
-/// fn bypass(raw: ProtocolPollVerdict) -> PollVerdict {
+/// fn bypass(raw: ProtocolPollVerdict<()>) -> PollVerdict<()> {
 ///     PollVerdict(raw)
 /// }
 /// ```
 #[derive(Debug)]
-pub struct PollVerdict(ProtocolPollVerdict);
+pub struct PollVerdict<T>(ProtocolPollVerdict<T>);
 
-impl PollVerdict {
-    fn into_protocol(self) -> ProtocolPollVerdict {
+impl<T> PollVerdict<T> {
+    fn into_protocol(self) -> ProtocolPollVerdict<T> {
         self.0
     }
 }
 
-impl From<CreateVerdict> for PollVerdict {
-    fn from(verdict: CreateVerdict) -> Self {
+impl<T> From<CreateVerdict<T>> for PollVerdict<T> {
+    fn from(verdict: CreateVerdict<T>) -> Self {
         Self(verdict.0.into())
     }
 }
@@ -763,21 +868,21 @@ impl<T> From<CreateStep<T>> for ResumeStep<T> {
 /// ```compile_fail
 /// use carina_plugin_sdk::{ProtocolResumeVerdict, ResumeVerdict};
 ///
-/// fn bypass(raw: ProtocolResumeVerdict) -> ResumeVerdict {
+/// fn bypass(raw: ProtocolResumeVerdict<()>) -> ResumeVerdict<()> {
 ///     ResumeVerdict(raw)
 /// }
 /// ```
 #[derive(Debug)]
-pub struct ResumeVerdict(ProtocolResumeVerdict);
+pub struct ResumeVerdict<T>(ProtocolResumeVerdict<T>);
 
-impl ResumeVerdict {
-    fn into_protocol(self) -> ProtocolResumeVerdict {
+impl<T> ResumeVerdict<T> {
+    fn into_protocol(self) -> ProtocolResumeVerdict<T> {
         self.0
     }
 }
 
-impl From<CreateVerdict> for ResumeVerdict {
-    fn from(verdict: CreateVerdict) -> Self {
+impl<T> From<CreateVerdict<T>> for ResumeVerdict<T> {
+    fn from(verdict: CreateVerdict<T>) -> Self {
         Self(verdict.0.into())
     }
 }
@@ -820,6 +925,215 @@ impl<'de> serde::Deserialize<'de> for Never {
     }
 }
 
+/// The state of one top-level desired resource attribute at normalization time.
+///
+/// The host holds unresolved attributes back from the WASM value boundary. A
+/// provider must therefore distinguish an attribute the user omitted from one
+/// whose value exists but cannot be observed until its dependency resolves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DesiredAttribute<T> {
+    Known(T),
+    Absent,
+    Deferred,
+}
+
+/// A desired resource decoded from the WASM normalization boundary.
+///
+/// Attribute storage and the host's deferred-name set stay private so callers
+/// cannot accidentally interpret a missing map entry as user-authored
+/// absence. Use [`DesiredResource::attribute`] or
+/// [`DesiredResource::attribute_mut`] for one attribute, or
+/// [`DesiredResource::attributes`] to walk every known and deferred attribute.
+#[derive(Debug)]
+pub struct DesiredResource {
+    resource: Resource,
+    deferred: std::collections::BTreeSet<String>,
+}
+
+/// A desired resource whose normalization is complete.
+///
+/// This type is intentionally opaque. Provider implementations can create it
+/// only by calling [`DesiredResource::finish`]; the SDK's guest glue is solely
+/// responsible for encoding it onto the WASM boundary.
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{NormalizedResource, types::Resource};
+///
+/// fn expose_raw(normalized: NormalizedResource) -> Resource {
+///     let NormalizedResource { resource } = normalized;
+///     resource
+/// }
+/// ```
+#[derive(Debug)]
+pub struct NormalizedResource {
+    // Guest encoding exists only for WASM builds; host-only SDK builds still
+    // need this opaque return type in the public trait signature.
+    #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+    resource: Resource,
+}
+
+/// An attempted insertion targeted an attribute that was not absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesiredAttributeError {
+    /// The name already has a known value.
+    Known { name: String },
+    /// The host is withholding the name's unresolved value.
+    Deferred { name: String },
+}
+
+impl std::fmt::Display for DesiredAttributeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Known { name } => write!(
+                formatter,
+                "attribute '{name}' is known; insert_absent requires an absent attribute"
+            ),
+            Self::Deferred { name } => write!(
+                formatter,
+                "attribute '{name}' is deferred; insert_absent requires an absent attribute"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DesiredAttributeError {}
+
+/// Invalid `desired-resource` input received from the WASM host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesiredResourceDecodeError {
+    DuplicateDeferredAttribute { name: String },
+    DeferredAttributePresent { name: String },
+}
+
+impl std::fmt::Display for DesiredResourceDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateDeferredAttribute { name } => {
+                write!(
+                    formatter,
+                    "deferred attribute name '{name}' appears more than once"
+                )
+            }
+            Self::DeferredAttributePresent { name } => write!(
+                formatter,
+                "attribute '{name}' is both present in the resource and marked deferred"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DesiredResourceDecodeError {}
+
+impl DesiredResource {
+    #[cfg(any(target_arch = "wasm32", test))]
+    fn decode(
+        resource: Resource,
+        deferred: Vec<String>,
+    ) -> Result<Self, DesiredResourceDecodeError> {
+        let mut deferred_names = std::collections::BTreeSet::new();
+        for name in deferred {
+            if !deferred_names.insert(name.clone()) {
+                return Err(DesiredResourceDecodeError::DuplicateDeferredAttribute { name });
+            }
+        }
+        if let Some(name) = deferred_names
+            .iter()
+            .find(|name| resource.attributes.contains_key(name.as_str()))
+        {
+            return Err(DesiredResourceDecodeError::DeferredAttributePresent {
+                name: name.clone(),
+            });
+        }
+        Ok(Self {
+            resource,
+            deferred: deferred_names,
+        })
+    }
+
+    /// Resource identity used for provider dispatch and diagnostics.
+    pub fn id(&self) -> &ResourceId {
+        &self.resource.id
+    }
+
+    /// Query one top-level attribute without conflating absence and deferral.
+    pub fn attribute(&self, name: &str) -> DesiredAttribute<&Value> {
+        if self.deferred.contains(name) {
+            DesiredAttribute::Deferred
+        } else {
+            self.resource
+                .attributes
+                .get(name)
+                .map_or(DesiredAttribute::Absent, DesiredAttribute::Known)
+        }
+    }
+
+    /// Mutably query one known top-level attribute.
+    ///
+    /// Deferred and absent attributes cannot be synthesized through this
+    /// method; both remain explicit enum variants.
+    pub fn attribute_mut(&mut self, name: &str) -> DesiredAttribute<&mut Value> {
+        if self.deferred.contains(name) {
+            DesiredAttribute::Deferred
+        } else {
+            self.resource
+                .attributes
+                .get_mut(name)
+                .map_or(DesiredAttribute::Absent, DesiredAttribute::Known)
+        }
+    }
+
+    /// Iterate over every known and deferred top-level attribute.
+    ///
+    /// Absent attributes have no name to yield. Each deferred name is emitted
+    /// explicitly as [`DesiredAttribute::Deferred`].
+    pub fn attributes(&self) -> impl Iterator<Item = (&str, DesiredAttribute<&Value>)> {
+        let known = self
+            .resource
+            .attributes
+            .iter()
+            .map(|(name, value)| (name.as_str(), DesiredAttribute::Known(value)));
+        let deferred = self
+            .deferred
+            .iter()
+            .map(|name| (name.as_str(), DesiredAttribute::Deferred));
+        known.chain(deferred)
+    }
+
+    /// Insert a top-level attribute only when it is truly absent.
+    ///
+    /// Known and deferred names produce distinct typed errors. In particular,
+    /// a deferred name cannot be replaced while its value is withheld by the
+    /// host.
+    pub fn insert_absent(
+        &mut self,
+        name: impl Into<String>,
+        value: Value,
+    ) -> Result<(), DesiredAttributeError> {
+        use std::collections::btree_map::Entry;
+
+        let name = name.into();
+        if self.deferred.contains(&name) {
+            return Err(DesiredAttributeError::Deferred { name });
+        }
+        match self.resource.attributes.entry(name) {
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+                Ok(())
+            }
+            Entry::Occupied(entry) => Err(DesiredAttributeError::Known {
+                name: entry.key().clone(),
+            }),
+        }
+    }
+
+    /// Finish normalization and seal the resource for the SDK's guest glue.
+    pub fn finish(self) -> NormalizedResource {
+        NormalizedResource {
+            resource: self.resource,
+        }
+    }
+}
+
 /// Trait that provider authors implement.
 #[allow(clippy::result_large_err)]
 pub trait CarinaProvider {
@@ -840,6 +1154,11 @@ pub trait CarinaProvider {
     /// Return all resource schemas this provider supports.
     fn schemas(&self) -> Vec<ValidatedResourceSchema>;
 
+    /// Return provider-wide reference forms keyed by refined String identity.
+    /// Resource schemas, config, and this table are admitted together before
+    /// any schema metadata is emitted.
+    fn reference_forms(&self) -> ReferenceForms;
+
     /// Return the types of the provider block's configuration attributes
     /// (e.g., `region`). The host uses these to validate attributes
     /// against their declared types *before* calling [`validate_config`].
@@ -854,10 +1173,7 @@ pub trait CarinaProvider {
 
     /// Initialize the provider with configuration.
     /// Called once before any CRUD operations.
-    fn initialize(&mut self, attrs: &BTreeMap<String, Value>) -> Result<(), String> {
-        let _ = attrs;
-        Ok(())
-    }
+    fn initialize(&mut self, attrs: &BTreeMap<String, Value>) -> Result<ReferenceScope, String>;
 
     /// Read current state of a resource.
     ///
@@ -892,7 +1208,7 @@ pub trait CarinaProvider {
         id: &ResourceId,
         request: CreateRequest,
         attempt: CreateAttempt,
-    ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict>;
+    ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict<Self::CreateToken>>;
 
     /// Perform one short poll step for a pending create operation.
     ///
@@ -903,7 +1219,7 @@ pub trait CarinaProvider {
         id: &ResourceId,
         request: CreateRequest,
         poll: Poll<Self::CreateToken>,
-    ) -> Result<CreateStep<Self::CreateToken>, PollVerdict>;
+    ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>>;
 
     /// Continue a create operation loaded from state.
     fn resume_create(
@@ -911,7 +1227,7 @@ pub trait CarinaProvider {
         id: &ResourceId,
         request: CreateRequest,
         resume: Resume<Self::CreateToken>,
-    ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict>;
+    ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>>;
 
     /// Perform one short update step.
     ///
@@ -997,8 +1313,19 @@ pub trait CarinaProvider {
     }
 
     /// Normalize desired resources (optional).
-    fn normalize_desired(&self, resources: Vec<Resource>) -> Result<Vec<Resource>, ProviderError> {
-        Ok(resources)
+    ///
+    /// Every attribute lookup is a three-way query: [`DesiredAttribute::Known`],
+    /// [`DesiredAttribute::Absent`], or [`DesiredAttribute::Deferred`], because
+    /// the host temporarily withholds unresolved values from WASM. Use
+    /// [`DesiredResource::attributes`] for a generic walk,
+    /// [`DesiredResource::attribute_mut`] to edit known values, and
+    /// [`DesiredResource::insert_absent`] to add a value only when it is truly
+    /// absent. Return each resource by calling [`DesiredResource::finish`].
+    fn normalize_desired(
+        &self,
+        resources: Vec<DesiredResource>,
+    ) -> Result<Vec<NormalizedResource>, ProviderError> {
+        Ok(resources.into_iter().map(DesiredResource::finish).collect())
     }
 
     /// Normalize read-back state (optional).
@@ -1026,7 +1353,7 @@ pub fn dispatch_create<P: CarinaProvider + ?Sized>(
     provider: &P,
     id: &ResourceId,
     request: CreateRequest,
-) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolCreateVerdict>> {
+) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolCreateVerdict<P::CreateToken>>> {
     provider
         .create(id, request, CreateAttempt::new())
         .map(CreateStep::into_protocol)
@@ -1041,7 +1368,7 @@ pub fn dispatch_poll_create<P: CarinaProvider + ?Sized>(
     identifier: Option<AppliedIdentifier>,
     sent: Sent,
     token: P::CreateToken,
-) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolPollVerdict>> {
+) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolPollVerdict<P::CreateToken>>> {
     let poll = match identifier {
         Some(identifier) => Poll::Issued(IssuedCreate::from_parts(identifier, sent), token),
         None => Poll::Unissued(PollAttempt::from_sent(sent), token),
@@ -1059,7 +1386,7 @@ pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
     request: CreateRequest,
     identifier: Option<AppliedIdentifier>,
     token: P::CreateToken,
-) -> Result<ProtocolResumeStep<P::CreateToken>, Box<ProtocolResumeVerdict>> {
+) -> Result<ProtocolResumeStep<P::CreateToken>, Box<ProtocolResumeVerdict<P::CreateToken>>> {
     let resume = match identifier {
         Some(identifier) => Resume::Issued(ResumedCreate::new(identifier), token),
         None => Resume::Unissued(ResumeAttempt::new(), token),
@@ -1073,6 +1400,208 @@ pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    struct SchemaOnlyProvider {
+        resources: Vec<ValidatedResourceSchema>,
+        forms: carina_core::schema::ReferenceForms,
+        reference_form_calls: Cell<usize>,
+    }
+
+    impl CarinaProvider for SchemaOnlyProvider {
+        type CreateToken = Never;
+        type UpdateToken = Never;
+        type DeleteToken = Never;
+
+        fn info(&self) -> ProviderInfo {
+            ProviderInfo {
+                name: "test".to_string(),
+                display_name: "Test".to_string(),
+                capabilities: Vec::new(),
+                version: "test".to_string(),
+            }
+        }
+
+        fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+            self.resources.clone()
+        }
+
+        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+            ValidatedConfigSchema::default()
+        }
+
+        fn reference_forms(&self) -> carina_core::schema::ReferenceForms {
+            self.reference_form_calls
+                .set(self.reference_form_calls.get() + 1);
+            self.forms.clone()
+        }
+
+        fn validate_config(&self, _attrs: &BTreeMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn initialize(
+            &mut self,
+            _attrs: &BTreeMap<String, Value>,
+        ) -> Result<ReferenceScope, String> {
+            Ok(ReferenceScope::Unavailable)
+        }
+
+        fn read(
+            &self,
+            _id: &ResourceId,
+            _identifier: &AppliedIdentifier,
+            _request: ReadRequest,
+        ) -> Result<ReadOutcome, ProviderError> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn read_data_source(&self, _resource: &Resource) -> Result<State, ProviderError> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+            _attempt: CreateAttempt,
+        ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict<Self::CreateToken>> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn poll_create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+            _poll: Poll<Self::CreateToken>,
+        ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn resume_create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+            _resume: Resume<Self::CreateToken>,
+        ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &AppliedIdentifier,
+            _request: UpdateRequest,
+        ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn poll_update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &AppliedIdentifier,
+            _request: UpdateRequest,
+            _pending: Pending<Self::UpdateToken>,
+        ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &AppliedIdentifier,
+            _request: DeleteRequest,
+        ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn poll_delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &AppliedIdentifier,
+            _request: DeleteRequest,
+            _pending: Pending<Self::DeleteToken>,
+        ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
+            unimplemented!("schema-only provider")
+        }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: PlanOp,
+        ) -> Result<Vec<String>, ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn reference_identity() -> carina_core::schema::TypeIdentity {
+        carina_core::schema::TypeIdentity::new(Some("test"), ["widget"], "Name")
+    }
+
+    fn reference_form() -> carina_core::schema::ReferenceForm {
+        carina_core::schema::ReferenceForm::Template {
+            long: carina_core::schema::ReferenceTemplate::new(
+                "arn:{partition}:service:{region}:{account}:widget/{name}",
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn provider_schema_cache_rejects_a_form_for_an_undeclared_identity() {
+        let identity = reference_identity();
+        let provider = SchemaOnlyProvider {
+            resources: Vec::new(),
+            forms: BTreeMap::from([(identity.clone(), reference_form())]),
+            reference_form_calls: Cell::new(0),
+        };
+
+        let error = match ProviderSchemaCache::from_provider(&provider) {
+            Ok(_) => panic!("an undeclared reference form must not be emitted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            carina_core::schema::ProviderSchemaValidationError::DanglingReferenceForm {
+                identity: actual,
+            } if actual == identity
+        ));
+    }
+
+    #[test]
+    fn provider_schema_cache_captures_and_projects_reference_forms_once() {
+        let identity = reference_identity();
+        let schema = carina_core::schema::ResourceSchema::new("test.Widget")
+            .attribute(
+                carina_core::schema::AttributeSchema::optional(
+                    "name",
+                    carina_core::schema::AttributeType::refined_string(
+                        Some(identity.clone()),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let provider = SchemaOnlyProvider {
+            resources: vec![schema],
+            forms: BTreeMap::from([(identity, reference_form())]),
+            reference_form_calls: Cell::new(0),
+        };
+
+        let cache = ProviderSchemaCache::from_provider(&provider).unwrap();
+        assert_eq!(provider.reference_form_calls.get(), 1);
+        for _ in 0..2 {
+            let json = provider_schema_to_json(cache.witness()).unwrap();
+            let envelope: protocol::types::ProviderSchemaEnvelope =
+                serde_json::from_str(&json).unwrap();
+            assert_eq!(envelope.reference_forms.len(), 1);
+        }
+        assert_eq!(provider.reference_form_calls.get(), 1);
+    }
 
     #[test]
     fn schema_admission_rejects_a_closed_enum_transform_before_guest_serialization() {
@@ -1091,9 +1620,9 @@ mod tests {
                 .build(),
             )
             .validate()
-            .expect_err("a validated schema must always be projectable to protocol v12");
+            .expect_err("a validated schema must always be projectable to protocol v13");
 
-        assert!(error.to_string().contains("protocol v12"), "{error}");
+        assert!(error.to_string().contains("protocol v13"), "{error}");
     }
 
     #[test]
@@ -1105,6 +1634,150 @@ mod tests {
             serde_json::from_str::<Pending<Never>>(r#"{"token":null,"poll_after_secs":1}"#,)
                 .is_err()
         );
+    }
+
+    fn desired_resource(attributes: BTreeMap<String, Value>) -> Resource {
+        Resource {
+            id: ResourceId {
+                provider: "test".to_string(),
+                resource_type: "test.Widget".to_string(),
+                identity: "example".to_string(),
+            },
+            attributes,
+            directives: types::Directives::default(),
+        }
+    }
+
+    #[test]
+    fn desired_resource_exposes_known_absent_and_deferred_attributes() {
+        let mut desired = DesiredResource::decode(
+            desired_resource(BTreeMap::from([(
+                "known".to_string(),
+                Value::String("before".to_string()),
+            )])),
+            vec!["deferred".to_string()],
+        )
+        .expect("valid desired resource");
+
+        assert!(matches!(
+            desired.attribute("known"),
+            DesiredAttribute::Known(Value::String(value)) if value == "before"
+        ));
+        assert!(matches!(
+            desired.attribute("absent"),
+            DesiredAttribute::Absent
+        ));
+        assert!(matches!(
+            desired.attribute("deferred"),
+            DesiredAttribute::Deferred
+        ));
+
+        match desired.attribute_mut("known") {
+            DesiredAttribute::Known(value) => *value = Value::String("after".to_string()),
+            DesiredAttribute::Absent | DesiredAttribute::Deferred => {
+                panic!("known attribute must remain mutable")
+            }
+        }
+        assert!(matches!(
+            desired.attribute_mut("deferred"),
+            DesiredAttribute::Deferred
+        ));
+
+        let normalized = desired.finish();
+        assert_eq!(
+            normalized.resource.attributes.get("known"),
+            Some(&Value::String("after".to_string()))
+        );
+        assert!(!normalized.resource.attributes.contains_key("deferred"));
+    }
+
+    #[test]
+    fn desired_resource_iteration_and_absent_insertion_preserve_three_way_state() {
+        let mut desired = DesiredResource::decode(
+            desired_resource(BTreeMap::from([(
+                "known".to_string(),
+                Value::String("configured".to_string()),
+            )])),
+            vec!["deferred".to_string()],
+        )
+        .expect("valid desired resource");
+
+        let states = desired
+            .attributes()
+            .map(|(name, attribute)| {
+                let state = match attribute {
+                    DesiredAttribute::Known(_) => "known",
+                    DesiredAttribute::Deferred => "deferred",
+                    DesiredAttribute::Absent => unreachable!("absent names are not iterable"),
+                };
+                (name, state)
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            states,
+            BTreeMap::from([("deferred", "deferred"), ("known", "known")])
+        );
+
+        let deferred_error = desired
+            .insert_absent("deferred", Value::String("replacement".to_string()))
+            .expect_err("a deferred attribute is not absent");
+        assert_eq!(
+            deferred_error,
+            DesiredAttributeError::Deferred {
+                name: "deferred".to_string()
+            }
+        );
+
+        let known_error = desired
+            .insert_absent("known", Value::String("replacement".to_string()))
+            .expect_err("a known attribute is not absent");
+        assert_eq!(
+            known_error,
+            DesiredAttributeError::Known {
+                name: "known".to_string()
+            }
+        );
+
+        desired
+            .insert_absent("absent", Value::String("default".to_string()))
+            .expect("an absent attribute accepts a default");
+        assert!(matches!(
+            desired.attribute("absent"),
+            DesiredAttribute::Known(Value::String(value)) if value == "default"
+        ));
+    }
+
+    #[test]
+    fn desired_resource_rejects_duplicate_deferred_names() {
+        let error = DesiredResource::decode(
+            desired_resource(BTreeMap::new()),
+            vec!["pending".to_string(), "pending".to_string()],
+        )
+        .expect_err("duplicate deferred names must be rejected");
+
+        assert!(matches!(
+            error,
+            DesiredResourceDecodeError::DuplicateDeferredAttribute { name }
+                if name == "pending"
+        ));
+    }
+
+    #[test]
+    fn desired_resource_rejects_present_deferred_attribute() {
+        let error = DesiredResource::decode(
+            desired_resource(BTreeMap::from([(
+                "pending".to_string(),
+                Value::String("guest-visible".to_string()),
+            )])),
+            vec!["pending".to_string()],
+        )
+        .expect_err("an attribute cannot be both present and deferred");
+
+        assert!(matches!(
+            error,
+            DesiredResourceDecodeError::DeferredAttributePresent { name }
+                if name == "pending"
+        ));
     }
 
     #[test]

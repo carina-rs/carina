@@ -13,11 +13,14 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{Orphan, Orphans, into_all_prior_states, lift_prior_state_enum_leaves};
 use carina_core::effect::Effect;
 use carina_core::executor::UnresolvedDataSourceInput;
-use carina_core::parser::ProviderContext;
+use carina_core::parser::{ProviderContext, ResourceTypePath, StateBlockAddress};
 use carina_core::plan::Plan;
+use carina_core::plan::{
+    CreateOutcomeUnknownAbsentResolution, create_outcome_unknown_absent_resolution,
+};
 use carina_core::provider::{
     self as provider_mod, AppliedIdentifier, InFlightCreate, PersistedAttributes, Provider,
-    ProviderError, ProviderNormalizer, RawSavedAttrs,
+    ProviderError, ProviderNormalizer, ProviderRouter, RawSavedAttrs, UnknownCreateOutcome,
 };
 use carina_core::resource::{
     Current, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
@@ -27,12 +30,10 @@ use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
 };
 use carina_core::value::format_value;
-#[cfg(test)]
-use carina_state::LockInfo;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, BackendSelection, DeposedInstance,
-    DeposedKey, LoadedOrphans, ResourceState, RowBasis, StateBackend, StateFile, StateUrl,
-    load_state_from_url,
+    DeposedKey, LoadedOrphans, LockInfo, ResourceState, RowBasis, StateBackend, StateFile,
+    StateUrl, load_state_from_url,
 };
 
 use super::{
@@ -45,9 +46,12 @@ use crate::commands::plan::{
 };
 use crate::commands::shared::finalize::release_lock_after_execute;
 use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
-use crate::commands::shared::progress::{ProgressBackend, ProgressSink, RefreshPhase};
+use crate::commands::shared::progress::{
+    ProgressBackend, ProgressSink, RefreshPhase, emit_newline_on_interrupt,
+};
 use crate::commands::shared::state_writeback::SkippedExports;
 use crate::commands::state_output::{StateShowCurrentKind, StateShowDocument, StateShowResource};
+use crate::cursor::CursorReveal;
 use crate::error::AppError;
 use crate::wiring::{
     AddressedDataSourceReadInputs, ProviderLoad, ValidatedConfig, get_provider_with_ctx,
@@ -215,6 +219,22 @@ pub enum StateCommands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         lock: bool,
     },
+    /// Forget a create-outcome-unknown row after confirming the resource is absent
+    Forget {
+        /// Namespaced resource type, for example awscc.ec2.Vpc
+        resource_type: String,
+
+        /// Resource identity
+        identity: String,
+
+        /// Skip confirmation prompt (auto-approve)
+        #[arg(long)]
+        auto_approve: bool,
+
+        /// Path to directory containing backend configuration
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// List all managed resources from the state file
     List {
         /// Path to directory containing .crn files (defaults to ".").
@@ -272,7 +292,9 @@ pub enum StateCommands {
 impl StateCommands {
     pub fn project_dir(&self) -> Option<&Path> {
         match self {
-            Self::BucketDelete { path, .. } | Self::Refresh { path, .. } => Some(path),
+            Self::BucketDelete { path, .. }
+            | Self::Refresh { path, .. }
+            | Self::Forget { path, .. } => Some(path),
             Self::List { path, state_url }
             | Self::Lookup {
                 path, state_url, ..
@@ -305,6 +327,22 @@ pub async fn run_state_command(
         } => run_state_bucket_delete(user_dirs, &bucket_name, force, &path, provider_context).await,
         StateCommands::Refresh { path, lock } => {
             run_state_refresh(user_dirs, &path, lock, provider_context, cancel).await
+        }
+        StateCommands::Forget {
+            resource_type,
+            identity,
+            auto_approve,
+            path,
+        } => {
+            run_state_forget(
+                &resource_type,
+                &identity,
+                auto_approve,
+                &path,
+                provider_context,
+                cancel,
+            )
+            .await
         }
         StateCommands::List { path, state_url } => {
             run_state_list(path.as_deref(), state_url.as_deref(), provider_context).await
@@ -340,6 +378,200 @@ pub async fn run_state_command(
             .await
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateForgetConfirmation {
+    Confirmed,
+    Cancelled,
+}
+
+fn state_forget_address(
+    namespaced_type: &str,
+    identity: &str,
+) -> Result<StateBlockAddress, AppError> {
+    let type_path = ResourceTypePath::parse(namespaced_type).ok_or_else(|| {
+        AppError::Config(format!(
+            "Invalid resource type '{namespaced_type}'; expected a namespaced type such as awscc.ec2.Vpc"
+        ))
+    })?;
+    let identity = ResourceIdentity::try_from(identity.to_owned())?;
+    Ok(StateBlockAddress::new(
+        type_path.provider,
+        type_path.resource_type,
+        identity,
+    ))
+}
+
+fn display_state_forget_address(address: &StateBlockAddress) -> String {
+    format!(
+        "{} {}",
+        address.display_type(),
+        carina_core::parser::display_string_literal(address.name_str())
+    )
+}
+
+fn format_state_forget_target(
+    address: &StateBlockAddress,
+    row: &carina_state::ResourceState,
+) -> String {
+    let mut lines = vec![
+        format!(
+            "Create-outcome-unknown row: {}",
+            display_state_forget_address(address)
+        ),
+        "This row has no provider identifier and cannot be destroyed safely.".to_string(),
+    ];
+    if !row.deposed.is_empty() {
+        lines.push(
+            "Deposed generations that will remain tracked for deletion by the next plan:"
+                .to_string(),
+        );
+        lines.extend(row.deposed.iter().map(|deposed| {
+            format!(
+                "  - identifier `{}` (generation `{}`, provider instance `{}`)",
+                deposed.identifier,
+                deposed.key,
+                deposed.provider_instance.as_deref().unwrap_or("default")
+            )
+        }));
+    }
+    lines.join("\n")
+}
+
+async fn confirm_state_forget<R>(
+    reader: R,
+    cancel: ShutdownToken,
+    auto_approve: bool,
+) -> Result<StateForgetConfirmation, AppError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    if auto_approve {
+        return Ok(StateForgetConfirmation::Confirmed);
+    }
+
+    println!(
+        "{}",
+        "Forget this create-outcome-unknown state row?"
+            .yellow()
+            .bold()
+    );
+    println!(
+        "  {}",
+        "Only continue after confirming that the resource does not exist. Type 'yes' to confirm."
+            .yellow()
+    );
+    let input = {
+        let _reveal = CursorReveal::new();
+        print!("\n  Enter a value: ");
+        std::io::Write::flush(&mut std::io::stdout()).map_err(|error| error.to_string())?;
+        let result = crate::signal::read_line_until_cancelled(reader, cancel).await;
+        emit_newline_on_interrupt(&mut std::io::stdout(), &result);
+        result?
+    };
+
+    if input.trim() == "yes" {
+        println!();
+        Ok(StateForgetConfirmation::Confirmed)
+    } else {
+        println!();
+        println!("{}", "State forget cancelled.".yellow());
+        Ok(StateForgetConfirmation::Cancelled)
+    }
+}
+
+/// Remove the recovery row for a create whose outcome is unknown.
+pub async fn run_state_forget(
+    namespaced_type: &str,
+    identity: &str,
+    auto_approve: bool,
+    path: &Path,
+    provider_context: &ProviderContext,
+    cancel: ShutdownToken,
+) -> Result<(), AppError> {
+    let address = state_forget_address(namespaced_type, identity)?;
+    let parsed = load_configuration_with_config(
+        path,
+        provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    )?
+    .parsed;
+    let verified_backend =
+        verify_for_mutation(path, parsed.backend.as_ref(), DriftCommand::ForgetState)?;
+    let backend = verified_backend
+        .resolve()
+        .await
+        .map_err(AppError::Backend)?;
+
+    println!("{}", "Acquiring state lock...".cyan());
+    let lock = backend
+        .acquire_lock("state forget")
+        .await
+        .map_err(|error| map_lock_error(error, path))?;
+    println!("  {} Lock acquired", "✓".green());
+
+    let reader = tokio::io::BufReader::new(tokio::io::stdin());
+    let operation = run_state_forget_locked(
+        backend.as_ref(),
+        &lock,
+        &address,
+        path,
+        auto_approve,
+        reader,
+        cancel.clone(),
+    )
+    .await;
+    let release =
+        release_lock_after_execute(backend.as_ref(), StateLockRef::Held(&lock), &cancel).await;
+    if release.is_ok() {
+        println!("  {} Lock released", "✓".green());
+    }
+    operation?;
+    release
+}
+
+async fn run_state_forget_locked<R>(
+    backend: &dyn StateBackend,
+    lock: &LockInfo,
+    address: &StateBlockAddress,
+    project_dir: &Path,
+    auto_approve: bool,
+    reader: R,
+    cancel: ShutdownToken,
+) -> Result<(), AppError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut state =
+        crate::commands::apply::load_state_persist_if_migrated(backend, StateLockRef::Held(lock))
+            .await?
+            .unwrap_or_default();
+    let row = state
+        .find_outcome_unknown(address)
+        .map_err(|source| AppError::from_state_forget(source, project_dir))?;
+
+    println!("{}", format_state_forget_target(address, row.resource()));
+    if confirm_state_forget(reader, cancel, auto_approve).await?
+        == StateForgetConfirmation::Cancelled
+    {
+        return Ok(());
+    }
+
+    match create_outcome_unknown_absent_resolution() {
+        CreateOutcomeUnknownAbsentResolution::StateForget => {
+            StateFile::forget(row);
+        }
+    }
+    crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
+    println!(
+        "{} {}",
+        "Forgot create-outcome-unknown current instance:"
+            .green()
+            .bold(),
+        display_state_forget_address(address)
+    );
+    Ok(())
 }
 
 /// Run force-unlock command
@@ -466,6 +698,7 @@ enum StateCommandCurrent<'a> {
         kind: StateCommandStateKind,
     },
     CreateInFlight(&'a InFlightCreate),
+    CreateOutcomeUnknown(&'a UnknownCreateOutcome),
 }
 
 impl<'a> From<&'a Current> for StateCommandCurrent<'a> {
@@ -480,6 +713,7 @@ impl<'a> From<&'a Current> for StateCommandCurrent<'a> {
                 kind: StateCommandStateKind::Present,
             },
             Current::CreateInFlight(pending) => Self::CreateInFlight(pending),
+            Current::CreateOutcomeUnknown(unknown) => Self::CreateOutcomeUnknown(unknown),
             Current::MissingIdentifier(unidentified) => Self::State {
                 state: unidentified.state(),
                 kind: StateCommandStateKind::MissingIdentifier,
@@ -500,6 +734,13 @@ fn current_for_state_command(state: &StateFile, row: &ResourceState) -> Current 
 
 fn create_in_flight_status(pending: &InFlightCreate) -> String {
     format!("create in flight since {}", pending.started_at().as_str())
+}
+
+fn create_outcome_unknown_status(unknown: &UnknownCreateOutcome) -> String {
+    format!(
+        "create outcome unknown since {}; the create may have reached the cloud",
+        unknown.started_at().as_str()
+    )
 }
 
 /// Format state list output. Returns each line as a string.
@@ -526,6 +767,12 @@ fn format_state_list(state: &StateFile) -> Vec<String> {
                 lines.push(format!(
                     "{row_prefix}  ({})",
                     create_in_flight_status(pending)
+                ));
+            }
+            StateCommandCurrent::CreateOutcomeUnknown(unknown) => {
+                lines.push(format!(
+                    "{row_prefix}  ({})",
+                    create_outcome_unknown_status(unknown)
                 ));
             }
         }
@@ -747,6 +994,24 @@ fn format_resource_value(
                 }
             }
         },
+        StateCommandCurrent::CreateOutcomeUnknown(unknown) => match attribute {
+            Some(attr) => {
+                let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
+                Err(AppError::Config(format!(
+                    "Cannot look up attribute '{attr}' on resource '{display_name}': {}.",
+                    create_outcome_unknown_status(unknown)
+                )))
+            }
+            None => {
+                let status = create_outcome_unknown_status(unknown);
+                if json_output {
+                    Ok(serde_json::to_string_pretty(&status)
+                        .expect("outcome-unknown status is serializable"))
+                } else {
+                    Ok(status)
+                }
+            }
+        },
     }
 }
 
@@ -802,7 +1067,7 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
             identity,
             rs.directives.provider_instance.clone(),
         );
-        resource.directives = rs.directives.clone();
+        resource.directives = rs.directives.clone().into();
 
         // Set typed metadata fields from state
         resource.binding = rs.binding.clone();
@@ -853,6 +1118,9 @@ fn format_state_show(state: &StateFile) -> String {
             ),
             StateCommandCurrent::CreateInFlight(pending) => {
                 output.push_str(&format!("  {}\n", create_in_flight_status(pending)));
+            }
+            StateCommandCurrent::CreateOutcomeUnknown(unknown) => {
+                output.push_str(&format!("  {}\n", create_outcome_unknown_status(unknown)));
             }
         }
         for deposed in &rs.deposed {
@@ -928,8 +1196,8 @@ async fn run_state_show(
             &carina_core::schema::SchemaRegistry::new(),
             &historical_display,
             Some(&prev_explicit),
-        )
-        .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
+            &carina_core::provider::ProviderRouter::new(),
+        )?;
     } else {
         let output = format_state_show(&state);
         print!("{}", output);
@@ -951,7 +1219,6 @@ async fn run_state_bucket_delete(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
 
@@ -977,13 +1244,8 @@ async fn run_state_bucket_delete(
     // resolved provider values needed for construction can wait until after
     // confirmation.
     let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
-    let validated_config = providers.validate_evaluated_config(
-        parsed,
-        base_dir,
-        true,
-        &inference_errors,
-        &duplicate_declarations,
-    )?;
+    let validated_config =
+        providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
     println!(
         "{}",
@@ -1048,6 +1310,7 @@ async fn run_state_bucket_delete(
     let bucket_id =
         ResourceId::with_provider_identity(provider_name, resource_type, bucket_identity, None);
     match bucket_provider
+        .provider()
         .delete(
             &bucket_id,
             &bucket_identifier,
@@ -1087,13 +1350,13 @@ async fn create_state_bucket_delete_provider<R>(
     validated_config: &ValidatedConfig<R>,
     provider_configs: &carina_core::parser::ResolvedProviderConfigs,
     provider_name: &str,
-) -> Result<Box<dyn carina_core::provider::Provider>, AppError> {
+) -> Result<carina_core::provider::InitializedProvider, AppError> {
     let ctx = validated_config.context();
     let factory = provider_mod::find_factory(ctx.factories(), provider_name)
         .ok_or_else(|| format!("No provider factory found for '{provider_name}'"))?;
     let config = prepare_default_provider_ready_config(factory, provider_name, provider_configs)?;
     factory
-        .create_provider(None, &config)
+        .create_initialized_provider(None, &config)
         .await
         .map_err(AppError::Provider)
 }
@@ -1111,19 +1374,13 @@ pub async fn run_state_refresh(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
-    let validated_config = providers.validate_evaluated_config(
-        parsed,
-        base_dir,
-        true,
-        &inference_errors,
-        &duplicate_declarations,
-    )?;
+    let validated_config =
+        providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
     let verified_backend = verify_for_mutation(
         path,
@@ -1258,6 +1515,10 @@ pub(crate) async fn run_state_refresh_locked(
                 Current::CreateInFlight(pending) => {
                     managed_current.insert(resource.id.clone(), Current::CreateInFlight(pending));
                 }
+                Current::CreateOutcomeUnknown(unknown) => {
+                    managed_current
+                        .insert(resource.id.clone(), Current::CreateOutcomeUnknown(unknown));
+                }
                 Current::Absent(_state) => {}
             }
         }
@@ -1295,6 +1556,7 @@ pub(crate) async fn run_state_refresh_locked(
             Current::Absent(_state) => {}
             Current::Present(_present) => {}
             Current::CreateInFlight(_pending) => {}
+            Current::CreateOutcomeUnknown(_unknown) => {}
             Current::MissingIdentifier(_state) => {
                 warn_missing_provider_identifier(id);
                 missing_provider_identifier_ids.insert(id.clone());
@@ -1380,6 +1642,7 @@ pub(crate) async fn run_state_refresh_locked(
     } = validated_config
         .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
             provider: &provider,
+            comparison_provider: &provider,
             expansion: &mut prepared_expansion,
             warning_policy: crate::wiring::DeferredForWarningPolicy::Print,
             remote_bindings: &HashMap::new(),
@@ -1479,7 +1742,10 @@ pub(crate) async fn run_state_refresh_locked(
         ctx.schemas(),
     );
 
-    let resolved_resources = ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?;
+    let resolved_resources = ResolvedResource::collect_resolved_with_schemas(
+        sorted_resources.iter().cloned(),
+        ctx.schemas(),
+    )?;
 
     let mut state = state_file.take().unwrap();
 
@@ -1495,12 +1761,13 @@ pub(crate) async fn run_state_refresh_locked(
             Some(current) => current,
             None => continue, // Not in state, skip
         };
-        diff_display_update_resource(
+        diff_display_update_resource_with_provider(
             &resource.resolved_id(),
             fresh_current,
             &mut state,
             Some(resource),
             ctx.schemas(),
+            &provider,
             "",
             &mut refresh_counts,
         )?;
@@ -1515,12 +1782,13 @@ pub(crate) async fn run_state_refresh_locked(
             Some(current) => current,
             None => continue,
         };
-        diff_display_update_resource(
+        diff_display_update_resource_with_provider(
             orphan_id,
             fresh_current,
             &mut state,
             None,
             ctx.schemas(),
+            &provider,
             " (orphan)",
             &mut refresh_counts,
         )?;
@@ -1561,7 +1829,7 @@ pub(crate) async fn run_state_refresh_locked(
         let checked_exports = carina_core::validation::check_export_values_pre_apply(
             &parsed.export_params,
             &carina_core::binding_index::ResolvedBindings::for_validation(parsed),
-            provider_context,
+            ctx.provider_context(),
         )
         .map_err(AppError::Validation)?;
         let values = crate::commands::shared::state_writeback::resolve_export_values_post_apply(
@@ -1572,7 +1840,7 @@ pub(crate) async fn run_state_refresh_locked(
                 post_apply_states: &post_apply_states,
                 schemas: ctx.schemas(),
                 wait_aliases: &wait_aliases,
-                provider_context,
+                provider_context: ctx.provider_context(),
             },
         )?;
         let resolution = crate::commands::shared::state_writeback::materialize_exports(&values)?;
@@ -1778,6 +2046,7 @@ async fn refresh_orphans_until_cancelled(
                 Current::Absent(_state) => false,
                 Current::Present(_present) => true,
                 Current::CreateInFlight(_pending) => false,
+                Current::CreateOutcomeUnknown(_unknown) => false,
                 Current::MissingIdentifier(_state) => false,
             };
             in_flight.push(async move {
@@ -2141,12 +2410,14 @@ struct StateRefreshCounts {
     unchanged: u32,
 }
 
-fn diff_display_update_resource(
+#[allow(clippy::too_many_arguments)]
+fn diff_display_update_resource_with_provider(
     id: &ResolvedResourceId,
     fresh_current: &Current,
     state: &mut carina_state::StateFile,
     resource: Option<&ResolvedResource>,
     schemas: &carina_core::schema::SchemaRegistry,
+    provider: &ProviderRouter,
     label_suffix: &str,
     counts: &mut StateRefreshCounts,
 ) -> Result<(), AppError> {
@@ -2176,17 +2447,24 @@ fn diff_display_update_resource(
             println!();
             return Ok(());
         }
+        StateCommandCurrent::CreateOutcomeUnknown(unknown) => {
+            counts.unchanged += 1;
+            println!(
+                "  {} \"{}\"{}:",
+                id.display_type().cyan(),
+                identity,
+                label_suffix,
+            );
+            println!("    {}", create_outcome_unknown_status(unknown));
+            println!();
+            return Ok(());
+        }
     };
 
-    let schema = match resource {
-        Some(resource) => schemas.get_for(resource),
-        None => schemas.get(
-            &id.provider,
-            &id.resource_type,
-            carina_core::schema::SchemaKind::Resource,
-        ),
-    };
-    let resource_schema = schema.map(|schema| schema.schema().as_schema());
+    let resolved_comparison = provider.comparison_for(schemas, id.as_inner())?;
+    let owner_schema = resolved_comparison.owner_schema();
+    let comparison = resolved_comparison.context();
+    let resource_schema = Some(owner_schema.schema().as_schema());
 
     let refreshed_resource_state = if exists {
         match resource {
@@ -2198,6 +2476,7 @@ fn diff_display_update_resource(
                     resource_schema,
                     RowBasis::Carried,
                     None,
+                    comparison,
                 )
                 .map_err(|source| {
                     AppError::from_resource_state_encoding(resource.id.clone(), source)
@@ -2258,8 +2537,9 @@ fn diff_display_update_resource(
                     if !carina_core::diff_helpers::resource_attribute_values_equal(
                         old,
                         new,
-                        schema.as_deref(),
+                        Some(owner_schema.schema()),
                         key,
+                        comparison,
                     ) =>
                 {
                     has_changes = true;
@@ -2322,6 +2602,30 @@ fn diff_display_update_resource(
 }
 
 #[cfg(test)]
+fn diff_display_update_resource(
+    id: &ResolvedResourceId,
+    fresh_current: &Current,
+    state: &mut carina_state::StateFile,
+    resource: Option<&ResolvedResource>,
+    schemas: &carina_core::schema::SchemaRegistry,
+    label_suffix: &str,
+    counts: &mut StateRefreshCounts,
+) -> Result<(), AppError> {
+    let (schemas, provider) =
+        carina_core::provider::comparison_fixture_for_test(schemas, std::iter::once(id.as_inner()));
+    diff_display_update_resource_with_provider(
+        id,
+        fresh_current,
+        state,
+        resource,
+        &schemas,
+        &provider,
+        label_suffix,
+        counts,
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::shared::cancellation_test_support::{
@@ -2357,7 +2661,10 @@ mod tests {
     fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
         LiveCompositionArgument::from_value(
             value,
-            carina_core::parser::TypeExpr::String,
+            carina_core::validation::resolve_consumer_static_type_for_signature(
+                &carina_core::parser::TypeExpr::String,
+                &carina_core::parser::ProviderContext::default(),
+            ),
             carina_core::parser::ArgumentOrigin::Defaulted,
         )
     }
@@ -2378,6 +2685,96 @@ mod tests {
             .expect("secret tag carries a digest")
     }
 
+    #[test]
+    fn state_refresh_counts_reference_form_equivalent_value_as_unchanged() {
+        use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
+        use carina_core::schema::{
+            ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity, ValidatedConfigSchema,
+            ValidatedProviderSchemaWitness,
+        };
+
+        let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
+        let schema = ResourceSchema::new("lambda.Permission").attribute(
+            AttributeSchema::optional(
+                "function_name",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .build(),
+        );
+        let forms = ReferenceForms::from([(
+            identity,
+            ReferenceForm::Template {
+                long: ReferenceTemplate::new(
+                    "arn:{partition}:lambda:{region}:{account}:function:{name}",
+                )
+                .expect("valid reference template"),
+            },
+        )]);
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![schema.validate().expect("valid schema")],
+            ValidatedConfigSchema::default(),
+            forms,
+        )
+        .expect("valid provider schema witness");
+        let mut schemas = SchemaRegistry::new();
+        schemas
+            .insert_provider_witness("aws", &witness)
+            .expect("fixture owner has one validated witness");
+
+        let desired = resolved(
+            Resource::with_provider("aws", "lambda.Permission", "invoke", None).with_attribute(
+                "function_name",
+                Value::Concrete(ConcreteValue::String("processor".into())),
+            ),
+        );
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(
+                ResourceState::try_applied("lambda.Permission", "invoke", "aws", "permission-id")
+                    .expect("fixture identifier is non-empty")
+                    .with_attribute(
+                        "function_name",
+                        json!("arn:aws:lambda:us-east-1:123456789012:function:processor"),
+                    ),
+            )
+            .expect("state fixture is valid");
+        let fresh = Current::from_state(
+            State::existing(
+                desired.id.clone(),
+                HashMap::from([(
+                    "function_name".to_string(),
+                    Value::Concrete(ConcreteValue::String("processor".into())),
+                )]),
+            )
+            .with_identifier("permission-id"),
+        );
+        let mut provider = ProviderRouter::new();
+        provider.add_provider(
+            "aws".to_string(),
+            InitializedProvider::for_test(
+                Box::new(carina_provider_mock::MockProvider::new()),
+                ReferenceScope::available("aws", "us-east-1", "123456789012")
+                    .expect("fixture scope is valid"),
+            ),
+        );
+        let mut counts = StateRefreshCounts::default();
+
+        diff_display_update_resource_with_provider(
+            &ResolvedResourceId::new(desired.id.clone()),
+            &fresh,
+            &mut state,
+            Some(&desired),
+            &schemas,
+            &provider,
+            "",
+            &mut counts,
+        )
+        .expect("state refresh comparison succeeds");
+
+        assert_eq!(counts.updated, 0);
+        assert_eq!(counts.unchanged, 1);
+    }
+
     struct ModuleConstraintRefreshBackend {
         state: StateFile,
     }
@@ -2386,7 +2783,7 @@ mod tests {
         let mut state = StateFile::new();
         state
             .upsert_resource(
-                ResourceState::try_applied("thing", "orphan", provider, "orphan")
+                ResourceState::try_applied("test.resource", "orphan", provider, "orphan")
                     .expect("fixture identifier is non-empty"),
             )
             .unwrap();
@@ -2595,7 +2992,7 @@ mod tests {
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &downstream).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &downstream, true, &[], &[])
+            .validate_evaluated_config(parsed, &downstream, true, &[])
             .unwrap();
 
         run_state_refresh_locked(
@@ -2617,7 +3014,7 @@ mod tests {
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &base_dir, true, &[], &[])
+            .validate_evaluated_config(parsed, &base_dir, true, &[])
             .unwrap();
 
         run_state_refresh_locked(
@@ -2639,7 +3036,7 @@ mod tests {
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &base_dir, true, &[], &[])
+            .validate_evaluated_config(parsed, &base_dir, true, &[])
             .unwrap();
 
         run_state_refresh_locked(
@@ -2832,16 +3229,30 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             let reads = self.reads.clone();
             Box::pin(async move {
-                Ok(Box::new(ModuleConstraintRefreshProvider { reads }) as Box<dyn Provider>)
+                Ok(carina_core::provider::InitializeOutcome::unavailable()
+                    .with_provider(Box::new(ModuleConstraintRefreshProvider { reads })))
             })
         }
 
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
+        }
+
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
-            let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
-                vec![ResourceSchema::new("lookup").as_data_source()];
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = vec![
+                ResourceSchema::new("test.resource"),
+                ResourceSchema::new("orphan"),
+                ResourceSchema::new("lookup").as_data_source(),
+            ];
             schema_drafts
                 .into_iter()
                 .map(|schema| {
@@ -2956,20 +3367,33 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             let reads = self.reads.clone();
             let trigger = self.trigger.clone();
             Box::pin(async move {
                 Ok(
-                    Box::new(CancellingDataSourceRefreshProvider { reads, trigger })
-                        as Box<dyn Provider>,
+                    carina_core::provider::InitializeOutcome::unavailable().with_provider(
+                        Box::new(CancellingDataSourceRefreshProvider { reads, trigger }),
+                    ),
                 )
             })
         }
 
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
+        }
+
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
-            let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
-                vec![ResourceSchema::new("lookup").as_data_source()];
+            let schema_drafts: Vec<carina_core::schema::ResourceSchema> = vec![
+                ResourceSchema::new("test.resource"),
+                ResourceSchema::new("lookup").as_data_source(),
+            ];
             schema_drafts
                 .into_iter()
                 .map(|schema| {
@@ -3286,6 +3710,225 @@ mod tests {
             "State is locked by another process (lock ID: lock-123, operation: apply)\n\
              If you believe this is stale, run: `carina force-unlock lock-123 infra/foo`"
         );
+    }
+
+    fn outcome_unknown_state_fixture() -> StateFile {
+        carina_state::check_and_migrate(
+            &serde_json::json!({
+                "version": StateFile::CURRENT_VERSION,
+                "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+                "serial": 4,
+                "lineage": "state-forget-test",
+                "carina_version": "test",
+                "resources": [{
+                    "resource_type": "test.Resource",
+                    "identity": "unknown",
+                    "provider": "mock",
+                    "current": {
+                        "kind": "create_outcome_unknown",
+                        "started_at": "2026-10-30T03:00:00Z"
+                    }
+                }],
+                "exports": {}
+            })
+            .to_string(),
+        )
+        .expect("outcome-unknown fixture must decode")
+        .into_state()
+    }
+
+    fn outcome_unknown_state_with_deposed_fixture() -> StateFile {
+        carina_state::check_and_migrate(
+            &serde_json::json!({
+                "version": StateFile::CURRENT_VERSION,
+                "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+                "serial": 4,
+                "lineage": "state-forget-deposed-test",
+                "carina_version": "test",
+                "resources": [{
+                    "resource_type": "test.Resource",
+                    "identity": "unknown",
+                    "provider": "mock",
+                    "current": {
+                        "kind": "create_outcome_unknown",
+                        "started_at": "2026-10-30T03:00:00Z"
+                    },
+                    "deposed": [{
+                        "key": "00000000-0000-4000-8000-000000000001",
+                        "identifier": "old-id",
+                        "attributes": {},
+                        "dependency_bindings": []
+                    }]
+                }],
+                "exports": {}
+            })
+            .to_string(),
+        )
+        .expect("outcome-unknown fixture with deposed generation must decode")
+        .into_state()
+    }
+
+    #[test]
+    fn state_forget_prompt_lists_deposed_generations_that_remain_tracked() {
+        let mut state = outcome_unknown_state_with_deposed_fixture();
+        let address = StateBlockAddress::new("mock", "test.Resource", "unknown");
+        let row = state
+            .find_outcome_unknown(&address)
+            .expect("the fixture must select its outcome-unknown row");
+
+        let prompt = format_state_forget_target(&address, row.resource());
+
+        assert!(prompt.contains("Deposed generations that will remain tracked"));
+        assert!(prompt.contains("identifier `old-id`"));
+        assert!(prompt.contains("generation `00000000-0000-4000-8000-000000000001`"));
+    }
+
+    fn state_forget_fixture(state: &StateFile) -> CancellationFixtureBase {
+        let fixture = CancellationFixtureBase::new();
+        fixture.write_crn(format!(
+            "backend local {{ path = \"{}\" }}\n",
+            fixture.state_path().display()
+        ));
+        fixture.write_backend_lock();
+        fixture.write_state(state);
+        fixture
+    }
+
+    #[tokio::test]
+    async fn state_forget_removes_and_persists_only_outcome_unknown_row() {
+        let fixture = state_forget_fixture(&outcome_unknown_state_fixture());
+
+        run_state_forget(
+            "mock.test.Resource",
+            "unknown",
+            true,
+            fixture.config_path(),
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect("outcome-unknown row may be forgotten");
+
+        let persisted = fixture.read_state().await;
+        assert!(persisted.resources().is_empty());
+        assert_eq!(persisted.serial, 5);
+    }
+
+    #[tokio::test]
+    async fn state_forget_keeps_deposed_generation_and_next_plan_deletes_it() {
+        let fixture = state_forget_fixture(&outcome_unknown_state_with_deposed_fixture());
+
+        run_state_forget(
+            "mock.test.Resource",
+            "unknown",
+            true,
+            fixture.config_path(),
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect("the outcome-unknown current instance may be forgotten");
+
+        let persisted = fixture.read_state().await;
+        let row = persisted
+            .resources()
+            .first()
+            .expect("the deposed-only shell must remain persisted");
+        assert!(matches!(row.current(), carina_state::CurrentInstance::None));
+        assert_eq!(row.deposed.len(), 1);
+
+        let mut plan = Plan::new();
+        crate::wiring::add_deposed_delete_effects(&mut plan, &Some(persisted), &[]);
+        assert!(matches!(
+            plan.effects(),
+            [Effect::Delete {
+                identifier,
+                generation: carina_core::effect::EffectGeneration::Deposed(_),
+                ..
+            }] if identifier.as_str() == "old-id"
+        ));
+    }
+
+    #[tokio::test]
+    async fn state_forget_rejects_normal_row_with_typed_removed_guidance() {
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(
+                ResourceState::try_applied("test.Resource", "normal", "mock", "provider-id")
+                    .expect("fixture identifier is non-empty"),
+            )
+            .expect("normal fixture row is valid");
+        let fixture = state_forget_fixture(&state);
+
+        let error = run_state_forget(
+            "mock.test.Resource",
+            "normal",
+            true,
+            fixture.config_path(),
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect_err("ordinary rows cannot be forgotten");
+
+        assert!(matches!(&error, AppError::StateForget(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("removed { from = mock.test.Resource 'normal' }")
+        );
+        assert_eq!(fixture.read_state().await.resources().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn state_forget_reports_lock_contention_like_other_locked_commands() {
+        let fixture = state_forget_fixture(&outcome_unknown_state_fixture());
+        let backend = fixture.backend_handle();
+        let held = backend
+            .acquire_lock("apply")
+            .await
+            .expect("hold fixture lock");
+
+        let error = run_state_forget(
+            "mock.test.Resource",
+            "unknown",
+            true,
+            fixture.config_path(),
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect_err("held lock must reject state forget");
+
+        assert!(matches!(error, AppError::Config(_)));
+        assert!(error.to_string().contains("State is locked by"));
+        assert!(error.to_string().contains("operation: apply"));
+        assert_eq!(fixture.read_state().await.resources().len(), 1);
+        backend
+            .release_lock(&held)
+            .await
+            .expect("release fixture lock");
+    }
+
+    #[tokio::test]
+    async fn state_forget_confirmation_requires_yes_and_auto_approve_skips_input() {
+        let cancelled = confirm_state_forget(
+            tokio::io::BufReader::new("no\n".as_bytes()),
+            ShutdownToken::running(),
+            false,
+        )
+        .await
+        .expect("confirmation input is readable");
+        assert_eq!(cancelled, StateForgetConfirmation::Cancelled);
+
+        let confirmed = confirm_state_forget(
+            tokio::io::BufReader::new(tokio::io::empty()),
+            ShutdownToken::running(),
+            true,
+        )
+        .await
+        .expect("auto approve does not read input");
+        assert_eq!(confirmed, StateForgetConfirmation::Confirmed);
     }
 
     #[derive(Default)]
@@ -3636,10 +4279,13 @@ mod tests {
             Current::from_state(
                 State::existing(
                     source.id.clone(),
-                    HashMap::from([(
-                        "items".to_string(),
-                        Value::Concrete(ConcreteValue::List(vec![string_value("widget-1")])),
-                    )]),
+                    HashMap::from([
+                        ("name".to_string(), string_value("source")),
+                        (
+                            "items".to_string(),
+                            Value::Concrete(ConcreteValue::List(vec![string_value("widget-1")])),
+                        ),
+                    ]),
                 )
                 .with_identifier("source-id"),
             ),
@@ -3667,6 +4313,23 @@ mod tests {
             .expect("schema fixture must be valid");
         let mut schemas = SchemaRegistry::new();
         schemas.insert("aws", widget_schema.clone());
+
+        let source_schema = ResourceSchema::new("service.Source")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "items",
+                    AttributeType::list(AttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("source schema fixture must be valid");
+        schemas.insert("aws", source_schema.clone());
 
         let preview = crate::wiring::expand_same_config_deferred_for(
             &parsed,
@@ -3749,11 +4412,20 @@ mod tests {
             parsed,
             Vec::new(),
             &[],
-            [("aws".to_string(), widget_schema)],
+            [
+                ("aws".to_string(), source_schema),
+                ("aws".to_string(), widget_schema),
+            ],
         );
+        let (_comparison_schemas, comparison_provider) =
+            carina_core::provider::comparison_fixture_for_test(
+                &schemas,
+                preview.sorted_resources.iter().map(|resource| &resource.id),
+            );
         validated_config
             .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
                 provider: &provider,
+                comparison_provider: &comparison_provider,
                 expansion: &mut prepared_expansion,
                 warning_policy: crate::wiring::DeferredForWarningPolicy::Suppress,
                 remote_bindings: &HashMap::new(),
@@ -4122,8 +4794,15 @@ mod tests {
             Some("pending-id"),
             Sent::AllRequestAttributes,
         );
-        let mut row = ResourceState::from_in_flight(&resource, &pending, None, None, None)
-            .expect("in-flight fixture must be encodable");
+        let mut row = ResourceState::from_in_flight(
+            &resource,
+            &pending,
+            None,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        )
+        .expect("in-flight fixture must be encodable");
         row.binding = Some("pending".to_string());
         let mut state = StateFile::new();
         state
@@ -4938,7 +5617,9 @@ mod tests {
             prevent_destroy: true,
             depends_on: vec!["security_group".to_string()],
             provider_instance: Some("west".to_string()),
-        };
+            ignore_changes: Vec::new(),
+        }
+        .into();
         row.prefixes = HashMap::from([("name".to_string(), "prod-".to_string())]);
         row.protected = true;
         row.name_overrides.insert(
@@ -5017,6 +5698,7 @@ mod tests {
                 prevent_destroy: true,
                 depends_on: vec!["security_group".to_string()],
                 provider_instance: Some("west".to_string()),
+                ignore_changes: Vec::new(),
             }
         );
         assert_eq!(
@@ -5051,7 +5733,7 @@ mod tests {
 
         let desired_ids = HashSet::new();
         let orphans = state.build_orphans(&desired_ids).into_plan_orphans();
-        let plan = carina_core::differ::create_plan(
+        let plan = carina_core::differ::create_plan_for_test(
             &[],
             &[],
             &carina_core::provider::ProviderRouter::new(),
@@ -5189,6 +5871,7 @@ mod tests {
                 schemas
                     .get_for(&desired)
                     .map(|schema| schema.schema().as_schema()),
+                &carina_core::differ::exact_comparison_context_for_tests(),
             ),
             Diff::NoChange(_)
         ));
@@ -5285,6 +5968,7 @@ mod tests {
             schemas
                 .get_for(&desired)
                 .map(|schema| schema.schema().as_schema()),
+            &carina_core::differ::exact_comparison_context_for_tests(),
         )
         else {
             panic!("refresh must preserve the pending tags removal");
@@ -5317,6 +6001,7 @@ mod tests {
             None,
             RowBasis::Applied(&accepted_create),
             None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
         )
         .expect("accepted create should establish the original authoring tree");
         let mut prior_state = StateFile::new();
@@ -5332,6 +6017,7 @@ mod tests {
             &prior_saved,
             Some(&prior.explicit),
             None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
         )
         else {
             panic!("the Applied row must initially plan the nested removal");
@@ -5347,6 +6033,7 @@ mod tests {
             None,
             RowBasis::Carried,
             None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
         )
         .expect("failed update should carry provider state");
         let mut refreshed_state = StateFile::new();
@@ -5376,7 +6063,14 @@ mod tests {
             .build_saved_attrs()
             .lift(&SchemaRegistry::new());
         (
-            diff(&desired, &provider_state, &saved, Some(&explicit), None),
+            diff(
+                &desired,
+                &provider_state,
+                &saved,
+                Some(&explicit),
+                None,
+                &carina_core::differ::exact_comparison_context_for_tests(),
+            ),
             explicit,
         )
     }

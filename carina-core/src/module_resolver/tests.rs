@@ -14,8 +14,9 @@ use indexmap::IndexMap;
 use super::resolver::ModuleResolver;
 use super::*;
 use crate::parser::{
-    ArgumentOrigin, ArgumentParameter, AttributePathSegment, BindingUseOwner, ModuleArgument,
-    ModuleCall, ParsedFile, ProviderContext, TypeExpr,
+    ArgumentOrigin, ArgumentParameter, AttributePathSegment, BindingUseOwner,
+    LoadedProviderContext, ModuleArgument, ModuleCall, ParsedFile, ProviderContext,
+    ResourceTypePath, TypeExpr,
 };
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, RawEnumIdentifier, Resource,
@@ -23,8 +24,19 @@ use crate::resource::{
 };
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
 
+fn known(type_expr: TypeExpr) -> TypeExpr {
+    type_expr
+}
+
+fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType {
+    crate::validation::resolve_consumer_static_type_for_signature(
+        &type_expr,
+        &ProviderContext::default(),
+    )
+}
+
 fn resolve_modules(parsed: &mut ParsedFile, base_dir: &std::path::Path) -> Result<(), ModuleError> {
-    super::resolve_modules(parsed, base_dir)
+    super::resolve_modules_providerless(parsed, base_dir)
 }
 
 fn resolve_modules_with_config(
@@ -33,7 +45,7 @@ fn resolve_modules_with_config(
     config: &ProviderContext,
     schemas: &crate::schema::SchemaRegistry,
 ) -> Result<(), ModuleError> {
-    super::resolve_modules_with_config(parsed, base_dir, config, schemas)
+    super::resolve_modules_with_providerless_config(parsed, base_dir, config, schemas)
 }
 
 fn reconcile_anonymous_module_instances(
@@ -325,22 +337,45 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
     );
 
     let claims = crate::identifier::StateBlockClaims::empty();
-    let state_entry = crate::identifier::AnonymousIdStateInfo {
-        name: "_for0[0]._for0[0]".to_string(),
-        provider_instance: None,
-        create_only_values: HashMap::from([("name".to_string(), "inner".to_string())]),
-    };
+    let state_entry = crate::identifier::AnonymousIdStateInfo::try_from_state_attributes(
+        crate::resource::ResolvedResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            ResourceIdentity::new("_for0[0]._for0[0]"),
+            None,
+        ),
+        None,
+        registry
+            .get("mock", "test.resource", crate::schema::SchemaKind::Resource)
+            .expect("state fixture schema")
+            .schema(),
+        &HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("inner".into())),
+        )]),
+    )
+    .expect("state fixture has a valid resolved address");
+    let (_, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        &registry,
+        parsed.iter_all_resources().map(|resource| resource.id()),
+    );
     let moves = crate::identifier::detect_legacy_loop_address_moves(
         &parsed.resources,
         &registry,
+        &comparison_provider,
         &|provider, resource_type| {
-            claims.screen_entries(provider, resource_type, [state_entry.clone()], |entry| {
-                entry.name.as_str()
-            })
+            claims.screen_entries(
+                provider,
+                resource_type,
+                [state_entry.clone()],
+                crate::identifier::AnonymousIdStateInfo::name,
+            )
         },
+        &|_binding| Vec::new(),
         &claims,
         &[],
-    );
+    )
+    .expect("legacy-loop comparison fixture must resolve");
     assert_eq!(
         moves.len(),
         1,
@@ -375,7 +410,7 @@ fn resolver_error_from_parsed_call_retains_call_identity() {
         "fixture must pin the authored call range",
     );
 
-    let error = super::resolve_modules_with_config(
+    let error = super::resolve_modules_with_providerless_config(
         &mut parsed,
         base.path(),
         &ProviderContext::default(),
@@ -413,6 +448,7 @@ fn create_test_module() -> ParsedFile {
                 attrs.into_iter().collect()
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
@@ -427,14 +463,14 @@ fn create_test_module() -> ParsedFile {
         arguments: vec![
             ArgumentParameter {
                 name: "vpc_id".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: known(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "enable_flag".to_string(),
-                type_expr: TypeExpr::Bool,
+                static_type: known(TypeExpr::Bool),
                 default: Some(Value::Concrete(ConcreteValue::Bool(true))),
                 description: None,
                 validations: Vec::new(),
@@ -557,6 +593,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
                 attrs
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
@@ -748,6 +785,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
                 provider_instance: Some("us".to_string()),
                 ..Directives::default()
             },
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".to_string()),
             dependency_bindings: BTreeSet::new(),
@@ -850,6 +888,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
             provider_instance: Some("us".to_string()),
             ..Directives::default()
         },
+        resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding: Some(format!("{}.role", current_prefix)),
         dependency_bindings: BTreeSet::new(),
@@ -909,6 +948,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                     attrs.into_iter().collect()
                 },
                 directives: Directives::default(),
+                resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: Some("vpc".to_string()),
                 dependency_bindings: BTreeSet::new(),
@@ -928,6 +968,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                     attrs.into_iter().collect()
                 },
                 directives: Directives::default(),
+                resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: Some("subnet".to_string()),
                 dependency_bindings: BTreeSet::new(),
@@ -942,7 +983,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "cidr".to_string(),
-            type_expr: TypeExpr::String,
+            static_type: known(TypeExpr::String),
             default: None,
             description: None,
             validations: Vec::new(),
@@ -1071,6 +1112,7 @@ fn create_module_with_attributes() -> ParsedFile {
                 attrs.into_iter().collect()
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("sg".to_string()),
             dependency_bindings: BTreeSet::new(),
@@ -1386,14 +1428,14 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         arguments: vec![
             ArgumentParameter {
                 name: "region".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: known(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: vec![],
             },
             ArgumentParameter {
                 name: "instance_count".to_string(),
-                type_expr: TypeExpr::Int,
+                static_type: known(TypeExpr::Int),
                 default: None,
                 description: None,
                 validations: vec![],
@@ -1474,7 +1516,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
             .signature
             .arguments
             .get("region")
-            .map(|argument| argument.declared_type()),
+            .and_then(|argument| argument.declared_type().known()),
         Some(&TypeExpr::String),
         "the declared sink type must travel with the argument value",
     );
@@ -1877,7 +1919,7 @@ thing { name = 'after-edit' }
                 "role_name".to_string(),
                 vec![],
             ),
-            TypeExpr::String,
+            consumer_type(TypeExpr::String),
             ArgumentOrigin::Defaulted,
         ),
     );
@@ -2445,6 +2487,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
                 attrs.into_iter().collect()
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("distribution".to_string()),
             dependency_bindings: BTreeSet::new(),
@@ -2742,6 +2785,7 @@ fn create_module_with_interpolation() -> ParsedFile {
                 attrs.into_iter().collect()
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("vpc".to_string()),
             dependency_bindings: BTreeSet::new(),
@@ -2756,14 +2800,14 @@ fn create_module_with_interpolation() -> ParsedFile {
         arguments: vec![
             ArgumentParameter {
                 name: "cidr_block".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: known(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "env_name".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: known(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -3372,7 +3416,7 @@ fn create_module_with_port_validation() -> ParsedFile {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "port".to_string(),
-            type_expr: TypeExpr::Int,
+            static_type: known(TypeExpr::Int),
             default: Some(Value::Concrete(ConcreteValue::Int(8080))),
             description: Some("Web server port".to_string()),
             validations: vec![ValidationBlock::dummy(
@@ -3440,7 +3484,7 @@ fn test_argument_validation_with_resource_reference_is_pending() {
     use crate::parser::{CompareOp, ValidateExpr, ValidationBlock};
 
     let mut module = create_module_with_port_validation();
-    module.arguments[0].type_expr = TypeExpr::String;
+    module.arguments[0].static_type = known(TypeExpr::String);
     module.arguments[0].validations = vec![ValidationBlock::dummy(
         ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::FunctionCall {
@@ -3525,7 +3569,7 @@ let root = outer { outer_port = producer.port }
                     Value::Deferred(DeferredValue::BindingRef {
                         binding: "outer_port".to_string(),
                     }),
-                    TypeExpr::String,
+                    consumer_type(TypeExpr::String),
                     ArgumentOrigin::Defaulted,
                 ),
             )]),
@@ -3560,7 +3604,7 @@ let root = outer { outer_port = producer.port }
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "outer_port".to_string(),
-            type_expr: TypeExpr::String,
+            static_type: known(TypeExpr::String),
             default: None,
             description: None,
             validations: vec![],
@@ -3740,7 +3784,7 @@ fn test_argument_validation_no_message_uses_default() {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "count".to_string(),
-            type_expr: TypeExpr::Int,
+            static_type: known(TypeExpr::Int),
             default: None,
             description: None,
             validations: vec![ValidationBlock::dummy(
@@ -3804,7 +3848,7 @@ fn test_argument_validation_len_with_list() {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "tags".to_string(),
-            type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+            static_type: known(TypeExpr::List(Box::new(TypeExpr::String))),
             default: None,
             description: None,
             validations: vec![ValidationBlock::dummy(
@@ -3888,14 +3932,14 @@ fn test_require_block_passes() {
         arguments: vec![
             ArgumentParameter {
                 name: "enable_https".to_string(),
-                type_expr: TypeExpr::Bool,
+                static_type: known(TypeExpr::Bool),
                 default: Some(Value::Concrete(ConcreteValue::Bool(true))),
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "cert_arn".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: known(TypeExpr::String),
                 default: Some(Value::Concrete(ConcreteValue::String(
                     "arn:aws:acm:us-east-1:123:cert/abc".into(),
                 ))),
@@ -3970,14 +4014,14 @@ fn test_require_block_fails_with_not_expr() {
         arguments: vec![
             ArgumentParameter {
                 name: "enable_https".to_string(),
-                type_expr: TypeExpr::Bool,
+                static_type: known(TypeExpr::Bool),
                 default: Some(Value::Concrete(ConcreteValue::Bool(true))),
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "has_cert".to_string(),
-                type_expr: TypeExpr::Bool,
+                static_type: known(TypeExpr::Bool),
                 default: Some(Value::Concrete(ConcreteValue::Bool(false))),
                 description: None,
                 validations: Vec::new(),
@@ -4051,7 +4095,7 @@ fn test_require_block_len_function() {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "subnet_ids".to_string(),
-            type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+            static_type: known(TypeExpr::List(Box::new(TypeExpr::String))),
             default: None,
             description: None,
             validations: Vec::new(),
@@ -4139,14 +4183,14 @@ fn test_require_block_multiple_constraints() {
         arguments: vec![
             ArgumentParameter {
                 name: "min_size".to_string(),
-                type_expr: TypeExpr::Int,
+                static_type: known(TypeExpr::Int),
                 default: None,
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "max_size".to_string(),
-                type_expr: TypeExpr::Int,
+                static_type: known(TypeExpr::Int),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -4306,11 +4350,11 @@ fn test_argument_type_mismatch_string_for_bool() {
 
 #[test]
 fn test_argument_type_custom_validator() {
-    // Create a ProviderContext with a custom "arn" validator
+    // Create a loaded ProviderContext with a custom "arn" validator
     let identity = TypeIdentity::bare("Arn");
     let owned = crate::parser::OwnedTypeIdentity::provider("test", identity.clone());
     let validator_identity = identity.clone();
-    let config = ProviderContext {
+    let config = LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([owned.clone()]),
             Box::new(move |target, value| {
@@ -4335,19 +4379,20 @@ fn test_argument_type_custom_validator() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "policy_arn".to_string(),
-        type_expr: TypeExpr::SchemaType { owned },
+        static_type: known(TypeExpr::SchemaType { owned }),
         default: None,
         description: None,
         validations: Vec::new(),
     }];
 
+    let schemas = crate::schema::SchemaRegistry::new();
     let resolver = {
-        let mut r = ModuleResolver::with_config(".", &config);
+        let mut r = ModuleResolver::with_config_and_schemas(".", &config, &schemas);
         r.imported_modules.insert("test_module".to_string(), module);
         r
     };
@@ -4392,7 +4437,7 @@ fn test_argument_type_list_of_custom_type() {
     let identity = TypeIdentity::bare("Arn");
     let owned = crate::parser::OwnedTypeIdentity::provider("test", identity.clone());
     let validator_identity = identity.clone();
-    let config = ProviderContext {
+    let config = LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([owned.clone()]),
             Box::new(move |target, value| {
@@ -4417,19 +4462,20 @@ fn test_argument_type_list_of_custom_type() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "policy_arns".to_string(),
-        type_expr: TypeExpr::List(Box::new(TypeExpr::SchemaType { owned })),
+        static_type: known(TypeExpr::List(Box::new(TypeExpr::SchemaType { owned }))),
         default: None,
         description: None,
         validations: Vec::new(),
     }];
 
+    let schemas = crate::schema::SchemaRegistry::new();
     let resolver = {
-        let mut r = ModuleResolver::with_config(".", &config);
+        let mut r = ModuleResolver::with_config_and_schemas(".", &config, &schemas);
         r.imported_modules.insert("test_module".to_string(), module);
         r
     };
@@ -5981,10 +6027,10 @@ fn create_module_with_environment_union() -> ParsedFile {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "environment".to_string(),
-            type_expr: TypeExpr::Union(vec![
+            static_type: known(TypeExpr::Union(vec![
                 TypeExpr::StringLiteral("dev".to_string()),
                 TypeExpr::StringLiteral("prod".to_string()),
-            ]),
+            ])),
             default: Some(Value::Concrete(ConcreteValue::String("dev".into()))),
             description: None,
             validations: Vec::new(),
@@ -6262,6 +6308,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             id: ResourceId::with_identity("acm.Certificate", "cert"),
             attributes: HashMap::new().into_iter().collect(),
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".to_string()),
             dependency_bindings: BTreeSet::new(),
@@ -6300,6 +6347,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                     a
                 },
                 directives: Directives::default(),
+                resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: None,
                 dependency_bindings: BTreeSet::new(),
@@ -6480,6 +6528,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                 id: ResourceId::with_identity("sso.Assignment", "placeholder"),
                 attributes: HashMap::new().into_iter().collect(),
                 directives: Directives::default(),
+                resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: None,
                 dependency_bindings: BTreeSet::new(),
@@ -6893,7 +6942,9 @@ fn argument_type_list_accepts_resource_ref() {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "role_arns".to_string(),
-        type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("arn".to_string()))),
+        static_type: known(TypeExpr::List(Box::new(TypeExpr::Simple(
+            "arn".to_string(),
+        )))),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -6931,7 +6982,7 @@ fn argument_type_map_accepts_resource_ref() {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "tags".to_string(),
-        type_expr: TypeExpr::Map(Box::new(TypeExpr::String)),
+        static_type: known(TypeExpr::Map(Box::new(TypeExpr::String))),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -6968,9 +7019,9 @@ fn argument_type_struct_accepts_resource_ref() {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "options".to_string(),
-        type_expr: TypeExpr::Struct {
+        static_type: known(TypeExpr::Struct {
             fields: vec![("name".to_string(), TypeExpr::String)],
-        },
+        }),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -7004,7 +7055,7 @@ fn argument_type_int_accepts_resource_ref_for_later_ref_type_validation() {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "count".to_string(),
-        type_expr: TypeExpr::Int,
+        static_type: known(TypeExpr::Int),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -7140,7 +7191,7 @@ fn module_argument_type_error_with_config(
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: arg_name.to_string(),
-        type_expr,
+        static_type: known(type_expr),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -7303,10 +7354,10 @@ fn binding_ref_argument_defers_to_binding_index() {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: "environment".to_string(),
-        type_expr: TypeExpr::Union(vec![
+        static_type: known(TypeExpr::Union(vec![
             TypeExpr::StringLiteral("dev".to_string()),
             TypeExpr::StringLiteral("prod".to_string()),
-        ]),
+        ])),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -7514,10 +7565,46 @@ fn resolved_module_signature_groups_all_owners_of_a_dotted_annotation() {
     .expect("module signature fixture must parse");
 
     let signature = super::signature::resolved_signature(&parsed, &context);
-    let resolved = &signature.arguments[0].type_expr;
+    let resolved = &signature.arguments[0].static_type;
 
     assert!(
-        matches!(resolved, TypeExpr::List(inner) if matches!(inner.as_ref(), TypeExpr::SchemaType { .. })),
+        matches!(
+            resolved,
+            crate::static_type::StaticType::Known(resolved)
+                if matches!(resolved.type_expr(), TypeExpr::List(inner)
+                    if matches!(inner.as_ref(), TypeExpr::SchemaType { .. }))
+        ),
         "module signatures must not retain DottedUnresolved for a known shared identity: {resolved:?}"
+    );
+}
+
+#[test]
+fn resolved_module_signature_preserves_unresolvable_attribute_type_for_best_effort_snapshot() {
+    let parsed = crate::parser::parse(
+        "attributes {\n  out: missing.types.Identifier = 'value'\n}\n",
+        &ProviderContext::default(),
+    )
+    .expect("module signature fixture must parse");
+
+    let signature = super::signature::resolved_signature(&parsed, &ProviderContext::default());
+    let static_type = signature.attributes["out"]
+        .as_ref()
+        .expect("declared attribute type");
+
+    assert!(
+        matches!(
+            static_type,
+            crate::static_type::StaticType::Unchecked(reason)
+                if reason.original()
+                    == &TypeExpr::DottedUnresolved(ResourceTypePath::new(
+                        "missing",
+                        "types.Identifier",
+                    ))
+                    && matches!(
+                        reason.resolution_error(),
+                        crate::static_type::StaticTypeResolutionError::UnknownCustomType { .. }
+                    )
+        ),
+        "best-effort module signature must retain the typed unchecked reason: {static_type:?}",
     );
 }

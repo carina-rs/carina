@@ -64,8 +64,12 @@ impl ProviderFactory for AwsccTestFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-        Box::pin(async { Ok(Box::new(NoopProvider) as Box<dyn Provider>) })
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(NoopProvider)))
+        })
     }
     fn create_normalizer(
         &self,
@@ -74,6 +78,15 @@ impl ProviderFactory for AwsccTestFactory {
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let schema_drafts: Vec<carina_core::schema::ResourceSchema> =
             vec![role_schema(), role_policy_schema()];
@@ -300,7 +313,7 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
     // Drive it explicitly here so the post-expansion shape (RolePolicy
     // in `resources`, `_virtual.bs.bootstrap` in `compositions`)
     // is in place for the assertion below.
-    carina_core::module_resolver::resolve_modules_with_config(
+    carina_core::module_resolver::resolve_modules_with_providerless_config(
         &mut parsed,
         &caller,
         &provider_context,

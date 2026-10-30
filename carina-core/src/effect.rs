@@ -20,10 +20,11 @@ use crate::non_empty::NonEmptyVec;
 use crate::parser::{DeferredForExpression, MovedAddresses, StateBlockAddress};
 use crate::provider::AppliedIdentifier;
 #[cfg(test)]
-use crate::resource::{DataSource, DeferredValue, Resource};
+use crate::resource::{DataSource, DeferredValue};
 use crate::resource::{
     DeposedKey, Directives, LoopElementOrigin, ModuleSource, ResolvedDataSource, ResolvedResource,
-    ResolvedResourceId, ResourceId, ResourceIdentity, SavedModuleSource, State, Value,
+    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, SavedModuleSource, State, Value,
+    resolve_resource_ignore_changes,
 };
 use crate::schema::FieldName;
 use crate::wait::ManagedWaitTarget;
@@ -74,6 +75,24 @@ pub enum EffectGeneration {
 impl EffectGeneration {
     pub fn is_current(&self) -> bool {
         matches!(self, Self::Current)
+    }
+}
+
+/// Typed evidence that an import effect replaces the same full resource ID's
+/// protected create-outcome-unknown current instance.
+///
+/// The private field prevents callers from turning an arbitrary
+/// [`ResourceId`] into differ authorization. The only minting function is
+/// [`EffectWithSource::import_replacing_outcome_unknown`], which returns this
+/// witness together with the matching [`Effect::Import`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OutcomeUnknownImportReplacement {
+    id: ResolvedResourceId,
+}
+
+impl OutcomeUnknownImportReplacement {
+    pub fn resource_id(&self) -> &ResourceId {
+        self.id.as_inner()
     }
 }
 
@@ -495,7 +514,10 @@ impl MoveAuthority<'_> {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedMove {
-    from: ResolvedResourceId,
+    /// Persisted row that originally owned the state being moved.
+    origin: ResolvedResourceId,
+    /// Effective source address after any move already applied in this plan.
+    projected_from: ResolvedResourceId,
     to: ResolvedResourceId,
 }
 
@@ -534,19 +556,45 @@ impl ResolvedMove {
                 declared_to: Box::new(declared_to),
             });
         }
-        Ok(Self { from, to })
+        Ok(Self {
+            origin: from.clone(),
+            projected_from: from,
+            to,
+        })
     }
 
-    pub(crate) fn from_detected_rename(from: ResolvedResourceId, to: ResolvedResourceId) -> Self {
-        Self { from, to }
+    /// Build an automatically detected move while retaining its persisted
+    /// origin and current in-memory projection as separate addresses.
+    pub(crate) fn from_detected_rename(
+        origin: ResolvedResourceId,
+        projected_from: ResolvedResourceId,
+        to: ResolvedResourceId,
+    ) -> Self {
+        Self {
+            origin,
+            projected_from,
+            to,
+        }
     }
 
     fn matches_address(resolved: &ResolvedResourceId, declared: &StateBlockAddress) -> bool {
         declared.matches_resource_id(resolved.as_inner())
     }
 
+    /// Persisted row that owns this move.
+    ///
+    /// Effects and saved move pairs use this address even when state has
+    /// already been projected through an earlier move in the same plan.
     pub fn from(&self) -> &ResolvedResourceId {
-        &self.from
+        &self.origin
+    }
+
+    /// Effective source address from which in-memory state must be transferred.
+    ///
+    /// This differs from [`Self::from`] when a persisted row has already been
+    /// projected through an earlier move in the same plan.
+    pub fn projected_from(&self) -> &ResolvedResourceId {
+        &self.projected_from
     }
 
     pub fn to(&self) -> &ResolvedResourceId {
@@ -555,18 +603,19 @@ impl ResolvedMove {
 
     pub fn authority(&self) -> MoveAuthority<'_> {
         MoveAuthority {
-            from: &self.from,
+            from: &self.projected_from,
             to: &self.to,
         }
     }
 
+    /// Consume the move as the persisted origin-to-final-destination pair.
     pub fn into_parts(self) -> (ResolvedResourceId, ResolvedResourceId) {
-        (self.from, self.to)
+        (self.origin, self.to)
     }
 
     pub fn into_effect(self) -> Effect {
         Effect::Move {
-            from: self.from,
+            from: self.origin,
             to: self.to,
             origin: None,
         }
@@ -741,6 +790,297 @@ pub enum EffectWithSource<S> {
 
 pub type Effect<S = ModuleSource> = EffectWithSource<S>;
 pub type SavedEffect = EffectWithSource<SavedModuleSource>;
+
+/// Saved-plan effect payload before authored resource directives have been
+/// resolved against the fingerprint-checked provider schemas.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum UnresolvedSavedEffect {
+    Read {
+        resource: ResolvedDataSource<SavedModuleSource>,
+    },
+    Create(Resource<SavedModuleSource>),
+    ResumeCreate {
+        resource: Resource<SavedModuleSource>,
+        started_at: crate::provider::Timestamp,
+    },
+    Update {
+        from: Box<State>,
+        identifier: AppliedIdentifier,
+        to: Resource<SavedModuleSource>,
+        changed_attributes: Vec<String>,
+    },
+    Delete {
+        id: ResolvedResourceId,
+        identifier: AppliedIdentifier,
+        #[serde(default, skip_serializing_if = "EffectGeneration::is_current")]
+        generation: EffectGeneration,
+        #[serde(default)]
+        directives: Directives,
+        #[serde(default)]
+        binding: Option<String>,
+        #[serde(default)]
+        dependencies: HashSet<String>,
+        #[serde(default)]
+        explicit_dependencies: HashSet<String>,
+        #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+        blocked_by_updates: HashSet<ResourceIdentity>,
+    },
+    Import {
+        id: ResolvedResourceId,
+        identifier: crate::resource::Value,
+    },
+    Remove {
+        id: ResolvedResourceId,
+    },
+    Move {
+        from: ResolvedResourceId,
+        to: ResolvedResourceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<LoopElementOrigin>,
+    },
+    ReleaseListKeys {
+        id: ResolvedResourceId,
+        attribute: String,
+        key_field: FieldName,
+        keys: ReleasedListKeys,
+    },
+    Wait {
+        identity: ResourceIdentity,
+        target_id: ManagedWaitTarget,
+        until: WaitPredicate,
+        until_surface: String,
+        #[serde(with = "crate::resource::duration_secs")]
+        timeout: std::time::Duration,
+        #[serde(with = "crate::resource::duration_secs")]
+        interval: std::time::Duration,
+        #[serde(default)]
+        explicit_dependencies: HashSet<String>,
+    },
+    DeferredCreate {
+        id: ResolvedResourceId,
+        template: Box<DeferredForExpression<SavedModuleSource>>,
+    },
+    DeferredReplace(Box<DeferredReplacePayload<SavedModuleSource>>),
+}
+
+impl From<SavedEffect> for UnresolvedSavedEffect {
+    fn from(effect: SavedEffect) -> Self {
+        match effect {
+            Effect::Read { resource } => Self::Read { resource },
+            Effect::Create(resource) => Self::Create(resource.into_inner()),
+            Effect::ResumeCreate {
+                resource,
+                started_at,
+            } => Self::ResumeCreate {
+                resource: resource.into_inner(),
+                started_at,
+            },
+            Effect::Update {
+                from,
+                identifier,
+                to,
+                changed_attributes,
+            } => Self::Update {
+                from,
+                identifier,
+                to: to.into_inner(),
+                changed_attributes,
+            },
+            Effect::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            } => Self::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            },
+            Effect::Import { id, identifier } => Self::Import { id, identifier },
+            Effect::Remove { id } => Self::Remove { id },
+            Effect::Move { from, to, origin } => Self::Move { from, to, origin },
+            Effect::ReleaseListKeys {
+                id,
+                attribute,
+                key_field,
+                keys,
+            } => Self::ReleaseListKeys {
+                id,
+                attribute,
+                key_field,
+                keys,
+            },
+            Effect::Wait {
+                identity,
+                target_id,
+                until,
+                until_surface,
+                timeout,
+                interval,
+                explicit_dependencies,
+            } => Self::Wait {
+                identity,
+                target_id,
+                until,
+                until_surface,
+                timeout,
+                interval,
+                explicit_dependencies,
+            },
+            Effect::DeferredCreate { id, template } => Self::DeferredCreate { id, template },
+            Effect::DeferredReplace(payload) => Self::DeferredReplace(payload),
+        }
+    }
+}
+
+impl UnresolvedSavedEffect {
+    pub fn move_authority(&self) -> Option<MoveAuthority<'_>> {
+        match self {
+            Self::Move { from, to, .. } => Some(MoveAuthority { from, to }),
+            Self::Read { .. }
+            | Self::Create(_)
+            | Self::ResumeCreate { .. }
+            | Self::Update { .. }
+            | Self::Delete { .. }
+            | Self::Import { .. }
+            | Self::Remove { .. }
+            | Self::ReleaseListKeys { .. }
+            | Self::Wait { .. }
+            | Self::DeferredCreate { .. }
+            | Self::DeferredReplace(_) => None,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Read { .. } => "read",
+            Self::Create(_) => "create",
+            Self::ResumeCreate { .. } => "resume_create",
+            Self::Update { .. } => "update",
+            Self::Delete { .. } => "delete",
+            Self::Import { .. } => "import",
+            Self::Remove { .. } => "remove",
+            Self::Move { .. } => "move",
+            Self::ReleaseListKeys { .. } => "release_list_keys",
+            Self::Wait { .. } => "wait",
+            Self::DeferredCreate { .. } => "deferred_create",
+            Self::DeferredReplace(_) => "deferred_replace",
+        }
+    }
+
+    pub fn resource_id(&self) -> &ResourceId {
+        match self {
+            Self::Read { resource } => &resource.id,
+            Self::Create(resource) | Self::ResumeCreate { resource, .. } => &resource.id,
+            Self::Update { to, .. } => &to.id,
+            Self::Delete { id, .. }
+            | Self::Import { id, .. }
+            | Self::Remove { id }
+            | Self::Move { to: id, .. }
+            | Self::ReleaseListKeys { id, .. }
+            | Self::DeferredCreate { id, .. } => id,
+            Self::Wait { target_id, .. } => target_id.id(),
+            Self::DeferredReplace(payload) => &payload.id,
+        }
+    }
+
+    pub fn resolve_with_schemas(
+        self,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> Result<SavedEffect, crate::resource::ResolvedResourceError> {
+        Ok(match self {
+            Self::Read { resource } => Effect::Read { resource },
+            Self::Create(resource) => {
+                Effect::Create(ResolvedResource::resolve_with_schemas(resource, schemas)?)
+            }
+            Self::ResumeCreate {
+                resource,
+                started_at,
+            } => Effect::ResumeCreate {
+                resource: ResolvedResource::resolve_with_schemas(resource, schemas)?,
+                started_at,
+            },
+            Self::Update {
+                from,
+                identifier,
+                to,
+                changed_attributes,
+            } => Effect::Update {
+                from,
+                identifier,
+                to: ResolvedResource::resolve_with_schemas(to, schemas)?,
+                changed_attributes,
+            },
+            Self::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            } => Effect::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            },
+            Self::Import { id, identifier } => Effect::Import { id, identifier },
+            Self::Remove { id } => Effect::Remove { id },
+            Self::Move { from, to, origin } => Effect::Move { from, to, origin },
+            Self::ReleaseListKeys {
+                id,
+                attribute,
+                key_field,
+                keys,
+            } => Effect::ReleaseListKeys {
+                id,
+                attribute,
+                key_field,
+                keys,
+            },
+            Self::Wait {
+                identity,
+                target_id,
+                until,
+                until_surface,
+                timeout,
+                interval,
+                explicit_dependencies,
+            } => Effect::Wait {
+                identity,
+                target_id,
+                until,
+                until_surface,
+                timeout,
+                interval,
+                explicit_dependencies,
+            },
+            Self::DeferredCreate { id, mut template } => {
+                resolve_resource_ignore_changes(&mut template.template_resource, schemas)?;
+                Effect::DeferredCreate { id, template }
+            }
+            Self::DeferredReplace(mut payload) => {
+                resolve_resource_ignore_changes(&mut payload.template.template_resource, schemas)?;
+                Effect::DeferredReplace(payload)
+            }
+        })
+    }
+}
 
 impl From<Effect> for SavedEffect {
     fn from(effect: Effect) -> Self {
@@ -1007,6 +1347,16 @@ impl<S> EffectWithSource<S> {
 }
 
 impl EffectWithSource<ModuleSource> {
+    /// Construct an import and the only typed authorization for suppressing
+    /// the matching create-outcome-unknown planning error.
+    pub fn import_replacing_outcome_unknown(
+        id: ResolvedResourceId,
+        identifier: crate::resource::Value,
+    ) -> (Self, OutcomeUnknownImportReplacement) {
+        let replacement = OutcomeUnknownImportReplacement { id: id.clone() };
+        (Self::Import { id, identifier }, replacement)
+    }
+
     pub const fn replace_display_glyph(create_before_destroy: bool) -> &'static str {
         if create_before_destroy { "+/-" } else { "-/+" }
     }
@@ -1842,6 +2192,7 @@ pub fn resolve_import_identifier(identifier: &crate::resource::Value) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::ConcreteValue;
     use std::collections::HashSet;
 
     const EFFECT_VARIANT_COUNT: usize = 12;
@@ -1852,6 +2203,26 @@ mod tests {
 
     fn deserialize_effect_value(value: serde_json::Value) -> SavedEffect {
         serde_json::from_value::<SavedEffect>(value).expect("deserialize saved effect")
+    }
+
+    #[test]
+    fn outcome_unknown_import_replacement_witness_is_tied_to_the_import_effect() {
+        let id = ResolvedResourceId::with_provider_identity(
+            "mock",
+            "test.Resource",
+            "shared",
+            Some("west".to_string()),
+        );
+        let (effect, replacement) = Effect::import_replacing_outcome_unknown(
+            id.clone(),
+            Value::Concrete(ConcreteValue::String("provider-id".into())),
+        );
+
+        assert!(matches!(
+            effect,
+            Effect::Import { id: effect_id, .. } if effect_id == id
+        ));
+        assert_eq!(replacement.resource_id(), id.as_inner());
     }
 
     #[test]
