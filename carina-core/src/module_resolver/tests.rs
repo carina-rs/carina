@@ -14,8 +14,8 @@ use indexmap::IndexMap;
 use super::resolver::ModuleResolver;
 use super::*;
 use crate::parser::{
-    ArgumentOrigin, ArgumentParameter, AttributePathSegment, BindingUseOwner, ModuleArgument,
-    ModuleCall, ParsedFile, ProviderContext, TypeExpr,
+    ArgumentOrigin, ArgumentParameter, AttributePathSegment, BindingUseOwner,
+    LoadedProviderContext, ModuleArgument, ModuleCall, ParsedFile, ProviderContext, TypeExpr,
 };
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, RawEnumIdentifier, Resource,
@@ -4323,11 +4323,11 @@ fn test_argument_type_mismatch_string_for_bool() {
 
 #[test]
 fn test_argument_type_custom_validator() {
-    // Create a ProviderContext with a custom "arn" validator
+    // Create a loaded ProviderContext with a custom "arn" validator
     let identity = TypeIdentity::bare("Arn");
     let owned = crate::parser::OwnedTypeIdentity::provider("test", identity.clone());
     let validator_identity = identity.clone();
-    let config = ProviderContext {
+    let config = LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([owned.clone()]),
             Box::new(move |target, value| {
@@ -4352,7 +4352,7 @@ fn test_argument_type_custom_validator() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
@@ -4363,8 +4363,9 @@ fn test_argument_type_custom_validator() {
         validations: Vec::new(),
     }];
 
+    let schemas = crate::schema::SchemaRegistry::new();
     let resolver = {
-        let mut r = ModuleResolver::with_config(".", &config);
+        let mut r = ModuleResolver::with_config_and_schemas(".", &config, &schemas);
         r.imported_modules.insert("test_module".to_string(), module);
         r
     };
@@ -4409,7 +4410,7 @@ fn test_argument_type_list_of_custom_type() {
     let identity = TypeIdentity::bare("Arn");
     let owned = crate::parser::OwnedTypeIdentity::provider("test", identity.clone());
     let validator_identity = identity.clone();
-    let config = ProviderContext {
+    let config = LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([owned.clone()]),
             Box::new(move |target, value| {
@@ -4434,7 +4435,7 @@ fn test_argument_type_list_of_custom_type() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
@@ -4445,8 +4446,9 @@ fn test_argument_type_list_of_custom_type() {
         validations: Vec::new(),
     }];
 
+    let schemas = crate::schema::SchemaRegistry::new();
     let resolver = {
-        let mut r = ModuleResolver::with_config(".", &config);
+        let mut r = ModuleResolver::with_config_and_schemas(".", &config, &schemas);
         r.imported_modules.insert("test_module".to_string(), module);
         r
     };
