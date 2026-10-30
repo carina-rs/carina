@@ -10523,8 +10523,8 @@ fn resolve_block_names(
     }
 }
 
-fn resolve_file_block_names<E>(
-    parsed: &mut crate::parser::File<E>,
+fn resolve_file_block_names<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &mut crate::parser::File<E, D>,
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
     let mut conflicts = Vec::new();
@@ -10563,8 +10563,8 @@ fn resolve_file_block_names<E>(
     conflicts
 }
 
-fn managed_resource_by_id<'a, E>(
-    parsed: &'a crate::parser::File<E>,
+fn managed_resource_by_id<'a, E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &'a crate::parser::File<E, D>,
     id: &crate::resource::ResourceId,
 ) -> Option<&'a Resource> {
     parsed
@@ -10585,9 +10585,14 @@ fn managed_resource_by_id<'a, E>(
         })
 }
 
-fn resolve_file_block_names_with_authored<E, A>(
-    parsed: &mut crate::parser::File<E>,
-    authored: &crate::parser::File<A>,
+fn resolve_file_block_names_with_authored<
+    E,
+    D: crate::parser::DeferredForPhaseTraversal,
+    A,
+    AD: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &mut crate::parser::File<E, D>,
+    authored: &crate::parser::File<A, AD>,
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
     let mut conflicts = Vec::new();
@@ -10641,8 +10646,8 @@ fn resolve_file_block_names_with_authored<E, A>(
 
 /// Resolve block names in one evaluated file, including deferred-for
 /// templates that can materialize after refresh.
-pub fn resolve_file_block_names_with_schemas<E>(
-    parsed: &mut crate::parser::File<E>,
+pub fn resolve_file_block_names_with_schemas<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &mut crate::parser::File<E, D>,
     registry: &SchemaRegistry,
 ) -> Result<(), Vec<BlockNameConflict>> {
     let conflicts = resolve_file_block_names(parsed, registry);
@@ -10659,11 +10664,13 @@ pub fn resolve_file_block_names_with_schemas<E>(
 /// This raw primitive returns plain values and carries no pairing guarantee.
 /// Only carina-cli's validated-wiring transition may mint its canonical
 /// resource pair from these values.
-pub fn resolve_config_block_names<E>(
-    mut parsed: crate::parser::File<E>,
+pub type ResolvedConfigBlockNames<E, D> = (crate::parser::File<E, D>, Vec<Resource>);
+
+pub fn resolve_config_block_names<E, D: crate::parser::DeferredForPhaseTraversal>(
+    mut parsed: crate::parser::File<E, D>,
     unresolved: UnresolvedConfigSnapshot,
     registry: &SchemaRegistry,
-) -> Result<(crate::parser::File<E>, Vec<Resource>), Vec<BlockNameConflict>> {
+) -> Result<ResolvedConfigBlockNames<E, D>, Vec<BlockNameConflict>> {
     let mut unresolved = unresolved.into_inner();
     let mut conflicts = resolve_file_block_names_with_authored(&mut parsed, &unresolved, registry);
     let mut seen = conflicts.iter().cloned().collect::<HashSet<_>>();

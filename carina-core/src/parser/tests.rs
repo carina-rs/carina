@@ -9,10 +9,9 @@ use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
-fn cross_deferred_for_resolution_seam(mut parsed: ParsedFile) -> ParsedFile {
-    crate::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
-        .expect("deferred fixture crosses the module-resolution seam");
-    parsed
+fn cross_deferred_for_resolution_seam(parsed: ParsedFile) -> ModuleResolvedParsedFile {
+    crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+        .expect("deferred fixture crosses the module-resolution seam")
 }
 
 #[test]
@@ -6046,7 +6045,7 @@ fn deferred_unbound_target_round_trips() {
         .unwrap(),
     );
 
-    let target = &parsed.deferred_for_expressions[0].target;
+    let target = &parsed.deferred_for_expressions()[0].target;
     assert!(matches!(target, DeferredForTarget::Unbound { .. }));
     let json = serde_json::to_string(target).unwrap();
     let decoded: DeferredForTarget = serde_json::from_str(&json).unwrap();
@@ -6197,7 +6196,8 @@ fn parse_top_level_for_uses_last_segment_of_dotted_iterable() {
         cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
     // Deferred (upstream_state not resolved), so no concrete resources
     // but the deferred target should retain _accounts only as migration provenance.
-    let DeferredForTarget::Unbound { template } = &result.deferred_for_expressions[0].target else {
+    let DeferredForTarget::Unbound { template } = &result.deferred_for_expressions()[0].target
+    else {
         panic!("top-level deferred loop must remain unbound")
     };
     assert_eq!(template.legacy_base().exact_state_name(), "_accounts");
@@ -8654,29 +8654,24 @@ fn provider_context_lookup_preserves_typed_custom_validation_errors() {
 }
 
 #[test]
-fn unloaded_provider_custom_types_report_the_typed_state_error() {
+fn schema_custom_type_validation_accepts_a_loaded_context_witness() {
     let owned = crate::parser::OwnedTypeIdentity::provider(
         "test",
         TypeIdentity::from_dotted("test.Widget.Id"),
     );
 
-    let error = validate_schema_custom_type(
+    validate_schema_custom_type(
         &owned,
         &Value::Concrete(ConcreteValue::String("widget-1".into())),
-        &ProviderContext::default(),
+        &crate::parser::LoadedProviderContext::empty_for_test(),
     )
-    .expect_err("provider annotations cannot be validated before providers are loaded");
-
-    assert!(matches!(
-        error,
-        crate::parser::CustomTypeValidationError::ProvidersNotLoaded
-    ));
+    .expect("the loaded fixture resolver accepts the annotation");
 }
 
 #[test]
 fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
     let identity = TypeIdentity::from_dotted("test.Widget.SecretId");
-    let config = ProviderContext {
+    let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
@@ -8685,7 +8680,7 @@ fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
             Box::new(|_target, _value| panic!("secret plaintext reached provider validation")),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     validate_schema_custom_type(
         &crate::parser::OwnedTypeIdentity::provider("test", identity),
@@ -8704,7 +8699,7 @@ fn provider_context_validator_receives_canonical_numeric_text() {
     let identity = TypeIdentity::bare("NumericBridge");
     let seen = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&seen);
-    let config = ProviderContext {
+    let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
@@ -8724,7 +8719,7 @@ fn provider_context_validator_receives_canonical_numeric_text() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     for value in [
         Value::Concrete(ConcreteValue::Int(-42)),
@@ -8791,7 +8786,7 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
         .expect("two value")
         .attr_type()
         .clone();
-    let config = ProviderContext {
+    let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([
                 crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
@@ -8824,7 +8819,7 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     validate_schema_custom_type(
         &crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
@@ -8864,7 +8859,7 @@ fn parse_custom_validator_rejects_invalid() {
     // Actually, let's test validate_custom_type directly to avoid grammar issues.
     let identity = TypeIdentity::bare("CustomType");
     let validator_identity = identity.clone();
-    let config = ProviderContext {
+    let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
@@ -8892,7 +8887,7 @@ fn parse_custom_validator_rejects_invalid() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     // Test validate_custom_type directly since the grammar may not accept
     // arbitrary type names. This verifies the custom validator is called.
@@ -10037,10 +10032,10 @@ fn coalesced_resource_ref_for_iterable_is_deferred_as_a_complete_expression() {
     "#;
 
     let parsed = parse(input, &ProviderContext::default()).unwrap();
-    let [deferred] = parsed.parsed_deferred_for_expressions.as_slice() else {
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
         panic!(
             "coalesced unresolved iterable must produce one deferred for-expression: {:?}",
-            parsed.parsed_deferred_for_expressions
+            parsed.parsed_deferred_for_expressions()
         );
     };
     let Value::Deferred(DeferredValue::Coalesce { value, default }) = &deferred.iterable else {
@@ -10070,12 +10065,8 @@ let calls = for x in src.list { child { item = x } }
     )
     .expect("the parser must classify deferred bodies without rejecting them");
 
-    let bodies = &parsed.parsed_deferred_for_expressions;
+    let bodies = &parsed.parsed_deferred_for_expressions();
     assert_eq!(bodies.len(), 3);
-    assert!(
-        parsed.deferred_for_expressions.is_empty(),
-        "raw parser output must not materialize the resolved deferred-for typestate"
-    );
     assert!(matches!(bodies[0].body, DeferredForBody::Resource(_)));
     assert!(matches!(bodies[1].body, DeferredForBody::Read(_)));
     assert!(matches!(bodies[2].body, DeferredForBody::ModuleCall(_)));
@@ -10128,7 +10119,7 @@ let resources = for x in (
     )
     .expect("the multiline deferred iterable must parse");
 
-    let [deferred] = parsed.parsed_deferred_for_expressions.as_slice() else {
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
         panic!("expected one deferred loop")
     };
     assert_eq!(deferred.header, "for x in src.list ?? []");
@@ -10184,10 +10175,21 @@ let items = for x in src.list {
     )
     .expect_err("a genuine parser error in a deferred resource body must be preserved");
 
+    let ParseError::DeferredForBodyTemplate {
+        line,
+        header,
+        source,
+        ..
+    } = error
+    else {
+        panic!("expected deferred body template error")
+    };
+    assert_eq!(line, 2);
+    assert_eq!(header, "for x in src.list");
     assert!(matches!(
-        error,
+        source.as_ref(),
         ParseError::ReservedResourceAttribute {
-            ref attribute,
+            attribute,
             line: 5,
             ..
         } if attribute == "_invalid"
@@ -10314,7 +10316,7 @@ fn expand_deferred_for_with_remote_bindings() {
 
     let mut parsed =
         cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
     assert_eq!(parsed.resources.len(), 0, "no resources before expansion"); // allow: direct — fixture test inspection
 
     // Simulate loading upstream_state with actual values
@@ -10336,7 +10338,7 @@ fn expand_deferred_for_with_remote_bindings() {
 
     // Deferred should be resolved
     assert_eq!(
-        parsed.deferred_for_expressions.len(),
+        parsed.deferred_for_expressions().len(),
         0,
         "deferred should be empty after expansion"
     );
@@ -10391,7 +10393,7 @@ fn expand_deferred_for_no_remote_data_stays_deferred() {
 
     let mut parsed =
         cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
 
     // Empty remote_bindings — upstream hasn't been applied yet
     let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -10401,7 +10403,7 @@ fn expand_deferred_for_no_remote_data_stays_deferred() {
 
     // Should remain deferred
     assert_eq!(
-        parsed.deferred_for_expressions.len(),
+        parsed.deferred_for_expressions().len(),
         1,
         "should stay deferred when remote data not available"
     );
@@ -10427,7 +10429,7 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
 
     let mut parsed =
         cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut accounts: IndexMap<String, Value> = IndexMap::new();
@@ -10450,7 +10452,7 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
         .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
         .unwrap();
 
-    assert_eq!(parsed.deferred_for_expressions.len(), 0);
+    assert_eq!(parsed.deferred_for_expressions().len(), 0);
     assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
 
     // Verify both key and value are substituted.
@@ -10496,7 +10498,7 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
 
     let mut parsed =
         cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10567,7 +10569,7 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
 
     let mut parsed =
         cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
-    assert_eq!(parsed.deferred_for_expressions.len(), 3);
+    assert_eq!(parsed.deferred_for_expressions().len(), 3);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10592,7 +10594,7 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
         .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
         .unwrap();
 
-    assert_eq!(parsed.deferred_for_expressions.len(), 0);
+    assert_eq!(parsed.deferred_for_expressions().len(), 0);
     assert_eq!(parsed.resources.len(), 3); // allow: direct — fixture test inspection
     for resource in &parsed.resources {
         assert!(
@@ -10624,7 +10626,7 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
 
     let mut parsed =
         cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10647,7 +10649,7 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
             remote_bindings.clone(),
         ))
         .unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 0);
+    assert_eq!(parsed.deferred_for_expressions().len(), 0);
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
     let bindings = ResolvedBindings::pre_data_source_read_live(LivePreDataSourceReadInputs {
@@ -10689,7 +10691,7 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
 
     let mut parsed =
         cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10805,7 +10807,7 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
         0,
         "simple binding with map iterable should not silently expand"
     );
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
     assert!(
         parsed
             .warnings
@@ -10857,7 +10859,7 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
         "map binding with list iterable should not silently expand"
     );
     assert_eq!(
-        parsed.deferred_for_expressions.len(),
+        parsed.deferred_for_expressions().len(),
         1,
         "should remain deferred on shape mismatch"
     );
@@ -12154,7 +12156,7 @@ fn parse_directory_files_preserves_sibling_resource_ref_rhs() {
 #[test]
 fn parse_directory_preserves_module_arg_dotted_string_literal() {
     use crate::config_loader::parse_directory;
-    use crate::module_resolver::resolve_modules;
+    use crate::module_resolver::resolve_modules_providerless as resolve_modules;
 
     let tmp = tempfile::tempdir().unwrap();
     let module_dir = tmp.path().join("uc");
@@ -12188,9 +12190,9 @@ fn parse_directory_preserves_module_arg_dotted_string_literal() {
     )
     .unwrap();
 
-    let mut parsed = parse_directory(tmp.path(), &ProviderContext::default())
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
         .expect("directory fixture must parse");
-    resolve_modules(&mut parsed, tmp.path()).expect("module expansion must succeed");
+    let parsed = resolve_modules(parsed, tmp.path()).expect("module expansion must succeed");
     let record = parsed
         .resources
         .iter()
@@ -13034,6 +13036,51 @@ fn extract_directives_reads_depends_on_list() {
 }
 
 #[test]
+fn extract_directives_reads_ignore_changes_attribute_paths() {
+    let src = r#"
+        let function = awscc.lambda.Function {
+            code = { image_uri = "registry.example.test/image:tag" }
+            tags = { Owner = "platform" }
+            directives {
+                ignore_changes = [code.image_uri, tags["Owner"]]
+            }
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let function = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.identity_str() == Some("function"))
+        .expect("function binding");
+    let paths = function
+        .directives
+        .ignore_changes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    assert_eq!(paths, ["code.image_uri", "tags[\"Owner\"]"]);
+}
+
+#[test]
+fn extract_directives_rejects_string_literal_ignore_changes_paths() {
+    let src = r#"
+        let function = awscc.lambda.Function {
+            code = { image_uri = "registry.example.test/image:tag" }
+            directives { ignore_changes = ["code.image_uri"] }
+        }
+    "#;
+    let error = parse(src, &ProviderContext::default())
+        .expect_err("ignore_changes paths must not be string literals")
+        .to_string();
+
+    assert!(
+        error.contains("bare attribute path") && error.contains("code.image_uri"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn parser_resolve_unions_directives_depends_on_into_dependency_bindings() {
     let src = r#"
         let role = aws.iam.Role {
@@ -13313,7 +13360,7 @@ fn extract_directives_depends_on_in_for_loop_resource() {
     "#;
     let parsed = parse(src, &ProviderContext::default()).unwrap();
     let deferred = parsed
-        .parsed_deferred_for_expressions
+        .parsed_deferred_for_expressions()
         .first()
         .expect("for expression present");
     let DeferredForBody::Resource(template) = &deferred.body else {
@@ -15721,11 +15768,8 @@ mod loop_var_field_access_matrix {
 
     fn first_name(src: &str) -> Value {
         let p = parse(src, &ProviderContext::default()).expect("parse");
-        assert_eq!(
-            p.deferred_for_expressions.len(),
-            0,
-            "inline-list loop must fully expand at parse time"
-        );
+        // Raw parser output cannot expose finalized deferred loops; the
+        // concrete resource below proves this inline list expanded eagerly.
         p.resources
             .first()
             .expect("one resource")
@@ -15801,11 +15845,11 @@ mod loop_var_field_access_matrix {
         let mut p = cross_deferred_for_resolution_seam(
             parse(src, &ProviderContext::default()).expect("parse"),
         );
-        assert_eq!(p.deferred_for_expressions.len(), 1, "loop deferred");
+        assert_eq!(p.deferred_for_expressions().len(), 1, "loop deferred");
         // The template body must carry the deferred postfix operation, not a
         // resource ResourceRef (which would never resolve for a loop var) and
         // not a bare ForValue (which would lose the `.k`).
-        let tmpl = &p.deferred_for_expressions[0].template_resource;
+        let tmpl = &p.deferred_for_expressions()[0].template_resource;
         assert!(
             matches!(
                 tmpl.get_attr("name"),
@@ -15841,7 +15885,7 @@ mod loop_var_field_access_matrix {
         p.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote))
             .unwrap();
 
-        assert_eq!(p.deferred_for_expressions.len(), 0, "loop expanded");
+        assert_eq!(p.deferred_for_expressions().len(), 0, "loop expanded");
         assert_eq!(
             p.resources.first().expect("one resource").get_attr("name"),
             Some(&Value::Concrete(ConcreteValue::String("resolved".into()))),

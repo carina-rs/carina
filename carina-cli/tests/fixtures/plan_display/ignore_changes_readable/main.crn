@@ -1,0 +1,20 @@
+let ignored_only = mock.test.resource {
+  name    = 'ignored-only'
+  comment = 'desired'
+
+  directives {
+    ignore_changes = [comment]
+  }
+}
+
+let sibling_update = mock.test.resource {
+  name    = 'sibling-update'
+  comment = 'desired'
+  tags = {
+    Owner = 'new'
+  }
+
+  directives {
+    ignore_changes = [comment]
+  }
+}

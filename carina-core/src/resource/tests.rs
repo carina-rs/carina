@@ -477,6 +477,35 @@ fn resolved_resource_try_new_returns_some_with_identity() {
 }
 
 #[test]
+fn resolved_resource_error_preserves_typed_ignore_errors() {
+    let mut resource = Resource::new("Widget", "example");
+    resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
+        ParsedIgnorePathSegment::Attribute("missing".to_string()),
+    ])];
+    let mut registry = crate::schema::SchemaRegistry::new();
+    registry.insert(
+        "",
+        crate::schema::ResourceSchema::new("Widget")
+            .validate()
+            .expect("valid test schema"),
+    );
+
+    let error = ResolvedResource::resolve_with_schemas(resource, &registry)
+        .expect_err("the authored path is not in the schema");
+    let rendered = error.to_string();
+    let ResolvedResourceError::InvalidIgnoreChanges { errors, .. } = error else {
+        panic!("expected typed ignore_changes errors");
+    };
+
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].to_string(),
+        "ignore_changes path `missing` does not exist in the resource schema"
+    );
+    assert!(rendered.contains(&errors[0].to_string()));
+}
+
+#[test]
 fn resolved_resource_serde_round_trips_as_resource() {
     let resolved = ResolvedResource::new(Resource::with_provider(
         "aws",
@@ -496,6 +525,25 @@ fn resolved_resource_deserialize_rejects_absent_identity() {
     value["id"].as_object_mut().unwrap().remove("identity");
     let err = serde_json::from_value::<SavedResolvedResource>(value).unwrap_err();
     assert!(err.to_string().contains("identity is required"));
+}
+
+#[test]
+fn resource_deserialization_cannot_restore_resolved_ignore_changes() {
+    let resource: SavedResource = Resource::new("Widget", "example").into();
+    let mut value = serde_json::to_value(resource).expect("serialize saved resource");
+    value["resolved_ignore_changes"] = serde_json::json!([{
+        "attribute": "secret",
+        "leaf": [],
+        "authored": {
+            "segments": [{ "kind": "attribute", "value": "secret" }]
+        },
+        "write_only": true
+    }]);
+
+    let decoded: SavedResource =
+        serde_json::from_value(value).expect("unknown resolved metadata is ignored");
+
+    assert!(decoded.resolved_ignore_changes.is_empty());
 }
 
 #[test]
@@ -2539,16 +2587,17 @@ fn loop_scheduler_identity_uses_the_persisted_stable_hash_contract() {
 
 #[test]
 fn deserialized_unbound_loop_template_still_rejects_read_without_a_source_span() {
-    let mut parsed = crate::parser::parse(
+    let parsed = crate::parser::parse(
         "let upstream = upstream_state { source = '../upstream' }\n\
          for value in upstream.values { mock.test.Leaf { value = value } }\n",
         &crate::parser::ProviderContext::default(),
     )
     .expect("deferred loop parses");
-    crate::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
-        .expect("deferred fixture crosses the module-resolution seam");
+    let parsed =
+        crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+            .expect("deferred fixture crosses the module-resolution seam");
     let crate::parser::DeferredForTarget::Unbound { template } =
-        &parsed.deferred_for_expressions[0].target
+        &parsed.deferred_for_expressions()[0].target
     else {
         panic!("fixture must produce an unbound target")
     };

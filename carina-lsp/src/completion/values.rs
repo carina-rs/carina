@@ -9,7 +9,7 @@ use tower_lsp::lsp_types::{
 use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
 use carina_core::resource::EnumValueResolver;
-use carina_core::schema::{AttributeType, Shape, TypeIdentity, TypeInSchema};
+use carina_core::schema::{AttributeType, EffectiveType, Shape, TypeIdentity, TypeInSchema};
 
 use super::{AttributeValueTarget, CompletionProvider, DslSource};
 
@@ -794,6 +794,15 @@ impl CompletionProvider {
                 ..Default::default()
             },
             CompletionItem {
+                label: "ignore_changes".to_string(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some("Preserve externally managed attribute paths on update".to_string()),
+                insert_text: Some("ignore_changes = [$0]".to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                command: Some(trigger_suggest.clone()),
+                ..Default::default()
+            },
+            CompletionItem {
                 label: "prevent_destroy".to_string(),
                 kind: Some(CompletionItemKind::PROPERTY),
                 detail: Some("Block any plan that would destroy this resource".to_string()),
@@ -814,6 +823,74 @@ impl CompletionProvider {
                 ..Default::default()
             },
         ]
+    }
+
+    /// Schema-authored path candidates for `ignore_changes = [|]`.
+    pub(super) fn directives_ignore_changes_completions(
+        &self,
+        resource_type: &str,
+    ) -> Vec<CompletionItem> {
+        fn push_nested_paths(
+            value_type: EffectiveType<'_>,
+            prefix: &str,
+            depth: usize,
+            labels: &mut std::collections::BTreeSet<String>,
+        ) {
+            if depth >= 16 {
+                return;
+            }
+            match value_type.shape() {
+                Shape::List { .. } => {
+                    if let Some(element) = value_type.list_element() {
+                        push_nested_paths(element, prefix, depth + 1, labels);
+                    }
+                }
+                Shape::Struct { .. } => {
+                    for field in value_type.field_candidates() {
+                        if field.is_read_only() {
+                            continue;
+                        }
+                        let authored = field.block_name().unwrap_or_else(|| field.name());
+                        let path = format!("{prefix}.{authored}");
+                        labels.insert(path.clone());
+                        push_nested_paths(field.value_type(), &path, depth + 1, labels);
+                    }
+                }
+                // Map keys are authored data and cannot be guessed; unions are
+                // invalid traversal targets for v1 ignore paths.
+                Shape::Map { .. }
+                | Shape::Union
+                | Shape::String { .. }
+                | Shape::Int { .. }
+                | Shape::Float { .. }
+                | Shape::Bool
+                | Shape::Duration
+                | Shape::Enum { .. } => {}
+            }
+        }
+
+        let Some(schema) = self.lookup_schema(resource_type) else {
+            return Vec::new();
+        };
+        let mut labels = std::collections::BTreeSet::new();
+        for attribute in schema.effective_attributes() {
+            if attribute.is_read_only() {
+                continue;
+            }
+            let authored = attribute.block_name().unwrap_or_else(|| attribute.name());
+            labels.insert(authored.to_string());
+            push_nested_paths(attribute.value_type(), authored, 0, &mut labels);
+        }
+        labels
+            .into_iter()
+            .map(|label| CompletionItem {
+                insert_text: Some(label.clone()),
+                label,
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some("Resource attribute path".to_string()),
+                ..Default::default()
+            })
+            .collect()
     }
 
     /// Value candidates for `directives { provider = | }` (carina#2191
@@ -1944,7 +2021,7 @@ fn resolve_upstream_export_keys(
         source: std::path::PathBuf::from(source),
     };
     let (mut exports, _errors) =
-        carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+        carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
             base,
             &[upstream],
             &Default::default(),
@@ -2020,7 +2097,7 @@ fn infer_for_binding_type(
                 source: std::path::PathBuf::from(source),
             };
             let (mut resolved, _errors) =
-                carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+                carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
                     base,
                     &[upstream],
                     &Default::default(),

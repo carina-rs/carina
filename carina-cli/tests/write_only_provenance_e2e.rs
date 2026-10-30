@@ -10,14 +10,23 @@ struct Scenario {
     _tmp: TempDir,
     project: PathBuf,
     mock_state: PathBuf,
+    update_patch_log: PathBuf,
 }
 
 impl Scenario {
     fn new() -> Self {
         let tmp = TempDir::new().expect("temporary project");
         let project = tmp.path().to_path_buf();
+        fs::write(
+            project.join("backend.crn"),
+            "backend local { path = \"carina.state.json\" }\n",
+        )
+        .expect("write backend configuration");
+        fs::write(project.join("providers.crn"), "provider mock {}\n")
+            .expect("write provider configuration");
         Self {
             mock_state: project.join("mock-state.json"),
+            update_patch_log: project.join("update-patches.jsonl"),
             project,
             _tmp: tmp,
         }
@@ -30,10 +39,7 @@ impl Scenario {
         fs::write(
             self.project.join("main.crn"),
             format!(
-                r#"backend local {{ path = "carina.state.json" }}
-provider mock {{}}
-
-let r1 = mock.test.resource {{
+                r#"let r1 = mock.test.resource {{
   name = "r1"
 {password}}}
 "#
@@ -46,10 +52,7 @@ let r1 = mock.test.resource {{
         fs::write(
             self.project.join("main.crn"),
             format!(
-                r#"backend local {{ path = "carina.state.json" }}
-provider mock {{}}
-
-let r1 = mock.test.resource {{
+                r#"let r1 = mock.test.resource {{
   name     = "r1"
   password = secret("{password}")
 }}
@@ -63,10 +66,7 @@ let r1 = mock.test.resource {{
         fs::write(
             self.project.join("main.crn"),
             format!(
-                r#"backend local {{ path = "carina.state.json" }}
-provider mock {{}}
-
-let r1 = mock.test.resource {{
+                r#"let r1 = mock.test.resource {{
   name     = "r1"
   password = secret("{password}")
   comment  = "{comment}"
@@ -78,24 +78,106 @@ let r1 = mock.test.resource {{
     }
 
     fn write_nested_secret_and_comment_config(&self, client_secret: &str, comment: &str) {
+        self.write_nested_secret_and_comment_config_with_ignore(client_secret, comment, false);
+    }
+
+    fn write_nested_secret_and_comment_config_with_ignore(
+        &self,
+        client_secret: &str,
+        comment: &str,
+        ignore_client_secret: bool,
+    ) {
+        let directives = if ignore_client_secret {
+            r#"
+  directives {
+    ignore_changes = [oidc_config.client_secret]
+  }
+"#
+        } else {
+            ""
+        };
         fs::write(
             self.project.join("main.crn"),
             format!(
-                r#"backend local {{ path = "carina.state.json" }}
-provider mock {{}}
-
-let r1 = mock.test.resource {{
+                r#"let r1 = mock.test.resource {{
   name    = "r1"
   comment = "{comment}"
   oidc_config = {{
     issuer        = "https://issuer.example.com"
     client_secret = secret("{client_secret}")
   }}
+{directives}
 }}
 "#
             ),
         )
         .expect("write nested secret and comment configuration");
+    }
+
+    fn write_readable_ignore_config(&self, comment: &str, owner: Option<&str>) {
+        let tags = owner
+            .map(|owner| {
+                format!(
+                    r#"  tags = {{
+    Owner = "{owner}"
+  }}
+"#
+                )
+            })
+            .unwrap_or_default();
+        fs::write(
+            self.project.join("main.crn"),
+            format!(
+                r#"let r1 = mock.test.resource {{
+  name    = "r1"
+  comment = "{comment}"
+{tags}
+  directives {{
+    ignore_changes = [comment]
+  }}
+}}
+"#
+            ),
+        )
+        .expect("write readable ignore_changes configuration");
+    }
+
+    fn mutate_provider_attribute(&self, attribute: &str, value: serde_json::Value) {
+        let mut provider: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&self.mock_state).expect("read mock provider state"),
+        )
+        .expect("parse mock provider state");
+        provider["states"]["test.resource.r1"][attribute] = value;
+        fs::write(
+            &self.mock_state,
+            serde_json::to_vec_pretty(&provider).expect("serialize mock provider state"),
+        )
+        .expect("write externally changed mock provider state");
+    }
+
+    fn mutate_provider_nested_client_secret(&self, value: &str) {
+        self.mutate_provider_attribute(
+            "oidc_config",
+            serde_json::json!({
+                "issuer": "https://issuer.example.com",
+                "client_secret": value,
+            }),
+        );
+    }
+
+    fn provider_state(&self) -> serde_json::Value {
+        serde_json::from_str(
+            &fs::read_to_string(&self.mock_state).expect("read mock provider state"),
+        )
+        .expect("parse mock provider state")
+    }
+
+    fn update_patch_operations(&self) -> Vec<serde_json::Value> {
+        fs::read_to_string(&self.update_patch_log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse mock update patch log entry"))
+            .collect()
     }
 
     fn clear_write_only_metadata(&self) {
@@ -131,6 +213,7 @@ let r1 = mock.test.resource {{
         carina(&self.project)
             .args(["plan", ".", "--refresh=false", "--out", name])
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
+            .env("CARINA_MOCK_UPDATE_PATCH_LOG", &self.update_patch_log)
             .output()
             .expect("save carina plan")
     }
@@ -139,6 +222,7 @@ let r1 = mock.test.resource {{
         carina(&self.project)
             .args(["plan", ".", "--out", name])
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
+            .env("CARINA_MOCK_UPDATE_PATCH_LOG", &self.update_patch_log)
             .output()
             .expect("save carina plan with refresh")
     }
@@ -147,6 +231,7 @@ let r1 = mock.test.resource {{
         carina(&self.project)
             .args(["apply", name, "--auto-approve", "--lock=false"])
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
+            .env("CARINA_MOCK_UPDATE_PATCH_LOG", &self.update_patch_log)
             .output()
             .expect("apply saved plan")
     }
@@ -155,6 +240,7 @@ let r1 = mock.test.resource {{
         carina(&self.project)
             .args(["apply", name, "--auto-approve", "--lock=false"])
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
+            .env("CARINA_MOCK_UPDATE_PATCH_LOG", &self.update_patch_log)
             .env("CARINA_MOCK_UPDATE_FAIL_FOR", "test.resource.r1")
             .output()
             .expect("apply saved plan with failed update")
@@ -164,6 +250,7 @@ let r1 = mock.test.resource {{
         carina(&self.project)
             .args(["plan", ".", "--refresh=false"])
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
+            .env("CARINA_MOCK_UPDATE_PATCH_LOG", &self.update_patch_log)
             .output()
             .expect("run carina plan")
     }
@@ -172,6 +259,7 @@ let r1 = mock.test.resource {{
         carina(&self.project)
             .args(["plan", "."])
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
+            .env("CARINA_MOCK_UPDATE_PATCH_LOG", &self.update_patch_log)
             .output()
             .expect("run carina plan with refresh")
     }
@@ -201,6 +289,37 @@ fn output_text(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn tamper_authored_ignore_paths(value: &mut serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(values) => {
+            values.iter_mut().map(tamper_authored_ignore_paths).sum()
+        }
+        serde_json::Value::Object(fields) => {
+            let mut tampered = 0;
+            if let Some(paths) = fields
+                .get_mut("ignore_changes")
+                .and_then(|value| value.as_array_mut())
+            {
+                for path in paths {
+                    if let Some(root) = path["segments"]
+                        .as_array_mut()
+                        .and_then(|segments| segments.first_mut())
+                    {
+                        root["value"] = serde_json::json!("does_not_exist");
+                        tampered += 1;
+                    }
+                }
+            }
+            tampered
+                + fields
+                    .values_mut()
+                    .map(tamper_authored_ignore_paths)
+                    .sum::<usize>()
+        }
+        _ => 0,
+    }
 }
 
 #[test]
@@ -593,5 +712,271 @@ fn secret_write_only_refresh_and_saved_plan_apply_converge_without_sending_hash(
     assert!(
         converged_text.contains("No changes. Infrastructure is up-to-date."),
         "the accepted secret update must converge\nstdout/stderr:\n{converged_text}"
+    );
+}
+
+#[test]
+fn nested_write_only_without_ignore_changes_reasserts_and_rolls_back_external_value() {
+    let scenario = Scenario::new();
+    scenario.write_nested_secret_and_comment_config_with_ignore("infra-recorded", "before", false);
+    assert_success("carina init", &scenario.init());
+    assert_success(
+        "initial plan",
+        &scenario.save_plan_with_refresh("initial.json"),
+    );
+    assert_success("initial apply", &scenario.apply_plan("initial.json"));
+
+    scenario.mutate_provider_nested_client_secret("externally-deployed");
+    scenario.write_nested_secret_and_comment_config_with_ignore("infra-recorded", "after", false);
+    assert_success(
+        "unignored update plan",
+        &scenario.save_plan_with_refresh("update.json"),
+    );
+    assert_success(
+        "unignored update apply",
+        &scenario.apply_plan("update.json"),
+    );
+
+    assert_eq!(
+        scenario.provider_state()["states"]["test.resource.r1"]["oidc_config"]["client_secret"],
+        serde_json::json!("infra-recorded"),
+        "the existing Reassert behavior must pin the rollback that ignore_changes prevents"
+    );
+    let patches = scenario.update_patch_operations();
+    let operations = patches
+        .last()
+        .and_then(|entry| entry["operations"].as_array())
+        .expect("update patch operations");
+    assert!(
+        operations
+            .iter()
+            .any(|op| op["key"] == "oidc_config" && op["op"] == "reassert"),
+        "the unignored update must reassert oidc_config: {patches:#?}"
+    );
+}
+
+#[test]
+fn nested_write_only_ignore_changes_preserves_external_value_and_omits_parent_patch() {
+    let scenario = Scenario::new();
+    scenario.write_nested_secret_and_comment_config_with_ignore("infra-recorded", "before", true);
+    assert_success("carina init", &scenario.init());
+    assert_success(
+        "initial plan",
+        &scenario.save_plan_with_refresh("initial.json"),
+    );
+    assert_success("initial apply", &scenario.apply_plan("initial.json"));
+
+    let state_path = scenario.project.join("carina.state.json");
+    let before_state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).expect("read state after create"))
+            .expect("parse state after create");
+    let accepted_at_create =
+        before_state["resources"][0]["current"]["attributes"]["oidc_config"].clone();
+    assert!(
+        !before_state.to_string().contains("ignore_changes"),
+        "state rows must use the persistence projection without host-only ignore paths: {before_state:#}"
+    );
+
+    scenario.mutate_provider_nested_client_secret("externally-deployed");
+    scenario.write_nested_secret_and_comment_config_with_ignore("infra-recorded", "after", true);
+    assert_success(
+        "ignored update plan",
+        &scenario.save_plan_with_refresh("update.json"),
+    );
+    assert_success("ignored update apply", &scenario.apply_plan("update.json"));
+
+    assert_eq!(
+        scenario.provider_state()["states"]["test.resource.r1"]["oidc_config"]["client_secret"],
+        serde_json::json!("externally-deployed"),
+        "omitting the write-only-bearing parent must preserve the external deployment"
+    );
+    let patches = scenario.update_patch_operations();
+    let operations = patches
+        .last()
+        .and_then(|entry| entry["operations"].as_array())
+        .expect("update patch operations");
+    assert!(
+        operations.iter().any(|op| op["key"] == "comment")
+            && operations.iter().all(|op| op["key"] != "oidc_config"),
+        "the provider update must contain the unrelated field and omit oidc_config: {patches:#?}"
+    );
+
+    let after_state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&state_path).expect("read state after ignored update"),
+    )
+    .expect("parse state after ignored update");
+    assert_eq!(
+        after_state["resources"][0]["current"]["attributes"]["oidc_config"], accepted_at_create,
+        "ignored write-only leaves must keep their create-time accepted record"
+    );
+    assert!(!after_state.to_string().contains("ignore_changes"));
+}
+
+#[test]
+fn readable_ignore_changes_hides_drift_and_omits_it_from_an_unrelated_update() {
+    let scenario = Scenario::new();
+    scenario.write_readable_ignore_config("configured", Some("old"));
+    assert_success("carina init", &scenario.init());
+    assert_success(
+        "initial plan",
+        &scenario.save_plan_with_refresh("initial.json"),
+    );
+    assert_success("initial apply", &scenario.apply_plan("initial.json"));
+
+    scenario.mutate_provider_attribute("comment", serde_json::json!("external"));
+    let drift = scenario.plan_with_refresh();
+    assert_success("ignored readable drift plan", &drift);
+    let drift_text = output_text(&drift);
+    assert!(
+        drift_text.contains("# 1 ignored attribute(s) differ")
+            && !drift_text.contains("'external' → 'configured'")
+            && !drift_text.contains("~ comment"),
+        "ignored readable drift must be summarized without a change row:\n{drift_text}"
+    );
+
+    scenario.write_readable_ignore_config("configured", Some("new"));
+    assert_success(
+        "unrelated readable-ignore update plan",
+        &scenario.save_plan_with_refresh("update.json"),
+    );
+    assert_success(
+        "unrelated readable-ignore update apply",
+        &scenario.apply_plan("update.json"),
+    );
+    assert_eq!(
+        scenario.provider_state()["states"]["test.resource.r1"]["comment"],
+        serde_json::json!("external")
+    );
+    let patches = scenario.update_patch_operations();
+    let operations = patches
+        .last()
+        .and_then(|entry| entry["operations"].as_array())
+        .expect("update patch operations");
+    assert!(
+        operations.iter().any(|op| op["key"] == "tags")
+            && operations.iter().all(|op| op["key"] != "comment"),
+        "the unrelated patch must not send the ignored readable attribute: {patches:#?}"
+    );
+}
+
+#[test]
+fn saved_plan_apply_refills_ignored_readable_leaf_from_apply_time_read() {
+    let scenario = Scenario::new();
+    scenario.write_readable_ignore_config("configured", Some("old"));
+    assert_success("carina init", &scenario.init());
+    assert_success(
+        "initial plan",
+        &scenario.save_plan_with_refresh("initial.json"),
+    );
+    assert_success("initial apply", &scenario.apply_plan("initial.json"));
+
+    scenario.write_readable_ignore_config("configured", Some("new"));
+    assert_success(
+        "saved update plan",
+        &scenario.save_plan_with_refresh("update.json"),
+    );
+    let saved: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(scenario.project.join("update.json")).expect("read saved plan"),
+    )
+    .expect("parse saved plan");
+    assert_eq!(saved["version"], serde_json::json!(31));
+    assert!(
+        !saved.to_string().contains("resolved_ignore_changes"),
+        "saved plans must not persist schema-resolved ignore metadata: {saved:#}"
+    );
+    assert_eq!(
+        saved["sorted_resources"][0]["directives"]["ignore_changes"][0]["segments"][0]["value"],
+        serde_json::json!("comment"),
+        "saved plans must retain the authored ignore path: {saved:#}"
+    );
+
+    scenario.mutate_provider_attribute("comment", serde_json::json!("between-plan-and-apply"));
+    let apply = scenario.apply_plan("update.json");
+    assert_success("saved ignored-readable apply", &apply);
+    assert!(
+        !output_text(&apply).contains("Infrastructure drift detected"),
+        "ignored drift between plan and apply must be accepted:\n{}",
+        output_text(&apply)
+    );
+    assert_eq!(
+        scenario.provider_state()["states"]["test.resource.r1"]["comment"],
+        serde_json::json!("between-plan-and-apply"),
+        "apply must refill the sent value from its fresh read"
+    );
+}
+
+#[test]
+fn saved_plan_apply_re_resolves_tampered_authored_ignore_paths() {
+    let scenario = Scenario::new();
+    scenario.write_readable_ignore_config("configured", Some("old"));
+    assert_success("carina init", &scenario.init());
+    assert_success(
+        "initial plan",
+        &scenario.save_plan_with_refresh("initial.json"),
+    );
+    assert_success("initial apply", &scenario.apply_plan("initial.json"));
+
+    scenario.write_readable_ignore_config("configured", Some("new"));
+    assert_success(
+        "saved update plan",
+        &scenario.save_plan_with_refresh("tampered.json"),
+    );
+    let path = scenario.project.join("tampered.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read saved plan"))
+            .expect("parse saved plan");
+    assert!(
+        tamper_authored_ignore_paths(&mut saved) > 0,
+        "fixture must contain authored ignore paths: {saved:#}"
+    );
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&saved).expect("serialize tampered saved plan"),
+    )
+    .expect("write tampered saved plan");
+
+    let apply = scenario.apply_plan("tampered.json");
+    let rendered = output_text(&apply);
+    assert!(
+        !apply.status.success(),
+        "tampered plan applied:\n{rendered}"
+    );
+    assert!(
+        rendered
+            .contains("ignore_changes path `does_not_exist` does not exist in the resource schema"),
+        "apply must reject the edited authored path through the shared resolver:\n{rendered}"
+    );
+}
+
+#[test]
+fn v30_saved_plan_is_rejected_after_ignore_changes_format_bump() {
+    let scenario = Scenario::new();
+    scenario.write_readable_ignore_config("configured", None);
+    assert_success("carina init", &scenario.init());
+    assert_success(
+        "current saved plan",
+        &scenario.save_plan_with_refresh("old.json"),
+    );
+
+    let path = scenario.project.join("old.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read current saved plan"))
+            .expect("parse current saved plan");
+    saved["version"] = serde_json::json!(30);
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&saved).expect("serialize old saved plan"),
+    )
+    .expect("write old saved plan");
+
+    let apply = scenario.apply_plan("old.json");
+    let rendered = output_text(&apply);
+    assert!(
+        !apply.status.success(),
+        "v30 saved plan applied:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Unsupported plan file version: 30") && rendered.contains("plan --out"),
+        "old plan must fail with replan guidance:\n{rendered}"
     );
 }

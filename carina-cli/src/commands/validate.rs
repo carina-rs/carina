@@ -8,7 +8,7 @@ use carina_core::config_loader::{
     find_crn_files_in_dir, get_base_dir, load_configuration_with_config,
 };
 use carina_core::lint::find_duplicate_attrs;
-use carina_core::parser::{File, ProviderContext, ResourceRef, UpstreamState};
+use carina_core::parser::{ProviderContext, ResourceRef, UpstreamState};
 use carina_core::resource::ResourceId;
 
 use crate::error::AppError;
@@ -122,19 +122,26 @@ pub fn validated_resource_ids_with_factories(
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::for_test(factories, &parsed.providers);
 
-    // Run the same resolve/validate pass as the CLI so the parsed tree
-    // (and its `deferred_for_expressions`) is in the post-validation
-    // state the display path observes.
-    let _ = super::validate_and_resolve_errors(
+    // This adapter exercises only the resource-enumeration half of validate.
+    // Keep the identical module/name-resolution seam, but do not reject a
+    // fixture before enumeration for an unrelated provider-schema diagnostic.
+    let validation_report = providers.validation_report(
         &mut parsed,
         base_dir,
-        &providers,
-        false,
+        true,
         &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
+    assert!(
+        validation_report.errors().is_empty(),
+        "fixture failed validation: {:?}",
+        validation_report.errors()
+    );
+    let parsed = validation_report
+        .resolved()
+        .expect("successful validation must retain its resolved file");
 
-    validated_entries(&parsed)
+    validated_entries(parsed)
         .iter()
         .map(ToString::to_string)
         .collect()
@@ -229,7 +236,7 @@ impl std::fmt::Display for ValidatedEntry<'_> {
 }
 
 /// The resources `validate` enumerates, derived from
-/// [`File::iter_all_resources`] so it stays in sync with every other
+/// [`carina_core::parser::File::iter_all_resources`] so it stays in sync with every other
 /// resource-walking checker (the unified-walk invariant from
 /// `notes/specs/2026-04-19-unify-resource-walk-design.md`).
 ///
@@ -238,7 +245,9 @@ impl std::fmt::Display for ValidatedEntry<'_> {
 /// at their own boundary, so a deferred placeholder is structurally
 /// distinct from a resolved id rather than a string that happens to
 /// contain `[?]`.
-fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
+fn validated_entries<E>(
+    parsed: &carina_core::parser::ModuleResolvedFile<E>,
+) -> Vec<ValidatedEntry<'_>> {
     parsed
         .iter_all_resources()
         // Every call now has a composition so its typed boundary survives
@@ -342,6 +351,9 @@ pub fn run_validate(
     if !error_reports.is_empty() {
         return Err(AppError::Validation(error_reports.join("\n")));
     }
+    let parsed = validation_report
+        .resolved()
+        .expect("successful validation must retain its resolved file");
 
     // Check for unused let bindings (warnings, not errors)
     let unused_warnings = carina_core::validation::check_unused_bindings_with_identity_requirements(
@@ -390,7 +402,7 @@ pub fn run_validate(
                 file: Some(file_path.display().to_string()),
             });
         }
-        let entries = validated_entries(&parsed);
+        let entries = validated_entries(parsed);
         let output = ValidateOutput {
             status: "ok",
             resource_count: entries.len(),
@@ -405,7 +417,7 @@ pub fn run_validate(
         return Ok(());
     }
 
-    let entries = validated_entries(&parsed);
+    let entries = validated_entries(parsed);
     println!(
         "{}",
         format!("✓ {} resources validated successfully.", entries.len())
@@ -467,6 +479,16 @@ fn check_upstream_state_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolve_file_for_test(
+        parsed: carina_core::parser::ParsedFile,
+    ) -> carina_core::parser::ModuleResolvedParsedFile {
+        carina_core::module_resolver::resolve_modules_providerless(
+            parsed,
+            std::path::Path::new("."),
+        )
+        .expect("test fixture crosses module resolution")
+    }
 
     #[test]
     fn hard_provider_load_error_keeps_unrelated_static_validation_error() {
@@ -531,6 +553,30 @@ backend s3 {
         assert!(parsed.get("warnings").is_none());
     }
 
+    #[test]
+    fn undefined_deferred_iterable_does_not_add_unsupported_body_error() {
+        let fixture = tempfile::tempdir().expect("undefined iterable fixture");
+        let child = fixture.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(
+            child.join("main.crn"),
+            "arguments { item: String }\nattributes { value = item }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            "let child = use { source = './child' }\n\
+             let calls = for item in itmes { child { item = item } }\n",
+        )
+        .unwrap();
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+
+        assert_eq!(errors.len(), 1, "unexpected validation errors: {errors:#?}");
+        assert!(errors[0].contains("Undefined identifier `itmes`"));
+        assert!(!errors[0].contains("cannot use module call"));
+    }
+
     /// carina#3121 fix A: the `--json` output must enumerate a `for`
     /// loop body over an unresolved (deferred) iterable, not just the
     /// human-readable list. Builds `ValidateOutput` exactly as the
@@ -558,18 +604,21 @@ backend s3 {
                 }
             }
         "#;
-        let mut parsed = carina_core::parser::parse_file(
+        let parsed = carina_core::parser::parse_file(
             src,
             std::path::Path::new("validate_fixture.crn"),
             &ProviderContext::default(),
         )
         .expect("fixture parses");
-        carina_core::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
-            .expect("cross the deferred-body resolution seam");
+        let parsed = carina_core::module_resolver::resolve_modules_providerless(
+            parsed,
+            std::path::Path::new("."),
+        )
+        .expect("cross the deferred-body resolution seam");
         // After the resolution seam the same-config provider-read loop is not
         // in `parsed.resources`; its resource-only template is ready for the
         // validate display path in `deferred_for_expressions`.
-        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+        assert_eq!(parsed.deferred_for_expressions().len(), 1);
 
         let entries = validated_entries(&parsed);
         let output = ValidateOutput {
@@ -616,6 +665,7 @@ backend s3 {
         let mut res = Resource::pending("s3.Bucket");
         res.id.provider = "aws".to_string();
         parsed.resources.push(res); // allow: direct — fixture test inspection
+        let parsed = resolve_file_for_test(parsed);
 
         let entries = validated_entries(&parsed);
         assert_eq!(entries.len(), 1);
@@ -660,6 +710,7 @@ backend s3 {
         parsed
             .compositions
             .push(composition("example_deadbeefdeadbeef", None));
+        let parsed = resolve_file_for_test(parsed);
 
         let rendered: Vec<_> = validated_entries(&parsed)
             .into_iter()

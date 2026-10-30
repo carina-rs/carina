@@ -100,6 +100,17 @@ pub enum ParseError {
     #[error("{0}")]
     DeferredForBodyUnsupported(Box<DeferredForBodyUnsupportedError>),
 
+    #[error(
+        "Deferred `for` expression `{header}` at line {line} cannot build its body template because its loop value is not known at plan time: {source}"
+    )]
+    DeferredForBodyTemplate {
+        line: usize,
+        header: String,
+        span: SourceSpan,
+        #[source]
+        source: Box<ParseError>,
+    },
+
     /// Provider-aware parsing could not resolve a type annotation. The
     /// rendered message is deliberately separate from the typed token used by
     /// diagnostic coverage and deduplication.

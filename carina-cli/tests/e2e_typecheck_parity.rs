@@ -128,7 +128,7 @@ fn cli_diagnostics_at(
 fn cli_validated_file(
     factories: Vec<Box<dyn ProviderFactory>>,
     fixture: &TempDir,
-) -> carina_core::parser::InferredFile {
+) -> carina_core::parser::ModuleResolvedInferredFile {
     let loaded = carina_core::config_loader::load_configuration_with_config(
         fixture.path(),
         &carina_core::parser::ProviderContext::default(),
@@ -293,15 +293,10 @@ fn module_call_parity_schemas() -> SchemaRegistry {
 }
 
 fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &SchemaRegistry) {
-    let context = carina_core::parser::ProviderContext {
-        decryptor: None,
-        custom_types: carina_core::provider::provider_custom_types_from_factories(Arc::new(
-            factories_for(schemas),
-        )),
-        resource_types: carina_core::parser::ProviderContext::resource_types_from_schema_registry(
-            schemas,
-        ),
-    };
+    let context = carina_core::provider::loaded_provider_context_from_factories(
+        schemas,
+        Arc::new(factories_for(schemas)),
+    );
     let directory = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
         base_dir,
         &context,
@@ -1370,6 +1365,91 @@ attributes { loaded: Bool = true }
             "each concrete constraint message must underline its own root call",
         );
     }
+}
+
+#[test]
+fn ignore_changes_validation_has_cli_lsp_parity_for_every_v1_error() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "backend.crn",
+            "backend local { path = \"carina.state.json\" }\n",
+        ),
+        (
+            "main.crn",
+            r#"let missing = mock.test.resource {
+  name = "missing"
+  directives { ignore_changes = [does_not_exist] }
+}
+let read_only = mock.test.resource {
+  name = "read-only"
+  directives { ignore_changes = [identifier] }
+}
+let indexed = mock.test.resource {
+  name = "indexed"
+  rule { action = "allow" }
+  directives { ignore_changes = [rule[0].action] }
+}
+let through_list = mock.test.resource {
+  name = "through-list"
+  rule { action = "allow" }
+  directives { ignore_changes = [rule.action] }
+}
+let union_path = mock.test.resource {
+  name = "union"
+  choice = { value = "selected" }
+  directives { ignore_changes = [choice.value] }
+}
+let unwritten = mock.test.resource {
+  name = "unwritten"
+  directives { ignore_changes = [comment] }
+}
+let duplicate = mock.test.resource {
+  name = "duplicate"
+  comment = "recorded"
+  directives { ignore_changes = [comment, comment] }
+}
+"#,
+        ),
+    ]);
+    let schemas = carina_provider_mock::builtin_schemas().into_iter().fold(
+        SchemaRegistry::new(),
+        |mut registry, schema| {
+            registry.insert("mock", schema);
+            registry
+        },
+    );
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    let extract = |message: &str| {
+        message
+            .find("ignore_changes path")
+            .map(|start| message[start..].to_string())
+    };
+    let mut cli_messages = cli
+        .iter()
+        .filter_map(|message| extract(message))
+        .collect::<Vec<_>>();
+    let mut lsp_messages = lsp
+        .iter()
+        .filter_map(|diagnostic| extract(&diagnostic.message))
+        .collect::<Vec<_>>();
+    cli_messages.sort();
+    lsp_messages.sort();
+
+    assert_eq!(cli_messages, lsp_messages, "CLI={cli:#?}; LSP={lsp:#?}");
+    assert_eq!(
+        cli_messages,
+        [
+            "ignore_changes path `choice.value` passes through a union",
+            "ignore_changes path `comment` is listed more than once",
+            "ignore_changes path `comment` is not written in this resource block",
+            "ignore_changes path `does_not_exist` does not exist in the resource schema",
+            "ignore_changes path `identifier` reaches a read-only or provider-populated node",
+            "ignore_changes path `rule.action` passes through a list, which is not supported",
+            "ignore_changes path `rule[0].action` contains a list index, which is not supported",
+        ]
+    );
 }
 
 #[test]
@@ -3331,22 +3411,21 @@ awscc.cloudfront.Distribution {
     .expect("write module fixture");
 
     let config = carina_core::parser::ProviderContext::default();
-    let mut loaded = carina_core::config_loader::load_configuration_with_config(
+    let loaded = carina_core::config_loader::load_configuration_with_config(
         fixture.path(),
         &config,
         &schemas,
     )
     .expect("load caller configuration");
-    carina_core::module_resolver::resolve_modules_with_config(
-        &mut loaded.parsed,
+    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
+        loaded.parsed,
         fixture.path(),
         &config,
         &schemas,
     )
     .expect("expand module call without panicking");
 
-    let expanded = loaded
-        .parsed
+    let expanded = parsed
         .resources
         .iter()
         .find(|resource| resource.id.resource_type == "cloudfront.Distribution")

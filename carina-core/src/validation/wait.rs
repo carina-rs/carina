@@ -47,8 +47,8 @@ pub struct WaitDiagnostic {
 
 /// Run all wait diagnostics against a parsed file + schema registry.
 /// Returns the full list of errors; callers decide how to surface them.
-pub fn validate_wait_bindings<E>(
-    parsed: &File<E>,
+pub fn validate_wait_bindings<E, D>(
+    parsed: &File<E, D>,
     schemas: &SchemaRegistry,
 ) -> Vec<WaitDiagnostic> {
     if parsed.wait_bindings.is_empty() {

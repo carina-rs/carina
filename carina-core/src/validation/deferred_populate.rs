@@ -65,8 +65,8 @@ pub struct DeferredPopulateDiagnostic {
 
 /// Run the deferred-populate diagnostic against a parsed file +
 /// schema registry.
-pub fn validate_deferred_populate_refs<E>(
-    parsed: &File<E>,
+pub fn validate_deferred_populate_refs<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &File<E, D>,
     schemas: &SchemaRegistry,
 ) -> Vec<DeferredPopulateDiagnostic> {
     // binding name → (provider, resource_type) for schema lookup.
@@ -527,7 +527,7 @@ mod tests {
         let mut parsed = parsed_with_unsynchronized_chained_ref();
         let record = parsed.resources.pop().expect("record resource");
         parsed
-            .parsed_deferred_for_expressions
+            .parsed_deferred_for_expressions_mut()
             .push(ParsedDeferredForExpression {
                 file: None,
                 line: 1,
@@ -537,6 +537,7 @@ mod tests {
                     binding: "records".to_string(),
                 },
                 iterable: Value::Concrete(ConcreteValue::List(Vec::new())),
+                iterable_state: crate::parser::ParsedDeferredForIterableState::Deferred,
                 binding: ForBinding::Simple("item".to_string()),
                 body: DeferredForBody::Resource(Box::new(record)),
             });

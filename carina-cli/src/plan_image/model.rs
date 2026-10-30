@@ -9,7 +9,7 @@ use carina_core::plan::{Plan, ReplaceDisplayInfo};
 use carina_core::plan_tree::build_dependency_graph_from_effects;
 use carina_core::resource::{
     EphemeralId, ExpansionTrace, LiveComposition, ModuleSource, PersistentId, ResolvedResource,
-    ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
+    ResolvedResourceId, ResourceId, ResourceIdentity,
 };
 
 use crate::plan_summary::{PlanChangeSummary, PlanEffectSummaryPart};
@@ -571,12 +571,17 @@ fn effect_owned_resource_id(effect: &Effect) -> Option<&ResourceId> {
 }
 
 fn dependency_only_create(resource: &ResolvedResource) -> Effect {
-    let mut shell = Resource::from_id(resource.id.clone());
-    shell.binding = resource.binding.clone();
+    // Project from the resolved resource so host-owned schema witnesses stay
+    // attached even though this graph-only shell deliberately drops values.
+    let mut shell = resource.as_inner().clone();
+    shell.attributes.clear();
+    shell.prefixes.clear();
+    shell.module_source = None;
+    shell.default_tag_keys = Default::default();
+    shell.quoted_string_attrs.clear();
     shell.dependency_bindings = carina_core::deps::get_resource_dependencies(resource.as_inner())
         .into_iter()
         .collect();
-    shell.directives = resource.directives.clone();
     Effect::Create(ResolvedResource::new(shell))
 }
 
@@ -1130,6 +1135,40 @@ mod tests {
         ResolvedResource::collect_resolved(resources).expect("test resources have resolved ids")
     }
 
+    #[test]
+    fn dependency_only_create_preserves_resolved_ignore_changes() {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+
+        let mut resource = Resource::new("test.Widget", "example").with_attribute(
+            "comment",
+            Value::Concrete(ConcreteValue::String("configured".into())),
+        );
+        resource.directives.ignore_changes = vec![
+            serde_json::from_value(serde_json::json!({
+                "segments": [{ "kind": "attribute", "value": "comment" }]
+            }))
+            .expect("valid ignore_changes path"),
+        ];
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            ResourceSchema::new("test.Widget")
+                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+                .validate()
+                .expect("valid graph-model schema"),
+        );
+        let resource = ResolvedResource::resolve_with_schemas(resource, &schemas)
+            .expect("ignore_changes path resolves");
+
+        let effect = dependency_only_create(&resource);
+        let Effect::Create(shell) = effect else {
+            panic!("dependency shell must be a create effect");
+        };
+
+        assert_eq!(shell.ignore_changes(), resource.ignore_changes());
+        assert!(shell.attributes.is_empty());
+    }
+
     fn named_resource(binding: &str, dependencies: &[&str]) -> Resource {
         let identity = carina_core::resource::ResourceIdentity::try_from(binding.to_string())
             .expect("test binding is a valid identity");
@@ -1185,7 +1224,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
 
         assert_eq!(model.nodes.len(), 2);
@@ -1210,7 +1253,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
 
@@ -1237,7 +1284,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
 
@@ -1283,15 +1334,16 @@ mod tests {
              }\n",
         )
         .expect("write deferred loop fixture");
-        let mut parsed = carina_core::config_loader::parse_directory(
+        let parsed = carina_core::config_loader::parse_directory(
             fixture.path(),
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("parse deferred loop fixture");
-        carina_core::module_resolver::resolve_modules(&mut parsed, fixture.path())
-            .expect("cross the deferred-body resolution seam");
+        let mut parsed =
+            carina_core::module_resolver::resolve_modules_providerless(parsed, fixture.path())
+                .expect("cross the deferred-body resolution seam");
         let template = parsed
-            .deferred_for_expressions
+            .deferred_for_expressions_mut()
             .pop()
             .expect("fixture contains one deferred loop");
         assert_eq!(template.target.display_name(), "main.crn:2");
@@ -1370,7 +1422,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
 
@@ -1390,7 +1446,11 @@ mod tests {
             &plan,
             &[],
             &[],
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let leaf = model.node(&GraphNodeId::Effect(2)).unwrap();
         let affected_by: HashSet<_> = leaf
@@ -1420,7 +1480,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let connector_id = GraphNodeId::Unchanged(ResolvedResourceId::new(connector.id));
         let unrelated_id = GraphNodeId::Unchanged(ResolvedResourceId::new(unrelated.id));
@@ -1439,7 +1503,7 @@ mod tests {
             compositions: &[],
             expansion_trace: None,
             state: None,
-            summary: &PlanChangeSummary::new(&fixture.plan, &[], &[]),
+            summary: &PlanChangeSummary::new(&fixture.plan, &[], &fixture.deferred_for_expressions),
         });
 
         let replacements: Vec<_> = model
@@ -1467,7 +1531,11 @@ mod tests {
             &plan,
             &[],
             &[],
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let source = model
             .nodes
@@ -1514,7 +1582,11 @@ mod tests {
                 &plan,
                 &desired,
                 &unresolved,
-                &PlanChangeSummary::new(&plan, &[], &[]),
+                &PlanChangeSummary::new(
+                    &plan,
+                    &[],
+                    &crate::plan_summary::resolved_deferred_for_for_test([]),
+                ),
             )
         });
 
@@ -1566,7 +1638,11 @@ mod tests {
                 &plan,
                 &desired,
                 &unresolved,
-                &PlanChangeSummary::new(&plan, &[], &[]),
+                &PlanChangeSummary::new(
+                    &plan,
+                    &[],
+                    &crate::plan_summary::resolved_deferred_for_for_test([]),
+                ),
             )
         });
         let deleted = model.node(&GraphNodeId::Effect(0)).expect("delete node");
@@ -1592,7 +1668,7 @@ mod tests {
             compositions: &fixture.compositions,
             expansion_trace: Some(&fixture.expansion_trace),
             state: None,
-            summary: &PlanChangeSummary::new(&fixture.plan, &[], &[]),
+            summary: &PlanChangeSummary::new(&fixture.plan, &[], &fixture.deferred_for_expressions),
         });
 
         let replacements: Vec<_> = model

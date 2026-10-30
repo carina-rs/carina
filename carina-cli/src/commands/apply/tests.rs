@@ -1,7 +1,7 @@
 use super::*;
 use carina_core::binding_index::LivePreApplyInputs;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
-use carina_core::effect::Effect;
+use carina_core::effect::{Effect, UnresolvedSavedEffect};
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
     PatchOp, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
@@ -67,6 +67,18 @@ fn complete_create(state: carina_core::resource::State) -> carina_core::executor
     }
 }
 
+fn resolve_file_for_test<E: carina_core::parser::ExportParamLike>(
+    parsed: carina_core::parser::File<E>,
+) -> carina_core::parser::ModuleResolvedFile<E> {
+    carina_core::module_resolver::resolve_modules_with_providerless_config(
+        parsed,
+        std::path::Path::new("."),
+        &carina_core::parser::ProviderContext::default(),
+        &carina_core::schema::SchemaRegistry::new(),
+    )
+    .expect("test fixture crosses module resolution")
+}
+
 fn complete_update(
     state: carina_core::resource::State,
     sent: &[&str],
@@ -83,17 +95,21 @@ fn canonical_unresolved_for_test(
     parsed: &carina_core::parser::InferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> CanonicalResourcePair<carina_core::parser::InferredExportParam> {
-    resolve_config_block_names_for_test(parsed.clone(), unresolved.clone(), ctx.schemas())
-        .unwrap_or_else(|errors| {
-            panic!(
-                "test block-name resolution failed: {}",
-                errors
-                    .into_iter()
-                    .map(|error| error.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        })
+    resolve_config_block_names_for_test(
+        resolve_file_for_test(parsed.clone()),
+        unresolved.clone(),
+        ctx.schemas(),
+    )
+    .unwrap_or_else(|errors| {
+        panic!(
+            "test block-name resolution failed: {}",
+            errors
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    })
 }
 
 fn canonical_resources_for_test(
@@ -102,8 +118,9 @@ fn canonical_resources_for_test(
 ) -> CanonicalResourcePair<carina_core::parser::ParsedExportParam> {
     let mut unresolved = carina_core::parser::ParsedFile::default();
     unresolved.resources = resources;
+    let resolved = resolve_file_for_test(unresolved.clone());
     resolve_config_block_names_for_test(
-        unresolved.clone(),
+        resolved,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         schemas,
     )
@@ -362,7 +379,7 @@ fn record_with_builtin_mock_schemas(contents: PlanFileContents) -> PlanFile {
 
 #[test]
 fn plan_format_29_round_trip_preserves_loop_provenance_and_deferred_targets() {
-    let mut parsed = carina_core::parser::parse_file(
+    let parsed = carina_core::parser::parse_file(
         r#"
 let orgs = upstream_state { source = "../orgs" }
 
@@ -382,8 +399,10 @@ for account_id in orgs.accounts {
         &ProviderContext::default(),
     )
     .expect("parse saved-plan loop provenance fixture");
-    carina_core::module_resolver::resolve_modules(&mut parsed, Path::new("."))
+    let parsed = carina_core::module_resolver::resolve_modules_providerless(parsed, Path::new("."))
         .expect("cross the deferred-body resolution seam");
+
+    let mut deferred = parsed.deferred_for_expressions().to_vec().into_iter();
 
     let mut resource = parsed
         .resources
@@ -402,7 +421,6 @@ for account_id in orgs.accounts {
         .expect("concrete loop provenance")
         .clone();
 
-    let mut deferred = parsed.deferred_for_expressions.into_iter();
     let bound = deferred.next().expect("bound deferred loop");
     let unbound = deferred.next().expect("unbound deferred loop");
     assert!(matches!(
@@ -447,7 +465,7 @@ for account_id in orgs.accounts {
     });
 
     let plan_file = record_with_builtin_mock_schemas(PlanFileContents {
-        version: PlanFile::CURRENT_VERSION,
+        version: 29,
         carina_version: "test".to_string(),
         timestamp: "2026-10-30T00:00:00Z".to_string(),
         source_path: "infra".to_string(),
@@ -497,7 +515,7 @@ for account_id in orgs.accounts {
         .effects()
         .iter()
         .find_map(|effect| match effect {
-            Effect::Move { origin, .. } => origin.as_ref(),
+            UnresolvedSavedEffect::Move { origin, .. } => origin.as_ref(),
             _ => None,
         })
         .expect("Move origin after round-trip");
@@ -508,7 +526,7 @@ for account_id in orgs.accounts {
         .effects()
         .iter()
         .filter_map(|effect| match effect {
-            Effect::DeferredCreate { template, .. } => Some(&template.target),
+            UnresolvedSavedEffect::DeferredCreate { template, .. } => Some(&template.target),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -814,7 +832,7 @@ fn checked_exports(
     carina_core::validation::check_export_values_pre_apply(
         params,
         &carina_core::binding_index::ResolvedBindings::default(),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
     )
     .expect("test exports must pass the secret boundary")
 }
@@ -910,6 +928,7 @@ fn saved_plan_import_rehydration_respects_current_provider_instance() {
         to_span: None,
         id: string_value("provider-id"),
     }];
+    let parsed = resolve_file_for_test(parsed);
 
     let identifiers = import_identifiers_from_current_config(&plan, &parsed);
 
@@ -951,6 +970,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     current.call_path = crate::test_composition_call_path_in(&current_source);
     let mut parsed = carina_core::parser::InferredFile::default();
     parsed.compositions = vec![current];
+    let parsed = resolve_file_for_test(parsed);
     let provider_inputs = load_and_resolve_provider_configs(
         &parsed,
         tmp.path(),
@@ -991,7 +1011,9 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
 
     let mut plan_file = plan_file
         .reload_in_flight_from_locked_state(None)
-        .expect("test plan should cross the locked-state reload boundary");
+        .expect("test plan should cross the locked-state reload boundary")
+        .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
+        .expect("test plan should cross schema resolution");
     let result = rehydrate_desired_plan_file_from_parts(
         &mut plan_file,
         candidates.parsed(),
@@ -1543,6 +1565,13 @@ let secret_resource = mock.test.resource {{
 async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
     let (_temp, downstream, parsed) =
         crate::provider_upstream_test_support::provider_upstream_fixture();
+    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
+        parsed,
+        &downstream,
+        &ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("test fixture crosses module resolution");
     let inputs = load_apply_provider_inputs(&parsed, &downstream, &ProviderContext::default())
         .await
         .expect("bootstrap provider inputs must resolve");
@@ -1572,6 +1601,13 @@ async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
 async fn apply_provider_loading_remains_all_strict_for_tag_only_upstreams() {
     let (_temp, base_dir, parsed) =
         crate::provider_upstream_test_support::provider_default_tags_missing_upstream_fixture();
+    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
+        parsed,
+        &base_dir,
+        &ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("test fixture crosses module resolution");
 
     let error =
         match load_apply_provider_inputs(&parsed, &base_dir, &ProviderContext::default()).await {
@@ -1675,6 +1711,13 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     let unresolved_parsed = loaded.unresolved_parsed;
     let wiring = ValidatedWiring::from_load_for_test(providers);
     let validated_config = validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed);
+    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
+        parsed,
+        &downstream,
+        &ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("test fixture crosses module resolution");
     let stale_inputs =
         load_apply_provider_inputs(&parsed, &downstream, &ProviderContext::default())
             .await
@@ -3735,6 +3778,13 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     )
     .expect("load plan fixture")
     .parsed;
+    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
+        parsed,
+        &downstream,
+        &ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("test fixture crosses module resolution");
     let plan_inputs = load_and_resolve_provider_configs(
         &parsed,
         &downstream,
@@ -6006,8 +6056,8 @@ async fn bootstrap_declared_state_bucket(
         .validate()
         .expect("schema fixture must be valid"),
     );
-    let parsed = carina_core::parser::InferredFile::default();
     let provider_configs = empty_resolved_provider_configs();
+    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
 
     create_checked_bootstrap_resource(
         provider,
@@ -6274,9 +6324,9 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
         .expect("schema fixture must be valid"),
     );
 
-    let parsed = carina_core::parser::InferredFile::default();
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
+    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
     let error = create_checked_bootstrap_resource(
         &provider,
         resource,
@@ -6347,12 +6397,13 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
 
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
+    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
     let error = create_checked_bootstrap_resource(
         &provider,
         resource,
         BootstrapCreateContext {
             backend: backend.as_ref(),
-            parsed: &carina_core::parser::InferredFile::default(),
+            parsed: &parsed,
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
             factories: &[],
@@ -6389,6 +6440,7 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
         Value::Concrete(ConcreteValue::String("forbidden".into())),
         "forbidden",
     )];
+    let parsed = resolve_file_for_test(parsed);
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
@@ -6447,13 +6499,14 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
     );
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
+    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
 
     let error = create_checked_bootstrap_resource(
         &provider,
         resource,
         BootstrapCreateContext {
             backend: backend.as_ref(),
-            parsed: &carina_core::parser::InferredFile::default(),
+            parsed: &parsed,
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
             factories: &[],
@@ -6532,13 +6585,14 @@ async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_
     );
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
+    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
 
     let error = create_checked_bootstrap_resource(
         &provider,
         resource,
         BootstrapCreateContext {
             backend: backend.as_ref(),
-            parsed: &carina_core::parser::InferredFile::default(),
+            parsed: &parsed,
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
             factories: &[],
@@ -6622,13 +6676,14 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
     );
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
+    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
 
     let error = create_checked_bootstrap_resource(
         &provider,
         resource,
         BootstrapCreateContext {
             backend: backend.as_ref(),
-            parsed: &carina_core::parser::InferredFile::default(),
+            parsed: &parsed,
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
             factories: &[],
@@ -6687,13 +6742,14 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
         .expect("schema fixture must be valid"),
     );
     let provider_configs = empty_resolved_provider_configs();
+    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
 
     let error = create_checked_bootstrap_resource(
         &provider,
         resource,
         BootstrapCreateContext {
             backend: &BootstrapWriteFailureBackend,
-            parsed: &carina_core::parser::InferredFile::default(),
+            parsed: &parsed,
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
             factories: &[],
@@ -7882,7 +7938,7 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()
@@ -7991,7 +8047,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()
@@ -8119,7 +8175,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()
@@ -8316,7 +8372,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()
@@ -8433,7 +8489,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()
@@ -8554,19 +8610,23 @@ mod apply_deferred_for_parity {
     use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
     use std::collections::HashMap;
 
-    fn parse_resolved(source: &str) -> carina_core::parser::ParsedFile {
-        let mut parsed = parse_file(
+    fn parse_resolved(source: &str) -> carina_core::parser::ModuleResolvedParsedFile {
+        let parsed = parse_file(
             source,
             std::path::Path::new("apply_deferred_for.crn"),
             &ProviderContext::default(),
         )
         .expect("parse");
-        carina_core::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
-            .expect("cross the deferred-body resolution seam");
-        parsed
+        carina_core::module_resolver::resolve_modules_providerless(
+            parsed,
+            std::path::Path::new("."),
+        )
+        .expect("cross the deferred-body resolution seam")
     }
 
-    fn dvo_state(parsed: &carina_core::parser::ParsedFile) -> HashMap<ResourceId, State> {
+    fn dvo_state(
+        parsed: &carina_core::parser::ModuleResolvedParsedFile,
+    ) -> HashMap<ResourceId, State> {
         let cert = parsed
             .resources
             .iter()
@@ -8847,8 +8907,10 @@ mod apply_deferred_for_parity {
 #[cfg(test)]
 mod saved_plan_version_tests {
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 29 persists anonymous
-    //! loop provenance, typed deferred targets, and Move origins (carina#4109).
+    //! `carina plan` is the supported migration. Version 31 persists authored
+    //! ignore paths; version 30 was reserved for provider protocol v13 and was
+    //! never emitted. Version 29 persists anonymous loop provenance, typed
+    //! deferred targets, and Move origins (carina#4109).
     //! Version 26 persists exact provider artifact identities (carina#4045);
     //! version 25 persists total data-source outcomes (carina#3993); version 24
     //! removed the wait target schema kind (carina#3916), and version 23 added
@@ -8904,7 +8966,7 @@ mod saved_plan_version_tests {
             panic!("expected typed unsupported plan version error")
         };
         assert_eq!(found, 28);
-        assert_eq!(expected, 29);
+        assert_eq!(expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
     }
 
     #[tokio::test]

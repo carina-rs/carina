@@ -2547,6 +2547,37 @@ fn deferred_template_contains_redacted_secret<S>(
         || attributes_contain_redacted_secret(template_resource.attributes.values())
 }
 
+pub(crate) fn unresolved_effect_contains_redacted_secret(
+    effect: &crate::effect::UnresolvedSavedEffect,
+) -> bool {
+    use crate::effect::UnresolvedSavedEffect;
+
+    match effect {
+        UnresolvedSavedEffect::Read { resource } => {
+            attributes_contain_redacted_secret(resource.attributes.values())
+        }
+        UnresolvedSavedEffect::Create(resource)
+        | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
+            attributes_contain_redacted_secret(resource.attributes.values())
+        }
+        UnresolvedSavedEffect::Update { from, to, .. } => {
+            attributes_contain_redacted_secret(from.attributes.values())
+                || attributes_contain_redacted_secret(to.attributes.values())
+        }
+        UnresolvedSavedEffect::Import { identifier, .. } => contains_redacted_secret(identifier),
+        UnresolvedSavedEffect::Wait { until, .. } => contains_redacted_secret(until.value()),
+        UnresolvedSavedEffect::DeferredCreate { template, .. } => {
+            deferred_template_contains_redacted_secret(template)
+        }
+        UnresolvedSavedEffect::DeferredReplace(payload) => {
+            deferred_template_contains_redacted_secret(&payload.template)
+        }
+        UnresolvedSavedEffect::Delete { .. }
+        | UnresolvedSavedEffect::Remove { .. }
+        | UnresolvedSavedEffect::Move { .. } => false,
+    }
+}
+
 pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<S>) -> bool {
     use crate::effect::Effect;
 
@@ -4123,7 +4154,7 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
     resources: &HashMap<crate::resource::ResourceId, crate::resource::Resource>,
     data_sources: &HashMap<crate::resource::ResourceId, crate::resource::DataSource>,
     import_identifiers: &HashMap<crate::resource::ResourceId, Value>,
-    deferred_templates: &[crate::parser::DeferredForExpression],
+    deferred_templates: &crate::parser::ResolvedDeferredForExpressions,
 ) -> Result<crate::plan::Plan<S>, SecretRehydrationSiteError> {
     use crate::effect::{DeferredReplacePayload, Effect};
 
@@ -5085,6 +5116,78 @@ fn canonicalize_desired_with_type_and_ancestry(
         return Err(error);
     }
     Ok(canonical)
+}
+
+/// Canonicalize one authored desired attribute through its resource schema.
+///
+/// Identity and reconciliation seams use this before reducing a value to a
+/// comparison string, so parser-surface enum identifiers and already
+/// canonical enum values share the same API-value representation.
+pub(crate) fn canonicalize_desired_attribute_value_with_schema(
+    mut value: Value,
+    schema: &crate::schema::ResourceSchema,
+    attribute: &str,
+) -> Result<Value, crate::schema::TypeError> {
+    // Already-canonical enums may carry an equivalent historical provider
+    // namespace. Their API spelling is the comparison identity at this seam,
+    // so only parser-surface EnumIdentifier values need schema resolution.
+    if first_enum_identifier(&value).is_none() {
+        return Ok(value);
+    }
+    reparse_canonical_enum_leaves(&mut value);
+    let Some(attribute_schema) = schema.attributes.get(attribute) else {
+        return Ok(value);
+    };
+    canonicalize_desired_with_type_and_ancestry(
+        value,
+        &attribute_schema.attr_type,
+        &schema.defs,
+        crate::schema::FieldAncestry::from_input_mode(attribute_schema.input_mode()),
+        DesiredValueSource::AuthoredDsl,
+    )
+}
+
+/// Re-enter already-canonical enum leaves through their API spelling when a
+/// container also contains parser-surface enum identifiers. This keeps the
+/// identity/reconciliation seam's documented API-value identity rule stable
+/// for mixed List/Map values, including historical provider namespaces.
+fn reparse_canonical_enum_leaves(value: &mut Value) {
+    match value {
+        Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
+            *value = Value::Concrete(ConcreteValue::enum_identifier(
+                canonical.api_value().to_string(),
+            ));
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
+            for item in items {
+                reparse_canonical_enum_leaves(item);
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            for item in map.values_mut() {
+                reparse_canonical_enum_leaves(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Canonicalize one provider or persisted-state attribute through its resource
+/// schema while preserving the attribute's effective input ancestry.
+pub(crate) fn canonicalize_state_attribute_value_with_schema(
+    value: Value,
+    schema: &crate::schema::ResourceSchema,
+    attribute: &str,
+) -> Value {
+    let Some(attribute_schema) = schema.attributes.get(attribute) else {
+        return value;
+    };
+    canonicalize_state_with_type_and_ancestry(
+        value,
+        &attribute_schema.attr_type,
+        &schema.defs,
+        crate::schema::FieldAncestry::from_input_mode(attribute_schema.input_mode()),
+    )
 }
 
 /// Canonicalize provider or persisted state. Unrecognized enum-positioned
@@ -6267,6 +6370,21 @@ pub fn canonicalize_states_with_schemas(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolved_deferred_templates(
+        expressions: impl IntoIterator<Item = crate::parser::DeferredForExpression>,
+    ) -> crate::parser::ResolvedDeferredForExpressions {
+        let resolved = crate::module_resolver::resolve_modules_providerless(
+            crate::parser::ParsedFile::default(),
+            std::path::Path::new("."),
+        )
+        .expect("deferred-template fixture crosses module resolution");
+        let mut templates = resolved.into_deferred_for_expressions();
+        for expression in expressions {
+            templates.push(expression);
+        }
+        templates
+    }
 
     #[test]
     fn state_canonicalization_fits_provider_output_with_missing_declared_required_field() {
@@ -12234,6 +12352,7 @@ mod tests {
             id: ResourceId::with_provider_identity("aws", "iam.policy", "p1", None),
             attributes,
             directives: Default::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("p1".to_string()),
             dependency_bindings: BTreeSet::new(),
@@ -12986,12 +13105,13 @@ mod tests {
         let Effect::DeferredCreate { template, .. } = &effect else {
             unreachable!();
         };
+        let deferred_templates = resolved_deferred_templates([template.as_ref().clone()]);
         let rehydrated = rehydrate_plan_desired_secrets(
             &redacted_plan,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            std::slice::from_ref(template.as_ref()),
+            &deferred_templates,
         )
         .expect("unchanged deferred template secret should rehydrate");
         let Effect::DeferredCreate { template, .. } = &rehydrated.effects()[0] else {
@@ -13137,12 +13257,13 @@ mod tests {
             )),
             template: redacted_template,
         });
+        let deferred_templates = resolved_deferred_templates([]);
         let rehydrated = rehydrate_plan_desired_secrets(
             &plan,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &[],
+            &deferred_templates,
         )
         .expect("placeholder-free template must not need a candidate");
         let Effect::DeferredCreate {

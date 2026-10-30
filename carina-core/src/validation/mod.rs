@@ -12,8 +12,8 @@ use indexmap::IndexMap;
 use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
-    ForBinding, ModuleCall, ModuleCallId, ProviderContext, ResourceContext, ResourceRef,
-    ResourceTypePath, SourceFileId, SourceSpan, TypeExpr,
+    ForBinding, LoadedProviderContext, ModuleCall, ModuleCallId, ProviderContext, ResourceContext,
+    ResourceRef, ResourceTypePath, SourceFileId, SourceSpan, TypeExpr,
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{
@@ -307,17 +307,48 @@ struct ExpectedEnumTarget<'a> {
 /// may leave dotted declarations unresolved, but this validation seam may not.
 pub struct ValidationTypeContext<'a> {
     pub schemas: &'a SchemaRegistry,
-    pub provider_context: &'a ProviderContext,
     pub module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+    provider_context: typecheck::TypecheckProviderContext<'a>,
     scope_bindings: BindingIndex<'a>,
     inference_bindings: inference::InferenceBindings,
 }
 
 impl<'a> ValidationTypeContext<'a> {
-    pub fn new<E>(
-        file: &'a crate::parser::File<E>,
+    pub fn new<E, D>(
+        file: &'a crate::parser::File<E, D>,
+        schemas: &'a SchemaRegistry,
+        provider_context: &'a LoadedProviderContext,
+        module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+    ) -> Self {
+        Self::with_provider_context(
+            file,
+            schemas,
+            typecheck::TypecheckProviderContext::loaded(provider_context),
+            module_signatures,
+        )
+    }
+
+    /// Build the validation view used by bootstrap/editor callers that have
+    /// no loaded provider custom-type catalog. Structural checks still run,
+    /// while provider-owned leaves never reach the resolver.
+    pub fn new_providerless<E, D>(
+        file: &'a crate::parser::File<E, D>,
         schemas: &'a SchemaRegistry,
         provider_context: &'a ProviderContext,
+        module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+    ) -> Self {
+        Self::with_provider_context(
+            file,
+            schemas,
+            typecheck::TypecheckProviderContext::providerless(provider_context),
+            module_signatures,
+        )
+    }
+
+    fn with_provider_context<E, D>(
+        file: &'a crate::parser::File<E, D>,
+        schemas: &'a SchemaRegistry,
+        provider_context: typecheck::TypecheckProviderContext<'a>,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     ) -> Self {
         Self {
@@ -331,6 +362,10 @@ impl<'a> ValidationTypeContext<'a> {
             ),
             inference_bindings: inference::bindings_from_parsed(file),
         }
+    }
+
+    fn raw_provider_context(&self) -> &'a ProviderContext {
+        self.provider_context.as_provider_context()
     }
 }
 
@@ -407,21 +442,21 @@ impl std::error::Error for BindingUseReport {}
 /// ```
 #[derive(Debug)]
 pub struct ResolvedFile<E> {
-    inner: crate::parser::File<E>,
+    inner: crate::parser::ModuleResolvedFile<E>,
 }
 
 impl<E> ResolvedFile<E> {
-    pub fn as_file(&self) -> &crate::parser::File<E> {
+    pub fn as_file(&self) -> &crate::parser::ModuleResolvedFile<E> {
         &self.inner
     }
 
-    pub fn into_file(self) -> crate::parser::File<E> {
+    pub fn into_file(self) -> crate::parser::ModuleResolvedFile<E> {
         self.inner
     }
 }
 
 impl<E> std::ops::Deref for ResolvedFile<E> {
-    type Target = crate::parser::File<E>;
+    type Target = crate::parser::ModuleResolvedFile<E>;
 
     fn deref(&self) -> &Self::Target {
         self.as_file()
@@ -746,7 +781,7 @@ fn resolve_value_source_against_sink(
             None => binding_value_assignable_to_enum(
                 value,
                 declared_type,
-                context.provider_context,
+                context.raw_provider_context(),
                 &target,
                 &resolver,
                 &identity,
@@ -763,7 +798,7 @@ fn resolve_value_source_against_sink(
             &use_site.name,
             declared_type,
             sink,
-            context.provider_context,
+            context.raw_provider_context(),
         );
     }
 
@@ -781,18 +816,15 @@ fn resolve_value_source_against_sink(
             FieldAncestry::WRITABLE,
         )
         .map_err(BindingResolutionError::Type),
-        RefSink::TypeExpr(type_expr) => typecheck::check_type_expr_value(
-            type_expr,
-            value,
-            context.provider_context,
-            typecheck::TypecheckInference::Unavailable,
-        )
-        .map_err(|error| BindingResolutionError::ValueType(Box::new(error))),
+        RefSink::TypeExpr(type_expr) => context
+            .provider_context
+            .check(type_expr, value, typecheck::TypecheckInference::Unavailable)
+            .map_err(|error| BindingResolutionError::ValueType(Box::new(error))),
     }
 }
 
-fn resource_sink<'a, E>(
-    file: &'a crate::parser::File<E>,
+fn resource_sink<'a, E, D: crate::parser::DeferredForPhaseTraversal>(
+    file: &'a crate::parser::File<E, D>,
     address: &crate::parser::ResourceAddress,
     path: &crate::parser::AttributePath,
     schemas: &'a SchemaRegistry,
@@ -832,8 +864,8 @@ fn resource_sink<'a, E>(
     Some(sink)
 }
 
-fn module_argument_type<E>(
-    file: &crate::parser::File<E>,
+fn module_argument_type<E, D>(
+    file: &crate::parser::File<E, D>,
     call_id: &crate::parser::ModuleCallId,
     argument: &str,
     signatures: &crate::module_resolver::ResolvedModuleSignatures,
@@ -860,9 +892,12 @@ fn module_argument_type<E>(
 
 fn module_enum_declaration(
     expected: &TypeExpr,
-    config: &ProviderContext,
+    config: typecheck::TypecheckProviderContext<'_>,
 ) -> Result<Option<AttributeType>, BindingResolutionError> {
     let TypeExpr::SchemaType { owned } = expected else {
+        return Ok(None);
+    };
+    let Some(config) = config.loaded_context() else {
         return Ok(None);
     };
     config
@@ -947,7 +982,7 @@ fn resolve_record_against_module(
     let Some(resolved) = resolve_module_argument_path_type(
         expected,
         &record.authored.path,
-        context.provider_context,
+        context.raw_provider_context(),
     )?
     else {
         return Ok(());
@@ -973,7 +1008,7 @@ fn resolve_record_against_module(
                 return binding_value_assignable_to_enum(
                     value,
                     declared_type.as_deref(),
-                    context.provider_context,
+                    context.raw_provider_context(),
                     &target,
                     &resolver,
                     &identity,
@@ -1024,8 +1059,8 @@ fn same_authored_use(
 /// module argument. A direct bare binding is the complete argument. For a
 /// nested use, ordinary container validation remains active unless the typed
 /// authority produced the diagnostic for that leaf.
-pub fn binding_use_authority_owns_module_argument<E>(
-    file: &crate::parser::File<E>,
+pub fn binding_use_authority_owns_module_argument<E, D>(
+    file: &crate::parser::File<E, D>,
     report: &BindingUseReport,
     call: &crate::parser::ModuleCallId,
     argument: &str,
@@ -1048,8 +1083,8 @@ pub fn binding_use_authority_owns_module_argument<E>(
 
 /// Whether parsing reserved this entire module argument because a structural
 /// leaf could not be represented in the runtime `Value` tree.
-pub fn module_argument_has_pending_binding_use<E>(
-    file: &crate::parser::File<E>,
+pub fn module_argument_has_pending_binding_use<E, D>(
+    file: &crate::parser::File<E, D>,
     call: &crate::parser::ModuleCallId,
     argument: &str,
 ) -> bool {
@@ -1068,8 +1103,8 @@ pub fn module_argument_has_pending_binding_use<E>(
 /// Report-only schema-aware authority for every parser-recorded bare binding
 /// use. Editor and collect-all validation paths borrow the file through this
 /// function; they do not mint production readiness.
-pub fn check_bare_binding_uses<E>(
-    file: &crate::parser::File<E>,
+pub fn check_bare_binding_uses<E, D: crate::parser::DeferredForPhaseTraversal>(
+    file: &crate::parser::File<E, D>,
     context: &ValidationTypeContext<'_>,
 ) -> BindingUseReport {
     let mut report = BindingUseReport {
@@ -1162,9 +1197,9 @@ pub fn check_bare_binding_uses<E>(
 /// channel, so no later caller can pair an unrelated file with a detached
 /// proof. On failure the report contains every authored finding.
 pub fn resolve_bare_binding_uses<E>(
-    file: crate::parser::File<E>,
+    file: crate::parser::ModuleResolvedFile<E>,
     schemas: &SchemaRegistry,
-    provider_context: &ProviderContext,
+    provider_context: &LoadedProviderContext,
     module_signatures: &crate::module_resolver::ResolvedModuleSignatures,
 ) -> Result<ResolvedFile<E>, BindingUseReport> {
     let report = {
@@ -1974,15 +2009,21 @@ fn composition_ref_error_kind(
 /// The shared value checker deliberately defers references. This pass supplies
 /// the missing binding authority: function-call arguments use their declared
 /// parameter type, and function bodies use the declared return type.
-pub fn validate_user_function_ref_types_with_bindings<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+pub fn validate_user_function_ref_types_with_bindings<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
     validate_user_function_ref_types_inner(parsed, bindings, UnknownReferencePolicy::Report)
 }
 
-fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+fn validate_user_function_ref_types_inner<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     bindings: &BindingIndex<'_>,
     unknown_policy: UnknownReferencePolicy,
 ) -> Result<(), String> {
@@ -2606,8 +2647,8 @@ pub fn validate_anonymous_resource_schemas<'a>(
 /// and a non-`read` resource requires a `Managed` registry entry. If the
 /// wrong-kind entry is present (e.g. `read` against a managed-only type),
 /// emit a kind-specific error explaining the mismatch.
-pub fn validate_resources<E>(
-    parsed: &crate::parser::File<E>,
+pub fn validate_resources<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &crate::parser::File<E, D>,
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
     provider_context: &ProviderContext,
@@ -2653,7 +2694,8 @@ pub fn validate_resources<E>(
          schema: Option<crate::schema::OwnerBoundResourceSchema<'_>>,
          id: &crate::resource::ResourceId,
          quoted_string_attrs: &HashSet<String>,
-         resolved_attributes: std::collections::HashMap<String, Value>| {
+         resolved_attributes: std::collections::HashMap<String, Value>,
+         managed_resource: Option<&crate::resource::Resource>| {
             match schema {
                 Some(schema) => {
                     let is_string_literal = |attr: &str| quoted_string_attrs.contains(attr);
@@ -2665,6 +2707,13 @@ pub fn validate_resources<E>(
                         for error in errors {
                             all_errors.push(format!("{}: {}", id, error));
                         }
+                    }
+                    if let Some(resource) = managed_resource
+                        && let Err(errors) =
+                            crate::resource::resolve_ignore_changes(resource, &schema)
+                    {
+                        all_errors
+                            .extend(errors.into_iter().map(|error| format!("{}: {}", id, error)));
                     }
                 }
                 None => {
@@ -2720,12 +2769,19 @@ pub fn validate_resources<E>(
                 (ValidatableKind::Resource, registry.get_for(m))
             }
         };
+        let managed_resource = match rref {
+            ResourceRef::Resource(resource)
+            | ResourceRef::Deferred { resource, .. }
+            | ResourceRef::ParsedDeferred { resource, .. } => Some(resource),
+            ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
+        };
         validate_resource(
             kind,
             schema,
             rref.id(),
             rref.quoted_string_attrs(),
             rref.resolved_attributes(),
+            managed_resource,
         );
     }
     if all_errors.is_empty() {
@@ -2739,8 +2795,8 @@ pub fn validate_resources<E>(
 ///
 /// For example, if `ipv4_ipam_pool_id` expects `IpamPoolId` type,
 /// a reference like `vpc.vpc_id` (which is `AwsResourceId`) should be an error.
-pub fn validate_resource_ref_types<E>(
-    parsed: &crate::parser::File<E>,
+pub fn validate_resource_ref_types<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &crate::parser::File<E, D>,
     registry: &SchemaRegistry,
     _argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_>,
@@ -2748,8 +2804,8 @@ pub fn validate_resource_ref_types<E>(
     validate_resource_ref_types_inner(parsed, registry, bindings)
 }
 
-fn validate_resource_ref_types_inner<E>(
-    parsed: &crate::parser::File<E>,
+fn validate_resource_ref_types_inner<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &crate::parser::File<E, D>,
     registry: &SchemaRegistry,
     bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
@@ -2932,8 +2988,11 @@ pub fn validate_deferred_for_iterable_types<E>(
     validate_deferred_for_iterable_types_with_bindings(parsed, schemas, &bindings)
 }
 
-fn validate_deferred_for_iterable_types_with_bindings<E>(
-    parsed: &crate::parser::File<E>,
+fn validate_deferred_for_iterable_types_with_bindings<
+    E,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     schemas: &SchemaRegistry,
     bindings: &inference::InferenceBindings,
 ) -> Vec<DeferredForIterableTypeDiagnostic> {
@@ -4110,7 +4169,7 @@ pub(crate) fn resolve_file_type_exprs_or_unknown<E: crate::parser::ExportParamLi
 /// top-level `arguments` or `attributes` block marks the directory as a
 /// module whose provider configuration comes from its caller.
 #[must_use]
-pub fn is_module_definition<E>(parsed: &crate::parser::File<E>) -> bool {
+pub fn is_module_definition<E, D>(parsed: &crate::parser::File<E, D>) -> bool {
     !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty()
 }
 
@@ -4929,12 +4988,12 @@ pub enum ModuleCallReferenceChecks {
 }
 
 /// Input to the authored module-call diagnostic phase.
-pub struct ModuleCallCheckInput<'a, 'bindings, E> {
+pub struct ModuleCallCheckInput<'a, 'bindings, E, C: ?Sized = LoadedProviderContext> {
     pub authored: &'a crate::parser::File<E>,
     pub semantic: Option<&'a crate::parser::File<E>>,
     pub base_dir: Option<&'a std::path::Path>,
     pub imported_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
-    pub provider_context: &'a ProviderContext,
+    pub provider_context: &'a C,
     pub schemas: &'a SchemaRegistry,
     pub binding_use_report: &'a BindingUseReport,
     pub bindings: &'a BindingIndex<'bindings>,
@@ -4958,7 +5017,7 @@ pub enum ExpandedModuleCallCheckInput<'a, 'bindings> {
 }
 
 struct ModuleCallChecker<'a> {
-    provider_context: &'a ProviderContext,
+    provider_context: typecheck::TypecheckProviderContext<'a>,
     schemas: &'a SchemaRegistry,
     findings: Vec<ModuleCallFinding>,
     active_modules: HashSet<std::path::PathBuf>,
@@ -5212,37 +5271,38 @@ impl ModuleCallChecker<'_> {
                 continue;
             }
 
-            let resolved_parameter =
-                match resolve_parameter_type_for_check(&parameter.type_expr, self.provider_context)
-                {
-                    Ok(Some(resolved_parameter)) => resolved_parameter,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        let source_file = authored_call.id().source_file();
-                        let line = authored.value_span().start_line();
-                        let anchor = module_call_anchor(authored_call.id(), authored.key_span());
-                        let diagnostic = TypeResolutionDiagnostic::description(
-                            format!(
-                                "module {} argument '{}' in {} at line {line}",
-                                authored_call.module_name,
-                                argument,
-                                source_file.display(),
-                            ),
-                            error.into(),
-                            Some(TypeResolutionSource::new(
-                                anchor.source_file.clone(),
-                                anchor.span,
-                            )),
-                        );
-                        self.push(
-                            ModuleCallFindingKind::TypeResolution,
-                            owner.clone(),
-                            anchor,
-                            ModuleCallFindingMessage::TypeResolution(Box::new(diagnostic)),
-                        );
-                        continue;
-                    }
-                };
+            let resolved_parameter = match resolve_parameter_type_for_check(
+                &parameter.type_expr,
+                self.provider_context.as_provider_context(),
+            ) {
+                Ok(Some(resolved_parameter)) => resolved_parameter,
+                Ok(None) => continue,
+                Err(error) => {
+                    let source_file = authored_call.id().source_file();
+                    let line = authored.value_span().start_line();
+                    let anchor = module_call_anchor(authored_call.id(), authored.key_span());
+                    let diagnostic = TypeResolutionDiagnostic::description(
+                        format!(
+                            "module {} argument '{}' in {} at line {line}",
+                            authored_call.module_name,
+                            argument,
+                            source_file.display(),
+                        ),
+                        error.into(),
+                        Some(TypeResolutionSource::new(
+                            anchor.source_file.clone(),
+                            anchor.span,
+                        )),
+                    );
+                    self.push(
+                        ModuleCallFindingKind::TypeResolution,
+                        owner.clone(),
+                        anchor,
+                        ModuleCallFindingMessage::TypeResolution(Box::new(diagnostic)),
+                    );
+                    continue;
+                }
+            };
             let semantic_argument = semantic_call.and_then(|call| call.argument(argument));
             let argument_value = semantic_argument.unwrap_or_else(|| authored.argument());
             if let Some(handle) = argument_value.handle() {
@@ -5279,12 +5339,10 @@ impl ModuleCallChecker<'_> {
             } else {
                 typecheck::TypecheckInference::Unavailable
             };
-            if let Err(error) = typecheck::check_type_expr_value(
-                &resolved_parameter.as_type_expr(),
-                value,
-                self.provider_context,
-                inference,
-            ) {
+            if let Err(error) =
+                self.provider_context
+                    .check(&resolved_parameter.as_type_expr(), value, inference)
+            {
                 self.push_finding(ModuleCallFinding::argument_value(
                     ModuleCallFindingKind::ValueType,
                     owner.clone(),
@@ -5409,11 +5467,12 @@ impl ModuleCallChecker<'_> {
         }
 
         if let Some(mut module) = crate::module_resolver::load_module(&module_dir) {
-            let resolution_errors = resolve_file_type_exprs(&mut module, self.provider_context);
+            let resolution_errors =
+                resolve_file_type_exprs(&mut module, self.provider_context.as_provider_context());
             let signatures = crate::module_resolver::load_resolved_module_signatures(
                 &module,
                 &module_dir,
-                self.provider_context,
+                self.provider_context.as_provider_context(),
             );
             let bindings = BindingIndex::from_parsed_with_module_signatures(
                 &module,
@@ -5422,7 +5481,7 @@ impl ModuleCallChecker<'_> {
             );
             let binding_use_report = check_bare_binding_uses(
                 &module,
-                &ValidationTypeContext::new(
+                &ValidationTypeContext::with_provider_context(
                     &module,
                     self.schemas,
                     self.provider_context,
@@ -5738,13 +5797,34 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
 }
 
 /// Collect module-call findings from authored source and its imported graph.
-pub fn check_module_calls<E>(input: ModuleCallCheckInput<'_, '_, E>) -> Vec<ModuleCallFinding> {
+pub fn check_module_calls<E>(
+    input: ModuleCallCheckInput<'_, '_, E, LoadedProviderContext>,
+) -> Vec<ModuleCallFinding> {
+    let provider_context = typecheck::TypecheckProviderContext::loaded(input.provider_context);
+    check_module_calls_with_provider_context(input, provider_context)
+}
+
+/// Providerless module-call diagnostics for bootstrap and orphan-editor
+/// contexts. Structural checks still run, while provider-owned leaves are not
+/// sent to an unloaded resolver.
+pub fn check_module_calls_providerless<E>(
+    input: ModuleCallCheckInput<'_, '_, E, ProviderContext>,
+) -> Vec<ModuleCallFinding> {
+    let provider_context =
+        typecheck::TypecheckProviderContext::providerless(input.provider_context);
+    check_module_calls_with_provider_context(input, provider_context)
+}
+
+fn check_module_calls_with_provider_context<'a, 'bindings, E, C: ?Sized>(
+    input: ModuleCallCheckInput<'a, 'bindings, E, C>,
+    provider_context: typecheck::TypecheckProviderContext<'a>,
+) -> Vec<ModuleCallFinding> {
     let ModuleCallCheckInput {
         authored,
         semantic,
         base_dir,
         imported_signatures,
-        provider_context,
+        provider_context: _,
         schemas,
         binding_use_report,
         bindings,
@@ -5778,7 +5858,7 @@ pub fn check_expanded_module_calls(
     let provider_context = ProviderContext::default();
     let schemas = SchemaRegistry::new();
     let mut checker = ModuleCallChecker {
-        provider_context: &provider_context,
+        provider_context: typecheck::TypecheckProviderContext::providerless(&provider_context),
         schemas: &schemas,
         findings: Vec::new(),
         active_modules: HashSet::new(),
@@ -5876,7 +5956,7 @@ impl<P> CheckedExportValues<P> {
 fn resolve_and_validate_export_values<P>(
     export_params: &[P],
     bindings: &crate::binding_index::ResolvedBindings,
-    config: &ProviderContext,
+    config: typecheck::TypecheckProviderContext<'_>,
 ) -> Result<Vec<P>, String>
 where
     P: crate::parser::ExportParamLike + Clone,
@@ -5903,7 +5983,11 @@ where
                 checked.push(resolved_param);
                 continue;
             }
-            match crate::resolver::resolve_ref_value_with_config(value, bindings, config) {
+            match crate::resolver::resolve_ref_value_with_config(
+                value,
+                bindings,
+                config.as_provider_context(),
+            ) {
                 Ok(resolved) if crate::value::contains_secret(&resolved) => {
                     errors.push(format!(
                         "export '{}' cannot hold a secret value",
@@ -5914,10 +5998,9 @@ where
                     resolved_param.set_value(Some(resolved));
                     if let (Some(type_expr), Some(value)) =
                         (resolved_param.type_expr_opt(), resolved_param.value())
-                        && let Err(error) = typecheck::check_type_expr_value(
+                        && let Err(error) = config.check(
                             type_expr,
                             value,
-                            config,
                             typecheck::TypecheckInference::Unavailable,
                         )
                     {
@@ -5937,10 +6020,10 @@ where
     }
 }
 
-/// Resolve every export through the pre-apply value binding graph, evaluate
-/// builtins that become concrete, and accumulate both secret-boundary and
-/// value-type errors in one pass.
-pub fn check_export_values_pre_apply<P>(
+/// Resolve and structurally validate exports without loaded providers.
+/// Provider-owned custom-type leaves are left unchecked, while container
+/// shapes and provider-independent sibling values retain normal diagnostics.
+pub fn check_export_values_pre_apply_providerless<P>(
     export_params: &[P],
     bindings: &crate::binding_index::ResolvedBindings,
     config: &ProviderContext,
@@ -5948,7 +6031,33 @@ pub fn check_export_values_pre_apply<P>(
 where
     P: crate::parser::ExportParamLike + Clone,
 {
-    let display_params = resolve_and_validate_export_values(export_params, bindings, config)?;
+    let display_params = resolve_and_validate_export_values(
+        export_params,
+        bindings,
+        typecheck::TypecheckProviderContext::providerless(config),
+    )?;
+    Ok(ExportsCheckedPreApply {
+        original_params: export_params.to_vec(),
+        display_params,
+    })
+}
+
+/// Resolve every export through the pre-apply value binding graph, evaluate
+/// builtins that become concrete, and accumulate both secret-boundary and
+/// value-type errors in one pass.
+pub fn check_export_values_pre_apply<P>(
+    export_params: &[P],
+    bindings: &crate::binding_index::ResolvedBindings,
+    config: &LoadedProviderContext,
+) -> Result<ExportsCheckedPreApply<P>, String>
+where
+    P: crate::parser::ExportParamLike + Clone,
+{
+    let display_params = resolve_and_validate_export_values(
+        export_params,
+        bindings,
+        typecheck::TypecheckProviderContext::loaded(config),
+    )?;
     Ok(ExportsCheckedPreApply {
         original_params: export_params.to_vec(),
         display_params,
@@ -5961,13 +6070,16 @@ where
 pub fn resolve_export_values_post_apply<P>(
     export_params: &ExportsCheckedPreApply<P>,
     bindings: &crate::binding_index::ResolvedBindings,
-    config: &ProviderContext,
+    config: &LoadedProviderContext,
 ) -> Result<CheckedExportValues<P>, String>
 where
     P: crate::parser::ExportParamLike + Clone,
 {
-    let params =
-        resolve_and_validate_export_values(&export_params.original_params, bindings, config)?;
+    let params = resolve_and_validate_export_values(
+        &export_params.original_params,
+        bindings,
+        typecheck::TypecheckProviderContext::loaded(config),
+    )?;
     Ok(CheckedExportValues { params })
 }
 
@@ -5978,7 +6090,7 @@ where
 /// has the source type authority needed for directional checks.
 pub fn validate_attribute_params(
     attribute_params: &[crate::parser::AttributeParameter],
-    config: &ProviderContext,
+    config: &LoadedProviderContext,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
 
@@ -6017,6 +6129,25 @@ pub fn check_unused_bindings(view: &crate::config_loader::AuthoredBindingView) -
 }
 
 fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<String> {
+    let resources = parsed.iter_all_resources().collect();
+    let deferred_sites = parsed.deferred_for_sites().collect();
+    check_unused_bindings_in_file_parts(parsed, resources, deferred_sites)
+}
+
+#[cfg(test)]
+fn check_unused_bindings_in_resolved_file(
+    parsed: &crate::parser::ModuleResolvedParsedFile,
+) -> Vec<String> {
+    let resources = parsed.iter_all_resources().collect();
+    let deferred_sites = parsed.deferred_for_sites().collect();
+    check_unused_bindings_in_file_parts(parsed, resources, deferred_sites)
+}
+
+fn check_unused_bindings_in_file_parts<'a, D>(
+    parsed: &'a crate::parser::File<crate::parser::ParsedExportParam, D>,
+    resources: Vec<ResourceRef<'a>>,
+    deferred_sites: Vec<crate::parser::DeferredForSite<'a>>,
+) -> Vec<String> {
     let mut referenced: HashSet<String> = HashSet::new();
     let mut scoped_bare_references: HashSet<(crate::parser::BindingScopeId, String)> =
         HashSet::new();
@@ -6043,7 +6174,7 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
     // for the top-level managed-resource arm, matching plan's `parsed.resources`
     // target-resolution set.
     let mut defined_bindings: Vec<(String, Option<crate::parser::BindingScopeId>)> = Vec::new();
-    for rref in parsed.iter_all_resources() {
+    for rref in &resources {
         if let Some(binding_name) = rref.binding() {
             if binding_name == "_" {
                 continue;
@@ -6070,7 +6201,7 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
     // Collect all referenced binding names. Walk both top-level resources
     // and for-body template resources so bindings referenced only inside a
     // `for` loop are counted as used.
-    for rref in parsed.iter_all_resources() {
+    for rref in &resources {
         let attrs = rref.attributes();
         for value in attrs.values() {
             collect_dependencies(value, &mut referenced);
@@ -6081,7 +6212,7 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
             referenced.insert(dep.clone());
         }
     }
-    for deferred in parsed.deferred_for_sites() {
+    for deferred in deferred_sites {
         collect_dependencies(deferred.iterable, &mut referenced);
     }
     for call in &parsed.module_calls {

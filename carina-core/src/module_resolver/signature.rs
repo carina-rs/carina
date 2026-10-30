@@ -59,8 +59,8 @@ pub(super) fn resolved_signature(
 }
 
 /// Load and resolve every module signature imported by `parsed`.
-pub fn load_resolved_module_signatures<E>(
-    parsed: &File<E>,
+pub fn load_resolved_module_signatures<E, D>(
+    parsed: &File<E, D>,
     base_dir: &Path,
     config: &ProviderContext,
 ) -> ResolvedModuleSignatures {

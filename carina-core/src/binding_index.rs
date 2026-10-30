@@ -457,8 +457,8 @@ impl<'a> BindingIndex<'a> {
     /// silently skipped — callers (validation / LSP) treat unknown resource
     /// types as a separate diagnostic, so reporting them again here would
     /// double-count. LiveComposition bindings do not need a registry lookup.
-    pub fn from_parsed<E>(
-        parsed: &'a crate::parser::File<E>,
+    pub fn from_parsed<E, D>(
+        parsed: &'a crate::parser::File<E, D>,
         registry: &'a SchemaRegistry,
     ) -> Self {
         Self::build(parsed, registry, None, None)
@@ -468,8 +468,8 @@ impl<'a> BindingIndex<'a> {
     /// This is the pre-expansion authority for references such as `web.url`:
     /// the module call is not a [`LiveComposition`] yet, but its imported
     /// signature already declares the output type.
-    pub fn from_parsed_with_module_signatures<E>(
-        parsed: &'a crate::parser::File<E>,
+    pub fn from_parsed_with_module_signatures<E, D>(
+        parsed: &'a crate::parser::File<E, D>,
         registry: &'a SchemaRegistry,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     ) -> Self {
@@ -479,8 +479,8 @@ impl<'a> BindingIndex<'a> {
     /// Build the index with statically resolved `upstream_state` exports.
     /// Bindings whose source could not be loaded are still recorded as known
     /// and therefore resolve to [`RefType::Unchecked`].
-    pub fn from_parsed_with_upstream_exports<E>(
-        parsed: &'a crate::parser::File<E>,
+    pub fn from_parsed_with_upstream_exports<E, D>(
+        parsed: &'a crate::parser::File<E, D>,
         registry: &'a SchemaRegistry,
         upstream_exports: &'a crate::upstream_exports::UpstreamExports,
     ) -> Self {
@@ -488,8 +488,8 @@ impl<'a> BindingIndex<'a> {
     }
 
     /// Build the complete pre-expansion validation index used by the LSP.
-    pub fn from_parsed_with_upstream_exports_and_module_signatures<E>(
-        parsed: &'a crate::parser::File<E>,
+    pub fn from_parsed_with_upstream_exports_and_module_signatures<E, D>(
+        parsed: &'a crate::parser::File<E, D>,
         registry: &'a SchemaRegistry,
         upstream_exports: &'a crate::upstream_exports::UpstreamExports,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
@@ -502,8 +502,8 @@ impl<'a> BindingIndex<'a> {
         )
     }
 
-    fn build<E>(
-        parsed: &'a crate::parser::File<E>,
+    fn build<E, D>(
+        parsed: &'a crate::parser::File<E, D>,
         registry: &'a SchemaRegistry,
         upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports>,
         module_signatures: Option<&'a crate::module_resolver::ResolvedModuleSignatures>,
@@ -1155,7 +1155,7 @@ impl BindingNameSet {
     /// — keeps `Variable` last because `parsed.variables` is the
     /// catch-all "any `let`-RHS placeholder lives here" map, while the
     /// preceding sources are narrower declaration forms.
-    pub fn from_parsed<E>(parsed: &crate::parser::File<E>) -> Self {
+    pub fn from_parsed<E, D>(parsed: &crate::parser::File<E, D>) -> Self {
         let mut by_name: HashMap<String, BindingNameKind> = HashMap::new();
 
         // carina#3181: walk the typed top-level slices — managed
@@ -1502,7 +1502,7 @@ impl ResolvedBindings {
     /// aliases are the complete value authority available at this phase.
     /// Keeping this constructor next to [`Self::pre_apply`] prevents CLI and
     /// LSP validation from assembling subtly different binding maps.
-    pub fn for_validation<E>(parsed: &crate::parser::File<E>) -> Self {
+    pub fn for_validation<E, D>(parsed: &crate::parser::File<E, D>) -> Self {
         let wait_aliases = parsed
             .wait_bindings
             .iter()

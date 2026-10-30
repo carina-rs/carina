@@ -1209,7 +1209,7 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
         )
         .chain(
             parsed
-                .parsed_deferred_for_expressions
+                .parsed_deferred_for_expressions()
                 .iter()
                 .filter_map(|deferred| match &deferred.body {
                     crate::parser::DeferredForBody::Resource(resource) => Some(resource.id.clone()),
@@ -1246,7 +1246,7 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
             origin.set_display_file(&display_file);
         }
     }
-    for deferred in &mut parsed.parsed_deferred_for_expressions {
+    for deferred in parsed.parsed_deferred_for_expressions_mut() {
         deferred.target.set_loop_display_file(&display_file);
         match &mut deferred.body {
             crate::parser::DeferredForBody::Resource(resource) => {
@@ -1261,7 +1261,7 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
     for warning in &mut parsed.warnings {
         warning.file = warning_file.clone();
     }
-    for deferred in &mut parsed.parsed_deferred_for_expressions {
+    for deferred in parsed.parsed_deferred_for_expressions_mut() {
         deferred.file = warning_file.clone();
     }
 }
@@ -2103,17 +2103,17 @@ for account_id in orgs.accounts {
         )
         .unwrap();
 
-        let mut config = load_configuration(&dir).expect("directory fixture loads");
-        crate::module_resolver::resolve_modules_with_config(
-            &mut config.parsed,
+        let config = load_configuration(&dir).expect("directory fixture loads");
+        let mut parsed = crate::module_resolver::resolve_modules_with_providerless_config(
+            config.parsed,
             &dir,
             &ProviderContext::default(),
             &SchemaRegistry::new(),
         )
         .expect("directory fixture crosses the module-resolution seam");
-        assert_eq!(config.parsed.deferred_for_expressions.len(), 1);
-        let deferred_line = config.parsed.deferred_for_expressions[0].line;
-        config.parsed.warnings.push(crate::parser::ParseWarning {
+        assert_eq!(parsed.deferred_for_expressions().len(), 1);
+        let deferred_line = parsed.deferred_for_expressions()[0].line;
+        parsed.warnings.push(crate::parser::ParseWarning {
             file: Some(crn_path.display().to_string()),
             line: deferred_line,
             kind: crate::parser::WarningKind::DeferredFor,
@@ -2131,20 +2131,18 @@ for account_id in orgs.accounts {
                     )])),
                 )]),
             )]));
-        config
-            .parsed
+        parsed
             .expand_deferred_for_expressions(&bindings)
             .expect("resolved upstream iterable expands");
 
-        assert!(config.parsed.deferred_for_expressions.is_empty());
+        assert!(parsed.deferred_for_expressions().is_empty());
         assert!(
-            config
-                .parsed
+            parsed
                 .warnings
                 .iter()
                 .all(|warning| warning.kind != crate::parser::WarningKind::DeferredFor),
             "resolved loop retained stale warnings: {:?}",
-            config.parsed.warnings,
+            parsed.warnings,
         );
         cleanup(&dir);
     }
@@ -2257,17 +2255,17 @@ let orgs = upstream_state {
 
     fn resolve_deferred_for_fixture(
         fixture: &tempfile::TempDir,
-    ) -> Result<InferredFile, crate::module_resolver::ModuleError> {
-        let mut parsed = load_configuration(fixture.path())
+    ) -> Result<crate::parser::ModuleResolvedInferredFile, crate::module_resolver::ModuleError>
+    {
+        let parsed = load_configuration(fixture.path())
             .expect("the parser-side deferred body must survive directory loading")
             .parsed;
-        crate::module_resolver::resolve_modules_with_config(
-            &mut parsed,
+        crate::module_resolver::resolve_modules_with_providerless_config(
+            parsed,
             fixture.path(),
             &ProviderContext::default(),
             &SchemaRegistry::new(),
-        )?;
-        Ok(parsed)
+        )
     }
 
     #[test]
@@ -2343,6 +2341,50 @@ let orgs = upstream_state {
             })
             .collect::<Vec<_>>();
         assert_eq!(names, ["A", "B"]);
+    }
+
+    #[test]
+    fn deferred_for_body_template_error_retains_loop_site_and_source() {
+        let fixture = tempfile::tempdir().expect("deferred body error fixture");
+        let file = fixture.path().join("main.crn");
+        let source = "let src = mock.test.resource { name = 'src' }\n\
+                      let lookup = { one = 'A' }\n\
+                      let resources = for name in src.list { mock.test.resource { name = lookup[name] } }\n";
+        let error =
+            parse_directory_files(&[(file, source.to_string())], &ProviderContext::default())
+                .expect_err("a dynamic template subscript must fail at the deferred-loop boundary");
+
+        let parser::ParseError::DeferredForBodyTemplate {
+            line,
+            header,
+            source,
+            ..
+        } = &error
+        else {
+            panic!("expected a typed deferred-body template error, got {error:?}");
+        };
+        assert_eq!(*line, 3);
+        assert_eq!(header, "for name in src.list");
+        assert!(matches!(
+            source.as_ref(),
+            parser::ParseError::InvalidExpression { message, .. }
+                if message.contains("index access key must be an integer or string")
+        ));
+        let message = error.to_string();
+        assert!(message.contains("for name in src.list"), "{message}");
+        assert!(message.contains("line 3"), "{message}");
+        assert!(
+            message.contains("loop value is not known at plan time"),
+            "{message}"
+        );
+        let source_error = std::error::Error::source(&error)
+            .expect("the body-local parser error must remain the typed source");
+        assert!(
+            source_error
+                .to_string()
+                .contains("index access key must be an integer or string"),
+            "{source_error}"
+        );
     }
 
     #[test]
@@ -2488,10 +2530,10 @@ let orgs = upstream_state {
 
         let parsed = resolve_deferred_for_fixture(&fixture)
             .expect("a managed-resource deferred-for body remains supported");
-        let [deferred] = parsed.deferred_for_expressions.as_slice() else {
+        let [deferred] = parsed.deferred_for_expressions().as_slice() else {
             panic!(
                 "expected exactly one deferred placeholder, got {:?}",
-                parsed.deferred_for_expressions
+                parsed.deferred_for_expressions()
             );
         };
         assert_eq!(deferred.header, "for x in src.list");

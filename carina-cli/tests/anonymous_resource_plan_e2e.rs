@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use carina_cli::commands::plan::PlanFile;
-use carina_core::effect::Effect;
+use carina_core::effect::UnresolvedSavedEffect as Effect;
 use carina_core::hint::ProjectCommand;
 use carina_state::StateFile;
 use tempfile::TempDir;

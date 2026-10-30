@@ -211,6 +211,22 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                     .create_only()
                     .build(),
             )
+            .attribute(
+                AttributeSchema::optional(
+                    "choice",
+                    AttributeType::union(vec![
+                        AttributeType::struct_(
+                            "StringChoice",
+                            vec![StructField::required("value", AttributeType::string()).build()],
+                        ),
+                        AttributeType::struct_(
+                            "IntegerChoice",
+                            vec![StructField::required("number", AttributeType::int()).build()],
+                        ),
+                    ]),
+                )
+                .build(),
+            )
             .attribute(AttributeSchema::optional("web_acl_arn", AttributeType::string()).build())
             .attribute(AttributeSchema::optional("parent", AttributeType::string()).build())
             .attribute(AttributeSchema::optional("parent_name", AttributeType::string()).build())
@@ -1111,6 +1127,51 @@ fn append_update_trace(event: &str, resource: &str, active: Option<usize>) {
     let _ = file.write_all(line.as_bytes());
 }
 
+fn append_update_patch_log(id: &ResourceId, ops: &[PatchOp]) -> ProviderResult<()> {
+    let Some(path) = env::var_os("CARINA_MOCK_UPDATE_PATCH_LOG").map(PathBuf::from) else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            ProviderError::internal_caused_by(
+                "Failed to create mock update patch log directory",
+                error,
+            )
+        })?;
+    }
+    let operations = ops
+        .iter()
+        .map(|op| match op {
+            PatchOp::Add { key, .. } => serde_json::json!({ "op": "add", "key": key }),
+            PatchOp::Replace { key, .. } => {
+                serde_json::json!({ "op": "replace", "key": key })
+            }
+            PatchOp::Reassert { key, .. } => {
+                serde_json::json!({ "op": "reassert", "key": key })
+            }
+            PatchOp::Remove { key } => serde_json::json!({ "op": "remove", "key": key }),
+        })
+        .collect::<Vec<_>>();
+    let line = serde_json::to_string(&serde_json::json!({
+        "resource": id.to_string(),
+        "operations": operations,
+    }))
+    .map_err(|error| {
+        ProviderError::internal_caused_by("Failed to encode mock update patch log", error)
+    })?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| {
+            ProviderError::internal_caused_by("Failed to open mock update patch log", error)
+        })?;
+    file.write_all(format!("{line}\n").as_bytes())
+        .map_err(|error| {
+            ProviderError::internal_caused_by("Failed to append mock update patch log", error)
+        })
+}
+
 impl MockProvider {
     async fn read_attributes(
         &self,
@@ -1370,12 +1431,22 @@ impl Provider for MockProvider {
             if let Some(error) = Self::update_fail_error_for(&id) {
                 return Err(error);
             }
+            append_update_patch_log(&id, &request.patch().ops)?;
 
-            // Apply the patch on top of `from` to construct the post-update
-            // attribute map. The mock writes only what the user changed —
-            // matching the Level 3 contract that providers MUST NOT touch
-            // unspecified fields.
-            let mut attributes = request.from().attributes.clone();
+            let _state_guard = Self::lock_state_file()?;
+            let mut states = self.load_states_for_operation()?;
+            // Apply only the requested operations to the provider's current
+            // value. In particular, a read may omit write-only leaves that
+            // still exist in the backend and must survive an unrelated patch.
+            let mut attributes = states.get(&key).map_or_else(
+                || request.from().attributes.clone(),
+                |attributes| {
+                    attributes
+                        .iter()
+                        .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
+                        .collect()
+                },
+            );
             for op in &request.patch().ops {
                 match op {
                     PatchOp::Add { key, value }
@@ -1393,8 +1464,6 @@ impl Provider for MockProvider {
             Self::add_server_list_update_out_of_band_element(&id, &mut attributes);
             Self::add_server_list_defaults(&id, &mut attributes);
 
-            let _state_guard = Self::lock_state_file()?;
-            let mut states = self.load_states_for_operation()?;
             let partial_update = self.partial_update_config_for(&id);
             let mut attrs: HashMap<String, PersistedValue> = attributes
                 .iter()

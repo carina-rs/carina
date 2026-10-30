@@ -188,7 +188,7 @@ pub type InferenceBindings = HashMap<String, InferenceBinding>;
 /// Build an [`InferenceBindings`] map from a `ParsedFile`. Convenience
 /// over [`bindings_from_parts`] for the common case of having a parsed
 /// file in hand.
-pub fn bindings_from_parsed<E>(parsed: &crate::parser::File<E>) -> InferenceBindings {
+pub fn bindings_from_parsed<E, D>(parsed: &crate::parser::File<E, D>) -> InferenceBindings {
     // carina#3181: pass the typed top-level slices directly so
     // `bindings_from_parts` classifies managed resources, data sources,
     // and (post-expansion) composition rows from their own kinds.
@@ -1054,10 +1054,13 @@ fn infer_function_call(
 /// sentinel-over-exclude shape prevents cascading "missing export"
 /// diagnostics; the inference error is the single point of truth for
 /// "this needs an annotation".
-pub fn apply_inference(
-    parsed: crate::parser::ParsedFile,
+pub fn apply_inference<D>(
+    parsed: crate::parser::File<crate::parser::ParsedExportParam, D>,
     schemas: &SchemaRegistry,
-) -> (crate::parser::InferredFile, Vec<ExportInferenceError>) {
+) -> (
+    crate::parser::File<crate::parser::InferredExportParam, D>,
+    Vec<ExportInferenceError>,
+) {
     let (inferred_exports, errors) = infer_export_params(&parsed, schemas);
     // Single phase-axis surface (carina#3126): only `export_params`
     // changes phase; every other field moves through `map_export_params`
@@ -1072,8 +1075,8 @@ pub fn apply_inference(
 /// non-export field; consumers that only need the export-side typecheck
 /// (LSP diagnostics, in particular) should use this instead to avoid
 /// the per-keystroke deep-clone.
-pub fn infer_export_params(
-    parsed: &crate::parser::ParsedFile,
+pub fn infer_export_params<D>(
+    parsed: &crate::parser::File<crate::parser::ParsedExportParam, D>,
     schemas: &SchemaRegistry,
 ) -> (
     Vec<crate::parser::InferredExportParam>,
@@ -1138,8 +1141,8 @@ pub fn infer_export_params(
 /// [`crate::validation::validate_export_param_ref_types_with_bindings`]. The
 /// LSP runs inference post-expansion and may report the same class through its
 /// `Virtual` binding instead; index suppression gives both paths one diagnostic.
-pub fn retry_unknown_export_inference(
-    parsed: &crate::parser::InferredFile,
+pub fn retry_unknown_export_inference<D>(
+    parsed: &crate::parser::File<crate::parser::InferredExportParam, D>,
     schemas: &SchemaRegistry,
     prior_errors: &[ExportInferenceError],
 ) -> Vec<ExportInferenceError> {

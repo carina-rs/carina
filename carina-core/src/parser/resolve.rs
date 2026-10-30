@@ -763,7 +763,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // call here would serialize its plaintext arguments from a deferred plan
     // effect. Keep resource references deferred so apply-time expansion still
     // substitutes the loop value and other runtime bindings normally.
-    for deferred in &mut parsed.parsed_deferred_for_expressions {
+    for deferred in parsed.parsed_deferred_for_expressions_mut() {
         match &mut deferred.body {
             super::DeferredForBody::Resource(resource) => {
                 for value in resource.attributes.values_mut() {
@@ -1738,8 +1738,8 @@ fn resolve_function_calls_only(
 /// Generic over the export-parameter shape so callers can pass either
 /// `ParsedFile` or `InferredFile` — we only touch
 /// `provider.unresolved_attributes`, never `export_params`.
-pub fn resolve_provider_unresolved_attributes<E>(
-    parsed: &mut super::File<E>,
+pub fn resolve_provider_unresolved_attributes<E, D>(
+    parsed: &mut super::File<E, D>,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -1801,8 +1801,8 @@ pub fn resolve_provider_unresolved_attributes<E>(
 /// validation/LSP paths that intentionally tolerate incomplete edits use the
 /// lower-level parser resolution passes and never receive
 /// [`ResolvedProviderConfigs`].
-pub fn resolve_provider_attributes_with_remote<E>(
-    parsed: &super::File<E>,
+pub fn resolve_provider_attributes_with_remote<E, D>(
+    parsed: &super::File<E, D>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     config: &ProviderContext,
 ) -> Result<ResolvedProviderConfigs, ProviderConfigResolutionError> {
@@ -1869,7 +1869,7 @@ pub fn resolve_provider_attributes_with_remote<E>(
 ///
 /// Errors when a resolved value has the wrong shape (e.g.
 /// `default_tags = "string"`).
-pub fn finalize_provider_configs<E>(parsed: &mut super::File<E>) -> Result<(), ParseError> {
+pub fn finalize_provider_configs<E, D>(parsed: &mut super::File<E, D>) -> Result<(), ParseError> {
     for provider in parsed.providers.iter_mut() {
         if let Some(value) = provider.unresolved_attributes.shift_remove("default_tags") {
             match value {
@@ -2166,7 +2166,7 @@ for item in source.arn {
         )
         .expect("parse deferred for fixture");
         let crate::parser::DeferredForBody::Resource(template) =
-            &parsed.parsed_deferred_for_expressions[0].body
+            &parsed.parsed_deferred_for_expressions()[0].body
         else {
             panic!("deferred fixture body must be a resource")
         };
@@ -2179,7 +2179,7 @@ for item in source.arn {
             .expect("resolve deferred template functions");
 
         let crate::parser::DeferredForBody::Resource(template) =
-            &parsed.parsed_deferred_for_expressions[0].body
+            &parsed.parsed_deferred_for_expressions()[0].body
         else {
             panic!("deferred fixture body must be a resource")
         };
@@ -2187,10 +2187,11 @@ for item in source.arn {
             template.attributes.get("comment"),
             Some(Value::Deferred(DeferredValue::Secret(_)))
         ));
-        crate::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
-            .expect("deferred fixture crosses the module-resolution seam");
+        let parsed =
+            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+                .expect("deferred fixture crosses the module-resolution seam");
         assert!(matches!(
-            parsed.deferred_for_expressions[0]
+            parsed.deferred_for_expressions()[0]
                 .attributes
                 .iter()
                 .find_map(|(key, value)| (key == "comment").then_some(value)),

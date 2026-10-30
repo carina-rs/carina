@@ -18,7 +18,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
-use crate::parser::{ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState};
+use crate::parser::{
+    LoadedProviderContext, ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState,
+};
 use crate::resource::{DeferredValue, Subscript, Value};
 use crate::schema::suggest_similar_name;
 
@@ -177,9 +179,19 @@ impl UpstreamRefDiagnostic for UpstreamFieldError {
 pub fn resolve_upstream_exports(
     base_dir: &Path,
     upstream_states: &[UpstreamState],
-    config: &ProviderContext,
+    config: &LoadedProviderContext,
 ) -> (UpstreamExports, Vec<UpstreamResolveError>) {
     resolve_upstream_exports_with_schemas(base_dir, upstream_states, config, None)
+}
+
+/// Bootstrap/discovery variant of [`resolve_upstream_exports`]. Module value
+/// checks are limited to provider-independent types.
+pub fn resolve_upstream_exports_providerless(
+    base_dir: &Path,
+    upstream_states: &[UpstreamState],
+    config: &ProviderContext,
+) -> (UpstreamExports, Vec<UpstreamResolveError>) {
+    resolve_upstream_exports_providerless_with_schemas(base_dir, upstream_states, config, None)
 }
 
 /// As [`resolve_upstream_exports`], but consult `schemas` to infer
@@ -192,9 +204,40 @@ pub fn resolve_upstream_exports(
 pub fn resolve_upstream_exports_with_schemas(
     base_dir: &Path,
     upstream_states: &[UpstreamState],
+    config: &LoadedProviderContext,
+    schemas: Option<&crate::schema::SchemaRegistry>,
+) -> (UpstreamExports, Vec<UpstreamResolveError>) {
+    resolve_upstream_exports_with_context(
+        base_dir,
+        upstream_states,
+        crate::validation::typecheck::TypecheckProviderContext::loaded(config),
+        schemas,
+    )
+}
+
+/// Bootstrap/discovery variant of
+/// [`resolve_upstream_exports_with_schemas`].
+pub fn resolve_upstream_exports_providerless_with_schemas(
+    base_dir: &Path,
+    upstream_states: &[UpstreamState],
     config: &ProviderContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
 ) -> (UpstreamExports, Vec<UpstreamResolveError>) {
+    resolve_upstream_exports_with_context(
+        base_dir,
+        upstream_states,
+        crate::validation::typecheck::TypecheckProviderContext::providerless(config),
+        schemas,
+    )
+}
+
+fn resolve_upstream_exports_with_context(
+    base_dir: &Path,
+    upstream_states: &[UpstreamState],
+    provider_context: crate::validation::typecheck::TypecheckProviderContext<'_>,
+    schemas: Option<&crate::schema::SchemaRegistry>,
+) -> (UpstreamExports, Vec<UpstreamResolveError>) {
+    let config = provider_context.as_provider_context();
     let mut out: UpstreamExports = HashMap::new();
     let mut errors: Vec<UpstreamResolveError> = Vec::new();
     for us in upstream_states {
@@ -228,19 +271,33 @@ pub fn resolve_upstream_exports_with_schemas(
                 // here matches what the CLI sees post-expansion.
                 let empty_schemas = crate::schema::SchemaRegistry::new();
                 let expansion_schemas = schemas.unwrap_or(&empty_schemas);
-                if let Err(reason) = crate::module_resolver::resolve_upstream_modules_with_config(
-                    &mut parsed,
-                    &source_abs,
-                    config,
-                    expansion_schemas,
-                ) {
-                    errors.push(UpstreamResolveError {
-                        binding: us.binding.clone(),
-                        source: us.source.clone(),
-                        reason: reason.to_string(),
-                    });
-                    continue;
-                }
+                let module_resolution = match provider_context.loaded_context() {
+                    Some(loaded) => crate::module_resolver::resolve_upstream_modules_with_config(
+                        parsed,
+                        &source_abs,
+                        loaded,
+                        expansion_schemas,
+                    ),
+                    None => {
+                        crate::module_resolver::resolve_upstream_modules_with_providerless_config(
+                            parsed,
+                            &source_abs,
+                            config,
+                            expansion_schemas,
+                        )
+                    }
+                };
+                let parsed = match module_resolution {
+                    Ok(parsed) => parsed,
+                    Err(reason) => {
+                        errors.push(UpstreamResolveError {
+                            binding: us.binding.clone(),
+                            source: us.source.clone(),
+                            reason: reason.to_string(),
+                        });
+                        continue;
+                    }
+                };
                 let declared_export_names: HashSet<String> = parsed
                     .export_params
                     .iter()
@@ -342,9 +399,10 @@ fn resource_attr_location(rref: ResourceRef<'_>, attr_name: &str) -> String {
 /// user-facing diagnostic location. Parser-side deferred resource bodies are
 /// matched explicitly; iterable expressions are handled separately because
 /// they have their own shape semantics.
-fn for_each_project_value<E, F>(parsed: &crate::parser::File<E>, mut f: F)
+fn for_each_project_value<E, D, F>(parsed: &crate::parser::File<E, D>, mut f: F)
 where
     E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
     F: FnMut(&Value, &str),
 {
     for rref in parsed.iter_all_resources() {
@@ -375,8 +433,11 @@ where
 ///
 /// Bindings absent from `exports` are skipped — the caller decides what to
 /// do about unresolved upstreams.
-pub fn check_upstream_state_field_references<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+pub fn check_upstream_state_field_references<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamFieldError> {
     check_upstream_state_field_references_inner(parsed, exports, true)
@@ -387,15 +448,21 @@ pub fn check_upstream_state_field_references<E: crate::parser::ExportParamLike>(
 /// Production validation uses this alongside the unified typed-reference
 /// passes; the broader legacy entry point above remains useful to callers that
 /// run this check in isolation.
-pub fn check_upstream_state_untyped_field_references<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+pub fn check_upstream_state_untyped_field_references<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamFieldError> {
     check_upstream_state_field_references_inner(parsed, exports, false)
 }
 
-fn check_upstream_state_field_references_inner<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+fn check_upstream_state_field_references_inner<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
     include_typed_consumers: bool,
 ) -> Vec<UpstreamFieldError> {
@@ -616,8 +683,8 @@ impl UpstreamRefDiagnostic for UpstreamForIterableShapeError {
 /// Both flag `(ForBinding × shape)` mismatches; this one fires at
 /// validate time off the upstream's *declared* type, the parser-side
 /// one fires at expansion time off the *resolved* `Value`.
-pub fn check_upstream_state_for_iterable_shapes<E>(
-    parsed: &crate::parser::File<E>,
+pub fn check_upstream_state_for_iterable_shapes<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamForIterableShapeError> {
     fn visit_possible_iterables(value: &Value, f: &mut impl FnMut(&crate::resource::AccessPath)) {
@@ -799,8 +866,11 @@ impl UpstreamRefDiagnostic for UpstreamAttributeAccessShapeError {
 /// Sibling of [`check_upstream_state_for_iterable_shapes`] from #2317;
 /// both surface "downstream usage doesn't fit upstream's declared
 /// shape" before apply.
-pub fn check_upstream_state_attribute_access_shapes<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+pub fn check_upstream_state_attribute_access_shapes<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
     check_upstream_state_attribute_access_shapes_inner(parsed, exports, true)
@@ -813,15 +883,21 @@ pub fn check_upstream_state_attribute_access_shapes<E: crate::parser::ExportPara
 /// List, map, and scalar values reached through field syntax resolve to
 /// `Unchecked`, so this fallback retains their more specific upstream shape
 /// diagnostics without reporting a struct-field typo twice.
-pub fn check_upstream_state_attribute_access_shape_fallbacks<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+pub fn check_upstream_state_attribute_access_shape_fallbacks<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
     check_upstream_state_attribute_access_shapes_inner(parsed, exports, false)
 }
 
-fn check_upstream_state_attribute_access_shapes_inner<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+fn check_upstream_state_attribute_access_shapes_inner<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
     include_resolver_struct_errors: bool,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
@@ -989,8 +1065,11 @@ impl UpstreamRefDiagnostic for UpstreamSubscriptShapeError {
 /// - the leading `field_path` already mismatches the declared shape
 ///   (already handled by `check_upstream_state_attribute_access_shapes`)
 ///   — in that case the field-walk diagnostic is enough.
-pub fn check_upstream_state_subscript_shapes<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+pub fn check_upstream_state_subscript_shapes<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamSubscriptShapeError> {
     let mut errors: Vec<UpstreamSubscriptShapeError> = Vec::new();
@@ -1097,8 +1176,8 @@ mod tests {
         fs::write(dir.join(name), body).unwrap();
     }
 
-    fn ctx() -> ProviderContext {
-        ProviderContext::default()
+    fn ctx() -> LoadedProviderContext {
+        LoadedProviderContext::empty_for_test()
     }
 
     fn upstream(binding: &str, source: &str) -> UpstreamState {
@@ -3984,7 +4063,7 @@ exports { out: Int = instance.out }
     }
 
     #[test]
-    fn upstream_module_unknown_consumer_custom_type_is_unchecked() {
+    fn providerless_upstream_module_unknown_consumer_custom_type_is_unchecked() {
         let tmp = tempfile::tempdir().unwrap();
         let upstream_dir = tmp.path().join("upstream");
         let module_dir = upstream_dir.join("module");
@@ -4003,10 +4082,10 @@ exports { out: String = instance.out }
 "#,
         );
 
-        let (exports, errors) = resolve_upstream_exports_with_schemas(
+        let (exports, errors) = resolve_upstream_exports_providerless_with_schemas(
             tmp.path(),
             &[upstream("ups", "upstream")],
-            &ctx(),
+            &ProviderContext::default(),
             Some(&crate::schema::SchemaRegistry::new()),
         );
 

@@ -39,7 +39,10 @@ fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
 ) -> String {
-    let summary = PlanChangeSummary::new(plan, export_changes, deferred_for_expressions);
+    let deferred_for_expressions = crate::plan_summary::resolved_deferred_for_for_test(
+        deferred_for_expressions.iter().cloned(),
+    );
+    let summary = PlanChangeSummary::new(plan, export_changes, &deferred_for_expressions);
     format_plan_with_delete_instances(
         plan,
         &summary,
@@ -135,6 +138,32 @@ fn snapshot_depends_on() {
         None,
         None,
     ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_ignore_changes_readable_drift() {
+    let fp = build_plan_from_fixture_name("ignore_changes_readable");
+    assert_eq!(fp.plan.ignored_change_summaries().len(), 2);
+    assert!(
+        fp.plan
+            .ignored_change_summaries()
+            .iter()
+            .all(|summary| summary.count() == 1)
+    );
+
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    assert_eq!(output.matches("# 1 ignored attribute(s) differ").count(), 2);
     insta::assert_snapshot!(output);
 }
 

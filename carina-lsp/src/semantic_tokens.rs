@@ -239,6 +239,11 @@ impl SemanticTokensProvider {
                 1,
                 6,
             )); // OPERATOR
+            if prop_name == "ignore_changes" {
+                let rhs_start =
+                    position::byte_offset_to_char_offset(line, eq_byte_pos) as usize + 1;
+                Self::find_ignore_change_path_identifiers(masked, rhs_start, &mut tokens);
+            }
         }
 
         // Number literals - use character-level operations for correct UTF-8 handling
@@ -329,6 +334,29 @@ impl SemanticTokensProvider {
             let start_char = position::byte_offset_to_char_offset(line, ident_start);
             tokens.push((start_char, length, 1)); // TYPE
             i = j;
+        }
+    }
+
+    fn find_ignore_change_path_identifiers(
+        masked: &MaskedCode,
+        rhs_start: usize,
+        tokens: &mut Vec<(u32, u32, u32)>,
+    ) {
+        let chars = masked.as_str().chars().collect::<Vec<_>>();
+        let mut index = rhs_start;
+        while index < chars.len() {
+            if !(chars[index].is_ascii_alphabetic() || chars[index] == '_') {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            index += 1;
+            while index < chars.len()
+                && (chars[index].is_ascii_alphanumeric() || chars[index] == '_')
+            {
+                index += 1;
+            }
+            tokens.push((start as u32, (index - start) as u32, 3)); // PROPERTY
         }
     }
 
@@ -1355,6 +1383,37 @@ mod tests {
             assert!(
                 kinds.contains(&expected),
                 "Expected token_type {expected} in output. Got kinds: {kinds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_changes_paths_keep_identifier_and_map_key_token_boundaries() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let line = "    ignore_changes = [code.image_uri, tags[\"Owner\"] ]";
+        let tokens = provider.tokenize_line(line);
+        let ignore_start = line.find("ignore_changes").unwrap() as u32;
+        let owner_start = line.find("\"Owner\"").unwrap() as u32;
+
+        assert!(
+            tokens.iter().any(|(start, len, kind)| {
+                *start == ignore_start && *len == "ignore_changes".len() as u32 && *kind == 3
+            }),
+            "directive key should remain a PROPERTY token: {tokens:?}",
+        );
+        assert!(
+            tokens.iter().any(|(start, len, kind)| {
+                *start == owner_start && *len == "\"Owner\"".len() as u32 && *kind == 4
+            }),
+            "quoted map key should remain a STRING token: {tokens:?}",
+        );
+        for identifier in ["code", "image_uri", "tags"] {
+            let start = line.find(identifier).unwrap() as u32;
+            assert!(
+                tokens.iter().any(|(token_start, len, kind)| {
+                    *token_start == start && *len == identifier.len() as u32 && *kind != 4
+                }),
+                "path identifier `{identifier}` must not be classified as a string: {tokens:?}",
             );
         }
     }

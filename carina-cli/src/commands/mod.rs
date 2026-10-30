@@ -18,11 +18,13 @@ pub mod validate;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use carina_core::config_loader::{DuplicateDeclaration, UnresolvedConfigSnapshot};
 use carina_core::module_resolver;
-use carina_core::parser::{BackendConfig, ProviderContext};
+use carina_core::parser::BackendConfig;
+#[cfg(test)]
+use carina_core::parser::ProviderContext;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::inference::ExportInferenceError;
 use carina_state::{
@@ -241,19 +243,6 @@ pub fn ensure_backend_lock(
         .map_err(AppError::Backend)
 }
 
-/// Create a `ProviderContext` with custom type validators extracted from
-/// the already-collected schema map and factory-based validation for WASM providers.
-pub(crate) fn enrich_provider_context(
-    schemas: &carina_core::schema::SchemaRegistry,
-    factories: Arc<Vec<Box<dyn carina_core::provider::ProviderFactory>>>,
-) -> ProviderContext {
-    ProviderContext {
-        decryptor: None,
-        custom_types: carina_core::provider::provider_custom_types_from_factories(factories),
-        resource_types: ProviderContext::resource_types_from_schema_registry(schemas),
-    }
-}
-
 /// Collapse an accumulated error Vec into a single `AppError`.
 ///
 /// Panics on empty input — callers must guard with `is_empty()` first.
@@ -386,17 +375,17 @@ pub(crate) enum ConfigNameResolution {
 /// After that owner is minted, production code can change its resources only
 /// through concrete [`crate::wiring::ValidatedConfig`] methods or consuming
 /// owner transitions.
-pub(crate) enum ResolvedConfig<'a> {
+pub(crate) enum ResolvedConfig {
     Evaluated {
-        parsed: &'a mut carina_core::parser::InferredFile,
+        parsed: Box<carina_core::parser::ModuleResolvedInferredFile>,
     },
     Paired {
         resources: Box<CanonicalResourcePair<carina_core::parser::InferredExportParam>>,
     },
 }
 
-impl ResolvedConfig<'_> {
-    fn parsed(&self) -> &carina_core::parser::InferredFile {
+impl ResolvedConfig {
+    fn parsed(&self) -> &carina_core::parser::ModuleResolvedInferredFile {
         match self {
             Self::Evaluated { parsed, .. } => parsed,
             Self::Paired { resources, .. } => resources.parsed(),
@@ -492,9 +481,9 @@ fn extend_expanded_binding_use_errors(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn validate_and_resolve_errors_inner<'a>(
+pub(crate) fn validate_and_resolve_errors_inner(
     access: &crate::wiring::ValidationPipelineAccess,
-    parsed: &'a mut carina_core::parser::InferredFile,
+    mut parsed: carina_core::parser::InferredFile,
     base_dir: &Path,
     ctx: &WiringContext,
     load_errors: &HashMap<String, String>,
@@ -502,12 +491,12 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
-) -> Result<ResolvedConfig<'a>, Vec<AppError>> {
+) -> Result<ResolvedConfig, Vec<AppError>> {
     // Binding-use validation is a production-readiness invariant, not a
     // resource-validation preference. Keep the recursive module snapshots
     // available even on destroy/state recovery paths; the later optional
     // policy checks remain gated by `skip_resource_validation`.
-    let module_walk = ModuleWalk::load(parsed, base_dir);
+    let module_walk = ModuleWalk::load(&parsed, base_dir);
 
     let mut errors: Vec<AppError> = Vec::new();
 
@@ -522,7 +511,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         Vec::new()
     } else {
         carina_core::validation::inference::retry_unknown_export_inference(
-            parsed,
+            &parsed,
             ctx.schemas(),
             prior_inference_errors,
         )
@@ -547,9 +536,9 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     // backend is misplaced, so do not also classify the module's arguments as
     // misplaced root declarations. Provider + arguments retains the existing
     // root-arguments rule (#2198).
-    if let Err(msg) = carina_core::validation::validate_no_backend_in_module(parsed) {
+    if let Err(msg) = carina_core::validation::validate_no_backend_in_module(&parsed) {
         errors.push(AppError::Validation(msg));
-    } else if let Err(msg) = carina_core::validation::validate_no_arguments_in_root(parsed) {
+    } else if let Err(msg) = carina_core::validation::validate_no_arguments_in_root(&parsed) {
         errors.push(AppError::Validation(msg));
     }
 
@@ -585,17 +574,18 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     }
 
     // Validate provider region
-    errors.extend(validate_provider_region_with_ctx(ctx, parsed));
+    errors.extend(validate_provider_region_with_ctx(ctx, &parsed));
 
-    if !carina_core::validation::is_module_definition(parsed)
+    if !carina_core::validation::is_module_definition(&parsed)
         && let Some(backend) = &parsed.backend
         && let Err(error) = StateBackendConfig::try_from(backend)
     {
         errors.push(AppError::Backend(error.into()));
     }
 
-    // Enrich provider context with custom type validators from loaded schemas
-    let enriched_context = enrich_provider_context(ctx.schemas(), ctx.factories_arc());
+    // Provider validation minted this loaded context from the exact factories
+    // and schemas retained by `ctx`.
+    let enriched_context = ctx.provider_context();
 
     // carina#3239: reject `arguments { foo: TotallyMadeUpType }`-shaped
     // unknown bare custom-type names in the root parse. The root
@@ -608,8 +598,11 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     // removed type cannot ride into apply. The recursive module-call checker
     // below runs this same typed resolver over every imported module.
     let mut root_type_resolution_findings = Vec::new();
-    let type_resolution =
-        carina_core::validation::resolve_file_type_exprs_report(parsed, &enriched_context, None);
+    let type_resolution = carina_core::validation::resolve_file_type_exprs_report(
+        &mut parsed,
+        enriched_context,
+        None,
+    );
     for diagnostic in type_resolution.into_diagnostics() {
         match carina_core::validation::ModuleCallFinding::try_from_type_resolution(diagnostic) {
             Ok(finding) => root_type_resolution_findings.push(finding),
@@ -618,7 +611,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     }
     extend_module_call_errors(&mut errors, root_type_resolution_findings);
     if let Err(error) =
-        carina_core::parser::resolve_resource_refs_with_config(parsed, &enriched_context)
+        carina_core::parser::resolve_resource_refs_with_config(&mut parsed, enriched_context)
     {
         errors.push(AppError::Config(error.to_string()));
     }
@@ -626,7 +619,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         errors.extend(validate_module_internal_ref_types(
             ctx,
             &module_walk,
-            &enriched_context,
+            enriched_context,
         ));
     }
 
@@ -634,7 +627,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     // them for every authored boundary; expansion retains only defensive
     // backstops for callers that bypass validation.
     let imported_module_signatures =
-        module_resolver::load_resolved_module_signatures(parsed, base_dir, &enriched_context);
+        module_resolver::load_resolved_module_signatures(&parsed, base_dir, enriched_context);
 
     // Consume caller-authored uses before the shared module-call checker or
     // expansion can turn a typed pending slot into a secondary missing-
@@ -642,11 +635,11 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     // recovery paths (`skip_resource_validation`): the flag may skip provider
     // resource checks, but it cannot mint validation readiness.
     let binding_use_report = carina_core::validation::check_bare_binding_uses(
-        parsed,
+        &parsed,
         &carina_core::validation::ValidationTypeContext::new(
-            parsed,
+            &parsed,
             ctx.schemas(),
-            &enriched_context,
+            enriched_context,
             &imported_module_signatures,
         ),
     );
@@ -656,14 +649,14 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         let module_signatures = module_resolver::load_resolved_module_signatures(
             module_parsed,
             module.module_path(),
-            &enriched_context,
+            enriched_context,
         );
         let report = carina_core::validation::check_bare_binding_uses(
             module_parsed,
             &carina_core::validation::ValidationTypeContext::new(
                 module_parsed,
                 ctx.schemas(),
-                &enriched_context,
+                enriched_context,
                 &module_signatures,
             ),
         );
@@ -673,7 +666,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     let authored_module_call_findings = {
         let module_call_bindings =
             carina_core::binding_index::BindingIndex::from_parsed_with_module_signatures(
-                parsed,
+                &parsed,
                 ctx.schemas(),
                 &imported_module_signatures,
             );
@@ -683,11 +676,11 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
             carina_core::validation::ModuleCallReferenceChecks::Enabled
         };
         carina_core::validation::check_module_calls(carina_core::validation::ModuleCallCheckInput {
-            authored: parsed,
-            semantic: Some(parsed),
+            authored: &parsed,
+            semantic: Some(&parsed),
             base_dir: Some(base_dir),
             imported_signatures: &imported_module_signatures,
-            provider_context: &enriched_context,
+            provider_context: enriched_context,
             schemas: ctx.schemas(),
             binding_use_report: &binding_use_report,
             bindings: &module_call_bindings,
@@ -723,19 +716,19 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     }
 
     let module_resolution = module_resolver::resolve_modules_with_diagnostics(
-        parsed,
+        &parsed,
         base_dir,
-        &enriched_context,
+        enriched_context,
         ctx.schemas(),
         &authored_module_call_findings,
     );
-    match module_resolution {
+    let mut parsed = match module_resolution {
         module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
-            *parsed = *graph;
             extend_module_call_errors(&mut errors, authored_module_call_findings);
             if !errors.is_empty() {
                 return Err(errors);
             }
+            *graph
         }
         module_resolver::ModuleResolutionDiagnosticResult::ConstraintFailed {
             findings: constraint_findings,
@@ -751,7 +744,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
                 errors.extend(validate_module_attribute_refs_after_expansion_failure(
                     ctx,
                     &module_walk,
-                    &enriched_context,
+                    enriched_context,
                 ));
             }
             extend_module_resolution_errors(&mut errors, &residuals, base_dir);
@@ -765,13 +758,13 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
                 errors.extend(validate_module_attribute_refs_after_expansion_failure(
                     ctx,
                     &module_walk,
-                    &enriched_context,
+                    enriched_context,
                 ));
             }
             extend_module_resolution_errors(&mut errors, &residuals, base_dir);
             return Err(errors);
         }
-    }
+    };
 
     // Module expansion produces composition resources for module-call
     // bindings (`carina-core/src/module_resolver/expander.rs`). Resolve
@@ -779,7 +772,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     // (`default_tags = mod.tags`), then finalize so the resolved values
     // are promoted into the typed `default_tags` field. See #2717.
     if let Err(e) =
-        carina_core::parser::resolve_provider_unresolved_attributes(parsed, &enriched_context)
+        carina_core::parser::resolve_provider_unresolved_attributes(&mut parsed, enriched_context)
     {
         errors.push(AppError::Config(format!(
             "Provider attribute resolution error: {}",
@@ -787,7 +780,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         )));
         return Err(errors);
     }
-    if let Err(e) = carina_core::parser::finalize_provider_configs(parsed) {
+    if let Err(e) = carina_core::parser::finalize_provider_configs(&mut parsed) {
         errors.push(AppError::Config(format!("Finalize error: {}", e)));
         return Err(errors);
     }
@@ -798,11 +791,11 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     // consumes this exact file through `resolve_bare_binding_uses`; both calls
     // use the same mandatory provider context.
     let binding_use_report = carina_core::validation::check_bare_binding_uses(
-        parsed,
+        &parsed,
         &carina_core::validation::ValidationTypeContext::new(
-            parsed,
+            &parsed,
             ctx.schemas(),
-            &enriched_context,
+            enriched_context,
             &imported_module_signatures,
         ),
     );
@@ -812,22 +805,22 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         return Err(errors);
     }
 
-    let parsed: &mut carina_core::parser::InferredFile = &mut *parsed;
-
     // Resolve names (let bindings -> resource names) — must succeed
     // before per-resource schema checks can look up the renamed
     // attributes, so its failures gate the remaining pipeline.
     let mut resolved_config = match name_resolution {
         ConfigNameResolution::EvaluatedOnly => {
-            let name_errors = resolve_file_names_with_ctx(ctx, parsed);
+            let name_errors = resolve_file_names_with_ctx(ctx, &mut parsed);
             if !name_errors.is_empty() {
                 errors.extend(name_errors);
                 return Err(errors);
             }
-            ResolvedConfig::Evaluated { parsed }
+            ResolvedConfig::Evaluated {
+                parsed: Box::new(parsed),
+            }
         }
         ConfigNameResolution::Paired(unresolved) => {
-            match access.resolve_config_names(ctx, std::mem::take(parsed), *unresolved) {
+            match access.resolve_config_names(ctx, parsed, *unresolved) {
                 Ok(resources) => ResolvedConfig::Paired {
                     resources: Box::new(resources),
                 },
@@ -846,7 +839,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
             base_dir,
             &parsed.upstream_states,
-            &enriched_context,
+            enriched_context,
             Some(ctx.schemas()),
         )
     };
@@ -858,7 +851,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         // below try to type-check around the marker. See #2487.
         errors.extend(validate_no_empty_interpolations(parsed));
 
-        errors.extend(validate_resources_with_ctx(ctx, parsed, &enriched_context));
+        errors.extend(validate_resources_with_ctx(ctx, parsed, enriched_context));
         errors.extend(validate_depends_on_with_ctx(parsed));
         errors.extend(validate_wait_bindings_with_ctx(ctx, parsed));
         errors.extend(validate_deferred_populate_refs_with_ctx(ctx, parsed));
@@ -873,7 +866,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         let checked_export_values = carina_core::validation::check_export_values_pre_apply(
             &parsed.export_params,
             &export_value_bindings,
-            &enriched_context,
+            enriched_context,
         );
         let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures(
             parsed,
@@ -910,7 +903,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         }
         if let Err(message) = carina_core::validation::validate_attribute_params(
             &parsed.attribute_params,
-            &enriched_context,
+            enriched_context,
         ) {
             errors.extend(split_validation_message(&message));
         }
@@ -1488,7 +1481,7 @@ child { values = [source] }
         let schemas = carina_core::schema::SchemaRegistry::new();
         let report = carina_core::validation::check_bare_binding_uses(
             &parsed,
-            &carina_core::validation::ValidationTypeContext::new(
+            &carina_core::validation::ValidationTypeContext::new_providerless(
                 &parsed,
                 &schemas,
                 &ProviderContext::default(),

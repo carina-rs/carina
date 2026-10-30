@@ -1208,7 +1208,11 @@ mod tests {
             changed_attributes: vec!["secret_token".to_string(), "write_only_token".to_string()],
         });
         let desired = vec![ResolvedResource::new(resource)];
-        let summary = crate::plan_summary::PlanChangeSummary::new(&plan, &[], &[]);
+        let summary = crate::plan_summary::PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        );
         let model = build_model(PlanImageInput {
             plan: &plan,
             desired_resources: &desired,
@@ -1258,7 +1262,11 @@ mod tests {
             changed_attributes,
         });
         let desired = vec![ResolvedResource::new(resource)];
-        let summary = crate::plan_summary::PlanChangeSummary::new(&plan, &[], &[]);
+        let summary = crate::plan_summary::PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        );
         let model = build_model(PlanImageInput {
             plan: &plan,
             desired_resources: &desired,
@@ -1364,7 +1372,11 @@ mod tests {
             .iter()
             .map(|resource| UnresolvedResource::from_pre_resolve(resource.as_inner().clone()))
             .collect();
-        let summary = crate::plan_summary::PlanChangeSummary::new(&plan, &[], &[]);
+        let summary = crate::plan_summary::PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        );
         let model = build_model(PlanImageInput {
             plan: &plan,
             desired_resources: &desired,

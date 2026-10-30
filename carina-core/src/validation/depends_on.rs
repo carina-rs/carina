@@ -83,7 +83,9 @@ fn depends_on_of<'a>(rref: ResourceRef<'a>) -> &'a [String] {
 /// Run all depends_on checks against a parsed file. Returns the full
 /// list of diagnostics (errors + warnings); callers decide how to surface
 /// them.
-pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
+pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &File<E, D>,
+) -> Vec<DependsOnDiagnostic> {
     // Common-case fast path: the vast majority of resources will have
     // no `depends_on` set, and the checks below allocate per-resource.
     // Walk top-level + for-body template resources so loops are covered
@@ -294,8 +296,7 @@ mod tests {
             &ProviderContext::default(),
         )
         .expect("fixture must parse");
-        assert!(parsed.deferred_for_expressions.is_empty());
-        assert_eq!(parsed.parsed_deferred_for_expressions.len(), 1);
+        assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
 
         let errors = diag_messages(&validate_depends_on(&parsed), Severity::Error);
         assert!(

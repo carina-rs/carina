@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use carina_core::effect::{Effect, EffectGeneration};
-use carina_core::identifier::canonical_create_only_value_string;
+use carina_core::identifier::{DesiredCreateOnlyValues, StateCreateOnlyValues};
 use carina_core::plan::Plan;
 use carina_core::resource::{Current, ResolvedResource, ResolvedResourceId, ResourceId, Value};
-use carina_core::schema::{EffectiveAttribute, SchemaRegistry};
+use carina_core::schema::{SchemaRegistry, ValidatedResourceSchema};
 use colored::Colorize;
 
 /// One plan-time suggestion. Rendering belongs to this typed value rather
@@ -341,12 +341,8 @@ struct DestroyCandidate<'a> {
 
 struct CreateCandidate<'schema> {
     id: ResolvedResourceId,
-    create_only_values: Vec<CreateOnlyValue<'schema>>,
-}
-
-struct CreateOnlyValue<'schema> {
-    attribute: EffectiveAttribute<'schema>,
-    desired: String,
+    schema: &'schema ValidatedResourceSchema,
+    create_only_values: DesiredCreateOnlyValues,
 }
 
 enum GraphNode {
@@ -368,28 +364,19 @@ fn create_candidate<'schema, S>(
     schemas: &'schema SchemaRegistry,
 ) -> Option<CreateCandidate<'schema>> {
     let schema = schemas.get_for(created.as_resource())?.schema();
-    let create_only_attributes = schema.as_schema().create_only_attributes();
-    if create_only_attributes.is_empty() {
-        return None;
-    }
-
-    let mut create_only_values = Vec::new();
-    for attribute in create_only_attributes {
-        let Some(desired_value) = created.get_attr(attribute) else {
-            continue;
-        };
-        let desired_value = canonical_create_only_value_string(desired_value)?;
-        create_only_values.push(CreateOnlyValue {
-            attribute: schema.effective_attribute(attribute)?,
-            desired: desired_value,
-        });
-    }
-    if create_only_values.is_empty() {
+    let create_only_values = DesiredCreateOnlyValues::without_binding_resolution(
+        created.as_resource(),
+        schema.as_schema(),
+    );
+    if !create_only_values.has_configured_values()
+        || !create_only_values.all_configured_values_resolved()
+    {
         return None;
     }
 
     Some(CreateCandidate {
         id: created.resolved_id(),
+        schema,
         create_only_values,
     })
 }
@@ -406,21 +393,11 @@ fn resources_match(destroyed: &DestroyCandidate<'_>, created: &CreateCandidate<'
         return false;
     }
 
-    for create_only in &created.create_only_values {
-        let Some(prior_value) = destroyed
-            .attributes
-            .get(create_only.attribute.name())
-            .cloned()
-            .map(|value| create_only.attribute.canonicalize_state(value))
-            .and_then(|value| canonical_create_only_value_string(&value))
-        else {
-            return false;
-        };
-        if create_only.desired != prior_value {
-            return false;
-        }
-    }
-    true
+    let prior_values =
+        StateCreateOnlyValues::from_state_attributes(created.schema, destroyed.attributes);
+    created
+        .create_only_values
+        .all_match(&prior_values, created.schema.as_schema())
 }
 
 fn render_address(id: &ResolvedResourceId) -> String {
@@ -718,6 +695,62 @@ mod tests {
         let hints = detect_moved_block_hints(&plan, &prior, &schemas);
 
         assert!(matches!(hints.as_slice(), [MovedBlockHint::Suggest(_)]));
+    }
+
+    #[test]
+    fn reordered_unordered_list_create_only_value_suggests_moved_block() {
+        let mut plan = Plan::new();
+        let mut prior = HashMap::new();
+        let old_id = id("old_vpc", None);
+        add_delete(
+            &mut plan,
+            &mut prior,
+            old_id.clone(),
+            CIDR,
+            EffectGeneration::Current,
+        );
+        let prior_attributes = prior
+            .get_mut(old_id.as_inner())
+            .and_then(Current::attributes_mut)
+            .expect("test prior has attributes");
+        prior_attributes.clear();
+        prior_attributes.insert(
+            "zones".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                concrete_string("zone-a"),
+                concrete_string("zone-b"),
+            ])),
+        );
+        let desired = Resource::from_id(id("vpcs[0]", None).into_inner()).with_attribute(
+            "zones",
+            Value::Concrete(ConcreteValue::List(vec![
+                concrete_string("zone-b"),
+                concrete_string("zone-a"),
+            ])),
+        );
+        plan.add(Effect::Create(ResolvedResource::new(desired)));
+
+        let schema = ResourceSchema::new(RESOURCE_TYPE)
+            .attribute(
+                AttributeSchema::optional(
+                    "zones",
+                    AttributeType::unordered_list(AttributeType::string()),
+                )
+                .create_only()
+                .build(),
+            )
+            .validate()
+            .expect("test unordered-list schema must validate");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(PROVIDER, schema);
+
+        let hints = detect_moved_block_hints(&plan, &prior, &schemas);
+
+        let [MovedBlockHint::Suggest(pair)] = hints.as_slice() else {
+            panic!("expected one suggestion, got {hints:?}");
+        };
+        assert_eq!(pair.from().identity_str(), "old_vpc");
+        assert_eq!(pair.to().identity_str(), "vpcs[0]");
     }
 
     #[test]

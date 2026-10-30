@@ -36,7 +36,7 @@ use carina_core::executor::{
     ExecutionObserver, ExecutionOutcome, ExecutionResult, LiveExecutionInput, ProviderCheckInputs,
     UnresolvedResource, execute_live_plan,
 };
-use carina_core::module_resolver::resolve_modules;
+use carina_core::module_resolver::resolve_modules_providerless as resolve_modules;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
@@ -226,10 +226,9 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let mut caller = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     caller.push("tests/fixtures/wait/module_wait_downstream/caller");
 
-    let mut parsed = parse_directory(&caller, &ProviderContext::default())
+    let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed for the caller fixture");
-
-    resolve_modules(&mut parsed, &caller).expect("module resolution should succeed");
+    let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
 
     // ---- Root-cause assertion #1: the module's wait binding survived
     // expansion, instance-prefixed with the module-call binding (`r`).
@@ -418,10 +417,9 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     root.push("tests/fixtures/wait/module_wait_nested/root");
 
-    let mut parsed = parse_directory(&root, &ProviderContext::default())
+    let parsed = parse_directory(&root, &ProviderContext::default())
         .expect("parse_directory should succeed for the nested root fixture");
-
-    resolve_modules(&mut parsed, &root).expect("nested module resolution should succeed");
+    let parsed = resolve_modules(parsed, &root).expect("nested module resolution should succeed");
 
     // The two-level-deep wait binding survived, doubly instance-prefixed
     // (outer call binding `o`, inner call binding `c`).
@@ -596,9 +594,9 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     let mut caller = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     caller.push("tests/fixtures/wait/module_wait_downstream/caller");
 
-    let mut parsed = parse_directory(&caller, &ProviderContext::default())
+    let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed");
-    resolve_modules(&mut parsed, &caller).expect("module resolution should succeed");
+    let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
 
     let sorted_resources =
         sort_resources_by_dependencies(&parsed.resources).expect("topological sort");

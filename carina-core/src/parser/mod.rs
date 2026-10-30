@@ -22,22 +22,28 @@ pub use ast::{
     ArgumentOrigin, ArgumentParameter, AttributeParameter, AttributePath, AttributePathSegment,
     AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingName,
     BindingScopeId, BindingUseOwner, CallExpansion, DeferredForBody, DeferredForExpansionError,
-    DeferredForExpression, DeferredForSite, DeferredForTarget, ExpansionKey, ExportParamLike,
-    ExportParameter, File, FnParam, InferredExportParam, InferredFile, ModuleArgument, ModuleCall,
-    ModuleCallDiagnosticSource, ModuleCallId, MovedAddresses, ParsedBindingUses,
-    ParsedDeferredForExpression, ParsedExportParam, ParsedFile, ParserBindingMetadata,
-    PendingValueSlot, ProviderConfig, RequireBlock, ResourceAddress, ResourceContext, ResourceMut,
-    ResourceRef, ResourceTypePath, SavedDeferredForExpression, ShapeMismatch, SourceFileId,
-    SourceSpan, StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst, UpstreamState,
-    UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding,
-    expand_deferred_children,
+    DeferredForExpression, DeferredForPhaseTraversal, DeferredForSite, DeferredForTarget,
+    ExpansionKey, ExportParamLike, ExportParameter, File, FnParam, InferredExportParam,
+    InferredFile, ModuleArgument, ModuleCall, ModuleCallDiagnosticSource, ModuleCallId,
+    ModuleResolvedFile, ModuleResolvedInferredFile, ModuleResolvedParsedFile, MovedAddresses,
+    ParsedBindingUses, ParsedDeferredForExpression, ParsedDeferredForPhase, ParsedExportParam,
+    ParsedFile, ParserBindingMetadata, PendingValueSlot, ProviderConfig, RequireBlock,
+    ResolvedDeferredForExpressions, ResolvedDeferredForPhase, ResourceAddress, ResourceContext,
+    ResourceMut, ResourceRef, ResourceTypePath, SavedDeferredForExpression, ShapeMismatch,
+    SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst,
+    UpstreamState, UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock,
+    WaitBinding, expand_deferred_children,
 };
-pub(crate) use ast::{BareBindingSource, ParsedBareBindingUse};
+pub(crate) use ast::{
+    BareBindingSource, DeferredForResourceExpressionError, ParsedBareBindingUse,
+    ParsedDeferredForIterableState,
+};
 pub(crate) use config::ProviderCustomTypeSource;
 pub use config::{
     CustomTypeResolver, CustomTypeValidationError, CustomTypeValidationTarget,
-    CustomTypeValidatorFn, DecryptorFn, IdentifiedCustomTypeDeclaration, NonEmptySchemaTypeOwners,
-    OwnedTypeIdentity, ProviderContext, ProviderCustomTypes, SchemaTypeOwner,
+    CustomTypeValidatorFn, DecryptorFn, IdentifiedCustomTypeDeclaration, LoadedProviderContext,
+    NonEmptySchemaTypeOwners, OwnedTypeIdentity, ProviderContext, ProviderCustomTypes,
+    SchemaTypeOwner,
 };
 #[cfg(test)]
 pub(crate) use config::{fixture_custom_type_rejection, fixture_invalid_custom_type_value};
@@ -71,6 +77,7 @@ pub use functions::{
 };
 pub(crate) use functions::{
     custom_type_lookup_for_schema, evaluate_resolved_user_function, function_argument_as_eval,
+    validate_schema_custom_type_with_context,
 };
 pub use resolve::{
     ProviderConfigInvariantError, ProviderConfigResolutionError, ResolvedProviderConfig,

@@ -373,6 +373,12 @@ impl ModuleError {
 fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
     match error {
         ParseError::DeferredForBodyUnsupported(_) => true,
+        ParseError::DeferredForBodyTemplate {
+            line: _,
+            header: _,
+            span: _,
+            source: _,
+        } => false,
         ParseError::Located { path: _, error } => parse_error_is_deferred_for_body_rejection(error),
         ParseError::Syntax(_)
         | ParseError::InvalidExpression { .. }

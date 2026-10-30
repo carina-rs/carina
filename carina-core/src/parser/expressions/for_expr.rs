@@ -11,9 +11,10 @@ use crate::eval_value::{EvalValue, StructuralHandleMetadata};
 use crate::parser::expressions::primary::parse_postfix_eval;
 use crate::parser::{
     DeferredForBody, DeferredForTarget, ModuleCall, ParseContext, ParseError, ParseWarning,
-    ParsedDeferredForExpression, PreprocessedFile, ResourceParseTarget, Rule, SourceSpan,
-    WarningKind, display_string_literal, evaluate_static_value, first_inner, next_pair,
-    parse_expression, parse_module_call, parse_read_resource_expr, parse_resource_for_target,
+    ParsedDeferredForExpression, ParsedDeferredForIterableState, PreprocessedFile,
+    ResourceParseTarget, Rule, SourceSpan, WarningKind, display_string_literal,
+    evaluate_static_value, first_inner, next_pair, parse_expression, parse_module_call,
+    parse_read_resource_expr, parse_resource_for_target,
 };
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, ForLoopElement, LegacyLoopAddress, LoopElementOrigin,
@@ -173,6 +174,7 @@ fn record_deferred_for_expression(
     span: SourceSpan,
     header: String,
     iterable: Value,
+    iterable_state: ParsedDeferredForIterableState,
 ) -> Result<(), ParseError> {
     let body = match parse_deferred_for_body_template(
         body_pair,
@@ -181,15 +183,25 @@ fn record_deferred_for_expression(
         target,
         preprocessed_file,
         source_file,
-    )? {
-        DeferredForBodyTemplateParse::Parsed(body) => body,
-        DeferredForBodyTemplateParse::RetryableProvisional => {
-            // This pass exists only to classify provisional directory
-            // bindings. The final pass reparses the exact body with fully
-            // classified bindings and either succeeds or propagates this
-            // body-local parser error.
-            return Ok(());
+    ) {
+        Err(source) => {
+            return Err(ParseError::DeferredForBodyTemplate {
+                line,
+                header,
+                span,
+                source: Box::new(source),
+            });
         }
+        Ok(template) => match template {
+            DeferredForBodyTemplateParse::Parsed(body) => body,
+            DeferredForBodyTemplateParse::RetryableProvisional => {
+                // This pass exists only to classify provisional directory
+                // bindings. The final pass reparses the exact body with fully
+                // classified bindings and either succeeds or propagates this
+                // body-local parser error.
+                return Ok(());
+            }
+        },
     };
 
     let parsed = ParsedDeferredForExpression {
@@ -199,6 +211,7 @@ fn record_deferred_for_expression(
         header,
         target: target.deferred_target(),
         iterable,
+        iterable_state,
         binding: binding.clone(),
         body,
     };
@@ -545,6 +558,7 @@ pub(crate) fn parse_for_expr(
                 for_span,
                 header,
                 iterable.clone(),
+                ParsedDeferredForIterableState::Deferred,
             )?;
             // Return empty — the for body produces zero concrete resources
         }
@@ -558,6 +572,11 @@ pub(crate) fn parse_for_expr(
                 .or(provisional_binding.as_ref())
             {
                 let header = deferred_for_header(&binding, s);
+                let iterable_state = if bare_unbound_identifier.is_some() {
+                    ParsedDeferredForIterableState::UndefinedIdentifier { name: s.clone() }
+                } else {
+                    ParsedDeferredForIterableState::Deferred
+                };
                 record_deferred_for_expression(
                     body_pair.clone(),
                     &binding,
@@ -569,6 +588,7 @@ pub(crate) fn parse_for_expr(
                     for_span,
                     header,
                     Value::Deferred(DeferredValue::BindingRef { binding: s.clone() }),
+                    iterable_state,
                 )?;
                 return Ok((resources, data_sources, module_calls));
             }

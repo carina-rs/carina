@@ -564,7 +564,11 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let resource_origins = sorted_resources.clone();
     let mut unresolved_for_plan = carina_core::parser::ParsedFile::default();
     unresolved_for_plan.resources = resources_for_plan.clone();
-    let canonical_for_plan = unresolved_for_plan.clone();
+    let canonical_for_plan = carina_core::module_resolver::resolve_modules_providerless(
+        unresolved_for_plan.clone(),
+        &caller,
+    )
+    .expect("canonical plan fixture crosses module resolution");
     let canonical_unresolved = resolve_config_block_names_for_test(
         canonical_for_plan,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved_for_plan),
