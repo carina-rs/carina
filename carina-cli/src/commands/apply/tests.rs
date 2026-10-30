@@ -1618,9 +1618,9 @@ inner { x = a }
     .expect_err("apply bootstrap reload must retain the reference-type gate");
     let message = crate::error::format_error_with_source_chain(&error);
     assert!(
-        message.contains("Type mismatch: expected Int, got String (from a)")
-            && message.contains("outer/main.crn")
-            && message.contains("line 3"),
+        message.contains("Reference type validation failed")
+            && message.contains("module call 'inner'")
+            && message.contains("expected Int, got String (from a)"),
         "{message}"
     );
 }
@@ -1701,7 +1701,7 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
             unresolved,
         )
         .expect_err("apply bootstrap reload must reject module-output type mismatch");
-        let message = error.to_string();
+        let message = crate::error::format_error_with_source_chain(&error);
         assert!(message.contains("module call 'y'"), "{message}");
         assert!(message.contains("expected Int"), "{message}");
         assert!(message.contains("got String"), "{message}");

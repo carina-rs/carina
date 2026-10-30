@@ -1329,7 +1329,7 @@ web_tier {
     let diagnostics = fixture.validate();
     assert!(
         diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("module call 'web_tier'")
+            diagnostic.contains("module call 'web_tier (anonymous call)'")
                 && diagnostic.contains("argument 'vpc_id'")
                 && diagnostic.contains("expected aws.ec2.Vpc.Id")
                 && diagnostic.contains("got aws.ec2.SecurityGroup.Id")

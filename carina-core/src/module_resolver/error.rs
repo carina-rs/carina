@@ -72,7 +72,7 @@ pub enum ModuleError {
     },
 
     #[error("Reference type validation failed: {0}")]
-    ReferenceType(String),
+    ReferenceType(crate::validation::ExpansionBoundaryReferenceErrors),
 
     // An I/O error is a terminal leaf here. Keep its diagnostic in Display
     // and do not expose it a second time through Error::source.
@@ -183,6 +183,53 @@ impl ModuleError {
             | Self::ExportsInModule
             | Self::Constraint(_)
             | Self::NotADirectory { .. } => ModuleErrorCallSource::Unavailable,
+        }
+    }
+
+    pub(crate) fn failing_call(&self) -> Option<&ModuleCallId> {
+        match self {
+            Self::OwnedByCalls { calls: _, error } => error.failing_call(),
+            Self::AtCall { call, error: _ } => Some(call),
+            Self::NotFound(_)
+            | Self::CircularImport(_)
+            | Self::MissingArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::InvalidArgumentType {
+                module: _,
+                argument: _,
+                mismatch: _,
+            }
+            | Self::BareStructuralHandleArgument {
+                module: _,
+                argument: _,
+                source_path: _,
+                line: _,
+                message: _,
+            }
+            | Self::ArgumentValueAccess {
+                module: _,
+                source_path: _,
+                line: _,
+                message: _,
+            }
+            | Self::ReferenceType(_)
+            | Self::Io(_)
+            | Self::Parse(_)
+            | Self::ParseInFile { path: _, error: _ }
+            | Self::UnknownArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::UnknownModule(_)
+            | Self::ProviderInModule
+            | Self::StateBlockInModule
+            | Self::BackendInModule
+            | Self::UpstreamStateInModule
+            | Self::ExportsInModule
+            | Self::Constraint(_)
+            | Self::NotADirectory { path: _ } => None,
         }
     }
 
