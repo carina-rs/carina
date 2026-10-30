@@ -17,6 +17,7 @@ use carina_core::parser::{
     BackendConfig, ProviderContext, ResolvedProviderConfigs, SavedProviderConfigs, UpstreamState,
 };
 use carina_core::plan::{Plan, SavedPlan};
+use carina_core::provider::{ProviderInstanceKey, ProviderRouter, ReferenceScope};
 use carina_core::provider_source::ProviderSource;
 #[cfg(test)]
 use carina_core::resource::DeferredValue;
@@ -127,6 +128,78 @@ pub struct SavedDataSourceValue {
 }
 
 pub type PlanProviderArtifacts = BTreeMap<String, RecordedProviderArtifact>;
+
+pub type PlanProviderScopes = BTreeMap<ProviderInstanceKey, ReferenceScope>;
+
+/// One initialized provider instance and the scope returned by that exact
+/// instance. The wire uses a sorted list because JSON object keys cannot
+/// faithfully encode the structured provider route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedProviderScope {
+    pub instance: ProviderInstanceKey,
+    pub scope: ReferenceScope,
+}
+
+/// The first deterministic difference between saved and initialized provider
+/// instance scopes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderScopeMismatch {
+    pub(crate) instance: ProviderInstanceKey,
+    pub(crate) recorded: Option<ReferenceScope>,
+    pub(crate) initialized: Option<ReferenceScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordedProviderScopes(PlanProviderScopes);
+
+impl RecordedProviderScopes {
+    pub(crate) fn from_router(provider: &ProviderRouter) -> Self {
+        Self(provider.provider_scopes())
+    }
+
+    pub(crate) fn verify(&self, provider: &ProviderRouter) -> Result<(), ProviderScopeMismatch> {
+        let initialized = provider.provider_scopes();
+        let instances = self
+            .0
+            .keys()
+            .chain(initialized.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for instance in instances {
+            let recorded = self.0.get(&instance);
+            let current = initialized.get(&instance);
+            if recorded != current {
+                return Err(ProviderScopeMismatch {
+                    instance,
+                    recorded: recorded.cloned(),
+                    initialized: current.cloned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn as_map(&self) -> &PlanProviderScopes {
+        &self.0
+    }
+
+    fn into_wire(self) -> Vec<RecordedProviderScope> {
+        self.0
+            .into_iter()
+            .map(|(instance, scope)| RecordedProviderScope { instance, scope })
+            .collect()
+    }
+
+    fn try_from_wire(records: Vec<RecordedProviderScope>) -> Result<Self, ProviderEvidenceError> {
+        let mut scopes = BTreeMap::new();
+        for RecordedProviderScope { instance, scope } in records {
+            if scopes.insert(instance.clone(), scope).is_some() {
+                return Err(ProviderEvidenceError::DuplicateProviderScope { instance });
+            }
+        }
+        Ok(Self(scopes))
+    }
+}
 
 /// Provider artifact identity persisted in a saved plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +394,131 @@ mod recorded_provider_artifact_tests {
         };
 
         assert_eq!(artifact.summary(), format!("wasm sha256 {sha256} (file)"));
+    }
+}
+
+#[cfg(test)]
+mod provider_scope_evidence_tests {
+    use super::*;
+    use carina_core::provider::{
+        InitializedProvider, ProviderInstanceKey, ProviderRouter, ReferenceScope,
+    };
+    use indexmap::IndexMap;
+
+    fn provider_config(binding: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: "test".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: Some(binding.to_string()),
+        }
+    }
+
+    fn available(region: &str) -> ReferenceScope {
+        ReferenceScope::Available {
+            partition: "aws".to_string(),
+            region: region.to_string(),
+            account: "123456789012".to_string(),
+        }
+    }
+
+    fn router(scopes: [(&str, ReferenceScope); 2]) -> ProviderRouter {
+        let mut router = ProviderRouter::new();
+        for (binding, scope) in scopes {
+            router.add_provider_instance(
+                ProviderInstanceKey::new("test", Some(binding.to_string())),
+                InitializedProvider::new(
+                    Box::new(carina_provider_mock::MockProvider::new()),
+                    scope,
+                ),
+            );
+        }
+        router
+    }
+
+    fn empty_contents(provider_configs: SavedProviderConfigs) -> PlanFileContents {
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-10-30T00:00:00Z".to_string(),
+            source_path: "test.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs,
+            backend_config: None,
+            plan: Plan::new(),
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn saved_plan_v30_round_trips_provider_scopes() {
+        let configs = vec![provider_config("east"), provider_config("west")];
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers = configs.clone();
+        let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
+            &parsed,
+            &HashMap::new(),
+            &ProviderContext::default(),
+        )
+        .expect("provider configs resolve");
+        let wiring = ValidatedConfig::from_factories_for_test((), Vec::new(), &configs);
+        let provider = router([
+            ("east", available("ap-northeast-1")),
+            ("west", available("us-west-2")),
+        ]);
+
+        let plan = empty_contents(SavedProviderConfigs::from(&resolved))
+            .record_for_test_with_provider(&wiring, &provider)
+            .expect("provider scopes form valid evidence");
+        let json = serde_json::to_value(&plan).expect("saved plan serializes");
+        assert_eq!(json["version"], serde_json::json!(30));
+        let scopes = json["provider_scopes"].as_array().unwrap();
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(
+            scopes[0]["instance"]["provider_instance"],
+            serde_json::json!("east")
+        );
+        assert_eq!(
+            scopes[1]["instance"]["provider_instance"],
+            serde_json::json!("west")
+        );
+
+        let decoded: PlanFile = serde_json::from_value(json).expect("saved plan round-trips");
+        assert_eq!(decoded.provider_scopes(), &provider.provider_scopes());
+    }
+
+    #[test]
+    fn named_instance_scope_mismatch_identifies_the_changed_region() {
+        let recorded = RecordedProviderScopes::from_router(&router([
+            ("east", available("ap-northeast-1")),
+            ("west", available("us-west-2")),
+        ]));
+        let initialized = router([
+            ("east", available("ap-northeast-1")),
+            ("west", available("eu-west-1")),
+        ]);
+
+        let mismatch = recorded
+            .verify(&initialized)
+            .expect_err("one named instance changed scope");
+        assert_eq!(mismatch.instance.provider(), "test");
+        assert_eq!(mismatch.instance.provider_instance(), Some("west"));
+        assert_eq!(mismatch.recorded, Some(available("us-west-2")));
+        assert_eq!(mismatch.initialized, Some(available("eu-west-1")));
     }
 }
 
@@ -550,6 +748,8 @@ struct ProviderEvidence {
     /// Exact provider-kind artifacts loaded while this plan was computed.
     /// This field is mandatory since plan format 26.
     provider_artifacts: PlanProviderArtifacts,
+    /// Exact scope of every initialized provider instance used by planning.
+    provider_scopes: RecordedProviderScopes,
 }
 
 /// Saved plan file for `plan --out` / `apply <plan-file>`.
@@ -570,7 +770,7 @@ pub struct PlanFile {
     evidence: ProviderEvidence,
 }
 
-/// Private format-27 wire representation.
+/// Private format-30 wire representation.
 ///
 /// Field order is intentionally identical to the historical `PlanFile`
 /// serialization order. Evidence is mandatory and is never defaulted.
@@ -600,6 +800,7 @@ struct PlanFileWire {
     wait_bindings: Vec<PlanWaitBinding>,
     schema_fingerprints: PlanSchemaFingerprints,
     provider_artifacts: PlanProviderArtifacts,
+    provider_scopes: Vec<RecordedProviderScope>,
 }
 
 /// A saved plan's provider evidence is incomplete or inconsistent.
@@ -638,6 +839,15 @@ pub enum ProviderEvidenceError {
         provider: String,
         expected: ExpectedRecordedArtifactOrigin,
         recorded: RecordedArtifactOrigin,
+    },
+    DuplicateProviderScope {
+        instance: ProviderInstanceKey,
+    },
+    MissingProviderScope {
+        instance: ProviderInstanceKey,
+    },
+    UnexpectedProviderScope {
+        instance: ProviderInstanceKey,
     },
 }
 
@@ -700,7 +910,29 @@ impl std::fmt::Display for ProviderEvidenceError {
                 formatter,
                 "provider_artifacts records provider `{provider}` with origin {recorded}, expected {expected}"
             ),
+            Self::DuplicateProviderScope { instance } => write!(
+                formatter,
+                "provider_scopes contains duplicate instance `{}`",
+                display_provider_instance(instance)
+            ),
+            Self::MissingProviderScope { instance } => write!(
+                formatter,
+                "provider_scopes is missing initialized instance `{}`",
+                display_provider_instance(instance)
+            ),
+            Self::UnexpectedProviderScope { instance } => write!(
+                formatter,
+                "provider_scopes contains unexpected instance `{}`",
+                display_provider_instance(instance)
+            ),
         }
+    }
+}
+
+fn display_provider_instance(instance: &ProviderInstanceKey) -> String {
+    match instance.provider_instance() {
+        Some(binding) => format!("{}.{binding}", instance.provider()),
+        None => format!("{} (default)", instance.provider()),
     }
 }
 
@@ -757,26 +989,33 @@ impl ProviderEvidence {
         references: &PlanSchemaReferences,
         provider_configs: &SavedProviderConfigs,
         ctx: &WiringContext,
+        provider: &ProviderRouter,
+        expected_instances: &BTreeSet<ProviderInstanceKey>,
     ) -> Result<Self, ProviderEvidenceError> {
         Self::new(
             PlanSchemaFingerprints::capture(references, ctx.schemas()),
             recorded_provider_artifacts(ctx),
+            RecordedProviderScopes::from_router(provider),
             references,
             provider_configs,
+            expected_instances,
         )
     }
 
     fn new(
         schema_fingerprints: PlanSchemaFingerprints,
         provider_artifacts: PlanProviderArtifacts,
+        provider_scopes: RecordedProviderScopes,
         references: &PlanSchemaReferences,
         provider_configs: &SavedProviderConfigs,
+        expected_instances: &BTreeSet<ProviderInstanceKey>,
     ) -> Result<Self, ProviderEvidenceError> {
         let evidence = Self {
             schema_fingerprints,
             provider_artifacts,
+            provider_scopes,
         };
-        evidence.validate(references, provider_configs)?;
+        evidence.validate(references, provider_configs, expected_instances)?;
         Ok(evidence)
     }
 
@@ -784,6 +1023,7 @@ impl ProviderEvidence {
         &self,
         references: &PlanSchemaReferences,
         provider_configs: &SavedProviderConfigs,
+        expected_instances: &BTreeSet<ProviderInstanceKey>,
     ) -> Result<(), ProviderEvidenceError> {
         let mut recorded = BTreeSet::new();
         for (provider, fingerprint) in &self.schema_fingerprints.providers {
@@ -880,6 +1120,22 @@ impl ProviderEvidence {
                 }
             }
         }
+        let recorded_instances = self
+            .provider_scopes
+            .as_map()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if let Some(instance) = expected_instances.difference(&recorded_instances).next() {
+            return Err(ProviderEvidenceError::MissingProviderScope {
+                instance: instance.clone(),
+            });
+        }
+        if let Some(instance) = recorded_instances.difference(expected_instances).next() {
+            return Err(ProviderEvidenceError::UnexpectedProviderScope {
+                instance: instance.clone(),
+            });
+        }
         Ok(())
     }
 }
@@ -911,6 +1167,7 @@ impl From<PlanFile> for PlanFileWire {
         let ProviderEvidence {
             schema_fingerprints,
             provider_artifacts,
+            provider_scopes,
         } = evidence;
         Self {
             version,
@@ -934,6 +1191,7 @@ impl From<PlanFile> for PlanFileWire {
             wait_bindings,
             schema_fingerprints,
             provider_artifacts,
+            provider_scopes: provider_scopes.into_wire(),
         }
     }
 }
@@ -964,6 +1222,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
             wait_bindings,
             schema_fingerprints,
             provider_artifacts,
+            provider_scopes,
         } = wire;
         let contents = PlanFileContents {
             version,
@@ -987,11 +1246,14 @@ impl TryFrom<PlanFileWire> for PlanFile {
             wait_bindings,
         };
         let references = contents.referenced_schema_types();
+        let expected_instances = contents.expected_provider_instances();
         let evidence = ProviderEvidence::new(
             schema_fingerprints,
             provider_artifacts,
+            RecordedProviderScopes::try_from_wire(provider_scopes)?,
             &references,
             &contents.provider_configs,
+            &expected_instances,
         )?;
         Ok(Self { contents, evidence })
     }
@@ -1012,7 +1274,7 @@ impl PlanFileContents {
         self,
         validated: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        self.record_with_context(validated.context())
+        self.record_with_context(validated.context(), &validated.resources().provider)
     }
 
     /// Record hand-built plan contents in unit and integration fixtures.
@@ -1021,12 +1283,33 @@ impl PlanFileContents {
         self,
         validated: &ValidatedConfig<R>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        self.record_with_context(validated.context())
+        let provider = test_provider_router(&self.expected_provider_instances());
+        self.record_with_context(validated.context(), &provider)
     }
 
-    fn record_with_context(self, ctx: &WiringContext) -> Result<PlanFile, ProviderEvidenceError> {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn record_for_test_with_provider<R>(
+        self,
+        validated: &ValidatedConfig<R>,
+        provider: &ProviderRouter,
+    ) -> Result<PlanFile, ProviderEvidenceError> {
+        self.record_with_context(validated.context(), provider)
+    }
+
+    fn record_with_context(
+        self,
+        ctx: &WiringContext,
+        provider: &ProviderRouter,
+    ) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
-        let evidence = ProviderEvidence::capture(&references, &self.provider_configs, ctx)?;
+        let expected_instances = self.expected_provider_instances();
+        let evidence = ProviderEvidence::capture(
+            &references,
+            &self.provider_configs,
+            ctx,
+            provider,
+            &expected_instances,
+        )?;
         Ok(PlanFile {
             contents: self.into(),
             evidence,
@@ -1043,8 +1326,15 @@ impl PlanFileContents<SavedModuleSource> {
         validated: &ValidatedConfig<R>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
-        let evidence =
-            ProviderEvidence::capture(&references, &self.provider_configs, validated.context())?;
+        let expected_instances = self.expected_provider_instances();
+        let provider = test_provider_router(&expected_instances);
+        let evidence = ProviderEvidence::capture(
+            &references,
+            &self.provider_configs,
+            validated.context(),
+            &provider,
+            &expected_instances,
+        )?;
         Ok(PlanFile {
             contents: self,
             evidence,
@@ -1171,10 +1461,120 @@ impl<S> PlanFileContents<S> {
         }
         PlanSchemaReferences(references)
     }
+
+    fn expected_provider_instances(&self) -> BTreeSet<ProviderInstanceKey> {
+        fn insert(instances: &mut BTreeSet<ProviderInstanceKey>, id: &ResourceId) {
+            instances.insert(ProviderInstanceKey::from(id));
+        }
+
+        let mut instances = self
+            .provider_configs
+            .as_provider_configs()
+            .iter()
+            .map(ProviderInstanceKey::from)
+            .collect::<BTreeSet<_>>();
+        for effect in self.plan.effects() {
+            match effect {
+                Effect::Read { resource } => insert(&mut instances, &resource.id),
+                Effect::Create(resource) => insert(&mut instances, &resource.id),
+                Effect::ResumeCreate {
+                    resource,
+                    started_at: _started_at,
+                } => insert(&mut instances, &resource.id),
+                Effect::Update {
+                    from,
+                    identifier: _identifier,
+                    to,
+                    changed_attributes: _changed_attributes,
+                } => {
+                    insert(&mut instances, &from.id);
+                    insert(&mut instances, &to.id);
+                }
+                Effect::Delete {
+                    id,
+                    identifier: _identifier,
+                    generation: _generation,
+                    directives: _directives,
+                    binding: _binding,
+                    dependencies: _dependencies,
+                    explicit_dependencies: _explicit_dependencies,
+                    blocked_by_updates: _blocked_by_updates,
+                } => insert(&mut instances, id),
+                Effect::Import {
+                    id,
+                    identifier: _identifier,
+                } => insert(&mut instances, id),
+                Effect::Remove { id } => insert(&mut instances, id),
+                Effect::DeferredCreate { id, template } => {
+                    insert(&mut instances, id);
+                    insert(&mut instances, &template.template_resource.id);
+                }
+                Effect::Move { from, to } => {
+                    insert(&mut instances, from);
+                    insert(&mut instances, to);
+                }
+                Effect::Wait {
+                    identity: _identity,
+                    target_id,
+                    until: _until,
+                    until_surface: _until_surface,
+                    timeout: _timeout,
+                    interval: _interval,
+                    explicit_dependencies: _explicit_dependencies,
+                } => insert(&mut instances, target_id.id().as_inner()),
+                Effect::DeferredReplace(payload) => {
+                    insert(&mut instances, &payload.id);
+                    insert(&mut instances, &payload.template.template_resource.id);
+                    for delete in &payload.deletes {
+                        insert(&mut instances, &delete.id);
+                    }
+                }
+            }
+        }
+        for resource in self
+            .sorted_resources
+            .iter()
+            .chain(&self.unresolved_resources)
+        {
+            insert(&mut instances, &resource.id);
+        }
+        for data_source in self.data_sources.iter().chain(&self.data_source_origins) {
+            insert(&mut instances, &data_source.id);
+        }
+        for saved in &self.data_source_values {
+            insert(&mut instances, &saved.id);
+        }
+        for current in &self.current_states {
+            let CurrentStateEntry::Managed {
+                id,
+                current: _current,
+            } = current;
+            insert(&mut instances, id);
+        }
+        if instances.is_empty() {
+            instances.insert(ProviderInstanceKey::new("", None));
+        }
+        instances
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn test_provider_router(instances: &BTreeSet<ProviderInstanceKey>) -> ProviderRouter {
+    let mut provider = ProviderRouter::new();
+    for instance in instances {
+        provider.add_provider_instance(
+            instance.clone(),
+            carina_core::provider::InitializedProvider::new(
+                Box::new(carina_provider_mock::MockProvider::new()),
+                ReferenceScope::Unavailable,
+            ),
+        );
+    }
+    provider
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 28;
+    pub const CURRENT_VERSION: u32 = 30;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> PlanFileContents<SavedModuleSource> {
@@ -1187,6 +1587,10 @@ impl PlanFile {
 
     pub fn provider_artifacts(&self) -> &PlanProviderArtifacts {
         &self.evidence.provider_artifacts
+    }
+
+    pub fn provider_scopes(&self) -> &PlanProviderScopes {
+        self.evidence.provider_scopes.as_map()
     }
 
     /// Reload state-owned create continuations after the saved-plan apply has
@@ -2144,12 +2548,15 @@ mod historical_display_tests {
         // production paths. There is deliberately no persisted state shape:
         // the desired Secret shape must still mask the provider plaintext.
         let historical = collect_historical_display_attributes(&plan, &current_states, None);
+        let provider = crate::fixture_plan::provider_router_for_plan(&plan);
         let app = carina_tui::App::new(
             &plan,
             &carina_core::schema::SchemaRegistry::new(),
             &historical,
             None,
-        );
+            &provider,
+        )
+        .expect("detail-row fixture must have an initialized provider route");
         let rendered = format!("{:?}", app.nodes[0].detail_rows);
 
         assert!(
@@ -2261,6 +2668,10 @@ impl ReloadedPlanFile {
 
     pub(crate) fn provider_artifacts(&self) -> &PlanProviderArtifacts {
         &self.evidence.provider_artifacts
+    }
+
+    pub(crate) fn provider_scopes(&self) -> &RecordedProviderScopes {
+        &self.evidence.provider_scopes
     }
 
     pub(crate) fn provider_configs(&self) -> &SavedProviderConfigs {
@@ -2667,8 +3078,15 @@ mod managed_current_serde_tests {
             None,
             Sent::AllRequestAttributes,
         );
-        let row = ResourceState::from_in_flight(&resource, &pending, None, None, None)
-            .expect("in-flight fixture must encode");
+        let row = ResourceState::from_in_flight(
+            &resource,
+            &pending,
+            None,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        )
+        .expect("in-flight fixture must encode");
         let mut locked_in_flight = StateFile::new();
         locked_in_flight
             .upsert_resource(row)
@@ -2711,8 +3129,15 @@ mod managed_current_serde_tests {
             None,
             Sent::AllRequestAttributes,
         );
-        let row = ResourceState::from_in_flight(&unexpected_resource, &pending, None, None, None)
-            .expect("in-flight fixture must encode");
+        let row = ResourceState::from_in_flight(
+            &unexpected_resource,
+            &pending,
+            None,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        )
+        .expect("in-flight fixture must encode");
         let mut locked = StateFile::new();
         locked
             .upsert_resource(row)
@@ -2744,8 +3169,15 @@ mod managed_current_serde_tests {
             None,
             Sent::AllRequestAttributes,
         );
-        let row = ResourceState::from_in_flight(&source_resource, &pending, None, None, None)
-            .expect("in-flight fixture must encode");
+        let row = ResourceState::from_in_flight(
+            &source_resource,
+            &pending,
+            None,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        )
+        .expect("in-flight fixture must encode");
         let mut locked = StateFile::new();
         locked
             .upsert_resource(row)
@@ -3023,6 +3455,8 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
+        // carina#4065: bumped 28→30 (29 is reserved) — saved plans bind
+        // every initialized provider instance to its reference scope.
         // carina#3883: bumped 27→28 — pending re-read unknowns now persist a
         // typed reason shared with state markers. V27 plans carry the removed
         // untyped unknown shape and must be regenerated.
@@ -3675,6 +4109,7 @@ pub async fn run_plan(
             ctx_wiring.schemas(),
             &historical_display,
             Some(&ctx.prev_explicit),
+            &ctx.provider,
         )
         .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
         if let Some(result) = iam_preflight_result.as_ref() {
@@ -3690,7 +4125,8 @@ pub async fn run_plan(
             &ctx.moved_origins,
             Some(&ctx.prev_explicit),
             Some(&ctx.expansion_trace),
-        );
+            &ctx.provider,
+        )?;
         if let Some(note) = drift_note.as_ref() {
             println!();
             println!("{}", note.yellow());

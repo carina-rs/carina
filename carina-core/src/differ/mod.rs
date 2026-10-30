@@ -11,13 +11,19 @@ use std::ops::Index;
 
 use crate::binding_index::ManagedBindingStability;
 use crate::effect::MoveAuthority;
-use crate::provider::{LiftedSavedAttrs, NestedWriteOnlyRecord, ProviderError, StateTransformMap};
+use crate::provider::{
+    LiftedSavedAttrs, NestedWriteOnlyRecord, ProviderError, ProviderResult, ProviderRouter,
+    StateTransformMap,
+};
 use crate::resource::{
     Current, Directives, PlanInputCurrent, PresentResourceState, ResolvedResource, Resource,
     ResourceId, State, UnidentifiedState, Value, into_plan_input_current_map,
 };
 use crate::schema::{ResourceSchema, SchemaKind, SchemaRegistry};
 
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub use plan::create_plan_for_test;
 pub use plan::{block_deletes_on_prior_consumer_updates, create_plan, create_plan_with_cascades};
 
 /// Project the differ's managed-resource decision into the attribute
@@ -34,7 +40,8 @@ pub fn managed_binding_stability(
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-) -> HashMap<ResourceId, ManagedBindingStability> {
+    provider: &ProviderRouter,
+) -> ProviderResult<HashMap<ResourceId, ManagedBindingStability>> {
     let mut result = HashMap::new();
     for resource in managed {
         let current = current_states
@@ -44,20 +51,28 @@ pub fn managed_binding_stability(
             result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
             continue;
         };
-        let schema = registry
+        let owner_schema = registry
             .get(
                 &resource.id.provider,
                 &resource.id.resource_type,
                 SchemaKind::Resource,
             )
-            .map(|schema| schema.schema().as_schema());
+            .ok_or_else(|| {
+                ProviderError::internal(format!(
+                    "missing managed resource schema for `{}`",
+                    resource.id
+                ))
+            })?;
+        let context = provider.comparison_context_for(&resource.id, owner_schema)?;
+        let schema = owner_schema.schema().as_schema();
         let changed_attributes = match diff_present(
             resource,
             present,
             saved_attrs.get(&resource.id),
             saved_attrs.nested_write_only(&resource.id),
             prev_explicit.get(&resource.id),
-            schema,
+            Some(schema),
+            &context,
         ) {
             PresentDiff::NoChange => {
                 result.insert(
@@ -84,9 +99,7 @@ pub fn managed_binding_stability(
             );
             continue;
         }
-        let create_only = schema
-            .map(ResourceSchema::create_only_attributes)
-            .unwrap_or_default();
+        let create_only = schema.create_only_attributes();
         if changed_attributes
             .iter()
             .any(|attribute| create_only.contains(&attribute.as_str()))
@@ -96,8 +109,7 @@ pub fn managed_binding_stability(
         }
         let changed_attributes = changed_attributes.into_iter().collect();
         let refreshable_attributes = schema
-            .map(ResourceSchema::read_only_attributes)
-            .unwrap_or_default()
+            .read_only_attributes()
             .into_iter()
             .map(str::to_string)
             .collect();
@@ -109,7 +121,7 @@ pub fn managed_binding_stability(
             },
         );
     }
-    result
+    Ok(result)
 }
 
 /// Provider-observed state paired with all host-owned planning metadata for a
@@ -755,13 +767,28 @@ fn create_plan_for_tests(
 ) -> crate::plan::Plan {
     let managed = ResolvedResource::collect_resolved(managed.iter().cloned())
         .expect("differ test resources must have resolved identities");
-    plan::create_plan(
+    let mut registry = registry.clone();
+    for resource in &managed {
+        let present = current_states
+            .get(&resource.id)
+            .is_some_and(|current| matches!(current.current(), Current::Present(_)));
+        if present && registry.get_for(resource).is_none() {
+            registry.insert(
+                resource.id.provider.clone(),
+                ResourceSchema::new(resource.id.resource_type.clone())
+                    .validate()
+                    .expect("empty differ fixture schema must validate"),
+            );
+        }
+    }
+    let provider = crate::provider::TestContextualProvider::new(provider);
+    plan::create_plan_with_contextual_provider(
         &managed,
         data_sources,
-        provider,
+        &provider,
         PlanPriorStates::new(current_states, orphans),
         directives_map,
-        registry,
+        &registry,
         saved_attrs,
         prev_explicit,
         wait_bindings,
@@ -776,8 +803,17 @@ use crate::effect::Effect;
 use crate::plan::Plan;
 #[cfg(test)]
 use crate::schema::AttributeType;
-#[cfg(test)]
-use comparison::find_changed_attributes;
+pub use comparison::ComparisonContext;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn exact_comparison_context_for_tests() -> ComparisonContext<'static> {
+    use std::sync::LazyLock;
+
+    static SCOPE: crate::provider::ReferenceScope = crate::provider::ReferenceScope::Unavailable;
+    static FORMS: LazyLock<crate::schema::ReferenceForms> =
+        LazyLock::new(crate::schema::ReferenceForms::new);
+    ComparisonContext::for_test(&SCOPE, &FORMS)
+}
 
 #[cfg(test)]
 fn empty_lifted_saved_attrs() -> crate::provider::LiftedSavedAttrs {
@@ -854,6 +890,7 @@ fn diff_present(
     nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
+    context: &ComparisonContext<'_>,
 ) -> PresentDiff {
     diff_existing_state(
         desired,
@@ -862,6 +899,7 @@ fn diff_present(
         nested_write_only,
         prev_explicit,
         schema,
+        context,
     )
 }
 
@@ -872,6 +910,7 @@ fn diff_existing_state(
     nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
+    context: &ComparisonContext<'_>,
 ) -> PresentDiff {
     let changed = comparison::find_changed_attributes(
         &desired.resolved_attributes(),
@@ -880,6 +919,7 @@ fn diff_existing_state(
         nested_write_only,
         prev_explicit,
         schema,
+        context,
     );
 
     if changed.is_empty() {
@@ -938,6 +978,7 @@ pub fn diff(
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
+    context: &ComparisonContext<'_>,
 ) -> Diff {
     diff_with_saved_parts(
         desired,
@@ -946,6 +987,7 @@ pub fn diff(
         saved_attrs.nested_write_only(&desired.id),
         prev_explicit,
         schema,
+        context,
     )
 }
 
@@ -956,6 +998,7 @@ fn diff_with_saved_parts(
     nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
+    context: &ComparisonContext<'_>,
 ) -> Diff {
     if !current.exists {
         return Diff::Create(desired.as_resource().clone());
@@ -967,6 +1010,7 @@ fn diff_with_saved_parts(
         nested_write_only,
         prev_explicit,
         schema,
+        context,
     ) {
         PresentDiff::Update {
             id,
@@ -990,6 +1034,7 @@ pub(crate) fn diff_test(
     saved: Option<&HashMap<String, Value>>,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
+    context: &ComparisonContext<'_>,
 ) -> Diff {
     diff_with_saved_parts(
         &ResolvedResource::new(desired.clone()),
@@ -998,6 +1043,7 @@ pub(crate) fn diff_test(
         &NestedWriteOnlyRecord::new(),
         prev_explicit,
         schema,
+        context,
     )
 }
 

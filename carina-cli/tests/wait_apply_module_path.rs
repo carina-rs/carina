@@ -35,10 +35,10 @@ use carina_core::binding_index::ResolvedBindings;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::data_source_value::ExecutableDataSourceValues;
 use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::{Orphans, create_plan};
+use carina_core::differ::Orphans;
 use carina_core::executor::{
     ExecutionObserver, ExecutionOutcome, ExecutionResult, LiveExecutionInput, ProviderCheckInputs,
-    UnresolvedResource, execute_live_plan,
+    UnresolvedResource,
 };
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
@@ -94,11 +94,14 @@ impl ProviderFactory for AwsStub {
         &self,
         _b: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
         Box::pin(async {
-            Ok(Box::new(NoopProvider {
-                cert_publishes_arn: true,
-            }) as Box<dyn Provider>)
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(NoopProvider {
+                    cert_publishes_arn: true,
+                }),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
         })
     }
     fn create_normalizer(
@@ -628,7 +631,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
 
     let saved_attrs = carina_core::provider::RawSavedAttrs::default().lift(ctx.schemas());
-    let plan = create_plan(
+    let plan = carina_core::differ::create_plan_for_test(
         &resolved_resources_for_plan,
         &parsed.data_sources,
         &provider,
@@ -692,7 +695,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::noop(),
     };
     let result = completed_result(
-        execute_live_plan(
+        carina_core::executor::execute_live_plan_for_test(
             &provider,
             input,
             &observer,

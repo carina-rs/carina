@@ -4,7 +4,7 @@
 //! directory. Multi-file cases deliberately split declarations across sibling
 //! `.crn` files so the loader merge seam is exercised directly.
 
-use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
+use carina_core::provider::{BoxFuture, ProviderFactory, ProviderResult};
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 use indexmap::IndexMap;
@@ -40,7 +40,7 @@ impl ProviderFactory for DuplicateTestFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
         Box::pin(async { panic!("validation tests never instantiate providers") })
     }
 

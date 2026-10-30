@@ -35,6 +35,7 @@ use ratatui::prelude::*;
 use carina_core::explicit::ExplicitFields;
 use carina_core::module::FileSignature;
 use carina_core::plan::Plan;
+use carina_core::provider::ProviderRouter;
 use carina_core::resource::ResourceId;
 use carina_core::schema::SchemaRegistry;
 
@@ -204,8 +205,10 @@ pub fn run(
     schemas: &SchemaRegistry,
     historical_display: &carina_core::detail_rows::HistoricalDisplayAttributes,
     prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
+    provider: &ProviderRouter,
 ) -> io::Result<()> {
-    let mut app = App::new(plan, schemas, historical_display, prev_explicit);
+    let mut app = App::new(plan, schemas, historical_display, prev_explicit, provider)
+        .map_err(|error| io::Error::other(error.to_string()))?;
     run_tui(ui::draw, handle_key, &mut app)
 }
 

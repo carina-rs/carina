@@ -144,9 +144,12 @@ impl ProviderFactory for EvidenceTestFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
         Box::pin(async {
-            Ok(Box::new(carina_provider_mock::MockProvider::new()) as Box<dyn Provider>)
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(carina_provider_mock::MockProvider::new()),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
         })
     }
 
@@ -197,7 +200,7 @@ fn record_test_plan(contents: PlanFileContents, providers: &[&str]) -> PlanFile 
 }
 
 fn final_state_save_inputs(sorted_resources: &[ResolvedResource]) -> Arc<ApplyStateSaveInputs> {
-    Arc::new(ApplyStateSaveInputs::new(
+    Arc::new(ApplyStateSaveInputs::new_for_test(
         sorted_resources.to_vec(),
         Plan::new(),
         SchemaRegistry::new(),
@@ -265,6 +268,26 @@ impl TestProvider {
         let mut read_results = HashMap::new();
         read_results.insert((id.to_string(), identifier.to_string()), result);
         Self { read_results }
+    }
+}
+
+impl crate::commands::apply::ComparisonProvider for TestProvider {
+    fn operation_provider(&self) -> &dyn Provider {
+        self
+    }
+
+    fn comparison_context_for<'a>(
+        &'a self,
+        id: &ResourceId,
+        schema: carina_core::schema::OwnerBoundResourceSchema<'a>,
+    ) -> ProviderResult<carina_core::differ::ComparisonContext<'a>> {
+        assert_eq!(id.provider, schema.owner());
+        static SCOPE: carina_core::provider::ReferenceScope =
+            carina_core::provider::ReferenceScope::Unavailable;
+        Ok(carina_core::differ::ComparisonContext::for_test(
+            &SCOPE,
+            schema.reference_forms(),
+        ))
     }
 }
 
@@ -1344,6 +1367,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
         None,
         RowBasis::Applied(&AcceptedRequest::create_for_test()),
         None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
     )
     .unwrap();
 
@@ -1474,6 +1498,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
         None,
         RowBasis::Applied(&AcceptedRequest::create_for_test()),
         None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
     )
     .unwrap();
     let mut state_file = StateFile::new();
@@ -1598,6 +1623,89 @@ async fn detect_drift_returns_none_when_no_drift() {
     .expect("drift check succeeds");
 
     assert!(result.drift_messages().is_none(), "Should detect no drift");
+}
+
+#[tokio::test]
+async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
+    use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
+    use carina_core::schema::{
+        ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity, ValidatedConfigSchema,
+        ValidatedProviderSchemaWitness,
+    };
+
+    let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
+    let schema = ResourceSchema::new("lambda.Permission").attribute(
+        AttributeSchema::optional(
+            "function_name",
+            AttributeType::refined_string(Some(identity.clone()), None, None, None),
+        )
+        .build(),
+    );
+    let forms = ReferenceForms::from([(
+        identity,
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:lambda:{region}:{account}:function:{name}",
+            )
+            .expect("valid reference template"),
+        },
+    )]);
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![schema.validate().expect("valid schema")],
+        ValidatedConfigSchema::default(),
+        forms,
+    )
+    .expect("valid provider schema witness");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert_provider_witness("aws", &witness);
+
+    let resource = Resource::with_provider("aws", "lambda.Permission", "invoke", None);
+    let id = resource.id.clone();
+    let identifier = "permission-id";
+    let planned = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "function_name".to_string(),
+            Value::Concrete(ConcreteValue::String("processor".into())),
+        )]),
+    )
+    .with_identifier(identifier);
+    let actual = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "function_name".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "arn:aws:lambda:us-east-1:123456789012:function:processor".into(),
+            )),
+        )]),
+    )
+    .with_identifier(identifier);
+    let mut provider = ProviderRouter::new();
+    provider.add_provider(
+        "aws".to_string(),
+        InitializedProvider::new(
+            Box::new(TestProvider::with_read_state(&id, identifier, actual)),
+            ReferenceScope::Available {
+                partition: "aws".to_string(),
+                region: "us-east-1".to_string(),
+                account: "123456789012".to_string(),
+            },
+        ),
+    );
+
+    let result = detect_drift(
+        &[resource],
+        &[ReloadedCurrentStateEntry::managed(id, planned)],
+        &MovedOrigins::from_plan(&Plan::new()),
+        &provider,
+        None,
+        &schemas,
+        ApplyTarget::Project(std::path::Path::new(".")),
+    )
+    .await
+    .expect("reference-equivalent drift check succeeds");
+
+    assert_eq!(result.drift_messages(), None);
 }
 
 #[tokio::test]

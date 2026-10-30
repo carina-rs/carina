@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
+use carina_core::provider::{BoxFuture, ProviderFactory, ProviderResult};
 use carina_core::resource::Value;
 use carina_core::schema::{
     ResourceSchema, SchemaRegistry, ValidatedConfigSchema, ValidatedResourceSchema,
@@ -49,7 +49,7 @@ impl ProviderFactory for SchemaFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
         unimplemented!("schema fixture factories are never instantiated")
     }
 

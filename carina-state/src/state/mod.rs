@@ -2,7 +2,7 @@
 
 use carina_core::binding_index::SecretPreservingAttributes;
 use carina_core::deps::get_resource_dependencies;
-use carina_core::differ::Orphan;
+use carina_core::differ::{ComparisonContext, Orphan};
 use carina_core::effect::MoveAuthority;
 use carina_core::executor::{AcceptedRequest, AcceptedRequestKind};
 use carina_core::explicit::{self, ExplicitFields};
@@ -2897,6 +2897,7 @@ impl ResourceState {
         stored_attributes: &HashMap<String, Value>,
         schema: Option<&ResourceSchema>,
         authoring_basis: DesiredAuthoringBasis,
+        comparison: &ComparisonContext<'_>,
     ) {
         if let Some(existing) = existing {
             self.protected = existing.protected;
@@ -2911,13 +2912,19 @@ impl ResourceState {
             // An empty Struct is a complete record that the applied desired
             // resource authored no attributes.
             DesiredAuthoringBasis::AppliedDesired => {
-                explicit::build_from_resource_for_stored_values(resource, stored_attributes, schema)
+                explicit::build_from_resource_for_stored_values(
+                    resource,
+                    stored_attributes,
+                    schema,
+                    comparison,
+                )
             }
             DesiredAuthoringBasis::CarryPrior => Self::carried_explicit_for_stored_values(
                 resource,
                 existing,
                 stored_attributes,
                 schema,
+                comparison,
             ),
         };
         self.binding = resource.binding.clone();
@@ -2932,12 +2939,14 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         stored_attributes: &HashMap<String, Value>,
         schema: Option<&ResourceSchema>,
+        comparison: &ComparisonContext<'_>,
     ) -> ExplicitFields {
         let Some(existing) = existing else {
             return explicit::build_from_resource_for_stored_values(
                 resource,
                 stored_attributes,
                 schema,
+                comparison,
             );
         };
         let prior_stored_attributes = existing
@@ -2950,6 +2959,7 @@ impl ResourceState {
             &existing.explicit,
             stored_attributes,
             schema,
+            comparison,
         )
     }
 
@@ -2965,6 +2975,7 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
+        comparison: &ComparisonContext<'_>,
     ) -> Result<Self, ResourceStateEncodingError> {
         let applied_desired = created
             .resolved_desired_attributes()
@@ -3064,6 +3075,7 @@ impl ResourceState {
             &stored_attributes,
             schema,
             DesiredAuthoringBasis::AppliedDesired,
+            comparison,
         );
         Ok(row)
     }
@@ -3079,6 +3091,7 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
+        comparison: &ComparisonContext<'_>,
     ) -> Result<Self, ResourceStateEncodingError> {
         let (persisted, authoring_basis) = match pending.persistence() {
             InFlightPersistence::Persisted => {
@@ -3111,6 +3124,7 @@ impl ResourceState {
                             resource,
                             &HashMap::new(),
                             schema,
+                            comparison,
                         );
                     }
                     return Ok(row);
@@ -3147,7 +3161,14 @@ impl ResourceState {
             resource.id.provider.clone(),
         );
         row.current = CurrentInstance::CreateInFlight { pending: persisted };
-        row.populate_desired_metadata(resource, existing, &HashMap::new(), schema, authoring_basis);
+        row.populate_desired_metadata(
+            resource,
+            existing,
+            &HashMap::new(),
+            schema,
+            authoring_basis,
+            comparison,
+        );
         Ok(row)
     }
 
@@ -3171,6 +3192,7 @@ impl ResourceState {
         schema: Option<&ResourceSchema>,
         row_basis: RowBasis<'_>,
         preferred_hashes: Option<&PersistedAttributes>,
+        comparison: &ComparisonContext<'_>,
     ) -> Result<Self, ResourceStateEncodingError> {
         // The resource carried by a saved plan still contains deferred expressions.
         // Once an operation has run, secret protection must follow the provider-ready
@@ -3341,6 +3363,7 @@ impl ResourceState {
             &state.attributes,
             schema,
             authoring_basis,
+            comparison,
         );
         Ok(rs)
     }

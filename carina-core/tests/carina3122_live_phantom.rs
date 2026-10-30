@@ -46,7 +46,9 @@ use std::collections::HashMap;
 
 use carina_core::differ::{Diff, diff};
 use carina_core::explicit::ExplicitFields;
+use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
 use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
+use carina_core::schema::{ResourceSchema, SchemaRegistry};
 
 fn load_dc(name: &str) -> Value {
     let path = format!(
@@ -102,6 +104,26 @@ fn carina3122_live_distribution_readback_defaults_are_projected_away() {
     let current = State::existing(id, state_attrs);
     let saved = carina_core::provider::RawSavedAttrs::default()
         .lift(&carina_core::schema::SchemaRegistry::new());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        ResourceSchema::new("cloudfront.Distribution")
+            .validate()
+            .expect("comparison owner schema is valid"),
+    );
+    let mut providers = ProviderRouter::new();
+    providers.add_provider(
+        "awscc".to_string(),
+        InitializedProvider::new(Box::new(ProviderRouter::new()), ReferenceScope::Unavailable),
+    );
+    let comparison = providers
+        .comparison_context_for(
+            &desired.id,
+            schemas
+                .get_for(&desired)
+                .expect("comparison owner schema is registered"),
+        )
+        .expect("comparison provider route is initialized");
 
     let result = diff(
         &ResolvedResource::new(desired),
@@ -109,6 +131,7 @@ fn carina3122_live_distribution_readback_defaults_are_projected_away() {
         &saved,
         Some(&prev_explicit),
         None,
+        &comparison,
     );
 
     assert!(

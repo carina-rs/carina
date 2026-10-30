@@ -1170,12 +1170,26 @@ pub trait ExecutionObserver<S = ModuleSource>: Send + Sync {
 /// - Dependency skip
 /// - Pending state refreshes
 pub async fn execute_live_plan(
-    provider: &dyn Provider,
+    provider: &crate::provider::ProviderRouter,
     input: LiveExecutionInput<'_>,
     observer: &dyn ExecutionObserver,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome {
     execute_runtime_plan(provider, input.into(), observer, shutdown).await
+}
+
+/// Test-only execution entry point for focused provider fixtures without an
+/// initialized provider instance. Comparisons use an unavailable scope.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub async fn execute_live_plan_for_test(
+    provider: &dyn Provider,
+    input: LiveExecutionInput<'_>,
+    observer: &dyn ExecutionObserver,
+    shutdown: ShutdownToken,
+) -> ExecutionOutcome {
+    let provider = crate::provider::TestContextualProvider::new(provider);
+    execute_runtime_plan(&provider, input.into(), observer, shutdown).await
 }
 
 #[cfg(test)]
@@ -1188,11 +1202,12 @@ async fn execute_plan(
     observer: &dyn ExecutionObserver,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome {
-    execute_live_plan(provider, input, observer, shutdown).await
+    let provider = crate::provider::TestContextualProvider::new(provider);
+    execute_runtime_plan(&provider, input.into(), observer, shutdown).await
 }
 
 pub async fn execute_saved_plan(
-    provider: &dyn Provider,
+    provider: &crate::provider::ProviderRouter,
     input: SavedExecutionInput<'_>,
     observer: &dyn ExecutionObserver<SavedModuleSource>,
     shutdown: ShutdownToken,
@@ -1201,7 +1216,7 @@ pub async fn execute_saved_plan(
 }
 
 async fn execute_runtime_plan<S: Clone>(
-    provider: &dyn Provider,
+    provider: &dyn crate::provider::ContextualProvider,
     mut input: RuntimeExecutionInput<'_, S>,
     observer: &dyn ExecutionObserver<S>,
     shutdown: ShutdownToken,

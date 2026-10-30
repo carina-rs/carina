@@ -12,7 +12,9 @@ use crate::plan::{
     PreventDestroyAction, ReplacementCannotCoexistError, ReplacementDelete, ReplacementGroup,
     SchemaNotRegisteredError,
 };
-use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult};
+use crate::provider::{
+    ContextualProvider, LiftedSavedAttrs, ProviderError, ProviderResult, ProviderRouter,
+};
 use crate::resource::{
     ConcreteValue, Current, DataSource, Directives, PlanInputCurrent, ResolvedDataSource,
     ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
@@ -309,7 +311,62 @@ pub fn generate_temporary_name(
 pub fn create_plan(
     managed: &[ResolvedResource],
     data_sources: &[DataSource],
-    provider: &dyn Provider,
+    provider: &ProviderRouter,
+    prior_states: PlanPriorStates<'_>,
+    directives_map: &HashMap<ResourceId, Directives>,
+    registry: &SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+    wait_bindings: &[WaitBinding],
+) -> ProviderResult<Plan> {
+    create_plan_with_contextual_provider(
+        managed,
+        data_sources,
+        provider,
+        prior_states,
+        directives_map,
+        registry,
+        saved_attrs,
+        prev_explicit,
+        wait_bindings,
+    )
+}
+
+/// Test-only entry point for focused provider fixtures that do not model an
+/// initialized provider instance. Comparisons use an unavailable scope.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn create_plan_for_test(
+    managed: &[ResolvedResource],
+    data_sources: &[DataSource],
+    provider: &dyn crate::provider::Provider,
+    prior_states: PlanPriorStates<'_>,
+    directives_map: &HashMap<ResourceId, Directives>,
+    registry: &SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+    wait_bindings: &[WaitBinding],
+) -> ProviderResult<Plan> {
+    let provider = crate::provider::TestContextualProvider::new(provider);
+    create_plan_with_contextual_provider(
+        managed,
+        data_sources,
+        &provider,
+        prior_states,
+        directives_map,
+        registry,
+        saved_attrs,
+        prev_explicit,
+        wait_bindings,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_plan_with_contextual_provider(
+    managed: &[ResolvedResource],
+    data_sources: &[DataSource],
+    provider: &dyn ContextualProvider,
     prior_states: PlanPriorStates<'_>,
     directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
@@ -339,7 +396,7 @@ pub fn create_plan_with_cascades(
     managed: &[ResolvedResource],
     unresolved_managed: &[ResolvedResource],
     data_sources: &[DataSource],
-    provider: &dyn Provider,
+    provider: &ProviderRouter,
     prior_states: PlanPriorStates<'_>,
     directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
@@ -380,7 +437,7 @@ struct PlanBuild {
 fn create_plan_parts(
     managed: &[ResolvedResource],
     data_sources: &[DataSource],
-    provider: &dyn Provider,
+    provider: &dyn ContextualProvider,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
@@ -409,13 +466,6 @@ fn create_plan_parts(
             .unwrap_or_else(|| PlanInputCurrent::absent(resource.id.clone()));
         let saved = saved_attrs.get(&resource.id);
         let prev_explicit_for_resource = prev_explicit.get(&resource.id);
-        let schema = registry
-            .get(
-                &resource.id.provider,
-                &resource.id.resource_type,
-                SchemaKind::Resource,
-            )
-            .map(|schema| schema.schema().as_schema());
         match current.current() {
             Current::Absent(_absent) => plan.add(Effect::Create(resource.clone())),
             Current::CreateInFlight(pending) => {
@@ -437,13 +487,28 @@ fn create_plan_parts(
                 ));
             }
             Current::Present(present) => {
+                let owner_schema = registry
+                    .get(
+                        &resource.id.provider,
+                        &resource.id.resource_type,
+                        SchemaKind::Resource,
+                    )
+                    .ok_or_else(|| {
+                        ProviderError::internal(format!(
+                            "missing managed resource schema for `{}`",
+                            resource.id
+                        ))
+                    })?;
+                let context = provider.comparison_context_for(&resource.id, owner_schema)?;
+                let schema = owner_schema.schema().as_schema();
                 match diff_present(
                     resource,
                     present,
                     saved,
                     saved_attrs.nested_write_only(&resource.id),
                     prev_explicit_for_resource,
-                    schema,
+                    Some(schema),
+                    &context,
                 ) {
                     PresentDiff::Update {
                         id,
@@ -722,7 +787,7 @@ fn create_plan_parts(
         // because `depends_on` is the user's source of truth and must never be
         // weakened by provider-derived knowledge.
         explicit_dependencies.extend(satisfier_augmentation(
-            provider,
+            provider.provider(),
             target_id.as_inner(),
             &attr,
             &known_bindings,

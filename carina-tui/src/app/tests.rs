@@ -253,7 +253,7 @@ fn whole_value_list_uses_whole_value_detail_row() {
 
     let schemas = SchemaRegistry::new();
     let historical_display = HistoricalDisplayAttributes::for_plan(&plan);
-    let app = App::new(&plan, &schemas, &historical_display, Some(&prev_explicit));
+    let app = App::new_for_test(&plan, &schemas, &historical_display, Some(&prev_explicit));
     assert!(matches!(
         app.nodes[0].detail_rows.as_slice(),
         [DetailRow::Changed { key, .. }] if key == "rules"

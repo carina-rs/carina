@@ -13,7 +13,7 @@ use std::pin::Pin;
 
 use carina_provider_protocol::types as protocol_types;
 pub use carina_provider_protocol::types::{
-    AppliedIdentifier, EmptyAppliedIdentifier, PendingToken, Sent,
+    AppliedIdentifier, EmptyAppliedIdentifier, PendingToken, ReferenceScope, Sent,
 };
 use carina_provider_protocol::types::{
     ProviderError as WireProviderError, ProviderErrorKind as WireProviderErrorKind,
@@ -4086,20 +4086,33 @@ impl ProviderNormalizer for NoopNormalizer {
     }
 }
 
-/// The routing identity shared by provider dispatch and host-owned default-tag
-/// normalization.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ProviderRouteKey {
+/// The exact initialized provider instance selected for a resource operation.
+///
+/// The provider kind alone is insufficient: named instances of one provider
+/// kind may initialize in different regions or accounts and therefore carry
+/// different reference-comparison scopes.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct ProviderInstanceKey {
     provider: String,
     provider_instance: Option<String>,
 }
 
-impl ProviderRouteKey {
-    fn new(provider: impl Into<String>, provider_instance: Option<String>) -> Self {
+impl ProviderInstanceKey {
+    pub fn new(provider: impl Into<String>, provider_instance: Option<String>) -> Self {
         Self {
             provider: provider.into(),
             provider_instance,
         }
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn provider_instance(&self) -> Option<&str> {
+        self.provider_instance.as_deref()
     }
 
     fn matches(&self, id: &ResourceId) -> bool {
@@ -4107,13 +4120,13 @@ impl ProviderRouteKey {
     }
 }
 
-impl From<&ProviderConfig> for ProviderRouteKey {
+impl From<&ProviderConfig> for ProviderInstanceKey {
     fn from(config: &ProviderConfig) -> Self {
         Self::new(config.name.clone(), config.binding.clone())
     }
 }
 
-impl From<&ResourceId> for ProviderRouteKey {
+impl From<&ResourceId> for ProviderInstanceKey {
     fn from(id: &ResourceId) -> Self {
         Self::new(id.provider.clone(), id.provider_instance.clone())
     }
@@ -4250,7 +4263,7 @@ pub fn merge_default_tags<S>(
         return Ok(());
     }
 
-    let route = ProviderRouteKey::from(config);
+    let route = ProviderInstanceKey::from(config);
     for resource in resources.iter_mut() {
         if !route.matches(&resource.id) {
             continue;
@@ -4303,6 +4316,117 @@ pub fn merge_default_tags<S>(
     Ok(())
 }
 
+/// A provider implementation paired with the scope returned by that exact
+/// initialized instance.
+///
+/// The fields are private so a routed provider cannot exist without an
+/// explicit scope. Comparison contexts borrow this witness rather than a raw
+/// provider, which makes scope selection part of the type-level call path.
+pub struct InitializedProvider {
+    provider: Box<dyn Provider>,
+    reference_scope: ReferenceScope,
+}
+
+impl InitializedProvider {
+    pub fn new(provider: Box<dyn Provider>, reference_scope: ReferenceScope) -> Self {
+        Self {
+            provider,
+            reference_scope,
+        }
+    }
+
+    pub fn reference_scope(&self) -> &ReferenceScope {
+        &self.reference_scope
+    }
+
+    pub fn provider(&self) -> &(dyn Provider + 'static) {
+        self.provider.as_ref()
+    }
+}
+
+impl std::ops::Deref for InitializedProvider {
+    type Target = dyn Provider + 'static;
+
+    fn deref(&self) -> &Self::Target {
+        self.provider()
+    }
+}
+
+/// Provider normalizers without CRUD-capable initialized instances.
+///
+/// Normalizer-only loading returns this type. It deliberately has no API that
+/// can mint a [`crate::differ::ComparisonContext`].
+pub struct NormalizerRouter {
+    normalizers: Vec<(String, Box<dyn ProviderNormalizer>)>,
+}
+
+impl Default for NormalizerRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NormalizerRouter {
+    pub fn new() -> Self {
+        Self {
+            normalizers: Vec::new(),
+        }
+    }
+
+    pub fn add_normalizer(
+        &mut self,
+        provider_name: impl Into<String>,
+        ext: Box<dyn ProviderNormalizer>,
+    ) {
+        self.normalizers.push((provider_name.into(), ext));
+    }
+}
+
+impl ProviderNormalizer for NormalizerRouter {
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [ProviderResource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            for (provider_name, ext) in &self.normalizers {
+                ext.normalize_desired(resources)
+                    .await
+                    .map_err(|error| error.for_provider(provider_name.clone()))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn normalize_state<'a>(
+        &'a self,
+        current_states: &'a mut StateTransformMap,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            for (provider_name, ext) in &self.normalizers {
+                ext.normalize_state(current_states)
+                    .await
+                    .map_err(|error| error.for_provider(provider_name.clone()))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn hydrate_read_state<'a>(
+        &'a self,
+        current_states: &'a mut StateTransformMap,
+        saved_attrs: &'a SavedAttrs,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            for (provider_name, ext) in &self.normalizers {
+                ext.hydrate_read_state(current_states, saved_attrs)
+                    .await
+                    .map_err(|error| error.for_provider(provider_name.clone()))?;
+            }
+            Ok(())
+        })
+    }
+}
+
 /// A provider that routes operations to the correct sub-provider
 /// based on the resource's `(provider, provider_instance)` pair.
 ///
@@ -4313,8 +4437,24 @@ pub fn merge_default_tags<S>(
 ///   `let <name> = provider <kind> { ... }` and selected via
 ///   `directives { provider = <name> }`.
 pub struct ProviderRouter {
-    providers: HashMap<ProviderRouteKey, Box<dyn Provider>>,
-    normalizers: Vec<(String, Box<dyn ProviderNormalizer>)>,
+    providers: HashMap<ProviderInstanceKey, InitializedProvider>,
+    normalizers: NormalizerRouter,
+}
+
+/// Internal provider surface for code that both dispatches operations and
+/// performs schema-aware comparisons.
+///
+/// Production implementations are initialized routers. Tests may use the
+/// scoped adapter below so focused provider fixtures do not need to reproduce
+/// the full initialization pipeline.
+pub(crate) trait ContextualProvider: Send + Sync {
+    fn provider(&self) -> &dyn Provider;
+
+    fn comparison_context_for<'a>(
+        &'a self,
+        id: &ResourceId,
+        schema: crate::schema::OwnerBoundResourceSchema<'a>,
+    ) -> ProviderResult<crate::differ::ComparisonContext<'a>>;
 }
 
 impl Default for ProviderRouter {
@@ -4327,22 +4467,33 @@ impl ProviderRouter {
     pub fn new() -> Self {
         Self {
             providers: HashMap::new(),
-            normalizers: Vec::new(),
+            normalizers: NormalizerRouter::new(),
         }
     }
 
     /// Register the kind's default instance (resources with
     /// `provider_instance = None` route here).
-    pub fn add_provider(&mut self, kind: String, provider: Box<dyn Provider>) {
+    pub fn add_provider(&mut self, kind: String, provider: InitializedProvider) {
         self.providers
-            .insert(ProviderRouteKey::new(kind, None), provider);
+            .insert(ProviderInstanceKey::new(kind, None), provider);
     }
 
     /// Register a provider under the same route derived from its config by
     /// host-owned normalization.
-    pub fn add_provider_config(&mut self, config: &ProviderConfig, provider: Box<dyn Provider>) {
+    pub fn add_provider_config(&mut self, config: &ProviderConfig, provider: InitializedProvider) {
         self.providers
-            .insert(ProviderRouteKey::from(config), provider);
+            .insert(ProviderInstanceKey::from(config), provider);
+    }
+
+    /// Register an already-initialized provider under an explicit instance
+    /// route. Native hosts and test harnesses use this when no parsed provider
+    /// block exists to carry the route.
+    pub fn add_provider_instance(
+        &mut self,
+        key: ProviderInstanceKey,
+        provider: InitializedProvider,
+    ) {
+        self.providers.insert(key, provider);
     }
 
     pub fn add_normalizer(
@@ -4350,16 +4501,19 @@ impl ProviderRouter {
         provider_name: impl Into<String>,
         ext: Box<dyn ProviderNormalizer>,
     ) {
-        self.normalizers.push((provider_name.into(), ext));
+        self.normalizers.add_normalizer(provider_name, ext);
     }
 
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
     }
 
-    fn get_provider_or_error(&self, id: &ResourceId) -> ProviderResult<&dyn Provider> {
-        let key = ProviderRouteKey::from(id);
-        self.providers.get(&key).map(|p| p.as_ref()).ok_or_else(|| {
+    fn get_initialized_provider_or_error(
+        &self,
+        id: &ResourceId,
+    ) -> ProviderResult<&InitializedProvider> {
+        let key = ProviderInstanceKey::from(id);
+        self.providers.get(&key).ok_or_else(|| {
             ProviderError::internal(match &id.provider_instance {
                 Some(binding) => format!(
                     "Unknown provider instance: {} (kind={})",
@@ -4368,6 +4522,92 @@ impl ProviderRouter {
                 None => format!("Unknown provider: {}", id.provider),
             })
         })
+    }
+
+    fn get_provider_or_error(&self, id: &ResourceId) -> ProviderResult<&dyn Provider> {
+        self.get_initialized_provider_or_error(id)
+            .map(InitializedProvider::provider)
+    }
+
+    /// Return the exact scope of every initialized provider instance.
+    pub fn provider_scopes(&self) -> BTreeMap<ProviderInstanceKey, ReferenceScope> {
+        self.providers
+            .iter()
+            .map(|(key, provider)| (key.clone(), provider.reference_scope().clone()))
+            .collect()
+    }
+
+    /// Mint the comparison context for one resource and its owner-bound
+    /// schema. Both the instance route and schema owner must agree.
+    pub fn comparison_context_for<'a>(
+        &'a self,
+        id: &ResourceId,
+        schema: crate::schema::OwnerBoundResourceSchema<'a>,
+    ) -> ProviderResult<crate::differ::ComparisonContext<'a>> {
+        let key = ProviderInstanceKey::from(id);
+        if key.provider() != schema.owner() {
+            return Err(ProviderError::internal(format!(
+                "resource `{id}` routes to provider `{}` but its schema is owned by `{}`",
+                key.provider(),
+                schema.owner(),
+            )));
+        }
+        let provider = self.get_initialized_provider_or_error(id)?;
+        Ok(crate::differ::ComparisonContext::from_initialized_provider(
+            provider, schema,
+        ))
+    }
+}
+
+impl ContextualProvider for ProviderRouter {
+    fn provider(&self) -> &dyn Provider {
+        self
+    }
+
+    fn comparison_context_for<'a>(
+        &'a self,
+        id: &ResourceId,
+        schema: crate::schema::OwnerBoundResourceSchema<'a>,
+    ) -> ProviderResult<crate::differ::ComparisonContext<'a>> {
+        ProviderRouter::comparison_context_for(self, id, schema)
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) struct TestContextualProvider<'a> {
+    provider: &'a dyn Provider,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl<'a> TestContextualProvider<'a> {
+    pub(crate) fn new(provider: &'a dyn Provider) -> Self {
+        Self { provider }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl ContextualProvider for TestContextualProvider<'_> {
+    fn provider(&self) -> &dyn Provider {
+        self.provider
+    }
+
+    fn comparison_context_for<'a>(
+        &'a self,
+        id: &ResourceId,
+        schema: crate::schema::OwnerBoundResourceSchema<'a>,
+    ) -> ProviderResult<crate::differ::ComparisonContext<'a>> {
+        if id.provider != schema.owner() {
+            return Err(ProviderError::internal(format!(
+                "resource `{id}` routes to provider `{}` but its schema is owned by `{}`",
+                id.provider,
+                schema.owner(),
+            )));
+        }
+        static SCOPE: ReferenceScope = ReferenceScope::Unavailable;
+        Ok(crate::differ::ComparisonContext::for_test(
+            &SCOPE,
+            schema.reference_forms(),
+        ))
     }
 }
 
@@ -4469,31 +4709,14 @@ impl ProviderNormalizer for ProviderRouter {
         &'a self,
         resources: &'a mut [ProviderResource],
     ) -> BoxFuture<'a, ProviderResult<()>> {
-        Box::pin(async move {
-            // Sequential, never concurrent: normalizers are not
-            // commutative, and `resources` is re-borrowed per iteration
-            // across the `.await`.
-            for (provider_name, ext) in &self.normalizers {
-                ext.normalize_desired(resources)
-                    .await
-                    .map_err(|error| error.for_provider(provider_name.clone()))?;
-            }
-            Ok(())
-        })
+        self.normalizers.normalize_desired(resources)
     }
 
     fn normalize_state<'a>(
         &'a self,
         current_states: &'a mut StateTransformMap,
     ) -> BoxFuture<'a, ProviderResult<()>> {
-        Box::pin(async move {
-            for (provider_name, ext) in &self.normalizers {
-                ext.normalize_state(current_states)
-                    .await
-                    .map_err(|error| error.for_provider(provider_name.clone()))?;
-            }
-            Ok(())
-        })
+        self.normalizers.normalize_state(current_states)
     }
 
     fn hydrate_read_state<'a>(
@@ -4501,14 +4724,8 @@ impl ProviderNormalizer for ProviderRouter {
         current_states: &'a mut StateTransformMap,
         saved_attrs: &'a SavedAttrs,
     ) -> BoxFuture<'a, ProviderResult<()>> {
-        Box::pin(async move {
-            for (provider_name, ext) in &self.normalizers {
-                ext.hydrate_read_state(current_states, saved_attrs)
-                    .await
-                    .map_err(|error| error.for_provider(provider_name.clone()))?;
-            }
-            Ok(())
-        })
+        self.normalizers
+            .hydrate_read_state(current_states, saved_attrs)
     }
 }
 
@@ -4964,7 +5181,7 @@ pub trait ProviderFactory: Send + Sync {
         &self,
         binding: Option<&str>,
         config: &ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>>;
+    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>>;
 
     /// Create a normalizer instance from configuration attributes.
     ///
@@ -5834,6 +6051,10 @@ impl Provider for Box<dyn Provider> {
 mod tests {
     use super::*;
 
+    fn initialized(provider: impl Provider + 'static) -> InitializedProvider {
+        InitializedProvider::new(Box::new(provider), ReferenceScope::Unavailable)
+    }
+
     #[test]
     fn schema_derived_guest_dispatch_restores_the_typed_scalar() {
         use crate::schema::{AttributeSchema, ResourceSchema, legacy_validator};
@@ -6219,7 +6440,7 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &crate::executor::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
             Box::pin(async { Err(ProviderError::internal("not used")) })
         }
     }
@@ -7769,7 +7990,7 @@ mod tests {
         // The router must route read_data_source to the underlying provider
         // so that overrides work across provider boundaries.
         let mut router = ProviderRouter::new();
-        router.add_provider("input-aware".to_string(), Box::new(InputAwareProvider));
+        router.add_provider("input-aware".to_string(), initialized(InputAwareProvider));
 
         let mut resource =
             DataSource::with_provider("input-aware", "identitystore.user", "mizzy", None);
@@ -7806,7 +8027,7 @@ mod tests {
     #[tokio::test]
     async fn provider_router_dispatches_read_by_provider_name() {
         let mut router = ProviderRouter::new();
-        router.add_provider("mock".to_string(), Box::new(MockProvider));
+        router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let identifier = fixture_applied_identifier("mock-id");
@@ -7861,7 +8082,7 @@ mod tests {
     #[tokio::test]
     async fn provider_router_dispatches_create_by_provider_name() {
         let mut router = ProviderRouter::new();
-        router.add_provider("mock".to_string(), Box::new(MockProvider));
+        router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let resource = Resource::with_provider("mock", "test", "example", None);
         let id = resource.id.clone();
@@ -8807,7 +9028,7 @@ mod tests {
     #[tokio::test]
     async fn provider_router_dispatches_update_by_provider_name() {
         let mut router = ProviderRouter::new();
-        router.add_provider("mock".to_string(), Box::new(MockProvider));
+        router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let from = State::existing(id.clone(), HashMap::new());
@@ -8827,7 +9048,7 @@ mod tests {
     #[tokio::test]
     async fn provider_router_dispatches_delete_by_provider_name() {
         let mut router = ProviderRouter::new();
-        router.add_provider("mock".to_string(), Box::new(MockProvider));
+        router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let request = DeleteRequest::default();
@@ -8923,7 +9144,7 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_provider(
             "mock".to_string(),
-            Box::new(TaggedProvider { tag: "default" }),
+            initialized(TaggedProvider { tag: "default" }),
         );
         let named_config = ProviderConfig {
             name: "mock".to_string(),
@@ -8935,7 +9156,7 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: Some("us".to_string()),
         };
-        router.add_provider_config(&named_config, Box::new(TaggedProvider { tag: "us" }));
+        router.add_provider_config(&named_config, initialized(TaggedProvider { tag: "us" }));
 
         let default_id = ResourceId::with_provider_identity("mock", "test", "a", None);
         let identifier = fixture_applied_identifier("mock-id");
@@ -8963,10 +9184,131 @@ mod tests {
         );
     }
 
+    fn reference_form_registry(owner: &str) -> (crate::schema::SchemaRegistry, AttributeType) {
+        use crate::schema::{
+            AttributeSchema, ReferenceForm, ReferenceForms, ReferenceTemplate, ResourceSchema,
+            ValidatedProviderSchemaWitness,
+        };
+
+        let identity = TypeIdentity::new(Some(owner), ["lambda", "Function"], "Name");
+        let attr_type = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let schema = ResourceSchema::new("lambda.Permission")
+            .attribute(AttributeSchema::optional("function_name", attr_type.clone()).build())
+            .validate()
+            .expect("fixture schema must validate");
+        let forms = ReferenceForms::from([(
+            identity,
+            ReferenceForm::Template {
+                long: ReferenceTemplate::new(
+                    "arn:{partition}:lambda:{region}:{account}:function:{name}",
+                )
+                .expect("fixture reference template must validate"),
+            },
+        )]);
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![schema],
+            ValidatedConfigSchema::default(),
+            forms,
+        )
+        .expect("fixture provider schema must validate");
+        let mut registry = crate::schema::SchemaRegistry::new();
+        registry.insert_provider_witness(owner, &witness);
+        (registry, attr_type)
+    }
+
+    fn reference_scope(region: &str) -> ReferenceScope {
+        ReferenceScope::Available {
+            partition: "aws".to_string(),
+            region: region.to_string(),
+            account: "123456789012".to_string(),
+        }
+    }
+
+    fn string_value(value: &str) -> Value {
+        Value::Concrete(ConcreteValue::String(value.into()))
+    }
+
+    #[test]
+    fn comparison_context_routes_by_provider_kind_and_named_instance() {
+        let (registry, attr_type) = reference_form_registry("mock");
+        let schema = registry
+            .get(
+                "mock",
+                "lambda.Permission",
+                crate::schema::SchemaKind::Resource,
+            )
+            .expect("fixture schema must be registered");
+        let mut router = ProviderRouter::new();
+        router.add_provider_instance(
+            ProviderInstanceKey::new("mock", Some("east".to_string())),
+            InitializedProvider::new(Box::new(MockProvider), reference_scope("us-east-1")),
+        );
+        router.add_provider_instance(
+            ProviderInstanceKey::new("mock", Some("west".to_string())),
+            InitializedProvider::new(Box::new(MockProvider), reference_scope("us-west-2")),
+        );
+        let id = ResourceId::with_provider_identity(
+            "mock",
+            "lambda.Permission",
+            "invoke",
+            Some("west".to_string()),
+        );
+
+        let context = router
+            .comparison_context_for(&id, schema)
+            .expect("the named provider instance must supply its scope");
+        let name = string_value("processor");
+        let west_arn = string_value("arn:aws:lambda:us-west-2:123456789012:function:processor");
+        let east_arn = string_value("arn:aws:lambda:us-east-1:123456789012:function:processor");
+        assert!(crate::differ::type_aware_equal(
+            &name,
+            &west_arn,
+            Some(&attr_type),
+            crate::schema::empty_defs_for_schema_walks(),
+            &context,
+        ));
+        assert!(!crate::differ::type_aware_equal(
+            &name,
+            &east_arn,
+            Some(&attr_type),
+            crate::schema::empty_defs_for_schema_walks(),
+            &context,
+        ));
+    }
+
+    #[test]
+    fn comparison_context_rejects_a_schema_owned_by_another_provider() {
+        let (registry, _attr_type) = reference_form_registry("mock");
+        let schema = registry
+            .get(
+                "mock",
+                "lambda.Permission",
+                crate::schema::SchemaKind::Resource,
+            )
+            .expect("fixture schema must be registered");
+        let router = ProviderRouter::new();
+        let id = ResourceId::with_provider_identity(
+            "other",
+            "lambda.Permission",
+            "invoke",
+            Some("west".to_string()),
+        );
+
+        let error = match router.comparison_context_for(&id, schema) {
+            Ok(_) => panic!("a provider must not compare through another owner's form table"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("routes to provider `other` but its schema is owned by `mock`")
+        );
+    }
+
     #[tokio::test]
     async fn provider_router_unknown_named_instance_errors_with_binding() {
         let mut router = ProviderRouter::new();
-        router.add_provider("mock".to_string(), Box::new(MockProvider));
+        router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let id =
             ResourceId::with_provider_identity("mock", "test", "x", Some("missing".to_string()));
@@ -9013,7 +9355,7 @@ mod tests {
                 &self,
                 _binding: Option<&str>,
                 _config: &ProviderReadyConfig,
-            ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
                 Box::pin(async {
                     Err(ProviderError::invalid_input(
                         "AWS account ID '019115212452' is not in the provider's \
@@ -9107,12 +9449,17 @@ mod tests {
                 &self,
                 binding: Option<&str>,
                 _config: &ProviderReadyConfig,
-            ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
                 self.calls
                     .lock()
                     .unwrap()
                     .push(binding.map(|s| s.to_string()));
-                Box::pin(async { Ok(Box::new(MockProvider) as Box<dyn Provider>) })
+                Box::pin(async {
+                    Ok(InitializedProvider::new(
+                        Box::new(MockProvider),
+                        ReferenceScope::Unavailable,
+                    ))
+                })
             }
             fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
                 crate::schema::ValidatedProviderSchemaWitness::new(
@@ -9370,7 +9717,7 @@ mod tests {
         }
 
         let mut router = ProviderRouter::new();
-        router.add_provider("normalizing".to_string(), Box::new(NormalizingProvider));
+        router.add_provider("normalizing".to_string(), initialized(NormalizingProvider));
         router.add_normalizer("normalizing", Box::new(TestNormalizer));
 
         let peer_ref = Value::resource_ref("peer", "identifier", Vec::new());

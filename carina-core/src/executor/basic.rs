@@ -16,9 +16,9 @@ use crate::executor::provider_ready::{
     prepare_provider_ready_resource_after_resolution,
 };
 use crate::provider::{
-    AppliedIdentifier, CompletedResume, CreateFailureKind, CreateRequest, DeleteRequest,
-    PartialReadDiagnostic, Provider, ProviderReadyResource, ReadRequest, ResumeCreateRequest,
-    ResumeFailureKind, ResumeOutcomeKind, UpdateOutcome, UpdateRequest,
+    AppliedIdentifier, CompletedResume, ContextualProvider, CreateFailureKind, CreateRequest,
+    DeleteRequest, PartialReadDiagnostic, Provider, ProviderReadyResource, ReadRequest,
+    ResumeCreateRequest, ResumeFailureKind, ResumeOutcomeKind, UpdateOutcome, UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{
@@ -717,7 +717,7 @@ pub(super) fn count_actionable_effects<S>(effects: &[Effect<S>]) -> usize {
 /// `execute_basic_effect`'s arity in check (clippy `too_many_arguments`)
 /// and keeping dispatch context fields grouped consistently.
 pub(super) struct BasicEffectCtx<'a, S> {
-    pub(super) provider: &'a dyn Provider,
+    pub(super) provider: &'a dyn ContextualProvider,
     pub(super) provider_check_inputs: &'a super::ProviderCheckInputs<'a, S>,
     pub(super) runtime_authored: bool,
     pub(super) preparation: &'a ProviderPreparationContext<'a>,
@@ -745,7 +745,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
     in_flight_start: InFlightStart<S>,
     observer: &'observer dyn ExecutionObserver<S>,
 ) -> StartedBasicEffectResult<'observer, S> {
-    let provider = ctx.provider;
+    let provider = ctx.provider.provider();
     let preparation = ctx.preparation;
     let completed = ctx.completed;
     let total = ctx.total;
@@ -1018,6 +1018,23 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     );
                 }
             };
+            let owner_schema = preparation
+                .schemas()
+                .get_for(resolved_resource)
+                .expect("managed_update_schema proved that the owner-bound schema exists");
+            let comparison = match ctx.provider.comparison_context_for(id, owner_schema) {
+                Ok(comparison) => comparison,
+                Err(error) => {
+                    return StartedBasicEffectResult::new(
+                        started_effect,
+                        started,
+                        BasicEffectResult::Failure {
+                            error: error.to_string(),
+                            refresh: None,
+                        },
+                    );
+                }
+            };
             for (key, new_value) in &resolved_resource.attributes {
                 if effective_changed.iter().any(|k| k == key) {
                     continue;
@@ -1044,6 +1061,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         saved: None,
                         type_info,
                     },
+                    &comparison,
                 );
                 if changed {
                     effective_changed.push(key.clone());

@@ -120,9 +120,12 @@ use carina_core::parser::{
     WarningKind,
 };
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
+#[cfg(test)]
+use carina_core::provider::ProviderInstanceKey;
 use carina_core::provider::{
-    self as provider_mod, AppliedIdentifier, LiftedSavedAttrs, Provider, ProviderError,
-    ProviderFactory, ProviderNormalizer, ProviderRouter,
+    self as provider_mod, AppliedIdentifier, InitializedProvider, LiftedSavedAttrs,
+    NormalizerRouter, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderRouter,
+    ReferenceScope,
 };
 use carina_core::provider_source::ProviderSource;
 use carina_core::resource::{
@@ -1519,6 +1522,7 @@ impl<E: Clone> ValidatedConfig<carina_core::parser::File<E>> {
         let Self { wiring, resources } = self;
         let ValidatedExpandRefreshAndLiftInputs {
             provider,
+            comparison_provider,
             expansion,
             warning_policy,
             remote_bindings,
@@ -1530,6 +1534,7 @@ impl<E: Clone> ValidatedConfig<carina_core::parser::File<E>> {
             &mut resources.inner,
             ExpandRefreshAndLiftInputs {
                 provider,
+                comparison_provider,
                 expansion,
                 warning_policy,
                 remote_bindings,
@@ -1574,6 +1579,7 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
         prepared: &PreparedDeferredForExpansion,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         warning_policy: DeferredForWarningPolicy,
+        provider: &ProviderRouter,
     ) -> Result<
         (
             ValidatedConfig<ExpandedCanonicalResources<E>>,
@@ -1589,6 +1595,7 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
                     wiring.context().schemas(),
                     remote_bindings,
                     warning_policy,
+                    provider,
                 )
             })?;
         Ok((ValidatedConfig { wiring, resources }, expansion))
@@ -3443,7 +3450,10 @@ pub(crate) async fn get_provider_with_ctx(
         // Register the kind's default instance with empty kind to match
         // resources without a provider prefix.
         progress_sink.line("Using mock provider".cyan());
-        router.add_provider(String::new(), Box::new(MockProvider::new()));
+        router.add_provider(
+            String::new(),
+            InitializedProvider::new(Box::new(MockProvider::new()), ReferenceScope::Unavailable),
+        );
     }
 
     Ok(router)
@@ -3542,7 +3552,7 @@ async fn instantiate_provider_into_router(
         progress_sink.line("Using mock provider".cyan());
         router.add_provider_config(
             provider_config.as_provider_config(),
-            Box::new(MockProvider::new()),
+            InitializedProvider::new(Box::new(MockProvider::new()), ReferenceScope::Unavailable),
         );
     } else if let Some(message) = missing_provider_message(provider_config, inherited_source) {
         eprintln!("{}", message.red());
@@ -3660,7 +3670,10 @@ pub async fn create_providers_from_configs_with_ctx(
     }
     if router.is_empty() && ctx.uses_builtin_mock() {
         ProgressSink::Human.line("Using mock provider".cyan());
-        router.add_provider(String::new(), Box::new(MockProvider::new()));
+        router.add_provider(
+            String::new(),
+            InitializedProvider::new(Box::new(MockProvider::new()), ReferenceScope::Unavailable),
+        );
     }
 
     Ok(router)
@@ -3673,8 +3686,8 @@ pub async fn create_providers_from_configs_with_ctx(
 pub(crate) async fn create_normalizers_from_configs_with_ctx(
     ctx: &WiringContext,
     configs: &ResolvedProviderConfigs,
-) -> Result<ProviderRouter, AppError> {
-    let mut router = ProviderRouter::new();
+) -> Result<NormalizerRouter, AppError> {
+    let mut router = NormalizerRouter::new();
 
     for config in configs.iter() {
         if let Some(factory) = provider_mod::find_factory(ctx.factories(), config.name()) {
@@ -4968,6 +4981,7 @@ pub fn derive_managed_binding_stability<E>(
     prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[WaitAliasSpec],
+    provider: &ProviderRouter,
 ) -> Result<HashMap<ResourceId, carina_core::binding_index::ManagedBindingStability>, AppError> {
     let plan_input_current = carina_core::resource::into_plan_input_current_map(
         managed_current.clone(),
@@ -5015,7 +5029,8 @@ pub fn derive_managed_binding_stability<E>(
         schemas,
         saved_attrs,
         prev_explicit,
-    );
+        provider,
+    )?;
     stability.extend(pending_stability);
     Ok(stability)
 }
@@ -5030,6 +5045,7 @@ impl PreparedDeferredForExpansion {
         schemas: &SchemaRegistry,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         warning_policy: DeferredForWarningPolicy,
+        provider: &ProviderRouter,
     ) -> Result<(ExpandedCanonicalResources<E>, DeferredForExpansion), AppError> {
         resources.reconcile_refreshed_prefixed_names(&|provider, resource_type, identity| {
             self.1
@@ -5050,6 +5066,7 @@ impl PreparedDeferredForExpansion {
             &self.0.addressed.state.moved_pairs,
             &self.0.addressed.already_refreshed,
             warning_policy,
+            provider,
         )?;
         Ok((ExpandedCanonicalResources { resources }, expansion))
     }
@@ -5064,6 +5081,7 @@ impl PreparedAddressPreservingDeferredForExpansion {
         schemas: &SchemaRegistry,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         warning_policy: DeferredForWarningPolicy,
+        provider: &ProviderRouter,
     ) -> Result<DeferredForExpansion, AppError> {
         expand_same_config_deferred_for_target(
             parsed,
@@ -5078,6 +5096,7 @@ impl PreparedAddressPreservingDeferredForExpansion {
             &self.0.addressed.state.moved_pairs,
             &self.0.addressed.already_refreshed,
             warning_policy,
+            provider,
         )
     }
 }
@@ -5199,6 +5218,7 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
     already_refreshed: &HashSet<ResourceId>,
     warning_policy: DeferredForWarningPolicy,
+    provider: &ProviderRouter,
 ) -> Result<DeferredForExpansion, AppError> {
     let parsed = target.parsed();
     // Common case: no deferred-for at all. Skip the binding projection
@@ -5232,6 +5252,7 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
         prev_explicit,
         remote_bindings,
         wait_aliases,
+        provider,
     )?;
     let plan_input_current = carina_core::resource::into_plan_input_current_map(
         managed_current.clone(),
@@ -5359,6 +5380,7 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
     moved_targets: &HashSet<ResourceId>,
     already_refreshed: &HashSet<ResourceId>,
 ) -> Result<DeferredForExpansion, AppError> {
+    let comparison_provider = test_comparison_provider_router(sorted_resources);
     let moved_pairs = moved_targets
         .iter()
         .map(|target| {
@@ -5387,7 +5409,27 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
         schemas,
         remote_bindings,
         DeferredForWarningPolicy::Print,
+        &comparison_provider,
     )
+}
+
+#[cfg(test)]
+pub(crate) fn test_comparison_provider_router<S>(resources: &[Resource<S>]) -> ProviderRouter {
+    let routes = resources
+        .iter()
+        .map(|resource| ProviderInstanceKey::from(&resource.id))
+        .collect::<BTreeSet<_>>();
+    let mut provider = ProviderRouter::new();
+    for route in routes {
+        provider.add_provider_instance(
+            route,
+            InitializedProvider::new(
+                Box::new(carina_provider_mock::MockProvider::new()),
+                ReferenceScope::Unavailable,
+            ),
+        );
+    }
+    provider
 }
 
 /// Result of the deferred-for expansion, materialised-child read,
@@ -5436,6 +5478,7 @@ pub struct ExpandedRefreshState<R> {
 /// arg list would already trip the 7-argument lint here.
 pub(crate) struct ExpandRefreshAndLiftInputs<'a, 'backend, P: Provider + ProviderNormalizer, E> {
     pub provider: &'a P,
+    pub comparison_provider: &'a ProviderRouter,
     /// Address/metadata parity witness produced by the shared I/O-free
     /// prelude. Expansion cannot be invoked with independently assembled
     /// saved attributes, aliases, or exclusion sets.
@@ -5457,6 +5500,7 @@ pub(crate) struct ValidatedExpandRefreshAndLiftInputs<
     E,
 > {
     pub provider: &'a P,
+    pub comparison_provider: &'a ProviderRouter,
     pub expansion: &'a mut E,
     pub warning_policy: DeferredForWarningPolicy,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
@@ -5488,6 +5532,7 @@ async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormaliz
         inputs.schemas,
         inputs.remote_bindings,
         inputs.warning_policy,
+        inputs.comparison_provider,
     )?;
     finish_expanded_refresh_state((), expansion, inputs).await
 }
@@ -5510,6 +5555,7 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
     } = validated;
     let ValidatedExpandRefreshAndLiftInputs {
         provider,
+        comparison_provider,
         expansion,
         warning_policy,
         remote_bindings,
@@ -5527,12 +5573,14 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
                         schemas,
                         remote_bindings,
                         warning_policy,
+                        comparison_provider,
                     )?;
                     let state = finish_expanded_refresh_state(
                         canonical_resources,
                         expanded,
                         ExpandRefreshAndLiftInputs {
                             provider,
+                            comparison_provider,
                             expansion,
                             warning_policy,
                             remote_bindings,
@@ -5895,6 +5943,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         ctx.schemas(),
         remote_bindings,
         DeferredForWarningPolicy::Print,
+        &provider,
     )?;
     let DeferredForExpansion {
         sorted_resources: resorted,
@@ -6010,6 +6059,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         &addressed.prev_explicit,
         remote_bindings,
         &wait_aliases,
+        &provider,
     )?;
     let pre_apply_current = carina_core::resource::into_plan_input_current_map(
         addressed.managed_current.clone(),
@@ -6152,7 +6202,8 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         ctx.schemas(),
         &addressed.saved_attrs,
         &addressed.prev_explicit,
-    );
+        &provider,
+    )?;
     override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
         RebuildBindingsInputs {
             compositions: &parsed.compositions,

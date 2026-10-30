@@ -17,7 +17,7 @@ use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{
     self as provider_mod, AppliedIdentifier, InFlightCreate, PersistedAttributes, Provider,
-    ProviderError, ProviderNormalizer, RawSavedAttrs,
+    ProviderError, ProviderNormalizer, ProviderRouter, RawSavedAttrs,
 };
 use carina_core::resource::{
     Current, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
@@ -863,6 +863,7 @@ async fn run_state_show(
             &carina_core::schema::SchemaRegistry::new(),
             &historical_display,
             Some(&prev_explicit),
+            &carina_core::provider::ProviderRouter::new(),
         )
         .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
     } else {
@@ -983,6 +984,7 @@ async fn run_state_bucket_delete(
     let bucket_id =
         ResourceId::with_provider_identity(provider_name, resource_type, bucket_identity, None);
     match bucket_provider
+        .provider()
         .delete(
             &bucket_id,
             &bucket_identifier,
@@ -1022,7 +1024,7 @@ async fn create_state_bucket_delete_provider<R>(
     validated_config: &ValidatedConfig<R>,
     provider_configs: &carina_core::parser::ResolvedProviderConfigs,
     provider_name: &str,
-) -> Result<Box<dyn carina_core::provider::Provider>, AppError> {
+) -> Result<carina_core::provider::InitializedProvider, AppError> {
     let ctx = validated_config.context();
     let factory = provider_mod::find_factory(ctx.factories(), provider_name)
         .ok_or_else(|| format!("No provider factory found for '{provider_name}'"))?;
@@ -1321,6 +1323,7 @@ pub(crate) async fn run_state_refresh_locked(
     } = validated_config
         .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
             provider: &provider,
+            comparison_provider: &provider,
             expansion: &mut prepared_expansion,
             warning_policy: crate::wiring::DeferredForWarningPolicy::Print,
             remote_bindings: &HashMap::new(),
@@ -1436,12 +1439,13 @@ pub(crate) async fn run_state_refresh_locked(
             Some(current) => current,
             None => continue, // Not in state, skip
         };
-        diff_display_update_resource(
+        diff_display_update_resource_with_provider(
             &resource.resolved_id(),
             fresh_current,
             &mut state,
             Some(resource),
             ctx.schemas(),
+            &provider,
             "",
             &mut refresh_counts,
         )?;
@@ -1456,12 +1460,13 @@ pub(crate) async fn run_state_refresh_locked(
             Some(current) => current,
             None => continue,
         };
-        diff_display_update_resource(
+        diff_display_update_resource_with_provider(
             orphan_id,
             fresh_current,
             &mut state,
             None,
             ctx.schemas(),
+            &provider,
             " (orphan)",
             &mut refresh_counts,
         )?;
@@ -2082,12 +2087,13 @@ struct StateRefreshCounts {
     unchanged: u32,
 }
 
-fn diff_display_update_resource(
+fn diff_display_update_resource_with_provider(
     id: &ResolvedResourceId,
     fresh_current: &Current,
     state: &mut carina_state::StateFile,
     resource: Option<&ResolvedResource>,
     schemas: &carina_core::schema::SchemaRegistry,
+    provider: &ProviderRouter,
     label_suffix: &str,
     counts: &mut StateRefreshCounts,
 ) -> Result<(), AppError> {
@@ -2119,7 +2125,7 @@ fn diff_display_update_resource(
         }
     };
 
-    let schema = match resource {
+    let owner_schema = match resource {
         Some(resource) => schemas.get_for(resource),
         None => schemas.get(
             &id.provider,
@@ -2127,7 +2133,22 @@ fn diff_display_update_resource(
             carina_core::schema::SchemaKind::Resource,
         ),
     };
-    let resource_schema = schema.map(|schema| schema.schema().as_schema());
+    let typed_comparison = owner_schema
+        .map(|owner_schema| {
+            provider
+                .comparison_context_for(id.as_inner(), owner_schema)
+                .map(|comparison| (owner_schema, comparison))
+        })
+        .transpose()
+        .map_err(AppError::Provider)?;
+    if resource.is_some() && typed_comparison.is_none() {
+        return Err(AppError::Provider(ProviderError::internal(format!(
+            "missing managed resource schema while refreshing `{id}`"
+        ))));
+    }
+    let resource_schema = typed_comparison
+        .as_ref()
+        .map(|(owner_schema, _comparison)| owner_schema.schema().as_schema());
 
     let refreshed_resource_state = if exists {
         match resource {
@@ -2139,6 +2160,10 @@ fn diff_display_update_resource(
                     resource_schema,
                     RowBasis::Carried,
                     None,
+                    &typed_comparison
+                        .as_ref()
+                        .expect("desired resource refresh requires a registered schema")
+                        .1,
                 )
                 .map_err(|source| {
                     AppError::from_resource_state_encoding(resource.id.clone(), source)
@@ -2196,12 +2221,18 @@ fn diff_display_update_resource(
 
             match (old_val, new_val) {
                 (Some(old), Some(new))
-                    if !carina_core::diff_helpers::resource_attribute_values_equal(
-                        old,
-                        new,
-                        schema.as_deref(),
-                        key,
-                    ) =>
+                    if !match &typed_comparison {
+                        Some((owner_schema, comparison)) => {
+                            carina_core::diff_helpers::resource_attribute_values_equal(
+                                old,
+                                new,
+                                Some(owner_schema.schema()),
+                                key,
+                                comparison,
+                            )
+                        }
+                        None => old.semantically_equal(new),
+                    } =>
                 {
                     has_changes = true;
                     changes.push(format!(
@@ -2263,6 +2294,47 @@ fn diff_display_update_resource(
 }
 
 #[cfg(test)]
+fn diff_display_update_resource(
+    id: &ResolvedResourceId,
+    fresh_current: &Current,
+    state: &mut carina_state::StateFile,
+    resource: Option<&ResolvedResource>,
+    schemas: &carina_core::schema::SchemaRegistry,
+    label_suffix: &str,
+    counts: &mut StateRefreshCounts,
+) -> Result<(), AppError> {
+    let mut schemas = schemas.clone();
+    if let Some(resource) = resource
+        && schemas.get_for(resource).is_none()
+    {
+        schemas.insert(
+            resource.id.provider.clone(),
+            carina_core::schema::ResourceSchema::new(resource.id.resource_type.clone())
+                .validate()
+                .expect("empty state-refresh fixture schema must validate"),
+        );
+    }
+    let mut provider = ProviderRouter::new();
+    provider.add_provider_instance(
+        carina_core::provider::ProviderInstanceKey::from(id.as_inner()),
+        carina_core::provider::InitializedProvider::new(
+            Box::new(carina_provider_mock::MockProvider::new()),
+            carina_core::provider::ReferenceScope::Unavailable,
+        ),
+    );
+    diff_display_update_resource_with_provider(
+        id,
+        fresh_current,
+        state,
+        resource,
+        &schemas,
+        &provider,
+        label_suffix,
+        counts,
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::shared::cancellation_test_support::{
@@ -2317,6 +2389,97 @@ mod tests {
             .get(carina_core::value::PERSISTED_SECRET_KEY)
             .and_then(serde_json::Value::as_str)
             .expect("secret tag carries a digest")
+    }
+
+    #[test]
+    fn state_refresh_counts_reference_form_equivalent_value_as_unchanged() {
+        use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
+        use carina_core::schema::{
+            ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity, ValidatedConfigSchema,
+            ValidatedProviderSchemaWitness,
+        };
+
+        let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
+        let schema = ResourceSchema::new("lambda.Permission").attribute(
+            AttributeSchema::optional(
+                "function_name",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .build(),
+        );
+        let forms = ReferenceForms::from([(
+            identity,
+            ReferenceForm::Template {
+                long: ReferenceTemplate::new(
+                    "arn:{partition}:lambda:{region}:{account}:function:{name}",
+                )
+                .expect("valid reference template"),
+            },
+        )]);
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![schema.validate().expect("valid schema")],
+            ValidatedConfigSchema::default(),
+            forms,
+        )
+        .expect("valid provider schema witness");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert_provider_witness("aws", &witness);
+
+        let desired = resolved(
+            Resource::with_provider("aws", "lambda.Permission", "invoke", None).with_attribute(
+                "function_name",
+                Value::Concrete(ConcreteValue::String("processor".into())),
+            ),
+        );
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(
+                ResourceState::try_applied("lambda.Permission", "invoke", "aws", "permission-id")
+                    .expect("fixture identifier is non-empty")
+                    .with_attribute(
+                        "function_name",
+                        json!("arn:aws:lambda:us-east-1:123456789012:function:processor"),
+                    ),
+            )
+            .expect("state fixture is valid");
+        let fresh = Current::from_state(
+            State::existing(
+                desired.id.clone(),
+                HashMap::from([(
+                    "function_name".to_string(),
+                    Value::Concrete(ConcreteValue::String("processor".into())),
+                )]),
+            )
+            .with_identifier("permission-id"),
+        );
+        let mut provider = ProviderRouter::new();
+        provider.add_provider(
+            "aws".to_string(),
+            InitializedProvider::new(
+                Box::new(carina_provider_mock::MockProvider::new()),
+                ReferenceScope::Available {
+                    partition: "aws".to_string(),
+                    region: "us-east-1".to_string(),
+                    account: "123456789012".to_string(),
+                },
+            ),
+        );
+        let mut counts = StateRefreshCounts::default();
+
+        diff_display_update_resource_with_provider(
+            &ResolvedResourceId::new(desired.id.clone()),
+            &fresh,
+            &mut state,
+            Some(&desired),
+            &schemas,
+            &provider,
+            "",
+            &mut counts,
+        )
+        .expect("state refresh comparison succeeds");
+
+        assert_eq!(counts.updated, 0);
+        assert_eq!(counts.unchanged, 1);
     }
 
     struct ModuleConstraintRefreshBackend {
@@ -2773,10 +2936,13 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
             let reads = self.reads.clone();
             Box::pin(async move {
-                Ok(Box::new(ModuleConstraintRefreshProvider { reads }) as Box<dyn Provider>)
+                Ok(carina_core::provider::InitializedProvider::new(
+                    Box::new(ModuleConstraintRefreshProvider { reads }),
+                    carina_core::provider::ReferenceScope::Unavailable,
+                ))
             })
         }
 
@@ -2906,14 +3072,14 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
             let reads = self.reads.clone();
             let trigger = self.trigger.clone();
             Box::pin(async move {
-                Ok(
-                    Box::new(CancellingDataSourceRefreshProvider { reads, trigger })
-                        as Box<dyn Provider>,
-                )
+                Ok(carina_core::provider::InitializedProvider::new(
+                    Box::new(CancellingDataSourceRefreshProvider { reads, trigger }),
+                    carina_core::provider::ReferenceScope::Unavailable,
+                ))
             })
         }
 
@@ -3699,9 +3865,12 @@ mod tests {
             &[],
             [("aws".to_string(), widget_schema)],
         );
+        let comparison_provider =
+            crate::wiring::test_comparison_provider_router(&preview.sorted_resources);
         let expanded = validated_config
             .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
                 provider: &provider,
+                comparison_provider: &comparison_provider,
                 expansion: &mut prepared_expansion,
                 warning_policy: crate::wiring::DeferredForWarningPolicy::Suppress,
                 remote_bindings: &HashMap::new(),
@@ -5047,6 +5216,7 @@ mod tests {
                 schemas
                     .get_for(&desired)
                     .map(|schema| schema.schema().as_schema()),
+                &carina_core::differ::exact_comparison_context_for_tests(),
             ),
             Diff::NoChange(_)
         ));
@@ -5143,6 +5313,7 @@ mod tests {
             schemas
                 .get_for(&desired)
                 .map(|schema| schema.schema().as_schema()),
+            &carina_core::differ::exact_comparison_context_for_tests(),
         )
         else {
             panic!("refresh must preserve the pending tags removal");
@@ -5175,6 +5346,7 @@ mod tests {
             None,
             RowBasis::Applied(&accepted_create),
             None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
         )
         .expect("accepted create should establish the original authoring tree");
         let mut prior_state = StateFile::new();
@@ -5190,6 +5362,7 @@ mod tests {
             &prior_saved,
             Some(&prior.explicit),
             None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
         )
         else {
             panic!("the Applied row must initially plan the nested removal");
@@ -5205,6 +5378,7 @@ mod tests {
             None,
             RowBasis::Carried,
             None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
         )
         .expect("failed update should carry provider state");
         let mut refreshed_state = StateFile::new();
@@ -5234,7 +5408,14 @@ mod tests {
             .build_saved_attrs()
             .lift(&SchemaRegistry::new());
         (
-            diff(&desired, &provider_state, &saved, Some(&explicit), None),
+            diff(
+                &desired,
+                &provider_state,
+                &saved,
+                Some(&explicit),
+                None,
+                &carina_core::differ::exact_comparison_context_for_tests(),
+            ),
             explicit,
         )
     }

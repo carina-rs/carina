@@ -889,7 +889,7 @@ fn should_reload_for_event(event: &FileEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::provider::{BoxFuture, Provider, ProviderResult};
+    use carina_core::provider::{BoxFuture, ProviderResult};
     use carina_core::resource::Value;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
     use indexmap::IndexMap;
@@ -926,7 +926,7 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
             Box::pin(async { unreachable!("formatting tests do not instantiate providers") })
         }
 

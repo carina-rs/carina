@@ -77,7 +77,7 @@ impl ProviderFactory for RegionConfigFactory {
         Box<
             dyn std::future::Future<
                     Output = carina_core::provider::ProviderResult<
-                        Box<dyn carina_core::provider::Provider>,
+                        carina_core::provider::InitializedProvider,
                     >,
                 > + Send
                 + '_,
@@ -216,7 +216,7 @@ impl ProviderFactory for SuspendedValidationFactory {
         Box<
             dyn std::future::Future<
                     Output = carina_core::provider::ProviderResult<
-                        Box<dyn carina_core::provider::Provider>,
+                        carina_core::provider::InitializedProvider,
                     >,
                 > + Send
                 + '_,
@@ -321,7 +321,7 @@ impl ProviderFactory for EnumDeclaredCustomTypeFactory {
         Box<
             dyn std::future::Future<
                     Output = carina_core::provider::ProviderResult<
-                        Box<dyn carina_core::provider::Provider>,
+                        carina_core::provider::InitializedProvider,
                     >,
                 > + Send
                 + '_,
@@ -434,7 +434,7 @@ impl ProviderFactory for SharedRoleArnFactory {
         _config: &carina_core::provider::ProviderReadyConfig,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+        carina_core::provider::ProviderResult<carina_core::provider::InitializedProvider>,
     > {
         unimplemented!("diagnostics tests do not construct providers")
     }
@@ -539,7 +539,7 @@ impl ProviderFactory for BareTypeFactory {
         _config: &carina_core::provider::ProviderReadyConfig,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+        carina_core::provider::ProviderResult<carina_core::provider::InitializedProvider>,
     > {
         unimplemented!("diagnostics tests do not construct providers")
     }
@@ -918,7 +918,7 @@ impl ProviderFactory for SchemaFixtureFactory {
         _config: &carina_core::provider::ProviderReadyConfig,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+        carina_core::provider::ProviderResult<carina_core::provider::InitializedProvider>,
     > {
         unimplemented!("schema fixture factories do not construct providers")
     }

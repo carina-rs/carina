@@ -9,6 +9,23 @@ use crate::plan::{
 };
 use crate::resource::{ConcreteValue, ResolvedResourceId, Resource, ResourceIdentity};
 
+fn diff_test(
+    desired: &Resource,
+    current: &State,
+    saved: Option<&HashMap<String, Value>>,
+    prev_explicit: Option<&ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+) -> Diff {
+    super::diff_test(
+        desired,
+        current,
+        saved,
+        prev_explicit,
+        schema,
+        &super::exact_comparison_context_for_tests(),
+    )
+}
+
 fn existing_state(id: ResourceId, attributes: HashMap<String, Value>) -> State {
     let identifier = id
         .identity_str()
@@ -305,6 +322,94 @@ fn explicit_top_level(keys: &[&str]) -> ExplicitFields {
             .map(|k| ((*k).to_string(), ExplicitFields::Leaf))
             .collect(),
     }
+}
+
+#[test]
+fn provider_scoped_reference_form_suppresses_create_only_replacement_in_plan() {
+    use crate::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
+    use crate::schema::{
+        AttributeSchema, ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity,
+        ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+    };
+
+    let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
+    let schema = ResourceSchema::new("lambda.Permission")
+        .attribute(
+            AttributeSchema::optional(
+                "function_name",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .create_only()
+            .build(),
+        )
+        .validate()
+        .expect("fixture schema must validate");
+    let forms = ReferenceForms::from([(
+        identity,
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:lambda:{region}:{account}:function:{name}",
+            )
+            .expect("fixture reference template must validate"),
+        },
+    )]);
+    let witness =
+        ValidatedProviderSchemaWitness::new(vec![schema], ValidatedConfigSchema::default(), forms)
+            .expect("fixture provider schema must validate");
+    let mut registry = SchemaRegistry::new();
+    registry.insert_provider_witness("aws", &witness);
+
+    let desired = Resource::with_provider("aws", "lambda.Permission", "invoke", None)
+        .with_attribute(
+            "function_name",
+            Value::Concrete(ConcreteValue::String("processor".into())),
+        );
+    let current = Current::from_state(
+        State::existing(
+            desired.id.clone(),
+            HashMap::from([(
+                "function_name".to_string(),
+                Value::Concrete(ConcreteValue::String(
+                    "arn:aws:lambda:us-east-1:123456789012:function:processor".into(),
+                )),
+            )]),
+        )
+        .with_identifier("permission-id"),
+    );
+    let current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(desired.id.clone(), current)]),
+        &registry,
+        std::slice::from_ref(&desired),
+    );
+    let managed = ResolvedResource::collect_resolved(vec![desired]).expect("resolved fixture");
+    let mut provider = ProviderRouter::new();
+    provider.add_provider(
+        "aws".to_string(),
+        InitializedProvider::new(
+            Box::new(HintProvider { hints: Vec::new() }),
+            ReferenceScope::Available {
+                partition: "aws".to_string(),
+                region: "us-east-1".to_string(),
+                account: "123456789012".to_string(),
+            },
+        ),
+    );
+    let saved = crate::provider::RawSavedAttrs::default().lift(&registry);
+
+    let plan = plan::create_plan(
+        &managed,
+        &[],
+        &provider,
+        PlanPriorStates::new(&current, &Orphans::new()),
+        &HashMap::new(),
+        &registry,
+        &saved,
+        &HashMap::new(),
+        &[],
+    )
+    .expect("plan comparison succeeds");
+
+    assert!(plan.effects().is_empty(), "unexpected plan: {plan:?}");
 }
 
 struct HintProvider {
@@ -1385,6 +1490,7 @@ fn list_elements_authored_field_removal_produces_update_for_paired_element() {
         &children["rules"],
         None,
         crate::schema::empty_defs_for_schema_walks(),
+        &super::exact_comparison_context_for_tests(),
     );
     let Value::Concrete(ConcreteValue::List(effective_rules)) = effective_desired else {
         panic!("expected effective desired rules list");
@@ -1558,8 +1664,12 @@ fn unchanged_dsl_after_writeback_pairs_raw_saved_list_without_phantom_removal() 
             rule(true, true),
         ])),
     )]);
-    let prior =
-        crate::explicit::build_from_resource_for_stored_values(&authored, &saved_attributes, None);
+    let prior = crate::explicit::build_from_resource_for_stored_values(
+        &authored,
+        &saved_attributes,
+        None,
+        &super::exact_comparison_context_for_tests(),
+    );
     let ExplicitFields::Struct { children } = &prior else {
         panic!("expected resource-root Struct");
     };

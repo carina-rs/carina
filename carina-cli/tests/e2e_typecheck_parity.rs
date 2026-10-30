@@ -977,8 +977,16 @@ impl ProviderFactory for TestProviderFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<Box<dyn Provider>>> {
-        Box::pin(async { Ok(Box::new(NoopProvider) as Box<dyn Provider>) })
+    ) -> BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<carina_core::provider::InitializedProvider>,
+    > {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(NoopProvider),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
+        })
     }
 
     fn create_normalizer(
@@ -3051,8 +3059,16 @@ impl ProviderFactory for WasmStyleProviderFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<Box<dyn Provider>>> {
-        Box::pin(async { Ok(Box::new(NoopProvider) as Box<dyn Provider>) })
+    ) -> BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<carina_core::provider::InitializedProvider>,
+    > {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(NoopProvider),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
+        })
     }
     fn create_normalizer(
         &self,

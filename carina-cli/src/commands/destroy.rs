@@ -703,8 +703,9 @@ async fn run_destroy_locked_owned(
         format_destroy_plan_with_delete_instances(
             &destroy_plan,
             DetailLevel::Full,
-            &historical_display
-        )
+            &historical_display,
+            &provider,
+        )?
     );
 
     // Show protected resources

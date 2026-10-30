@@ -1,6 +1,95 @@
 use super::*;
 use crate::explicit::ExplicitFields;
 
+fn merge_with_saved(
+    desired: &Value,
+    saved: SavedValueViews<'_>,
+    prior_explicit: &ExplicitFields,
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> Value {
+    super::merge_with_saved(
+        desired,
+        saved,
+        prior_explicit,
+        attr_type,
+        defs,
+        &crate::differ::exact_comparison_context_for_tests(),
+    )
+}
+
+fn pair_list_elements<D, S>(
+    desired: &[D],
+    saved: &[S],
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> Vec<Option<usize>>
+where
+    D: std::borrow::Borrow<Value>,
+    S: std::borrow::Borrow<Value>,
+{
+    super::pair_list_elements(
+        desired,
+        saved,
+        attr_type,
+        defs,
+        &crate::differ::exact_comparison_context_for_tests(),
+    )
+}
+
+fn pair_list_elements_with_uniqueness<D, S>(
+    desired: &[D],
+    saved: &[S],
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> Vec<ListElementPairing>
+where
+    D: std::borrow::Borrow<Value>,
+    S: std::borrow::Borrow<Value>,
+{
+    super::pair_list_elements_with_uniqueness(
+        desired,
+        saved,
+        attr_type,
+        defs,
+        &crate::differ::exact_comparison_context_for_tests(),
+    )
+}
+
+fn similarity_score(
+    a: &Value,
+    b: &Value,
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> usize {
+    super::similarity_score(
+        a,
+        b,
+        attr_type,
+        defs,
+        &crate::differ::exact_comparison_context_for_tests(),
+    )
+}
+
+fn merge_lists(
+    desired: &[Value],
+    projected_saved: &[Value],
+    raw_saved: &[Value],
+    prior_explicit: &ExplicitFields,
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> Vec<Value> {
+    super::merge_lists(
+        desired,
+        projected_saved,
+        raw_saved,
+        prior_explicit,
+        attr_type,
+        defs,
+        &crate::differ::exact_comparison_context_for_tests(),
+    )
+}
+
 #[test]
 fn module_argument_source_location_is_not_value_data() {
     let located = Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {

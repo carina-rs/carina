@@ -12600,7 +12600,14 @@ mod tests {
             }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
-        let result = diff_test(&desired[0], current, None, None, Some(&schema));
+        let result = diff_test(
+            &desired[0],
+            current,
+            None,
+            None,
+            Some(&schema),
+            &crate::differ::exact_comparison_context_for_tests(),
+        );
         assert!(
             matches!(result, Diff::NoChange(_)),
             "dynamic AZ enum API spelling in state must canonicalize to DSL spelling; got {result:?}"

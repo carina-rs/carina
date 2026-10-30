@@ -177,6 +177,29 @@ fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
     );
     assert!(std::error::Error::source(&unavailable).is_none());
 
+    let scope_mismatch = saved_plan_secret_preparation_error(
+        AppError::SavedPlanProviderScopeMismatch(
+            crate::error::SavedPlanProviderScopeMismatchError {
+                instance: carina_core::provider::ProviderInstanceKey::new(
+                    "test",
+                    Some("west".to_string()),
+                ),
+                recorded: Some(carina_core::provider::ReferenceScope::Unavailable),
+                initialized: Some(carina_core::provider::ReferenceScope::Available {
+                    partition: "aws".to_string(),
+                    region: "us-west-2".to_string(),
+                    account: "123456789012".to_string(),
+                }),
+                replan_command: "carina plan --out reviewed-plan.json infra".to_string(),
+            },
+        ),
+        target,
+    );
+    assert!(matches!(
+        scope_mismatch,
+        AppError::SavedPlanProviderScopeMismatch(_)
+    ));
+
     let serialization = saved_plan_secret_rehydration_error(
         carina_core::value::SecretRehydrationSiteError::new(
             "mock.test.resource.example.token",
@@ -1105,8 +1128,13 @@ impl ProviderFactory for FailBCreateFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-        Box::pin(async { Ok(Box::new(FailBCreateProvider) as Box<dyn Provider>) })
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(FailBCreateProvider),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
+        })
     }
 
     fn create_normalizer(
@@ -1844,9 +1872,14 @@ impl ProviderFactory for ApplyTimeReadFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
         let shared = self.shared.clone();
-        Box::pin(async move { Ok(Box::new(ApplyTimeReadProvider { shared }) as Box<dyn Provider>) })
+        Box::pin(async move {
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(ApplyTimeReadProvider { shared }),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
+        })
     }
 
     fn create_normalizer(
@@ -1958,6 +1991,26 @@ struct ApplyTimeReadProvider {
     shared: ApplyTimeReadShared,
 }
 
+impl ComparisonProvider for ApplyTimeReadProvider {
+    fn operation_provider(&self) -> &dyn Provider {
+        self
+    }
+
+    fn comparison_context_for<'a>(
+        &'a self,
+        id: &ResourceId,
+        schema: carina_core::schema::OwnerBoundResourceSchema<'a>,
+    ) -> ProviderResult<carina_core::differ::ComparisonContext<'a>> {
+        assert_eq!(id.provider, schema.owner());
+        static SCOPE: carina_core::provider::ReferenceScope =
+            carina_core::provider::ReferenceScope::Unavailable;
+        Ok(carina_core::differ::ComparisonContext::for_test(
+            &SCOPE,
+            schema.reference_forms(),
+        ))
+    }
+}
+
 #[derive(Clone, Default)]
 struct ApplyCascadeShared {
     creates: Arc<Mutex<ApplyCascadeCreateCalls>>,
@@ -2017,9 +2070,14 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
         let shared = self.shared.clone();
-        Box::pin(async move { Ok(Box::new(ApplyCascadeProvider { shared }) as Box<dyn Provider>) })
+        Box::pin(async move {
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(ApplyCascadeProvider { shared }),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
+        })
     }
 
     fn create_normalizer(
@@ -5625,6 +5683,26 @@ struct BootstrapRecordingProvider {
     behavior: BootstrapCreateBehavior,
 }
 
+impl ComparisonProvider for BootstrapRecordingProvider {
+    fn operation_provider(&self) -> &dyn Provider {
+        self
+    }
+
+    fn comparison_context_for<'a>(
+        &'a self,
+        id: &ResourceId,
+        schema: carina_core::schema::OwnerBoundResourceSchema<'a>,
+    ) -> ProviderResult<carina_core::differ::ComparisonContext<'a>> {
+        assert_eq!(id.provider, schema.owner());
+        static SCOPE: carina_core::provider::ReferenceScope =
+            carina_core::provider::ReferenceScope::Unavailable;
+        Ok(carina_core::differ::ComparisonContext::for_test(
+            &SCOPE,
+            schema.reference_forms(),
+        ))
+    }
+}
+
 impl Provider for BootstrapRecordingProvider {
     fn name(&self) -> &str {
         "aws"
@@ -7002,6 +7080,7 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
         &saved,
         Some(&prev_explicit),
         Some(&schema),
+        &carina_core::differ::exact_comparison_context_for_tests(),
     );
 
     assert!(

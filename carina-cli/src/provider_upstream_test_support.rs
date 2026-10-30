@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use carina_core::config_loader::load_configuration_with_config;
 use carina_core::parser::{InferredFile, ProviderConfig, ProviderContext, UpstreamState};
-use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
+use carina_core::provider::{BoxFuture, ProviderFactory, ProviderResult};
 use carina_core::resource::{Resource, Value};
 use carina_core::schema::SchemaRegistry;
 use carina_state::StateFile;
@@ -41,10 +41,13 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
         &self,
         _binding: Option<&str>,
         config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
         *self.received_role_arn.lock().unwrap() = config.attributes().get("role_arn").cloned();
         Box::pin(async {
-            Ok(Box::new(carina_provider_mock::MockProvider::new()) as Box<dyn Provider>)
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(carina_provider_mock::MockProvider::new()),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
         })
     }
 

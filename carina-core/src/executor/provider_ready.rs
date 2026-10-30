@@ -900,7 +900,7 @@ mod provider_config_tests {
 
     use super::*;
     use crate::parser::ResolvedProviderConfigs;
-    use crate::provider::{Provider, ProviderError, ProviderResult};
+    use crate::provider::{ProviderError, ProviderResult};
     use crate::resource::ConcreteValue;
     use crate::schema::{AttributeType, RootlessType, TypeIdentity, legacy_validator};
 
@@ -986,7 +986,7 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::InitializedProvider>> {
             unreachable!("config preparation tests do not create providers")
         }
 
@@ -1073,7 +1073,7 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::InitializedProvider>> {
             unreachable!("routing tests do not create providers")
         }
 
@@ -1800,7 +1800,7 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::InitializedProvider>> {
             unreachable!("config preparation tests do not create providers")
         }
 
@@ -1913,7 +1913,7 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::InitializedProvider>> {
             unreachable!("config preparation tests do not create providers")
         }
 

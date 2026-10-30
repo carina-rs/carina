@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
-use carina_core::provider::ProviderError;
+use carina_core::provider::{ProviderError, ProviderInstanceKey, ReferenceScope};
 use carina_core::resource::{ResolvedResourceId, ResourceId};
 use carina_state::BackendError;
 
@@ -141,6 +141,45 @@ impl std::fmt::Display for SavedPlanProviderArtifactMismatchError {
 }
 
 impl std::error::Error for SavedPlanProviderArtifactMismatchError {}
+
+/// Saved and newly initialized scopes for one provider instance differ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedPlanProviderScopeMismatchError {
+    pub instance: ProviderInstanceKey,
+    pub recorded: Option<ReferenceScope>,
+    pub initialized: Option<ReferenceScope>,
+    pub replan_command: String,
+}
+
+impl std::fmt::Display for SavedPlanProviderScopeMismatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let instance = match self.instance.provider_instance() {
+            Some(binding) => format!("{}.{}", self.instance.provider(), binding),
+            None => format!("{} (default)", self.instance.provider()),
+        };
+        write!(
+            formatter,
+            "Provider scope mismatch for `{instance}`: recorded {}; initialized {}.\nRe-run `{}` to produce a new saved plan before applying.",
+            reference_scope_summary(self.recorded.as_ref()),
+            reference_scope_summary(self.initialized.as_ref()),
+            self.replan_command,
+        )
+    }
+}
+
+fn reference_scope_summary(scope: Option<&ReferenceScope>) -> String {
+    match scope {
+        Some(ReferenceScope::Available {
+            partition,
+            region,
+            account,
+        }) => format!("{partition}/{region}/{account}"),
+        Some(ReferenceScope::Unavailable) => "unavailable".to_string(),
+        None => "missing".to_string(),
+    }
+}
+
+impl std::error::Error for SavedPlanProviderScopeMismatchError {}
 
 /// A backend-selection failure annotated with the upstream project whose
 /// state was being resolved.
@@ -807,6 +846,10 @@ pub enum AppError {
     /// A saved plan was computed with different provider artifacts.
     #[error("{0}")]
     SavedPlanProviderArtifactMismatch(SavedPlanProviderArtifactMismatchError),
+
+    /// A saved plan was computed under a different initialized instance scope.
+    #[error("{0}")]
+    SavedPlanProviderScopeMismatch(SavedPlanProviderScopeMismatchError),
 
     /// Apply completed with one or more partial create results.
     #[error("{0}")]

@@ -6,7 +6,7 @@ use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::effect::PlanOp;
 use carina_core::executor::{
     ExecutionEvent, ExecutionObserver, ExecutionOutcome, LiveExecutionInput, ProviderCheckInputs,
-    UnresolvedResource, execute_live_plan,
+    UnresolvedResource,
 };
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
@@ -789,7 +789,7 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
             unreachable!("plan canonicalization test does not create providers")
         }
 
@@ -1199,7 +1199,7 @@ fn create_plan(
     wait_bindings: &[carina_core::parser::WaitBinding],
 ) -> Plan {
     let managed = ResolvedResource::collect_resolved(managed.iter().cloned()).unwrap();
-    carina_core::differ::create_plan(
+    carina_core::differ::create_plan_for_test(
         &managed,
         data_sources,
         provider,
@@ -1662,8 +1662,13 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-            Box::pin(async { Ok(Box::new(MockProvider::new()) as Box<dyn Provider>) })
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+            Box::pin(async {
+                Ok(carina_core::provider::InitializedProvider::new(
+                    Box::new(MockProvider::new()),
+                    carina_core::provider::ReferenceScope::Unavailable,
+                ))
+            })
         }
 
         fn create_normalizer(
@@ -1778,10 +1783,13 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
             Box::pin(async move {
                 if self.lines.is_empty() {
-                    Ok(Box::new(MockProvider::new()) as Box<dyn Provider>)
+                    Ok(carina_core::provider::InitializedProvider::new(
+                        Box::new(MockProvider::new()),
+                        carina_core::provider::ReferenceScope::Unavailable,
+                    ))
                 } else {
                     Err(ProviderError::internal(
                         "provider progress was emitted before initialization",
@@ -1863,7 +1871,7 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
             Box::pin(async {
                 Err(
                     carina_plugin_host::wasm_factory::decode_initialize_string_error_for_test(
@@ -1965,9 +1973,14 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
         self.creates.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Ok(Box::new(MockProvider::new()) as Box<dyn Provider>) })
+        Box::pin(async {
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(MockProvider::new()),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
+        })
     }
 
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
@@ -2151,8 +2164,13 @@ impl ProviderFactory for CascadeAwsccFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-        Box::pin(async { Ok(Box::new(CascadeCreateProvider::default()) as Box<dyn Provider>) })
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(CascadeCreateProvider::default()),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
+        })
     }
 
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
@@ -2489,9 +2507,12 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
         Box::pin(async {
-            Ok(Box::new(ReadWithRetryProvider::new(ReadBehavior::Success)) as Box<dyn Provider>)
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(ReadWithRetryProvider::new(ReadBehavior::Success)),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
         })
     }
 
@@ -2818,7 +2839,7 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
             Box::pin(async { unreachable!("state normalization does not create providers") })
         }
 
@@ -2939,7 +2960,7 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
             unreachable!("config selection test does not construct a provider")
         }
 
@@ -3314,8 +3335,15 @@ fn moved_in_flight_rebinds_resume_to_destination() {
     ));
     let pending =
         crate::fixture_in_flight_create(&from, "opaque-token", None, Sent::AllRequestAttributes);
-    let row = ResourceState::from_in_flight(&old_resource, &pending, None, None, None)
-        .expect("in-flight fixture must encode");
+    let row = ResourceState::from_in_flight(
+        &old_resource,
+        &pending,
+        None,
+        None,
+        None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
+    )
+    .expect("in-flight fixture must encode");
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(row)
@@ -3639,8 +3667,15 @@ fn removed_suppresses_in_flight_orphan_error_and_keeps_deposed() {
         None,
         Sent::AllRequestAttributes,
     );
-    let mut row = ResourceState::from_in_flight(&resource, &pending, None, None, None)
-        .expect("in-flight fixture must encode");
+    let mut row = ResourceState::from_in_flight(
+        &resource,
+        &pending,
+        None,
+        None,
+        None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
+    )
+    .expect("in-flight fixture must encode");
     let deposed_key = DeposedKey::new_unique();
     row.deposed.push(DeposedInstance::from_persisted_json(
         deposed_key.clone(),
@@ -3869,8 +3904,15 @@ fn deposed_delete_waits_for_the_rows_in_flight_create() {
     ));
     let pending =
         crate::fixture_in_flight_create(&resource.id, "opaque", None, Sent::AllRequestAttributes);
-    let mut row = ResourceState::from_in_flight(&resource, &pending, None, None, None)
-        .expect("in-flight fixture must encode");
+    let mut row = ResourceState::from_in_flight(
+        &resource,
+        &pending,
+        None,
+        None,
+        None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
+    )
+    .expect("in-flight fixture must encode");
     let key = DeposedKey::new_unique();
     row.deposed.push(DeposedInstance::from_persisted_json(
         key.clone(),
@@ -4785,10 +4827,13 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
         _config: &carina_core::provider::ProviderReadyConfig,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+        carina_core::provider::ProviderResult<carina_core::provider::InitializedProvider>,
     > {
         Box::pin(async {
-            Ok(Box::new(MockProvider::new()) as Box<dyn carina_core::provider::Provider>)
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(MockProvider::new()),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
         })
     }
 
@@ -5067,9 +5112,15 @@ fn resource_move_invariants_unprojected_in_flight_target_blocks_orphan_match() {
         None,
         Sent::AllRequestAttributes,
     );
-    let in_flight =
-        ResourceState::from_in_flight(&resolved_persisted_target, &pending, None, None, None)
-            .expect("in-flight fixture must encode");
+    let in_flight = ResourceState::from_in_flight(
+        &resolved_persisted_target,
+        &pending,
+        None,
+        None,
+        None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
+    )
+    .expect("in-flight fixture must encode");
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(route_table_state("private_rtb", "rtb-private"))
@@ -5795,7 +5846,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         precompleted_success_count: 0,
         checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::noop(),
     };
-    let outcome = execute_live_plan(
+    let outcome = carina_core::executor::execute_live_plan_for_test(
         &provider,
         input,
         &NoopExecutionObserver,
@@ -6980,10 +7031,13 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
         _config: &carina_core::provider::ProviderReadyConfig,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+        carina_core::provider::ProviderResult<carina_core::provider::InitializedProvider>,
     > {
         Box::pin(async {
-            Ok(Box::new(MockProvider::new()) as Box<dyn carina_core::provider::Provider>)
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(MockProvider::new()),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
         })
     }
 
@@ -8169,6 +8223,7 @@ mod expand_same_config_deferred_for_tests {
                 &schemas,
                 &HashMap::new(),
                 DeferredForWarningPolicy::Suppress,
+                &ProviderRouter::new(),
             )
             .expect("deferred-for expansion should succeed");
         assert!(
@@ -9823,8 +9878,13 @@ mod resolved_value_constraint_gate {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-            Box::pin(async { Ok(Box::new(MockProvider::new()) as Box<dyn Provider>) })
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+            Box::pin(async {
+                Ok(carina_core::provider::InitializedProvider::new(
+                    Box::new(MockProvider::new()),
+                    carina_core::provider::ReferenceScope::Unavailable,
+                ))
+            })
         }
 
         fn create_normalizer(
@@ -9933,10 +9993,13 @@ mod resolved_value_constraint_gate {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
             let reads = self.reads.clone();
             Box::pin(async move {
-                Ok(Box::new(RecordingDataSourceProvider { reads }) as Box<dyn Provider>)
+                Ok(carina_core::provider::InitializedProvider::new(
+                    Box::new(RecordingDataSourceProvider { reads }),
+                    carina_core::provider::ReferenceScope::Unavailable,
+                ))
             })
         }
 

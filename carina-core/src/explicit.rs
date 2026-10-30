@@ -8,6 +8,7 @@
 //! See `notes/specs/2026-05-10-explicit-fields-design.md`.
 
 use crate::diff_helpers::{list_element_type, map_entry_subtype};
+use crate::differ::ComparisonContext;
 use crate::resource::{
     ConcreteValue, ListElementPairing, Resource, Value, pair_list_elements,
     pair_list_elements_with_uniqueness,
@@ -147,6 +148,7 @@ pub fn build_from_resource_for_stored_values<S>(
     resource: &Resource<S>,
     stored_attributes: &HashMap<String, Value>,
     schema: Option<&ResourceSchema>,
+    comparison: &ComparisonContext<'_>,
 ) -> ExplicitFields {
     let defs = schema
         .map(|schema| &schema.defs)
@@ -165,6 +167,7 @@ pub fn build_from_resource_for_stored_values<S>(
                             .and_then(|schema| schema.attributes.get(key))
                             .map(|attribute| &attribute.attr_type),
                         defs,
+                        comparison,
                     ),
                 )
             })
@@ -187,11 +190,17 @@ pub fn build_carried_from_resource_for_stored_values<S>(
     prior_explicit: &ExplicitFields,
     fresh_stored_attributes: &HashMap<String, Value>,
     schema: Option<&ResourceSchema>,
+    comparison: &ComparisonContext<'_>,
 ) -> ExplicitFields {
     let defs = schema
         .map(|schema| &schema.defs)
         .unwrap_or(empty_defs_for_schema_walks());
-    let rebuilt = build_from_resource_for_stored_values(resource, fresh_stored_attributes, schema);
+    let rebuilt = build_from_resource_for_stored_values(
+        resource,
+        fresh_stored_attributes,
+        schema,
+        comparison,
+    );
     let prior_children = match prior_explicit {
         ExplicitFields::Struct { children } => children,
         ExplicitFields::Leaf
@@ -206,7 +215,7 @@ pub fn build_carried_from_resource_for_stored_values<S>(
         Some(CarryMap::Hash(prior_stored_attributes)),
         CarryMap::Index(&resource.attributes),
         CarryMap::Hash(fresh_stored_attributes),
-        CarryContext::resource(schema, defs),
+        CarryContext::resource(schema, defs, *comparison),
     )
     .explicit
 }
@@ -241,26 +250,31 @@ enum CarryLocation<'a> {
 struct CarryContext<'a> {
     location: CarryLocation<'a>,
     defs: &'a BTreeMap<String, AttributeType>,
+    comparison: ComparisonContext<'a>,
 }
 
 impl<'a> CarryContext<'a> {
     fn resource(
         schema: Option<&'a ResourceSchema>,
         defs: &'a BTreeMap<String, AttributeType>,
+        comparison: ComparisonContext<'a>,
     ) -> Self {
         Self {
             location: CarryLocation::Resource(schema),
             defs,
+            comparison,
         }
     }
 
     fn value(
         attr_type: Option<&'a AttributeType>,
         defs: &'a BTreeMap<String, AttributeType>,
+        comparison: ComparisonContext<'a>,
     ) -> Self {
         Self {
             location: CarryLocation::Value(attr_type),
             defs,
+            comparison,
         }
     }
 
@@ -271,7 +285,7 @@ impl<'a> CarryContext<'a> {
                 .map(|attribute| &attribute.attr_type),
             CarryLocation::Value(attr_type) => map_entry_subtype(attr_type, key, self.defs),
         };
-        Self::value(attr_type, self.defs)
+        Self::value(attr_type, self.defs, self.comparison)
     }
 
     fn list_element(self) -> Self {
@@ -279,7 +293,7 @@ impl<'a> CarryContext<'a> {
             CarryLocation::Resource(_) => None,
             CarryLocation::Value(attr_type) => list_element_type(attr_type, self.defs),
         };
-        Self::value(attr_type, self.defs)
+        Self::value(attr_type, self.defs, self.comparison)
     }
 
     fn attr_type(self) -> Option<&'a AttributeType> {
@@ -520,9 +534,20 @@ fn carry_list(
         return carried_list_without_alignment(&candidate_paths, rebuilt);
     }
 
-    let prior_to_desired =
-        pair_list_elements_with_uniqueness(prior_items, desired_items, item_type, context.defs);
-    let prior_to_fresh = mutually_unique_pairs(prior_items, fresh_items, item_type, context.defs);
+    let prior_to_desired = pair_list_elements_with_uniqueness(
+        prior_items,
+        desired_items,
+        item_type,
+        context.defs,
+        &context.comparison,
+    );
+    let prior_to_fresh = mutually_unique_pairs(
+        prior_items,
+        fresh_items,
+        item_type,
+        context.defs,
+        &context.comparison,
+    );
     // The normal builder deliberately retains only the stable stored-index
     // authoring vector (including deterministic choices for duplicates). It
     // does not retain the desired index or uniqueness evidence, so transfer
@@ -610,9 +635,10 @@ fn mutually_unique_pairs(
     right: &[Value],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    comparison: &ComparisonContext<'_>,
 ) -> Vec<Option<usize>> {
-    let forward = pair_list_elements_with_uniqueness(left, right, attr_type, defs);
-    let reverse = pair_list_elements_with_uniqueness(right, left, attr_type, defs);
+    let forward = pair_list_elements_with_uniqueness(left, right, attr_type, defs, comparison);
+    let reverse = pair_list_elements_with_uniqueness(right, left, attr_type, defs, comparison);
     forward
         .into_iter()
         .enumerate()
@@ -691,6 +717,7 @@ fn pending_candidate_paths(
         desired_items,
         item_context.attr_type(),
         item_context.defs,
+        &item_context.comparison,
     );
     let pending = broad_candidates
         .into_iter()
@@ -837,6 +864,7 @@ fn build_from_value_for_stored_value(
     stored: Option<&Value>,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    comparison: &ComparisonContext<'_>,
 ) -> ExplicitFields {
     match desired {
         Value::Concrete(ConcreteValue::Map(desired_fields)) => {
@@ -855,6 +883,7 @@ fn build_from_value_for_stored_value(
                                 stored_fields.and_then(|fields| fields.get(key)),
                                 map_entry_subtype(attr_type, key, defs),
                                 defs,
+                                comparison,
                             ),
                         )
                     })
@@ -866,7 +895,7 @@ fn build_from_value_for_stored_value(
                 let item_type = list_element_type(attr_type, defs);
                 let mut elements = vec![ExplicitFields::Unrecorded; stored_items.len()];
                 for (desired_index, stored_index) in
-                    pair_list_elements(desired_items, stored_items, item_type, defs)
+                    pair_list_elements(desired_items, stored_items, item_type, defs, comparison)
                         .into_iter()
                         .enumerate()
                 {
@@ -876,6 +905,7 @@ fn build_from_value_for_stored_value(
                             Some(&stored_items[stored_index]),
                             item_type,
                             defs,
+                            comparison,
                         );
                     }
                 }
@@ -1106,6 +1136,55 @@ mod tests {
     use super::*;
     use crate::resource::{DeferredValue, UnknownReason};
     use indexmap::IndexMap;
+
+    fn build_from_resource_for_stored_values<S>(
+        resource: &Resource<S>,
+        stored_attributes: &HashMap<String, Value>,
+        schema: Option<&ResourceSchema>,
+    ) -> ExplicitFields {
+        super::build_from_resource_for_stored_values(
+            resource,
+            stored_attributes,
+            schema,
+            &crate::differ::exact_comparison_context_for_tests(),
+        )
+    }
+
+    fn build_carried_from_resource_for_stored_values<S>(
+        resource: &Resource<S>,
+        prior_stored_attributes: &HashMap<String, Value>,
+        prior_explicit: &ExplicitFields,
+        fresh_stored_attributes: &HashMap<String, Value>,
+        schema: Option<&ResourceSchema>,
+    ) -> ExplicitFields {
+        super::build_carried_from_resource_for_stored_values(
+            resource,
+            prior_stored_attributes,
+            prior_explicit,
+            fresh_stored_attributes,
+            schema,
+            &crate::differ::exact_comparison_context_for_tests(),
+        )
+    }
+
+    fn pair_list_elements<D, S>(
+        desired: &[D],
+        saved: &[S],
+        attr_type: Option<&AttributeType>,
+        defs: &BTreeMap<String, AttributeType>,
+    ) -> Vec<Option<usize>>
+    where
+        D: std::borrow::Borrow<Value>,
+        S: std::borrow::Borrow<Value>,
+    {
+        crate::resource::pair_list_elements(
+            desired,
+            saved,
+            attr_type,
+            defs,
+            &crate::differ::exact_comparison_context_for_tests(),
+        )
+    }
 
     fn rule(port: i64, description: Option<&str>) -> Value {
         let mut fields = IndexMap::from([(

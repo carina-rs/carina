@@ -15,7 +15,7 @@ use carina_cli::display::{
 };
 use carina_cli::fixture_plan::{
     FixturePlan, build_fixture_plan_change_summary, build_plan_from_fixture_name_using,
-    delete_instance_attributes_from_plan,
+    delete_instance_attributes_from_plan, provider_router_for_plan,
 };
 
 fn build_plan_from_fixture_name(fixture: &str) -> FixturePlan {
@@ -29,6 +29,7 @@ fn render_plan(fixture: &str, detail: DetailLevel) -> String {
     let delete_attributes =
         delete_instance_attributes_from_plan(&fp.plan, &fp.managed_current, fp.state_file.as_ref());
     let summary = build_fixture_plan_change_summary(&fp);
+    let provider = provider_router_for_plan(&fp.plan);
     format_plan_with_delete_instances(
         &fp.plan,
         &summary,
@@ -38,7 +39,9 @@ fn render_plan(fixture: &str, detail: DetailLevel) -> String {
         &fp.moved_origins,
         Some(&fp.prev_explicit),
         None,
+        &provider,
     )
+    .expect("fixture plan must have an initialized provider route")
 }
 
 /// Render a fixture as a destroy plan, mirroring `plan-fixture --destroy`.
@@ -46,7 +49,9 @@ fn render_destroy_plan(fixture: &str, detail: DetailLevel) -> String {
     let fp = build_plan_from_fixture_name(fixture);
     let delete_attributes =
         delete_instance_attributes_from_plan(&fp.plan, &fp.managed_current, fp.state_file.as_ref());
-    format_destroy_plan_with_delete_instances(&fp.plan, detail, &delete_attributes)
+    let provider = provider_router_for_plan(&fp.plan);
+    format_destroy_plan_with_delete_instances(&fp.plan, detail, &delete_attributes, &provider)
+        .expect("fixture destroy plan must have an initialized provider route")
 }
 
 fn assert_non_empty(output: &str, fixture: &str) {

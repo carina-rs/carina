@@ -24,6 +24,7 @@ use subtle::ConstantTimeEq;
 
 use crate::ValueDescription;
 use crate::diff_helpers::{list_element_type, map_entry_subtype, schema_aware_equal};
+use crate::differ::ComparisonContext;
 use crate::effect::MoveAuthority;
 use crate::explicit::ExplicitFields;
 use crate::parser::display_string_literal;
@@ -4995,6 +4996,7 @@ pub(crate) fn merge_with_saved(
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> Value {
     match (desired, saved.projected) {
         (
@@ -5012,6 +5014,7 @@ pub(crate) fn merge_with_saved(
                 prior_explicit,
                 attr_type,
                 defs,
+                context,
             )
         }
         (
@@ -5029,6 +5032,7 @@ pub(crate) fn merge_with_saved(
                 prior_explicit,
                 attr_type,
                 defs,
+                context,
             )))
         }
         _ => desired.clone(),
@@ -5042,6 +5046,7 @@ fn merge_maps(
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> Value {
     let prior_children = match prior_explicit {
         ExplicitFields::Struct { children } => Some(children),
@@ -5078,6 +5083,7 @@ fn merge_maps(
                         .unwrap_or(&ExplicitFields::Unrecorded),
                     map_entry_subtype(attr_type, key, defs),
                     defs,
+                    context,
                 )
             }
             None => desired_value.clone(),
@@ -5106,12 +5112,13 @@ pub(crate) fn pair_list_elements<D, S>(
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> Vec<Option<usize>>
 where
     D: Borrow<Value>,
     S: Borrow<Value>,
 {
-    let candidates = list_pair_candidates(desired, saved, attr_type, defs);
+    let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
     commit_list_element_pairs(desired.len(), saved.len(), &candidates)
 }
 
@@ -5140,12 +5147,13 @@ pub(crate) fn pair_list_elements_with_uniqueness<D, S>(
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> Vec<ListElementPairing>
 where
     D: Borrow<Value>,
     S: Borrow<Value>,
 {
-    let candidates = list_pair_candidates(desired, saved, attr_type, defs);
+    let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
     let pairs = commit_list_element_pairs(desired.len(), saved.len(), &candidates);
     classify_list_element_pairs(&pairs, saved.len(), &candidates)
 }
@@ -5155,15 +5163,16 @@ fn list_pair_candidates<D, S>(
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
     S: Borrow<Value>,
 {
     if desired.len().max(saved.len()) < HASH_THRESHOLD {
-        pair_candidates_quadratic(desired, saved, attr_type, defs)
+        pair_candidates_quadratic(desired, saved, attr_type, defs, context)
     } else {
-        pair_candidates_hashed(desired, saved, attr_type, defs)
+        pair_candidates_hashed(desired, saved, attr_type, defs, context)
     }
 }
 
@@ -5346,6 +5355,7 @@ fn pair_candidates_quadratic<D, S>(
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
@@ -5361,6 +5371,7 @@ where
                 saved_value.borrow(),
                 attr_type,
                 defs,
+                context,
             );
             if score > 0 {
                 entries.push((score, desired_index, saved_index));
@@ -5396,6 +5407,7 @@ fn pair_candidates_hashed<D, S>(
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
@@ -5452,7 +5464,7 @@ where
                         return false;
                     };
                     map.get(*key).is_some_and(|value| {
-                        schema_aware_equal(representative, value, field_type, defs)
+                        schema_aware_equal(representative, value, field_type, defs, context)
                     })
                 })
             {
@@ -5471,7 +5483,13 @@ where
             if bucket.len() == saved.len()
                 && bucket.iter().copied().eq(0..saved.len())
                 && saved.iter().all(|saved_value| {
-                    schema_aware_equal(representative, saved_value.borrow(), attr_type, defs)
+                    schema_aware_equal(
+                        representative,
+                        saved_value.borrow(),
+                        attr_type,
+                        defs,
+                        context,
+                    )
                 })
             {
                 universal_values.insert(*value_hash, representative);
@@ -5504,6 +5522,7 @@ where
                                                 representative,
                                                 field_type,
                                                 defs,
+                                                context,
                                             )
                                         },
                                     )
@@ -5528,7 +5547,7 @@ where
                     universal_values
                         .get(value_hash)
                         .is_some_and(|representative| {
-                            schema_aware_equal(value, representative, attr_type, defs)
+                            schema_aware_equal(value, representative, attr_type, defs, context)
                         })
                 });
                 if value_is_universal {
@@ -5551,6 +5570,7 @@ where
                 saved[saved_index].borrow(),
                 attr_type,
                 defs,
+                context,
             );
             if score > 0 {
                 entries.push((score, desired_index, saved_index));
@@ -5718,6 +5738,7 @@ fn merge_lists(
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> Vec<Value> {
     // `WholeValue` is the explicit whole-value fallback used when a carried row
     // cannot transfer a pending nested removal to a uniquely identified list
@@ -5739,8 +5760,8 @@ fn merge_lists(
     };
 
     let item_type = list_element_type(attr_type, defs);
-    let projected_pairs = pair_list_elements(desired, projected_saved, item_type, defs);
-    let raw_pairs = pair_list_elements(desired, raw_saved, item_type, defs);
+    let projected_pairs = pair_list_elements(desired, projected_saved, item_type, defs, context);
+    let raw_pairs = pair_list_elements(desired, raw_saved, item_type, defs, context);
 
     projected_pairs
         .into_iter()
@@ -5767,6 +5788,7 @@ fn merge_lists(
                         authoring,
                         item_type,
                         defs,
+                        context,
                     )
                 }
                 None => desired[desired_index].clone(),
@@ -5784,6 +5806,7 @@ fn similarity_score(
     b: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> usize {
     match (a, b) {
         (Value::Concrete(ConcreteValue::Map(am)), Value::Concrete(ConcreteValue::Map(bm))) => am
@@ -5791,12 +5814,18 @@ fn similarity_score(
             .filter(|(k, v)| {
                 bm.get(*k)
                     .map(|bv| {
-                        schema_aware_equal(v, bv, map_entry_subtype(attr_type, k, defs), defs)
+                        schema_aware_equal(
+                            v,
+                            bv,
+                            map_entry_subtype(attr_type, k, defs),
+                            defs,
+                            context,
+                        )
                     })
                     .unwrap_or(false)
             })
             .count(),
-        _ => usize::from(schema_aware_equal(a, b, attr_type, defs)),
+        _ => usize::from(schema_aware_equal(a, b, attr_type, defs, context)),
     }
 }
 

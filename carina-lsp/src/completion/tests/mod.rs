@@ -447,7 +447,7 @@ impl ProviderFactory for EnumShadowFactory {
         Box<
             dyn std::future::Future<
                     Output = carina_core::provider::ProviderResult<
-                        Box<dyn carina_core::provider::Provider>,
+                        carina_core::provider::InitializedProvider,
                     >,
                 > + Send
                 + '_,

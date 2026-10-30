@@ -6576,7 +6576,7 @@ impl crate::provider::ProviderFactory for RecordingFactory {
         _config: &crate::provider::ProviderReadyConfig,
     ) -> futures::future::BoxFuture<
         '_,
-        crate::provider::ProviderResult<Box<dyn crate::provider::Provider>>,
+        crate::provider::ProviderResult<crate::provider::InitializedProvider>,
     > {
         unimplemented!("RecordingFactory::create_provider is not used in these tests")
     }
@@ -6712,7 +6712,7 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
             _config: &crate::provider::ProviderReadyConfig,
         ) -> futures::future::BoxFuture<
             '_,
-            crate::provider::ProviderResult<Box<dyn crate::provider::Provider>>,
+            crate::provider::ProviderResult<crate::provider::InitializedProvider>,
         > {
             unimplemented!("EnumRecordingFactory::create_provider is not used in this test")
         }

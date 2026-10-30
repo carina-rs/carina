@@ -318,7 +318,7 @@ mod tests {
     use super::*;
     use carina_core::detail_rows::{
         DetailLevel, DetailRow, HistoricalDisplayAttributes, NonEmptyListOfMapsBlock,
-        build_detail_rows_by_instance,
+        build_detail_rows_by_instance_for_test,
     };
     use carina_core::effect::Effect;
     use carina_core::plan::Plan;
@@ -366,12 +366,13 @@ mod tests {
         plan.add(effect);
         let historical = HistoricalDisplayAttributes::for_plan(&plan);
 
-        build_detail_rows_by_instance(
+        build_detail_rows_by_instance_for_test(
             &plan.effects()[0],
             None,
             DetailLevel::Explicit,
             &historical,
             None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
         )
     }
 

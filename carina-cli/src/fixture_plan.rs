@@ -15,7 +15,10 @@ use carina_core::differ::{
 };
 use carina_core::executor::UnresolvedResource;
 use carina_core::plan::Plan;
-use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult, ProviderRouter};
+use carina_core::provider::{
+    BoxFuture, InitializedProvider, ProviderFactory, ProviderInstanceKey, ProviderResult,
+    ProviderRouter, ReferenceScope,
+};
 use carina_core::resource::{Current, ResolvedResource, ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
@@ -197,6 +200,26 @@ pub struct FixturePlan {
     pub expansion_trace: carina_core::resource::ExpansionTrace,
 }
 
+/// Build an explicitly scoped provider router for rendering a hand-built plan.
+pub fn provider_router_for_plan<S>(plan: &Plan<S>) -> ProviderRouter {
+    let instances = plan
+        .effects()
+        .iter()
+        .map(|effect| ProviderInstanceKey::from(effect.resource_id()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut provider = ProviderRouter::new();
+    for instance in instances {
+        provider.add_provider_instance(
+            instance,
+            InitializedProvider::new(
+                Box::new(carina_provider_mock::MockProvider::new()),
+                ReferenceScope::Unavailable,
+            ),
+        );
+    }
+    provider
+}
+
 /// Build a plan from a fixture directory name (e.g. "all_create"). Resolves
 /// the fixture under `CARGO_MANIFEST_DIR/tests/fixtures/plan_display/<name>`.
 #[cfg(test)]
@@ -356,6 +379,34 @@ where
     )
     .expect("fixture provider configs must resolve");
     let raw_provider_configs = resolved_provider_configs.as_provider_configs();
+    // Fixture planning still follows the production comparison path: every
+    // resource route has an initialized provider and an explicit scope.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime for plan preprocessing");
+    let mut provider_router = ProviderRouter::new();
+    for factory in wiring.factories() {
+        let resolved_config = resolved_provider_configs.provider_or_implicit(factory.name());
+        let config = carina_core::executor::prepare_provider_ready_config(
+            factory.as_ref(),
+            resolved_config.as_ref(),
+        )
+        .expect("fixture provider config unexpectedly failed validation");
+        provider_router.add_normalizer(
+            factory.name(),
+            rt.block_on(factory.create_normalizer(None, &config))
+                .expect("fixture normalizer creation unexpectedly failed"),
+        );
+        provider_router.add_provider(
+            factory.name().to_string(),
+            carina_core::provider::InitializedProvider::new(
+                Box::new(carina_provider_mock::MockProvider::new()),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ),
+        );
+    }
     let expansion_prelude = expansion_prelude
         .detect_moves(
             wiring,
@@ -432,6 +483,7 @@ where
         expansion_prelude.prev_explicit(),
         &remote_bindings,
         expansion_prelude.wait_aliases(),
+        &provider_router,
     )
     .expect("fixture managed binding stability must resolve");
     let projected_state = expansion_prelude.projected_state();
@@ -478,52 +530,21 @@ where
     let module_gate =
         carina_core::executor::ModuleConstraintGate::from_live_compositions(&prepared_compositions);
     let wait_bindings = parsed.wait_bindings.clone();
-    let mut provider_router = ProviderRouter::new();
-    let preparation = {
-        // Provider config validation may use `block_in_place` to bridge a
-        // synchronous factory hook to async WASM calls. Keep both preparation
-        // and normalizer creation inside a compatible runtime.
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("failed to build tokio runtime for plan preprocessing");
-        for factory in wiring.factories() {
-            let resolved_config = resolved_provider_configs.provider_or_implicit(factory.name());
-            let config = rt
-                .block_on(async {
-                    carina_core::executor::prepare_provider_ready_config(
-                        factory.as_ref(),
-                        resolved_config.as_ref(),
-                    )
-                })
-                .expect("fixture provider config unexpectedly failed validation");
-            provider_router.add_normalizer(
-                factory.name(),
-                rt.block_on(factory.create_normalizer(None, &config))
-                    .expect("fixture normalizer creation unexpectedly failed"),
-            );
-            provider_router.add_provider(
-                factory.name().to_string(),
-                Box::new(carina_provider_mock::MockProvider::new()),
-            );
-        }
-        rt.block_on(async {
-            PlanPreprocessor::new(&provider_router, wiring)
-                .prepare(
-                    &mut override_aware_resources,
-                    &constraint_origin_resources,
-                    &module_gate,
-                    &mut managed_current,
-                    &mut data_source_values,
-                    &mut orphans,
-                    raw_provider_configs,
-                    &mut data_sources_for_plan,
-                    &data_sources,
-                )
-                .await
-        })
-    };
+    let preparation = rt.block_on(async {
+        PlanPreprocessor::new(&provider_router, wiring)
+            .prepare(
+                &mut override_aware_resources,
+                &constraint_origin_resources,
+                &module_gate,
+                &mut managed_current,
+                &mut data_source_values,
+                &mut orphans,
+                raw_provider_configs,
+                &mut data_sources_for_plan,
+                &data_sources,
+            )
+            .await
+    });
     if let Err(error) = preparation {
         let errors = match error {
             PlanPreparationError::Plan(errors) => errors,
@@ -623,7 +644,9 @@ where
         wiring.schemas(),
         reconciled_expansion.saved_attrs(),
         reconciled_expansion.prev_explicit(),
-    );
+        &provider_router,
+    )
+    .expect("fixture managed binding stability must resolve");
     override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
         RebuildBindingsInputs {
             compositions: &parsed.compositions,
@@ -641,6 +664,7 @@ where
             &prepared_expansion,
             &remote_bindings,
             crate::wiring::DeferredForWarningPolicy::Print,
+            &provider_router,
         )
         .expect("fixture deferred-for expansion failed");
     let crate::wiring::PreparedDeferredForExpansionParts {
@@ -921,7 +945,7 @@ impl ProviderFactory for FixtureProviderConfigFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -977,7 +1001,7 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1042,7 +1066,7 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1124,7 +1148,7 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1199,7 +1223,7 @@ impl ProviderFactory for PlanImageFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1264,7 +1288,7 @@ impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1328,7 +1352,7 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1400,7 +1424,7 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1460,7 +1484,7 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 

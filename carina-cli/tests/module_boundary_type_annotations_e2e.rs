@@ -55,8 +55,13 @@ impl ProviderFactory for AwsTestFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-        Box::pin(async { Ok(Box::new(NoopProvider) as Box<dyn Provider>) })
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(NoopProvider),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
+        })
     }
 
     fn create_normalizer(
@@ -325,8 +330,13 @@ impl ProviderFactory for SharedRoleArnFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-        Box::pin(async { Ok(Box::new(NoopProvider) as Box<dyn Provider>) })
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializedProvider::new(
+                Box::new(NoopProvider),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ))
+        })
     }
 
     fn create_normalizer(

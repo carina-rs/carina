@@ -3654,6 +3654,7 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
         &saved_attrs,
         None,
         None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
     );
     assert!(
         !diff.is_change(),

@@ -7,7 +7,9 @@ use std::time::Instant;
 use crate::effect::Effect;
 #[cfg(test)]
 use crate::effect::deps::UnresolvedResource;
-use crate::provider::{AppliedIdentifier, Provider};
+#[cfg(test)]
+use crate::provider::Provider;
+use crate::provider::{AppliedIdentifier, ContextualProvider};
 #[cfg(test)]
 use crate::resource::Resource;
 use crate::resource::{ResourceId, ResourceIdentity};
@@ -235,7 +237,7 @@ pub(super) fn build_dependency_levels(
 }
 
 pub(super) async fn execute_effects_sequential<S: Clone>(
-    provider: &dyn Provider,
+    provider: &dyn ContextualProvider,
     input: &mut RuntimeExecutionInput<'_, S>,
     observer: &dyn ExecutionObserver<S>,
     shutdown: &ShutdownToken,
@@ -613,7 +615,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                                                         &provider_values,
                                                     );
                                                     super::read_data_source_with_retry(
-                                                        provider, &ready,
+                                                        provider.provider(), &ready,
                                                     )
                                                     .await
                                                     .map(|state| (resolved_attrs, state))
@@ -694,7 +696,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                             let binding = wait.identity().to_string();
                             let outcome = super::wait::execute_wait_effect(
                                 &cleanup_loop,
-                                provider,
+                                provider.provider(),
                                 wait,
                                 &identifier_resolver,
                                 wait_cancel_rx.expect("wait dispatch must have a cancel receiver"),
@@ -941,7 +943,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
         LoopStep::Abandon => true,
         LoopStep::Continue(cleanup_wait) => {
             let refresh = refresh_pending_states(
-                provider,
+                provider.provider(),
                 &mut accumulated,
                 &pending_refreshes,
                 observer,
@@ -1277,7 +1279,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            execute_effects_sequential(&provider, &mut input, &observer, &ShutdownToken::running()),
+            execute_effects_sequential(
+                &crate::provider::TestContextualProvider::new(&provider),
+                &mut input,
+                &observer,
+                &ShutdownToken::running(),
+            ),
         )
         .await
         .expect("wait should be skipped as unsatisfiable instead of timing out");
@@ -1395,7 +1402,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            execute_effects_sequential(&provider, &mut input, &observer, &ShutdownToken::running()),
+            execute_effects_sequential(
+                &crate::provider::TestContextualProvider::new(&provider),
+                &mut input,
+                &observer,
+                &ShutdownToken::running(),
+            ),
         )
         .await
         .expect("wait should be skipped as unsatisfiable instead of polling until timeout");

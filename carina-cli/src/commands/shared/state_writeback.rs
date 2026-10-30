@@ -15,6 +15,7 @@ use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesF
 use carina_core::provider::SentRecord;
 use carina_core::provider::{
     AppliedIdentifier, InFlightCreate, InFlightPersistence, ObservedCreate, PersistedAttributes,
+    ProviderError, ProviderRouter,
 };
 use carina_core::resource::{
     ConcreteValue, Current, DefaultTagKeys, ModuleSource, ResolvedResource, ResolvedResourceId,
@@ -155,6 +156,7 @@ pub(crate) struct ApplyStateSaveInputs<S = ModuleSource> {
     plan: Plan<S>,
     schemas: SchemaRegistry,
     planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
+    provider: Arc<ProviderRouter>,
 }
 
 impl<S: Clone> ApplyStateSaveInputs<S> {
@@ -163,12 +165,14 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
         plan: Plan<S>,
         schemas: SchemaRegistry,
         planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
+        provider: Arc<ProviderRouter>,
     ) -> Self {
         Self {
             sorted_resources,
             plan,
             schemas,
             planned_secret_hashes,
+            provider,
         }
     }
 
@@ -180,12 +184,60 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
         &self.schemas
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        sorted_resources: Vec<ResolvedResource<S>>,
+        plan: Plan<S>,
+        mut schemas: SchemaRegistry,
+        planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
+    ) -> Self {
+        let missing_schemas = sorted_resources
+            .iter()
+            .filter(|resource| schemas.get_for(*resource).is_none())
+            .map(|resource| {
+                (
+                    resource.id.provider.clone(),
+                    resource.id.resource_type.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        for (owner, resource_type) in missing_schemas {
+            schemas.insert(
+                owner,
+                ResourceSchema::new(resource_type)
+                    .validate()
+                    .expect("empty test schema must validate"),
+            );
+        }
+        let routes = sorted_resources
+            .iter()
+            .map(|resource| carina_core::provider::ProviderInstanceKey::from(&resource.id))
+            .collect::<BTreeSet<_>>();
+        let mut provider = ProviderRouter::new();
+        for route in routes {
+            provider.add_provider_instance(
+                route,
+                carina_core::provider::InitializedProvider::new(
+                    Box::new(carina_provider_mock::MockProvider::new()),
+                    carina_core::provider::ReferenceScope::Unavailable,
+                ),
+            );
+        }
+        Self::new(
+            sorted_resources,
+            plan,
+            schemas,
+            planned_secret_hashes,
+            Arc::new(provider),
+        )
+    }
+
     pub(crate) fn build_state(
         &self,
         state: StateFile,
         result: &ExecutionResult<S>,
     ) -> Result<StateFile, AppError> {
-        build_state_after_apply(
+        build_state_after_apply_with_provider(
             ApplyStateSave {
                 state_file: state,
                 sorted_resources: &self.sorted_resources,
@@ -198,6 +250,7 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
                 schemas: &self.schemas,
             },
             self.planned_secret_hashes.as_ref(),
+            self.provider.as_ref(),
         )
     }
 }
@@ -1365,9 +1418,83 @@ fn decompose_with_moved_origins<'a, S>(
     Ok(wb)
 }
 
+#[cfg(test)]
 pub(crate) fn build_state_after_apply<S: Clone>(
     save: ApplyStateSave<'_, S>,
     planned_secret_hashes: Option<&HashMap<ResourceId, PersistedAttributes>>,
+) -> Result<StateFile, AppError> {
+    let ApplyStateSave {
+        state_file,
+        sorted_resources,
+        runtime_synthesized_resources,
+        managed_current,
+        applied_states,
+        plan,
+        successfully_deleted,
+        failed_refreshes,
+        schemas,
+    } = save;
+    let resources = sorted_resources
+        .iter()
+        .chain(runtime_synthesized_resources.iter())
+        .collect::<Vec<_>>();
+    let mut complete_schemas = schemas.clone();
+    let missing_schemas = resources
+        .iter()
+        .copied()
+        .filter(|resource| complete_schemas.get_for(resource).is_none())
+        .map(|resource| {
+            (
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    for (owner, resource_type) in missing_schemas {
+        complete_schemas.insert(
+            owner,
+            ResourceSchema::new(resource_type)
+                .validate()
+                .expect("empty test schema must validate"),
+        );
+    }
+
+    let routes = resources
+        .iter()
+        .map(|resource| carina_core::provider::ProviderInstanceKey::from(&resource.id))
+        .collect::<BTreeSet<_>>();
+    let mut provider = ProviderRouter::new();
+    for route in routes {
+        provider.add_provider_instance(
+            route,
+            carina_core::provider::InitializedProvider::new(
+                Box::new(carina_provider_mock::MockProvider::new()),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ),
+        );
+    }
+
+    build_state_after_apply_with_provider(
+        ApplyStateSave {
+            state_file,
+            sorted_resources,
+            runtime_synthesized_resources,
+            managed_current,
+            applied_states,
+            plan,
+            successfully_deleted,
+            failed_refreshes,
+            schemas: &complete_schemas,
+        },
+        planned_secret_hashes,
+        &provider,
+    )
+}
+
+pub(crate) fn build_state_after_apply_with_provider<S: Clone>(
+    save: ApplyStateSave<'_, S>,
+    planned_secret_hashes: Option<&HashMap<ResourceId, PersistedAttributes>>,
+    provider: &ProviderRouter,
 ) -> Result<StateFile, AppError> {
     let ApplyStateSave {
         state_file,
@@ -1402,9 +1529,15 @@ pub(crate) fn build_state_after_apply<S: Clone>(
         let resource = planned.resource;
         let existing = moved_origins.find_persisted_row(&state, id);
         let preferred_hashes = planned_secret_hashes.and_then(|hashes| hashes.get(id));
-        let schema = schemas
-            .get_for(resource)
-            .map(|schema| schema.schema().as_schema());
+        let owner_schema = schemas.get_for(resource).ok_or_else(|| {
+            AppError::Provider(ProviderError::internal(format!(
+                "missing managed resource schema while writing state for `{id}`"
+            )))
+        })?;
+        let comparison = provider
+            .comparison_context_for(&resource.id, owner_schema)
+            .map_err(AppError::Provider)?;
+        let schema = Some(owner_schema.schema().as_schema());
         let mut resource_state = match &planned.source {
             UpsertSource::Complete { state, request } => {
                 ResourceState::from_provider_state_for_resource_and_schema(
@@ -1414,6 +1547,7 @@ pub(crate) fn build_state_after_apply<S: Clone>(
                     schema,
                     RowBasis::Applied(request),
                     preferred_hashes,
+                    &comparison,
                 )
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
             }
@@ -1428,6 +1562,7 @@ pub(crate) fn build_state_after_apply<S: Clone>(
                     schema,
                     RowBasis::Imported,
                     preferred_hashes,
+                    &comparison,
                 )
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
             }
@@ -1439,6 +1574,7 @@ pub(crate) fn build_state_after_apply<S: Clone>(
                     schema,
                     RowBasis::Carried,
                     preferred_hashes,
+                    &comparison,
                 )
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
             }
@@ -1448,13 +1584,19 @@ pub(crate) fn build_state_after_apply<S: Clone>(
                 existing,
                 schema,
                 preferred_hashes,
+                &comparison,
             )
             .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?,
             UpsertSource::CreateInFlight(pending)
-            | UpsertSource::CurrentCreateInFlight(pending) => {
-                ResourceState::from_in_flight(resource, pending, existing, schema, preferred_hashes)
-                    .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
-            }
+            | UpsertSource::CurrentCreateInFlight(pending) => ResourceState::from_in_flight(
+                resource,
+                pending,
+                existing,
+                schema,
+                preferred_hashes,
+                &comparison,
+            )
+            .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?,
         };
         if planned.source.records_name_overrides()
             && let Some(overrides) = permanent_name_overrides.get(id)
@@ -3686,9 +3828,15 @@ mod apply_state_save_tests {
             None,
             carina_core::provider::Sent::AllRequestAttributes,
         );
-        let mut existing =
-            ResourceState::from_in_flight(&resolved_resource, &fresh, None, None, None)
-                .expect("fresh continuation must encode");
+        let mut existing = ResourceState::from_in_flight(
+            &resolved_resource,
+            &fresh,
+            None,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        )
+        .expect("fresh continuation must encode");
         existing.explicit = ExplicitFields::Unrecorded;
 
         let mut state = StateFile::new();
@@ -3700,9 +3848,15 @@ mod apply_state_save_tests {
         };
         let repended = crate::fixture_repend_in_flight_create(loaded, "second-token");
 
-        let seeded_without_prior =
-            ResourceState::from_in_flight(&resolved_resource, &repended, None, None, None)
-                .expect("persisted re-pend without a prior row must encode");
+        let seeded_without_prior = ResourceState::from_in_flight(
+            &resolved_resource,
+            &repended,
+            None,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        )
+        .expect("persisted re-pend without a prior row must encode");
         assert_eq!(
             seeded_without_prior.explicit,
             ExplicitFields::Struct {
@@ -3716,6 +3870,7 @@ mod apply_state_save_tests {
             Some(&existing),
             None,
             None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
         )
         .expect("persisted re-pend must encode");
         assert_eq!(
@@ -3749,9 +3904,15 @@ mod apply_state_save_tests {
             None,
             carina_core::provider::Sent::AllRequestAttributes,
         );
-        let source_row =
-            ResourceState::from_in_flight(&source_resource, &source_pending, None, None, None)
-                .expect("source continuation must encode");
+        let source_row = ResourceState::from_in_flight(
+            &source_resource,
+            &source_pending,
+            None,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        )
+        .expect("source continuation must encode");
         let mut initial = StateFile::new();
         initial
             .upsert_resource(source_row)
@@ -3771,6 +3932,7 @@ mod apply_state_save_tests {
             None,
             None,
             None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
         )
         .expect("destination continuation must encode");
         let mut destination_state = StateFile::new();

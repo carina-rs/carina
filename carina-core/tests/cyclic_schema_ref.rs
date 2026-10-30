@@ -25,6 +25,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use carina_core::differ::{Diff, diff};
+use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
 use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry, StructField,
@@ -158,6 +159,27 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
     let current = State::existing(id.clone(), current_attrs);
     let saved = carina_core::provider::RawSavedAttrs::default()
         .lift(&carina_core::schema::SchemaRegistry::new());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        schema
+            .clone()
+            .validate()
+            .expect("comparison owner schema is valid"),
+    );
+    let mut providers = ProviderRouter::new();
+    providers.add_provider(
+        String::new(),
+        InitializedProvider::new(Box::new(ProviderRouter::new()), ReferenceScope::Unavailable),
+    );
+    let comparison = providers
+        .comparison_context_for(
+            &id,
+            schemas
+                .get("", "wafv2.WebACL", SchemaKind::Resource)
+                .expect("comparison owner schema is registered"),
+        )
+        .expect("comparison provider route is initialized");
 
     let d = diff(
         &ResolvedResource::new(desired),
@@ -165,6 +187,7 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
         &saved,
         None,
         Some(&schema),
+        &comparison,
     );
     assert!(
         matches!(d, Diff::NoChange(_)),
@@ -192,6 +215,27 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
     let current = State::existing(id.clone(), current_attrs);
     let saved = carina_core::provider::RawSavedAttrs::default()
         .lift(&carina_core::schema::SchemaRegistry::new());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        schema
+            .clone()
+            .validate()
+            .expect("comparison owner schema is valid"),
+    );
+    let mut providers = ProviderRouter::new();
+    providers.add_provider(
+        String::new(),
+        InitializedProvider::new(Box::new(ProviderRouter::new()), ReferenceScope::Unavailable),
+    );
+    let comparison = providers
+        .comparison_context_for(
+            &id,
+            schemas
+                .get("", "wafv2.WebACL", SchemaKind::Resource)
+                .expect("comparison owner schema is registered"),
+        )
+        .expect("comparison provider route is initialized");
 
     let d = diff(
         &ResolvedResource::new(desired),
@@ -199,6 +243,7 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
         &saved,
         None,
         Some(&schema),
+        &comparison,
     );
     match d {
         Diff::Update {

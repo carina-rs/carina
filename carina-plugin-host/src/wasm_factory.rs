@@ -32,11 +32,11 @@ use carina_core::effect::PlanOp;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CanonicalCustomTypeValue,
     CanonicalProviderConfigAttributes, CreateAttempt, CreateFailure, CreateOutcome, CreateRequest,
-    DeleteRequest, Observation, PendingCreate as CorePendingCreate, Poll as CorePoll, Provider,
-    ProviderError, ProviderFactory, ProviderNormalizer, ProviderReadyConfig, ProviderResult,
-    ReadOutcome, ReadRequest, ResentPendingCreate, ResentPoll as CoreResentPoll,
-    Resume as CoreResume, ResumeCreateRequest, ResumeFailure, ResumeOutcome, SavedAttrs, Sent,
-    UpdateOutcome, UpdateRequest,
+    DeleteRequest, InitializedProvider, Observation, PendingCreate as CorePendingCreate,
+    Poll as CorePoll, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
+    ProviderReadyConfig, ProviderResult, ReadOutcome, ReadRequest, ResentPendingCreate,
+    ResentPoll as CoreResentPoll, Resume as CoreResume, ResumeCreateRequest, ResumeFailure,
+    ResumeOutcome, SavedAttrs, Sent, UpdateOutcome, UpdateRequest,
 };
 #[cfg(test)]
 use carina_core::provider::{
@@ -4228,7 +4228,7 @@ impl ProviderFactory for WasmProviderFactory {
         &self,
         binding: Option<&str>,
         config: &ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
         let attrs = config.attributes().clone();
         let binding = binding.map(|s| s.to_string());
         Box::pin(async move {
@@ -4242,12 +4242,14 @@ impl ProviderFactory for WasmProviderFactory {
                     error.into_provider_error_with(&self.instantiation_error_mapper)
                 })?;
             let reference_scope = instance.reference_scope().clone();
-            Ok(Box::new(WasmProvider {
-                instance,
-                name: self.configured.label.name.clone(),
-                schema_witness: Arc::clone(&self.schema_witness),
-                _reference_scope: reference_scope,
-            }) as Box<dyn Provider>)
+            Ok(InitializedProvider::new(
+                Box::new(WasmProvider {
+                    instance,
+                    name: self.configured.label.name.clone(),
+                    schema_witness: Arc::clone(&self.schema_witness),
+                }),
+                reference_scope,
+            ))
         })
     }
 
@@ -4284,7 +4286,6 @@ pub struct WasmProvider {
     instance: Arc<FailFastInstance>,
     name: String,
     schema_witness: Arc<ValidatedProviderSchemaWitness>,
-    _reference_scope: proto::ReferenceScope,
 }
 
 struct PendingCreate {
