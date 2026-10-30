@@ -47,7 +47,7 @@ carinaには、「今はまだ決まっていない」を表す形がいくつ�
 #4093で`TypeExpr::Unknown`を削除しました。`TypeExpr`は検査できる型だけを表します。以前の3つの用途は、次の型に分かれました。
 
 - exportの推論結果は`ExportStaticType`が宣言型と推論型を区別し、`InferredUncheckedReason`が推論失敗と推論できない理由を保持します。
-- 利用側で名前を解決できない型は`UnnameableInConsumer`が元の型と`TypeResolutionError`を保持します。
+- 利用側で名前を解決できない型は`UnnameableInConsumer`が元の型と`StaticTypeResolutionError`を保持します。
 - iterableの外形だけが分かる場合は`DeferredIterableShape`が`List`と`Map`を表します。
 
 `InferenceFailed`はvalidate、plan、applyで同じ診断になります。`NotInferable`と`UnnameableInConsumer`は型を比較せず、参照先の存在だけを確かめます。

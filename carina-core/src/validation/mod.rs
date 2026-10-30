@@ -4241,14 +4241,12 @@ fn resolve_file_type_exprs_impl<E: crate::parser::ExportParamLike>(
 
 /// Resolve a signature snapshot when the consumer's provider catalog may be
 /// incomplete. The snapshot does not own diagnostics, so a resolution failure
-/// retains the authored declaration for the later authoritative module load.
+/// retains its typed unchecked reason for the later authoritative module load.
 pub fn resolve_consumer_static_type_for_signature(
     type_expr: &TypeExpr,
     config: &ProviderContext,
 ) -> ConsumerStaticType {
-    StaticType::Known(
-        resolve_type_expr(type_expr, config).unwrap_or_else(|_error| type_expr.clone()),
-    )
+    resolve_consumer_static_type(type_expr, config)
 }
 
 /// Resolve every module-boundary type declaration in place. Diagnostics
@@ -5456,39 +5454,47 @@ impl ModuleCallChecker<'_> {
                 continue;
             }
 
-            let Some(parameter_type) = parameter.static_type.known() else {
-                continue;
-            };
-            let resolved_parameter =
-                match resolve_parameter_type_for_check(parameter_type, self.provider_context) {
-                    Ok(Some(resolved_parameter)) => resolved_parameter,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        let source_file = authored_call.id().source_file();
-                        let line = authored.value_span().start_line();
-                        let anchor = module_call_anchor(authored_call.id(), authored.key_span());
-                        let diagnostic = TypeResolutionDiagnostic::description(
-                            format!(
-                                "module {} argument '{}' in {} at line {line}",
-                                authored_call.module_name,
-                                argument,
-                                source_file.display(),
-                            ),
-                            error.into(),
-                            Some(TypeResolutionSource::new(
-                                anchor.source_file.clone(),
-                                anchor.span,
-                            )),
-                        );
-                        self.push(
-                            ModuleCallFindingKind::TypeResolution,
-                            owner.clone(),
-                            anchor,
-                            ModuleCallFindingMessage::TypeResolution(Box::new(diagnostic)),
-                        );
-                        continue;
+            let parameter_resolution = match &parameter.static_type {
+                StaticType::Known(parameter_type) => {
+                    resolve_parameter_type_for_check(parameter_type, self.provider_context)
+                }
+                StaticType::Unchecked(reason) => {
+                    if self.provider_context.custom_types_loaded() {
+                        Err(reason.resolution_error.clone())
+                    } else {
+                        Ok(None)
                     }
-                };
+                }
+            };
+            let resolved_parameter = match parameter_resolution {
+                Ok(Some(resolved_parameter)) => resolved_parameter,
+                Ok(None) => continue,
+                Err(error) => {
+                    let source_file = authored_call.id().source_file();
+                    let line = authored.value_span().start_line();
+                    let anchor = module_call_anchor(authored_call.id(), authored.key_span());
+                    let diagnostic = TypeResolutionDiagnostic::description(
+                        format!(
+                            "module {} argument '{}' in {} at line {line}",
+                            authored_call.module_name,
+                            argument,
+                            source_file.display(),
+                        ),
+                        error.into(),
+                        Some(TypeResolutionSource::new(
+                            anchor.source_file.clone(),
+                            anchor.span,
+                        )),
+                    );
+                    self.push(
+                        ModuleCallFindingKind::TypeResolution,
+                        owner.clone(),
+                        anchor,
+                        ModuleCallFindingMessage::TypeResolution(Box::new(diagnostic)),
+                    );
+                    continue;
+                }
+            };
             let semantic_argument = semantic_call.and_then(|call| call.argument(argument));
             let argument_value = semantic_argument.unwrap_or_else(|| authored.argument());
             if let Some(handle) = argument_value.handle() {

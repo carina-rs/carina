@@ -2350,8 +2350,62 @@ fn upstream_state_dot_completion_keeps_consumer_unnameable_export_discoverable()
     let export = find_completion(&completions, "vpc_id");
     let detail = export.detail.as_deref().unwrap_or_default();
     assert!(
-        detail.contains("up") && !detail.contains("VpcId"),
-        "unnameable consumer type must fall back to existence-only detail: {detail:?}",
+        detail.contains("up")
+            && detail.contains("awscc.ec2.VpcId")
+            && detail.contains("declared type unavailable in consumer"),
+        "unnameable consumer type must retain its authored display type: {detail:?}",
+    );
+}
+
+#[test]
+fn upstream_state_dot_completion_detail_distinguishes_static_type_states() {
+    let provider = test_provider();
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("parent");
+    let upstream = tmp.path().join("upstream");
+    let downstream = tmp.path().join("downstream");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::create_dir_all(&upstream).unwrap();
+    std::fs::create_dir_all(&downstream).unwrap();
+    std::fs::write(parent.join("main.crn"), "exports { y: String = 'y' }\n").unwrap();
+    std::fs::write(
+        upstream.join("main.crn"),
+        "let parent = upstream_state { source = '../parent' }\n\
+         exports {\n\
+           known: String = 'known'\n\
+           unnameable: awscc.ec2.VpcId = 'vpc-1'\n\
+           not_inferable = parent.y\n\
+           inference_failed = [1, 'a']\n\
+         }\n",
+    )
+    .unwrap();
+    let source = "let up = upstream_state { source = '../upstream' }\nlet value = up.\n";
+    std::fs::write(downstream.join("main.crn"), source).unwrap();
+    let position = Position {
+        line: 1,
+        character: "let value = up.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&create_document(source), position, Some(&downstream));
+    let detail = |label| {
+        find_completion(&completions, label)
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+    };
+
+    assert_eq!(detail("known"), "export from upstream_state `up`: String",);
+    assert_eq!(
+        detail("unnameable"),
+        "export from upstream_state `up`: awscc.ec2.VpcId (declared type unavailable in consumer)",
+    );
+    assert_eq!(
+        detail("not_inferable"),
+        "export from upstream_state `up` (type not inferable: binding `parent` is not inferable in this context)",
+    );
+    assert_eq!(
+        detail("inference_failed"),
+        "export from upstream_state `up` (upstream export type inference failed: collection element types disagree: `Int` vs `String`)",
     );
 }
 
@@ -2383,6 +2437,28 @@ fn upstream_state_depth2_dot_completion_lists_struct_fields() {
         labels.contains(&"name") && labels.contains(&"region"),
         "expected struct fields `name` and `region` in completions, got: {:?}",
         labels
+    );
+}
+
+#[test]
+fn upstream_state_depth2_dot_completion_preserves_struct_with_unnameable_leaf() {
+    let provider = test_provider();
+    let (_tmp, base) = set_up_upstream_project(
+        "exports {\n  net: struct { vpc: awscc.ec2.VpcId, name: String } = { vpc = 'vpc-1', name = 'main' }\n}\n",
+        "let up = upstream_state { source = '../organizations' }\nlet x = up.net.\n",
+    );
+    let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
+    let position = Position {
+        line: 1,
+        character: "let x = up.net.".chars().count() as u32,
+    };
+
+    let completions = provider.complete(&create_document(&main_src), position, Some(&base));
+    let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"vpc") && labels.contains(&"name"),
+        "the authored struct shape must remain available when one leaf is unnameable: {labels:?}",
     );
 }
 

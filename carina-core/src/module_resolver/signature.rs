@@ -20,10 +20,10 @@ pub struct ResolvedModuleSignature {
 /// Imported module alias to its resolved argument/output signature.
 pub type ResolvedModuleSignatures = HashMap<String, ResolvedModuleSignature>;
 
-// This snapshot loader does not own diagnostics. It keeps an unresolved type
-// when best-effort resolution fails; the strict module load later rejects
-// genuinely invalid authored declarations before expansion. The end-to-end
-// guarantee is pinned by
+// This snapshot loader does not own diagnostics. It keeps a typed unchecked
+// reason when consumer-side resolution fails; the strict module load later
+// rejects genuinely invalid authored declarations before expansion. The
+// end-to-end guarantee is pinned by
 // `carina-cli/tests/validate_unknown_custom_type_e2e.rs`.
 pub(super) fn resolved_signature(
     parsed: &ParsedFile,

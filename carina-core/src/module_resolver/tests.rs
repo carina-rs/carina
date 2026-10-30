@@ -7222,13 +7222,17 @@ fn resolved_module_signature_preserves_unresolvable_attribute_type_for_best_effo
     assert!(
         matches!(
             static_type,
-            crate::static_type::StaticType::Known(type_expr)
-                if *type_expr
+            crate::static_type::StaticType::Unchecked(reason)
+                if reason.original
                     == TypeExpr::DottedUnresolved(ResourceTypePath::new(
                         "missing",
                         "types.Identifier",
                     ))
+                    && matches!(
+                        reason.resolution_error,
+                        crate::static_type::StaticTypeResolutionError::UnknownCustomType { .. }
+                    )
         ),
-        "best-effort module signature must retain the authored type: {static_type:?}",
+        "best-effort module signature must retain the typed unchecked reason: {static_type:?}",
     );
 }

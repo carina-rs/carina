@@ -3709,6 +3709,62 @@ fn check_module_calls_reports_parameter_type_resolution_errors() {
 }
 
 #[test]
+fn check_module_calls_reports_unnameable_signature_type_resolution_errors() {
+    use crate::parser::ArgumentParameter;
+
+    let mut parsed = empty_parsed();
+    parsed.module_calls = vec![ModuleCall::test(
+        "child",
+        Some("instance".to_string()),
+        module_arguments([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("input".into())),
+        )]),
+    )];
+    let unresolved =
+        TypeExpr::DottedUnresolved(crate::parser::ResourceTypePath::new("aws", "missing.Type"));
+    let provider_context = context_with_known_custom_types(HashSet::new());
+    let static_type = resolve_consumer_static_type_for_signature(&unresolved, &provider_context);
+    assert!(
+        matches!(
+            &static_type,
+            crate::static_type::StaticType::Unchecked(reason)
+                if reason.original == unresolved
+                    && matches!(
+                        reason.resolution_error,
+                        crate::static_type::StaticTypeResolutionError::UnknownCustomType { .. }
+                    )
+        ),
+        "an unresolved consumer signature must be typed as unchecked: {static_type:?}",
+    );
+    let signatures = HashMap::from([(
+        "child".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "value".to_string(),
+                static_type,
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+
+    let findings = module_call_findings_for_test(&parsed, &signatures, &provider_context);
+
+    assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
+    assert!(
+        findings[0]
+            .message()
+            .to_string()
+            .contains("unknown custom type 'aws.missing.Type'"),
+        "the typed unchecked reason must remain a module-call finding: {findings:#?}",
+    );
+}
+
+#[test]
 fn check_module_calls_reports_nested_file_type_resolution_errors() {
     let fixture = tempfile::tempdir().expect("nested type-resolution fixture");
     let child = fixture.path().join("child");

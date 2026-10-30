@@ -10,7 +10,11 @@ use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
 use carina_core::resource::EnumValueResolver;
 use carina_core::schema::{AttributeType, Shape, TypeIdentity, TypeInSchema};
-use carina_core::upstream_exports::UpstreamExportEntry;
+use carina_core::static_type::{
+    ConsumerExportStaticType, ConsumerInferredUncheckedReason, InferenceError, NotInferableReason,
+    StaticType,
+};
+use carina_core::upstream_exports::{UpstreamExportEntry, UpstreamExportType};
 
 use super::{AttributeValueTarget, CompletionProvider, DslSource};
 
@@ -19,8 +23,165 @@ const UPSTREAM_SOURCE_MAX_UP: usize = 6;
 /// Safety cap on the number of suggestions returned.
 const UPSTREAM_SOURCE_MAX_ITEMS: usize = 100;
 
-fn upstream_completion_static_type(entry: &UpstreamExportEntry) -> Option<&TypeExpr> {
-    entry.static_type.known()
+#[derive(Clone, Copy)]
+enum UpstreamCompletionStaticType<'a> {
+    Known(&'a TypeExpr),
+    DeclaredUnnameable(&'a TypeExpr),
+    InferredUnnameable(&'a TypeExpr),
+    NotInferable(&'a NotInferableReason),
+    InferenceFailed(&'a InferenceError),
+    InferenceNotRun,
+}
+
+#[derive(Clone, Copy)]
+enum StructuralTypeForCompletion<T> {
+    Known(T),
+    Unnameable(T),
+}
+
+impl<T> StructuralTypeForCompletion<T> {
+    fn map<U>(self, map_type: impl FnOnce(T) -> U) -> StructuralTypeForCompletion<U> {
+        match self {
+            Self::Known(type_expr) => StructuralTypeForCompletion::Known(map_type(type_expr)),
+            Self::Unnameable(type_expr) => {
+                StructuralTypeForCompletion::Unnameable(map_type(type_expr))
+            }
+        }
+    }
+}
+
+impl<'a> StructuralTypeForCompletion<&'a TypeExpr> {
+    fn type_expr(self) -> &'a TypeExpr {
+        match self {
+            Self::Known(type_expr) | Self::Unnameable(type_expr) => type_expr,
+        }
+    }
+}
+
+impl StructuralTypeForCompletion<TypeExpr> {
+    fn is_candidate_for_target(
+        &self,
+        target: &AttributeType,
+        target_defs: &std::collections::BTreeMap<String, AttributeType>,
+    ) -> bool {
+        match self {
+            Self::Known(type_expr) => {
+                type_expr_source_is_assignable_to(type_expr, target, target_defs)
+            }
+            Self::Unnameable(_type_expr) => true,
+        }
+    }
+}
+
+/// Preserve an export's authored container shape for completion while keeping
+/// unchecked consumer types distinct from types that are safe to compare.
+fn structural_type_for_completion(entry: &UpstreamExportEntry) -> UpstreamCompletionStaticType<'_> {
+    match &entry.static_type {
+        UpstreamExportType::Static(ConsumerExportStaticType::Declared(StaticType::Known(
+            type_expr,
+        )))
+        | UpstreamExportType::Static(ConsumerExportStaticType::Inferred(StaticType::Known(
+            type_expr,
+        ))) => UpstreamCompletionStaticType::Known(type_expr),
+        UpstreamExportType::Static(ConsumerExportStaticType::Declared(StaticType::Unchecked(
+            reason,
+        ))) => UpstreamCompletionStaticType::DeclaredUnnameable(&reason.original),
+        UpstreamExportType::Static(ConsumerExportStaticType::Inferred(StaticType::Unchecked(
+            ConsumerInferredUncheckedReason::UnnameableInConsumer(reason),
+        ))) => UpstreamCompletionStaticType::InferredUnnameable(&reason.original),
+        UpstreamExportType::Static(ConsumerExportStaticType::Inferred(StaticType::Unchecked(
+            ConsumerInferredUncheckedReason::NotInferable(reason),
+        ))) => UpstreamCompletionStaticType::NotInferable(reason),
+        UpstreamExportType::Static(ConsumerExportStaticType::Inferred(StaticType::Unchecked(
+            ConsumerInferredUncheckedReason::InferenceFailed(error),
+        ))) => UpstreamCompletionStaticType::InferenceFailed(error),
+        UpstreamExportType::InferenceNotRun => UpstreamCompletionStaticType::InferenceNotRun,
+    }
+}
+
+impl<'a> UpstreamCompletionStaticType<'a> {
+    fn structural_type(self) -> Option<StructuralTypeForCompletion<&'a TypeExpr>> {
+        match self {
+            Self::Known(type_expr) => Some(StructuralTypeForCompletion::Known(type_expr)),
+            Self::DeclaredUnnameable(type_expr) | Self::InferredUnnameable(type_expr) => {
+                Some(StructuralTypeForCompletion::Unnameable(type_expr))
+            }
+            Self::NotInferable(_reason) => None,
+            Self::InferenceFailed(_error) => None,
+            Self::InferenceNotRun => None,
+        }
+    }
+
+    /// Unnameable types are unchecked at the consumer boundary, so they are
+    /// eligible completion candidates without comparing their authored form.
+    fn is_candidate_for_target(
+        self,
+        target: &AttributeType,
+        target_defs: &std::collections::BTreeMap<String, AttributeType>,
+    ) -> bool {
+        match self {
+            Self::Known(type_expr) => {
+                type_expr_source_is_assignable_to(type_expr, target, target_defs)
+            }
+            Self::DeclaredUnnameable(_type_expr) | Self::InferredUnnameable(_type_expr) => true,
+            Self::NotInferable(_reason) => false,
+            Self::InferenceFailed(_error) => false,
+            Self::InferenceNotRun => false,
+        }
+    }
+
+    fn dot_detail(self, binding: &str) -> String {
+        match self {
+            Self::Known(type_expr) => {
+                format!("export from upstream_state `{binding}`: {type_expr}")
+            }
+            Self::DeclaredUnnameable(type_expr) => format!(
+                "export from upstream_state `{binding}`: {type_expr} \
+                 (declared type unavailable in consumer)"
+            ),
+            Self::InferredUnnameable(type_expr) => format!(
+                "export from upstream_state `{binding}`: {type_expr} \
+                 (inferred type unavailable in consumer)"
+            ),
+            Self::NotInferable(reason) => {
+                format!("export from upstream_state `{binding}` (type not inferable: {reason})")
+            }
+            Self::InferenceFailed(error) => format!(
+                "export from upstream_state `{binding}` \
+                 (upstream export type inference failed: {error})"
+            ),
+            Self::InferenceNotRun => format!("export from upstream_state `{binding}`"),
+        }
+    }
+
+    fn reference_detail(
+        self,
+        binding: &str,
+        format_type: impl FnOnce(&TypeExpr) -> String,
+    ) -> String {
+        match self {
+            Self::Known(type_expr) => format!(
+                "export from upstream_state `{binding}` ({})",
+                format_type(type_expr)
+            ),
+            Self::DeclaredUnnameable(type_expr) => format!(
+                "export from upstream_state `{binding}` ({type_expr}; \
+                 declared type unavailable in consumer)"
+            ),
+            Self::InferredUnnameable(type_expr) => format!(
+                "export from upstream_state `{binding}` ({type_expr}; \
+                 inferred type unavailable in consumer)"
+            ),
+            Self::NotInferable(reason) => {
+                format!("export from upstream_state `{binding}` (type not inferable: {reason})")
+            }
+            Self::InferenceFailed(error) => format!(
+                "export from upstream_state `{binding}` \
+                 (upstream export type inference failed: {error})"
+            ),
+            Self::InferenceNotRun => format!("export from upstream_state `{binding}`"),
+        }
+    }
 }
 
 /// Treat non-liftable boundary declarations as unchecked; otherwise compare
@@ -276,25 +437,19 @@ impl CompletionProvider {
                     &mut exports_cache,
                 );
                 for (export_name, entry) in exports {
-                    let Some(export_type) = upstream_completion_static_type(entry) else {
-                        continue;
-                    };
-                    if !type_expr_source_is_assignable_to(
-                        export_type,
-                        attr_schema.attr_type(),
-                        schema.as_schema().defs(),
-                    ) {
+                    let completion_type = structural_type_for_completion(entry);
+                    if !completion_type
+                        .is_candidate_for_target(attr_schema.attr_type(), schema.as_schema().defs())
+                    {
                         continue;
                     }
                     let full_ref = format!("{}.{}", binding, export_name);
                     completions.push(CompletionItem {
                         label: full_ref.clone(),
                         kind: Some(CompletionItemKind::REFERENCE),
-                        detail: Some(format!(
-                            "export from upstream_state `{}` ({})",
-                            binding,
-                            self.format_type_expr(export_type)
-                        )),
+                        detail: Some(completion_type.reference_detail(binding, |type_expr| {
+                            self.format_type_expr(type_expr)
+                        })),
                         text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                             range: ref_edit_range,
                             new_text: full_ref,
@@ -383,7 +538,7 @@ impl CompletionProvider {
                     &self.schemas,
                     &mut exports_cache,
                 )
-                && !type_expr_source_is_assignable_to(&element_type, attr_type, target_defs)
+                && !element_type.is_candidate_for_target(attr_type, target_defs)
             {
                 continue;
             }
@@ -1116,14 +1271,7 @@ impl CompletionProvider {
             .map(|(key, entry)| CompletionItem {
                 label: key.clone(),
                 kind: Some(CompletionItemKind::FIELD),
-                detail: Some(match upstream_completion_static_type(entry) {
-                    Some(type_expr) => {
-                        format!("export from upstream_state `{binding}`: {type_expr}")
-                    }
-                    None => {
-                        format!("export from upstream_state `{binding}`")
-                    }
-                }),
+                detail: Some(structural_type_for_completion(entry).dot_detail(binding)),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range,
                     new_text: key.clone(),
@@ -1161,9 +1309,10 @@ impl CompletionProvider {
         let Some(entry) = keys.get(key) else {
             return Vec::new();
         };
-        let Some(type_expr) = upstream_completion_static_type(entry) else {
+        let Some(structural_type) = structural_type_for_completion(entry).structural_type() else {
             return Vec::new();
         };
+        let type_expr = structural_type.type_expr();
         let partial_chars = partial.chars().count() as u32;
         let range = Range {
             start: Position {
@@ -1483,21 +1632,19 @@ impl CompletionProvider {
                 &mut exports_cache,
             );
             for (export_name, entry) in exports {
-                let Some(export_type) = upstream_completion_static_type(entry) else {
-                    continue;
-                };
-                if !type_expr_source_is_assignable_to(export_type, target, target_defs) {
+                let completion_type = structural_type_for_completion(entry);
+                if !completion_type.is_candidate_for_target(target, target_defs) {
                     continue;
                 }
                 let full_ref = format!("{}.{}", binding, export_name);
                 items.push(CompletionItem {
                     label: full_ref.clone(),
                     kind: Some(CompletionItemKind::REFERENCE),
-                    detail: Some(format!(
-                        "export from upstream_state `{}` ({})",
-                        binding,
-                        self.format_type_expr(export_type)
-                    )),
+                    detail: Some(
+                        completion_type.reference_detail(binding, |type_expr| {
+                            self.format_type_expr(type_expr)
+                        }),
+                    ),
                     insert_text: Some(full_ref),
                     ..Default::default()
                 });
@@ -2023,7 +2170,7 @@ fn infer_for_binding_type(
         String,
         carina_core::upstream_exports::UpstreamExportEntries,
     >,
-) -> Option<carina_core::parser::TypeExpr> {
+) -> Option<StructuralTypeForCompletion<carina_core::parser::TypeExpr>> {
     use super::top_level::ForBindingSlot;
     use carina_core::parser::TypeExpr;
 
@@ -2049,17 +2196,18 @@ fn infer_for_binding_type(
             // don't pay a deep `Value` clone on the per-keystroke path.
             resolved.remove(&iterable.binding).unwrap_or_default()
         });
-    let export_type = upstream_completion_static_type(exports.get(&iterable.export)?)?;
+    let export_type =
+        structural_type_for_completion(exports.get(&iterable.export)?).structural_type()?;
 
-    match (export_type, binding.slot) {
+    let projected = match (export_type.type_expr(), binding.slot) {
         (TypeExpr::List(inner), ForBindingSlot::Value | ForBindingSlot::PairValue) => {
-            Some((**inner).clone())
+            (**inner).clone()
         }
-        (TypeExpr::List(_), ForBindingSlot::PairKey) => Some(TypeExpr::Int),
+        (TypeExpr::List(_), ForBindingSlot::PairKey) => TypeExpr::Int,
         (TypeExpr::Map(inner), ForBindingSlot::Value | ForBindingSlot::PairValue) => {
-            Some((**inner).clone())
+            (**inner).clone()
         }
-        (TypeExpr::Map(_), ForBindingSlot::PairKey) => Some(TypeExpr::String),
+        (TypeExpr::Map(_), ForBindingSlot::PairKey) => TypeExpr::String,
         // Iterating a struct binds each field as a (name, value) pair,
         // matching the runtime's map-iteration semantics. Field types
         // may differ, so we only surface a value type when all fields
@@ -2068,12 +2216,12 @@ fn infer_for_binding_type(
             let mut iter = fields.iter().map(|(_, ty)| ty);
             let first = iter.next()?;
             if iter.all(|ty| ty == first) {
-                Some(first.clone())
+                first.clone()
             } else {
-                None
+                return None;
             }
         }
-        (TypeExpr::Struct { .. }, ForBindingSlot::PairKey) => Some(TypeExpr::String),
+        (TypeExpr::Struct { .. }, ForBindingSlot::PairKey) => TypeExpr::String,
         (
             TypeExpr::String
             | TypeExpr::Bool
@@ -2087,8 +2235,10 @@ fn infer_for_binding_type(
             | TypeExpr::StringLiteral(_)
             | TypeExpr::Union(_),
             ForBindingSlot::Value | ForBindingSlot::PairKey | ForBindingSlot::PairValue,
-        ) => None,
-    }
+        ) => return None,
+    };
+
+    Some(export_type.map(|_type_expr| projected))
 }
 
 /// Decide whether a built-in's declared return type is assignable to the
