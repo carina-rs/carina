@@ -394,10 +394,8 @@ fn dispatch_fixture_create(
     let provider = FixtureCreateProvider {
         result: std::sync::Mutex::new(Some(result)),
     };
-    block_on_ready(carina_core::executor::dispatch_create(
-        &provider, id, request,
-    ))
-    .expect_err("fixture create returns a classified failure")
+    let (create, _cancellation) = carina_core::executor::dispatch_create(&provider, id, request);
+    block_on_ready(create).expect_err("fixture create returns a classified failure")
 }
 
 #[cfg(test)]
@@ -426,6 +424,9 @@ pub(crate) fn fixture_in_flight_create(
         } => panic!("pending fixture was classified created: {error}"),
         carina_core::provider::CreateFailureKind::Untracked(error) => {
             panic!("pending fixture was classified untracked: {error}")
+        }
+        carina_core::provider::CreateFailureKind::OutcomeUnknown { error, .. } => {
+            panic!("pending fixture was classified outcome unknown: {error}")
         }
     }
 }
@@ -503,6 +504,9 @@ pub(crate) fn fixture_observed_create(
         } => panic!("observed fixture remained pending: {error}"),
         carina_core::provider::CreateFailureKind::Untracked(error) => {
             panic!("observed fixture was classified untracked: {error}")
+        }
+        carina_core::provider::CreateFailureKind::OutcomeUnknown { error, .. } => {
+            panic!("observed fixture was classified outcome unknown: {error}")
         }
     }
 }

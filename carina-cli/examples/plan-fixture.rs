@@ -22,7 +22,7 @@ use carina_cli::DetailLevel;
 use carina_cli::display::{format_destroy_plan_with_delete_instances, print_plan};
 use carina_cli::fixture_plan::{
     build_fixture_plan_change_summary, build_plan_from_fixture_name_using,
-    delete_instance_attributes_from_plan,
+    delete_instance_attributes_from_plan, provider_router_for_plan,
 };
 use carina_cli::plan_image::{
     ImageTheme, PlanImageInput, PlanImageTarget, StateMetadata, parse_output_target,
@@ -196,14 +196,16 @@ fn main() -> ExitCode {
         );
     }
 
+    let provider = provider_router_for_plan(&fp.plan);
     if tui {
         if let Err(e) = carina_tui::run(
             &fp.plan,
             &fp.schemas,
             &historical_display,
             Some(&fp.prev_explicit),
+            &provider,
         ) {
-            eprintln!("TUI error: {}", e);
+            eprintln!("{}", carina_cli::error::format_error_with_source_chain(&e));
             return ExitCode::from(1);
         }
         fp.moved_hints.eprint();
@@ -211,12 +213,21 @@ fn main() -> ExitCode {
     }
 
     if destroy {
-        print!(
-            "{}",
-            format_destroy_plan_with_delete_instances(&fp.plan, detail, &historical_display)
-        );
+        let output = match format_destroy_plan_with_delete_instances(
+            &fp.plan,
+            detail,
+            &historical_display,
+            &provider,
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        print!("{output}");
     } else {
-        print_plan(
+        if let Err(error) = print_plan(
             &fp.plan,
             &summary,
             detail,
@@ -225,7 +236,11 @@ fn main() -> ExitCode {
             &fp.moved_origins,
             Some(&fp.prev_explicit),
             None,
-        );
+            &provider,
+        ) {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
     }
     fp.moved_hints.eprint();
 

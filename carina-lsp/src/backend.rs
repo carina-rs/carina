@@ -81,21 +81,17 @@ impl ProviderState {
         let mut provider_names: Vec<String> =
             factories.iter().map(|f| f.name().to_string()).collect();
         let mut known_provider_names = HashSet::new();
-        let supplemental_schemas = if use_builtin_mock {
+        let mut supplemental_schemas = SchemaRegistry::new();
+        if use_builtin_mock {
+            supplemental_schemas
+                .insert_provider_witness(
+                    carina_provider_mock::BUILTIN_PROVIDER_NAME,
+                    &carina_provider_mock::builtin_schema_witness(),
+                )
+                .expect("the built-in mock exposes one consistent schema witness");
             provider_names.push(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
             known_provider_names.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
-            carina_provider_mock::builtin_schemas()
-                .into_iter()
-                .map(|schema| {
-                    (
-                        carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string(),
-                        schema,
-                    )
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        }
         let region_completions: Vec<CompletionValue> = factories
             .iter()
             .flat_map(|f| f.config_completions().remove("region").unwrap_or_default())
@@ -906,7 +902,7 @@ fn should_reload_for_event(event: &FileEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::provider::{BoxFuture, Provider, ProviderResult};
+    use carina_core::provider::{BoxFuture, ProviderResult};
     use carina_core::resource::Value;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
     use indexmap::IndexMap;
@@ -943,8 +939,18 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async { unreachable!("formatting tests do not instantiate providers") })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {

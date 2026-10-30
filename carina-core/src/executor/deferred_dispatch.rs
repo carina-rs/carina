@@ -335,6 +335,7 @@ pub(super) fn report_deferred_create_failure<S>(
     ctx.observer.on_event(&ExecutionEvent::EffectFailed {
         effect,
         error: &message,
+        recovery: None,
         duration: Duration::ZERO,
         progress: ProgressInfo {
             completed: ctx.completed.load(Ordering::Relaxed),

@@ -20,10 +20,9 @@ use carina_core::schema::SchemaRegistry;
 
 use crate::DetailLevel;
 use crate::display::{
-    format_destroy_plan_with_delete_instances as format_destroy_plan,
-    format_plan_with_delete_instances,
+    format_destroy_plan_with_delete_instances, format_plan_with_delete_instances,
 };
-use crate::fixture_plan::{FixturePlan, build_plan_from_fixture_name};
+use crate::fixture_plan::{FixturePlan, build_plan_from_fixture_name, provider_router_for_plan};
 use crate::moved_hint::MovedBlockHint;
 use crate::plan_summary::PlanChangeSummary;
 
@@ -40,6 +39,7 @@ fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
 ) -> String {
     let summary = PlanChangeSummary::new(plan, export_changes, deferred_for_expressions);
+    let provider = provider_router_for_plan(plan);
     format_plan_with_delete_instances(
         plan,
         &summary,
@@ -49,7 +49,19 @@ fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
         moved_origins,
         prev_explicit,
         expansion_trace,
+        &provider,
     )
+    .expect("snapshot plan must have an initialized provider route")
+}
+
+fn format_destroy_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
+    plan: &Plan,
+    detail: DetailLevel,
+    historical_display: &D,
+) -> String {
+    let provider = provider_router_for_plan(plan);
+    format_destroy_plan_with_delete_instances(plan, detail, historical_display, &provider)
+        .expect("snapshot destroy plan must have an initialized provider route")
 }
 
 fn resolved(resource: Resource) -> ResolvedResource {
@@ -285,7 +297,11 @@ fn snapshot_resolved_value_constraint_multifile() {
         .plan
         .errors()
         .iter()
-        .map(ToString::to_string)
+        .map(|error| {
+            error
+                .display_with_project_dir(std::path::Path::new("."))
+                .to_string()
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -311,7 +327,9 @@ fn snapshot_module_constraint_plan_error() {
         }),
     );
 
-    let rendered = error.to_string();
+    let rendered = error
+        .display_with_project_dir(std::path::Path::new("."))
+        .to_string();
     assert_eq!(
         rendered,
         "module 'mod' (call 'c'): argument 'name': too long (got \"abcd\")"

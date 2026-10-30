@@ -10,7 +10,8 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use super::{
-    AllowListHttpHooks, HttpTestRoute, ProviderKind, ProviderLabel, build_sandboxed_wasi_ctx,
+    AllowListHttpHooks, CallEgressRecorder, HttpTestRoute, ProviderKind, ProviderLabel,
+    build_sandboxed_wasi_ctx,
 };
 
 /// Period between increments of the wasmtime engine epoch.
@@ -266,6 +267,20 @@ impl GuestStore {
         tokio::time::timeout(wall, async move { f(store).await })
             .await
             .map_err(|_elapsed| WallBudgetExceeded { wall })
+    }
+
+    pub(super) fn begin_create_call(&mut self, recorder: CallEgressRecorder) {
+        let active = &mut self.store.data_mut().http_hooks.call_egress;
+        assert!(active.is_none(), "guest calls cannot overlap on one store");
+        *active = Some(recorder);
+    }
+
+    pub(super) fn finish_create_call(&mut self) {
+        let active = &mut self.store.data_mut().http_hooks.call_egress;
+        assert!(
+            active.take().is_some(),
+            "a create call scope must be active"
+        );
     }
 
     #[cfg(any(test, feature = "test-utils"))]

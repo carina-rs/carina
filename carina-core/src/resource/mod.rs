@@ -29,10 +29,11 @@ use subtle::ConstantTimeEq;
 
 use crate::ValueDescription;
 use crate::diff_helpers::{list_element_type, map_entry_subtype, schema_aware_equal};
+use crate::differ::ComparisonContext;
 use crate::effect::MoveAuthority;
 use crate::explicit::ExplicitFields;
 use crate::parser::display_string_literal;
-use crate::provider::{AppliedIdentifier, InFlightCreate};
+use crate::provider::{AppliedIdentifier, InFlightCreate, UnknownCreateOutcome};
 use crate::schema::{AttributeType, DslMap, ResourceSchema, Shape, ShapeWalkBudget, TypeIdentity};
 
 pub use enum_value::{
@@ -5152,6 +5153,7 @@ pub(crate) fn merge_with_saved(
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> Value {
     match (desired, saved.projected) {
         (
@@ -5169,6 +5171,7 @@ pub(crate) fn merge_with_saved(
                 prior_explicit,
                 attr_type,
                 defs,
+                context,
             )
         }
         (
@@ -5186,6 +5189,7 @@ pub(crate) fn merge_with_saved(
                 prior_explicit,
                 attr_type,
                 defs,
+                context,
             )))
         }
         _ => desired.clone(),
@@ -5199,6 +5203,7 @@ fn merge_maps(
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> Value {
     let prior_children = match prior_explicit {
         ExplicitFields::Struct { children } => Some(children),
@@ -5235,6 +5240,7 @@ fn merge_maps(
                         .unwrap_or(&ExplicitFields::Unrecorded),
                     map_entry_subtype(attr_type, key, defs),
                     defs,
+                    context,
                 )
             }
             None => desired_value.clone(),
@@ -5263,12 +5269,13 @@ pub(crate) fn pair_list_elements<D, S>(
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> Vec<Option<usize>>
 where
     D: Borrow<Value>,
     S: Borrow<Value>,
 {
-    let candidates = list_pair_candidates(desired, saved, attr_type, defs);
+    let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
     commit_list_element_pairs(desired.len(), saved.len(), &candidates)
 }
 
@@ -5297,12 +5304,13 @@ pub(crate) fn pair_list_elements_with_uniqueness<D, S>(
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> Vec<ListElementPairing>
 where
     D: Borrow<Value>,
     S: Borrow<Value>,
 {
-    let candidates = list_pair_candidates(desired, saved, attr_type, defs);
+    let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
     let pairs = commit_list_element_pairs(desired.len(), saved.len(), &candidates);
     classify_list_element_pairs(&pairs, saved.len(), &candidates)
 }
@@ -5312,15 +5320,16 @@ fn list_pair_candidates<D, S>(
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
     S: Borrow<Value>,
 {
     if desired.len().max(saved.len()) < HASH_THRESHOLD {
-        pair_candidates_quadratic(desired, saved, attr_type, defs)
+        pair_candidates_quadratic(desired, saved, attr_type, defs, context)
     } else {
-        pair_candidates_hashed(desired, saved, attr_type, defs)
+        pair_candidates_hashed(desired, saved, attr_type, defs, context)
     }
 }
 
@@ -5503,6 +5512,7 @@ fn pair_candidates_quadratic<D, S>(
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
@@ -5518,6 +5528,7 @@ where
                 saved_value.borrow(),
                 attr_type,
                 defs,
+                context,
             );
             if score > 0 {
                 entries.push((score, desired_index, saved_index));
@@ -5553,6 +5564,7 @@ fn pair_candidates_hashed<D, S>(
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
@@ -5565,7 +5577,7 @@ where
             Value::Concrete(ConcreteValue::Map(map)) => {
                 for (key, value) in map {
                     let field_type = map_entry_subtype(attr_type, key, defs);
-                    for value_hash in pairing_hashes(value, field_type, defs) {
+                    for value_hash in pairing_hashes(value, field_type, defs, context) {
                         map_field_buckets
                             .entry(key)
                             .or_default()
@@ -5576,7 +5588,7 @@ where
                 }
             }
             value => {
-                for value_hash in pairing_hashes(value, attr_type, defs) {
+                for value_hash in pairing_hashes(value, attr_type, defs, context) {
                     value_buckets
                         .entry(value_hash)
                         .or_default()
@@ -5609,7 +5621,7 @@ where
                         return false;
                     };
                     map.get(*key).is_some_and(|value| {
-                        schema_aware_equal(representative, value, field_type, defs)
+                        schema_aware_equal(representative, value, field_type, defs, context)
                     })
                 })
             {
@@ -5628,7 +5640,13 @@ where
             if bucket.len() == saved.len()
                 && bucket.iter().copied().eq(0..saved.len())
                 && saved.iter().all(|saved_value| {
-                    schema_aware_equal(representative, saved_value.borrow(), attr_type, defs)
+                    schema_aware_equal(
+                        representative,
+                        saved_value.borrow(),
+                        attr_type,
+                        defs,
+                        context,
+                    )
                 })
             {
                 universal_values.insert(*value_hash, representative);
@@ -5648,7 +5666,7 @@ where
             Value::Concrete(ConcreteValue::Map(map)) => {
                 for (key, value) in map {
                     let field_type = map_entry_subtype(attr_type, key, defs);
-                    let value_hashes = pairing_hashes(value, field_type, defs);
+                    let value_hashes = pairing_hashes(value, field_type, defs, context);
                     let field_is_universal =
                         universal_map_fields
                             .get(key.as_str())
@@ -5661,6 +5679,7 @@ where
                                                 representative,
                                                 field_type,
                                                 defs,
+                                                context,
                                             )
                                         },
                                     )
@@ -5680,12 +5699,12 @@ where
                 }
             }
             value => {
-                let value_hashes = pairing_hashes(value, attr_type, defs);
+                let value_hashes = pairing_hashes(value, attr_type, defs, context);
                 let value_is_universal = value_hashes.iter().any(|value_hash| {
                     universal_values
                         .get(value_hash)
                         .is_some_and(|representative| {
-                            schema_aware_equal(value, representative, attr_type, defs)
+                            schema_aware_equal(value, representative, attr_type, defs, context)
                         })
                 });
                 if value_is_universal {
@@ -5708,6 +5727,7 @@ where
                 saved[saved_index].borrow(),
                 attr_type,
                 defs,
+                context,
             );
             if score > 0 {
                 entries.push((score, desired_index, saved_index));
@@ -5727,6 +5747,7 @@ fn pairing_hashes(
     value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> Vec<u64> {
     let mut hashes = vec![value.canonical_hash()];
     match value {
@@ -5738,7 +5759,7 @@ fn pairing_hashes(
             // hashes cover plaintext (including schema normalizations); the
             // fixed tag deliberately admits every state-secret spelling for
             // exact verification by `similarity_score`.
-            hashes.extend(pairing_hashes(inner, attr_type, defs));
+            hashes.extend(pairing_hashes(inner, attr_type, defs, context));
             hashes.push(secret_state_pairing_hash());
         }
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
@@ -5747,7 +5768,7 @@ fn pairing_hashes(
         _ => {}
     }
     if let Some(attr_type) = attr_type {
-        append_schema_pairing_hashes(value, attr_type, defs, &mut hashes, 0);
+        append_schema_pairing_hashes(value, attr_type, defs, context, &mut hashes, 0);
     }
     hashes.sort_unstable();
     hashes.dedup();
@@ -5762,6 +5783,7 @@ fn append_schema_pairing_hashes(
     value: &Value,
     attr_type: &AttributeType,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
     hashes: &mut Vec<u64>,
     depth: usize,
 ) {
@@ -5771,17 +5793,16 @@ fn append_schema_pairing_hashes(
     }
     match attr_type.shape_with_defs(defs) {
         Shape::String {
-            to_dsl: Some(transform),
-            ..
+            identity, to_dsl, ..
         } => {
             if let Value::Concrete(ConcreteValue::String(text)) = value {
                 hashes.push(pairing_component_hash(
                     0x01,
-                    &transform.apply(text.expose_plaintext()),
+                    &context.canonical_string(text.expose_plaintext(), identity, to_dsl),
                 ));
             }
         }
-        Shape::String { to_dsl: None, .. } | Shape::Bool | Shape::Duration => {}
+        Shape::Bool | Shape::Duration => {}
         Shape::Int { .. } | Shape::Float { .. } => {
             if let Some(hash) = numeric_pairing_hash(value) {
                 hashes.push(hash);
@@ -5838,7 +5859,14 @@ fn append_schema_pairing_hashes(
             let members = crate::schema::union_members_with_defs(attr_type, defs)
                 .expect("Shape::Union must expose union members internally");
             for member in members.iter().flatten() {
-                append_schema_pairing_hashes(value, member.as_attr(), defs, hashes, depth + 1);
+                append_schema_pairing_hashes(
+                    value,
+                    member.as_attr(),
+                    defs,
+                    context,
+                    hashes,
+                    depth + 1,
+                );
             }
         }
     }
@@ -5875,6 +5903,7 @@ fn merge_lists(
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> Vec<Value> {
     // `WholeValue` is the explicit whole-value fallback used when a carried row
     // cannot transfer a pending nested removal to a uniquely identified list
@@ -5893,8 +5922,8 @@ fn merge_lists(
     };
 
     let item_type = list_element_type(attr_type, defs);
-    let projected_pairs = pair_list_elements(desired, projected_saved, item_type, defs);
-    let raw_pairs = pair_list_elements(desired, raw_saved, item_type, defs);
+    let projected_pairs = pair_list_elements(desired, projected_saved, item_type, defs, context);
+    let raw_pairs = pair_list_elements(desired, raw_saved, item_type, defs, context);
     let projected_origins = if projected_saved.len() == raw_saved.len() {
         // Projection preserves order when it retains every stored element.
         // Keeping the direct index mapping also preserves the established
@@ -5903,7 +5932,7 @@ fn merge_lists(
             .map(ListElementPairing::Unique)
             .collect()
     } else {
-        pair_list_elements_with_uniqueness(projected_saved, raw_saved, item_type, defs)
+        pair_list_elements_with_uniqueness(projected_saved, raw_saved, item_type, defs, context)
     };
 
     projected_pairs
@@ -5944,6 +5973,7 @@ fn merge_lists(
                         authoring,
                         item_type,
                         defs,
+                        context,
                     )
                 }
                 None => desired[desired_index].clone(),
@@ -5961,6 +5991,7 @@ fn similarity_score(
     b: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> usize {
     match (a, b) {
         (Value::Concrete(ConcreteValue::Map(am)), Value::Concrete(ConcreteValue::Map(bm))) => am
@@ -5968,12 +5999,18 @@ fn similarity_score(
             .filter(|(k, v)| {
                 bm.get(*k)
                     .map(|bv| {
-                        schema_aware_equal(v, bv, map_entry_subtype(attr_type, k, defs), defs)
+                        schema_aware_equal(
+                            v,
+                            bv,
+                            map_entry_subtype(attr_type, k, defs),
+                            defs,
+                            context,
+                        )
                     })
                     .unwrap_or(false)
             })
             .count(),
-        _ => usize::from(schema_aware_equal(a, b, attr_type, defs)),
+        _ => usize::from(schema_aware_equal(a, b, attr_type, defs, context)),
     }
 }
 
@@ -7849,6 +7886,7 @@ pub enum Current {
     Absent(AbsentState),
     Present(PresentResourceState),
     CreateInFlight(InFlightCreate),
+    CreateOutcomeUnknown(UnknownCreateOutcome),
     MissingIdentifier(UnidentifiedState),
 }
 
@@ -7900,11 +7938,16 @@ impl Current {
         Self::CreateInFlight(pending)
     }
 
+    pub fn create_outcome_unknown(unknown: UnknownCreateOutcome) -> Self {
+        Self::CreateOutcomeUnknown(unknown)
+    }
+
     pub fn id(&self) -> &ResourceId {
         match self {
             Self::Absent(state) => &state.0.id,
             Self::Present(present) => &present.state.id,
             Self::CreateInFlight(pending) => pending.id(),
+            Self::CreateOutcomeUnknown(unknown) => unknown.id(),
             Self::MissingIdentifier(state) => &state.0.id,
         }
     }
@@ -7927,6 +7970,7 @@ impl Current {
                 state: &mut present.state,
             }),
             Self::CreateInFlight(_pending) => None,
+            Self::CreateOutcomeUnknown(_unknown) => None,
             Self::MissingIdentifier(state) => Some(StateBearingCurrentMut {
                 state: &mut state.0,
             }),
@@ -7948,6 +7992,9 @@ impl Current {
                     .clone()
                     .rebind_for_move(authority.destination_address());
             }
+            Self::CreateOutcomeUnknown(unknown) => {
+                unknown.rebind_for_move(to.clone());
+            }
             Self::MissingIdentifier(state) => state.0.id = to.clone(),
         }
     }
@@ -7960,6 +8007,9 @@ impl Current {
             Self::CreateInFlight(pending) => {
                 *pending = pending.clone().rebind_for_move(authority.source_address());
             }
+            Self::CreateOutcomeUnknown(unknown) => {
+                unknown.rebind_for_move(from.clone());
+            }
             Self::MissingIdentifier(state) => state.0.id = from.clone(),
         }
     }
@@ -7971,6 +8021,7 @@ impl Current {
                 present.state.dependency_bindings = dependency_bindings;
             }
             Self::CreateInFlight(_pending) => {}
+            Self::CreateOutcomeUnknown(_unknown) => {}
             Self::MissingIdentifier(state) => {
                 state.0.dependency_bindings = dependency_bindings;
             }
@@ -7982,6 +8033,7 @@ impl Current {
             Self::Absent(state) => state.0.materialize_partial_read_unknowns(),
             Self::Present(present) => present.state.materialize_partial_read_unknowns(),
             Self::CreateInFlight(_pending) => {}
+            Self::CreateOutcomeUnknown(_unknown) => {}
             Self::MissingIdentifier(state) => state.0.materialize_partial_read_unknowns(),
         }
         PlanInputCurrent(self)

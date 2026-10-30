@@ -14,7 +14,9 @@ use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesF
 #[cfg(test)]
 use carina_core::provider::SentRecord;
 use carina_core::provider::{
-    AppliedIdentifier, InFlightCreate, InFlightPersistence, ObservedCreate, PersistedAttributes,
+    AppliedIdentifier, ComparisonResolutionError, InFlightCreate, InFlightPersistence,
+    ObservedCreate, PersistedAttributes, ProviderRouter, ResolvedComparisonTable,
+    UnknownCreateOutcome,
 };
 use carina_core::resource::{
     ConcreteValue, Current, ModuleSource, ResolvedResource, ResolvedResourceId, Resource,
@@ -150,11 +152,42 @@ impl PostApplyStates {
 /// Owning these together prevents the background saver and final write from
 /// silently diverging on the desired resources, plan, schemas, or saved-plan
 /// secret hashes.
+fn writeback_comparison_ids<'a, S>(
+    sorted_resources: &'a [ResolvedResource<S>],
+    plan: &'a Plan<S>,
+) -> Vec<&'a ResourceId> {
+    let mut ids = sorted_resources
+        .iter()
+        .map(|resource| &resource.id)
+        .collect::<Vec<_>>();
+    for effect in plan.effects() {
+        match effect {
+            Effect::DeferredCreate { template, .. } => {
+                ids.push(&template.template_resource.id);
+            }
+            Effect::DeferredReplace(payload) => {
+                ids.push(&payload.template.template_resource.id);
+            }
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::Wait { .. } => {}
+        }
+    }
+    ids
+}
+
 pub(crate) struct ApplyStateSaveInputs<S = ModuleSource> {
     sorted_resources: Vec<ResolvedResource<S>>,
     plan: Plan<S>,
     schemas: SchemaRegistry,
     planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
+    comparisons: ResolvedComparisonTable,
 }
 
 impl<S: Clone> ApplyStateSaveInputs<S> {
@@ -163,13 +196,17 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
         plan: Plan<S>,
         schemas: SchemaRegistry,
         planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
-    ) -> Self {
-        Self {
+        provider: &ProviderRouter,
+    ) -> Result<Self, ComparisonResolutionError> {
+        let comparison_ids = writeback_comparison_ids(&sorted_resources, &plan);
+        let comparisons = provider.resolve_comparisons(&schemas, comparison_ids)?;
+        Ok(Self {
             sorted_resources,
             plan,
             schemas,
             planned_secret_hashes,
-        }
+            comparisons,
+        })
     }
 
     pub(crate) fn sorted_resources(&self) -> &[ResolvedResource<S>] {
@@ -180,12 +217,32 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
         &self.schemas
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        sorted_resources: Vec<ResolvedResource<S>>,
+        plan: Plan<S>,
+        schemas: SchemaRegistry,
+        planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
+    ) -> Self {
+        let comparison_ids = writeback_comparison_ids(&sorted_resources, &plan);
+        let (schemas, provider) =
+            carina_core::provider::comparison_fixture_for_test(&schemas, comparison_ids);
+        Self::new(
+            sorted_resources,
+            plan,
+            schemas,
+            planned_secret_hashes,
+            &provider,
+        )
+        .expect("test state-save inputs must resolve every comparison")
+    }
+
     pub(crate) fn build_state(
         &self,
         state: StateFile,
         result: &ExecutionResult<S>,
     ) -> Result<StateFile, AppError> {
-        build_state_after_apply(
+        build_state_after_apply_with_comparisons(
             ApplyStateSave {
                 state_file: state,
                 sorted_resources: &self.sorted_resources,
@@ -198,6 +255,7 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
                 schemas: &self.schemas,
             },
             self.planned_secret_hashes.as_ref(),
+            &self.comparisons,
         )
     }
 }
@@ -656,6 +714,8 @@ enum UpsertSource<'a> {
     Imported(&'a State),
     CurrentPresent(&'a State),
     CurrentCreateInFlight(&'a InFlightCreate),
+    CreateOutcomeUnknown(&'a UnknownCreateOutcome),
+    CurrentCreateOutcomeUnknown(&'a UnknownCreateOutcome),
     CurrentMissingIdentifier(&'a State),
 }
 
@@ -667,6 +727,8 @@ impl<'a> UpsertSource<'a> {
             Self::CreateInFlight(pending) => pending.identifier().map(|value| value.as_str()),
             Self::CurrentPresent(_state) => None,
             Self::CurrentCreateInFlight(_pending) => None,
+            Self::CreateOutcomeUnknown(_unknown) => None,
+            Self::CurrentCreateOutcomeUnknown(_unknown) => None,
             Self::CurrentMissingIdentifier(_state) => None,
         }
     }
@@ -681,6 +743,8 @@ impl<'a> UpsertSource<'a> {
             Self::Imported(_state) => true,
             Self::CurrentPresent(_state) => false,
             Self::CurrentCreateInFlight(_pending) => false,
+            Self::CreateOutcomeUnknown(_unknown) => true,
+            Self::CurrentCreateOutcomeUnknown(_unknown) => false,
             Self::CurrentMissingIdentifier(_state) => false,
         }
     }
@@ -690,6 +754,8 @@ impl<'a> UpsertSource<'a> {
             Self::Observed(_created) => true,
             Self::CreateInFlight(_pending) => true,
             Self::CurrentCreateInFlight(_pending) => true,
+            Self::CreateOutcomeUnknown(_unknown) => true,
+            Self::CurrentCreateOutcomeUnknown(_unknown) => true,
             Self::Complete { .. } => false,
             Self::Imported(_state) => false,
             Self::CurrentPresent(_state) => false,
@@ -980,6 +1046,7 @@ fn replacement_create_result<'upsert, 'resource, S>(
             Applied::Complete { .. }
             | Applied::Observed(_)
             | Applied::CreateInFlight(_)
+            | Applied::CreateOutcomeUnknown(_)
             | Applied::Imported(_)
             | Applied::DataSource(_)
             | Applied::WaitSnapshot(_),
@@ -1002,6 +1069,7 @@ fn planned_depose<S>(
         Current::Absent(state) => Some(state.state()),
         Current::Present(present) => Some(present.state()),
         Current::CreateInFlight(_pending) => None,
+        Current::CreateOutcomeUnknown(_unknown) => None,
         Current::MissingIdentifier(state) => Some(state.state()),
     });
     let existing_attributes = existing.and_then(ResourceState::persisted_attributes);
@@ -1152,6 +1220,7 @@ fn plan_displaced_identifier_deposes<S>(
                     Current::Absent(_state) => true,
                     Current::Present(_present) => false,
                     Current::CreateInFlight(_pending) => false,
+                    Current::CreateOutcomeUnknown(_unknown) => false,
                     Current::MissingIdentifier(_state) => false,
                 })
         {
@@ -1260,6 +1329,9 @@ fn decompose_with_moved_origins<'a, S>(
             Applied::CreateInFlight(pending) => {
                 wb.add_upsert(resource, UpsertSource::CreateInFlight(pending))
             }
+            Applied::CreateOutcomeUnknown(unknown) => {
+                wb.add_upsert(resource, UpsertSource::CreateOutcomeUnknown(unknown))
+            }
             Applied::CreateEnded => wb.add_clear_current(resource.resolved_id()),
             Applied::Imported(state) => wb.add_upsert(resource, UpsertSource::Imported(state)),
             Applied::DataSource(_state) | Applied::WaitSnapshot(_state) => Ok(()),
@@ -1281,6 +1353,9 @@ fn decompose_with_moved_origins<'a, S>(
                 }
                 Current::CreateInFlight(pending) => {
                     wb.add_upsert(resource, UpsertSource::CurrentCreateInFlight(pending))?
+                }
+                Current::CreateOutcomeUnknown(unknown) => {
+                    wb.add_upsert(resource, UpsertSource::CurrentCreateOutcomeUnknown(unknown))?
                 }
                 Current::MissingIdentifier(state) => wb.add_upsert(
                     resource,
@@ -1365,9 +1440,59 @@ fn decompose_with_moved_origins<'a, S>(
     Ok(wb)
 }
 
+#[cfg(test)]
 pub(crate) fn build_state_after_apply<S: Clone>(
     save: ApplyStateSave<'_, S>,
     planned_secret_hashes: Option<&HashMap<ResourceId, PersistedAttributes>>,
+) -> Result<StateFile, AppError> {
+    let ApplyStateSave {
+        state_file,
+        sorted_resources,
+        runtime_synthesized_resources,
+        managed_current,
+        applied_states,
+        plan,
+        successfully_deleted,
+        failed_refreshes,
+        schemas,
+    } = save;
+    let resources = sorted_resources
+        .iter()
+        .chain(runtime_synthesized_resources.iter())
+        .collect::<Vec<_>>();
+    let (complete_schemas, provider) = carina_core::provider::comparison_fixture_for_test(
+        schemas,
+        resources.iter().map(|resource| &resource.id),
+    );
+
+    let comparisons = provider
+        .resolve_comparisons(
+            &complete_schemas,
+            resources.iter().map(|resource| &resource.id),
+        )
+        .map_err(AppError::from)?;
+
+    build_state_after_apply_with_comparisons(
+        ApplyStateSave {
+            state_file,
+            sorted_resources,
+            runtime_synthesized_resources,
+            managed_current,
+            applied_states,
+            plan,
+            successfully_deleted,
+            failed_refreshes,
+            schemas: &complete_schemas,
+        },
+        planned_secret_hashes,
+        &comparisons,
+    )
+}
+
+fn build_state_after_apply_with_comparisons<S: Clone>(
+    save: ApplyStateSave<'_, S>,
+    planned_secret_hashes: Option<&HashMap<ResourceId, PersistedAttributes>>,
+    comparisons: &ResolvedComparisonTable,
 ) -> Result<StateFile, AppError> {
     let ApplyStateSave {
         state_file,
@@ -1402,9 +1527,12 @@ pub(crate) fn build_state_after_apply<S: Clone>(
         let resource = planned.resource;
         let existing = moved_origins.find_persisted_row(&state, id);
         let preferred_hashes = planned_secret_hashes.and_then(|hashes| hashes.get(id));
-        let schema = schemas
-            .get_for(resource)
-            .map(|schema| schema.schema().as_schema());
+        let resolved_comparison = comparisons
+            .comparison_for(&resource.id)
+            .map_err(AppError::from)?;
+        let owner_schema = resolved_comparison.owner_schema();
+        let comparison = resolved_comparison.context();
+        let schema = Some(owner_schema.schema().as_schema());
         let mut resource_state = match &planned.source {
             UpsertSource::Complete { state, request } => {
                 ResourceState::from_provider_state_for_resource_and_schema(
@@ -1414,6 +1542,7 @@ pub(crate) fn build_state_after_apply<S: Clone>(
                     schema,
                     RowBasis::Applied(request),
                     preferred_hashes,
+                    comparison,
                 )
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
             }
@@ -1428,6 +1557,7 @@ pub(crate) fn build_state_after_apply<S: Clone>(
                     schema,
                     RowBasis::Imported,
                     preferred_hashes,
+                    comparison,
                 )
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
             }
@@ -1439,6 +1569,7 @@ pub(crate) fn build_state_after_apply<S: Clone>(
                     schema,
                     RowBasis::Carried,
                     preferred_hashes,
+                    comparison,
                 )
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
             }
@@ -1448,12 +1579,24 @@ pub(crate) fn build_state_after_apply<S: Clone>(
                 existing,
                 schema,
                 preferred_hashes,
+                comparison,
             )
             .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?,
             UpsertSource::CreateInFlight(pending)
-            | UpsertSource::CurrentCreateInFlight(pending) => {
-                ResourceState::from_in_flight(resource, pending, existing, schema, preferred_hashes)
-                    .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
+            | UpsertSource::CurrentCreateInFlight(pending) => ResourceState::from_in_flight(
+                resource,
+                pending,
+                existing,
+                schema,
+                preferred_hashes,
+                comparison,
+            )
+            .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?,
+            UpsertSource::CreateOutcomeUnknown(unknown)
+            | UpsertSource::CurrentCreateOutcomeUnknown(unknown) => {
+                ResourceState::from_unknown_create_outcome(
+                    resource, unknown, existing, schema, comparison,
+                )
             }
         };
         if planned.source.records_name_overrides()
@@ -1678,6 +1821,9 @@ mod post_apply_states_tests {
             Current::CreateInFlight(pending) => {
                 panic!("identifier row was classified in flight: {pending:?}")
             }
+            Current::CreateOutcomeUnknown(unknown) => {
+                panic!("identifier row was classified outcome unknown: {unknown:?}")
+            }
             Current::MissingIdentifier(state) => {
                 panic!("identifier row lost its identifier: {state:?}")
             }
@@ -1727,6 +1873,9 @@ mod post_apply_states_tests {
             Current::CreateInFlight(pending) => {
                 panic!("deposed-only row was classified in flight: {pending:?}")
             }
+            Current::CreateOutcomeUnknown(unknown) => {
+                panic!("deposed-only row was classified outcome unknown: {unknown:?}")
+            }
             Current::MissingIdentifier(state) => {
                 panic!("deposed-only row was treated as malformed current state: {state:?}")
             }
@@ -1763,6 +1912,9 @@ mod post_apply_states_tests {
             Current::CreateInFlight(pending) => {
                 panic!("identifierless row was classified in flight: {pending:?}")
             }
+            Current::CreateOutcomeUnknown(unknown) => {
+                panic!("identifierless row was classified outcome unknown: {unknown:?}")
+            }
             Current::MissingIdentifier(state) => {
                 assert!(state.state().exists);
                 assert_eq!(
@@ -1777,7 +1929,7 @@ mod post_apply_states_tests {
 #[cfg(test)]
 mod apply_state_save_tests {
     use super::*;
-    use carina_core::differ::create_plan;
+    use carina_core::differ::create_plan_for_test as create_plan;
     use carina_core::effect::{
         DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes,
     };
@@ -1796,6 +1948,83 @@ mod apply_state_save_tests {
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
+    }
+
+    #[test]
+    fn apply_state_save_inputs_resolve_comparisons_before_writeback() {
+        let resource = resolved(Resource::with_provider(
+            "mock",
+            "test.Resource",
+            "main",
+            None,
+        ));
+        let id = resource.id.clone();
+        let mut provider = ProviderRouter::new();
+        provider.add_provider(
+            "mock".to_string(),
+            carina_core::provider::InitializedProvider::unavailable(Box::new(
+                carina_provider_mock::MockProvider::new(),
+            )),
+        );
+
+        let result = ApplyStateSaveInputs::new(
+            vec![resource],
+            Plan::new(),
+            SchemaRegistry::new(),
+            None,
+            &provider,
+        );
+        let Err(error) = result else {
+            panic!("apply setup must reject a missing comparison before execution starts")
+        };
+        assert!(matches!(
+            error,
+            carina_core::provider::ComparisonResolutionError::MissingResourceSchema {
+                id: actual
+            } if actual == id
+        ));
+    }
+
+    #[test]
+    fn apply_state_save_inputs_pre_resolve_deferred_runtime_comparisons() {
+        let mut plan = Plan::new();
+        plan.add(Effect::DeferredCreate {
+            id: ResolvedResourceId::new(ResourceId::with_identity(
+                "__deferred_for",
+                "validation_records",
+            )),
+            template: Box::new(DeferredForExpression {
+                file: Some("main.crn".to_string()),
+                line: 1,
+                header: "for opt in cert.domain_validation_options".to_string(),
+                resource_type: "aws.route53.Record".to_string(),
+                attributes: Vec::new(),
+                target: carina_core::parser::DeferredForTarget::Bound {
+                    binding: "validation_records".to_string(),
+                },
+                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                binding: ForBinding::Simple("opt".to_string()),
+                // Saved deferred templates are reconstructed before their
+                // runtime element identity exists. Comparison pre-resolution
+                // must key this pending id by provider instance and type.
+                template_resource: Resource::pending_with_provider("aws", "route53.Record", None),
+            }),
+        });
+        let runtime_id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            None,
+        );
+
+        let inputs =
+            ApplyStateSaveInputs::new_for_test(Vec::new(), plan, SchemaRegistry::new(), None);
+        let comparison = inputs
+            .comparisons
+            .comparison_for(&runtime_id)
+            .expect("the deferred template must pre-resolve its runtime comparison key");
+
+        assert_eq!(comparison.owner_schema().owner(), "aws");
     }
 
     fn complete_create(state: State) -> Applied {
@@ -1862,6 +2091,50 @@ mod apply_state_save_tests {
         sent: carina_core::provider::Sent,
     ) -> carina_core::provider::ObservedCreate {
         crate::fixture_observed_create(id, attributes, sent)
+    }
+
+    #[test]
+    fn outcome_unknown_apply_result_writes_tokenless_protected_row() {
+        let resource = Resource::with_provider("mock", "test.Resource", "unknown", None);
+        let id = resource.id.clone();
+        let resolved_resource = resolved(resource);
+        let failure = carina_core::provider::CreateAttempt::for_test(id.clone()).outcome_unknown(
+            carina_core::provider::EgressSent::for_test(),
+            carina_core::provider::ProviderError::api_error("guest trapped"),
+        );
+        let carina_core::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } =
+            failure.into_kind()
+        else {
+            panic!("the witness-gated fixture must mint an unknown outcome")
+        };
+
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: StateFile::new(),
+                sorted_resources: std::slice::from_ref(&resolved_resource),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(
+                    id.clone(),
+                    Applied::CreateOutcomeUnknown(unknown),
+                )]),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
+        .expect("outcome-unknown writeback");
+
+        let row = state.find_resource_for_id(&id).expect("protected row");
+        assert!(matches!(
+            row.current(),
+            CurrentInstance::CreateOutcomeUnknown { .. }
+        ));
+        let encoded = serde_json::to_value(row).unwrap();
+        assert!(encoded["current"].get("identifier").is_none());
+        assert!(encoded["current"].get("token").is_none());
     }
 
     #[derive(Clone, Copy)]
@@ -2036,6 +2309,9 @@ mod apply_state_save_tests {
                 pending,
                 pending.started_at().as_str()
             ),
+            CurrentInstance::CreateOutcomeUnknown { unknown } => {
+                panic!("expected applied current, got outcome unknown: {unknown:?}")
+            }
             CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes,
@@ -2068,6 +2344,9 @@ mod apply_state_save_tests {
                 "expected in-flight current, got applied {} ({attributes:?}, {write_only_attributes:?}, {nested_write_only:?}, {partial_read:?})",
                 identifier.as_str()
             ),
+            CurrentInstance::CreateOutcomeUnknown { unknown } => {
+                panic!("expected in-flight current, got outcome unknown: {unknown:?}")
+            }
             CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes,
@@ -2097,6 +2376,9 @@ mod apply_state_save_tests {
                 pending,
                 pending.started_at().as_str()
             ),
+            CurrentInstance::CreateOutcomeUnknown { unknown } => {
+                panic!("expected no current instance, got outcome unknown: {unknown:?}")
+            }
             CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes,
@@ -3684,9 +3966,15 @@ mod apply_state_save_tests {
             None,
             carina_core::provider::Sent::AllRequestAttributes,
         );
-        let mut existing =
-            ResourceState::from_in_flight(&resolved_resource, &fresh, None, None, None)
-                .expect("fresh continuation must encode");
+        let mut existing = ResourceState::from_in_flight(
+            &resolved_resource,
+            &fresh,
+            None,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        )
+        .expect("fresh continuation must encode");
         existing.explicit = ExplicitFields::Unrecorded;
 
         let mut state = StateFile::new();
@@ -3698,9 +3986,15 @@ mod apply_state_save_tests {
         };
         let repended = crate::fixture_repend_in_flight_create(loaded, "second-token");
 
-        let seeded_without_prior =
-            ResourceState::from_in_flight(&resolved_resource, &repended, None, None, None)
-                .expect("persisted re-pend without a prior row must encode");
+        let seeded_without_prior = ResourceState::from_in_flight(
+            &resolved_resource,
+            &repended,
+            None,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        )
+        .expect("persisted re-pend without a prior row must encode");
         assert_eq!(
             seeded_without_prior.explicit,
             ExplicitFields::Struct {
@@ -3714,6 +4008,7 @@ mod apply_state_save_tests {
             Some(&existing),
             None,
             None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
         )
         .expect("persisted re-pend must encode");
         assert_eq!(
@@ -3747,9 +4042,15 @@ mod apply_state_save_tests {
             None,
             carina_core::provider::Sent::AllRequestAttributes,
         );
-        let source_row =
-            ResourceState::from_in_flight(&source_resource, &source_pending, None, None, None)
-                .expect("source continuation must encode");
+        let source_row = ResourceState::from_in_flight(
+            &source_resource,
+            &source_pending,
+            None,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        )
+        .expect("source continuation must encode");
         let mut initial = StateFile::new();
         initial
             .upsert_resource(source_row)
@@ -3769,6 +4070,7 @@ mod apply_state_save_tests {
             None,
             None,
             None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
         )
         .expect("destination continuation must encode");
         let mut destination_state = StateFile::new();
@@ -5404,6 +5706,9 @@ mod apply_state_save_tests {
             carina_core::resource::Current::CreateInFlight(pending) => {
                 panic!("saved applied row unexpectedly remained in flight: {pending:?}")
             }
+            carina_core::resource::Current::CreateOutcomeUnknown(unknown) => {
+                panic!("saved applied row unexpectedly became outcome unknown: {unknown:?}")
+            }
         };
         let current_states = HashMap::from([(id.clone(), current_state)]);
         let second_plan = create_plan(
@@ -5555,6 +5860,9 @@ mod apply_state_save_tests {
             carina_core::resource::Current::MissingIdentifier(state) => state.into_state(),
             carina_core::resource::Current::CreateInFlight(pending) => {
                 panic!("saved applied row unexpectedly remained in flight: {pending:?}")
+            }
+            carina_core::resource::Current::CreateOutcomeUnknown(unknown) => {
+                panic!("saved applied row unexpectedly became outcome unknown: {unknown:?}")
             }
         };
         let current_states = HashMap::from([(id.clone(), current_state)]);
@@ -6644,6 +6952,9 @@ mod export_writeback_tests {
             }
             Current::CreateInFlight(pending) => {
                 panic!("partial-read row unexpectedly remained in flight: {pending:?}")
+            }
+            Current::CreateOutcomeUnknown(unknown) => {
+                panic!("partial-read row unexpectedly became outcome unknown: {unknown:?}")
             }
         }
 

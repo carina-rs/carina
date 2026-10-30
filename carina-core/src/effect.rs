@@ -77,6 +77,24 @@ impl EffectGeneration {
     }
 }
 
+/// Typed evidence that an import effect replaces the same full resource ID's
+/// protected create-outcome-unknown current instance.
+///
+/// The private field prevents callers from turning an arbitrary
+/// [`ResourceId`] into differ authorization. The only minting function is
+/// [`EffectWithSource::import_replacing_outcome_unknown`], which returns this
+/// witness together with the matching [`Effect::Import`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OutcomeUnknownImportReplacement {
+    id: ResolvedResourceId,
+}
+
+impl OutcomeUnknownImportReplacement {
+    pub fn resource_id(&self) -> &ResourceId {
+        self.id.as_inner()
+    }
+}
+
 /// Scheduler key for the exact instance generation an effect addresses.
 ///
 /// This deliberately keys on user identity plus generation only. It is for
@@ -1116,6 +1134,16 @@ impl<S> EffectWithSource<S> {
 }
 
 impl EffectWithSource<ModuleSource> {
+    /// Construct an import and the only typed authorization for suppressing
+    /// the matching create-outcome-unknown planning error.
+    pub fn import_replacing_outcome_unknown(
+        id: ResolvedResourceId,
+        identifier: crate::resource::Value,
+    ) -> (Self, OutcomeUnknownImportReplacement) {
+        let replacement = OutcomeUnknownImportReplacement { id: id.clone() };
+        (Self::Import { id, identifier }, replacement)
+    }
+
     pub const fn replace_display_glyph(create_before_destroy: bool) -> &'static str {
         if create_before_destroy { "+/-" } else { "-/+" }
     }
@@ -1912,6 +1940,7 @@ pub fn resolve_import_identifier(identifier: &crate::resource::Value) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::ConcreteValue;
     use std::collections::HashSet;
 
     const EFFECT_VARIANT_COUNT: usize = 10;
@@ -1922,6 +1951,26 @@ mod tests {
 
     fn deserialize_effect_value(value: serde_json::Value) -> SavedEffect {
         serde_json::from_value::<SavedEffect>(value).expect("deserialize saved effect")
+    }
+
+    #[test]
+    fn outcome_unknown_import_replacement_witness_is_tied_to_the_import_effect() {
+        let id = ResolvedResourceId::with_provider_identity(
+            "mock",
+            "test.Resource",
+            "shared",
+            Some("west".to_string()),
+        );
+        let (effect, replacement) = Effect::import_replacing_outcome_unknown(
+            id.clone(),
+            Value::Concrete(ConcreteValue::String("provider-id".into())),
+        );
+
+        assert!(matches!(
+            effect,
+            Effect::Import { id: effect_id, .. } if effect_id == id
+        ));
+        assert_eq!(replacement.resource_id(), id.as_inner());
     }
 
     #[test]

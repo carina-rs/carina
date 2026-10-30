@@ -55,8 +55,12 @@ impl ProviderFactory for AwsccTestFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-        Box::pin(async { Ok(Box::new(NoopProvider) as Box<dyn Provider>) })
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(NoopProvider)))
+        })
     }
 
     fn create_normalizer(
@@ -65,6 +69,15 @@ impl ProviderFactory for AwsccTestFactory {
         _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -639,7 +652,7 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AwsccTestFactory)];
     let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(factories),
-        std::iter::empty(),
+        carina_core::schema::SchemaRegistry::new(),
     );
     let provider_context = loaded_providers.provider_context();
     let schemas = loaded_providers.schemas();

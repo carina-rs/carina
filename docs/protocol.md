@@ -1,5 +1,81 @@
 # Provider protocol versions
 
+## Version 13
+
+Protocol v13 makes initialized reference scope, provider-declared reference
+forms, and recoverable create failures explicit transport data.
+
+The `normalize-desired` input is now
+`list<desired-resource { resource, deferred }>` rather than a plain resource
+list. `deferred` names the top-level attributes whose unresolved values the
+host withheld from `resource`. A returned resource must not contain an
+attribute named in its input's `deferred` list; the host rejects such a result
+and restores the original unresolved value (carina#4120).
+
+`initialize` now returns an `initialize-result` containing a closed
+`reference-scope`: either the provider instance's `partition`, `region`, and
+`account`, or `unavailable`. The scope belongs to the initialized instance, so
+two named instances of one provider kind may report different values.
+
+The `schemas` JSON is now a provider-schema envelope containing `resources`
+and `reference_forms`. Reference forms are a sorted list of `{identity, form}`
+records on the wire and a map in validated Rust witnesses. The `identity` is
+the same dotted string used by attribute-type identities and follows the same
+decode path. A form is currently the closed `template` variant, whose `long`
+value must contain `{name}` exactly once and may otherwise contain only
+`{partition}`, `{region}`, and `{account}` placeholders. Stray braces and
+unknown placeholders fail typed validation.
+
+At comparison time, `{name}` is the unqualified reference form and denotes one
+bare segment containing neither `:` nor `/`. Only such a bare value is expanded
+through `long`. A value containing `:` or `/` is already a qualified or path
+form, so it compares exactly as written and never compares equal to a bare name
+through reference-form expansion.
+
+The host admits resources, provider config, and forms as one provider-wide
+witness. Every form identity must be declared by that provider as a refined
+String; duplicate records, dangling identities, Int identities, and Enum
+identities are rejected while decoding. The registry retains one table per
+schema owner rather than one global identity table. Owner forms also contribute
+to semantic schema fingerprint encoding v5.
+
+State format 20 adds `create_outcome_unknown`, a token-less current instance
+containing only the create's UTC `started_at` timestamp. The host writes this
+row when an initial guest create fails after at least one host-approved request
+was dispatched and no identifier or continuation was returned. Plan, apply,
+and destroy block on the row. Refresh carries it forward unchanged without a
+provider read. Recovery is explicit: import replaces it when the resource
+exists, while `carina state forget` clears only the current instance after the
+operator confirms the resource is absent; any deposed generations remain
+tracked for deletion.
+
+Saved-plan format 31 persists authored `ignore_changes` paths for schema-time
+re-resolution. Format 30 was never emitted; provider protocol v13 uses format
+32.
+
+Saved-plan format 32 records the `reference-scope` of every loaded provider
+instance next to its provider artifact evidence. Saved-plan apply initializes
+those same provider instances and refuses a missing or different scope before
+drift reads, secret evaluation, or provider effects. The evidence is keyed by
+provider instance, not provider kind, so named instances in different regions
+or accounts remain distinct. The format also records an outcome-unknown marker
+and its `started_at` timestamp, never an identifier or continuation token.
+Apply reloads that marker under the state lock and rejects any lifecycle or
+timestamp change before provider effects run.
+
+Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
+continuation together with the error that stopped the current step. The host
+validates and preserves that continuation through the same typestate path as
+an ordinary `pending` result, including any identifier learned during the
+call. Provider-facing SDK handles use `preserve`; `undetermined` remains a wire
+classification used by guest glue when it cannot decode the request or token
+and therefore has no newer continuation.
+
+Hosts and providers must both use protocol v13. The minimum supported protocol
+version is 13. Rejecting v12 at provider load is intentional because v12 has no
+way to carry either initialized scope or an error-bearing replacement
+continuation.
+
 ## Version 12
 
 Protocol v12 adds the required `write_only` boolean to every nested
@@ -23,10 +99,10 @@ unobservable leaves against accepted-request provenance. State format v18 adds
 that typed per-instance leaf record; the v17 migration initializes it empty so
 the first plan performs one reconciling update.
 
-Hosts and providers must both use protocol v12. The minimum supported protocol
-version is 12. Rejecting v11 at provider load is intentional: either direction
-of host/provider skew would otherwise discard the nested `write_only` marker
-and silently restore the non-converging and incomplete-update behavior.
+Version 12 hosts and providers required an exact v12 match. Rejecting v11 at
+provider load was intentional: either direction of host/provider skew would
+otherwise discard the nested `write_only` marker and silently restore the
+non-converging and incomplete-update behavior.
 
 ## Version 11
 

@@ -1,10 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::Path;
 
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::{Orphan, Orphans, restore_current_move_source};
 use carina_core::parser::{BackendConfig, InferredExportParam, SavedProviderConfigs};
 use carina_core::plan::SavedPlan;
-use carina_core::provider::{AppliedIdentifier, PersistedAttributes, Provider, ReadRequest};
+use carina_core::provider::{
+    AppliedIdentifier, PersistedAttributes, Provider, ProviderRouter, ReadRequest,
+};
 use carina_core::resource::{
     Current, DataSource, ResolvedResourceId, Resource, ResourceId, SavedComposition,
     SavedDataSource, SavedResource, State, Value,
@@ -14,12 +17,12 @@ use carina_state::{ResourceState, StateFile};
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
     MovedOrigins, PlanFile, PlanSchemaReferences, PlanWaitBinding, RecordedProviderArtifact,
-    ReloadedCurrentStateEntry, ReloadedPlanFile, ResolvedProviderInputs,
+    RecordedProviderScopes, ReloadedCurrentStateEntry, ReloadedPlanFile, ResolvedProviderInputs,
     UnresolvedReloadedPlanFile, UpstreamSource, recorded_provider_artifacts,
 };
 use crate::error::{
     AppError, SavedPlanProviderArtifactDifference, SavedPlanProviderArtifactMismatchError,
-    SavedPlanSchemaMismatchError,
+    SavedPlanProviderScopeMismatchError, SavedPlanSchemaMismatchError,
 };
 use crate::wiring::{
     CheckedSavedPlanInputs, CompleteProviderLoad, ExpandedCanonicalResources, SavedPlanReplayMoves,
@@ -27,6 +30,22 @@ use crate::wiring::{
 };
 
 pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
+
+fn verify_saved_plan_provider_scopes(
+    recorded: &RecordedProviderScopes,
+    provider: &ProviderRouter,
+    apply_target: ApplyTarget<'_>,
+) -> Result<(), AppError> {
+    recorded.verify(provider).map_err(|mismatch| {
+        let mismatch = *mismatch;
+        AppError::SavedPlanProviderScopeMismatch(Box::new(SavedPlanProviderScopeMismatchError {
+            instance: mismatch.instance,
+            recorded: mismatch.recorded,
+            initialized: mismatch.initialized,
+            replan_command: apply_target.replan_command().to_string(),
+        }))
+    })
+}
 
 fn planned_secret_hashes(resources: &[SavedResource]) -> PlannedSecretHashes {
     resources
@@ -209,6 +228,7 @@ impl ProviderBoundPlanFile {
     pub(super) fn reload_in_flight_from_locked_state(
         self,
         state_file: Option<&carina_state::StateFile>,
+        project_dir: &Path,
     ) -> Result<ReloadedProviderBoundPlanFile, AppError> {
         match self {
             Self::Verified {
@@ -227,7 +247,7 @@ impl ProviderBoundPlanFile {
                     },
                     providers,
                 })
-                .map_err(AppError::Config),
+                .map_err(|source| AppError::from_locked_state_reload(source, project_dir)),
             Self::NeedsSecretVerification {
                 plan:
                     PendingPlanFile {
@@ -246,7 +266,7 @@ impl ProviderBoundPlanFile {
                         providers,
                     },
                 )
-                .map_err(AppError::Config),
+                .map_err(|source| AppError::from_locked_state_reload(source, project_dir)),
         }
     }
 
@@ -456,6 +476,9 @@ fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
         Current::CreateInFlight(pending) => {
             Orphan::create_in_flight(pending, row.binding.clone(), row.directives.clone().into())
         }
+        Current::CreateOutcomeUnknown(unknown) => {
+            Orphan::create_outcome_unknown(unknown, row.binding.clone(), (&row.directives).into())
+        }
         Current::MissingIdentifier(state) => {
             Orphan::missing_identifier(state, row.binding.clone(), row.directives.clone().into())
         }
@@ -528,6 +551,14 @@ pub(crate) struct SchemaCheckedPendingPlanFile {
 }
 
 impl SchemaCheckedPendingPlanFile {
+    pub(super) fn verify_provider_scopes(
+        &self,
+        provider: &ProviderRouter,
+        apply_target: ApplyTarget<'_>,
+    ) -> Result<(), AppError> {
+        verify_saved_plan_provider_scopes(self.plan_file.provider_scopes(), provider, apply_target)
+    }
+
     /// Reconstruct the minimal plan-time prior-state view needed by
     /// deferred-`for` expansion. Saved snapshots have already crossed address
     /// reconciliation, so move targets are restored through their plan-minted
@@ -695,7 +726,23 @@ impl ValidatedDesiredPlan {
         self.plan.historical_resource_addresses()
     }
 
-    pub(super) async fn verify_historical(
+    pub(super) fn verify_provider_scopes(
+        self,
+        provider: ProviderRouter,
+        apply_target: ApplyTarget<'_>,
+    ) -> Result<ScopeCheckedDesiredPlan, AppError> {
+        let recorded = match &self.plan {
+            DesiredPlanFile::Verified(plan) => plan.plan_file.provider_scopes(),
+            DesiredPlanFile::NeedsHistoricalVerification(plan) => plan.plan_file.provider_scopes(),
+        };
+        verify_saved_plan_provider_scopes(recorded, &provider, apply_target)?;
+        Ok(ScopeCheckedDesiredPlan {
+            plan: self,
+            provider,
+        })
+    }
+
+    async fn verify_historical(
         self,
         provider: &dyn Provider,
         actual_states: &mut HashMap<ResourceId, State>,
@@ -714,6 +761,75 @@ impl ValidatedDesiredPlan {
             )
             .await?;
         Ok(ValidatedExecutablePlan { plan, config })
+    }
+}
+
+/// A desired saved plan paired with the exact initialized provider instances
+/// whose scopes matched its recorded evidence.
+pub(super) struct ScopeCheckedDesiredPlan {
+    plan: ValidatedDesiredPlan,
+    provider: ProviderRouter,
+}
+
+impl ScopeCheckedDesiredPlan {
+    pub(super) fn context(&self) -> &WiringContext {
+        self.plan.context()
+    }
+
+    pub(super) fn sorted_resources(&self) -> &[SavedResource] {
+        self.plan.sorted_resources()
+    }
+
+    pub(super) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
+        self.plan.current_states()
+    }
+
+    pub(super) fn historical_resource_addresses(&self) -> HistoricalResourceAddresses {
+        self.plan.historical_resource_addresses()
+    }
+
+    pub(super) fn provider(&self) -> &ProviderRouter {
+        &self.provider
+    }
+
+    pub(super) async fn verify_historical(
+        self,
+        actual_states: &mut HashMap<ResourceId, State>,
+        verified_planned_states: &mut HashMap<ResourceId, State>,
+        historical_addresses: &HistoricalResourceAddresses,
+        apply_target: ApplyTarget<'_>,
+    ) -> Result<ScopeCheckedExecutablePlan, AppError> {
+        let Self { plan, provider } = self;
+        let plan = plan
+            .verify_historical(
+                &provider,
+                actual_states,
+                verified_planned_states,
+                historical_addresses,
+                apply_target,
+            )
+            .await?;
+        Ok(ScopeCheckedExecutablePlan { plan, provider })
+    }
+}
+
+/// Executable saved plan retaining the scope-checked initialized instances.
+pub(super) struct ScopeCheckedExecutablePlan {
+    plan: ValidatedExecutablePlan,
+    provider: ProviderRouter,
+}
+
+impl ScopeCheckedExecutablePlan {
+    pub(super) fn into_parts(self) -> (ValidatedExecutablePlan, ProviderRouter) {
+        (self.plan, self.provider)
+    }
+}
+
+impl std::ops::Deref for ScopeCheckedExecutablePlan {
+    type Target = ExecutablePlanFile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.plan
     }
 }
 
@@ -839,6 +955,7 @@ impl DesiredVerifiedPlanFile {
                     redacted_states.insert(id.clone(), present.state().clone());
                 }
                 carina_core::resource::Current::CreateInFlight(_pending) => {}
+                carina_core::resource::Current::CreateOutcomeUnknown(_unknown) => {}
                 carina_core::resource::Current::MissingIdentifier(state) => {
                     redacted_states.insert(id.clone(), state.state().clone());
                 }
@@ -869,6 +986,7 @@ impl DesiredVerifiedPlanFile {
                             .await?
                     }
                     carina_core::resource::Current::CreateInFlight(_pending) => None,
+                    carina_core::resource::Current::CreateOutcomeUnknown(_unknown) => None,
                     carina_core::resource::Current::MissingIdentifier(state) => {
                         verifier.verify(id, state.state(), None).await?
                     }
@@ -1039,7 +1157,10 @@ mod tests {
     use carina_core::effect::Effect;
     use carina_core::parser::ProviderConfig;
     use carina_core::plan::Plan;
-    use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
+    use carina_core::provider::{
+        BoxFuture, InitializedProvider, ProviderFactory, ProviderInstanceKey, ProviderResult,
+        ProviderRouter, ReferenceScope,
+    };
     use carina_core::resource::{
         ConcreteValue, Current, DataSource, DeferredValue, ResolvedResourceId, Resource,
         ResourceId, State, Value,
@@ -1054,7 +1175,7 @@ mod tests {
     use crate::commands::apply::ApplyTarget;
     use crate::commands::plan::{
         CurrentStateEntry, PlanFile, PlanFileContents, RecordedProviderArtifact,
-        SavedDataSourceValue, SavedManagedCurrent,
+        RecordedProviderScopes, SavedDataSourceValue, SavedManagedCurrent,
     };
     use crate::error::AppError;
     use crate::wiring::{
@@ -1093,10 +1214,21 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
-                Ok(Box::new(carina_provider_mock::MockProvider::new()) as Box<dyn Provider>)
+                Ok(carina_core::provider::InitializeOutcome::unavailable()
+                    .with_provider(Box::new(carina_provider_mock::MockProvider::new())))
             })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -1205,6 +1337,48 @@ mod tests {
             plan_file: Path::new("reviewed-plan.json"),
             source_dir: Path::new("."),
         }
+    }
+
+    fn available_scope(region: &str) -> ReferenceScope {
+        ReferenceScope::available("aws", region, "123456789012").expect("fixture scope is valid")
+    }
+
+    fn named_scope_router(scopes: [(&str, ReferenceScope); 2]) -> ProviderRouter {
+        let mut provider = ProviderRouter::new();
+        for (binding, scope) in scopes {
+            provider.add_provider_instance(
+                ProviderInstanceKey::new("test", Some(binding.to_string())),
+                InitializedProvider::for_test(
+                    Box::new(carina_provider_mock::MockProvider::new()),
+                    scope,
+                ),
+            );
+        }
+        provider
+    }
+
+    #[test]
+    fn saved_plan_apply_refuses_named_instance_scope_mismatch_before_drift() {
+        let recorded = RecordedProviderScopes::from_router(&named_scope_router([
+            ("east", available_scope("ap-northeast-1")),
+            ("west", available_scope("us-west-2")),
+        ]));
+        let initialized = named_scope_router([
+            ("east", available_scope("ap-northeast-1")),
+            ("west", available_scope("eu-west-1")),
+        ]);
+
+        let error =
+            super::verify_saved_plan_provider_scopes(&recorded, &initialized, apply_target())
+                .expect_err("scope drift must stop saved-plan apply before provider reads");
+
+        let AppError::SavedPlanProviderScopeMismatch(mismatch) = error else {
+            panic!("unexpected error: {error}")
+        };
+        assert_eq!(mismatch.instance.provider(), "test");
+        assert_eq!(mismatch.instance.provider_instance(), Some("west"));
+        assert_eq!(mismatch.recorded, available_scope("us-west-2"));
+        assert_eq!(mismatch.initialized, Some(available_scope("eu-west-1")));
     }
 
     fn reloaded(plan: PlanFile) -> ReloadedVerifiedPlanFile {

@@ -161,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_retry_is_undetermined_not_untracked() {
+    fn rejected_retry_preserves_the_continuation() {
         let provider = WidgetProvider {
             api: api_failing_with(vec![
                 ApiError::Unknown("timeout".into()),
@@ -183,7 +183,17 @@ mod tests {
             pending.token,
         )
         .expect_err("a rejected retry must not succeed");
-        assert!(matches!(*verdict, WirePollVerdict::Undetermined(_)));
+        let WirePollVerdict::InFlight(in_flight) = *verdict else {
+            panic!("expected an in-flight verdict")
+        };
+        match in_flight.pending.token {
+            CreateToken::Starting { client_token } => {
+                assert_eq!(client_token, "token-1");
+            }
+            CreateToken::Operation(operation) => {
+                panic!("expected the starting continuation, got {operation}");
+            }
+        }
     }
 
     #[test]
@@ -261,7 +271,7 @@ mod tests {
 }
 ```
 
-Test the classification as well as the happy path. Tests like `create_with_unknown_outcome_is_retried_with_the_same_client_token` and `rejected_retry_is_undetermined_not_untracked` are what keep a later change from turning an ambiguous failure into `untracked` and losing track of a real resource.
+Test the classification as well as the happy path. Tests like `create_with_unknown_outcome_is_retried_with_the_same_client_token` and `rejected_retry_preserves_the_continuation` are what keep a later change from turning an ambiguous failure into `untracked` and losing track of a real resource.
 
 ## Acceptance tests
 

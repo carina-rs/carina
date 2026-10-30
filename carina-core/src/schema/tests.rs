@@ -86,6 +86,172 @@ fn schema_registry_lookup_binds_owner_to_the_validated_schema() {
 }
 
 #[test]
+fn schema_registry_lookup_retains_the_owners_complete_reference_form_table() {
+    let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
+    let schema = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional(
+                "name",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let forms = ReferenceForms::from([(
+        identity.clone(),
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:service:{region}:{account}:widget/{name}",
+            )
+            .unwrap(),
+        },
+    )]);
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![schema],
+        ValidatedConfigSchema::default(),
+        forms.clone(),
+    )
+    .unwrap();
+    let mut registry = SchemaRegistry::new();
+    registry
+        .insert_provider_witness("actual-owner", &witness)
+        .expect("first witness table must be admitted");
+
+    let bound = registry
+        .get("actual-owner", "test.Widget", SchemaKind::Resource)
+        .expect("registered schema");
+    assert_eq!(bound.reference_forms(), &forms);
+    assert_eq!(bound.reference_forms().get(&identity), forms.get(&identity));
+}
+
+#[test]
+fn schema_registry_additional_schema_cannot_clear_witness_forms_when_registered_last() {
+    let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
+    let owned_schema = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional(
+                "name",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("owned schema must validate");
+    let forms = ReferenceForms::from([(
+        identity,
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:service:{region}:{account}:widget/{name}",
+            )
+            .expect("reference template must validate"),
+        },
+    )]);
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![owned_schema],
+        ValidatedConfigSchema::default(),
+        forms.clone(),
+    )
+    .expect("provider witness must validate");
+    let additional_schema = ResourceSchema::new("test.Additional")
+        .validate()
+        .expect("additional schema must validate");
+
+    let mut registry = SchemaRegistry::new();
+    registry
+        .insert_provider_witness("actual-owner", &witness)
+        .expect("witness table must be admitted");
+    let mut additional = SchemaRegistry::new();
+    additional.insert("actual-owner", additional_schema);
+    registry
+        .extend(additional)
+        .expect("plain resource insertion carries no competing forms");
+
+    let bound = registry
+        .get("actual-owner", "test.Widget", SchemaKind::Resource)
+        .expect("witness-backed schema must remain registered");
+    assert_eq!(bound.reference_forms(), &forms);
+}
+
+fn reference_form_witness(template: &str) -> (ValidatedProviderSchemaWitness, ReferenceForms) {
+    let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
+    let schema = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional(
+                "name",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("fixture schema must validate");
+    let forms = ReferenceForms::from([(
+        identity,
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(template).expect("fixture template must validate"),
+        },
+    )]);
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![schema],
+        ValidatedConfigSchema::default(),
+        forms.clone(),
+    )
+    .expect("fixture witness must validate");
+    (witness, forms)
+}
+
+#[test]
+fn schema_registry_extend_accepts_identical_witness_forms() {
+    let (witness, forms) =
+        reference_form_witness("arn:{partition}:service:{region}:{account}:widget/{name}");
+    let mut first = SchemaRegistry::new();
+    first
+        .insert_provider_witness("actual-owner", &witness)
+        .expect("first witness table must be admitted");
+    let mut second = SchemaRegistry::new();
+    second
+        .insert_provider_witness("actual-owner", &witness)
+        .expect("second witness table must be admitted");
+
+    first
+        .extend(second)
+        .expect("identical witness tables must merge");
+
+    let bound = first
+        .get("actual-owner", "test.Widget", SchemaKind::Resource)
+        .expect("merged schema must remain registered");
+    assert_eq!(bound.reference_forms(), &forms);
+}
+
+#[test]
+fn schema_registry_extend_rejects_conflicting_witness_forms() {
+    let (first_witness, first_forms) =
+        reference_form_witness("arn:{partition}:service:{region}:{account}:widget/{name}");
+    let (second_witness, second_forms) =
+        reference_form_witness("arn:{partition}:other:{region}:{account}:widget/{name}");
+    let mut first = SchemaRegistry::new();
+    first
+        .insert_provider_witness("actual-owner", &first_witness)
+        .expect("first witness table must be admitted");
+    let mut second = SchemaRegistry::new();
+    second
+        .insert_provider_witness("actual-owner", &second_witness)
+        .expect("second witness table must be admitted");
+
+    let error = first
+        .extend(second)
+        .expect_err("conflicting witness tables must not use last-writer-wins");
+    let SchemaRegistryError::ConflictingReferenceForms {
+        owner,
+        existing,
+        incoming,
+    } = error;
+    assert_eq!(owner, "actual-owner");
+    assert_eq!(existing, first_forms);
+    assert_eq!(incoming, second_forms);
+}
+
+#[test]
 fn rootless_lookup_collects_every_failure_without_a_fake_attribute() {
     let identity = TypeIdentity::new(Some("test"), Vec::<String>::new(), "Identifier");
     let root = RootlessType::new(AttributeType::list(AttributeType::refined_string(
@@ -968,7 +1134,7 @@ fn schema_admission_checks_identified_types_inside_referenced_definitions() {
 }
 
 #[test]
-fn schema_admission_rejects_closed_enum_transform_not_representable_in_v12() {
+fn schema_admission_rejects_closed_enum_transform_not_representable_in_v13() {
     let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
     let error = admission_error(
         ResourceSchema::new("test.Widget").attribute(
@@ -987,12 +1153,12 @@ fn schema_admission_rejects_closed_enum_transform_not_representable_in_v12() {
     );
 
     assert!(error.contains("test.widget.Mode"), "{error}");
-    assert!(error.contains("protocol v12"), "{error}");
+    assert!(error.contains("protocol v13"), "{error}");
     assert!(error.contains("transform"), "{error}");
 }
 
 #[test]
-fn config_schema_admission_enforces_scalar_and_v12_enum_invariants() {
+fn config_schema_admission_enforces_scalar_and_v13_enum_invariants() {
     let errors = ValidatedConfigSchema::validate(BTreeMap::from([
         (
             "non_scalar".to_string(),
@@ -1020,7 +1186,7 @@ fn config_schema_admission_enforces_scalar_and_v12_enum_invariants() {
 
     let rendered = errors.to_string();
     assert!(rendered.contains("scalar base"), "{rendered}");
-    assert!(rendered.contains("protocol v12"), "{rendered}");
+    assert!(rendered.contains("protocol v13"), "{rendered}");
 }
 
 #[test]

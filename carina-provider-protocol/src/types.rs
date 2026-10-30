@@ -36,6 +36,411 @@ pub struct TypeIdentity {
     pub kind: String,
 }
 
+/// A validated long-form reference template.
+///
+/// The only placeholders accepted by protocol v13 are `{partition}`,
+/// `{region}`, `{account}`, and `{name}`. The `{name}` placeholder appears
+/// exactly once and denotes the short form of the reference.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReferenceTemplate(ValidatedReferenceTemplate);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ValidatedReferenceTemplate {
+    source: String,
+    segments: Vec<ReferenceTemplateSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ReferenceTemplateSegment {
+    Literal(String),
+    Placeholder(ReferenceTemplatePlaceholder),
+}
+
+/// Why a reference template could not be admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceTemplateError {
+    NamePlaceholderCount { actual: usize },
+    UnknownPlaceholder { placeholder: String },
+    StrayOpeningBrace,
+    StrayClosingBrace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ReferenceTemplatePlaceholder {
+    Partition,
+    Region,
+    Account,
+    Name,
+}
+
+fn reference_template_placeholder(
+    value: &str,
+) -> Result<ReferenceTemplatePlaceholder, ReferenceTemplateError> {
+    if value == "partition" {
+        Ok(ReferenceTemplatePlaceholder::Partition)
+    } else if value == "region" {
+        Ok(ReferenceTemplatePlaceholder::Region)
+    } else if value == "account" {
+        Ok(ReferenceTemplatePlaceholder::Account)
+    } else if value == "name" {
+        Ok(ReferenceTemplatePlaceholder::Name)
+    } else {
+        Err(ReferenceTemplateError::UnknownPlaceholder {
+            placeholder: value.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for ReferenceTemplateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NamePlaceholderCount { actual } => write!(
+                formatter,
+                "reference template must contain exactly one `{{name}}` placeholder; found {actual}"
+            ),
+            Self::UnknownPlaceholder { placeholder } => write!(
+                formatter,
+                "reference template contains unknown placeholder `{{{placeholder}}}`"
+            ),
+            Self::StrayOpeningBrace => {
+                formatter.write_str("reference template contains a stray opening brace")
+            }
+            Self::StrayClosingBrace => {
+                formatter.write_str("reference template contains a stray closing brace")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReferenceTemplateError {}
+
+impl ReferenceTemplate {
+    pub fn new(value: impl Into<String>) -> Result<Self, ReferenceTemplateError> {
+        let value = value.into();
+        let bytes = value.as_bytes();
+        let mut index = 0;
+        let mut literal_start = 0;
+        let mut name_count = 0;
+        let mut segments = Vec::new();
+
+        while index < bytes.len() {
+            if bytes[index] == b'{' {
+                if literal_start < index {
+                    segments.push(ReferenceTemplateSegment::Literal(
+                        value[literal_start..index].to_string(),
+                    ));
+                }
+                let start = index + 1;
+                let mut end = start;
+                while end < bytes.len() && bytes[end] != b'}' {
+                    if bytes[end] == b'{' {
+                        return Err(ReferenceTemplateError::StrayOpeningBrace);
+                    }
+                    end += 1;
+                }
+                if end == bytes.len() {
+                    return Err(ReferenceTemplateError::StrayOpeningBrace);
+                }
+                let placeholder = &value[start..end];
+                let placeholder = reference_template_placeholder(placeholder)?;
+                match placeholder {
+                    ReferenceTemplatePlaceholder::Partition
+                    | ReferenceTemplatePlaceholder::Region
+                    | ReferenceTemplatePlaceholder::Account => {}
+                    ReferenceTemplatePlaceholder::Name => name_count += 1,
+                }
+                segments.push(ReferenceTemplateSegment::Placeholder(placeholder));
+                index = end + 1;
+                literal_start = index;
+            } else if bytes[index] == b'}' {
+                return Err(ReferenceTemplateError::StrayClosingBrace);
+            } else {
+                index += 1;
+            }
+        }
+
+        if name_count != 1 {
+            return Err(ReferenceTemplateError::NamePlaceholderCount { actual: name_count });
+        }
+        if literal_start < value.len() {
+            segments.push(ReferenceTemplateSegment::Literal(
+                value[literal_start..].to_string(),
+            ));
+        }
+        Ok(Self(ValidatedReferenceTemplate {
+            source: value,
+            segments,
+        }))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0.source
+    }
+
+    /// Expand this validated template once using one initialized provider
+    /// scope. Inserted values are appended as literal text and are never
+    /// parsed again as template placeholders.
+    pub fn render(&self, scope: &ReferenceScope, name: &str) -> Option<String> {
+        let values = scope.available_values()?;
+        let mut rendered = String::with_capacity(self.as_str().len() + name.len());
+        for segment in &self.0.segments {
+            match segment {
+                ReferenceTemplateSegment::Literal(literal) => rendered.push_str(literal),
+                ReferenceTemplateSegment::Placeholder(ReferenceTemplatePlaceholder::Partition) => {
+                    rendered.push_str(values.partition())
+                }
+                ReferenceTemplateSegment::Placeholder(ReferenceTemplatePlaceholder::Region) => {
+                    rendered.push_str(values.region())
+                }
+                ReferenceTemplateSegment::Placeholder(ReferenceTemplatePlaceholder::Account) => {
+                    rendered.push_str(values.account())
+                }
+                ReferenceTemplateSegment::Placeholder(ReferenceTemplatePlaceholder::Name) => {
+                    rendered.push_str(name)
+                }
+            }
+        }
+        Some(rendered)
+    }
+}
+
+impl std::fmt::Display for ReferenceTemplate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for ReferenceTemplate {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl TryFrom<String> for ReferenceTemplate {
+    type Error = ReferenceTemplateError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for ReferenceTemplate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ReferenceTemplate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
+
+/// Declared equivalence form for one refined String identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ReferenceForm {
+    Template { long: ReferenceTemplate },
+}
+
+/// One dotted identity/form pair in the provider schema envelope.
+///
+/// The string takes the same wire path as identities embedded in attribute
+/// types. Hosts therefore apply one decoding rule to both declarations before
+/// validating that a form belongs to an identified refined string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceFormDeclaration {
+    pub identity: String,
+    pub form: ReferenceForm,
+}
+
+/// Resource schemas and provider-wide reference-form declarations.
+///
+/// `reference_forms` is a list so core decoding can reject duplicate decoded
+/// identities explicitly. Core encoding sorts the list by its typed identity
+/// before projecting each key onto the dotted wire form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderSchemaEnvelope {
+    pub resources: Vec<ResourceSchema>,
+    pub reference_forms: Vec<ReferenceFormDeclaration>,
+}
+
+/// Values an initialized provider instance exposes for expanding short
+/// provider references into their long form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceScopeField {
+    Partition,
+    Region,
+    Account,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceScopeError {
+    Empty { field: ReferenceScopeField },
+    ContainsBrace { field: ReferenceScopeField },
+}
+
+impl std::fmt::Display for ReferenceScopeField {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Partition => formatter.write_str("partition"),
+            Self::Region => formatter.write_str("region"),
+            Self::Account => formatter.write_str("account"),
+        }
+    }
+}
+
+impl std::fmt::Display for ReferenceScopeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty { field } => write!(formatter, "reference scope {field} must not be empty"),
+            Self::ContainsBrace { field } => write!(
+                formatter,
+                "reference scope {field} must not contain `{{` or `}}`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReferenceScopeError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceScopeValues {
+    partition: String,
+    region: String,
+    account: String,
+}
+
+impl ReferenceScopeValues {
+    pub fn new(
+        partition: impl Into<String>,
+        region: impl Into<String>,
+        account: impl Into<String>,
+    ) -> Result<Self, ReferenceScopeError> {
+        let partition = partition.into();
+        let region = region.into();
+        let account = account.into();
+        validate_reference_scope_value(ReferenceScopeField::Partition, &partition)?;
+        validate_reference_scope_value(ReferenceScopeField::Region, &region)?;
+        validate_reference_scope_value(ReferenceScopeField::Account, &account)?;
+        Ok(Self {
+            partition,
+            region,
+            account,
+        })
+    }
+
+    pub fn partition(&self) -> &str {
+        &self.partition
+    }
+
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+}
+
+fn validate_reference_scope_value(
+    field: ReferenceScopeField,
+    value: &str,
+) -> Result<(), ReferenceScopeError> {
+    if value.is_empty() {
+        return Err(ReferenceScopeError::Empty { field });
+    }
+    if value.contains(['{', '}']) {
+        return Err(ReferenceScopeError::ContainsBrace { field });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceScope {
+    Available(ReferenceScopeValues),
+    Unavailable,
+}
+
+impl ReferenceScope {
+    pub fn available(
+        partition: impl Into<String>,
+        region: impl Into<String>,
+        account: impl Into<String>,
+    ) -> Result<Self, ReferenceScopeError> {
+        ReferenceScopeValues::new(partition, region, account).map(Self::Available)
+    }
+
+    pub fn available_values(&self) -> Option<&ReferenceScopeValues> {
+        match self {
+            Self::Available(values) => Some(values),
+            Self::Unavailable => None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum SerializedReferenceScope<'a> {
+    Available {
+        partition: &'a str,
+        region: &'a str,
+        account: &'a str,
+    },
+    Unavailable,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum DeserializedReferenceScope {
+    Available {
+        partition: String,
+        region: String,
+        account: String,
+    },
+    Unavailable,
+}
+
+impl Serialize for ReferenceScope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Available(values) => SerializedReferenceScope::Available {
+                partition: values.partition(),
+                region: values.region(),
+                account: values.account(),
+            }
+            .serialize(serializer),
+            Self::Unavailable => SerializedReferenceScope::Unavailable.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReferenceScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match DeserializedReferenceScope::deserialize(deserializer)? {
+            DeserializedReferenceScope::Available {
+                partition,
+                region,
+                account,
+            } => Self::available(partition, region, account).map_err(D::Error::custom),
+            DeserializedReferenceScope::Unavailable => Ok(Self::Unavailable),
+        }
+    }
+}
+
 /// Mirrors `carina_core::resource::Value`.
 ///
 /// Only includes variants that can cross the process boundary.
@@ -568,6 +973,13 @@ impl<T> PendingCreate<T> {
     }
 }
 
+/// A create continuation retained after an error stopped the current step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateInFlight<T, E> {
+    pub pending: PendingCreate<T>,
+    pub error: E,
+}
+
 /// An unfinished resumed create. Sent values stay in the persisted envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumePending<T> {
@@ -592,6 +1004,13 @@ impl<T> ResumePending<T> {
     pub fn into_parts(self) -> (T, Option<AppliedIdentifier>, u32) {
         (self.token, self.identifier, self.poll_after_secs)
     }
+}
+
+/// A resume continuation retained after an error stopped the current step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeInFlight<T, E> {
+    pub pending: ResumePending<T>,
+    pub error: E,
 }
 
 /// One provider step for an ordinary create.
@@ -631,28 +1050,31 @@ impl<R, E> CreatedFailure<R, E> {
 /// and native core adapters enforce create classification before converting
 /// their opaque verdict types into this wire representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CreateVerdict<R, E> {
+pub enum CreateVerdict<R, T, E> {
     Untracked(E),
     Created(CreatedFailure<R, E>),
     Discarded(E),
+    InFlight(CreateInFlight<T, E>),
 }
 
 /// Plain wire verdict from polling a create. Classification is enforced by
 /// the SDK or native core adapter before this value is encoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PollVerdict<R, E> {
+pub enum PollVerdict<R, T, E> {
     Untracked(E),
     Created(CreatedFailure<R, E>),
     Discarded(E),
     Undetermined(E),
+    InFlight(CreateInFlight<T, E>),
 }
 
-impl<R, E> From<CreateVerdict<R, E>> for PollVerdict<R, E> {
-    fn from(verdict: CreateVerdict<R, E>) -> Self {
+impl<R, T, E> From<CreateVerdict<R, T, E>> for PollVerdict<R, T, E> {
+    fn from(verdict: CreateVerdict<R, T, E>) -> Self {
         match verdict {
             CreateVerdict::Untracked(error) => Self::Untracked(error),
             CreateVerdict::Created(created) => Self::Created(created),
             CreateVerdict::Discarded(error) => Self::Discarded(error),
+            CreateVerdict::InFlight(in_flight) => Self::InFlight(in_flight),
         }
     }
 }
@@ -687,12 +1109,13 @@ pub enum ResumeStep<A, D, T> {
 /// Plain wire verdict while resuming a persisted create. Classification is
 /// enforced by the SDK or native core adapter before this value is encoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResumeVerdict<R, E> {
+pub enum ResumeVerdict<R, T, E> {
     Untracked(E),
     Created(ResumedFailure<R, E>),
     Discarded(E),
     Undetermined(E),
-    Resent(CreateVerdict<R, E>),
+    InFlight(ResumeInFlight<T, E>),
+    Resent(CreateVerdict<R, T, E>),
 }
 
 impl<A, D, T> From<CreateStep<A, D, T>> for ResumeStep<A, D, T> {
@@ -701,8 +1124,8 @@ impl<A, D, T> From<CreateStep<A, D, T>> for ResumeStep<A, D, T> {
     }
 }
 
-impl<R, E> From<CreateVerdict<R, E>> for ResumeVerdict<R, E> {
-    fn from(verdict: CreateVerdict<R, E>) -> Self {
+impl<R, T, E> From<CreateVerdict<R, T, E>> for ResumeVerdict<R, T, E> {
+    fn from(verdict: CreateVerdict<R, T, E>) -> Self {
         Self::Resent(verdict)
     }
 }
@@ -1430,7 +1853,7 @@ pub struct StructField {
     #[serde(default)]
     pub read_only: bool,
     /// Whether this nested field is accepted on write but omitted from reads.
-    /// Required in protocol v12 so host/provider skew fails loudly.
+    /// Required in protocol v13 so host/provider skew fails loudly.
     pub write_only: bool,
     /// Whether this nested field is populated asynchronously after Create returns.
     #[serde(default)]
@@ -1449,6 +1872,196 @@ mod tests {
             to_dsl: None,
             identity: None,
         }
+    }
+
+    #[test]
+    fn reference_scope_roundtrips_without_losing_the_closed_variant() {
+        let scopes = [
+            ReferenceScope::available("aws", "ap-northeast-1", "123456789012")
+                .expect("fixture scope is valid"),
+            ReferenceScope::Unavailable,
+        ];
+
+        for scope in scopes {
+            let encoded = serde_json::to_string(&scope).expect("scope must serialize");
+            let decoded: ReferenceScope =
+                serde_json::from_str(&encoded).expect("scope must deserialize");
+            assert_eq!(decoded, scope);
+        }
+    }
+
+    #[test]
+    fn reference_scope_constructor_and_serde_reject_invalid_values() {
+        assert_eq!(
+            ReferenceScope::available("aws", "", "123456789012").unwrap_err(),
+            ReferenceScopeError::Empty {
+                field: ReferenceScopeField::Region,
+            }
+        );
+        assert_eq!(
+            ReferenceScope::available("aws", "us-{name}-1", "123456789012").unwrap_err(),
+            ReferenceScopeError::ContainsBrace {
+                field: ReferenceScopeField::Region,
+            }
+        );
+        assert!(
+            serde_json::from_value::<ReferenceScope>(serde_json::json!({
+                "kind": "available",
+                "partition": "aws",
+                "region": "",
+                "account": "123456789012"
+            }))
+            .is_err(),
+            "deserialization must enter through ReferenceScope::available",
+        );
+    }
+
+    #[test]
+    fn reference_template_accepts_the_four_declared_placeholders() {
+        let raw = "arn:{partition}:lambda:{region}:{account}:function:{name}";
+        let template = ReferenceTemplate::new(raw).expect("declared template must validate");
+
+        assert_eq!(template.as_str(), raw);
+    }
+
+    #[test]
+    fn reference_template_requires_exactly_one_name_placeholder() {
+        for (raw, actual) in [
+            ("arn:{partition}:lambda:{region}:{account}:function", 0),
+            ("arn:{partition}:lambda:{name}:function:{name}", 2),
+        ] {
+            assert_eq!(
+                ReferenceTemplate::new(raw).expect_err("invalid name count must be rejected"),
+                ReferenceTemplateError::NamePlaceholderCount { actual },
+            );
+        }
+    }
+
+    #[test]
+    fn reference_template_rejects_unknown_placeholders() {
+        assert_eq!(
+            ReferenceTemplate::new("arn:{partition}:lambda:{zone}:{account}:function:{name}")
+                .expect_err("unknown placeholder must be rejected"),
+            ReferenceTemplateError::UnknownPlaceholder {
+                placeholder: "zone".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn reference_template_rejects_stray_braces() {
+        for (raw, expected) in [
+            (
+                "arn:{partition:lambda:{region}:{account}:function:{name}",
+                ReferenceTemplateError::StrayOpeningBrace,
+            ),
+            (
+                "arn:{partition}:lambda:{region}}:{account}:function:{name}",
+                ReferenceTemplateError::StrayClosingBrace,
+            ),
+        ] {
+            assert_eq!(
+                ReferenceTemplate::new(raw).expect_err("stray brace must be rejected"),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn reference_template_serde_cannot_bypass_validation() {
+        let raw = "arn:{partition}:lambda:{region}:{account}:function:{name}";
+        let template = ReferenceTemplate::new(raw).expect("declared template must validate");
+        assert_eq!(
+            serde_json::to_string(&template).expect("template must serialize as a string"),
+            serde_json::to_string(raw).unwrap(),
+        );
+        assert_eq!(
+            serde_json::from_str::<ReferenceTemplate>(&serde_json::to_string(raw).unwrap())
+                .expect("valid template must deserialize"),
+            template,
+        );
+
+        let invalid = serde_json::to_string("arn:{partition}:lambda:{name}:{name}").unwrap();
+        assert!(
+            serde_json::from_str::<ReferenceTemplate>(&invalid).is_err(),
+            "Deserialize must enter through ReferenceTemplate::new",
+        );
+    }
+
+    #[test]
+    fn provider_schema_envelope_roundtrips_reference_form_records() {
+        let identity = "aws.lambda.Function.Name".to_string();
+        let form = ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:lambda:{region}:{account}:function:{name}",
+            )
+            .unwrap(),
+        };
+        let envelope = ProviderSchemaEnvelope {
+            resources: Vec::new(),
+            reference_forms: vec![ReferenceFormDeclaration {
+                identity: identity.clone(),
+                form: form.clone(),
+            }],
+        };
+
+        let json = serde_json::to_string(&envelope).expect("envelope must serialize");
+        let decoded: ProviderSchemaEnvelope =
+            serde_json::from_str(&json).expect("envelope must deserialize");
+        assert!(decoded.resources.is_empty());
+        assert_eq!(decoded.reference_forms.len(), 1);
+        assert_eq!(decoded.reference_forms[0].identity, identity);
+        assert_eq!(decoded.reference_forms[0].form, form);
+    }
+
+    #[test]
+    fn in_flight_verdict_conversions_preserve_the_continuation() {
+        let pending = PendingCreate {
+            token: "next-token".to_string(),
+            identifier: Some(AppliedIdentifier::new("resource-123").unwrap()),
+            sent: Sent::only(["name"]),
+            poll_after_secs: 7,
+        };
+        let create: CreateVerdict<String, String, String> =
+            CreateVerdict::InFlight(CreateInFlight {
+                pending: pending.clone(),
+                error: "interrupted".to_string(),
+            });
+
+        let poll: PollVerdict<String, String, String> = create.clone().into();
+        assert_eq!(
+            poll,
+            PollVerdict::InFlight(CreateInFlight {
+                pending: pending.clone(),
+                error: "interrupted".to_string(),
+            })
+        );
+
+        let resume: ResumeVerdict<String, String, String> = create.into();
+        assert_eq!(
+            resume,
+            ResumeVerdict::Resent(CreateVerdict::InFlight(CreateInFlight {
+                pending,
+                error: "interrupted".to_string(),
+            }))
+        );
+    }
+
+    #[test]
+    fn resume_in_flight_payload_roundtrips() {
+        let in_flight = ResumeInFlight {
+            pending: ResumePending {
+                token: "resume-token".to_string(),
+                identifier: Some(AppliedIdentifier::new("resource-456").unwrap()),
+                poll_after_secs: 11,
+            },
+            error: "resume interrupted".to_string(),
+        };
+
+        let encoded = serde_json::to_string(&in_flight).expect("in-flight resume must serialize");
+        let decoded: ResumeInFlight<String, String> =
+            serde_json::from_str(&encoded).expect("in-flight resume must deserialize");
+        assert_eq!(decoded, in_flight);
     }
 
     #[test]
@@ -1473,8 +2086,8 @@ mod tests {
     }
 
     #[test]
-    fn ordered_maps_preserve_v12_state_json_bytes() {
-        assert_eq!(crate::PROTOCOL_VERSION, 12);
+    fn ordered_maps_preserve_v13_state_json_bytes() {
+        assert_eq!(crate::PROTOCOL_VERSION, 13);
         let state = State {
             id: ResourceId {
                 provider: "mock".into(),
@@ -1843,7 +2456,7 @@ mod tests {
                 "required":false
             }"#,
         )
-        .expect_err("protocol v12 requires write_only on every struct field");
+        .expect_err("protocol v13 requires write_only on every struct field");
 
         assert!(error.to_string().contains("missing field `write_only`"));
     }

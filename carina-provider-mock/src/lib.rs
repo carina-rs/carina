@@ -25,7 +25,8 @@ use carina_core::resource::{
     ConcreteValue, Resource, ResourceId, State, Value, legacy_secret_migration,
 };
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, StructField, ValidatedResourceSchema,
+    AttributeSchema, AttributeType, ResourceSchema, StructField, ValidatedConfigSchema,
+    ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 use carina_core::value::{PersistedValue, migrate_legacy_persisted_json};
 use serde::{Deserialize, Serialize};
@@ -322,6 +323,10 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                     .build(),
             )
             .attribute(AttributeSchema::optional("description", AttributeType::string()).build()),
+        ResourceSchema::new("iam.Roles").attribute(
+            AttributeSchema::optional("names", AttributeType::list(AttributeType::string()))
+                .build(),
+        ),
         ResourceSchema::new("iam.Roles")
             .attribute(AttributeSchema::optional("name_regex", AttributeType::string()).build())
             .attribute(
@@ -342,6 +347,16 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                 .expect("built-in mock resource schema must be valid")
         })
         .collect()
+}
+
+/// Aggregate schema witness exposed by Carina's built-in mock provider.
+pub fn builtin_schema_witness() -> ValidatedProviderSchemaWitness {
+    ValidatedProviderSchemaWitness::new(
+        builtin_schemas(),
+        ValidatedConfigSchema::default(),
+        Default::default(),
+    )
+    .expect("built-in mock schemas form a valid provider-wide witness")
 }
 
 pub struct MockProvider {
@@ -1574,6 +1589,9 @@ mod tests {
                 .iter()
                 .any(|schema| schema.as_schema().resource_type() == "test.deferred_source")
         );
+        let witness = builtin_schema_witness();
+        assert_eq!(witness.resources().len(), schemas.len());
+        assert!(witness.reference_forms().is_empty());
     }
 
     struct EnvGuard {
@@ -1639,7 +1657,9 @@ mod tests {
         let request = carina_core::executor::prepare_create_request(resource, &preparation)
             .await
             .expect("mock test resource should pass create preparation");
-        carina_core::executor::dispatch_create(provider, &id, request).await
+        let (create, _cancellation) =
+            carina_core::executor::dispatch_create(provider, &id, request);
+        create.await
     }
 
     fn persist_pending_for_resume(pending: &InFlightCreate) -> InFlightCreate {
@@ -1683,6 +1703,9 @@ mod tests {
             }
             carina_core::resource::Current::MissingIdentifier(state) => {
                 panic!("resume fixture loaded without an identifier: {state:?}")
+            }
+            carina_core::resource::Current::CreateOutcomeUnknown(unknown) => {
+                panic!("resume fixture loaded as outcome unknown: {unknown:?}")
             }
         }
     }
@@ -1762,6 +1785,12 @@ mod tests {
                 (expected, Err(CreateFailureKind::InFlight { pending, error })) => {
                     panic!("expected {expected}, got in flight {pending:?}: {error}")
                 }
+                (expected, Err(CreateFailureKind::OutcomeUnknown { unknown, error })) => {
+                    panic!(
+                        "expected {expected}, got outcome unknown for {}: {error}",
+                        unknown.id()
+                    )
+                }
             }
             drop(mode_guard);
         }
@@ -1790,6 +1819,12 @@ mod tests {
             Err(CreateFailureKind::Untracked(error)) => panic!("expected pending, got {error}"),
             Err(CreateFailureKind::Created { created, error }) => {
                 panic!("expected pending, got {created:?}: {error}")
+            }
+            Err(CreateFailureKind::OutcomeUnknown { unknown, error }) => {
+                panic!(
+                    "expected pending, got outcome unknown for {}: {error}",
+                    unknown.id()
+                )
             }
         };
         drop(create_mode);

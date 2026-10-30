@@ -4,6 +4,7 @@ use std::fmt;
 use carina_core::effect::{Effect, EffectGeneration};
 use carina_core::identifier::{DesiredCreateOnlyValues, StateCreateOnlyValues};
 use carina_core::plan::Plan;
+use carina_core::provider::{ComparisonResolutionError, ProviderRouter};
 use carina_core::resource::{Current, ResolvedResource, ResolvedResourceId, ResourceId, Value};
 use carina_core::schema::{SchemaRegistry, ValidatedResourceSchema};
 use colored::Colorize;
@@ -206,7 +207,8 @@ pub fn detect_moved_block_hints<S>(
     plan: &Plan<S>,
     prior: &HashMap<ResourceId, Current>,
     schemas: &SchemaRegistry,
-) -> MovedBlockHints {
+    comparison_provider: &ProviderRouter,
+) -> Result<MovedBlockHints, ComparisonResolutionError> {
     let mut replacement_creates = HashSet::new();
     let mut replacement_deletes = HashSet::new();
     for replacement in plan.replace_display_info() {
@@ -232,17 +234,15 @@ pub fn detect_moved_block_hints<S>(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let created = plan
-        .effects()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, effect)| match effect {
-            Effect::Create(resource) if !replacement_creates.contains(&index) => {
-                create_candidate(resource, schemas)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let mut created = Vec::new();
+    for (index, effect) in plan.effects().iter().enumerate() {
+        if let Effect::Create(resource) = effect
+            && !replacement_creates.contains(&index)
+            && let Some(candidate) = create_candidate(resource, schemas, comparison_provider)?
+        {
+            created.push(candidate);
+        }
+    }
 
     let mut destroyed_to_created = vec![Vec::new(); destroyed.len()];
     let mut created_to_destroyed = vec![Vec::new(); created.len()];
@@ -326,12 +326,12 @@ pub fn detect_moved_block_hints<S>(
     }
     components.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-    MovedBlockHints(
+    Ok(MovedBlockHints(
         components
             .into_iter()
             .map(|(_sort_key, hint)| hint)
             .collect(),
-    )
+    ))
 }
 
 struct DestroyCandidate<'a> {
@@ -342,6 +342,7 @@ struct DestroyCandidate<'a> {
 struct CreateCandidate<'schema> {
     id: ResolvedResourceId,
     schema: &'schema ValidatedResourceSchema,
+    comparison: carina_core::differ::ComparisonContext<'schema>,
     create_only_values: DesiredCreateOnlyValues,
 }
 
@@ -355,6 +356,7 @@ fn current_attributes(current: &Current) -> Option<&HashMap<String, Value>> {
         Current::Absent(state) => Some(&state.state().attributes),
         Current::Present(present) => Some(&present.state().attributes),
         Current::CreateInFlight(_pending) => None,
+        Current::CreateOutcomeUnknown(_unknown) => None,
         Current::MissingIdentifier(state) => Some(&state.state().attributes),
     }
 }
@@ -362,8 +364,15 @@ fn current_attributes(current: &Current) -> Option<&HashMap<String, Value>> {
 fn create_candidate<'schema, S>(
     created: &ResolvedResource<S>,
     schemas: &'schema SchemaRegistry,
-) -> Option<CreateCandidate<'schema>> {
-    let schema = schemas.get_for(created.as_resource())?.schema();
+    comparison_provider: &'schema ProviderRouter,
+) -> Result<Option<CreateCandidate<'schema>>, ComparisonResolutionError> {
+    let Some(schema) = schemas
+        .get_for(created.as_resource())
+        .map(|schema| schema.schema())
+    else {
+        return Ok(None);
+    };
+    let comparison = comparison_provider.comparison_for(schemas, &created.as_resource().id)?;
     let create_only_values = DesiredCreateOnlyValues::without_binding_resolution(
         created.as_resource(),
         schema.as_schema(),
@@ -371,14 +380,15 @@ fn create_candidate<'schema, S>(
     if !create_only_values.has_configured_values()
         || !create_only_values.all_configured_values_resolved()
     {
-        return None;
+        return Ok(None);
     }
 
-    Some(CreateCandidate {
+    Ok(Some(CreateCandidate {
         id: created.resolved_id(),
         schema,
+        comparison: *comparison.context(),
         create_only_values,
-    })
+    }))
 }
 
 /// Match only the create-only attributes set on the desired resource.
@@ -395,9 +405,11 @@ fn resources_match(destroyed: &DestroyCandidate<'_>, created: &CreateCandidate<'
 
     let prior_values =
         StateCreateOnlyValues::from_state_attributes(created.schema, destroyed.attributes);
-    created
-        .create_only_values
-        .all_match(&prior_values, created.schema.as_schema())
+    created.create_only_values.all_match(
+        &prior_values,
+        created.schema.as_schema(),
+        &created.comparison,
+    )
 }
 
 fn render_address(id: &ResolvedResourceId) -> String {
@@ -449,12 +461,31 @@ mod tests {
         AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
     };
 
-    use super::{MovedBlockHint, detect_moved_block_hints};
+    use super::{
+        MovedBlockHint, MovedBlockHints,
+        detect_moved_block_hints as detect_moved_block_hints_with_provider,
+    };
 
     const PROVIDER: &str = "awscc";
     const RESOURCE_TYPE: &str = "ec2.Vpc";
     const CREATE_ONLY_ATTRIBUTE: &str = "cidr_block";
     const CIDR: &str = "10.0.0.0/16";
+
+    fn detect_moved_block_hints<S>(
+        plan: &Plan<S>,
+        prior: &HashMap<ResourceId, Current>,
+        schemas: &SchemaRegistry,
+    ) -> MovedBlockHints {
+        let (_, comparison_provider) = carina_core::provider::comparison_fixture_for_test(
+            schemas,
+            plan.effects().iter().filter_map(|effect| match effect {
+                Effect::Create(resource) => Some(&resource.as_resource().id),
+                _ => None,
+            }),
+        );
+        detect_moved_block_hints_with_provider(plan, prior, schemas, &comparison_provider)
+            .expect("moved-hint comparison fixture must resolve")
+    }
 
     fn identity(value: &str) -> ResourceIdentity {
         ResourceIdentity::try_from(value.to_string()).expect("test identity must be non-empty")

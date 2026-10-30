@@ -8,9 +8,9 @@
 //! instead of silently degrading into an untyped string.
 //!
 //! The check fires at parse time, gated by whether provider custom types are
-//! loaded. Production runs through `enrich_provider_context`, which installs
-//! `ProviderCustomTypes::Loaded` once schemas have
-//! been collected; this test exercises the same CLI surface
+//! loaded. Production retains a `LoadedProviderContext` minted from the same
+//! validated provider witnesses as the schema registry; this test exercises
+//! the same CLI surface
 //! (`validate_with_factories`) that `carina-cli/tests/nested_module_call_ref_e2e.rs`
 //! does, so the fixture covers the real validate path end-to-end —
 //! including the [[feedback_directory_scoped_features]] requirement
@@ -68,8 +68,12 @@ impl ProviderFactory for AwsccTestFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-        Box::pin(async { Ok(Box::new(NoopProvider) as Box<dyn Provider>) })
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(NoopProvider)))
+        })
     }
     fn create_normalizer(
         &self,
@@ -78,6 +82,15 @@ impl ProviderFactory for AwsccTestFactory {
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
             let iam_policy_arn = AttributeType::refined_string_with_validator(

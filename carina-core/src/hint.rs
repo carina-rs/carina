@@ -12,7 +12,7 @@ use std::path::{Component, Path};
 /// as required by the CLI's positional argument layout.
 pub struct ProjectCommand<'a> {
     subcommand: &'static str,
-    argument: Option<CommandArgument<'a>>,
+    arguments: Vec<CommandArgument<'a>>,
     project_dir: &'a Path,
 }
 
@@ -30,7 +30,7 @@ impl<'a> ProjectCommand<'a> {
     pub fn new(subcommand: &'static str, project_dir: &'a Path) -> Self {
         Self {
             subcommand,
-            argument: None,
+            arguments: Vec::new(),
             project_dir,
         }
     }
@@ -38,14 +38,14 @@ impl<'a> ProjectCommand<'a> {
     /// Add a positional argument that must precede the project path, such as a
     /// lock ID. A leading `-` is protected with the `--` option terminator.
     pub fn with_argument(mut self, argument: &'a str) -> Self {
-        self.argument = Some(CommandArgument::Positional(argument));
+        self.arguments.push(CommandArgument::Positional(argument));
         self
     }
 
     /// Add a path argument that is the value of an option already included in
     /// the subcommand, such as the file following `plan --out`.
     pub fn with_path_argument(mut self, argument: &'a Path) -> Self {
-        self.argument = Some(CommandArgument::Path(argument));
+        self.arguments.push(CommandArgument::Path(argument));
         self
     }
 }
@@ -53,11 +53,13 @@ impl<'a> ProjectCommand<'a> {
 impl fmt::Display for ProjectCommand<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "carina {}", self.subcommand)?;
-        if let Some(argument) = &self.argument {
+        let mut options_terminated = false;
+        for argument in &self.arguments {
             match argument {
                 CommandArgument::Positional(argument) => {
-                    if argument.starts_with('-') {
+                    if argument.starts_with('-') && !options_terminated {
                         formatter.write_str(" --")?;
+                        options_terminated = true;
                     }
                     formatter.write_str(" ")?;
                     write_shell_word(formatter, argument)?;
@@ -165,6 +167,17 @@ mod tests {
                 .with_argument("lock-123")
                 .to_string(),
             "carina force-unlock lock-123 infra/foo"
+        );
+    }
+
+    #[test]
+    fn appends_project_dir_after_multiple_subcommand_arguments() {
+        assert_eq!(
+            ProjectCommand::new("state forget", Path::new("infra/foo bar"))
+                .with_argument("aws.acm.Certificate")
+                .with_argument("example cert")
+                .to_string(),
+            "carina state forget aws.acm.Certificate 'example cert' 'infra/foo bar'"
         );
     }
 

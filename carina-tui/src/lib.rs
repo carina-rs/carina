@@ -35,6 +35,7 @@ use ratatui::prelude::*;
 use carina_core::explicit::ExplicitFields;
 use carina_core::module::FileSignature;
 use carina_core::plan::Plan;
+use carina_core::provider::{ProviderError, ProviderRouter};
 use carina_core::resource::ResourceId;
 use carina_core::schema::SchemaRegistry;
 
@@ -187,9 +188,38 @@ pub fn handle_module_info_key(app: &mut ModuleInfoApp, code: KeyCode) -> KeyActi
 }
 
 /// Run the module info TUI with the given file signature.
-pub fn run_module_info(signature: &FileSignature) -> io::Result<()> {
+pub fn run_module_info(signature: &FileSignature) -> Result<(), TuiError> {
     let mut app = ModuleInfoApp::new(signature);
-    run_tui(module_info_ui::draw, handle_module_info_key, &mut app)
+    run_tui(module_info_ui::draw, handle_module_info_key, &mut app).map_err(TuiError::Io)
+}
+
+/// Typed failure at the interactive terminal boundary.
+///
+/// Display supplies only operation context. The provider or terminal I/O
+/// failure remains available through [`std::error::Error::source`], allowing
+/// command callers to add presentation without flattening it into a string.
+#[derive(Debug)]
+pub enum TuiError {
+    PlanDisplay(ProviderError),
+    Io(io::Error),
+}
+
+impl std::fmt::Display for TuiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PlanDisplay(_) => formatter.write_str("Failed to prepare TUI plan details"),
+            Self::Io(_) => formatter.write_str("TUI I/O failed"),
+        }
+    }
+}
+
+impl std::error::Error for TuiError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PlanDisplay(source) => Some(source),
+            Self::Io(source) => Some(source),
+        }
+    }
 }
 
 /// Run the TUI with the given plan and optional schemas.
@@ -204,9 +234,21 @@ pub fn run(
     schemas: &SchemaRegistry,
     historical_display: &carina_core::detail_rows::HistoricalDisplayAttributes,
     prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
-) -> io::Result<()> {
-    let mut app = App::new(plan, schemas, historical_display, prev_explicit);
-    run_tui(ui::draw, handle_key, &mut app)
+    provider: &ProviderRouter,
+) -> Result<(), TuiError> {
+    let mut app = app_for_run(plan, schemas, historical_display, prev_explicit, provider)?;
+    run_tui(ui::draw, handle_key, &mut app).map_err(TuiError::Io)
+}
+
+fn app_for_run(
+    plan: &Plan,
+    schemas: &SchemaRegistry,
+    historical_display: &carina_core::detail_rows::HistoricalDisplayAttributes,
+    prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
+    provider: &ProviderRouter,
+) -> Result<App, TuiError> {
+    App::new(plan, schemas, historical_display, prev_explicit, provider)
+        .map_err(TuiError::PlanDisplay)
 }
 
 fn run_tui<A>(
@@ -244,7 +286,8 @@ fn run_tui<A>(
 mod tests {
     use super::*;
     use carina_core::effect::Effect;
-    use carina_core::resource::{ResolvedResource, Resource};
+    use carina_core::provider::ComparisonResolutionError;
+    use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, State, Value};
 
     fn create(resource: Resource) -> Effect {
         Effect::Create(ResolvedResource::new(resource))
@@ -292,6 +335,54 @@ mod tests {
             KeyAction::Continue
         );
         assert_eq!(handle_key(&mut app, KeyCode::Tab), KeyAction::Continue);
+    }
+
+    #[test]
+    fn app_construction_tui_error_preserves_the_comparison_error_chain() {
+        let id = ResourceId::with_identity("test.Widget", "example");
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            identifier: crate::fixture_applied_identifier("widget-id"),
+            from: Box::new(
+                State::existing(
+                    id,
+                    HashMap::from([(
+                        "name".to_string(),
+                        Value::Concrete(ConcreteValue::String("old".into())),
+                    )]),
+                )
+                .with_identifier("widget-id"),
+            ),
+            to: ResolvedResource::new(
+                Resource::new("test.Widget", "example")
+                    .with_attribute("name", Value::Concrete(ConcreteValue::String("new".into()))),
+            ),
+            changed_attributes: vec!["name".to_string()],
+        });
+        let historical_display =
+            carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+
+        let error = match app_for_run(
+            &plan,
+            &SchemaRegistry::new(),
+            &historical_display,
+            None,
+            &ProviderRouter::new(),
+        ) {
+            Ok(_) => panic!("the missing comparison schema must reach the TUI boundary"),
+            Err(error) => error,
+        };
+
+        let provider_error = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<ProviderError>())
+            .expect("TuiError must retain ProviderError as its source");
+        assert!(matches!(
+            provider_error
+                .detail()
+                .cause()
+                .and_then(|source| source.downcast_ref::<ComparisonResolutionError>()),
+            Some(ComparisonResolutionError::MissingResourceSchema { .. })
+        ));
     }
 
     fn make_search_app() -> App {
