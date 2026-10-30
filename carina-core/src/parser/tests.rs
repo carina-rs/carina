@@ -14481,7 +14481,11 @@ let child = child_module { values = [vpc] }"#,
         .expect("nested structural module-argument use");
     assert!(matches!(
         &use_site.owner,
-        BindingUseOwner::ModuleArgument { call: owner, argument }
+        BindingUseOwner::ModuleArgument {
+            call: owner,
+            argument,
+            value_span: _,
+        }
             if owner == call.id() && argument == "values"
     ));
     assert!(matches!(
@@ -14592,7 +14596,11 @@ for item in ["one", "two"] {
         assert!(
             uses.iter().any(|use_site| matches!(
                 &use_site.owner,
-                BindingUseOwner::ModuleArgument { call: owner, argument }
+                BindingUseOwner::ModuleArgument {
+                    call: owner,
+                    argument,
+                    value_span: _,
+                }
                     if owner == call.id() && argument == "param"
             )),
             "each expanded call must own its corresponding use: {:?}",

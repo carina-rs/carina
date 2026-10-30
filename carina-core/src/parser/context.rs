@@ -431,6 +431,7 @@ impl<'a> ExpressionMode<'a> {
     pub(super) fn module_argument(
         call: super::ModuleCallId,
         argument: String,
+        value_span: super::SourceSpan,
         source_file: &'a std::path::Path,
         preprocessed_file: &'a super::PreprocessedFile,
         structural: StructuralSinkMode,
@@ -438,7 +439,11 @@ impl<'a> ExpressionMode<'a> {
         let path = AttributePath::root(argument.clone());
         Self {
             sink: Some(ExpressionSink {
-                owner: BindingUseOwner::ModuleArgument { call, argument },
+                owner: BindingUseOwner::ModuleArgument {
+                    call,
+                    argument,
+                    value_span,
+                },
                 root_path: path.clone(),
                 path,
                 source_file,
