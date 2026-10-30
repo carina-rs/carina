@@ -110,8 +110,9 @@ pub enum ExplicitFields {
     /// No authoring record for this position. A root projection passes
     /// attributes through unchanged, and a nested field/value projection
     /// treats it like `Leaf`. A uniquely paired `ListElements` entry is
-    /// different: its parent drops that whole element as server-added. Used as
-    /// the typed legacy-corruption marker
+    /// different: its parent drops that whole element as server-added only
+    /// when the element does not match the current desired list. Used as the
+    /// typed legacy-corruption marker
     /// when an older state migration encounters an empty `Struct`
     /// whose children may have been destroyed by an old write-path
     /// bug. A later desired-backed state write can seed it from current
@@ -672,10 +673,13 @@ fn carry_list(
                 &fresh_items[fresh_index],
                 item_context,
             );
-            if carried.pending_removal {
-                pending_removal = true;
-                rebuilt_elements[fresh_index] = carried.explicit;
-            }
+            // A mutually unique desired/fresh pairing is fresh authoring
+            // evidence. Always install the desired-derived rebuilt record,
+            // even when the prior record was the legacy `Unrecorded` marker.
+            // Only the unmatched branch below may preserve `Unrecorded` for a
+            // genuine provider-added element.
+            pending_removal |= carried.pending_removal;
+            rebuilt_elements[fresh_index] = carried.explicit;
         } else if let Some(fresh_index) = prior_to_fresh[prior_index]
             && matches!(
                 fresh_to_desired.get(fresh_index),
@@ -1162,23 +1166,80 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
 /// tree.
 ///
 /// The stored attribute map anchors [`ExplicitFields::ListElements`] records
-/// when the corresponding list is available. Missing or mismatched stored
-/// lists use the legacy union projection. Schema-aware list pairing uses the
-/// same equality as state writeback.
+/// when the corresponding list is available. Desired attributes distinguish
+/// authored elements from server additions even when legacy state recorded an
+/// authored element as [`ExplicitFields::Unrecorded`]. Missing or mismatched
+/// stored lists use the legacy union projection. Schema-aware list pairing
+/// uses the same equality as state writeback.
 pub struct ExplicitProjection<'a> {
     stored_attributes: &'a HashMap<String, Value>,
+    desired: ProjectionDesired<'a>,
     explicit: &'a ExplicitFields,
     schema: Option<&'a ResourceSchema>,
 }
 
+enum ProjectionDesired<'a> {
+    Attributes(HashMap<&'a str, &'a Value>),
+    Conservative,
+}
+
+#[derive(Clone, Copy)]
+enum ProjectionDesiredValue<'a> {
+    Present(&'a Value),
+    Absent,
+    Conservative,
+}
+
+impl ProjectionDesiredValue<'_> {
+    fn child(self, key: &str) -> Self {
+        match self {
+            Self::Present(Value::Concrete(ConcreteValue::Map(fields))) => {
+                fields.get(key).map_or(Self::Absent, Self::Present)
+            }
+            Self::Present(value) if !value.is_fully_resolved() => Self::Conservative,
+            Self::Present(_) | Self::Absent => Self::Absent,
+            Self::Conservative => Self::Conservative,
+        }
+    }
+}
+
 impl<'a> ExplicitProjection<'a> {
-    pub fn new(
+    /// Build a projection whose server-added classification is checked against
+    /// the resource's desired attributes.
+    pub fn for_desired<I>(
+        stored_attributes: &'a HashMap<String, Value>,
+        desired_attributes: I,
+        explicit: &'a ExplicitFields,
+        schema: Option<&'a ResourceSchema>,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (&'a String, &'a Value)>,
+    {
+        Self {
+            stored_attributes,
+            desired: ProjectionDesired::Attributes(
+                desired_attributes
+                    .into_iter()
+                    .map(|(key, value)| (key.as_str(), value))
+                    .collect(),
+            ),
+            explicit,
+            schema,
+        }
+    }
+
+    /// Build a projection for a path that genuinely has no desired resource.
+    ///
+    /// This mode never treats an `Unrecorded`-paired list element as a proven
+    /// server addition, so uncertain elements remain visible.
+    pub fn conservative(
         stored_attributes: &'a HashMap<String, Value>,
         explicit: &'a ExplicitFields,
         schema: Option<&'a ResourceSchema>,
     ) -> Self {
         Self {
             stored_attributes,
+            desired: ProjectionDesired::Conservative,
             explicit,
             schema,
         }
@@ -1213,9 +1274,19 @@ impl<'a> ExplicitProjection<'a> {
                 .schema
                 .and_then(|schema| schema.attributes.get(&key))
                 .map(|attribute| &attribute.attr_type);
+            let desired = match &self.desired {
+                ProjectionDesired::Attributes(attributes) => {
+                    attributes.get(key.as_str()).copied().map_or(
+                        ProjectionDesiredValue::Absent,
+                        ProjectionDesiredValue::Present,
+                    )
+                }
+                ProjectionDesired::Conservative => ProjectionDesiredValue::Conservative,
+            };
             let projected = project_value(
                 value,
                 self.stored_attributes.get(&key),
+                desired,
                 explicit,
                 attr_type,
                 defs,
@@ -1305,6 +1376,7 @@ struct ProjectedValue {
 fn project_value(
     value: Value,
     stored: Option<&Value>,
+    desired: ProjectionDesiredValue<'_>,
     explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
@@ -1338,6 +1410,7 @@ fn project_value(
                 let projected = project_value(
                     value,
                     stored_fields.and_then(|fields| fields.get(&key)),
+                    desired.child(&key),
                     child,
                     map_entry_subtype(attr_type, &key, defs),
                     defs,
@@ -1377,32 +1450,106 @@ fn project_value(
             }
 
             let item_type = list_element_type(attr_type, defs);
-            let pairings =
+            let stored_pairings =
                 pair_list_elements_with_uniqueness(&items, stored_items, item_type, defs);
+            let desired_by_current = match desired {
+                ProjectionDesiredValue::Present(Value::Concrete(ConcreteValue::List(
+                    desired_items,
+                ))) if desired_items.iter().all(Value::is_fully_resolved) => {
+                    // Pair in the normal desired -> current direction so each
+                    // desired element claims at most one current element. A
+                    // lower-scoring current candidate left unclaimed by that
+                    // assignment is not desired evidence; treating it as an
+                    // ambiguous match would resurface provider-added siblings.
+                    let stable_pairs = pair_list_elements(desired_items, &items, item_type, defs);
+                    let pairings =
+                        pair_list_elements_with_uniqueness(desired_items, &items, item_type, defs);
+                    let mut desired_by_current = vec![ProjectionDesiredValue::Absent; items.len()];
+                    for (desired_index, (current_index, pairing)) in
+                        stable_pairs.into_iter().zip(pairings).enumerate()
+                    {
+                        let Some(current_index) = current_index else {
+                            continue;
+                        };
+                        desired_by_current[current_index] = match pairing {
+                            ListElementPairing::Unique(unique_current_index) => {
+                                debug_assert_eq!(current_index, unique_current_index);
+                                ProjectionDesiredValue::Present(&desired_items[desired_index])
+                            }
+                            ListElementPairing::Ambiguous => ProjectionDesiredValue::Conservative,
+                            ListElementPairing::Unmatched => ProjectionDesiredValue::Absent,
+                        };
+                    }
+                    desired_by_current
+                }
+                ProjectionDesiredValue::Present(value) if !value.is_fully_resolved() => {
+                    vec![ProjectionDesiredValue::Conservative; items.len()]
+                }
+                ProjectionDesiredValue::Conservative => {
+                    vec![ProjectionDesiredValue::Conservative; items.len()]
+                }
+                ProjectionDesiredValue::Present(_) | ProjectionDesiredValue::Absent => {
+                    vec![ProjectionDesiredValue::Absent; items.len()]
+                }
+            };
             let mut projected_items = Vec::with_capacity(items.len());
             let mut projected_elements = Vec::with_capacity(items.len());
-            for (item, pairing) in items.into_iter().zip(pairings) {
-                match pairing {
-                    ListElementPairing::Unique(stored_index) => {
-                        let element = &elements[stored_index];
-                        if matches!(element, ExplicitFields::Unrecorded) {
-                            continue;
+            for ((item, stored_pairing), desired) in items
+                .into_iter()
+                .zip(stored_pairings)
+                .zip(desired_by_current)
+            {
+                let paired_stored = match stored_pairing {
+                    ListElementPairing::Unique(stored_index) => Some(&stored_items[stored_index]),
+                    ListElementPairing::Ambiguous | ListElementPairing::Unmatched => None,
+                };
+
+                let projected = match desired {
+                    ProjectionDesiredValue::Present(desired) => project_value(
+                        item,
+                        paired_stored,
+                        ProjectionDesiredValue::Present(desired),
+                        &union,
+                        item_type,
+                        defs,
+                    ),
+                    ProjectionDesiredValue::Conservative => project_value(
+                        item,
+                        paired_stored,
+                        ProjectionDesiredValue::Conservative,
+                        &union,
+                        item_type,
+                        defs,
+                    ),
+                    ProjectionDesiredValue::Absent => match stored_pairing {
+                        ListElementPairing::Unique(stored_index) => {
+                            let element = &elements[stored_index];
+                            if matches!(element, ExplicitFields::Unrecorded) {
+                                continue;
+                            }
+                            project_value(
+                                item,
+                                Some(&stored_items[stored_index]),
+                                ProjectionDesiredValue::Absent,
+                                element,
+                                item_type,
+                                defs,
+                            )
                         }
-                        let projected = project_value(
-                            item,
-                            Some(&stored_items[stored_index]),
-                            element,
-                            item_type,
-                            defs,
-                        );
-                        projected_items.push(projected.value);
-                        projected_elements.push(projected.authoring);
-                    }
-                    ListElementPairing::Ambiguous | ListElementPairing::Unmatched => {
-                        projected_items.push(project_legacy_value(item, &union));
-                        projected_elements.push(ProjectedAuthoring::from_unprojected(&union));
-                    }
-                }
+                        ListElementPairing::Ambiguous | ListElementPairing::Unmatched => {
+                            project_value(
+                                item,
+                                None,
+                                ProjectionDesiredValue::Absent,
+                                &union,
+                                item_type,
+                                defs,
+                            )
+                        }
+                    },
+                };
+                projected_items.push(projected.value);
+                projected_elements.push(projected.authoring);
             }
             ProjectedValue {
                 value: Value::Concrete(ConcreteValue::List(projected_items)),
@@ -1470,14 +1617,20 @@ mod tests {
     use crate::resource::{DeferredValue, UnknownReason};
     use indexmap::IndexMap;
 
-    fn project_against_stored(value: Value, stored: Value, explicit: &ExplicitFields) -> Value {
+    fn project_against_stored(
+        value: Value,
+        stored: Value,
+        desired: Value,
+        explicit: &ExplicitFields,
+    ) -> Value {
         let key = "value".to_string();
         let current_attributes = HashMap::from([(key.clone(), value)]);
         let stored_attributes = HashMap::from([(key.clone(), stored)]);
+        let desired_attributes = HashMap::from([(key.clone(), desired)]);
         let root = ExplicitFields::Struct {
             children: HashMap::from([(key.clone(), explicit.clone())]),
         };
-        ExplicitProjection::new(&stored_attributes, &root, None)
+        ExplicitProjection::for_desired(&stored_attributes, &desired_attributes, &root, None)
             .project_attributes(current_attributes)
             .into_attributes()
             .remove(&key)
@@ -1485,14 +1638,32 @@ mod tests {
     }
 
     fn project(value: Value, explicit: &ExplicitFields) -> Value {
-        project_against_stored(value.clone(), value, explicit)
+        project_against_stored(value.clone(), value.clone(), value, explicit)
+    }
+
+    fn project_conservatively_against_stored(
+        value: Value,
+        stored: Value,
+        explicit: &ExplicitFields,
+    ) -> Value {
+        let key = "value".to_string();
+        let current_attributes = HashMap::from([(key.clone(), value)]);
+        let stored_attributes = HashMap::from([(key.clone(), stored)]);
+        let root = ExplicitFields::Struct {
+            children: HashMap::from([(key.clone(), explicit.clone())]),
+        };
+        ExplicitProjection::conservative(&stored_attributes, &root, None)
+            .project_attributes(current_attributes)
+            .into_attributes()
+            .remove(&key)
+            .expect("projected test value")
     }
 
     fn project_attributes(
         attributes: HashMap<String, Value>,
         explicit: &ExplicitFields,
     ) -> HashMap<String, Value> {
-        ExplicitProjection::new(&attributes, explicit, None)
+        ExplicitProjection::for_desired(&attributes, &attributes, explicit, None)
             .project_attributes(attributes.clone())
             .into_attributes()
     }
@@ -1846,6 +2017,34 @@ mod tests {
             elements[2],
             ExplicitFields::Leaf,
             "a fresh out-of-band addition must remain visible"
+        );
+    }
+
+    #[test]
+    fn carried_list_rebuilds_legacy_unrecorded_element_that_matches_desired() {
+        let route_table_id = Value::Concrete(ConcreteValue::String("rtb-1".into()));
+        let prior_explicit = ExplicitFields::Struct {
+            children: HashMap::from([(
+                "items".to_string(),
+                ExplicitFields::ListElements {
+                    elements: vec![ExplicitFields::Unrecorded],
+                },
+            )]),
+        };
+        let carried = carried_items_explicit(
+            vec![route_table_id.clone()],
+            vec![route_table_id.clone()],
+            &prior_explicit,
+            vec![route_table_id],
+        );
+
+        let ExplicitFields::ListElements { elements } = root_items_child(&carried) else {
+            panic!("a uniquely aligned carried list must remain element-aware");
+        };
+        assert_eq!(
+            elements,
+            &[ExplicitFields::Leaf],
+            "a fresh element uniquely matched by concrete desired state must be rebuilt as authored"
         );
     }
 
@@ -2979,6 +3178,7 @@ mod tests {
             let projected = project_value(
                 current.clone(),
                 stored.as_ref(),
+                ProjectionDesiredValue::Conservative,
                 &explicit,
                 None,
                 empty_defs_for_schema_walks(),
@@ -3011,6 +3211,7 @@ mod tests {
         let projected = project_value(
             current,
             Some(&stored),
+            ProjectionDesiredValue::Conservative,
             &explicit,
             None,
             empty_defs_for_schema_walks(),
@@ -3063,9 +3264,10 @@ mod tests {
         let explicit = ExplicitFields::ListElements {
             elements: vec![authored_keyed_value(), ExplicitFields::Unrecorded],
         };
+        let desired = Value::Concrete(ConcreteValue::List(vec![authored.clone()]));
 
         assert_eq!(
-            project_against_stored(current.clone(), stored, &explicit),
+            project_against_stored(current.clone(), stored, desired, &explicit),
             Value::Concrete(ConcreteValue::List(vec![authored]))
         );
 
@@ -3078,6 +3280,89 @@ mod tests {
             pending: PendingPaths::try_new([vec!["value".to_string()]]).unwrap(),
         };
         assert_eq!(project(current.clone(), &whole_value), current);
+    }
+
+    #[test]
+    fn project_list_elements_keeps_unrecorded_element_ambiguous_in_desired() {
+        let item = |kind: &str, include_server: bool| {
+            let mut fields = IndexMap::from([
+                (
+                    "id".to_string(),
+                    Value::Concrete(ConcreteValue::String("same".into())),
+                ),
+                (
+                    "kind".to_string(),
+                    Value::Concrete(ConcreteValue::String(kind.to_string().into())),
+                ),
+            ]);
+            if include_server {
+                fields.insert(
+                    "server".to_string(),
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let first = item("first", true);
+        let second = item("second", true);
+        let current = Value::Concrete(ConcreteValue::List(vec![first, second]));
+        let desired = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([(
+                "id".to_string(),
+                Value::Concrete(ConcreteValue::String("same".into())),
+            )])),
+        )]));
+        let explicit = ExplicitFields::ListElements {
+            elements: vec![
+                ExplicitFields::Unrecorded,
+                ExplicitFields::Struct {
+                    children: HashMap::from([
+                        ("id".to_string(), ExplicitFields::Leaf),
+                        ("kind".to_string(), ExplicitFields::Leaf),
+                    ]),
+                },
+            ],
+        };
+
+        assert_eq!(
+            project_against_stored(current.clone(), current, desired, &explicit),
+            Value::Concrete(ConcreteValue::List(vec![
+                item("first", false),
+                item("second", false),
+            ]))
+        );
+    }
+
+    #[test]
+    fn conservative_projection_keeps_uniquely_paired_unrecorded_element() {
+        let item = keyed_value("uncertain", "one");
+        let current = Value::Concrete(ConcreteValue::List(vec![item.clone()]));
+        let explicit = ExplicitFields::ListElements {
+            elements: vec![ExplicitFields::Unrecorded],
+        };
+
+        assert_eq!(
+            project_conservatively_against_stored(current.clone(), current, &explicit),
+            Value::Concrete(ConcreteValue::List(vec![item]))
+        );
+    }
+
+    #[test]
+    fn project_list_elements_keeps_unrecorded_current_when_desired_element_is_unknown() {
+        let current_item = Value::Concrete(ConcreteValue::String("rtb-1".into()));
+        let current = Value::Concrete(ConcreteValue::List(vec![current_item.clone()]));
+        let desired = Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
+            DeferredValue::Unknown(UnknownReason::ForValue),
+        )]));
+        let explicit = ExplicitFields::ListElements {
+            elements: vec![ExplicitFields::Unrecorded],
+        };
+
+        assert_eq!(
+            project_against_stored(current.clone(), current, desired, &explicit),
+            Value::Concrete(ConcreteValue::List(vec![current_item])),
+            "an unresolved desired element cannot prove that the paired current element is server-added"
+        );
     }
 
     #[test]
@@ -3104,8 +3389,15 @@ mod tests {
                 },
             )]),
         };
+        let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "settings".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "attributes".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![authored.clone()])),
+            )]))),
+        )])));
 
-        let projected = project_against_stored(value.clone(), value, &explicit);
+        let projected = project_against_stored(value.clone(), value, desired, &explicit);
         let Value::Concrete(ConcreteValue::Map(root)) = projected else {
             panic!("expected root map");
         };
@@ -3135,9 +3427,10 @@ mod tests {
                 ExplicitFields::Unrecorded,
             ],
         };
+        let desired = Value::Concrete(ConcreteValue::List(Vec::new()));
 
         assert_eq!(
-            project_against_stored(current, stored, &explicit),
+            project_against_stored(current, stored, desired, &explicit),
             Value::Concrete(ConcreteValue::List(vec![duplicate]))
         );
     }
@@ -3157,9 +3450,10 @@ mod tests {
         let explicit = ExplicitFields::ListElements {
             elements: vec![authored_keyed_value(), ExplicitFields::Unrecorded],
         };
+        let desired = Value::Concrete(ConcreteValue::List(vec![authored.clone()]));
 
         assert_eq!(
-            project_against_stored(current, stored, &explicit),
+            project_against_stored(current, stored, desired, &explicit),
             Value::Concrete(ConcreteValue::List(vec![authored, out_of_band]))
         );
     }
