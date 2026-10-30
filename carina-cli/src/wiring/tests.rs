@@ -636,22 +636,11 @@ fn anonymous_to_named_fixed_point_uses_state_origin_after_undeclared_hash_projec
 }
 
 #[tokio::test]
-async fn anonymous_to_named_two_destinations_for_one_orphan_report_move_conflict() {
+async fn anonymous_to_named_two_destinations_for_one_orphan_are_ambiguous() {
     use carina_core::config_loader::load_configuration_with_config;
 
     const ANONYMOUS_NAME: &str = "test_thing_33333333";
-
-    let project = tempfile::tempdir().expect("create temporary project");
-    std::fs::write(project.path().join("providers.crn"), "provider test {}\n")
-        .expect("write provider fixture");
-    std::fs::write(
-        project.path().join("main.crn"),
-        "backend local { path = \"carina.state.json\" }\n",
-    )
-    .expect("write backend fixture");
-    std::fs::write(
-        project.path().join("resources.crn"),
-        r#"let first = test.thing {
+    let first_then_second = r#"let first = test.thing {
   mode = test.thing.Mode.allow
   priority = 7
 }
@@ -660,91 +649,101 @@ let second = test.thing {
   mode = test.thing.Mode.allow
   priority = 7
 }
-"#,
-    )
-    .expect("write competing resources fixture");
+"#;
+    let second_then_first = r#"let second = test.thing {
+  mode = test.thing.Mode.allow
+  priority = 7
+}
 
-    let loaded = load_configuration_with_config(
-        project.path(),
-        &carina_core::parser::ProviderContext::default(),
-        &SchemaRegistry::new(),
-    )
-    .expect("load multi-file fixture");
-    let parsed = loaded.parsed;
-    let provider_configs = resolved_provider_configs(&parsed);
-    let wiring = ValidatedWiring::from_factories_for_test(
-        vec![Box::new(RawEnumStateFactory)],
-        provider_configs.as_provider_configs(),
-    );
-    let canonical_resources = canonical_pair(
-        &parsed,
-        parsed.resources.clone(), // allow: direct — plan-time reconciliation
-        wiring.context().schemas(),
-    );
-    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+let first = test.thing {
+  mode = test.thing.Mode.allow
+  priority = 7
+}
+"#;
 
-    let mut row = carina_state::state::ResourceState::try_applied(
-        "thing",
-        ANONYMOUS_NAME,
-        "test",
-        "provider-id",
-    )
-    .expect("typed state identifier is non-empty")
-    .with_attribute("mode", serde_json::json!("Allow"))
-    .with_attribute("priority", serde_json::json!(7));
-    row.binding = None;
-    let mut persisted = StateFile::new();
-    persisted
-        .upsert_resource(row)
-        .expect("anonymous state row is unique");
-    let state_path = project.path().join("carina.state.json");
-    std::fs::write(
-        &state_path,
-        serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
-    )
-    .expect("write real state fixture");
-    let state_file = Some(
-        carina_state::state::check_and_migrate(
-            &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+    for resources in [first_then_second, second_then_first] {
+        let project = tempfile::tempdir().expect("create temporary project");
+        std::fs::write(project.path().join("providers.crn"), "provider test {}\n")
+            .expect("write provider fixture");
+        std::fs::write(
+            project.path().join("main.crn"),
+            "backend local { path = \"carina.state.json\" }\n",
         )
-        .expect("decode real state fixture")
-        .into_state(),
-    );
+        .expect("write backend fixture");
+        std::fs::write(project.path().join("resources.crn"), resources)
+            .expect("write competing resources fixture");
 
-    let error = match create_plan_from_parsed_with_upstream_with_ctx(
-        validated,
-        &provider_configs,
-        &state_file,
-        false,
-        ProgressSink::Human,
-        &HashMap::new(),
-        &StateBlockClaims::default(),
-        &ResolvedStateBlockTargets::default(),
-    )
-    .await
-    {
-        Ok(_) => panic!("two named resources must not claim one anonymous row arbitrarily"),
-        Err(error) => error,
-    };
+        let loaded = load_configuration_with_config(
+            project.path(),
+            &carina_core::parser::ProviderContext::default(),
+            &SchemaRegistry::new(),
+        )
+        .expect("load multi-file fixture");
+        let parsed = loaded.parsed;
+        let provider_configs = resolved_provider_configs(&parsed);
+        let wiring = ValidatedWiring::from_factories_for_test(
+            vec![Box::new(RawEnumStateFactory)],
+            provider_configs.as_provider_configs(),
+        );
+        let canonical_resources = canonical_pair(
+            &parsed,
+            parsed.resources.clone(), // allow: direct — plan-time reconciliation
+            wiring.context().schemas(),
+        );
+        let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
 
-    let AppError::DetectedMoveConflict {
-        from,
-        to,
-        existing_from,
-        existing_to,
-    } = error
-    else {
-        panic!("expected a typed move conflict, got {error:?}")
-    };
-    assert_eq!(from.identity_str(), ANONYMOUS_NAME);
-    assert_eq!(existing_from.identity_str(), ANONYMOUS_NAME);
-    assert_eq!(
-        HashSet::from([
-            to.identity_str().to_string(),
-            existing_to.identity_str().to_string(),
-        ]),
-        HashSet::from(["first".to_string(), "second".to_string()]),
-    );
+        let mut row = carina_state::state::ResourceState::try_applied(
+            "thing",
+            ANONYMOUS_NAME,
+            "test",
+            "provider-id",
+        )
+        .expect("typed state identifier is non-empty")
+        .with_attribute("mode", serde_json::json!("Allow"))
+        .with_attribute("priority", serde_json::json!(7));
+        row.binding = None;
+        let mut persisted = StateFile::new();
+        persisted
+            .upsert_resource(row)
+            .expect("anonymous state row is unique");
+        let state_path = project.path().join("carina.state.json");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
+        )
+        .expect("write real state fixture");
+        let state_file = Some(
+            carina_state::state::check_and_migrate(
+                &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+            )
+            .expect("decode real state fixture")
+            .into_state(),
+        );
+
+        let planned = create_plan_from_parsed_with_upstream_with_ctx(
+            validated,
+            &provider_configs,
+            &state_file,
+            false,
+            ProgressSink::Human,
+            &HashMap::new(),
+            &StateBlockClaims::default(),
+            &ResolvedStateBlockTargets::default(),
+        )
+        .await
+        .expect("a contested orphan must fall back to delete and create");
+
+        assert!(
+            planned
+                .resources()
+                .plan
+                .effects()
+                .iter()
+                .all(|effect| !matches!(effect, Effect::Move { .. })),
+            "neither resource may claim the contested row: {:#?}",
+            planned.resources().plan.effects(),
+        );
+    }
 }
 
 #[test]
@@ -5630,6 +5629,59 @@ fn projected_moved_binding_resolves_for_anonymous_to_named_detection() {
 }
 
 #[test]
+fn projected_removed_origin_is_hidden_from_type_candidates_and_binding_resolution() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let origin_binding = "old_rtb";
+    let projected_binding = "private_rtb";
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(route_table_state(origin_binding, "rtb-private"))
+        .expect("insert projected route-table state");
+
+    let origin = ResolvedResourceId::with_provider_identity(
+        "awscc",
+        "ec2.RouteTable",
+        test_identity(origin_binding),
+        None,
+    );
+    let projected = ResolvedResourceId::with_provider_identity(
+        "awscc",
+        "ec2.RouteTable",
+        test_identity(projected_binding),
+        None,
+    );
+    let claims = StateBlockClaims::new(
+        [StateBlockAddress::new(
+            "awscc",
+            "ec2.RouteTable",
+            origin_binding,
+        )]
+        .into_iter()
+        .collect(),
+        HashSet::new(),
+    );
+    let state_view =
+        AnonymousReconciliationStateView::new(&ctx, &state_file, &[(origin, projected)]);
+
+    assert!(
+        state_view
+            .entries_by_type(&claims, "awscc", "ec2.RouteTable")
+            .candidates()
+            .next()
+            .is_none(),
+        "a projected row claimed by removed.from must not be a type candidate",
+    );
+    assert!(
+        state_view
+            .entries_by_binding(&claims, projected_binding)
+            .is_empty(),
+        "the same removed row must not resolve a projected binding",
+    );
+}
+
+#[test]
 fn claimed_dependency_binding_is_hidden_from_anonymous_reconciliation() {
     use carina_state::state::StateFile;
 
@@ -8011,6 +8063,109 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
         addressed.orphans.contains_key(other_orphan_id.as_inner()),
         "the other matching row must remain an orphan and therefore a Delete candidate",
     );
+}
+
+#[test]
+fn late_anonymous_reconciliation_composes_from_projected_source_to_new_hash() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let origin_name = "ec2_subnet_route_table_association_11111111";
+    let early_name = "ec2_subnet_route_table_association_22222222";
+    let late_name = "ec2_subnet_route_table_association_33333333";
+    let desired = Resource::with_provider(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(early_name),
+        None,
+    )
+    .with_attribute(
+        "route_table_id",
+        Value::Concrete(ConcreteValue::String("rtb-private".into())),
+    )
+    .with_attribute(
+        "subnet_id",
+        Value::Concrete(ConcreteValue::String("subnet-a".into())),
+    );
+    let (mut resources, _) = build_override_aware_pair_for_test(
+        canonical_unresolved(vec![desired], ctx.schemas()),
+        None::<&StateFile>,
+        LivePreApplyInputs {
+            managed: &[],
+            compositions: &[],
+            managed_current: &HashMap::new(),
+            data_source_values: &DataSourceValues::empty(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        },
+    )
+    .expect("late-reconciliation fixture has no unresolved live references");
+
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(association_state(origin_name, "rtb-private", "subnet-a"))
+        .expect("test state setup must be valid");
+
+    let origin_id = ResolvedResourceId::with_provider_identity(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(origin_name),
+        None,
+    );
+    let early_id = ResolvedResourceId::new(resources.resources()[0].id.clone());
+    let desired_ids = HashSet::from([early_id.as_inner().clone()]);
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: state_file.build_orphans(&desired_ids).into_plan_orphans(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
+    let claims = StateBlockClaims::empty();
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let early_moves = reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        resources.resources(),
+        &[],
+        &state_view,
+        &claims,
+    );
+    apply_detected_resource_moves(
+        &mut addressed,
+        early_moves,
+        Some(&state_file),
+        MoveOverlapPolicy::ComposeForward,
+    )
+    .expect("early move must re-key its orphan state");
+    assert_eq!(
+        addressed.moved_pairs,
+        vec![(origin_id.clone(), early_id.clone())]
+    );
+
+    resources.resources_mut()[0].id = ResourceId::with_provider_identity(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(late_name),
+        None,
+    );
+    let late_id = ResolvedResourceId::new(resources.resources()[0].id.clone());
+
+    reconcile_late_anonymous_identities(
+        &ctx,
+        LateAnonymousIdentityInputs {
+            resources: &mut resources,
+            addressed: &mut addressed,
+            data_sources: &[],
+            state_file: Some(&state_file),
+            state_block_claims: &claims,
+            providers: &[],
+        },
+    )
+    .expect("late reconciliation must extend the early move chain");
+
+    assert_eq!(addressed.moved_pairs, vec![(origin_id, late_id.clone())]);
+    assert!(addressed.managed_current.contains_key(late_id.as_inner()));
+    assert!(!addressed.managed_current.contains_key(early_id.as_inner()));
 }
 
 #[test]

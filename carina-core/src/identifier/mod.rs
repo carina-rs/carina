@@ -692,7 +692,9 @@ pub fn canonical_create_only_value_string(value: &Value) -> Option<String> {
     match value {
         Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext().to_owned()),
         Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => Some(raw.as_str().to_string()),
-        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => Some(c.api_value().to_string()),
+        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+            Some(format!("EnumApiValue({:?})", c.api_value()))
+        }
         Value::Concrete(ConcreteValue::Int(i)) => Some(format!("Int({})", i)),
         Value::Concrete(ConcreteValue::Float(f)) => Some(format!("Float({})", f)),
         Value::Concrete(ConcreteValue::Bool(b)) => Some(format!("Bool({})", b)),
@@ -1129,28 +1131,57 @@ pub fn compute_anonymous_identifiers_with_provider_configs_for_test(
 /// State information needed for anonymous identifier reconciliation.
 #[derive(Clone)]
 pub struct AnonymousIdStateInfo {
-    /// The effective resource name presented to reconciliation. This may be a
-    /// projected move target rather than the persisted row identity.
-    pub name: String,
-    /// The persisted row identity that owns this candidate, before projection.
-    pub origin_identity: ResourceIdentity,
-    /// Provider-instance routing carried by that persisted row.
-    pub provider_instance: Option<String>,
-    /// Canonical create-only attribute values selected from persisted state.
-    pub create_only_values: CreateOnlyValues,
+    projected_id: ResolvedResourceId,
+    origin_id: ResolvedResourceId,
+    create_only_values: StateCreateOnlyValues,
 }
 
-fn resolved_anonymous_state_id(
-    provider: &str,
-    resource_type: &str,
-    entry: &AnonymousIdStateInfo,
-) -> ResolvedResourceId {
-    ResolvedResourceId::with_provider_identity(
-        provider,
-        resource_type,
-        entry.origin_identity.clone(),
-        entry.provider_instance.clone(),
-    )
+impl AnonymousIdStateInfo {
+    /// Build one reconciliation row from persisted values and an optional
+    /// already-applied projection of that same row.
+    ///
+    /// The full typed ids keep the effective name, persisted origin, and
+    /// provider route together. A projection across provider or resource type
+    /// is rejected instead of allowing callers to assemble inconsistent
+    /// identity fields.
+    pub fn try_from_state_attributes(
+        origin_id: ResolvedResourceId,
+        projected_id: Option<ResolvedResourceId>,
+        schema: &ValidatedResourceSchema,
+        attributes: &HashMap<String, Value>,
+    ) -> Option<Self> {
+        let projected_id = projected_id.unwrap_or_else(|| origin_id.clone());
+        if origin_id.provider() != projected_id.provider()
+            || origin_id.resource_type() != projected_id.resource_type()
+        {
+            return None;
+        }
+        Some(Self {
+            projected_id,
+            origin_id,
+            create_only_values: StateCreateOnlyValues::from_state_attributes(schema, attributes),
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        self.projected_id.identity_str()
+    }
+
+    pub fn origin_id(&self) -> &ResolvedResourceId {
+        &self.origin_id
+    }
+
+    pub fn projected_id(&self) -> &ResolvedResourceId {
+        &self.projected_id
+    }
+
+    pub fn create_only_values(&self) -> &StateCreateOnlyValues {
+        &self.create_only_values
+    }
+
+    fn move_to(&self, to: ResolvedResourceId) -> ResolvedMove {
+        ResolvedMove::from_detected_rename(self.origin_id.clone(), self.projected_id.clone(), to)
+    }
 }
 
 /// Cross-resource state information used to resolve simple deferred
@@ -1211,51 +1242,34 @@ fn canonical_or_resolved_create_only_value(
     ResolvedCreateOnlyValue::from_value(canonical).ok_or(UnresolvedReason::NotComparable)
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct ResolvedCreateOnlyValue {
-    canonical: String,
-    value: Option<Value>,
+    value: Value,
 }
 
 impl ResolvedCreateOnlyValue {
     fn from_value(value: Value) -> Option<Self> {
-        Some(Self {
-            canonical: canonical_create_only_value_string(&value)?,
-            value: Some(value),
-        })
-    }
-
-    #[cfg(test)]
-    fn from_comparison_string(canonical: String) -> Self {
-        Self {
-            canonical,
-            value: None,
-        }
+        canonical_create_only_value_string(&value)?;
+        Some(Self { value })
     }
 
     fn semantically_equal(&self, other: &Self, schema: &ResourceSchema, attribute: &str) -> bool {
-        match (&self.value, &other.value) {
-            (Some(left), Some(right)) => {
-                schema
-                    .attributes
-                    .get(attribute)
-                    .is_some_and(|attribute_schema| {
-                        crate::differ::type_aware_equal(
-                            left,
-                            right,
-                            Some(&attribute_schema.attr_type),
-                            &schema.defs,
-                        )
-                    })
-            }
-            _ => self.canonical == other.canonical,
-        }
+        schema
+            .attributes
+            .get(attribute)
+            .is_some_and(|attribute_schema| {
+                crate::differ::type_aware_equal(
+                    &self.value,
+                    &other.value,
+                    Some(&attribute_schema.attr_type),
+                    &schema.defs,
+                )
+            })
     }
 }
 
 /// Whether one configured desired create-only value can be compared yet.
-#[derive(Clone, PartialEq)]
-enum CreateOnlyValue {
+enum DesiredCreateOnlyValue {
     Resolved(ResolvedCreateOnlyValue),
     Unresolved,
 }
@@ -1266,21 +1280,20 @@ enum UnresolvedReason {
     Type(crate::schema::TypeError),
 }
 
-/// Canonical create-only values selected by a resource schema.
+/// Desired create-only values selected by a resource schema.
 ///
-/// This is the shared extraction and comparison seam for anonymous identity
-/// reconciliation and anonymous-to-named rename detection. Every configured
-/// desired attribute is retained as either a resolved canonical value or an
-/// unresolved marker. State values enter only through the persisted-state
-/// constructor after canonicalization.
-#[derive(Clone, Default)]
-pub struct CreateOnlyValues {
-    values: HashMap<String, CreateOnlyValue>,
+/// Every configured desired attribute is retained as either a resolved value
+/// or an unresolved marker. Persisted values use the separate
+/// [`StateCreateOnlyValues`] type so unresolved desired values cannot enter the
+/// state side of a comparison.
+pub struct DesiredCreateOnlyValues {
+    values: HashMap<String, DesiredCreateOnlyValue>,
 }
 
-impl CreateOnlyValues {
-    /// Extract the canonical create-only values configured on a resource.
-    pub fn of<S>(
+impl DesiredCreateOnlyValues {
+    /// Extract create-only values configured on a resource, resolving simple
+    /// state-backed binding references through `find_state_by_binding`.
+    pub fn from_resource<S>(
         resource: &Resource<S>,
         schema: &ResourceSchema,
         find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
@@ -1296,7 +1309,7 @@ impl CreateOnlyValues {
                         attribute,
                         find_state_by_binding,
                     ) {
-                        Ok(value) => CreateOnlyValue::Resolved(value),
+                        Ok(value) => DesiredCreateOnlyValue::Resolved(value),
                         Err(error) => {
                             match error {
                                 UnresolvedReason::NotComparable => tracing::debug!(
@@ -1310,7 +1323,7 @@ impl CreateOnlyValues {
                                     "create-only value is not available for identity comparison"
                                 ),
                             }
-                            CreateOnlyValue::Unresolved
+                            DesiredCreateOnlyValue::Unresolved
                         }
                     };
                     (attribute.to_string(), value)
@@ -1320,6 +1333,78 @@ impl CreateOnlyValues {
         Self { values }
     }
 
+    /// Extract desired values when binding resolution is intentionally not
+    /// available, such as post-diff moved-block hinting.
+    pub fn without_binding_resolution<S>(resource: &Resource<S>, schema: &ResourceSchema) -> Self {
+        Self::from_resource(resource, schema, &|_binding| Vec::new())
+    }
+
+    /// Whether at least one create-only attribute was configured.
+    pub fn has_configured_values(&self) -> bool {
+        !self.values.is_empty()
+    }
+
+    fn has_resolved_values(&self) -> bool {
+        self.values
+            .values()
+            .any(|value| matches!(value, DesiredCreateOnlyValue::Resolved(_)))
+    }
+
+    /// Whether every configured create-only attribute has a comparable value.
+    pub fn all_configured_values_resolved(&self) -> bool {
+        self.values
+            .values()
+            .all(|value| matches!(value, DesiredCreateOnlyValue::Resolved(_)))
+    }
+
+    fn match_counts(
+        &self,
+        state_values: &StateCreateOnlyValues,
+        schema: &ResourceSchema,
+    ) -> (usize, usize) {
+        let mut matched = 0;
+        let mut mismatched = 0;
+        for (attribute, desired_value) in &self.values {
+            let DesiredCreateOnlyValue::Resolved(desired_value) = desired_value else {
+                continue;
+            };
+            if let Some(state_value) = state_values.values.get(attribute) {
+                if desired_value.semantically_equal(state_value, schema, attribute) {
+                    matched += 1;
+                } else {
+                    mismatched += 1;
+                }
+            }
+        }
+        (matched, mismatched)
+    }
+
+    /// Compare every configured desired value with canonical persisted state
+    /// using the resource schema's type-aware equality rules.
+    pub fn all_match(&self, state_values: &StateCreateOnlyValues, schema: &ResourceSchema) -> bool {
+        self.values.iter().all(|(attribute, desired)| {
+            let DesiredCreateOnlyValue::Resolved(desired) = desired else {
+                return false;
+            };
+            let Some(state) = state_values.values.get(attribute) else {
+                return false;
+            };
+            desired.semantically_equal(state, schema, attribute)
+        })
+    }
+}
+
+/// Comparable create-only values selected from persisted state.
+///
+/// Construction always canonicalizes raw state through the validated resource
+/// schema. Unlike [`DesiredCreateOnlyValues`], this type cannot represent an
+/// unresolved configured value.
+#[derive(Clone)]
+pub struct StateCreateOnlyValues {
+    values: HashMap<String, ResolvedCreateOnlyValue>,
+}
+
+impl StateCreateOnlyValues {
     /// Canonicalize and select create-only values from raw persisted state.
     /// Missing or non-comparable state attributes remain absent.
     pub fn from_state_attributes(
@@ -1337,82 +1422,10 @@ impl CreateOnlyValues {
                     .get(attribute)
                     .cloned()
                     .and_then(ResolvedCreateOnlyValue::from_value)
-                    .map(|value| (attribute.to_string(), CreateOnlyValue::Resolved(value)))
+                    .map(|value| (attribute.to_string(), value))
             })
             .collect();
         Self { values }
-    }
-
-    #[cfg(test)]
-    fn from_comparison_strings(attributes: HashMap<String, String>) -> Self {
-        Self {
-            values: attributes
-                .into_iter()
-                .map(|(attribute, value)| {
-                    (
-                        attribute,
-                        CreateOnlyValue::Resolved(ResolvedCreateOnlyValue::from_comparison_string(
-                            value,
-                        )),
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    /// Whether at least one create-only attribute was configured.
-    pub fn has_configured_values(&self) -> bool {
-        !self.values.is_empty()
-    }
-
-    fn has_resolved_values(&self) -> bool {
-        self.values
-            .values()
-            .any(|value| matches!(value, CreateOnlyValue::Resolved(_)))
-    }
-
-    /// Whether every configured create-only attribute has a comparable value.
-    pub fn all_configured_values_resolved(&self) -> bool {
-        self.values
-            .values()
-            .all(|value| matches!(value, CreateOnlyValue::Resolved(_)))
-    }
-
-    fn match_counts(
-        &self,
-        state_values: &CreateOnlyValues,
-        schema: &ResourceSchema,
-    ) -> (usize, usize) {
-        let mut matched = 0;
-        let mut mismatched = 0;
-        for (attribute, desired_value) in &self.values {
-            let CreateOnlyValue::Resolved(desired_value) = desired_value else {
-                continue;
-            };
-            if let Some(CreateOnlyValue::Resolved(state_value)) = state_values.values.get(attribute)
-            {
-                if desired_value.semantically_equal(state_value, schema, attribute) {
-                    matched += 1;
-                } else {
-                    mismatched += 1;
-                }
-            }
-        }
-        (matched, mismatched)
-    }
-
-    /// Compare every configured desired value with canonical persisted state
-    /// using the resource schema's type-aware equality rules.
-    pub fn all_match(&self, state_values: &CreateOnlyValues, schema: &ResourceSchema) -> bool {
-        self.values.iter().all(|(attribute, desired)| {
-            let CreateOnlyValue::Resolved(desired) = desired else {
-                return false;
-            };
-            let Some(CreateOnlyValue::Resolved(state)) = state_values.values.get(attribute) else {
-                return false;
-            };
-            desired.semantically_equal(state, schema, attribute)
-        })
     }
 }
 
@@ -1453,11 +1466,13 @@ impl CreateOnlyValues {
 /// `provider_instance`, matching reconciliation candidate lookup and
 /// `StateFile::find_resource`.
 ///
-/// Every matching branch returns a [`ResolvedMove`] from the matched state row
-/// to the resource's resolved current address. This includes SimHash matches
-/// for older identifier formats and unique full or partial create-only
-/// matches. The move source carries the matched state row's provider-instance
-/// route, while the destination carries the desired resource's route.
+/// Every matching branch returns a [`ResolvedMove`] from the matched persisted
+/// row to the resource's resolved current address. This includes SimHash
+/// matches for older identifier formats and unique full or partial create-only
+/// matches. When an earlier move has already projected that row, the move also
+/// retains the projected source used for in-memory transfer. The persisted
+/// origin and projected source each keep their own provider-instance route;
+/// the destination carries the desired resource's route.
 pub fn reconcile_anonymous_identifiers(
     resources: &[Resource],
     data_sources: &[DataSource],
@@ -1514,11 +1529,15 @@ pub fn reconcile_anonymous_identifiers(
         );
 
         // If the resource's name already exists in state, no reconciliation is needed.
-        if state_entries.all().any(|e| e.name == resource_identity) {
+        if state_entries
+            .all()
+            .any(|entry| entry.name() == resource_identity)
+        {
             continue;
         }
 
-        let resource_co_values = CreateOnlyValues::of(resource, schema, find_state_by_binding);
+        let resource_co_values =
+            DesiredCreateOnlyValues::from_resource(resource, schema, find_state_by_binding);
 
         if !resource_co_values.has_resolved_values() {
             // No create-only properties or none set: use SimHash-based Hamming distance
@@ -1531,16 +1550,16 @@ pub fn reconcile_anonymous_identifiers(
 
             let candidates = state_entries
                 .candidates()
-                .filter(|entry| entry.name != resource_identity)
+                .filter(|entry| entry.name() != resource_identity)
                 .filter(|entry| {
                     !used_names
                         .get(&key)
-                        .is_some_and(|names| names.contains(&entry.name))
+                        .is_some_and(|names| names.contains(entry.name()))
                         && !claimed_names
                             .get(&key)
-                            .is_some_and(|names| names.contains(&entry.name))
+                            .is_some_and(|names| names.contains(entry.name()))
                 })
-                .filter_map(|entry| match extract_hash_from_identifier(&entry.name) {
+                .filter_map(|entry| match extract_hash_from_identifier(entry.name()) {
                     Some(AnonymousHashSuffix::SimHash(hash)) => Some((entry, hash)),
                     _ => None,
                 });
@@ -1552,19 +1571,11 @@ pub fn reconcile_anonymous_identifiers(
                 // pre-provider-prefix). Keep our freshly-computed new-format
                 // name on the resource and record a move so the wiring
                 // layer can re-key the state entry.
-                let from = resolved_anonymous_state_id(
-                    resolved_resource_id.provider(),
-                    resolved_resource_id.resource_type(),
-                    state_entry,
-                );
-                moves.push(ResolvedMove::from_detected_rename(
-                    from,
-                    resolved_resource_id.clone(),
-                ));
+                moves.push(state_entry.move_to(resolved_resource_id.clone()));
                 claimed_names
                     .entry(key)
                     .or_default()
-                    .insert(state_entry.name.clone());
+                    .insert(state_entry.name().to_string());
             }
             continue;
         }
@@ -1580,22 +1591,22 @@ pub fn reconcile_anonymous_identifiers(
         let mut full_matches: Vec<&AnonymousIdStateInfo> = Vec::new();
         let mut partial_matches: Vec<&AnonymousIdStateInfo> = Vec::new();
         for entry in state_entries.candidates() {
-            if entry.name == resource_identity {
+            if entry.name() == resource_identity {
                 // Same identifier, no reconciliation needed
                 continue;
             }
             if used_names
                 .get(&key)
-                .is_some_and(|names| names.contains(&entry.name))
+                .is_some_and(|names| names.contains(entry.name()))
                 || claimed_names
                     .get(&key)
-                    .is_some_and(|names| names.contains(&entry.name))
+                    .is_some_and(|names| names.contains(entry.name()))
             {
                 continue;
             }
 
             let (matched, mismatched) =
-                resource_co_values.match_counts(&entry.create_only_values, schema);
+                resource_co_values.match_counts(entry.create_only_values(), schema);
 
             if matched > 0 && mismatched == 0 {
                 full_matches.push(entry);
@@ -1613,19 +1624,11 @@ pub fn reconcile_anonymous_identifiers(
         };
 
         if let Some(matched_entry) = matched_name {
-            let from = resolved_anonymous_state_id(
-                resolved_resource_id.provider(),
-                resolved_resource_id.resource_type(),
-                matched_entry,
-            );
-            moves.push(ResolvedMove::from_detected_rename(
-                from,
-                resolved_resource_id,
-            ));
+            moves.push(matched_entry.move_to(resolved_resource_id));
             claimed_names
                 .entry(key)
                 .or_default()
-                .insert(matched_entry.name.clone());
+                .insert(matched_entry.name().to_string());
         }
     }
     moves
@@ -1677,7 +1680,9 @@ impl<'a> AnonymousToNamedCandidates<'a> {
 /// 2. The resource's binding name must not already exist in state
 /// 3. For resources with fully resolved configured create-only attributes:
 ///    exactly one orphaned anonymous state entry whose values all match wins.
-///    Ambiguous matches are skipped without a fallback.
+///    Ambiguous matches are skipped without a fallback. If otherwise-unique
+///    matches from multiple desired resources select the same orphan in one
+///    pass, every claim on that orphan is also skipped.
 /// 4. For resources with no configured create-only attributes, or with a
 ///    fully resolved create-only set that matches zero state rows, fall back
 ///    to SimHash Hamming-distance matching among rows that do not explicitly
@@ -1736,7 +1741,10 @@ pub fn detect_anonymous_to_named_renames(
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
 
         // Skip if the binding name already exists in state — nothing to rename.
-        if state_entries.all().any(|e| e.name == resource_identity) {
+        if state_entries
+            .all()
+            .any(|entry| entry.name() == resource_identity)
+        {
             continue;
         }
 
@@ -1750,20 +1758,21 @@ pub fn detect_anonymous_to_named_renames(
 
         // This is empty only when the resource configures no create-only
         // attributes. Configured-but-unresolved values remain explicit.
-        let resource_co_values = CreateOnlyValues::of(resource, schema, find_state_by_binding);
+        let resource_co_values =
+            DesiredCreateOnlyValues::from_resource(resource, schema, find_state_by_binding);
 
         let simhash_match = || {
             let resource_hash =
                 compute_resource_simhash(resource, providers, identity_attributes_fn);
             let candidates = state_entries
                 .candidates()
-                .filter(|entry| !used_in_dsl.contains(&entry.name))
+                .filter(|entry| !used_in_dsl.contains(entry.name()))
                 .filter(|entry| {
                     let (_matched, mismatched) =
-                        resource_co_values.match_counts(&entry.create_only_values, schema);
+                        resource_co_values.match_counts(entry.create_only_values(), schema);
                     mismatched == 0
                 })
-                .filter_map(|entry| match extract_hash_from_identifier(&entry.name) {
+                .filter_map(|entry| match extract_hash_from_identifier(entry.name()) {
                     Some(AnonymousHashSuffix::SimHash(hash)) => Some((entry, hash)),
                     _ => None,
                 });
@@ -1778,13 +1787,13 @@ pub fn detect_anonymous_to_named_renames(
             // Create-only path: find orphaned entries whose create-only values all match.
             let mut matches: Vec<&AnonymousIdStateInfo> = Vec::new();
             for entry in state_entries.candidates() {
-                if used_in_dsl.contains(&entry.name) {
+                if used_in_dsl.contains(entry.name()) {
                     continue;
                 }
-                if extract_hash_from_identifier(&entry.name).is_none() {
+                if extract_hash_from_identifier(entry.name()).is_none() {
                     continue;
                 }
-                let all_match = resource_co_values.all_match(&entry.create_only_values, schema);
+                let all_match = resource_co_values.all_match(entry.create_only_values(), schema);
                 if all_match {
                     matches.push(entry);
                 }
@@ -1803,17 +1812,24 @@ pub fn detect_anonymous_to_named_renames(
         };
 
         if let Some(entry) = matched_entry {
-            let from = resolved_anonymous_state_id(
-                &resource.id.provider,
-                &resource.id.resource_type,
-                entry,
-            );
             let Some(to) = ResolvedResourceId::try_new(resource.id.clone()) else {
                 continue;
             };
-            renames.push(ResolvedMove::from_detected_rename(from, to));
+            renames.push(entry.move_to(to));
         }
     }
+
+    let mut claims_per_origin = HashMap::<ResourceId, usize>::new();
+    for resolved_move in &renames {
+        *claims_per_origin
+            .entry(resolved_move.from().as_inner().clone())
+            .or_default() += 1;
+    }
+    renames.retain(|resolved_move| {
+        claims_per_origin
+            .get(resolved_move.from().as_inner())
+            .is_some_and(|count| *count == 1)
+    });
 
     renames
 }

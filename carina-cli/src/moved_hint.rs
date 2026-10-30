@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use carina_core::effect::{Effect, EffectGeneration};
-use carina_core::identifier::CreateOnlyValues;
+use carina_core::identifier::{DesiredCreateOnlyValues, StateCreateOnlyValues};
 use carina_core::plan::Plan;
 use carina_core::resource::{Current, ResolvedResource, ResolvedResourceId, ResourceId, Value};
 use carina_core::schema::{SchemaRegistry, ValidatedResourceSchema};
@@ -342,7 +342,7 @@ struct DestroyCandidate<'a> {
 struct CreateCandidate<'schema> {
     id: ResolvedResourceId,
     schema: &'schema ValidatedResourceSchema,
-    create_only_values: CreateOnlyValues,
+    create_only_values: DesiredCreateOnlyValues,
 }
 
 enum GraphNode {
@@ -364,10 +364,10 @@ fn create_candidate<'schema, S>(
     schemas: &'schema SchemaRegistry,
 ) -> Option<CreateCandidate<'schema>> {
     let schema = schemas.get_for(created.as_resource())?.schema();
-    let create_only_values =
-        CreateOnlyValues::of(created.as_resource(), schema.as_schema(), &|_binding| {
-            Vec::new()
-        });
+    let create_only_values = DesiredCreateOnlyValues::without_binding_resolution(
+        created.as_resource(),
+        schema.as_schema(),
+    );
     if !create_only_values.has_configured_values()
         || !create_only_values.all_configured_values_resolved()
     {
@@ -394,7 +394,7 @@ fn resources_match(destroyed: &DestroyCandidate<'_>, created: &CreateCandidate<'
     }
 
     let prior_values =
-        CreateOnlyValues::from_state_attributes(created.schema, destroyed.attributes);
+        StateCreateOnlyValues::from_state_attributes(created.schema, destroyed.attributes);
     created
         .create_only_values
         .all_match(&prior_values, created.schema.as_schema())

@@ -2455,7 +2455,17 @@ struct AnonymousReconciliationStateView {
 struct AnonymousIdBindingViewEntry {
     value: AnonymousIdBindingStateInfo,
     origin: ResourceId,
-    projected: bool,
+    effective: ResourceId,
+}
+
+impl AnonymousIdBindingViewEntry {
+    fn is_visible_to_binding_resolution(&self, claims: &StateBlockClaims) -> bool {
+        // A claimed source is normally unavailable to heuristic reads. A
+        // moved row is the exception: its matching target claim makes the
+        // projected address readable. A removed row has no target claim and
+        // therefore remains hidden even if another phase projected it.
+        !claims.claims_from(&self.origin) || claims.claims_to(&self.effective)
+    }
 }
 
 impl AnonymousReconciliationStateView {
@@ -2490,43 +2500,38 @@ impl AnonymousReconciliationStateView {
                 projected_id.provider().to_string(),
                 projected_id.resource_type().to_string(),
             );
-            let create_only_values = ctx
+            let state_info = ctx
                 .schemas()
                 .get(
                     projected_id.provider(),
                     projected_id.resource_type(),
                     carina_core::schema::SchemaKind::Resource,
                 )
-                .map(|schema| {
-                    identifier::CreateOnlyValues::from_state_attributes(
+                .and_then(|schema| {
+                    AnonymousIdStateInfo::try_from_state_attributes(
+                        state_row_id.clone(),
+                        projected_target.cloned(),
                         schema.schema(),
                         &attribute_values,
                     )
-                })
-                .unwrap_or_default();
+                });
             let projected_name = projected_id.identity_str().to_string();
-            origins_by_projected_name
-                .entry(type_key.clone())
-                .or_default()
-                .entry(projected_name.clone())
-                .or_default()
-                .push(state_row_id.as_inner().clone());
-            if !has_persisted_attributes {
-                existence_only_by_type
+            if let Some(state_info) = state_info {
+                origins_by_projected_name
                     .entry(type_key.clone())
                     .or_default()
-                    .insert(projected_name.clone());
-            }
+                    .entry(projected_name.clone())
+                    .or_default()
+                    .push(state_row_id.as_inner().clone());
+                if !has_persisted_attributes {
+                    existence_only_by_type
+                        .entry(type_key.clone())
+                        .or_default()
+                        .insert(projected_name.clone());
+                }
 
-            by_type
-                .entry(type_key)
-                .or_default()
-                .push(AnonymousIdStateInfo {
-                    name: projected_name.clone(),
-                    origin_identity: state_row_id.identity().clone(),
-                    provider_instance: state_row_id.provider_instance().map(str::to_string),
-                    create_only_values,
-                });
+                by_type.entry(type_key).or_default().push(state_info);
+            }
             let projected = projected_target.is_some();
             let effective_binding = if projected {
                 Some(projected_name.clone())
@@ -2541,7 +2546,7 @@ impl AnonymousReconciliationStateView {
                             attribute_values,
                         },
                         origin: state_row_id.as_inner().clone(),
-                        projected,
+                        effective: projected_id.as_inner().clone(),
                     },
                 );
             }
@@ -2577,12 +2582,10 @@ impl AnonymousReconciliationStateView {
             })
             .collect::<HashSet<_>>();
         claims
-            .screen_entries(provider, resource_type, entries, |entry| {
-                entry.name.as_str()
-            })
+            .screen_entries(provider, resource_type, entries, AnonymousIdStateInfo::name)
             .exclude_candidates(|entry| {
-                existence_only.is_some_and(|names| names.contains(&entry.name))
-                    || claimed_origin_names.contains(entry.name.as_str())
+                existence_only.is_some_and(|names| names.contains(entry.name()))
+                    || claimed_origin_names.contains(entry.name())
             })
     }
 
@@ -2595,7 +2598,7 @@ impl AnonymousReconciliationStateView {
             .get(binding)
             .into_iter()
             .flatten()
-            .filter(|entry| entry.projected || !claims.claims_from(&entry.origin))
+            .filter(|entry| entry.is_visible_to_binding_resolution(claims))
             .map(|entry| entry.value.clone())
             .collect()
     }
@@ -4119,12 +4122,16 @@ fn conflicting_move<'a>(
     policy: MoveOverlapPolicy,
 ) -> Option<&'a (ResolvedResourceId, ResolvedResourceId)> {
     moved_pairs.iter().find(|(existing_from, existing_to)| {
-        let continues_forward = existing_to == resolved_move.from()
+        let continues_forward = existing_to == resolved_move.projected_from()
+            && (existing_from == resolved_move.from()
+                || resolved_move.from() == resolved_move.projected_from())
             && existing_from != resolved_move.to()
-            && resolved_move.from() != resolved_move.to();
+            && resolved_move.projected_from() != resolved_move.to();
         let overlaps = existing_from == resolved_move.from()
+            || existing_from == resolved_move.projected_from()
             || existing_from == resolved_move.to()
             || existing_to == resolved_move.from()
+            || existing_to == resolved_move.projected_from()
             || existing_to == resolved_move.to();
         let composition_is_allowed = match policy {
             MoveOverlapPolicy::ComposeForward => continues_forward,
@@ -4173,11 +4180,15 @@ fn apply_detected_resource_moves(
         addressed
             .saved_attrs
             .remap_resource_id(authority.from(), authority.to().clone());
+        let projected_from = resolved_move.projected_from().clone();
         let (from, to) = resolved_move.into_parts();
-        if let Some((_origin, prior_target)) = addressed
-            .moved_pairs
-            .iter_mut()
-            .find(|(_origin, prior_target)| prior_target == &from)
+        if let Some((_origin, prior_target)) =
+            addressed
+                .moved_pairs
+                .iter_mut()
+                .find(|(origin, prior_target)| {
+                    prior_target == &projected_from && (origin == &from || from == projected_from)
+                })
         {
             *prior_target = to;
         } else {
