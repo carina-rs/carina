@@ -86,6 +86,77 @@ fn anonymous_loop_attribute_derived_diagnostic_has_exact_range() {
 }
 
 #[test]
+fn anonymous_plain_and_single_loop_member_both_receive_diagnostics() {
+    let source = concat!(
+        "mock.test.Thing { name = 'plain' }\n",
+        "for name in ['loop'] {\n",
+        "  mock.test.Thing { name = name }\n",
+        "}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+
+    let plain = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .starts_with("Anonymous resource identity is derived from mutable attributes")
+                && diagnostic.message.contains("'mock.test.Thing'")
+        })
+        .collect::<Vec<_>>();
+    let loops = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("produced by the unbound `for`"))
+        .collect::<Vec<_>>();
+    assert_eq!(plain.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(loops.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        loops[0].range,
+        Range::new(Position::new(1, 0), Position::new(3, 1))
+    );
+}
+
+#[test]
+fn distinct_single_element_loops_receive_two_diagnostics() {
+    let source = concat!(
+        "for name in ['alpha'] {\n  mock.test.Thing { name = name }\n}\n",
+        "for name in ['beta'] {\n  mock.test.Thing { name = name }\n}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let loops = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("produced by the unbound `for`"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(loops.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(loops[0].range.start.line, 0);
+    assert_eq!(loops[1].range.start.line, 3);
+}
+
+#[test]
+fn sibling_single_element_loops_each_receive_their_own_diagnostic() {
+    let temp = tempfile::tempdir().expect("create diagnostic fixture");
+    let a = "for name in ['alpha'] {\n  mock.test.Thing { name = name }\n}\n";
+    let b = "for name in ['beta'] {\n  mock.test.Thing { name = name }\n}\n";
+    std::fs::write(temp.path().join("a.crn"), a).expect("write a fixture");
+    std::fs::write(temp.path().join("b.crn"), b).expect("write b fixture");
+    std::fs::write(temp.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write provider fixture");
+
+    for (file, source) in [("a.crn", a), ("b.crn", b)] {
+        let path = temp.path().join(file);
+        let diagnostics =
+            anonymous_loop_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+        let loops = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("produced by the unbound `for`"))
+            .collect::<Vec<_>>();
+        assert_eq!(loops.len(), 1, "{file} diagnostics: {diagnostics:#?}");
+        assert!(loops[0].message.contains(&format!("at {file}:1")));
+    }
+}
+
+#[test]
 fn anonymous_loop_identical_identity_diagnostic_has_exact_range() {
     let source =
         "for name in ['same', 'same'] {\n  mock.test.resource {\n    name = name\n  }\n}\n";

@@ -8281,35 +8281,50 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
     );
 }
 
-#[test]
-fn unbound_deferred_create_absorbs_same_kind_anonymous_current_delete() {
+fn unbound_deferred_test_target() -> DeferredCreateTarget {
     let parsed = parse(
         "let upstream = upstream_state { source = '../upstream' }\n\
-         for value in upstream.values {\n\
+         for value in upstream.accounts {\n\
            mock.test.Child { identity_input = value }\n\
          }\n",
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("unbound deferred loop parses");
-    let target = DeferredCreateTarget::from_deferred(&parsed.deferred_for_expressions[0])
-        .expect("deferred target has a system identity");
-    let anonymous_id = ResolvedResourceId::with_provider_identity(
+    DeferredCreateTarget::from_deferred(&parsed.deferred_for_expressions[0])
+        .expect("deferred target has a system identity")
+}
+
+fn delete_effect_for_unbound_child(
+    identity: &str,
+    binding: Option<&str>,
+) -> (carina_core::resource::ResolvedResourceId, Effect) {
+    let id = ResolvedResourceId::with_provider_identity(
         "mock",
         "test.Child",
-        "mock_test_child_deadbeef",
+        carina_core::resource::ResourceIdentity::try_from(identity.to_string())
+            .expect("test identity is non-empty"),
         None,
     );
-    let mut plan = Plan::new();
-    plan.add(Effect::Delete {
-        id: anonymous_id.clone(),
+    let effect = Effect::Delete {
+        id: id.clone(),
         identifier: crate::fixture_applied_identifier("old-child"),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
-        binding: None,
+        binding: binding.map(str::to_string),
         dependencies: std::collections::HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
         blocked_by_updates: std::collections::HashSet::new(),
-    });
+    };
+    (id, effect)
+}
+
+#[test]
+fn unbound_deferred_create_absorbs_exact_legacy_current_delete() {
+    let target = unbound_deferred_test_target();
+    let (legacy_id, legacy_delete) =
+        delete_effect_for_unbound_child("_accounts.alpha", Some("_accounts.alpha"));
+    let mut plan = Plan::new();
+    plan.add(legacy_delete);
 
     add_deferred_create_effects(&mut plan, &[target]);
 
@@ -8320,14 +8335,54 @@ fn unbound_deferred_create_absorbs_same_kind_anonymous_current_delete() {
             Effect::DeferredReplace(payload) => Some(payload),
             _ => None,
         })
-        .expect("anonymous current row must be owned by DeferredReplace");
+        .expect("the exact legacy row must be owned by DeferredReplace");
     assert_eq!(payload.deletes.len(), 1);
-    assert_eq!(payload.deletes[0].id, anonymous_id);
+    assert_eq!(payload.deletes[0].id, legacy_id);
+    assert_eq!(
+        payload.deletes[0].binding.as_deref(),
+        Some("_accounts.alpha")
+    );
     assert!(
         plan.effects()
             .iter()
             .all(|effect| !matches!(effect, Effect::Delete { .. })),
-        "the anonymous delete must not race the runtime child as a standalone effect",
+        "the legacy delete must not race the runtime recreate",
+    );
+}
+
+#[test]
+fn unbound_deferred_create_keeps_unrelated_anonymous_delete_plain() {
+    let target = unbound_deferred_test_target();
+    let anonymous_id = ResolvedResourceId::with_provider_identity(
+        "mock",
+        "test.Child",
+        "mock_test_child_deadbeef",
+        None,
+    );
+    let (_, anonymous_delete) = delete_effect_for_unbound_child("mock_test_child_deadbeef", None);
+    let mut plan = Plan::new();
+    plan.add(anonymous_delete);
+
+    add_deferred_create_effects(&mut plan, &[target]);
+
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
+        "an unrelated anonymous row does not belong to this loop",
+    );
+    assert!(
+        plan
+        .effects()
+        .iter()
+            .any(|effect| matches!(effect, Effect::Delete { id, binding: None, .. } if id == &anonymous_id)),
+        "the unrelated anonymous row must remain a standalone Delete",
+    );
+    assert!(
+        plan.effects()
+            .iter()
+            .all(|effect| !matches!(effect, Effect::DeferredReplace(_))),
+        "an unrelated anonymous row must not be absorbed",
     );
 }
 

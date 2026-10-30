@@ -3520,6 +3520,76 @@ fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
     );
 }
 
+#[test]
+fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
+    let parsed = carina_core::parser::parse_file(
+        "let upstream = upstream_state { source = '../upstream' }\n\
+         for value in upstream.values {\n\
+           mock.test.resource { name = value }\n\
+         }\n",
+        std::path::Path::new("main.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("unbound deferred loop parses");
+    let mut template = parsed.deferred_for_expressions[0].clone();
+    assert!(matches!(
+        template.target,
+        carina_core::parser::DeferredForTarget::Unbound { .. }
+    ));
+    template.template_resource.id = carina_core::resource::ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "incorrectly_resolved",
+        None,
+    );
+    let mut plan = Plan::new();
+    plan.add(Effect::DeferredCreate {
+        id: carina_core::resource::ResolvedResourceId::with_provider_identity(
+            "mock",
+            "__deferred_for",
+            "unbound_loop",
+            None,
+        ),
+        template: Box::new(template),
+    });
+    let plan_file = record_test_plan(
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-10-30T00:00:00Z".to_string(),
+            source_path: "main.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
+            backend_config: None,
+            plan,
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        },
+        &["mock"],
+    );
+
+    let error = plan_file
+        .validate_resource_identities()
+        .expect_err("unbound deferred templates require a pending identity");
+    assert!(
+        error.contains("plan.effects[0].template_resource")
+            && error.contains("unbound deferred target")
+            && error.contains("pending"),
+        "unexpected validation error: {error}",
+    );
+}
+
 fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
     use std::time::Duration;
 

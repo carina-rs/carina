@@ -21,7 +21,7 @@ use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, RawEnumIdentifier, Resource,
     ResourceId, ResourceIdentity, UnknownReason, Value,
 };
-use crate::schema::TypeIdentity;
+use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
 
 fn resolve_modules(parsed: &mut ParsedFile, base_dir: &std::path::Path) -> Result<(), ModuleError> {
     super::resolve_modules(parsed, base_dir)
@@ -56,6 +56,110 @@ fn module_arguments(
         .into_iter()
         .map(|(name, value)| (name, ModuleArgument::new(value)))
         .collect()
+}
+
+#[test]
+fn nested_unbound_module_loop_migrates_composed_legacy_address() {
+    let root = tempfile::tempdir().expect("temporary configuration root");
+    let module_dir = root.path().join("modules/network");
+    fs::create_dir_all(&module_dir).expect("create module directory");
+    fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  label: String\n}\n\n\
+         for inner in ['inner'] {\n  mock.test.resource { name = inner }\n}\n",
+    )
+    .expect("write module fixture");
+    let root_source = "let network = use { source = './modules/network' }\n\n\
+                       for outer in ['outer'] {\n  network { label = outer }\n}\n";
+    let root_file = root.path().join("main.crn");
+    fs::write(&root_file, root_source).expect("write root fixture");
+
+    let mut parsed =
+        crate::parser::parse_file(root_source, &root_file, &ProviderContext::default())
+            .expect("root fixture parses");
+    resolve_modules(&mut parsed, root.path()).expect("nested loop module expands");
+    assert_eq!(
+        parsed.resources.len(),
+        1,
+        "fixture emits one inner resource"
+    );
+    assert_eq!(
+        parsed.resources[0]
+            .loop_provenance
+            .display_origin()
+            .expect("inner loop origin")
+            .file(),
+        "modules/network/main.crn",
+        "loop origin labels must be relative to the configuration root",
+    );
+
+    let mut registry = crate::schema::SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .expect("resource schema is valid"),
+    );
+    crate::identifier::compute_anonymous_identifiers_for_test(
+        &mut parsed.resources,
+        &[],
+        &registry,
+        &|_| Vec::new(),
+    )
+    .expect("compute anonymous identity");
+
+    let identity = parsed.resources[0]
+        .id
+        .identity()
+        .expect("computed resource identity");
+    let candidates = parsed.resources[0]
+        .loop_provenance
+        .legacy_candidates(identity)
+        .into_iter()
+        .map(|candidate| candidate.exact_state_name().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate == "_for0[0]._for0[0]"),
+        "nested loop expansion must retain the recursively composed legacy address: {candidates:?}",
+    );
+
+    let claims = crate::identifier::StateBlockClaims::empty();
+    let state_entry = crate::identifier::AnonymousIdStateInfo {
+        name: "_for0[0]._for0[0]".to_string(),
+        provider_instance: None,
+        create_only_values: HashMap::from([("name".to_string(), "inner".to_string())]),
+    };
+    let moves = crate::identifier::detect_legacy_loop_address_moves(
+        &parsed.resources,
+        &registry,
+        &|provider, resource_type| {
+            claims.screen_entries(provider, resource_type, [state_entry.clone()], |entry| {
+                entry.name.as_str()
+            })
+        },
+        &claims,
+        &[],
+    );
+    assert_eq!(
+        moves.len(),
+        1,
+        "the nested legacy row must migrate exactly once"
+    );
+    assert_eq!(moves[0].from().identity_str(), "_for0[0]._for0[0]");
+    assert_eq!(
+        moves[0].to().identity_str(),
+        parsed.resources[0]
+            .id
+            .identity_str()
+            .expect("resolved destination"),
+    );
 }
 
 #[test]

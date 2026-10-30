@@ -767,20 +767,6 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         errors.extend(validate_wait_bindings_with_ctx(ctx, parsed));
         errors.extend(validate_deferred_populate_refs_with_ctx(ctx, parsed));
         errors.extend(
-            carina_core::identifier::check_attribute_derived_anonymous_resource_conflicts(
-                &parsed.resources,
-                ctx.schemas(),
-            )
-            .into_iter()
-            .filter(|conflict| {
-                !parsed.resources.iter().any(|resource| {
-                    !resource.loop_provenance.is_empty()
-                        && conflict.includes(resource, ctx.schemas())
-                })
-            })
-            .map(|conflict| AppError::Validation(conflict.to_string())),
-        );
-        errors.extend(
             upstream_resolve_errors
                 .iter()
                 .map(|error| AppError::Validation(error.to_string())),

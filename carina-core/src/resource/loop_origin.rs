@@ -78,8 +78,21 @@ impl LegacyLoopAddress {
         &self.0
     }
 
+    #[cfg(test)]
     pub(crate) fn with_parent_prefix(&self, prefix: &ResourceIdentity) -> Self {
         Self(format!("{}.{}", prefix.as_str(), self.0))
+    }
+
+    pub(crate) fn with_parent_legacy(&self, prefix: &Self) -> Self {
+        Self(format!("{}.{}", prefix.exact_state_name(), self.0))
+    }
+
+    fn remap_identity_prefix(&mut self, from: &ResourceIdentity, to: &ResourceIdentity) {
+        if let Some(rewritten) =
+            replace_identity_prefix(self.exact_state_name(), from.as_str(), to.as_str())
+        {
+            self.0 = rewritten;
+        }
     }
 }
 
@@ -324,8 +337,17 @@ impl LoopElementOrigin {
         &self.legacy
     }
 
+    #[cfg(test)]
     pub(crate) fn prefix_legacy(&mut self, prefix: &ResourceIdentity) {
         self.legacy = self.legacy.with_parent_prefix(prefix);
+    }
+
+    pub(crate) fn prefix_legacy_address(&mut self, prefix: &LegacyLoopAddress) {
+        self.legacy = self.legacy.with_parent_legacy(prefix);
+    }
+
+    fn remap_legacy_identity_prefix(&mut self, from: &ResourceIdentity, to: &ResourceIdentity) {
+        self.legacy.remap_identity_prefix(from, to);
     }
 
     pub(crate) fn set_binding_scope(&mut self, binding_scope: Arc<BTreeSet<String>>) {
@@ -385,6 +407,25 @@ impl LoopModulePrefixOrigin {
             self.current_prefix = ResourceIdentity::new(rewritten);
         }
     }
+
+    fn prefix_for_module(
+        &mut self,
+        current_parent: &ResourceIdentity,
+        legacy_parent: &LegacyLoopAddress,
+    ) {
+        self.current_prefix = ResourceIdentity::new(format!(
+            "{}.{}",
+            current_parent.as_str(),
+            self.current_prefix.as_str(),
+        ));
+        self.origin.prefix_legacy_address(legacy_parent);
+        self.origin.source_mut().scope_to_module(current_parent);
+    }
+
+    fn remap_identity_prefix(&mut self, from: &ResourceIdentity, to: &ResourceIdentity) {
+        self.remap_current_prefix(from, to);
+        self.origin.remap_legacy_identity_prefix(from, to);
+    }
 }
 
 /// Host-owned provenance for resources emitted directly or through a module.
@@ -420,6 +461,7 @@ impl LoopProvenance {
         self.direct.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn direct_origin_mut(&mut self) -> Option<&mut LoopElementOrigin> {
         self.direct.as_deref_mut()
     }
@@ -429,12 +471,31 @@ impl LoopProvenance {
         &self.module_prefixes
     }
 
-    pub(crate) fn module_prefixes_mut(&mut self) -> &mut [LoopModulePrefixOrigin] {
-        &mut self.module_prefixes
-    }
-
     pub(crate) fn push_module_prefix(&mut self, origin: LoopModulePrefixOrigin) {
         self.module_prefixes.push(origin);
+    }
+
+    pub(crate) fn prefix_for_module(
+        &mut self,
+        current_parent: &ResourceIdentity,
+        legacy_parent: &LegacyLoopAddress,
+    ) {
+        if let Some(origin) = &mut self.direct {
+            origin.prefix_legacy_address(legacy_parent);
+            origin.source_mut().scope_to_module(current_parent);
+        }
+        for prefix in &mut self.module_prefixes {
+            prefix.prefix_for_module(current_parent, legacy_parent);
+        }
+    }
+
+    pub(crate) fn remap_identity_prefix(&mut self, from: &ResourceIdentity, to: &ResourceIdentity) {
+        if let Some(origin) = &mut self.direct {
+            origin.remap_legacy_identity_prefix(from, to);
+        }
+        for prefix in &mut self.module_prefixes {
+            prefix.remap_identity_prefix(from, to);
+        }
     }
 
     pub(crate) fn set_display_file(&mut self, file: &str) {
@@ -549,9 +610,13 @@ impl UnboundLoopTemplate {
         &self.legacy_base
     }
 
-    pub(crate) fn prefix_for_module(&mut self, prefix: &ResourceIdentity) {
-        self.source.scope_to_module(prefix);
-        self.legacy_base = self.legacy_base.with_parent_prefix(prefix);
+    pub(crate) fn prefix_for_module(
+        &mut self,
+        current_parent: &ResourceIdentity,
+        legacy_parent: &LegacyLoopAddress,
+    ) {
+        self.source.scope_to_module(current_parent);
+        self.legacy_base = self.legacy_base.with_parent_legacy(legacy_parent);
     }
 }
 

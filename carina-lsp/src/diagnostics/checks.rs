@@ -659,6 +659,7 @@ impl DiagnosticEngine {
         doc: &Document,
         current_file: &ParsedFile,
         directory: &ParsedFile,
+        configuration_root: Option<&std::path::Path>,
     ) -> Vec<Diagnostic> {
         let mut resources = directory.resources.clone();
         let mut canonical_resources = match carina_core::value::canonicalize_resources_with_schemas(
@@ -674,48 +675,52 @@ impl DiagnosticEngine {
             &self.factories,
             &self.schemas,
         );
-        let current_name = doc
-            .source_file()
-            .file_name()
-            .map(|name| name.to_string_lossy());
-        match identity_result {
-            Err(carina_core::identifier::AnonymousIdentityComputationError::Identity(
-                carina_core::identifier::AnonymousIdentityError::Loop(conflict),
-            )) => {
-                if current_name.as_deref() != Some(conflict.file()) {
-                    return Vec::new();
+        let current_name = configuration_root
+            .and_then(|root| doc.source_file().strip_prefix(root).ok())
+            .unwrap_or_else(|| doc.source_file())
+            .to_string_lossy();
+        let mut diagnostics = Vec::new();
+        if let Err(carina_core::identifier::AnonymousIdentityComputationError::Identity(error)) =
+            identity_result
+        {
+            for error in error.into_individual_errors() {
+                let carina_core::identifier::AnonymousIdentityError::Loop(conflict) = error else {
+                    continue;
+                };
+                if current_name != conflict.file() {
+                    continue;
                 }
                 let Some(span) = conflict.source_span() else {
-                    return Vec::new();
+                    continue;
                 };
                 let Some(range) = parser_span_range(doc, span) else {
-                    return Vec::new();
+                    continue;
                 };
-                return vec![carina_diagnostic_range(
+                diagnostics.push(carina_diagnostic_range(
                     range,
                     DiagnosticSeverity::ERROR,
                     conflict.to_string(),
-                )];
+                ));
             }
-            Err(_) => return Vec::new(),
-            Ok(()) => {}
         }
 
-        carina_core::identifier::check_legacy_loop_move_targets(
-            &current_file.state_blocks,
-            &resources,
-        )
-        .into_iter()
-        .filter_map(|error| {
-            let span = error.source_span()?;
-            let range = parser_span_range(doc, span)?;
-            Some(carina_diagnostic_range(
-                range,
-                DiagnosticSeverity::ERROR,
-                error.to_string(),
-            ))
-        })
-        .collect()
+        diagnostics.extend(
+            carina_core::identifier::check_legacy_loop_move_targets(
+                &current_file.state_blocks,
+                &resources,
+            )
+            .into_iter()
+            .filter_map(|error| {
+                let span = error.source_span()?;
+                let range = parser_span_range(doc, span)?;
+                Some(carina_diagnostic_range(
+                    range,
+                    DiagnosticSeverity::ERROR,
+                    error.to_string(),
+                ))
+            }),
+        );
+        diagnostics
     }
 
     /// Flag `arguments` blocks placed in a root configuration.

@@ -1029,6 +1029,18 @@ pub(crate) fn parse_directory_files_located(
     files: &[(PathBuf, String)],
     config: &ProviderContext,
 ) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, LocatedParseError> {
+    let display_root = files
+        .first()
+        .and_then(|(path, _)| path.parent())
+        .unwrap_or_else(|| Path::new(""));
+    parse_directory_files_located_from_root(files, config, display_root)
+}
+
+pub(crate) fn parse_directory_files_located_from_root(
+    files: &[(PathBuf, String)],
+    config: &ProviderContext,
+    display_root: &Path,
+) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, LocatedParseError> {
     let directory_functions = parser::top_level_user_functions_in_files(files, config)
         .map_err(LocatedParseError::directory_wide)?;
     let mut directory_module_parameters = HashSet::new();
@@ -1157,7 +1169,7 @@ pub(crate) fn parse_directory_files_located(
             true,
         )
         .map_err(|error| LocatedParseError::in_file(path, error))?;
-        record_parsed_file_source_metadata(&mut parsed, path);
+        record_parsed_file_source_metadata(&mut parsed, path, display_root);
         out.push((
             path.clone(),
             DirectoryResolvedFile {
@@ -1180,7 +1192,7 @@ pub(crate) fn parse_directory_files_located(
     Ok(out)
 }
 
-fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path) {
+fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, display_root: &Path) {
     parsed
         .parser_binding_metadata
         .set_pending_function_source_file(path);
@@ -1210,8 +1222,14 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path) {
         function.body.source_file = Some(path.to_path_buf());
     }
     let display_file = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
+        .strip_prefix(display_root)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(|relative| relative.to_string_lossy().into_owned())
+        .or_else(|| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
         .unwrap_or_else(|| path.display().to_string());
     for resource in &mut parsed.resources {
         resource.loop_provenance.set_display_file(&display_file);

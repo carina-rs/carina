@@ -5814,6 +5814,94 @@ fn loop_attribute_derived_conflict_renders_exact_rewrite() {
 }
 
 #[test]
+fn attribute_derived_plain_and_single_loop_member_report_both_typed_errors() {
+    let mut resources = vec![
+        Resource::pending_with_provider("mock", "ec2.Vpc", None).with_attribute(
+            "identity_input",
+            Value::Concrete(ConcreteValue::String("plain".into())),
+        ),
+    ];
+    resources.extend(parse_loop_fixture(
+        "for cidr in ['10.0.0.0/16'] {\n  mock.ec2.Vpc { identity_input = cidr }\n}",
+        "loop.crn",
+    ));
+
+    let error = compute_anonymous_identifiers_for_test(
+        &mut resources,
+        &[],
+        &loop_identity_registry(false),
+        &|_| Vec::new(),
+    )
+    .expect_err("a plain declaration and one loop element are ambiguous peers");
+    let rendered = error.to_string();
+
+    assert!(
+        rendered.contains("Anonymous resource identity is derived from mutable attributes"),
+        "plain member lost its typed error: {rendered}",
+    );
+    assert!(
+        rendered.contains("unbound `for` at loop.crn:1"),
+        "single loop member lost its rewrite error: {rendered}",
+    );
+    assert!(rendered.contains("from = mock.ec2.Vpc '_for0[0]'"));
+}
+
+#[test]
+fn attribute_derived_single_element_loops_in_sibling_files_report_each_loop() {
+    let mut resources = parse_loop_fixture(
+        "for cidr in ['10.0.0.0/16'] {\n  mock.ec2.Vpc { identity_input = cidr }\n}",
+        "a.crn",
+    );
+    resources.extend(parse_loop_fixture(
+        "for cidr in ['10.1.0.0/16'] {\n  mock.ec2.Vpc { identity_input = cidr }\n}",
+        "b.crn",
+    ));
+
+    let error = compute_anonymous_identifiers_for_test(
+        &mut resources,
+        &[],
+        &loop_identity_registry(false),
+        &|_| Vec::new(),
+    )
+    .expect_err("both sibling loops require independent rewrites");
+    let rendered = error.to_string();
+
+    assert_eq!(
+        rendered.matches("Anonymous resources produced by").count(),
+        2
+    );
+    assert!(rendered.contains("unbound `for` at a.crn:1"));
+    assert!(rendered.contains("unbound `for` at b.crn:1"));
+}
+
+#[test]
+fn attribute_derived_distinct_single_element_loops_report_two_rewrites() {
+    let mut resources = parse_loop_fixture(
+        "for cidr in ['10.0.0.0/16'] {\n  mock.ec2.Vpc { identity_input = cidr }\n}\n\
+         for cidr in ['10.1.0.0/16'] {\n  mock.ec2.Vpc { identity_input = cidr }\n}",
+        "loops.crn",
+    );
+
+    let error = compute_anonymous_identifiers_for_test(
+        &mut resources,
+        &[],
+        &loop_identity_registry(false),
+        &|_| Vec::new(),
+    )
+    .expect_err("each authored loop source requires its own rewrite");
+    let rendered = error.to_string();
+
+    assert_eq!(
+        rendered.matches("Anonymous resources produced by").count(),
+        2
+    );
+    assert!(rendered.contains("unbound `for` at loops.crn:1"));
+    assert!(rendered.contains("unbound `for` at loops.crn:4"));
+    assert!(rendered.contains("let vpc = for cidr"));
+    assert!(rendered.contains("let vpc_2 = for cidr"));
+}
+
+#[test]
 fn loop_identical_identity_inputs_renders_exact_moves() {
     let source = "let entries = {\n  alpha = 'same'\n  \"can't\" = 'same'\n}\nfor key, name in entries {\n  mock.ec2.Vpc {\n    identity_input = name\n  }\n}";
     let mut resources = parse_loop_fixture(source, "quoted-key.crn");
@@ -5999,17 +6087,128 @@ fn legacy_loop_detector_refuses_a_mismatching_desired_input() {
 }
 
 #[test]
+fn legacy_loop_detector_compares_concrete_subset_when_other_inputs_are_references() {
+    let source = "for cidr in ['10.0.0.0/24'] {\n  mock.ec2.Subnet {\n    cidr_block = cidr\n    vpc_id = 'placeholder'\n  }\n}";
+    let mut resources = parse_loop_fixture(source, "subnet.crn");
+    resources[0].set_attr(
+        "vpc_id",
+        Value::resource_ref("network", "vpc_id", Vec::new()),
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("ec2.Subnet")
+            .attribute(
+                AttributeSchema::optional("vpc_id", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .expect("subnet identity schema is valid"),
+    );
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("the reference-valued input still participates in identity hashing");
+    let state = AnonymousIdStateInfo {
+        name: "_for0[0]".to_string(),
+        provider_instance: None,
+        create_only_values: HashMap::from([
+            ("vpc_id".to_string(), "vpc-123".to_string()),
+            ("cidr_block".to_string(), "10.9.0.0/24".to_string()),
+        ]),
+    };
+
+    let moves = detect_legacy_loop_moves_for_test(
+        &resources,
+        &registry,
+        &[state],
+        &StateBlockClaims::empty(),
+        &[],
+    );
+
+    assert!(
+        moves.is_empty(),
+        "the concrete CIDR mismatch is negative evidence even though vpc_id is unresolved",
+    );
+}
+
+#[test]
+fn legacy_loop_detector_matches_generated_value_against_desired_prefix() {
+    let mut resources = parse_loop_fixture(
+        "for value in ['stable'] {\n  mock.ec2.Vpc { identity_input = value }\n}",
+        "prefix.crn",
+    );
+    resources[0]
+        .prefixes
+        .insert("identity_input".to_string(), "service-".to_string());
+    resources[0].set_attr(
+        "identity_input",
+        Value::Concrete(ConcreteValue::String("service-generated".into())),
+    );
+    let registry = loop_identity_registry(true);
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("prefix-backed anonymous identity computes");
+
+    let moves = detect_legacy_loop_moves_for_test(
+        &resources,
+        &registry,
+        &[loop_state_entry("_for0[0]", None, Some("service-existing"))],
+        &StateBlockClaims::empty(),
+        &[],
+    );
+
+    assert_eq!(
+        moves.len(),
+        1,
+        "a concrete persisted value satisfies Prefix(service-)"
+    );
+}
+
+#[test]
 fn moved_to_rejects_a_legacy_segment_below_a_module_prefix() {
+    let (mut resource, _) = resolved_single_loop_resource(None);
+    resource
+        .loop_provenance
+        .direct_origin_mut()
+        .expect("loop origin")
+        .prefix_legacy(&ResourceIdentity::new("net"));
+    resource.id =
+        ResourceId::with_provider_identity("mock", "ec2.Vpc", "net.mock_ec2_vpc_current", None);
     let parsed = crate::parser::parse(
         "moved {\n  from = mock.ec2.Vpc 'old'\n  to = mock.ec2.Vpc 'net._for0[0]'\n}\n",
         &crate::parser::ProviderContext::default(),
     )
     .expect("moved block parses");
 
-    let errors = check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[]);
+    let errors = check_legacy_loop_move_targets(&parsed.state_blocks, &[resource]);
 
     assert_eq!(errors.len(), 1);
     assert!(errors[0].to_string().contains("net._for0[0]"));
+}
+
+#[test]
+fn moved_to_allows_bound_map_keys_that_begin_with_underscore() {
+    let parsed = crate::parser::parse(
+        concat!(
+            "moved {\n  from = mock.ec2.Vpc 'old-one'\n",
+            "  to = mock.ec2.Vpc 'items._private'\n}\n",
+            "moved {\n  from = mock.ec2.Vpc 'old-two'\n",
+            "  to = mock.ec2.Vpc \"items['a._b']\"\n}\n",
+        ),
+        &crate::parser::ProviderContext::default(),
+    )
+    .expect("bound map-key move destinations parse");
+
+    let errors = check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[]);
+
+    assert!(
+        errors.is_empty(),
+        "real bound map-key addresses were rejected: {errors:#?}"
+    );
 }
 
 #[test]

@@ -106,6 +106,86 @@ fn anonymous_loop_attribute_derived_error() {
 }
 
 #[test]
+fn anonymous_loop_sibling_conflicts_report_every_loop_in_validate_and_plan() {
+    let scenario = Scenario::from_fixture("anonymous_loop_sibling_conflicts");
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+
+    for args in [
+        ["validate", "."].as_slice(),
+        ["plan", "--refresh=false", "."].as_slice(),
+    ] {
+        let output = scenario.carina(args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "carina {} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{stderr}",
+            args[0],
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert_eq!(
+            stderr
+                .matches("Anonymous resources produced by the unbound `for`")
+                .count(),
+            2,
+            "every loop source must be reported by carina {}: {stderr}",
+            args[0],
+        );
+        assert!(
+            stderr.contains("at a.crn:1"),
+            "missing a.crn error: {stderr}"
+        );
+        assert!(
+            stderr.contains("at b.crn:1"),
+            "missing b.crn error: {stderr}"
+        );
+        assert!(stderr.contains("let thing = for name"), "{stderr}");
+        assert!(stderr.contains("let thing_2 = for name"), "{stderr}");
+    }
+}
+
+#[test]
+fn anonymous_plain_and_single_loop_conflict_reach_validate_and_plan() {
+    let scenario = Scenario::from_fixture("anonymous_loop_mixed_conflict");
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+
+    for args in [
+        ["validate", "."].as_slice(),
+        ["plan", "--refresh=false", "."].as_slice(),
+    ] {
+        let output = scenario.carina(args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "carina {} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{stderr}",
+            args[0],
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert_eq!(
+            stderr
+                .matches("Anonymous resource identity is derived from mutable attributes")
+                .count(),
+            1,
+            "plain declaration conflict missing from carina {}: {stderr}",
+            args[0],
+        );
+        assert_eq!(
+            stderr
+                .matches("Anonymous resources produced by the unbound `for`")
+                .count(),
+            1,
+            "loop rewrite conflict missing from carina {}: {stderr}",
+            args[0],
+        );
+        assert!(stderr.contains("at main.crn:5"), "{stderr}");
+        assert!(stderr.contains("let thing = for name"), "{stderr}");
+        assert!(
+            stderr.contains("from = mock.test.Thing '_for0[0]'"),
+            "{stderr}",
+        );
+    }
+}
+
+#[test]
 fn anonymous_loop_identical_identity_error() {
     assert_validate_and_plan_error(
         "anonymous_loop_identical_identity_error",

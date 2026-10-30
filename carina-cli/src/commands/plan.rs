@@ -1441,7 +1441,18 @@ impl PlanFile {
                     }
                     Ok(())
                 }
-                carina_core::parser::DeferredForTarget::Unbound { .. } => Ok(()),
+                carina_core::parser::DeferredForTarget::Unbound { .. } => {
+                    if matches!(
+                        template.template_resource.id.identity_state(),
+                        carina_core::resource::ResourceIdentityState::Pending(_)
+                    ) {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "Invalid saved plan: {location} for an unbound deferred target must have a pending resource identity"
+                        ))
+                    }
+                }
             }
         }
 

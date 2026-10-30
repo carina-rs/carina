@@ -14,9 +14,9 @@ use crate::parser::{
 };
 use crate::resource::{
     AccessMissPolicy, CompositionCall, CompositionCallPath, ConcreteValue, DataSource,
-    DeferredValue, LiveComposition, ModuleInstanceScope, ModuleSource, PathSegment, Resource,
-    ResourceId, ResourceIdentity, ResourceIdentityState, StructuralOperandRef, Value,
-    ValuePathSegmentResult, apply_value_path_segment,
+    DeferredValue, LegacyLoopAddress, LiveComposition, ModuleInstanceScope, ModuleSource,
+    PathSegment, Resource, ResourceId, ResourceIdentity, ResourceIdentityState,
+    StructuralOperandRef, Value, ValuePathSegmentResult, apply_value_path_segment,
 };
 
 use super::error::ModuleError;
@@ -1418,10 +1418,13 @@ fn prefix_module_resource_with_identity(
         ),
     };
 
-    if let Some(origin) = new_resource.loop_provenance.direct_origin_mut() {
-        origin.prefix_legacy(instance_identity);
-        origin.source_mut().scope_to_module(instance_identity);
-    }
+    let legacy_parent = module_call
+        .loop_origin()
+        .map(|origin| origin.legacy_address().clone())
+        .unwrap_or_else(|| LegacyLoopAddress::new(instance_identity.as_str()));
+    new_resource
+        .loop_provenance
+        .prefix_for_module(instance_identity, &legacy_parent);
     if let Some(origin) = module_call.loop_origin() {
         new_resource.loop_provenance.push_module_prefix(
             crate::resource::LoopModulePrefixOrigin::new(origin.clone(), instance_identity.clone()),
@@ -1795,6 +1798,10 @@ fn prefix_deferred_for_expression(
     } = d;
     let instance_identity = ResourceIdentity::try_from(instance_prefix.to_string())
         .expect("module instance prefix is non-empty");
+    let legacy_parent = module_call
+        .loop_origin()
+        .map(|origin| origin.legacy_address().clone())
+        .unwrap_or_else(|| LegacyLoopAddress::new(instance_identity.as_str()));
 
     Ok(DeferredForExpression {
         // provenance — pass through (like WaitBinding.line)
@@ -1832,7 +1839,7 @@ fn prefix_deferred_for_expression(
             }
             crate::parser::DeferredForTarget::Unbound { template } => {
                 let mut template = template.clone();
-                template.prefix_for_module(&instance_identity);
+                template.prefix_for_module(&instance_identity, &legacy_parent);
                 crate::parser::DeferredForTarget::Unbound { template }
             }
         },
@@ -2593,12 +2600,10 @@ pub fn reconcile_anonymous_module_instances(
             let new_prefix = format!("{}_{:016x}", module, target);
             let new_name = format!("{}.{}", new_prefix, rest);
             r.id.set_identity(ResourceIdentity::new(new_name));
-            for origin in r.loop_provenance.module_prefixes_mut() {
-                origin.remap_current_prefix(
-                    &ResourceIdentity::new(old_prefix.clone()),
-                    &ResourceIdentity::new(new_prefix.clone()),
-                );
-            }
+            r.loop_provenance.remap_identity_prefix(
+                &ResourceIdentity::new(old_prefix.clone()),
+                &ResourceIdentity::new(new_prefix.clone()),
+            );
             if let Some(ref binding) = r.binding
                 && let Some((_, binding_rest)) = split_instance_prefix(binding)
             {
@@ -2965,7 +2970,8 @@ mod tests {
                 .expect("direct origin retained")
                 .legacy_address()
                 .exact_state_name(),
-            "registry_publish._for0[0]",
+            "_for0[0]._for0[0]",
+            "an inner loop resource must compose the outer module-loop legacy address",
         );
         let [module_prefix] = prefixed.loop_provenance.module_prefixes() else {
             panic!("loop-generated module call must add one prefix origin");
@@ -3028,6 +3034,61 @@ mod tests {
             module_prefix.legacy_prefix().exact_state_name(),
             "_for0[0]",
             "legacy migration oracle must not follow current SimHash reconciliation",
+        );
+    }
+
+    #[test]
+    fn anonymous_module_reconcile_remaps_current_prefixed_direct_legacy_address() {
+        let seed = crate::parser::parse_file(
+            "for value in ['one'] {\n  mock.test.Leaf { value = value }\n}\n",
+            std::path::Path::new("module/loop.crn"),
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("loop fixture parses")
+        .resources
+        .remove(0);
+        let mut direct = seed
+            .loop_provenance
+            .direct_origin()
+            .expect("loop origin")
+            .clone();
+        let current_hash =
+            crate::identifier::compute_simhash(&std::collections::BTreeMap::from([(
+                "argument",
+                "current".to_string(),
+            )]));
+        let state_hash = current_hash.with_flipped_mask_for_test(1);
+        let current_prefix = format!("web_{current_hash:016x}");
+        let state_prefix = format!("web_{state_hash:016x}");
+        direct.prefix_legacy(&ResourceIdentity::new(current_prefix.clone()));
+
+        let mut resource = Resource::with_provider(
+            "mock",
+            "test.Leaf",
+            ResourceIdentity::new(format!("{current_prefix}.leaf")),
+            None,
+        );
+        resource.loop_provenance = crate::resource::LoopProvenance::direct(direct);
+        let mut resources = vec![resource];
+
+        reconcile_anonymous_module_instances(
+            &mut resources,
+            &mut [],
+            &|_, _| vec![format!("{state_prefix}.leaf")],
+            &crate::identifier::StateBlockClaims::empty(),
+        );
+
+        let expected_name = format!("{state_prefix}.leaf");
+        assert_eq!(resources[0].id.identity_str(), Some(expected_name.as_str()));
+        assert_eq!(
+            resources[0]
+                .loop_provenance
+                .direct_origin()
+                .expect("direct origin retained")
+                .legacy_address()
+                .exact_state_name(),
+            format!("{state_prefix}._for0[0]"),
+            "legacy migration candidates derived from an anonymous module prefix must move with reconciliation",
         );
     }
 

@@ -355,6 +355,7 @@ impl DiagnosticEngine {
                 doc,
                 current_file,
                 merged.unwrap_or(current_file),
+                base_path,
             ));
         }
         let upstream_resolution = match (base_path, merged) {

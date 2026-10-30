@@ -86,6 +86,41 @@ pub(super) fn apply_deferred_replace_delete_deps<S>(
     deps_of: &mut HashMap<usize, HashSet<usize>>,
     deferred_replace_delete_deps: &[(usize, usize)],
 ) {
+    // An unrelated anonymous state row remains a normal Delete rather than
+    // being claimed by one arbitrary unbound loop. Every same-kind unbound
+    // runtime gate must nevertheless wait for that row to be removed, because
+    // any gate may materialize a child with the persisted generated address.
+    for (delete_idx, effect) in effects.iter().enumerate() {
+        let Effect::Delete {
+            id,
+            generation: crate::effect::EffectGeneration::Current,
+            binding: None,
+            ..
+        } = effect
+        else {
+            continue;
+        };
+        if !deps_of.contains_key(&delete_idx) {
+            continue;
+        }
+        for (gate_idx, candidate) in effects.iter().enumerate() {
+            let template = match candidate {
+                Effect::DeferredCreate { template, .. } => template.as_ref(),
+                Effect::DeferredReplace(payload) => payload.template.as_ref(),
+                _ => continue,
+            };
+            if matches!(
+                template.target,
+                crate::parser::DeferredForTarget::Unbound { .. }
+            ) && template.template_resource.id.provider == id.provider
+                && template.template_resource.id.resource_type == id.resource_type
+                && template.template_resource.id.provider_instance == id.provider_instance
+            {
+                deps_of.entry(gate_idx).or_default().insert(delete_idx);
+            }
+        }
+    }
+
     for &(gate_idx, delete_idx) in deferred_replace_delete_deps {
         let Some(Effect::DeferredReplace(payload)) = effects.get(gate_idx) else {
             continue;
@@ -1088,7 +1123,8 @@ mod tests {
         ProviderResult, ReadRequest, UpdateRequest,
     };
     use crate::resource::{
-        ConcreteValue, LiveComposition, ResolvedResource, ResourceIdentity, State, Value,
+        ConcreteValue, Directives, LiveComposition, ResolvedResource, ResourceIdentity, State,
+        Value,
     };
     use crate::schema::SchemaRegistry;
     use crate::wait::predicate::{AttrPath, WaitPredicate};
@@ -1101,6 +1137,72 @@ mod tests {
 
     fn state_for(id: &ResourceId) -> State {
         State::existing(id.clone(), HashMap::new()).with_identifier("id")
+    }
+
+    fn unbound_deferred_template_in(file: &str) -> crate::parser::DeferredForExpression {
+        crate::parser::parse_file(
+            "let upstream = upstream_state { source = '../upstream' }\n\
+             for value in upstream.accounts {\n\
+               mock.test.Child { identity_input = value }\n\
+             }\n",
+            std::path::Path::new(file),
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("unbound deferred fixture parses")
+        .deferred_for_expressions
+        .into_iter()
+        .next()
+        .expect("fixture contains one deferred loop")
+    }
+
+    #[test]
+    fn all_same_kind_unbound_deferred_gates_wait_for_anonymous_delete() {
+        let deleted_id = crate::resource::ResolvedResourceId::with_provider_identity(
+            "mock",
+            "test.Child",
+            "mock_test_child_deadbeef",
+            None,
+        );
+        let effects = vec![
+            Effect::Delete {
+                id: deleted_id,
+                identifier: crate::effect::fixture_applied_identifier("old-child"),
+                generation: crate::effect::EffectGeneration::Current,
+                directives: Directives::default(),
+                binding: None,
+                dependencies: HashSet::new(),
+                explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
+            },
+            Effect::DeferredCreate {
+                id: crate::resource::ResolvedResourceId::with_provider_identity(
+                    "mock",
+                    "__deferred_for",
+                    "first_loop",
+                    None,
+                ),
+                template: Box::new(unbound_deferred_template_in("a.crn")),
+            },
+            Effect::DeferredCreate {
+                id: crate::resource::ResolvedResourceId::with_provider_identity(
+                    "mock",
+                    "__deferred_for",
+                    "second_loop",
+                    None,
+                ),
+                template: Box::new(unbound_deferred_template_in("b.crn")),
+            },
+        ];
+        let mut deps_of = HashMap::from([
+            (0usize, HashSet::new()),
+            (1usize, HashSet::new()),
+            (2usize, HashSet::new()),
+        ]);
+
+        apply_deferred_replace_delete_deps(&effects, &mut deps_of, &[]);
+
+        assert_eq!(deps_of.get(&1), Some(&HashSet::from([0])));
+        assert_eq!(deps_of.get(&2), Some(&HashSet::from([0])));
     }
 
     fn resolved(resource: Resource) -> ResolvedResource {

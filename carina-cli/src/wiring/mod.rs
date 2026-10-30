@@ -2748,9 +2748,11 @@ pub fn compute_anonymous_identifiers_with_ctx(
         Err(identifier::AnonymousIdentityComputationError::ProviderConfig(error)) => {
             vec![error.into()]
         }
-        Err(identifier::AnonymousIdentityComputationError::Identity(error)) => {
-            vec![error.into()]
-        }
+        Err(identifier::AnonymousIdentityComputationError::Identity(error)) => error
+            .into_individual_errors()
+            .into_iter()
+            .map(AppError::from)
+            .collect(),
     }
 }
 
@@ -2767,7 +2769,11 @@ pub(crate) fn compute_canonical_pair_anonymous_identifiers_with_ctx<E>(
         Ok(()) => Ok(Vec::new()),
         Err(CanonicalResourceIdentityError::EnumCanonicalization(error)) => Err(error.into()),
         Err(CanonicalResourceIdentityError::ProviderConfig(error)) => Ok(vec![error.into()]),
-        Err(CanonicalResourceIdentityError::Identity(error)) => Ok(vec![error.into()]),
+        Err(CanonicalResourceIdentityError::Identity(error)) => Ok(error
+            .into_individual_errors()
+            .into_iter()
+            .map(AppError::from)
+            .collect()),
     }
 }
 
@@ -7552,14 +7558,9 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
                 {
                     return None;
                 }
-                let matches = match &target.template.target {
-                    carina_core::parser::DeferredForTarget::Bound { .. } => {
-                        binding.as_deref().is_some_and(|binding| {
-                            binding_matches_deferred_template(binding, &target.template.target)
-                        })
-                    }
-                    carina_core::parser::DeferredForTarget::Unbound { .. } => binding.is_none(),
-                };
+                let matches = binding.as_deref().is_some_and(|binding| {
+                    binding_matches_deferred_template(binding, &target.template.target)
+                });
                 matches.then(|| DeferredReplaceDelete {
                     id: id.clone(),
                     identifier: identifier.clone(),
