@@ -91,10 +91,18 @@ pub struct ResidualModuleResolutionError(Box<ModuleError>);
 /// Source-routing shape of a residual resolver error. Core classifies every
 /// [`ModuleError`] variant; editor adapters only map the resulting location.
 pub enum ResidualModuleResolutionDiagnostic<'a> {
-    Constraint { origin: &'a ConstraintOrigin },
-    ArgumentValueAccess { source_path: &'a str, line: usize },
+    Constraint {
+        origin: &'a ConstraintOrigin,
+    },
+    ArgumentValueAccess {
+        source_path: &'a str,
+        line: usize,
+    },
     ModuleCall,
-    Parse,
+    Parse {
+        source_path: Option<&'a Path>,
+        error: &'a ParseError,
+    },
 }
 
 impl ResidualModuleResolutionError {
@@ -136,11 +144,24 @@ impl ResidualModuleResolutionError {
                 source_path,
                 line: *line,
             }),
-            ModuleError::Parse(_error) => Some(ResidualModuleResolutionDiagnostic::Parse),
-            ModuleError::ParseInFile {
-                path: _path,
-                error: _error,
-            } => Some(ResidualModuleResolutionDiagnostic::Parse),
+            ModuleError::Parse(error) => match error {
+                ParseError::Located { path, error } => {
+                    Some(ResidualModuleResolutionDiagnostic::Parse {
+                        source_path: Some(path),
+                        error,
+                    })
+                }
+                error => Some(ResidualModuleResolutionDiagnostic::Parse {
+                    source_path: None,
+                    error,
+                }),
+            },
+            ModuleError::ParseInFile { path, error } => {
+                Some(ResidualModuleResolutionDiagnostic::Parse {
+                    source_path: Some(path),
+                    error,
+                })
+            }
             ModuleError::NotFound(_module) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::CircularImport(_module) => None,
             ModuleError::Io(_error) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
@@ -264,11 +285,7 @@ impl ResidualModuleResolutionError {
                     line: _,
                     span: _,
                 }
-                | ParseError::DeferredForBodyUnsupported {
-                    line: _,
-                    header: _,
-                    body: _,
-                }
+                | ParseError::DeferredForBodyUnsupported(_)
                 | ParseError::UnresolvedDeclarationType {
                     token: _,
                     line: _,
@@ -1176,7 +1193,8 @@ pub fn resolve_modules_with_config<E: crate::parser::ExportParamLike>(
     config: &ProviderContext,
     schemas: &SchemaRegistry,
 ) -> Result<(), ModuleError> {
-    RefCheckedModuleGraph::check(parsed, base_dir, config, schemas)?.expand()
+    RefCheckedModuleGraph::check(parsed, base_dir, config, schemas)?.expand()?;
+    finalize_deferred_for_bodies(parsed)
 }
 
 /// Expand an upstream project's modules using the consumer's necessarily
@@ -1189,7 +1207,8 @@ pub(crate) fn resolve_upstream_modules_with_config<E: crate::parser::ExportParam
     config: &ProviderContext,
     schemas: &SchemaRegistry,
 ) -> Result<(), ModuleError> {
-    UpstreamRefCheckedModuleGraph::check(parsed, base_dir, config, schemas)?.expand()
+    UpstreamRefCheckedModuleGraph::check(parsed, base_dir, config, schemas)?.expand()?;
+    finalize_deferred_for_bodies(parsed)
 }
 
 /// Resolve modules while retaining the expander's own per-call constraint
@@ -1216,6 +1235,9 @@ pub fn resolve_modules_with_diagnostics<E: crate::parser::ExportParamLike + Clon
         )),
         Err(error) => errors.push(error),
     }
+    if let Err(error) = finalize_deferred_for_bodies(&mut graph) {
+        errors.push(error);
+    }
     let constraint_reports = resolver
         .constraint_reports
         .into_inner()
@@ -1239,6 +1261,76 @@ pub fn resolve_modules_with_diagnostics<E: crate::parser::ExportParamLike + Clon
         }
     } else {
         ModuleResolutionDiagnosticResult::Unowned { errors }
+    }
+}
+
+/// Convert parser-side deferred-loop bodies into the resource-only typestate
+/// consumed by every post-resolution subsystem.
+///
+/// This runs only after root and module-expanded loops have crossed argument
+/// substitution. A read or module-call template therefore reaches exactly one
+/// typed rejection seam, with enough information to distinguish a genuinely
+/// residual iterable from one that became concrete during module expansion.
+fn finalize_deferred_for_bodies<E>(parsed: &mut crate::parser::File<E>) -> Result<(), ModuleError> {
+    if parsed.parsed_deferred_for_expressions.is_empty() {
+        return Ok(());
+    }
+
+    let pending = std::mem::take(&mut parsed.parsed_deferred_for_expressions);
+    let resolved = pending
+        .into_iter()
+        .map(|expression| match &expression.body {
+            crate::parser::DeferredForBody::Resource(resource) => {
+                let template = resource.as_ref().clone();
+                Ok(expression.into_resource_expression(template))
+            }
+            crate::parser::DeferredForBody::Read(data_source) => {
+                Err(unsupported_deferred_for_body(
+                    &expression,
+                    crate::parser::DeferredForBodyKind::Read {
+                        resource_type: data_source.id.display_type(),
+                    },
+                ))
+            }
+            crate::parser::DeferredForBody::ModuleCall(call) => Err(unsupported_deferred_for_body(
+                &expression,
+                crate::parser::DeferredForBodyKind::ModuleCall {
+                    name: call.module_name.clone(),
+                },
+            )),
+        })
+        .collect::<Result<Vec<_>, ModuleError>>()?;
+    parsed.deferred_for_expressions = resolved;
+    Ok(())
+}
+
+fn unsupported_deferred_for_body(
+    expression: &crate::parser::ParsedDeferredForExpression,
+    body: crate::parser::DeferredForBodyKind,
+) -> ModuleError {
+    let iterable_resolution = match &expression.iterable {
+        crate::resource::Value::Concrete(_) => {
+            crate::parser::DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution
+        }
+        crate::resource::Value::Deferred(_) => {
+            crate::parser::DeferredForIterableResolution::StillDeferred
+        }
+    };
+    let error = ParseError::DeferredForBodyUnsupported(Box::new(
+        crate::parser::DeferredForBodyUnsupportedError {
+            line: expression.line,
+            header: expression.header.clone(),
+            body,
+            span: expression.span,
+            iterable_resolution,
+        },
+    ));
+    match &expression.file {
+        Some(path) => ModuleError::ParseInFile {
+            path: std::path::PathBuf::from(path),
+            error: Box::new(error),
+        },
+        None => ModuleError::Parse(error),
     }
 }
 

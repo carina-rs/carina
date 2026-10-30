@@ -763,32 +763,23 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // call here would serialize its plaintext arguments from a deferred plan
     // effect. Keep resource references deferred so apply-time expansion still
     // substitutes the loop value and other runtime bindings normally.
-    for deferred in &mut parsed.deferred_for_expressions {
-        for value in deferred.template_resource.attributes.values_mut() {
-            *value = resolve_function_calls_only(
-                value,
-                &binding_map,
-                &fn_ctx,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
-            )?;
-        }
-        for (key, value) in &mut deferred.attributes {
-            // `attributes` is the display projection of the same template.
-            // Reuse the evaluated resource value so effect serialization is
-            // consistent and side-effecting evaluators such as `decrypt()`
-            // run only once.
-            if let Some(evaluated) = deferred.template_resource.attributes.get(key) {
-                *value = evaluated.clone();
-            } else {
-                *value = resolve_function_calls_only(
-                    value,
-                    &binding_map,
-                    &fn_ctx,
-                    defer_unknown_functions,
-                    preserve_failed_user_calls,
-                )?;
+    for deferred in &mut parsed.parsed_deferred_for_expressions {
+        match &mut deferred.body {
+            super::DeferredForBody::Resource(resource) => {
+                for value in resource.attributes.values_mut() {
+                    *value = resolve_function_calls_only(
+                        value,
+                        &binding_map,
+                        &fn_ctx,
+                        defer_unknown_functions,
+                        preserve_failed_user_calls,
+                    )?;
+                }
             }
+            // Unsupported read and module-call bodies are retained verbatim
+            // so the module-resolution seam can report their typed error.
+            // They never become a resource template or a saved plan effect.
+            super::DeferredForBody::Read(_) | super::DeferredForBody::ModuleCall(_) => {}
         }
     }
 
@@ -1322,12 +1313,12 @@ fn accumulate_deferred_iterable_errors(
     known: &std::collections::HashSet<&str>,
     errors: &mut Vec<ParseError>,
 ) {
-    for d in &parsed.deferred_for_expressions {
-        for root in d.root_bindings() {
+    for deferred in &parsed.parsed_deferred_for_expressions {
+        for root in deferred.root_bindings() {
             if known.contains(root.as_str()) {
                 continue;
             }
-            errors.push(undefined_identifier_error(known, root, d.line));
+            errors.push(undefined_identifier_error(known, root, deferred.line));
         }
     }
 }
@@ -2174,7 +2165,11 @@ for item in source.arn {
             &ProviderContext::default(),
         )
         .expect("parse deferred for fixture");
-        let template = &parsed.deferred_for_expressions[0].template_resource;
+        let crate::parser::DeferredForBody::Resource(template) =
+            &parsed.parsed_deferred_for_expressions[0].body
+        else {
+            panic!("deferred fixture body must be a resource")
+        };
         assert!(matches!(
             template.attributes.get("comment"),
             Some(Value::Deferred(DeferredValue::FunctionCall { name, .. })) if name == "secret"
@@ -2183,11 +2178,17 @@ for item in source.arn {
         resolve_resource_refs_with_config(&mut parsed, &ProviderContext::default())
             .expect("resolve deferred template functions");
 
-        let template = &parsed.deferred_for_expressions[0].template_resource;
+        let crate::parser::DeferredForBody::Resource(template) =
+            &parsed.parsed_deferred_for_expressions[0].body
+        else {
+            panic!("deferred fixture body must be a resource")
+        };
         assert!(matches!(
             template.attributes.get("comment"),
             Some(Value::Deferred(DeferredValue::Secret(_)))
         ));
+        crate::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+            .expect("deferred fixture crosses the module-resolution seam");
         assert!(matches!(
             parsed.deferred_for_expressions[0]
                 .attributes

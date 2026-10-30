@@ -10,10 +10,10 @@
 use crate::eval_value::{EvalValue, StructuralHandleMetadata};
 use crate::parser::expressions::primary::parse_postfix_eval;
 use crate::parser::{
-    DeferredForBodyKind, DeferredForExpression, DeferredForTarget, ModuleCall, ParseContext,
-    ParseError, ParseWarning, PreprocessedFile, ResourceParseTarget, Rule, WarningKind,
-    display_string_literal, evaluate_static_value, first_inner, next_pair, parse_expression,
-    parse_module_call, parse_read_resource_expr, parse_resource_for_target,
+    DeferredForBody, DeferredForTarget, ModuleCall, ParseContext, ParseError, ParseWarning,
+    ParsedDeferredForExpression, PreprocessedFile, ResourceParseTarget, Rule, SourceSpan,
+    WarningKind, display_string_literal, evaluate_static_value, first_inner, next_pair,
+    parse_expression, parse_module_call, parse_read_resource_expr, parse_resource_for_target,
 };
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, ForLoopElement, LegacyLoopAddress, LoopElementOrigin,
@@ -82,20 +82,23 @@ pub(crate) enum LoopParseTarget {
     Unbound(UnboundLoopTemplate),
 }
 
-struct DeferredForSite<'a> {
-    line: usize,
-    header: &'a str,
+struct RetryableProvisionalBodyError {
+    error: ParseError,
 }
 
-fn parse_deferred_resource_template(
+enum DeferredForBodyTemplateParse {
+    Parsed(DeferredForBody),
+    RetryableProvisional(RetryableProvisionalBodyError),
+}
+
+fn parse_deferred_for_body_template(
     body_pair: pest::iterators::Pair<Rule>,
     binding: &ForBinding,
     ctx: &ParseContext,
     target: &LoopParseTarget,
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
-    site: DeferredForSite<'_>,
-) -> Result<Box<Resource>, ParseError> {
+) -> Result<DeferredForBodyTemplateParse, ParseError> {
     let mut template_ctx = ctx.child_scope();
     let bind = |ctx: &mut ParseContext, name: &str, value: Value| {
         if name != "_" {
@@ -130,30 +133,85 @@ fn parse_deferred_resource_template(
         }
     }
 
-    match parse_for_body(
+    let parsed = parse_for_body(
         body_pair,
         &template_ctx,
         target,
         None,
         preprocessed_file,
         source_file,
-    )? {
-        ForBodyResult::Resource(resource) => Ok(resource),
-        ForBodyResult::DataSource(data_source) => Err(ParseError::DeferredForBodyUnsupported {
-            line: site.line,
-            header: site.header.to_string(),
-            body: DeferredForBodyKind::Read {
-                resource_type: data_source.id.display_type(),
-            },
-        }),
-        ForBodyResult::ModuleCall(call) => Err(ParseError::DeferredForBodyUnsupported {
-            line: site.line,
-            header: site.header.to_string(),
-            body: DeferredForBodyKind::ModuleCall {
-                name: call.module_name,
-            },
-        }),
+    );
+    let result = match parsed {
+        Ok(result) => result,
+        Err(error) if ctx.defer_provisional_static_conditions => {
+            return Ok(DeferredForBodyTemplateParse::RetryableProvisional(
+                RetryableProvisionalBodyError { error },
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(DeferredForBodyTemplateParse::Parsed(match result {
+        ForBodyResult::Resource(resource) => DeferredForBody::Resource(resource),
+        ForBodyResult::DataSource(data_source) => DeferredForBody::Read(data_source),
+        ForBodyResult::ModuleCall(call) => DeferredForBody::ModuleCall(call),
+    }))
+}
+
+fn deferred_for_header(binding: &ForBinding, iterable_surface: &str) -> String {
+    match binding {
+        ForBinding::Simple(value) => format!("for {value} in {iterable_surface}"),
+        ForBinding::Indexed(index, value) => {
+            format!("for ({index}, {value}) in {iterable_surface}")
+        }
+        ForBinding::Map(key, value) => format!("for {key}, {value} in {iterable_surface}"),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_deferred_for_expression(
+    body_pair: pest::iterators::Pair<Rule>,
+    binding: &ForBinding,
+    ctx: &mut ParseContext,
+    target: &LoopParseTarget,
+    preprocessed_file: &PreprocessedFile,
+    source_file: &std::path::Path,
+    line: usize,
+    span: SourceSpan,
+    header: String,
+    iterable: Value,
+) -> Result<(), ParseError> {
+    let body = match parse_deferred_for_body_template(
+        body_pair,
+        binding,
+        ctx,
+        target,
+        preprocessed_file,
+        source_file,
+    )? {
+        DeferredForBodyTemplateParse::Parsed(body) => body,
+        DeferredForBodyTemplateParse::RetryableProvisional(retryable) => {
+            // This pass exists only to classify provisional directory
+            // bindings. The final pass reparses the exact body with fully
+            // classified bindings and either succeeds or propagates this
+            // body-local parser error.
+            let RetryableProvisionalBodyError { error: _error } = retryable;
+            return Ok(());
+        }
+    };
+
+    let parsed = ParsedDeferredForExpression {
+        file: None,
+        line,
+        span,
+        header,
+        target: target.deferred_target(),
+        iterable,
+        binding: binding.clone(),
+        body,
+    };
+
+    ctx.parsed_deferred_for_expressions.push(parsed);
+    Ok(())
 }
 
 impl LoopParseTarget {
@@ -284,6 +342,7 @@ pub(crate) fn parse_for_expr(
     source_file: &std::path::Path,
 ) -> Result<(Vec<Resource>, Vec<DataSource>, Vec<ModuleCall>), ParseError> {
     let for_line = pair.as_span().start_pos().line_col().0;
+    let for_span = SourceSpan::from_pest(&pair, preprocessed_file);
     let mut inner = pair.into_inner();
 
     // Parse the binding pattern
@@ -292,6 +351,7 @@ pub(crate) fn parse_for_expr(
 
     // Parse the iterable expression
     let iterable_pair = next_pair(&mut inner, "iterable", "for expression")?;
+    let iterable_surface = iterable_pair.as_str().trim().to_string();
     let ParsedForIterable {
         value: iterable,
         bare_unbound_identifier,
@@ -480,52 +540,19 @@ pub(crate) fn parse_for_expr(
         // not collapse to the default before the reference snapshot is known
         // to be complete.
         (_, iterable @ Value::Deferred(_)) => {
-            let iterable_surface = crate::value::format_value(iterable);
-            // Build the for-expression header string
-            let header = match &binding {
-                ForBinding::Simple(var) => {
-                    format!("for {} in {}", var, iterable_surface)
-                }
-                ForBinding::Indexed(idx, val) => {
-                    format!("for ({}, {}) in {}", idx, val, iterable_surface)
-                }
-                ForBinding::Map(k, v) => {
-                    format!("for {}, {} in {}", k, v, iterable_surface)
-                }
-            };
-
-            let resource = parse_deferred_resource_template(
+            let header = deferred_for_header(&binding, &iterable_surface);
+            record_deferred_for_expression(
                 body_pair.clone(),
                 &binding,
                 ctx,
                 &target,
                 preprocessed_file,
                 source_file,
-                DeferredForSite {
-                    line: for_line,
-                    header: &header,
-                },
-            )?;
-            let attrs: Vec<(String, Value)> = resource
-                .attributes
-                .iter()
-                .map(|(k, value)| (k.clone(), value.clone()))
-                .collect();
-            ctx.deferred_for_expressions.push(DeferredForExpression {
-                file: None,
-                line: for_line,
+                for_line,
+                for_span,
                 header,
-                resource_type: if resource.id.provider.is_empty() {
-                    resource.id.resource_type.clone()
-                } else {
-                    format!("{}.{}", resource.id.provider, resource.id.resource_type)
-                },
-                attributes: attrs,
-                target: target.deferred_target(),
-                iterable: iterable.clone(),
-                binding: binding.clone(),
-                template_resource: *resource,
-            });
+                iterable.clone(),
+            )?;
             // Return empty — the for body produces zero concrete resources
         }
         _ => {
@@ -537,43 +564,19 @@ pub(crate) fn parse_for_expr(
                 .as_ref()
                 .or(provisional_binding.as_ref())
             {
-                let header = match &binding {
-                    ForBinding::Simple(var) => format!("for {} in {}", var, s),
-                    ForBinding::Indexed(idx, val) => format!("for ({}, {}) in {}", idx, val, s),
-                    ForBinding::Map(k, v) => format!("for {}, {} in {}", k, v, s),
-                };
-                let resource = parse_deferred_resource_template(
+                let header = deferred_for_header(&binding, &iterable_surface);
+                record_deferred_for_expression(
                     body_pair.clone(),
                     &binding,
                     ctx,
                     &target,
                     preprocessed_file,
                     source_file,
-                    DeferredForSite {
-                        line: for_line,
-                        header: &header,
-                    },
-                )?;
-                let attrs: Vec<(String, Value)> = resource
-                    .attributes
-                    .iter()
-                    .map(|(k, value)| (k.clone(), value.clone()))
-                    .collect();
-                ctx.deferred_for_expressions.push(DeferredForExpression {
-                    file: None,
-                    line: for_line,
+                    for_line,
+                    for_span,
                     header,
-                    resource_type: if resource.id.provider.is_empty() {
-                        resource.id.resource_type.clone()
-                    } else {
-                        format!("{}.{}", resource.id.provider, resource.id.resource_type)
-                    },
-                    attributes: attrs,
-                    target: target.deferred_target(),
-                    iterable: Value::Deferred(DeferredValue::BindingRef { binding: s.clone() }),
-                    binding: binding.clone(),
-                    template_resource: *resource,
-                });
+                    Value::Deferred(DeferredValue::BindingRef { binding: s.clone() }),
+                )?;
                 return Ok((resources, data_sources, module_calls));
             }
             let iterable_type = if structural_handle_metadata

@@ -362,7 +362,7 @@ fn record_with_builtin_mock_schemas(contents: PlanFileContents) -> PlanFile {
 
 #[test]
 fn plan_format_29_round_trip_preserves_loop_provenance_and_deferred_targets() {
-    let parsed = carina_core::parser::parse_file(
+    let mut parsed = carina_core::parser::parse_file(
         r#"
 let orgs = upstream_state { source = "../orgs" }
 
@@ -382,6 +382,8 @@ for account_id in orgs.accounts {
         &ProviderContext::default(),
     )
     .expect("parse saved-plan loop provenance fixture");
+    carina_core::module_resolver::resolve_modules(&mut parsed, Path::new("."))
+        .expect("cross the deferred-body resolution seam");
 
     let mut resource = parsed
         .resources
@@ -8552,6 +8554,18 @@ mod apply_deferred_for_parity {
     use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
     use std::collections::HashMap;
 
+    fn parse_resolved(source: &str) -> carina_core::parser::ParsedFile {
+        let mut parsed = parse_file(
+            source,
+            std::path::Path::new("apply_deferred_for.crn"),
+            &ProviderContext::default(),
+        )
+        .expect("parse");
+        carina_core::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+            .expect("cross the deferred-body resolution seam");
+        parsed
+    }
+
     fn dvo_state(parsed: &carina_core::parser::ParsedFile) -> HashMap<ResourceId, State> {
         let cert = parsed
             .resources
@@ -8608,12 +8622,7 @@ mod apply_deferred_for_parity {
                 }
             }
         "#;
-        let parsed = parse_file(
-            src,
-            std::path::Path::new("apply_deferred_for.crn"),
-            &ProviderContext::default(),
-        )
-        .expect("parse");
+        let parsed = parse_resolved(src);
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = dvo_state(&parsed);
 
@@ -8681,12 +8690,7 @@ mod apply_deferred_for_parity {
                 aws.route53.RecordSet { name = opt.resource_record.name }
             }
         "#;
-        let parsed = parse_file(
-            src,
-            std::path::Path::new("apply_deferred_for.crn"),
-            &ProviderContext::default(),
-        )
-        .expect("parse");
+        let parsed = parse_resolved(src);
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let empty: HashMap<ResourceId, State> = HashMap::new();
 
@@ -8742,12 +8746,7 @@ mod apply_deferred_for_parity {
             }
         "#
         .replacen("LOOP_TARGET", loop_target, 1);
-        let parsed = parse_file(
-            &src,
-            std::path::Path::new("apply_deferred_for.crn"),
-            &ProviderContext::default(),
-        )
-        .expect("parse");
+        let parsed = parse_resolved(&src);
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = dvo_state(&parsed);
         let mut schemas = carina_core::schema::SchemaRegistry::new();

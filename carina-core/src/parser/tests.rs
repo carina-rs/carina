@@ -9,6 +9,12 @@ use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
+fn cross_deferred_for_resolution_seam(mut parsed: ParsedFile) -> ParsedFile {
+    crate::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+        .expect("deferred fixture crosses the module-resolution seam");
+    parsed
+}
+
 #[test]
 fn parse_and_resolve_returns_value_only_no_closure() {
     // Issue #2230 acceptance criterion 3: `parse_and_resolve` must
@@ -71,7 +77,8 @@ fn iter_all_resources_yields_direct_then_deferred() {
             }
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed =
+        cross_deferred_for_resolution_seam(parse(src, &ProviderContext::default()).unwrap());
 
     let items: Vec<_> = parsed.iter_all_resources().collect();
     assert_eq!(items.len(), 2, "expected one direct + one deferred");
@@ -6024,8 +6031,9 @@ fn unbound_if_read_requires_let() {
 
 #[test]
 fn deferred_unbound_target_round_trips() {
-    let parsed = parse(
-        r#"
+    let parsed = cross_deferred_for_resolution_seam(
+        parse(
+            r#"
         let orgs = upstream_state { source = "../orgs" }
         for account_id in orgs.accounts {
             awscc.sso.Assignment {
@@ -6033,9 +6041,10 @@ fn deferred_unbound_target_round_trips() {
             }
         }
     "#,
-        &ProviderContext::default(),
-    )
-    .unwrap();
+            &ProviderContext::default(),
+        )
+        .unwrap(),
+    );
 
     let target = &parsed.deferred_for_expressions[0].target;
     assert!(matches!(target, DeferredForTarget::Unbound { .. }));
@@ -6184,7 +6193,8 @@ fn parse_top_level_for_uses_last_segment_of_dotted_iterable() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
     // Deferred (upstream_state not resolved), so no concrete resources
     // but the deferred target should retain _accounts only as migration provenance.
     let DeferredForTarget::Unbound { template } = &result.deferred_for_expressions[0].target else {
@@ -10027,10 +10037,10 @@ fn coalesced_resource_ref_for_iterable_is_deferred_as_a_complete_expression() {
     "#;
 
     let parsed = parse(input, &ProviderContext::default()).unwrap();
-    let [deferred] = parsed.deferred_for_expressions.as_slice() else {
+    let [deferred] = parsed.parsed_deferred_for_expressions.as_slice() else {
         panic!(
             "coalesced unresolved iterable must produce one deferred for-expression: {:?}",
-            parsed.deferred_for_expressions
+            parsed.parsed_deferred_for_expressions
         );
     };
     let Value::Deferred(DeferredValue::Coalesce { value, default }) = &deferred.iterable else {
@@ -10048,56 +10058,62 @@ fn coalesced_resource_ref_for_iterable_is_deferred_as_a_complete_expression() {
 }
 
 #[test]
-fn deferred_for_module_call_body_is_rejected_for_bare_unbound_iterable() {
-    let error = parse(
+fn deferred_for_parser_retains_every_typed_body_kind() {
+    let parsed = parse(
+        r#"let child = use { source = "./child" }
+let src = mock.test.resource { name = "src" }
+let resources = for x in src.list { mock.test.resource { name = x } }
+let reads = for x in src.list { read mock.iam.Roles { name_regex = x } }
+let calls = for x in src.list { child { item = x } }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("the parser must classify deferred bodies without rejecting them");
+
+    let bodies = &parsed.parsed_deferred_for_expressions;
+    assert_eq!(bodies.len(), 3);
+    assert!(
+        parsed.deferred_for_expressions.is_empty(),
+        "raw parser output must not materialize the resolved deferred-for typestate"
+    );
+    assert!(matches!(bodies[0].body, DeferredForBody::Resource(_)));
+    assert!(matches!(bodies[1].body, DeferredForBody::Read(_)));
+    assert!(matches!(bodies[2].body, DeferredForBody::ModuleCall(_)));
+}
+
+#[test]
+fn deferred_for_module_call_body_with_bare_unbound_iterable_reports_identifier_error() {
+    let parsed = parse(
         r#"let child = use { source = "./child" }
 let mod_items = for x in items { child { item = x } }
 "#,
         &ProviderContext::default(),
     )
-    .expect_err("a deferred for must not silently drop a module-call body");
+    .expect("body classification must not mask directory-scope identifier checks");
 
+    let errors = check_identifier_scope(&parsed);
     assert!(matches!(
-        &error,
-        ParseError::DeferredForBodyUnsupported {
-            line: 2,
-            header,
-            body: DeferredForBodyKind::ModuleCall { name },
-        } if header == "for x in items" && name == "child"
+        errors.as_slice(),
+        [ParseError::UndefinedIdentifier { name, line: 2, .. }] if name == "items"
     ));
-    let message = error.to_string();
-    assert!(message.contains("for x in items"), "{message}");
-    assert!(message.contains("child"), "{message}");
-    assert!(message.contains("line 2"), "{message}");
-    assert!(message.contains("managed resource"), "{message}");
-    assert!(message.contains("plan time"), "{message}");
 }
 
 #[test]
-fn deferred_for_read_body_is_rejected_for_bare_unbound_iterable() {
-    let error = parse(
+fn deferred_for_read_body_with_bare_unbound_iterable_reports_identifier_error() {
+    let parsed = parse(
         r#"let read_items = for x in items {
   read mock.iam.Roles { name_regex = x }
 }
 "#,
         &ProviderContext::default(),
     )
-    .expect_err("a deferred for must not silently drop a read body");
+    .expect("body classification must not mask directory-scope identifier checks");
 
+    let errors = check_identifier_scope(&parsed);
     assert!(matches!(
-        &error,
-        ParseError::DeferredForBodyUnsupported {
-            line: 1,
-            header,
-            body: DeferredForBodyKind::Read { resource_type },
-        } if header == "for x in items" && resource_type == "mock.iam.Roles"
+        errors.as_slice(),
+        [ParseError::UndefinedIdentifier { name, line: 1, .. }] if name == "items"
     ));
-    let message = error.to_string();
-    assert!(message.contains("for x in items"), "{message}");
-    assert!(message.contains("mock.iam.Roles"), "{message}");
-    assert!(message.contains("line 1"), "{message}");
-    assert!(message.contains("managed resource"), "{message}");
-    assert!(message.contains("plan time"), "{message}");
 }
 
 #[test]
@@ -10243,7 +10259,8 @@ fn expand_deferred_for_with_remote_bindings() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
     assert_eq!(parsed.resources.len(), 0, "no resources before expansion"); // allow: direct — fixture test inspection
 
@@ -10319,7 +10336,8 @@ fn expand_deferred_for_no_remote_data_stays_deferred() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
 
     // Empty remote_bindings — upstream hasn't been applied yet
@@ -10354,7 +10372,8 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -10422,7 +10441,8 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -10492,7 +10512,8 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
     assert_eq!(parsed.deferred_for_expressions.len(), 3);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -10548,7 +10569,8 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -10612,7 +10634,8 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -10704,7 +10727,8 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut accounts: IndexMap<String, Value> = IndexMap::new();
@@ -10755,7 +10779,8 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -13234,11 +13259,13 @@ fn extract_directives_depends_on_in_for_loop_resource() {
         }
     "#;
     let parsed = parse(src, &ProviderContext::default()).unwrap();
-    let template = &parsed
-        .deferred_for_expressions
+    let deferred = parsed
+        .parsed_deferred_for_expressions
         .first()
-        .expect("for expression present")
-        .template_resource;
+        .expect("for expression present");
+    let DeferredForBody::Resource(template) = &deferred.body else {
+        panic!("deferred fixture body must be a resource")
+    };
     assert_eq!(
         template.directives.depends_on,
         vec!["role".to_string()],
@@ -15718,7 +15745,9 @@ mod loop_var_field_access_matrix {
                 aws.ec2.Subnet { name = o.k }
             }
         "#;
-        let mut p = parse(src, &ProviderContext::default()).expect("parse");
+        let mut p = cross_deferred_for_resolution_seam(
+            parse(src, &ProviderContext::default()).expect("parse"),
+        );
         assert_eq!(p.deferred_for_expressions.len(), 1, "loop deferred");
         // The template body must carry the deferred postfix operation, not a
         // resource ResourceRef (which would never resolve for a loop var) and
@@ -15775,7 +15804,9 @@ mod loop_var_field_access_matrix {
                 mock.test.Thing { name = item["missing"] }
             }
         "#;
-        let mut parsed = parse(src, &ProviderContext::default()).expect("parse deferred loop");
+        let mut parsed = cross_deferred_for_resolution_seam(
+            parse(src, &ProviderContext::default()).expect("parse deferred loop"),
+        );
         let item = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "present".to_string(),
             Value::Concrete(ConcreteValue::String("value".into())),
@@ -15805,7 +15836,9 @@ mod loop_var_field_access_matrix {
                 mock.test.Thing { name = r.missing }
             }
         "#;
-        let mut parsed = parse(src, &ProviderContext::default()).expect("parse deferred loop");
+        let mut parsed = cross_deferred_for_resolution_seam(
+            parse(src, &ProviderContext::default()).expect("parse deferred loop"),
+        );
         let item = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "present".to_string(),
             Value::Concrete(ConcreteValue::String("value".into())),

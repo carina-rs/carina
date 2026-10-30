@@ -289,3 +289,60 @@ fn validate_enumerates_deferred_for_body_over_same_config_read_attr() {
         ids
     );
 }
+
+#[test]
+fn validate_reports_runtime_deferred_module_call_body_at_resolution_seam() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider aws { region = 'us-east-1' }\n"),
+        (
+            "main.crn",
+            "let child = use { source = './child' }\n\
+             let cert = aws.acm.Certificate { domain_name = 'example.com' }\n\
+             let items = for item in cert.domain_validation_options { child { item = item } }\n",
+        ),
+    ]);
+    std::fs::create_dir(fixture.path().join("child")).expect("child directory");
+    std::fs::write(
+        fixture.path().join("child/main.crn"),
+        "arguments { item: String }\naws.route53.RecordSet { name = item }\n",
+    )
+    .expect("child module");
+
+    let errors =
+        carina_cli::commands::validate::validate_with_factories(fixture.path(), factories());
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("for item in cert.domain_validation_options")
+                && error.contains("module call `child`")
+                && error.contains("line 3")
+                && error.contains("still unresolved after module expansion")
+        }),
+        "carina validate must report the typed deferred-body error: {errors:#?}"
+    );
+}
+
+#[test]
+fn validate_reports_runtime_deferred_read_body_at_resolution_seam() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider aws { region = 'us-east-1' }\n"),
+        (
+            "main.crn",
+            "let cert = aws.acm.Certificate { domain_name = 'example.com' }\n\
+             let items = for item in cert.domain_validation_options {\n\
+               read aws.route53.RecordSet { name = item }\n\
+             }\n",
+        ),
+    ]);
+
+    let errors =
+        carina_cli::commands::validate::validate_with_factories(fixture.path(), factories());
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("for item in cert.domain_validation_options")
+                && error.contains("read `aws.route53.RecordSet`")
+                && error.contains("line 2")
+                && error.contains("still unresolved after module expansion")
+        }),
+        "carina validate must report the typed deferred-body error: {errors:#?}"
+    );
+}

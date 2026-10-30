@@ -152,7 +152,7 @@ fn anonymous_deferred_collision_fixture() -> (
     SchemaRegistry,
     Resource,
 ) {
-    let parsed = crate::parser::parse_file(
+    let mut parsed = crate::parser::parse_file(
         "let upstream = upstream_state { source = '../upstream' }\n\
          for value in upstream.values {\n\
            mock.test.Child { identity_input = value }\n\
@@ -161,6 +161,8 @@ fn anonymous_deferred_collision_fixture() -> (
         &crate::parser::ProviderContext::default(),
     )
     .expect("unbound deferred loop parses");
+    crate::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+        .expect("deferred fixture crosses the module-resolution seam");
     let template = parsed.deferred_for_expressions[0].clone();
     let mut bindings = ResolvedBindings::default();
     bindings.set_with_completeness(

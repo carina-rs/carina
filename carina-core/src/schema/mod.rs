@@ -10538,6 +10538,24 @@ fn resolve_file_block_names<E>(
             ));
         }
     }
+    for deferred in &mut parsed.parsed_deferred_for_expressions {
+        match &mut deferred.body {
+            crate::parser::DeferredForBody::Resource(resource) => {
+                conflicts.extend(resolve_block_names_detailed(
+                    std::slice::from_mut(resource.as_mut()),
+                    registry,
+                ));
+            }
+            // These bodies never cross the module-resolution seam, so block
+            // aliases cannot affect a materialized resource. Their typed body
+            // error remains the authoritative diagnostic.
+            crate::parser::DeferredForBody::Read(_)
+            | crate::parser::DeferredForBody::ModuleCall(_) => {}
+        }
+    }
+    // This function is also part of the post-resolution schema API. Synthetic
+    // resolved fixtures and finalized production files carry only this arm;
+    // raw parser output leaves it empty.
     for deferred in &mut parsed.deferred_for_expressions {
         conflicts.extend(resolve_block_names_detailed(
             std::slice::from_mut(&mut deferred.template_resource),
@@ -10551,6 +10569,30 @@ fn resolve_file_block_names<E>(
             .collect();
     }
     conflicts
+}
+
+fn deferred_resource_by_id<'a, E>(
+    parsed: &'a crate::parser::File<E>,
+    id: &crate::resource::ResourceId,
+) -> Option<&'a Resource> {
+    parsed
+        .parsed_deferred_for_expressions
+        .iter()
+        .find_map(|deferred| match &deferred.body {
+            crate::parser::DeferredForBody::Resource(resource) if resource.id == *id => {
+                Some(resource.as_ref())
+            }
+            crate::parser::DeferredForBody::Resource(_)
+            | crate::parser::DeferredForBody::Read(_)
+            | crate::parser::DeferredForBody::ModuleCall(_) => None,
+        })
+        .or_else(|| {
+            parsed
+                .deferred_for_expressions
+                .iter()
+                .find(|deferred| deferred.template_resource.id == *id)
+                .map(|deferred| &deferred.template_resource)
+        })
 }
 
 fn resolve_file_block_names_with_authored<E, A>(
@@ -10578,12 +10620,27 @@ fn resolve_file_block_names_with_authored<E, A>(
             ));
         }
     }
+    for deferred in &mut parsed.parsed_deferred_for_expressions {
+        match &mut deferred.body {
+            crate::parser::DeferredForBody::Resource(resource) => {
+                let authored_resources = deferred_resource_by_id(authored, &resource.id)
+                    .map(std::slice::from_ref)
+                    .unwrap_or_default();
+                conflicts.extend(resolve_block_names_detailed_with_authored(
+                    std::slice::from_mut(resource.as_mut()),
+                    authored_resources,
+                    registry,
+                ));
+            }
+            // Read and module-call bodies are rejected before they can enter
+            // the canonical evaluated/authored resource pair.
+            crate::parser::DeferredForBody::Read(_)
+            | crate::parser::DeferredForBody::ModuleCall(_) => {}
+        }
+    }
     for deferred in &mut parsed.deferred_for_expressions {
-        let authored_resources = authored
-            .deferred_for_expressions
-            .iter()
-            .find(|candidate| candidate.template_resource.id == deferred.template_resource.id)
-            .map(|candidate| std::slice::from_ref(&candidate.template_resource))
+        let authored_resources = deferred_resource_by_id(authored, &deferred.template_resource.id)
+            .map(std::slice::from_ref)
             .unwrap_or_default();
         conflicts.extend(resolve_block_names_detailed_with_authored(
             std::slice::from_mut(&mut deferred.template_resource),

@@ -94,6 +94,10 @@ impl DeferredForTarget {
 }
 
 /// A for-expression whose iterable is unresolved (e.g., upstream_state not yet available).
+///
+/// Parser-side deferred loops use [`ParsedDeferredForExpression`] instead.
+/// This resource-only shape is the resolved typestate consumed by planning,
+/// execution, display, and state persistence.
 /// Captures the structural shape of the loop body so the plan can show what
 /// resources *would* be created once the iterable becomes available.
 /// Also stores enough information to expand the loop later when the iterable
@@ -130,6 +134,127 @@ pub struct DeferredForExpression<S = ModuleSource> {
     /// Template resource for expansion (the for body parsed with placeholders).
     #[serde(with = "deferred_template_resource_serde")]
     pub template_resource: Resource<S>,
+}
+
+/// Typed parser-side body of a deferred `for` expression.
+///
+/// Every grammar-supported body kind is retained until module expansion has
+/// substituted caller arguments. Only the [`Self::Resource`] arm can cross
+/// the final resolution seam into [`DeferredForExpression`].
+#[derive(Debug, Clone)]
+pub enum DeferredForBody {
+    Resource(Box<Resource>),
+    Read(Box<DataSource>),
+    ModuleCall(ModuleCall),
+}
+
+/// Parser-side typestate for a deferred `for` expression.
+///
+/// Unlike [`DeferredForExpression`], this representation is deliberately not
+/// serializable and may contain a read or module-call template. The module
+/// resolver consumes it after all module argument substitution and produces
+/// the resource-only resolved representation.
+#[derive(Debug, Clone)]
+pub struct ParsedDeferredForExpression {
+    /// Full source path, stamped by the directory loader.
+    pub file: Option<String>,
+    /// Source line of the `for` keyword.
+    pub line: usize,
+    /// Exact authored span of the complete `for` expression.
+    pub span: SourceSpan,
+    /// Authored loop header, for example `for item in names`.
+    pub header: String,
+    pub target: DeferredForTarget,
+    pub iterable: Value,
+    pub binding: ForBinding,
+    pub body: DeferredForBody,
+}
+
+impl ParsedDeferredForExpression {
+    pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
+        self.iterable.root_bindings()
+    }
+
+    pub(crate) fn into_resource_expression(
+        self,
+        template_resource: Resource,
+    ) -> DeferredForExpression {
+        let Self {
+            file,
+            line,
+            span: _,
+            header,
+            target,
+            iterable,
+            binding,
+            body: _,
+        } = self;
+        let resource_type = if template_resource.id.provider.is_empty() {
+            template_resource.id.resource_type.clone()
+        } else {
+            format!(
+                "{}.{}",
+                template_resource.id.provider, template_resource.id.resource_type
+            )
+        };
+        let attributes = template_resource
+            .attributes
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        DeferredForExpression {
+            file,
+            line,
+            header,
+            resource_type,
+            attributes,
+            target,
+            iterable,
+            binding,
+            template_resource,
+        }
+    }
+}
+
+/// Phase-neutral, read-only metadata for a deferred `for` expression.
+///
+/// Before module resolution this borrows the parser-side typed entry; after
+/// the resolution seam it borrows the resource-only entry. The loop body is
+/// intentionally absent so downstream crates cannot bypass the resolved body
+/// typestate.
+#[derive(Debug, Clone, Copy)]
+pub struct DeferredForSite<'a> {
+    file: Option<&'a str>,
+    line: usize,
+    header: &'a str,
+    binding: &'a ForBinding,
+    iterable: &'a Value,
+}
+
+impl<'a> DeferredForSite<'a> {
+    pub fn file(&self) -> Option<&'a str> {
+        self.file
+    }
+
+    pub fn line(&self) -> usize {
+        self.line
+    }
+
+    pub fn header(&self) -> &'a str {
+        self.header
+    }
+
+    pub fn binding(&self) -> &'a ForBinding {
+        self.binding
+    }
+
+    pub fn iterable(&self) -> &'a Value {
+        self.iterable
+    }
+
+    pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
+        self.iterable.root_bindings()
+    }
 }
 
 pub type SavedDeferredForExpression = DeferredForExpression<SavedModuleSource>;
@@ -2682,6 +2807,12 @@ pub struct File<E> {
     pub warnings: Vec<ParseWarning>,
     /// For-expressions whose iterables are unresolved; displayed as deferred in plan.
     pub deferred_for_expressions: Vec<DeferredForExpression>,
+    /// Parser-side deferred loops awaiting the fallible post-module-expansion
+    /// conversion to `deferred_for_expressions`.
+    ///
+    /// Kept crate-private so downstream consumers can only observe the
+    /// resource-only resolved typestate above.
+    pub(crate) parsed_deferred_for_expressions: Vec<ParsedDeferredForExpression>,
     /// Plan-scoped lineage of leaf nodes back to the composition call
     /// sites that produced them (#3306).
     ///
@@ -2727,12 +2858,51 @@ impl<E> Default for File<E> {
             parsed_binding_uses: ParsedBindingUses::default(),
             warnings: Vec::new(),
             deferred_for_expressions: Vec::new(),
+            parsed_deferred_for_expressions: Vec::new(),
             expansion_trace: crate::resource::ExpansionTrace::new(),
         }
     }
 }
 
 impl<E> File<E> {
+    /// Parser-side deferred loops awaiting the module-resolution body seam.
+    ///
+    /// This slice is empty after successful resolution. Pre-resolution
+    /// diagnostics must match every [`DeferredForBody`] variant explicitly;
+    /// only the resource arm participates in resource-schema passes.
+    pub fn parsed_deferred_for_expressions(&self) -> &[ParsedDeferredForExpression] {
+        &self.parsed_deferred_for_expressions
+    }
+
+    /// Iterate deferred-loop metadata across the parser and resolved
+    /// typestates without exposing parser-side body variants.
+    ///
+    /// Production files populate exactly one side of this chain: raw parser
+    /// output uses `parsed_deferred_for_expressions`, and the module resolver
+    /// consumes it before producing `deferred_for_expressions`.
+    pub fn deferred_for_sites(&self) -> impl Iterator<Item = DeferredForSite<'_>> {
+        self.parsed_deferred_for_expressions
+            .iter()
+            .map(|deferred| DeferredForSite {
+                file: deferred.file.as_deref(),
+                line: deferred.line,
+                header: &deferred.header,
+                binding: &deferred.binding,
+                iterable: &deferred.iterable,
+            })
+            .chain(
+                self.deferred_for_expressions
+                    .iter()
+                    .map(|deferred| DeferredForSite {
+                        file: deferred.file.as_deref(),
+                        line: deferred.line,
+                        header: &deferred.header,
+                        binding: &deferred.binding,
+                        iterable: &deferred.iterable,
+                    }),
+            )
+    }
+
     pub(crate) fn set_loop_binding_scope(
         &mut self,
         binding_scope: std::collections::BTreeSet<String>,
@@ -2748,14 +2918,16 @@ impl<E> File<E> {
                 origin.set_binding_scope(std::sync::Arc::clone(&binding_scope));
             }
         }
-        for deferred in &mut self.deferred_for_expressions {
+        for deferred in &mut self.parsed_deferred_for_expressions {
             deferred
                 .target
                 .set_loop_binding_scope(std::sync::Arc::clone(&binding_scope));
-            deferred
-                .template_resource
-                .loop_provenance
-                .set_binding_scope(std::sync::Arc::clone(&binding_scope));
+            match &mut deferred.body {
+                DeferredForBody::Resource(resource) => resource
+                    .loop_provenance
+                    .set_binding_scope(std::sync::Arc::clone(&binding_scope)),
+                DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => {}
+            }
         }
     }
 
@@ -2796,6 +2968,7 @@ impl<E> File<E> {
             parsed_binding_uses,
             warnings,
             deferred_for_expressions,
+            parsed_deferred_for_expressions,
             expansion_trace,
         } = source;
 
@@ -2820,6 +2993,8 @@ impl<E> File<E> {
         self.warnings.extend(warnings);
         self.deferred_for_expressions
             .extend(deferred_for_expressions);
+        self.parsed_deferred_for_expressions
+            .extend(parsed_deferred_for_expressions);
         for (leaf, call_sites) in expansion_trace.leaf_to_call_sites {
             self.expansion_trace.record(leaf, call_sites);
         }
@@ -2864,6 +3039,7 @@ impl<E> File<E> {
             parsed_binding_uses,
             warnings,
             deferred_for_expressions,
+            parsed_deferred_for_expressions,
             expansion_trace,
         } = self;
 
@@ -2889,6 +3065,7 @@ impl<E> File<E> {
             parsed_binding_uses,
             warnings,
             deferred_for_expressions,
+            parsed_deferred_for_expressions,
             expansion_trace,
         }
     }
@@ -3805,6 +3982,7 @@ mod substitute_placeholder_tests {
             parsed_binding_uses: _,
             warnings: _,
             deferred_for_expressions: _,
+            parsed_deferred_for_expressions: _,
             expansion_trace: _,
         } = parsed;
     }
@@ -3904,7 +4082,7 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn deferred_unbound_children_are_pending_with_origin() {
-        let parsed = crate::parser::parse(
+        let mut parsed = crate::parser::parse(
             "let upstream = upstream_state { source = '../upstream' }\n\
              for value in upstream.values {\n\
                mock.test.Child { identity_input = value }\n\
@@ -3912,6 +4090,8 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
+        crate::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+            .expect("deferred fixture crosses the module-resolution seam");
         let deferred = &parsed.deferred_for_expressions[0];
         let children = expand_deferred_children(
             deferred,
@@ -3978,7 +4158,7 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn unbound_deferred_target_requires_serialized_loop_kind() {
-        let parsed = crate::parser::parse(
+        let mut parsed = crate::parser::parse(
             "let upstream = upstream_state { source = '../upstream' }\n\
              for value in upstream.values {\n\
                mock.test.Child { identity_input = value }\n\
@@ -3986,6 +4166,8 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
+        crate::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+            .expect("deferred fixture crosses the module-resolution seam");
         let target = &parsed.deferred_for_expressions[0].target;
         let mut json = serde_json::to_value(target).expect("serialize deferred target");
         json["template"]["source"]

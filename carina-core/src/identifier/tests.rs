@@ -6346,8 +6346,8 @@ import {
     )
     .expect("bound discard loop and state blocks parse");
     assert!(matches!(
-        parsed.deferred_for_expressions.as_slice(),
-        [crate::parser::DeferredForExpression {
+        parsed.parsed_deferred_for_expressions.as_slice(),
+        [crate::parser::ParsedDeferredForExpression {
             target: crate::parser::DeferredForTarget::Bound { binding },
             ..
         }] if binding == "_"

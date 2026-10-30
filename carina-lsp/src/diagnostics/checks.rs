@@ -20,7 +20,7 @@ use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
 use super::{
     DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic, carina_diagnostic_range,
-    parser_span_range,
+    parse_error_to_diagnostic, parser_span_range,
 };
 
 /// Directory parse plus the typed module-resolution outcome.
@@ -513,14 +513,11 @@ fn contains_matching_function_call(value: &Value, matches_name: &impl Fn(&str) -
     }
 }
 
-/// Whether `deferred` was parsed from the editor's current document.
-/// `DeferredForExpression.file` is stamped with the full source path, so we
-/// compare by basename to the LSP-supplied `current_file_name`.
-fn deferred_in_current_file(
-    deferred: &carina_core::parser::DeferredForExpression,
-    current_file_name: Option<&str>,
-) -> bool {
-    source_file_is_current(deferred.file.as_deref(), current_file_name)
+/// Whether a deferred expression was parsed from the editor's current
+/// document. Both deferred typestates stamp the full source path, so compare
+/// by basename to the LSP-supplied `current_file_name`.
+fn deferred_in_current_file(file: Option<&str>, current_file_name: Option<&str>) -> bool {
+    source_file_is_current(file, current_file_name)
 }
 
 fn source_file_is_current(file: Option<&str>, current_file_name: Option<&str>) -> bool {
@@ -1380,6 +1377,22 @@ impl DiagnosticEngine {
             return Vec::new();
         };
         let relative_message = residual.display_relative_to(base_path);
+        if let carina_core::module_resolver::ResidualModuleResolutionDiagnostic::Parse {
+            source_path: Some(error_source),
+            error,
+        } = &residual_diagnostic
+        {
+            let error_source = if error_source.is_absolute() {
+                error_source.to_path_buf()
+            } else {
+                base_path.join(error_source)
+            };
+            if current_source == error_source.as_path() {
+                let mut diagnostic = parse_error_to_diagnostic(error);
+                diagnostic.message = relative_message;
+                return vec![diagnostic];
+            }
+        }
         let (constraint_origin, direct_error_location, severity, message) =
             match residual_diagnostic {
             carina_core::module_resolver::ResidualModuleResolutionDiagnostic::Constraint {
@@ -1402,7 +1415,7 @@ impl DiagnosticEngine {
             carina_core::module_resolver::ResidualModuleResolutionDiagnostic::ModuleCall => {
                 (None, None, DiagnosticSeverity::ERROR, relative_message)
             }
-            carina_core::module_resolver::ResidualModuleResolutionDiagnostic::Parse => {
+            carina_core::module_resolver::ResidualModuleResolutionDiagnostic::Parse { .. } => {
                 (None, None, DiagnosticSeverity::ERROR, relative_message)
             }
         };
@@ -1890,23 +1903,26 @@ impl DiagnosticEngine {
         // 1:1 mapping between deferred expressions and diagnostics; two
         // sibling files with `for _ in <same>.attr` on the same line
         // would otherwise collide on the error's `(name, line)` key.
-        for deferred in &merged.deferred_for_expressions {
-            if !deferred_in_current_file(deferred, current_file_name) {
+        let deferred_sites = merged
+            .deferred_for_sites()
+            .map(|deferred| (deferred.file(), deferred.line(), deferred.root_bindings()));
+        for (file, line, root_bindings) in deferred_sites {
+            if !deferred_in_current_file(file, current_file_name) {
                 continue;
             }
-            for root in deferred.root_bindings() {
+            for root in root_bindings {
                 if known.contains(&root) {
                     continue;
                 }
-                let line_zero_based = deferred.line.saturating_sub(1) as u32;
-                let (col, end_col) = find_for_iterable_binding_column(&text, deferred.line, &root)
+                let line_zero_based = line.saturating_sub(1) as u32;
+                let (col, end_col) = find_for_iterable_binding_column(&text, line, &root)
                     .unwrap_or_else(|| {
                         // Multi-line `for` headers put the iterable on a later line;
                         // anchor the squiggle at the `for` keyword line so the user
                         // still sees the error.
                         let line_chars = text
                             .lines()
-                            .nth(deferred.line.saturating_sub(1))
+                            .nth(line.saturating_sub(1))
                             .map(|l| l.chars().count() as u32)
                             .unwrap_or(0);
                         (0, line_chars)
@@ -1915,11 +1931,8 @@ impl DiagnosticEngine {
                 // so the editor shows the did-you-mean suggestion and the list of
                 // in-scope bindings (#2038).
                 let in_scope: Vec<String> = known.iter_names().map(String::from).collect();
-                let err = carina_core::parser::ParseError::undefined_identifier(
-                    root,
-                    deferred.line,
-                    in_scope,
-                );
+                let err =
+                    carina_core::parser::ParseError::undefined_identifier(root, line, in_scope);
                 diagnostics.push(carina_diagnostic(
                     line_zero_based,
                     col,
@@ -2662,7 +2675,7 @@ impl DiagnosticEngine {
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        for rref in parsed.iter_all_resources() {
+        for rref in super::diagnostic_resources(parsed) {
             let attrs = rref.attributes();
             for attr_value in attrs.values() {
                 self.collect_ref_attr_diagnostics(doc, attr_value, binding_index, &mut diagnostics);

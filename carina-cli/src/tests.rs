@@ -3452,7 +3452,7 @@ fn plan_file_validation_rejects_missing_resource_identity() {
 
 #[test]
 fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
-    let parsed = carina_core::parser::parse_file(
+    let mut parsed = carina_core::parser::parse_file(
         "let upstream = upstream_state { source = '../upstream' }\n\
          let children = for value in upstream.values {\n\
            mock.test.resource { name = value }\n\
@@ -3461,6 +3461,8 @@ fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
         &ProviderContext::default(),
     )
     .expect("bound deferred loop parses");
+    carina_core::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+        .expect("cross the deferred-body resolution seam");
     let template = parsed.deferred_for_expressions[0].clone();
     assert!(matches!(
         template.target,
@@ -3522,7 +3524,7 @@ fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
 
 #[test]
 fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
-    let parsed = carina_core::parser::parse_file(
+    let mut parsed = carina_core::parser::parse_file(
         "let upstream = upstream_state { source = '../upstream' }\n\
          for value in upstream.values {\n\
            mock.test.resource { name = value }\n\
@@ -3531,6 +3533,8 @@ fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
         &ProviderContext::default(),
     )
     .expect("unbound deferred loop parses");
+    carina_core::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+        .expect("cross the deferred-body resolution seam");
     let mut template = parsed.deferred_for_expressions[0].clone();
     assert!(matches!(
         template.target,

@@ -1075,8 +1075,9 @@ pub(crate) fn parse_directory_files_located_from_root(
     );
 
     // Pass 1.a: classify declarations with the complete syntactic scope.
-    // Errors here propagate identically to Pass 2 (same input, same parser
-    // path), so don't try to be clever about saving them.
+    // Deferred-loop body errors are explicitly retryable while sibling
+    // bindings are provisional; every other error propagates here, and the
+    // final pass reparses those bodies with fully classified bindings.
     let mut pass1_union = ParsedFile::default();
     let mut pass_1a_local_variables = Vec::with_capacity(files.len());
     for (path, content) in files {
@@ -1208,9 +1209,15 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
         )
         .chain(
             parsed
-                .deferred_for_expressions
+                .parsed_deferred_for_expressions
                 .iter()
-                .map(|deferred| deferred.template_resource.id.clone()),
+                .filter_map(|deferred| match &deferred.body {
+                    crate::parser::DeferredForBody::Resource(resource) => Some(resource.id.clone()),
+                    crate::parser::DeferredForBody::Read(data_source) => {
+                        Some(data_source.id.clone())
+                    }
+                    crate::parser::DeferredForBody::ModuleCall(_) => None,
+                }),
         )
         .collect::<Vec<_>>();
     for id in resource_ids {
@@ -1239,19 +1246,22 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
             origin.set_display_file(&display_file);
         }
     }
-    for deferred in &mut parsed.deferred_for_expressions {
+    for deferred in &mut parsed.parsed_deferred_for_expressions {
         deferred.target.set_loop_display_file(&display_file);
-        deferred
-            .template_resource
-            .loop_provenance
-            .set_display_file(&display_file);
+        match &mut deferred.body {
+            crate::parser::DeferredForBody::Resource(resource) => {
+                resource.loop_provenance.set_display_file(&display_file);
+            }
+            crate::parser::DeferredForBody::Read(_)
+            | crate::parser::DeferredForBody::ModuleCall(_) => {}
+        }
     }
 
     let warning_file = Some(path.display().to_string());
     for warning in &mut parsed.warnings {
         warning.file = warning_file.clone();
     }
-    for deferred in &mut parsed.deferred_for_expressions {
+    for deferred in &mut parsed.parsed_deferred_for_expressions {
         deferred.file = warning_file.clone();
     }
 }
@@ -2094,6 +2104,13 @@ for account_id in orgs.accounts {
         .unwrap();
 
         let mut config = load_configuration(&dir).expect("directory fixture loads");
+        crate::module_resolver::resolve_modules_with_config(
+            &mut config.parsed,
+            &dir,
+            &ProviderContext::default(),
+            &SchemaRegistry::new(),
+        )
+        .expect("directory fixture crosses the module-resolution seam");
         assert_eq!(config.parsed.deferred_for_expressions.len(), 1);
         let deferred_line = config.parsed.deferred_for_expressions[0].line;
         config.parsed.warnings.push(crate::parser::ParseWarning {
@@ -2238,87 +2255,225 @@ let orgs = upstream_state {
         fixture
     }
 
-    fn deferred_for_body_parse_failure(fixture: &tempfile::TempDir) -> DirectoryParseFailure {
-        match parse_directory_with_overrides_and_diagnostics(
+    fn resolve_deferred_for_fixture(
+        fixture: &tempfile::TempDir,
+    ) -> Result<InferredFile, crate::module_resolver::ModuleError> {
+        let mut parsed = load_configuration(fixture.path())
+            .expect("the parser-side deferred body must survive directory loading")
+            .parsed;
+        crate::module_resolver::resolve_modules_with_config(
+            &mut parsed,
             fixture.path(),
             &ProviderContext::default(),
-            &HashMap::new(),
-        ) {
-            Ok(_) => panic!("unsupported deferred-for body unexpectedly loaded"),
-            Err(error) => error,
+            &SchemaRegistry::new(),
+        )?;
+        Ok(parsed)
+    }
+
+    #[test]
+    fn sibling_list_expands_module_call_and_read_for_bodies() {
+        let fixture = deferred_for_body_fixture(
+            "let child = use { source = './child' }\n\
+             let mods = for n in names { child { item = n } }\n\
+             let reads = for n in names { read mock.iam.Roles { name_regex = n } }\n",
+        );
+        fs::write(
+            fixture.path().join("values.crn"),
+            "let names = ['alpha', 'beta']\n",
+        )
+        .expect("sibling values fixture");
+
+        let loaded = load_configuration(fixture.path())
+            .expect("a sibling plan-time list must expand during the final parse pass");
+        let call_bindings = loaded
+            .parsed
+            .module_calls
+            .iter()
+            .filter_map(|call| call.binding_name.as_deref())
+            .collect::<Vec<_>>();
+        let read_bindings = loaded
+            .parsed
+            .data_sources
+            .iter()
+            .filter_map(|read| read.binding.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(call_bindings, ["mods[0]", "mods[1]"]);
+        assert_eq!(read_bindings, ["reads[0]", "reads[1]"]);
+    }
+
+    #[test]
+    fn later_list_expands_module_call_and_read_for_bodies() {
+        let fixture = deferred_for_body_fixture(
+            "let child = use { source = './child' }\n\
+             let mods = for n in names { child { item = n } }\n\
+             let reads = for n in names { read mock.iam.Roles { name_regex = n } }\n\
+             let names = ['alpha', 'beta']\n",
+        );
+
+        let loaded = load_configuration(fixture.path())
+            .expect("a later plan-time list must expand during the final parse pass");
+        assert_eq!(loaded.parsed.module_calls.len(), 2);
+        assert_eq!(loaded.parsed.data_sources.len(), 2);
+    }
+
+    #[test]
+    fn sibling_map_indexed_by_loop_variable_expands_resources() {
+        let fixture = deferred_for_body_fixture(
+            "let resources = for name in names {\n\
+               mock.test.resource { name = lookup[name] }\n\
+             }\n",
+        );
+        fs::write(
+            fixture.path().join("values.crn"),
+            "let names = ['one', 'two']\nlet lookup = { one = 'A', two = 'B' }\n",
+        )
+        .expect("sibling lookup fixture");
+
+        let loaded = load_configuration(fixture.path())
+            .expect("provisional template errors must be retried in the final parse pass");
+        let names = loaded
+            .parsed
+            .resources
+            .iter()
+            .map(|resource| match resource.get_attr("name") {
+                Some(Value::Concrete(crate::resource::ConcreteValue::String(name))) => {
+                    name.expose_plaintext()
+                }
+                other => panic!("expected concrete resource name, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["A", "B"]);
+    }
+
+    #[test]
+    fn typo_iterable_reports_undefined_identifier() {
+        let fixture = deferred_for_body_fixture(
+            "let child = use { source = './child' }\n\
+             let items = ['alpha', 'beta']\n\
+             let mods = for n in itmes { child { item = n } }\n",
+        );
+
+        let loaded = load_configuration(fixture.path())
+            .expect("an undefined iterable is diagnosed after the directory merge");
+        assert!(
+            loaded.identifier_scope_errors.iter().any(|error| matches!(
+                error,
+                crate::parser::ParseError::UndefinedIdentifier { name, line: 3, .. }
+                    if name == "itmes"
+            )),
+            "expected the normal undefined-identifier diagnostic, got {:?}",
+            loaded.identifier_scope_errors
+        );
+    }
+
+    #[test]
+    fn module_resolution_rejects_runtime_deferred_module_call_and_read_bodies() {
+        for (body, expected_body) in [
+            (
+                "child { item = x }",
+                crate::parser::DeferredForBodyKind::ModuleCall {
+                    name: "child".to_string(),
+                },
+            ),
+            (
+                "read mock.iam.Roles { name_regex = x }",
+                crate::parser::DeferredForBodyKind::Read {
+                    resource_type: "mock.iam.Roles".to_string(),
+                },
+            ),
+        ] {
+            let fixture = deferred_for_body_fixture(&format!(
+                "let child = use {{ source = './child' }}\n\
+                 let src = mock.test.resource {{ name = 'src' }}\n\
+                 let items = for x in src.list {{ {body} }}\n"
+            ));
+
+            let error = resolve_deferred_for_fixture(&fixture)
+                .expect_err("the final module-resolution seam must reject this deferred body");
+            let crate::module_resolver::ModuleError::ParseInFile { path, error } =
+                error.root_cause()
+            else {
+                panic!("expected a file-owned typed parse error, got {error:?}");
+            };
+            assert!(
+                path.ends_with("main.crn"),
+                "unexpected error owner: {path:?}"
+            );
+            assert!(matches!(
+                error.as_ref(),
+                crate::parser::ParseError::DeferredForBodyUnsupported(details)
+                    if details.line == 3
+                        && details.header == "for x in src.list"
+                        && details.body == expected_body
+            ));
+            let message = error.to_string();
+            assert!(message.contains("for x in src.list"), "{message}");
+            assert!(message.contains("line 3"), "{message}");
+            assert!(
+                message.contains("still unresolved after module expansion"),
+                "{message}"
+            );
+            assert!(message.contains("managed resources directly"), "{message}");
         }
     }
 
     #[test]
-    fn directory_validate_path_rejects_deferred_for_module_call_body() {
-        let fixture = deferred_for_body_fixture(
-            "let child = use { source = './child' }\n\
-             let src = mock.test.resource { name = 'src' }\n\
-             let res_items = for x in src.list { mock.test.resource { name = x } }\n\
-             let mod_items = for x in src.list { child { item = x } }\n\
-             let read_items = for x in src.list { read mock.iam.Roles { name_regex = x } }\n",
-        );
+    fn module_argument_iterable_is_substituted_before_body_rejection() {
+        let fixture = tempfile::tempdir().expect("module-argument fixture");
+        fs::create_dir_all(fixture.path().join("parent/grandchild"))
+            .expect("nested module directories");
+        fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+            .expect("providers fixture");
+        fs::write(
+            fixture.path().join("main.crn"),
+            "let parent = use { source = './parent' }\n\
+             parent { names = ['alpha', 'beta'] }\n",
+        )
+        .expect("root fixture");
+        fs::write(
+            fixture.path().join("parent/main.crn"),
+            "arguments { names: list(String) }\n\
+             let grandchild = use { source = './grandchild' }\n\
+             let calls = for name in names { grandchild { item = name } }\n",
+        )
+        .expect("parent fixture");
+        fs::write(
+            fixture.path().join("parent/grandchild/main.crn"),
+            "arguments { item: String }\nmock.test.resource { name = item }\n",
+        )
+        .expect("grandchild fixture");
 
-        let failure = deferred_for_body_parse_failure(&fixture);
-        let error = failure
-            .parse_error()
-            .expect("directory loader must retain the typed parser error");
-        assert!(matches!(
-            error,
-            crate::parser::ParseError::DeferredForBodyUnsupported {
-                line: 4,
-                header,
-                body: crate::parser::DeferredForBodyKind::ModuleCall { name },
-            } if header == "for x in src.list" && name == "child"
-        ));
-        let message = error.to_string();
-        assert!(message.contains("for x in src.list"), "{message}");
-        assert!(message.contains("child"), "{message}");
-        assert!(message.contains("line 4"), "{message}");
-        assert!(message.contains("managed resource"), "{message}");
-        assert!(message.contains("plan time"), "{message}");
-
-        let validate_error = match load_configuration(fixture.path()) {
-            Ok(_) => panic!("the validate loader path unexpectedly accepted the fixture"),
-            Err(error) => error,
+        let error = resolve_deferred_for_fixture(&fixture)
+            .expect_err("module-call loop replay is not supported at the final seam");
+        let crate::module_resolver::ModuleError::ParseInFile { path, error } = error.root_cause()
+        else {
+            panic!("expected a file-owned typed parse error, got {error:?}");
         };
-        assert!(validate_error.contains(&message), "{validate_error}");
-    }
-
-    #[test]
-    fn directory_validate_path_rejects_deferred_for_read_body() {
-        let fixture = deferred_for_body_fixture(
-            "let child = use { source = './child' }\n\
-             let src = mock.test.resource { name = 'src' }\n\
-             let res_items = for x in src.list { mock.test.resource { name = x } }\n\
-             \n\
-             let read_items = for x in src.list { read mock.iam.Roles { name_regex = x } }\n",
+        assert!(
+            path.ends_with("parent/main.crn"),
+            "unexpected error owner: {path:?}"
         );
-
-        let failure = deferred_for_body_parse_failure(&fixture);
-        let error = failure
-            .parse_error()
-            .expect("directory loader must retain the typed parser error");
-        assert!(matches!(
-            error,
-            crate::parser::ParseError::DeferredForBodyUnsupported {
-                line: 5,
-                header,
-                body: crate::parser::DeferredForBodyKind::Read { resource_type },
-            } if header == "for x in src.list" && resource_type == "mock.iam.Roles"
-        ));
+        assert!(
+            matches!(
+                error.as_ref(),
+                crate::parser::ParseError::DeferredForBodyUnsupported(details)
+                    if details.line == 3
+                        && details.header == "for name in names"
+                        && matches!(
+                            &details.body,
+                            crate::parser::DeferredForBodyKind::ModuleCall { name }
+                                if name == "grandchild"
+                        )
+            ),
+            "unexpected deferred-body error: {error:?}"
+        );
         let message = error.to_string();
-        assert!(message.contains("for x in src.list"), "{message}");
-        assert!(message.contains("mock.iam.Roles"), "{message}");
-        assert!(message.contains("line 5"), "{message}");
-        assert!(message.contains("managed resource"), "{message}");
-        assert!(message.contains("plan time"), "{message}");
-
-        let validate_error = match load_configuration(fixture.path()) {
-            Ok(_) => panic!("the validate loader path unexpectedly accepted the fixture"),
-            Err(error) => error,
-        };
-        assert!(validate_error.contains(&message), "{validate_error}");
+        assert!(
+            message.contains("concrete after module argument substitution"),
+            "{message}"
+        );
+        assert!(!message.contains("not known until apply"), "{message}");
+        assert!(!message.contains("still unresolved"), "{message}");
     }
 
     #[test]
@@ -2326,15 +2481,17 @@ let orgs = upstream_state {
         let fixture = deferred_for_body_fixture(
             "let child = use { source = './child' }\n\
              let src = mock.test.resource { name = 'src' }\n\
-             let res_items = for x in src.list { mock.test.resource { name = x } }\n",
+             let res_items = for x in src.list {\n\
+               mock.test.resource { name = x comment = secret('fixed') }\n\
+             }\n",
         );
 
-        let loaded = load_configuration(fixture.path())
+        let parsed = resolve_deferred_for_fixture(&fixture)
             .expect("a managed-resource deferred-for body remains supported");
-        let [deferred] = loaded.parsed.deferred_for_expressions.as_slice() else {
+        let [deferred] = parsed.deferred_for_expressions.as_slice() else {
             panic!(
                 "expected exactly one deferred placeholder, got {:?}",
-                loaded.parsed.deferred_for_expressions
+                parsed.deferred_for_expressions
             );
         };
         assert_eq!(deferred.header, "for x in src.list");
@@ -2344,6 +2501,10 @@ let orgs = upstream_state {
             deferred.template_resource.binding.as_deref(),
             Some("res_items[?]")
         );
+        assert!(matches!(
+            deferred.template_resource.get_attr("comment"),
+            Some(Value::Deferred(crate::resource::DeferredValue::Secret(_)))
+        ));
     }
 
     #[test]

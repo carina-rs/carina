@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn apply_time_unbound_children_receive_anonymous_ids() {
-        let parsed = crate::parser::parse(
+        let mut parsed = crate::parser::parse(
             "let upstream = upstream_state { source = '../upstream' }\n\
              for value in upstream.values {\n\
                mock.test.Child { identity_input = value }\n\
@@ -440,6 +440,8 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
+        crate::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+            .expect("deferred fixture crosses the module-resolution seam");
         let template = &parsed.deferred_for_expressions[0];
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(
@@ -490,7 +492,7 @@ mod tests {
 
     #[test]
     fn apply_time_unbound_enum_identity_matches_plan_time_canonical_identity() {
-        let parsed = crate::parser::parse_file(
+        let mut parsed = crate::parser::parse_file(
             "let upstream = upstream_state { source = '../upstream' }\n\
              for value in upstream.values {\n\
                mock.test.Child { mode = value }\n\
@@ -499,6 +501,8 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound enum loop parses");
+        crate::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+            .expect("deferred fixture crosses the module-resolution seam");
         let template = &parsed.deferred_for_expressions[0];
         let iterable = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::enum_identifier("foo"),
@@ -570,7 +574,7 @@ mod tests {
 
     #[test]
     fn apply_time_anonymous_identity_failure_preserves_the_typed_source() {
-        let parsed = crate::parser::parse(
+        let mut parsed = crate::parser::parse(
             "let upstream = upstream_state { source = '../upstream' }\n\
              for value in upstream.values {\n\
                mock.test.Child { identity_input = value }\n\
@@ -578,6 +582,8 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
+        crate::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+            .expect("deferred fixture crosses the module-resolution seam");
         let template = &parsed.deferred_for_expressions[0];
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(

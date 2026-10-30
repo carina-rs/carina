@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn cross_phase_unbound_failure_uses_source_location_not_scheduler_key() {
-        let parsed = crate::parser::parse_file(
+        let mut parsed = crate::parser::parse_file(
             "let upstream = upstream_state { source = '../upstream' }\n\
              for value in upstream.values {\n\
                mock.test.Child { identity_input = value }\n\
@@ -283,6 +283,8 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("unbound deferred loop parses");
+        crate::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+            .expect("deferred fixture crosses the module-resolution seam");
         let template = parsed.deferred_for_expressions[0].clone();
         let scheduler_key = template.target.scheduler_key().to_string();
         assert!(scheduler_key.starts_with("_loop_"));

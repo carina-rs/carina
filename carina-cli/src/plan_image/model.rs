@@ -1288,6 +1288,8 @@ mod tests {
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("parse deferred loop fixture");
+        carina_core::module_resolver::resolve_modules(&mut parsed, fixture.path())
+            .expect("cross the deferred-body resolution seam");
         let template = parsed
             .deferred_for_expressions
             .pop()

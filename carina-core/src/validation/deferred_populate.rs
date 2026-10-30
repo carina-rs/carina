@@ -82,6 +82,25 @@ pub fn validate_deferred_populate_refs<E>(
             );
         }
     }
+    for deferred in &parsed.parsed_deferred_for_expressions {
+        match &deferred.body {
+            crate::parser::DeferredForBody::Resource(resource) => {
+                if let Some(binding) = resource.binding.as_deref() {
+                    by_binding.insert(
+                        binding.to_string(),
+                        (
+                            resource.id.provider.clone(),
+                            resource.id.resource_type.clone(),
+                        ),
+                    );
+                }
+            }
+            // Read and module-call templates are rejected at the module-resolution
+            // seam and cannot participate in managed-resource synchronization.
+            crate::parser::DeferredForBody::Read(_)
+            | crate::parser::DeferredForBody::ModuleCall(_) => {}
+        }
+    }
     if by_binding.is_empty() {
         return Vec::new();
     }
@@ -108,6 +127,27 @@ pub fn validate_deferred_populate_refs<E>(
                 schemas,
                 &mut out,
             );
+        }
+    }
+    for deferred in &parsed.parsed_deferred_for_expressions {
+        match &deferred.body {
+            crate::parser::DeferredForBody::Resource(resource) => {
+                for (key, value) in &resource.attributes {
+                    collect_unsynchronized_refs(
+                        value,
+                        key,
+                        resource.binding.as_deref(),
+                        &by_binding,
+                        &synchronized,
+                        schemas,
+                        &mut out,
+                    );
+                }
+            }
+            // These bodies never cross the resource-only resolution seam, so
+            // this managed-resource diagnostic has no work to perform for them.
+            crate::parser::DeferredForBody::Read(_)
+            | crate::parser::DeferredForBody::ModuleCall(_) => {}
         }
     }
     out
@@ -369,7 +409,10 @@ fn path_traverses_deferred(top_attr: EffectiveAttribute<'_>, segments: &[PathSeg
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{ParsedFile, WaitBinding};
+    use crate::parser::{
+        DeferredForBody, DeferredForTarget, ForBinding, ParsedDeferredForExpression, ParsedFile,
+        SourceSpan, WaitBinding,
+    };
     use crate::resource::{
         AccessPath, ConcreteValue, DeferredValue, PathSegment, Resource, ResourceId, Subscript,
         Value,
@@ -517,6 +560,30 @@ mod tests {
             d.unresolved_path
         );
         assert!(d.message.contains("wait cert"), "got: {}", d.message);
+    }
+
+    #[test]
+    fn parser_side_deferred_resource_body_is_checked() {
+        let mut parsed = parsed_with_unsynchronized_chained_ref();
+        let record = parsed.resources.pop().expect("record resource");
+        parsed
+            .parsed_deferred_for_expressions
+            .push(ParsedDeferredForExpression {
+                file: None,
+                line: 1,
+                span: SourceSpan::dummy(),
+                header: "for item in pending.items".to_string(),
+                target: DeferredForTarget::Bound {
+                    binding: "records".to_string(),
+                },
+                iterable: Value::Concrete(ConcreteValue::List(Vec::new())),
+                binding: ForBinding::Simple("item".to_string()),
+                body: DeferredForBody::Resource(Box::new(record)),
+            });
+
+        let diags = validate_deferred_populate_refs(&parsed, &registry_for_acm());
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        assert_eq!(diags[0].target_binding, "cert");
     }
 
     #[test]

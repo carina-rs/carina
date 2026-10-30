@@ -13,13 +13,117 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use crate::document::Document;
 use crate::position;
 use carina_core::parser::{
-    ParseError, ParsedFile, ResourceRef, SourceSpan, WarningKind, contains_function_call,
+    DeferredForBody, ParseError, ParsedDeferredForExpression, ParsedFile, ResourceRef, SourceSpan,
+    WarningKind, contains_function_call,
 };
 use carina_core::provider::{
     HostErrorCause, ProviderError, ProviderFactory, SuspendedValidationId,
 };
-use carina_core::resource::{ConcreteValue, DeferredValue, Value};
+use carina_core::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, Value};
 use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
+
+#[derive(Clone, Copy)]
+enum DiagnosticResourceRef<'a> {
+    Materialized(ResourceRef<'a>),
+    ParsedDeferred {
+        deferred: &'a ParsedDeferredForExpression,
+        resource: &'a Resource,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum DiagnosticResourceContext {
+    Direct,
+    Deferred { line: usize },
+}
+
+impl<'a> DiagnosticResourceRef<'a> {
+    fn id(self) -> &'a ResourceId {
+        match self {
+            Self::Materialized(resource) => resource.id(),
+            Self::ParsedDeferred { resource, .. } => &resource.id,
+        }
+    }
+
+    fn attributes(self) -> std::borrow::Cow<'a, indexmap::IndexMap<String, Value>> {
+        match self {
+            Self::Materialized(resource) => resource.attributes(),
+            Self::ParsedDeferred { resource, .. } => {
+                std::borrow::Cow::Borrowed(&resource.attributes)
+            }
+        }
+    }
+
+    fn binding(self) -> Option<&'a str> {
+        match self {
+            Self::Materialized(resource) => resource.binding(),
+            Self::ParsedDeferred { resource, .. } => resource.binding.as_deref(),
+        }
+    }
+
+    fn quoted_string_attrs(self) -> &'a HashSet<String> {
+        match self {
+            Self::Materialized(resource) => resource.quoted_string_attrs(),
+            Self::ParsedDeferred { resource, .. } => &resource.quoted_string_attrs,
+        }
+    }
+
+    fn resolved_attributes(self) -> HashMap<String, Value> {
+        match self {
+            Self::Materialized(resource) => resource.resolved_attributes(),
+            Self::ParsedDeferred { resource, .. } => resource.resolved_attributes(),
+        }
+    }
+
+    fn context(self) -> DiagnosticResourceContext {
+        match self {
+            Self::Materialized(ResourceRef::Deferred { deferred, .. }) => {
+                DiagnosticResourceContext::Deferred {
+                    line: deferred.line,
+                }
+            }
+            Self::ParsedDeferred { deferred, .. } => DiagnosticResourceContext::Deferred {
+                line: deferred.line,
+            },
+            Self::Materialized(
+                ResourceRef::Resource(_)
+                | ResourceRef::LiveComposition(_)
+                | ResourceRef::DataSource(_),
+            ) => DiagnosticResourceContext::Direct,
+        }
+    }
+
+    fn is_data_source(self) -> bool {
+        match self {
+            Self::Materialized(ResourceRef::DataSource(_)) => true,
+            Self::Materialized(
+                ResourceRef::Resource(_)
+                | ResourceRef::LiveComposition(_)
+                | ResourceRef::Deferred { .. },
+            )
+            | Self::ParsedDeferred { .. } => false,
+        }
+    }
+}
+
+fn diagnostic_resources(parsed: &ParsedFile) -> impl Iterator<Item = DiagnosticResourceRef<'_>> {
+    parsed
+        .iter_all_resources()
+        .map(DiagnosticResourceRef::Materialized)
+        .chain(
+            parsed
+                .parsed_deferred_for_expressions()
+                .iter()
+                .filter_map(|deferred| match &deferred.body {
+                    DeferredForBody::Resource(resource) => {
+                        Some(DiagnosticResourceRef::ParsedDeferred { deferred, resource })
+                    }
+                    // These variants are rejected at the resolution seam and
+                    // have no managed-resource schema diagnostics to run.
+                    DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => None,
+                }),
+        )
+}
 
 fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
     let text = doc.text();
@@ -832,9 +936,7 @@ impl DiagnosticEngine {
                 }
             };
             let resolved_buffer_resources = resolved_buffer.as_ref().map(|resolved| {
-                resolved
-                    .iter_all_resources()
-                    .collect::<Vec<carina_core::parser::ResourceRef<'_>>>()
+                diagnostic_resources(resolved).collect::<Vec<DiagnosticResourceRef<'_>>>()
             });
             let mut anonymous_resource_lines = HashMap::<(String, String), VecDeque<u32>>::new();
             if let Ok(spans) = carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
@@ -848,7 +950,7 @@ impl DiagnosticEngine {
             }
             // Check resource types — include for-body template resources so
             // attribute/type/enum validation fires inside `for` loops too.
-            for (resource_index, rref) in parsed.iter_all_resources().enumerate() {
+            for (resource_index, rref) in diagnostic_resources(parsed).enumerate() {
                 let ctx = rref.context();
                 // carina#3181: schema lookup routes by the typestate arm.
                 // The `id` / `attributes` / `quoted_string_attrs` reads
@@ -858,7 +960,7 @@ impl DiagnosticEngine {
                 let resolved_resource_attributes = resolved_buffer_resources
                     .as_ref()
                     .and_then(|resources| resources.get(resource_index))
-                    .map(carina_core::parser::ResourceRef::attributes);
+                    .map(|resource| resource.attributes());
                 // Directory-aware semantic ASTs can expand a sibling-backed
                 // `for` before the buffer-only AST does, so positional
                 // resource indexes are not a stable join key. Named bindings
@@ -867,27 +969,30 @@ impl DiagnosticEngine {
                 let semantic_resource_attributes = semantic_file.and_then(|parsed| {
                     rref.binding()
                         .and_then(|binding| {
-                            parsed
-                                .iter_all_resources()
+                            diagnostic_resources(parsed)
                                 .find(|candidate| candidate.binding() == Some(binding))
                         })
                         .map(|candidate| candidate.attributes())
                 });
                 let resource_quoted_string_attrs = rref.quoted_string_attrs();
                 let resource_schema = || match rref {
-                    carina_core::parser::ResourceRef::Resource(m)
-                    | carina_core::parser::ResourceRef::Deferred { resource: m, .. } => {
+                    DiagnosticResourceRef::Materialized(
+                        ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. },
+                    )
+                    | DiagnosticResourceRef::ParsedDeferred { resource: m, .. } => {
                         self.schemas.get_for(m)
                     }
-                    carina_core::parser::ResourceRef::DataSource(d) => {
+                    DiagnosticResourceRef::Materialized(ResourceRef::DataSource(d)) => {
                         self.schemas.get_for_data_source(d)
                     }
-                    carina_core::parser::ResourceRef::LiveComposition(_) => None,
+                    DiagnosticResourceRef::Materialized(ResourceRef::LiveComposition(_)) => None,
                 };
                 let provider = &resource_id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource_id.resource_type);
                 let authored_direct_start = match rref {
-                    ResourceRef::Resource(resource) if resource.binding.is_none() => {
+                    DiagnosticResourceRef::Materialized(ResourceRef::Resource(resource))
+                        if resource.binding.is_none() =>
+                    {
                         anonymous_resource_lines
                             .get_mut(&(provider.to_string(), resource_id.resource_type.clone()))
                             .and_then(VecDeque::pop_front)
@@ -1002,7 +1107,7 @@ impl DiagnosticEngine {
                     let schema = validated_schema.as_schema();
                     // Check data source without `read` keyword
                     if schema.is_data_source()
-                        && !matches!(rref, ResourceRef::DataSource(_))
+                        && !rref.is_data_source()
                         && let Some((line, col)) = self.find_resource_type_position(
                             doc,
                             provider,
@@ -1565,8 +1670,7 @@ impl DiagnosticEngine {
             // from sibling files.
             let unused_binding_names: Vec<String> = match (merged_result.as_ref(), base_path) {
                 (Some(result), _) => {
-                    let current_file_bindings: HashSet<String> = parsed
-                        .iter_all_resources()
+                    let current_file_bindings: HashSet<String> = diagnostic_resources(parsed)
                         .filter_map(|rref| rref.binding().map(str::to_string))
                         .collect();
                     carina_core::validation::check_unused_bindings_with_identity_requirements(
@@ -1969,19 +2073,18 @@ impl DiagnosticEngine {
 /// ambiguity.
 fn resource_source_range(
     doc: &Document,
-    ctx: carina_core::parser::ResourceContext<'_>,
+    ctx: DiagnosticResourceContext,
     provider: &str,
     resource_type: &str,
     authored_direct_start: Option<u32>,
 ) -> Option<(u32, u32)> {
-    use carina_core::parser::ResourceContext;
     let text = doc.text();
     let lines: Vec<&str> = text.lines().collect();
 
     let start = match ctx {
         // `DeferredForExpression.line` is 1-indexed (pest line_col). Convert to 0-indexed.
-        ResourceContext::Deferred(d) => d.line.saturating_sub(1) as u32,
-        ResourceContext::Direct => {
+        DiagnosticResourceContext::Deferred { line } => line.saturating_sub(1) as u32,
+        DiagnosticResourceContext::Direct => {
             if let Some(start) = authored_direct_start {
                 start
             } else {
@@ -2231,10 +2334,17 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             DiagnosticSeverity::ERROR,
             error.to_string(),
         ),
-        ParseError::DeferredForBodyUnsupported { line, .. } => carina_diagnostic(
-            line.saturating_sub(1) as u32,
-            0,
-            100,
+        ParseError::DeferredForBodyUnsupported(details) => carina_diagnostic_range(
+            Range {
+                start: Position {
+                    line: details.span.start_line().saturating_sub(1) as u32,
+                    character: details.span.start_column().saturating_sub(1) as u32,
+                },
+                end: Position {
+                    line: details.span.end_line().saturating_sub(1) as u32,
+                    character: details.span.end_column().saturating_sub(1) as u32,
+                },
+            },
             DiagnosticSeverity::ERROR,
             error.to_string(),
         ),

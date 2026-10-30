@@ -331,9 +331,9 @@ fn resource_attr_location(rref: ResourceRef<'_>, attr_name: &str) -> String {
 }
 
 /// Walk every project value covered by the upstream export checks, with its
-/// user-facing diagnostic location. Deferred-for body attributes are included
-/// through `iter_all_resources`; iterable expressions are handled separately
-/// because they have their own shape semantics.
+/// user-facing diagnostic location. Parser-side deferred resource bodies are
+/// matched explicitly; iterable expressions are handled separately because
+/// they have their own shape semantics.
 fn for_each_project_value<E, F>(parsed: &crate::parser::File<E>, mut f: F)
 where
     E: crate::parser::ExportParamLike,
@@ -342,6 +342,25 @@ where
     for rref in parsed.iter_all_resources() {
         for (attr_name, value) in rref.attributes().iter() {
             f(value, &resource_attr_location(rref, attr_name));
+        }
+    }
+    for deferred in &parsed.parsed_deferred_for_expressions {
+        match &deferred.body {
+            crate::parser::DeferredForBody::Resource(resource) => {
+                for (attr_name, value) in &resource.attributes {
+                    f(
+                        value,
+                        &format!(
+                            "for-body `{}` {} attribute `{}`",
+                            deferred.header, resource.id, attr_name
+                        ),
+                    );
+                }
+            }
+            // Unsupported read and module-call templates are diagnosed at the
+            // resolution seam and were never part of the resource projection.
+            crate::parser::DeferredForBody::Read(_)
+            | crate::parser::DeferredForBody::ModuleCall(_) => {}
         }
     }
     for export in &parsed.export_params {
@@ -447,10 +466,10 @@ fn check_upstream_state_field_references_inner<E: crate::parser::ExportParamLike
 
     // Deferred iterables are not part of the materialized resource tree yet;
     // validate their complete expression separately.
-    for deferred in &parsed.deferred_for_expressions {
-        let location = format!("for-expression `{}`", deferred.header);
+    for deferred in parsed.deferred_for_sites() {
+        let location = format!("for-expression `{}`", deferred.header());
         deferred
-            .iterable
+            .iterable()
             .visit_resource_refs_with_usage(&mut |path, usage| {
                 if usage == crate::resource::ResourceRefUsage::CoalesceValue {
                     return;
@@ -637,9 +656,9 @@ pub fn check_upstream_state_for_iterable_shapes<E>(
     }
 
     let mut errors: Vec<UpstreamForIterableShapeError> = Vec::new();
-    for deferred in &parsed.deferred_for_expressions {
-        let binding_kind = ForIterableBindingKind::from_for_binding(&deferred.binding);
-        visit_possible_iterables(&deferred.iterable, &mut |path| {
+    for deferred in parsed.deferred_for_sites() {
+        let binding_kind = ForIterableBindingKind::from_for_binding(deferred.binding());
+        visit_possible_iterables(deferred.iterable(), &mut |path| {
             let Some(fields) = exports.get(path.binding()) else {
                 return;
             };
@@ -662,7 +681,7 @@ pub fn check_upstream_state_for_iterable_shapes<E>(
                 return;
             }
             errors.push(UpstreamForIterableShapeError {
-                location: format!("for-expression `{}`", deferred.header),
+                location: format!("for-expression `{}`", deferred.header()),
                 binding: path.binding().to_string(),
                 field: path.attribute().to_string(),
                 export_type: export_type.clone(),
@@ -827,11 +846,11 @@ fn check_upstream_state_attribute_access_shapes_inner<E: crate::parser::ExportPa
             &mut errors,
         );
     });
-    for deferred in &parsed.deferred_for_expressions {
+    for deferred in parsed.deferred_for_sites() {
         visit_attribute_access(
-            &deferred.iterable,
+            deferred.iterable(),
             exports,
-            &format!("for-expression `{}`", deferred.header),
+            &format!("for-expression `{}`", deferred.header()),
             include_resolver_struct_errors,
             &mut errors,
         );
@@ -989,11 +1008,11 @@ pub fn check_upstream_state_subscript_shapes<E: crate::parser::ExportParamLike>(
     for_each_project_value(parsed, |value, location| {
         visit_subscript_access(value, exports, location, &mut errors);
     });
-    for deferred in &parsed.deferred_for_expressions {
+    for deferred in parsed.deferred_for_sites() {
         visit_subscript_access(
-            &deferred.iterable,
+            deferred.iterable(),
             exports,
-            &format!("for-expression `{}`", deferred.header),
+            &format!("for-expression `{}`", deferred.header()),
             &mut errors,
         );
     }

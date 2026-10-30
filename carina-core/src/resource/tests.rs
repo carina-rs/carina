@@ -2539,12 +2539,14 @@ fn loop_scheduler_identity_uses_the_persisted_stable_hash_contract() {
 
 #[test]
 fn deserialized_unbound_loop_template_still_rejects_read_without_a_source_span() {
-    let parsed = crate::parser::parse(
+    let mut parsed = crate::parser::parse(
         "let upstream = upstream_state { source = '../upstream' }\n\
          for value in upstream.values { mock.test.Leaf { value = value } }\n",
         &crate::parser::ProviderContext::default(),
     )
     .expect("deferred loop parses");
+    crate::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+        .expect("deferred fixture crosses the module-resolution seam");
     let crate::parser::DeferredForTarget::Unbound { template } =
         &parsed.deferred_for_expressions[0].target
     else {

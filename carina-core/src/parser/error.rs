@@ -25,6 +25,25 @@ impl std::fmt::Display for DeferredForBodyKind {
     }
 }
 
+/// State of the iterable at the final post-module-expansion conversion seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredForIterableResolution {
+    StillDeferred,
+    ConcreteAfterModuleArgumentSubstitution,
+}
+
+/// Details for a deferred `for` body that cannot cross the final module
+/// expansion seam.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{}", format_deferred_for_body_unsupported(*line, header, body, *iterable_resolution))]
+pub struct DeferredForBodyUnsupportedError {
+    pub line: usize,
+    pub header: String,
+    pub body: DeferredForBodyKind,
+    pub span: SourceSpan,
+    pub iterable_resolution: DeferredForIterableResolution,
+}
+
 /// Typed identity and authored token span for an unresolved declaration type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UnresolvedTypeToken {
@@ -78,14 +97,8 @@ pub enum ParseError {
         span: Option<super::SourceSpan>,
     },
 
-    #[error(
-        "Invalid deferred `for` expression `{header}` at line {line}: a `for` over a value not known until apply can only contain a managed resource; found {body}. To use {body}, iterate over a value known at plan time"
-    )]
-    DeferredForBodyUnsupported {
-        line: usize,
-        header: String,
-        body: DeferredForBodyKind,
-    },
+    #[error("{0}")]
+    DeferredForBodyUnsupported(Box<DeferredForBodyUnsupportedError>),
 
     /// Provider-aware parsing could not resolve a type annotation. The
     /// rendered message is deliberately separate from the typed token used by
@@ -198,6 +211,28 @@ fn format_cyclic_let_binding(chain: &[String]) -> String {
         )
     } else {
         format!("Cyclic let binding detected: {rendered}")
+    }
+}
+
+fn format_deferred_for_body_unsupported(
+    line: usize,
+    header: &str,
+    body: &DeferredForBodyKind,
+    iterable_resolution: DeferredForIterableResolution,
+) -> String {
+    match iterable_resolution {
+        DeferredForIterableResolution::StillDeferred => format!(
+            "Deferred `for` expression `{header}` at line {line} cannot use {body}: its iterable \
+             is still unresolved after module expansion, and only a managed resource body can be \
+             deferred until apply. Iterate over a value known before module expansion, or put \
+             managed resources directly in the loop body"
+        ),
+        DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution => format!(
+            "Deferred `for` expression `{header}` at line {line} cannot use {body}: its iterable \
+             is concrete after module argument substitution, but replaying {body} after module \
+             expansion is not supported. Move the loop to the caller where the iterable is known \
+             during parsing, or put managed resources directly in the loop body"
+        ),
     }
 }
 

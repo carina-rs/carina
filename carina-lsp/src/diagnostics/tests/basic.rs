@@ -122,8 +122,25 @@ fn deferred_for_unsupported_bodies_surface_parser_diagnostics() {
             .unwrap_or_else(|| panic!("missing deferred-for diagnostic: {diagnostics:#?}"));
 
         assert_eq!(diagnostic.range.start.line, 2);
+        let loop_line = source.lines().nth(2).expect("loop source line");
+        assert_eq!(
+            diagnostic.range.start.character,
+            loop_line.find("for").expect("for column") as u32,
+            "diagnostic must start at the authored for-expression: {diagnostic:#?}"
+        );
+        assert_eq!(
+            diagnostic.range.end.character,
+            loop_line.chars().count() as u32,
+            "diagnostic must end at the authored for-expression: {diagnostic:#?}"
+        );
         assert!(diagnostic.message.contains("managed resource"));
-        assert!(diagnostic.message.contains("plan time"));
+        assert!(
+            diagnostic
+                .message
+                .contains("still unresolved after module expansion"),
+            "{}",
+            diagnostic.message
+        );
     }
 }
 

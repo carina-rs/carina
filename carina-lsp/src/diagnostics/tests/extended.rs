@@ -8679,6 +8679,12 @@ for _, id in orgs.xs {
 }
 "#;
     let doc = create_document(source);
+    let parsed = doc.parsed().expect("buffer fixture parses");
+    assert!(
+        parsed.deferred_for_expressions.is_empty(),
+        "buffer-only diagnostics must not rely on the resolved projection"
+    );
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     let diagnostics = provider.analyze(&doc, None);
     assert!(
         diagnostics.iter().any(|d| d.message.contains("aaaa")),

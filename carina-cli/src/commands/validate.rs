@@ -549,15 +549,17 @@ backend s3 {
                 }
             }
         "#;
-        let parsed = carina_core::parser::parse_file(
+        let mut parsed = carina_core::parser::parse_file(
             src,
             std::path::Path::new("validate_fixture.crn"),
             &ProviderContext::default(),
         )
         .expect("fixture parses");
-        // The loop is deferred (iterable is a same-config provider-read
-        // attribute), so it is not in `parsed.resources` but is in
-        // `deferred_for_expressions` — exactly the carina#3121 shape.
+        carina_core::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+            .expect("cross the deferred-body resolution seam");
+        // After the resolution seam the same-config provider-read loop is not
+        // in `parsed.resources`; its resource-only template is ready for the
+        // validate display path in `deferred_for_expressions`.
         assert_eq!(parsed.deferred_for_expressions.len(), 1);
 
         let entries = validated_entries(&parsed);

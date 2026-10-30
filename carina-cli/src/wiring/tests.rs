@@ -7613,7 +7613,7 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
     use carina_state::state::{ResourceState, StateFile};
 
     let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
-    let parsed = parse(
+    let mut parsed = parse(
         "let upstream = upstream_state { source = '../upstream' }\n\
          for key, subnet in upstream.subnets {\n\
            awscc.ec2.SubnetRouteTableAssociation {\n\
@@ -7624,6 +7624,8 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("deferred map loop parses");
+    carina_core::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+        .expect("deferred map loop resolves");
     let children = carina_core::parser::expand_deferred_children(
         &parsed.deferred_for_expressions[0],
         &Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -8395,7 +8397,7 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
 }
 
 fn unbound_deferred_test_target() -> DeferredCreateTarget {
-    let parsed = parse(
+    let mut parsed = parse(
         "let upstream = upstream_state { source = '../upstream' }\n\
          for value in upstream.accounts {\n\
            mock.test.Child { identity_input = value }\n\
@@ -8403,6 +8405,8 @@ fn unbound_deferred_test_target() -> DeferredCreateTarget {
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("unbound deferred loop parses");
+    carina_core::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))
+        .expect("unbound deferred loop resolves");
     DeferredCreateTarget::from_deferred(&parsed.deferred_for_expressions[0])
         .expect("deferred target has a system identity")
 }
@@ -8620,6 +8624,15 @@ mod expand_same_config_deferred_for_tests {
     use carina_core::resource::{ConcreteValue, DeferredValue, State, UnknownReason, Value};
     use std::collections::{HashMap, HashSet};
 
+    fn parse_resolved(
+        input: &str,
+        config: &ProviderContext,
+    ) -> Result<ParsedFile, Box<dyn std::error::Error>> {
+        let mut parsed = parse(input, config)?;
+        carina_core::module_resolver::resolve_modules(&mut parsed, std::path::Path::new("."))?;
+        Ok(parsed)
+    }
+
     /// `let cert` (same-config) + a `for` over its provider-read
     /// `account_ids`, plus a plain independent resource so re-sort
     /// stability has something to preserve order against.
@@ -8686,7 +8699,7 @@ mod expand_same_config_deferred_for_tests {
     #[test]
     fn deferred_for_warning_filter_preserves_single_quoted_warning_on_same_line() {
         let src = "for k in upstream.ids { awscc.s3.Bucket { name = 'a-${k}' } }\n";
-        let parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
+        let parsed = parse_resolved(src, &ProviderContext::default()).expect("fixture parses");
         assert_eq!(parsed.deferred_for_expressions.len(), 1);
         assert!(
             parsed
@@ -8721,7 +8734,7 @@ mod expand_same_config_deferred_for_tests {
     #[test]
     fn saved_plan_expansion_suppresses_duplicate_warning_output_but_keeps_candidate_state() {
         let src = "for k in upstream.ids { awscc.s3.Bucket { name = 'a-${k}' } }\n";
-        let mut parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
+        let mut parsed = parse_resolved(src, &ProviderContext::default()).expect("fixture parses");
         let state_file = None;
         let schemas = SchemaRegistry::new();
         let identity_context = WiringContext::new_for_test(Vec::new(), &[]);
@@ -8844,7 +8857,7 @@ mod expand_same_config_deferred_for_tests {
 
     #[test]
     fn same_config_read_iterable_materializes_in_plan_resources() {
-        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let parsed = parse_resolved(SRC, &ProviderContext::default()).expect("parse");
         assert_eq!(
             parsed.deferred_for_expressions.len(),
             1,
@@ -8919,7 +8932,7 @@ mod expand_same_config_deferred_for_tests {
 
     #[test]
     fn expand_same_config_emits_deferred_create_when_iterable_is_unresolved() {
-        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let parsed = parse_resolved(SRC, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = states_with_cert(&parsed, "account_ids", unknown_account_ids());
 
@@ -8968,7 +8981,7 @@ mod expand_same_config_deferred_for_tests {
 
     #[test]
     fn expand_same_config_pre_expands_when_iterable_is_concrete() {
-        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let parsed = parse_resolved(SRC, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = states_with_cert(&parsed, "account_ids", account_ids());
 
@@ -9002,7 +9015,7 @@ mod expand_same_config_deferred_for_tests {
 
     #[test]
     fn expand_same_config_passes_through_pr3558_dependency_bindings_on_pre_expanded_children() {
-        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let parsed = parse_resolved(SRC, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = states_with_cert(&parsed, "account_ids", account_ids());
 
@@ -9041,7 +9054,7 @@ mod expand_same_config_deferred_for_tests {
         // carina#3132 highest-risk requirement: appending loop children
         // and re-sorting must not reorder already-planned resources
         // (SimHash / moved-matching stability).
-        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let parsed = parse_resolved(SRC, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let pre_order: Vec<String> = sorted.iter().map(|r| r.id.to_string()).collect();
         let states = states_with_cert(&parsed, "account_ids", account_ids());
@@ -9091,7 +9104,7 @@ mod expand_same_config_deferred_for_tests {
     fn unresolvable_iterable_stays_deferred_no_misexpansion() {
         // No cert state → iterable genuinely unknowable. The loop must
         // stay in residual (carina#3128 placeholder), NOT mis-expand.
-        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let parsed = parse_resolved(SRC, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let empty_states: HashMap<ResourceId, State> = HashMap::new();
 
@@ -9152,7 +9165,7 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let parsed = parse_resolved(src, &ProviderContext::default()).expect("parse");
         assert_eq!(parsed.deferred_for_expressions.len(), 1);
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -9218,7 +9231,7 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let parsed = parse_resolved(src, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
         let mut rr = indexmap::IndexMap::new();
@@ -9323,7 +9336,7 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let parsed = parse_resolved(src, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
         let mut rr = indexmap::IndexMap::new();
@@ -9438,7 +9451,7 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let parsed = parse_resolved(src, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
         let make_entry = |name: &str, value: &str| {
@@ -9560,7 +9573,7 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let parsed = parse_resolved(src, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
         let make_entry = |name: &str, value: &str| {
