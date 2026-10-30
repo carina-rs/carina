@@ -1,0 +1,13 @@
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let network = use {
+  source = './network'
+}
+
+for cidr in ['10.0.0.0/16'] {
+  network {
+    vpc_cidr = cidr
+  }
+}

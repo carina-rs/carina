@@ -1,0 +1,16 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+assertion_line: 164
+expression: output
+---
+Execution Plan:
+
+  ~ mock.test.resource sibling_update
+      # 1 ignored attribute(s) differ
+      tags:
+        ~ Owner: 'old' → 'new'
+      # (2 unchanged attributes hidden)
+  # mock.test.resource ignored_only
+      # 1 ignored attribute(s) differ
+
+Plan: 0 to add, 1 to change, 0 to destroy.

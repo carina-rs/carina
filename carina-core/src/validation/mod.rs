@@ -12,8 +12,8 @@ use indexmap::IndexMap;
 use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
-    ForBinding, ModuleCall, ModuleCallId, ProviderContext, ResourceContext, ResourceRef,
-    ResourceTypePath, SourceFileId, SourceSpan, TypeExpr,
+    ForBinding, LoadedProviderContext, ModuleCall, ModuleCallId, ProviderContext, ResourceContext,
+    ResourceRef, ResourceTypePath, SourceFileId, SourceSpan, TypeExpr,
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{
@@ -365,8 +365,8 @@ struct ExpectedEnumTarget<'a> {
 /// may leave dotted declarations unresolved, but this validation seam may not.
 pub struct ValidationTypeContext<'a> {
     pub schemas: &'a SchemaRegistry,
-    pub provider_context: &'a ProviderContext,
     pub module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+    provider_context: typecheck::TypecheckProviderContext<'a>,
     scope_bindings: BindingIndex<'a>,
     inference_bindings: inference::InferenceBindings,
 }
@@ -375,7 +375,38 @@ impl<'a> ValidationTypeContext<'a> {
     pub fn new<E>(
         file: &'a crate::parser::File<E>,
         schemas: &'a SchemaRegistry,
+        provider_context: &'a LoadedProviderContext,
+        module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+    ) -> Self {
+        Self::with_provider_context(
+            file,
+            schemas,
+            typecheck::TypecheckProviderContext::loaded(provider_context),
+            module_signatures,
+        )
+    }
+
+    /// Build the validation view used by bootstrap/editor callers that have
+    /// no loaded provider custom-type catalog. Structural checks still run,
+    /// while provider-owned leaves never reach the resolver.
+    pub fn new_providerless<E>(
+        file: &'a crate::parser::File<E>,
+        schemas: &'a SchemaRegistry,
         provider_context: &'a ProviderContext,
+        module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+    ) -> Self {
+        Self::with_provider_context(
+            file,
+            schemas,
+            typecheck::TypecheckProviderContext::providerless(provider_context),
+            module_signatures,
+        )
+    }
+
+    fn with_provider_context<E>(
+        file: &'a crate::parser::File<E>,
+        schemas: &'a SchemaRegistry,
+        provider_context: typecheck::TypecheckProviderContext<'a>,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     ) -> Self {
         Self {
@@ -389,6 +420,10 @@ impl<'a> ValidationTypeContext<'a> {
             ),
             inference_bindings: inference::bindings_from_parsed(file),
         }
+    }
+
+    fn raw_provider_context(&self) -> &'a ProviderContext {
+        self.provider_context.as_provider_context()
     }
 }
 
@@ -813,7 +848,7 @@ fn resolve_value_source_against_sink(
             None => binding_value_assignable_to_enum(
                 value,
                 declared_type,
-                context.provider_context,
+                context.raw_provider_context(),
                 &target,
                 &resolver,
                 &identity,
@@ -830,7 +865,7 @@ fn resolve_value_source_against_sink(
             &use_site.name,
             declared_type,
             sink,
-            context.provider_context,
+            context.raw_provider_context(),
         );
     }
 
@@ -848,13 +883,10 @@ fn resolve_value_source_against_sink(
             FieldAncestry::WRITABLE,
         )
         .map_err(BindingResolutionError::Type),
-        RefSink::TypeExpr(type_expr) => typecheck::check_type_expr_value(
-            type_expr,
-            value,
-            context.provider_context,
-            typecheck::TypecheckInference::Unavailable,
-        )
-        .map_err(|error| BindingResolutionError::ValueType(Box::new(error))),
+        RefSink::TypeExpr(type_expr) => context
+            .provider_context
+            .check(type_expr, value, typecheck::TypecheckInference::Unavailable)
+            .map_err(|error| BindingResolutionError::ValueType(Box::new(error))),
     }
 }
 
@@ -924,9 +956,12 @@ fn module_argument_type<E>(
 
 fn module_enum_declaration(
     expected: &TypeExpr,
-    config: &ProviderContext,
+    config: typecheck::TypecheckProviderContext<'_>,
 ) -> Result<Option<AttributeType>, BindingResolutionError> {
     let TypeExpr::SchemaType { owned } = expected else {
+        return Ok(None);
+    };
+    let Some(config) = config.loaded_context() else {
         return Ok(None);
     };
     config
@@ -1025,7 +1060,7 @@ fn resolve_record_against_module(
     let Some(resolved) = resolve_module_argument_path_type(
         expected,
         &record.authored.path,
-        context.provider_context,
+        context.raw_provider_context(),
     )?
     else {
         return Ok(());
@@ -1051,7 +1086,7 @@ fn resolve_record_against_module(
                 return binding_value_assignable_to_enum(
                     value,
                     declared_type.as_deref(),
-                    context.provider_context,
+                    context.raw_provider_context(),
                     &target,
                     &resolver,
                     &identity,
@@ -1242,7 +1277,7 @@ pub fn check_bare_binding_uses<E>(
 pub fn resolve_bare_binding_uses<E>(
     file: crate::parser::File<E>,
     schemas: &SchemaRegistry,
-    provider_context: &ProviderContext,
+    provider_context: &LoadedProviderContext,
     module_signatures: &crate::module_resolver::ResolvedModuleSignatures,
 ) -> Result<ResolvedFile<E>, BindingUseReport> {
     let report = {
@@ -2789,6 +2824,20 @@ pub fn validate_resources<E>(
                 ) {
                     for error in errors {
                         all_errors.push(format!("{}: {}", id, error));
+                    }
+                }
+                if matches!(kind, ValidatableKind::Resource) {
+                    let resource = match rref {
+                        ResourceRef::Resource(resource)
+                        | ResourceRef::Deferred { resource, .. } => resource,
+                        ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => {
+                            unreachable!("managed validation kind must carry a resource")
+                        }
+                    };
+                    if let Err(errors) = crate::resource::resolve_ignore_changes(resource, &schema)
+                    {
+                        all_errors
+                            .extend(errors.into_iter().map(|error| format!("{}: {}", id, error)));
                     }
                 }
             }
@@ -5171,12 +5220,12 @@ pub enum ModuleCallReferenceChecks {
 }
 
 /// Input to the authored module-call diagnostic phase.
-pub struct ModuleCallCheckInput<'a, 'bindings, E> {
+pub struct ModuleCallCheckInput<'a, 'bindings, E, C: ?Sized = LoadedProviderContext> {
     pub authored: &'a crate::parser::File<E>,
     pub semantic: Option<&'a crate::parser::File<E>>,
     pub base_dir: Option<&'a std::path::Path>,
     pub imported_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
-    pub provider_context: &'a ProviderContext,
+    pub provider_context: &'a C,
     pub schemas: &'a SchemaRegistry,
     pub binding_use_report: &'a BindingUseReport,
     pub bindings: &'a BindingIndex<'bindings>,
@@ -5200,7 +5249,7 @@ pub enum ExpandedModuleCallCheckInput<'a, 'bindings> {
 }
 
 struct ModuleCallChecker<'a> {
-    provider_context: &'a ProviderContext,
+    provider_context: typecheck::TypecheckProviderContext<'a>,
     schemas: &'a SchemaRegistry,
     findings: Vec<ModuleCallFinding>,
     active_modules: HashSet<std::path::PathBuf>,
@@ -5457,10 +5506,10 @@ impl ModuleCallChecker<'_> {
             let parameter_resolution = match &parameter.static_type {
                 StaticType::Known(parameter_type) => resolve_parameter_type_for_check(
                     parameter_type.type_expr(),
-                    self.provider_context,
+                    self.provider_context.as_provider_context(),
                 ),
                 StaticType::Unchecked(reason) => {
-                    if self.provider_context.custom_types_loaded() {
+                    if self.provider_context.loaded_context().is_some() {
                         Err(reason.resolution_error().clone())
                     } else {
                         Ok(None)
@@ -5532,12 +5581,10 @@ impl ModuleCallChecker<'_> {
             } else {
                 typecheck::TypecheckInference::Unavailable
             };
-            if let Err(error) = typecheck::check_type_expr_value(
-                &resolved_parameter.as_type_expr(),
-                value,
-                self.provider_context,
-                inference,
-            ) {
+            if let Err(error) =
+                self.provider_context
+                    .check(&resolved_parameter.as_type_expr(), value, inference)
+            {
                 self.push_finding(ModuleCallFinding::argument_value(
                     ModuleCallFindingKind::ValueType,
                     owner.clone(),
@@ -5662,11 +5709,12 @@ impl ModuleCallChecker<'_> {
         }
 
         if let Some(mut module) = crate::module_resolver::load_module(&module_dir) {
-            let resolution_errors = resolve_file_type_exprs(&mut module, self.provider_context);
+            let resolution_errors =
+                resolve_file_type_exprs(&mut module, self.provider_context.as_provider_context());
             let signatures = crate::module_resolver::load_resolved_module_signatures(
                 &module,
                 &module_dir,
-                self.provider_context,
+                self.provider_context.as_provider_context(),
             );
             let bindings = BindingIndex::from_parsed_with_module_signatures(
                 &module,
@@ -5675,7 +5723,7 @@ impl ModuleCallChecker<'_> {
             );
             let binding_use_report = check_bare_binding_uses(
                 &module,
-                &ValidationTypeContext::new(
+                &ValidationTypeContext::with_provider_context(
                     &module,
                     self.schemas,
                     self.provider_context,
@@ -5991,13 +6039,34 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
 }
 
 /// Collect module-call findings from authored source and its imported graph.
-pub fn check_module_calls<E>(input: ModuleCallCheckInput<'_, '_, E>) -> Vec<ModuleCallFinding> {
+pub fn check_module_calls<E>(
+    input: ModuleCallCheckInput<'_, '_, E, LoadedProviderContext>,
+) -> Vec<ModuleCallFinding> {
+    let provider_context = typecheck::TypecheckProviderContext::loaded(input.provider_context);
+    check_module_calls_with_provider_context(input, provider_context)
+}
+
+/// Providerless module-call diagnostics for bootstrap and orphan-editor
+/// contexts. Structural checks still run, while provider-owned leaves are not
+/// sent to an unloaded resolver.
+pub fn check_module_calls_providerless<E>(
+    input: ModuleCallCheckInput<'_, '_, E, ProviderContext>,
+) -> Vec<ModuleCallFinding> {
+    let provider_context =
+        typecheck::TypecheckProviderContext::providerless(input.provider_context);
+    check_module_calls_with_provider_context(input, provider_context)
+}
+
+fn check_module_calls_with_provider_context<'a, 'bindings, E, C: ?Sized>(
+    input: ModuleCallCheckInput<'a, 'bindings, E, C>,
+    provider_context: typecheck::TypecheckProviderContext<'a>,
+) -> Vec<ModuleCallFinding> {
     let ModuleCallCheckInput {
         authored,
         semantic,
         base_dir,
         imported_signatures,
-        provider_context,
+        provider_context: _,
         schemas,
         binding_use_report,
         bindings,
@@ -6031,7 +6100,7 @@ pub fn check_expanded_module_calls(
     let provider_context = ProviderContext::default();
     let schemas = SchemaRegistry::new();
     let mut checker = ModuleCallChecker {
-        provider_context: &provider_context,
+        provider_context: typecheck::TypecheckProviderContext::providerless(&provider_context),
         schemas: &schemas,
         findings: Vec::new(),
         active_modules: HashSet::new(),
@@ -6129,7 +6198,7 @@ impl<P> CheckedExportValues<P> {
 fn resolve_and_validate_export_values<P>(
     export_params: &[P],
     bindings: &crate::binding_index::ResolvedBindings,
-    config: &ProviderContext,
+    config: typecheck::TypecheckProviderContext<'_>,
 ) -> Result<Vec<P>, String>
 where
     P: crate::parser::ExportParamLike + Clone,
@@ -6156,7 +6225,11 @@ where
                 checked.push(resolved_param);
                 continue;
             }
-            match crate::resolver::resolve_ref_value_with_config(value, bindings, config) {
+            match crate::resolver::resolve_ref_value_with_config(
+                value,
+                bindings,
+                config.as_provider_context(),
+            ) {
                 Ok(resolved) if crate::value::contains_secret(&resolved) => {
                     errors.push(format!(
                         "export '{}' cannot hold a secret value",
@@ -6165,12 +6238,11 @@ where
                 }
                 Ok(resolved) => {
                     resolved_param.set_value(Some(resolved));
-                    let known_type = resolved_param.type_expr_opt();
-                    if let (Some(type_expr), Some(value)) = (known_type, resolved_param.value())
-                        && let Err(error) = typecheck::check_type_expr_value(
+                    if let (Some(type_expr), Some(value)) =
+                        (resolved_param.type_expr_opt(), resolved_param.value())
+                        && let Err(error) = config.check(
                             type_expr,
                             value,
-                            config,
                             typecheck::TypecheckInference::Unavailable,
                         )
                     {
@@ -6190,10 +6262,10 @@ where
     }
 }
 
-/// Resolve every export through the pre-apply value binding graph, evaluate
-/// builtins that become concrete, and accumulate both secret-boundary and
-/// value-type errors in one pass.
-pub fn check_export_values_pre_apply<P>(
+/// Resolve and structurally validate exports without loaded providers.
+/// Provider-owned custom-type leaves are left unchecked, while container
+/// shapes and provider-independent sibling values retain normal diagnostics.
+pub fn check_export_values_pre_apply_providerless<P>(
     export_params: &[P],
     bindings: &crate::binding_index::ResolvedBindings,
     config: &ProviderContext,
@@ -6201,7 +6273,33 @@ pub fn check_export_values_pre_apply<P>(
 where
     P: crate::parser::ExportParamLike + Clone,
 {
-    let display_params = resolve_and_validate_export_values(export_params, bindings, config)?;
+    let display_params = resolve_and_validate_export_values(
+        export_params,
+        bindings,
+        typecheck::TypecheckProviderContext::providerless(config),
+    )?;
+    Ok(ExportsCheckedPreApply {
+        original_params: export_params.to_vec(),
+        display_params,
+    })
+}
+
+/// Resolve every export through the pre-apply value binding graph, evaluate
+/// builtins that become concrete, and accumulate both secret-boundary and
+/// value-type errors in one pass.
+pub fn check_export_values_pre_apply<P>(
+    export_params: &[P],
+    bindings: &crate::binding_index::ResolvedBindings,
+    config: &LoadedProviderContext,
+) -> Result<ExportsCheckedPreApply<P>, String>
+where
+    P: crate::parser::ExportParamLike + Clone,
+{
+    let display_params = resolve_and_validate_export_values(
+        export_params,
+        bindings,
+        typecheck::TypecheckProviderContext::loaded(config),
+    )?;
     Ok(ExportsCheckedPreApply {
         original_params: export_params.to_vec(),
         display_params,
@@ -6214,13 +6312,16 @@ where
 pub fn resolve_export_values_post_apply<P>(
     export_params: &ExportsCheckedPreApply<P>,
     bindings: &crate::binding_index::ResolvedBindings,
-    config: &ProviderContext,
+    config: &LoadedProviderContext,
 ) -> Result<CheckedExportValues<P>, String>
 where
     P: crate::parser::ExportParamLike + Clone,
 {
-    let params =
-        resolve_and_validate_export_values(&export_params.original_params, bindings, config)?;
+    let params = resolve_and_validate_export_values(
+        &export_params.original_params,
+        bindings,
+        typecheck::TypecheckProviderContext::loaded(config),
+    )?;
     Ok(CheckedExportValues { params })
 }
 
@@ -6231,7 +6332,7 @@ where
 /// has the source type authority needed for directional checks.
 pub fn validate_attribute_params(
     attribute_params: &[crate::parser::AttributeParameter],
-    config: &ProviderContext,
+    config: &LoadedProviderContext,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
 
@@ -6276,7 +6377,7 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
     let mut state_block_targets = Vec::new();
     for state_block in &parsed.state_blocks {
         match state_block {
-            crate::parser::StateBlock::Import { to, id } => {
+            crate::parser::StateBlock::Import { to, to_span: _, id } => {
                 collect_dependencies(id, &mut referenced);
                 state_block_targets.push(to.clone());
             }

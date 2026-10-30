@@ -14,8 +14,8 @@ use carina_state::{ResourceState, StateFile};
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
     MovedOrigins, PlanFile, PlanSchemaReferences, PlanWaitBinding, RecordedProviderArtifact,
-    ReloadedCurrentStateEntry, ReloadedPlanFile, ResolvedProviderInputs, UpstreamSource,
-    recorded_provider_artifacts,
+    ReloadedCurrentStateEntry, ReloadedPlanFile, ResolvedProviderInputs,
+    UnresolvedReloadedPlanFile, UpstreamSource, recorded_provider_artifacts,
 };
 use crate::error::{
     AppError, SavedPlanProviderArtifactDifference, SavedPlanProviderArtifactMismatchError,
@@ -287,7 +287,7 @@ pub(super) enum ReloadedProviderBoundPlanFile {
 
 /// Placeholder-free saved plan awaiting provider-schema verification.
 pub(super) struct ReloadedVerifiedPlanFile {
-    plan_file: ReloadedPlanFile,
+    plan_file: UnresolvedReloadedPlanFile,
     schema_references: PlanSchemaReferences,
 }
 
@@ -328,6 +328,7 @@ impl ReloadedVerifiedPlanFile {
         } = self;
         let (plan, config) = providers.verify_saved_plan_artifacts(move |ctx| {
             check_loaded_providers(&plan_file, &schema_references, ctx, apply_target)?;
+            let plan_file = plan_file.resolve_with_schemas(ctx.schemas())?;
             Ok(SavedPlanArtifactsChecked::new(
                 RehydratedPlanFile {
                     plan_file,
@@ -361,6 +362,7 @@ impl ReloadedPendingPlanFile {
         } = self;
         providers.verify_saved_plan_artifacts(move |ctx| {
             check_loaded_providers(&plan_file, &schema_references, ctx, apply_target)?;
+            let plan_file = plan_file.resolve_with_schemas(ctx.schemas())?;
             Ok(SavedPlanArtifactsChecked::new(
                 SchemaCheckedPendingPlanFile { plan_file },
                 ctx,
@@ -372,7 +374,7 @@ impl ReloadedPendingPlanFile {
 /// Check artifact identities and schemas against the context borrowed by the
 /// consuming wiring transition.
 fn check_loaded_providers(
-    plan_file: &ReloadedPlanFile,
+    plan_file: &UnresolvedReloadedPlanFile,
     schema_references: &PlanSchemaReferences,
     ctx: &WiringContext,
     apply_target: ApplyTarget<'_>,
@@ -433,7 +435,7 @@ pub(super) struct PendingPlanFile {
 /// Reloaded saved plan whose desired secret placeholders still need fresh
 /// source values.
 pub(super) struct ReloadedPendingPlanFile {
-    plan_file: ReloadedPlanFile,
+    plan_file: UnresolvedReloadedPlanFile,
     schema_references: PlanSchemaReferences,
 }
 
@@ -446,16 +448,16 @@ pub(super) struct ExpansionPriorStates {
 fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
     match current {
         Current::Absent(state) => {
-            Orphan::absent(state, row.binding.clone(), row.directives.clone())
+            Orphan::absent(state, row.binding.clone(), row.directives.clone().into())
         }
         Current::Present(present) => {
-            Orphan::present(present, row.binding.clone(), row.directives.clone())
+            Orphan::present(present, row.binding.clone(), row.directives.clone().into())
         }
         Current::CreateInFlight(pending) => {
-            Orphan::create_in_flight(pending, row.binding.clone(), row.directives.clone())
+            Orphan::create_in_flight(pending, row.binding.clone(), row.directives.clone().into())
         }
         Current::MissingIdentifier(state) => {
-            Orphan::missing_identifier(state, row.binding.clone(), row.directives.clone())
+            Orphan::missing_identifier(state, row.binding.clone(), row.directives.clone().into())
         }
     }
 }
@@ -775,7 +777,7 @@ impl DesiredPlanFile {
         historical_addresses: &HistoricalResourceAddresses,
         apply_target: ApplyTarget<'_>,
     ) -> Result<ExecutablePlanFile, AppError> {
-        let plan = match self {
+        let mut plan = match self {
             Self::Verified(plan) => plan,
             Self::NeedsHistoricalVerification(plan) => {
                 plan.verify_historical(
@@ -788,6 +790,9 @@ impl DesiredPlanFile {
                 .await?
             }
         };
+        plan.plan_file
+            .plan_mut()
+            .rebase_ignored_update_sources(actual_states);
         Ok(ExecutablePlanFile { plan })
     }
 }
@@ -1227,6 +1232,7 @@ mod tests {
         contents.plan.add(Effect::Move {
             from: ResolvedResourceId::new(from.clone()),
             to: ResolvedResourceId::new(to.clone()),
+            origin: None,
         });
         contents.current_states.push(CurrentStateEntry::Managed {
             id: to,
@@ -1248,7 +1254,9 @@ mod tests {
             .record_for_test(&builtin_context())
             .expect("test plan provider evidence must be valid")
             .reload_in_flight_from_locked_state(Some(&locked_state))
-            .expect("reload saved move plan");
+            .expect("reload saved move plan")
+            .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
+            .expect("resolve saved move plan");
         (
             SchemaCheckedPendingPlanFile { plan_file },
             Some(locked_state),
@@ -1624,7 +1632,9 @@ mod tests {
         .record_for_test(&builtin_context())
         .expect("test plan provider evidence must be valid")
         .reload_in_flight_from_locked_state(None)
-        .expect("reload saved plan");
+        .expect("reload saved plan")
+        .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
+        .expect("resolve saved plan");
         let pending = DesiredVerifiedPlanFile {
             plan_file,
             planned_secret_hashes: HashMap::new(),

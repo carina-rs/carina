@@ -5,11 +5,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use indexmap::IndexMap;
 
-use crate::explicit::{self, ExplicitFields};
+use crate::explicit::{ExplicitFields, ExplicitProjection};
 use crate::provider::NestedWriteOnlyRecord;
 use crate::resource::{
-    ConcreteValue, DeferredValue, InterpolationPart, SavedValueViews, UnknownReason, Value,
-    merge_with_saved,
+    ConcreteValue, DeferredValue, InterpolationPart, ResolvedIgnoreChanges, SavedValueViews,
+    UnknownReason, Value, merge_with_saved, value_at_leaf,
 };
 use crate::schema::{AttributeType, LeafPath, ResourceSchema, empty_defs_for_schema_walks};
 use crate::value::{PersistedValue, canonical_secret_hash_material, contains_secret};
@@ -630,6 +630,25 @@ pub(crate) fn key_should_enter_patch(
     leaf_provenance: LeafProvenance<'_>,
     cmp: AttrComparison<'_>,
 ) -> bool {
+    key_should_enter_patch_with_ignores(
+        key,
+        schema,
+        leaf_provenance,
+        cmp,
+        &ResolvedIgnoreChanges::default(),
+    )
+}
+
+pub(crate) fn key_should_enter_patch_with_ignores(
+    key: &str,
+    schema: Option<&ResourceSchema>,
+    leaf_provenance: LeafProvenance<'_>,
+    cmp: AttrComparison<'_>,
+    ignore_changes: &ResolvedIgnoreChanges,
+) -> bool {
+    if ignore_changes.ignores_whole_attribute(key) {
+        return false;
+    }
     // CloudControl reads omit write-only values. Ignore that absence only when
     // the key cannot be updated: otherwise the value must enter an Update and
     // exact accepted-request provenance can make subsequent plans converge.
@@ -642,7 +661,13 @@ pub(crate) fn key_should_enter_patch(
     if let Some(schema) = schema
         && schema.write_only_bearing(key)
     {
-        return nested_write_only_should_enter_patch(key, schema, leaf_provenance, cmp);
+        return nested_write_only_should_enter_patch(
+            key,
+            schema,
+            leaf_provenance,
+            cmp,
+            ignore_changes,
+        );
     }
     should_patch_attr(cmp)
 }
@@ -652,6 +677,7 @@ fn nested_write_only_should_enter_patch(
     schema: &ResourceSchema,
     leaf_provenance: LeafProvenance<'_>,
     cmp: AttrComparison<'_>,
+    ignore_changes: &ResolvedIgnoreChanges,
 ) -> bool {
     if contains_pending_reread(cmp.to) {
         return false;
@@ -673,7 +699,11 @@ fn nested_write_only_should_enter_patch(
     let observable_equal =
         write_only_observable_equal(schema, key, cmp.from, effective_to.as_ref(), attr_type);
 
-    let desired_leaves = schema.write_only_leaf_projection(key, cmp.to);
+    let desired_leaves = schema
+        .write_only_leaf_projection(key, cmp.to)
+        .into_iter()
+        .filter(|(path, _, _)| !ignore_changes.ignores_leaf(key, path))
+        .collect::<Vec<_>>();
     let leaf_equal = match leaf_provenance {
         LeafProvenance::Recorded(saved_leaves) => {
             if schema
@@ -685,6 +715,10 @@ fn nested_write_only_should_enter_patch(
                 return !observable_equal;
             }
             saved_leaves.map_or(desired_leaves.is_empty(), |saved_leaves| {
+                let saved_leaves = saved_leaves
+                    .iter()
+                    .filter(|(path, _)| !ignore_changes.ignores_leaf(key, path))
+                    .collect::<Vec<_>>();
                 saved_leaves.len() == desired_leaves.len()
                     && desired_leaves.iter().zip(saved_leaves).all(
                         |((path, desired, field_type), (saved_path, saved))| {
@@ -828,26 +862,31 @@ pub(crate) fn secret_grafted_comparison_view<'a>(
 /// If `saved` is provided, each desired value is merged with the saved value
 /// before comparison, filling in unmanaged nested fields.
 /// If `prev_explicit` is provided, the actual-state side is **projected**
-/// through its tree before comparison so server-side default fields the
-/// user never wrote do not surface as diffs (refs awscc#206). The
-/// projection is applied per-attribute: each `current[key]` is folded
-/// against the matching `prev_explicit` child shape via
-/// `crate::explicit::project`. Top-level keys absent from
-/// `prev_explicit.children` are treated as the user never having
-/// authored them and excluded from the comparison entirely (so their
-/// presence in `current` does not surface a removal).
+/// through its authoring context before comparison so server-side defaults
+/// the user never wrote do not surface as diffs (refs awscc#206). `saved`
+/// values anchor per-element list authoring when available; otherwise lists
+/// use the legacy union projection. Top-level keys absent from
+/// `prev_explicit.children` are treated as unauthored and excluded. Stored
+/// list values also anchor the per-element records used to remove uniquely
+/// paired server-added list elements (refs carina-provider-awscc#511).
 /// `prev_explicit` also drives the explicit-removal detection at the
 /// end of this function: the same set of top-level keys is used to
 /// flag attributes the user *previously* wrote but no longer mentions.
 /// If `schema` is provided, type-aware comparison is used for each attribute.
-pub(super) fn find_changed_attributes(
+pub(super) struct AttributeChanges {
+    pub changed: Vec<String>,
+    pub ignored_readable_differences: usize,
+}
+
+pub(super) fn find_changed_attributes_with_ignores(
     desired: &HashMap<String, Value>,
     current: &HashMap<String, Value>,
     saved: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
-) -> Vec<String> {
+    ignore_changes: &ResolvedIgnoreChanges,
+) -> AttributeChanges {
     let mut changed = Vec::new();
 
     // Pull the cyclic-struct definition map (`Ref` targets) from the
@@ -860,25 +899,77 @@ pub(super) fn find_changed_attributes(
     // Project `current` through `prev_explicit` so server-side defaults
     // the user never authored disappear before any comparison runs.
     // The projection is idempotent and shape-preserving for keys the
-    // user did author. When `prev_explicit` is absent (e.g. first-plan,
-    // no saved state) we fall back to the unprojected map — there is
-    // no authoring information to consult yet.
+    // user did author. Saved values anchor per-element list records when they
+    // are available. Without an anchor, projection retains every list item
+    // and applies the legacy union restriction to each one.
     //
     // `saved` undergoes the same projection so the saved-merge fallback
     // doesn't smuggle server-only fields back into `effective_desired`
     // (refs awscc#206).
-    let projected_current = match prev_explicit {
-        Some(e) => explicit::project_attributes(current.clone(), e),
-        None => current.clone(),
-    };
     let raw_saved = saved;
-    let projected_saved = match (raw_saved, prev_explicit) {
-        (Some(s), Some(e)) => Some(explicit::project_attributes(s.clone(), e)),
+    let empty_stored = HashMap::new();
+    let projection = prev_explicit.map(|explicit| {
+        ExplicitProjection::for_desired(
+            raw_saved.unwrap_or(&empty_stored),
+            desired,
+            explicit,
+            schema,
+        )
+    });
+    let projected_current = projection.as_ref().map_or_else(
+        || current.clone(),
+        |projection| {
+            projection
+                .project_attributes(current.clone())
+                .into_attributes()
+        },
+    );
+    let projected_saved = match (projection.as_ref(), raw_saved) {
+        (Some(projection), Some(stored)) => Some(
+            projection
+                .project_attributes(stored.clone())
+                .into_attributes(),
+        ),
         _ => None,
     };
     let projected_saved = projected_saved.as_ref().or(raw_saved);
 
+    let mut differing_ignored_paths = std::collections::HashSet::new();
+    for path in ignore_changes.iter().filter(|path| !path.is_write_only()) {
+        let Some(desired_value) = desired.get(path.attribute()) else {
+            continue;
+        };
+        let desired_leaf = value_at_leaf(desired_value, path.leaf());
+        let current_leaf = current
+            .get(path.attribute())
+            .and_then(|value| value_at_leaf(value, path.leaf()));
+        let equal = match (desired_leaf, current_leaf) {
+            (Some(desired), Some(current)) => {
+                let attr_type = path
+                    .leaf()
+                    .segments()
+                    .is_empty()
+                    .then(|| {
+                        schema?
+                            .attributes
+                            .get(path.attribute())
+                            .map(|attr| &attr.attr_type)
+                    })
+                    .flatten();
+                type_aware_equal(current, desired, attr_type, defs)
+            }
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        };
+        if !equal {
+            differing_ignored_paths.insert(path.authored());
+        }
+    }
+
     for (key, desired_value) in desired {
+        if ignore_changes.ignores_whole_attribute(key) {
+            continue;
+        }
         let type_info = schema.and_then(|s| {
             s.attributes.get(key).map(|attr| TypedAttr {
                 attr_type: &attr.attr_type,
@@ -900,9 +991,11 @@ pub(super) fn find_changed_attributes(
                 .filter(|value| crate::value::contains_redacted_secret(value))
         });
 
+        let effective_desired =
+            ignore_changes.with_observed_readable_leaves(key, desired_value, current_value);
         let comparison = AttrComparison {
             from: current_value,
-            to: desired_value,
+            to: &effective_desired,
             saved: projected_saved.and_then(|projected_saved| {
                 projected_saved.get(key).map(|projected_value| SavedAttr {
                     views: raw_saved
@@ -926,11 +1019,12 @@ pub(super) fn find_changed_attributes(
             }),
             type_info,
         };
-        let should_patch = key_should_enter_patch(
+        let should_patch = key_should_enter_patch_with_ignores(
             key,
             schema,
             LeafProvenance::Recorded(nested_write_only.get(key)),
             comparison,
+            ignore_changes,
         );
         if should_patch {
             changed.push(key.clone());
@@ -967,7 +1061,31 @@ pub(super) fn find_changed_attributes(
         | None => {}
     }
 
-    changed
+    AttributeChanges {
+        changed,
+        ignored_readable_differences: differing_ignored_paths.len(),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn find_changed_attributes(
+    desired: &HashMap<String, Value>,
+    current: &HashMap<String, Value>,
+    saved: Option<&HashMap<String, Value>>,
+    nested_write_only: &NestedWriteOnlyRecord,
+    prev_explicit: Option<&ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+) -> Vec<String> {
+    find_changed_attributes_with_ignores(
+        desired,
+        current,
+        saved,
+        nested_write_only,
+        prev_explicit,
+        schema,
+        &ResolvedIgnoreChanges::default(),
+    )
+    .changed
 }
 
 #[cfg(test)]

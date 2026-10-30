@@ -247,7 +247,9 @@ fn build_deferred_for_plan() -> Plan {
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
         attributes: deferred_record_attributes(),
-        binding_name: "validation_records".to_string(),
+        target: carina_core::parser::DeferredForTarget::Bound {
+            binding: "validation_records".to_string(),
+        },
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: ForBinding::Simple("opt".to_string()),
         template_resource,
@@ -267,13 +269,28 @@ fn build_deferred_for_plan() -> Plan {
 
 fn build_anonymous_deferred_for_plan() -> Plan {
     let template_resource = Resource::new("route53.Record", "validation_records");
+    let target = carina_core::parser::parse_file(
+        "for opt in cert.domain_validation_options {\n  aws.route53.Record { name = opt }\n}\n",
+        std::path::Path::new("main.crn"),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("parse anonymous deferred-for target")
+    .deferred_for_expressions
+    .into_iter()
+    .next()
+    .expect("anonymous deferred-for expression")
+    .target;
+    assert!(matches!(
+        &target,
+        carina_core::parser::DeferredForTarget::Unbound { .. }
+    ));
     let deferred = DeferredForExpression {
         file: None,
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
         attributes: deferred_record_attributes(),
-        binding_name: "_anon_validation_records".to_string(),
+        target,
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: ForBinding::Simple("opt".to_string()),
         template_resource,
@@ -300,7 +317,9 @@ fn build_deferred_replace_plan() -> Plan {
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
         attributes: deferred_record_attributes(),
-        binding_name: "validation_records".to_string(),
+        target: carina_core::parser::DeferredForTarget::Bound {
+            binding: "validation_records".to_string(),
+        },
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: ForBinding::Simple("opt".to_string()),
         template_resource,
@@ -375,6 +394,57 @@ fn snapshot_all_create() {
     let plan = build_all_create_plan();
     let output = render_tui(&plan, 120, 40, 0);
     insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_anonymous_loop_origin_effect_labels() {
+    let parsed = carina_core::parser::parse_file(
+        "for name in ['one'] {\n  mock.test.resource { name = name }\n}\n",
+        std::path::Path::new("main.crn"),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("parse anonymous-loop fixture");
+    let mut resource = parsed
+        .resources
+        .into_iter()
+        .next()
+        .expect("loop emits one resource");
+    resource.id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "mock_test_resource_96081a11",
+        None,
+    );
+    let origin = resource
+        .loop_provenance
+        .display_origin()
+        .cloned()
+        .expect("loop resource carries an origin");
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Move {
+        from: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "_for0[0]",
+            None,
+        )),
+        to: carina_core::resource::ResolvedResourceId::new(resource.id.clone()),
+        origin: Some(origin),
+    });
+    plan.add(create(resource));
+    let labels = App::for_plan(&plan, &SchemaRegistry::new())
+        .nodes
+        .into_iter()
+        .map(|node| node.effect_label)
+        .collect::<Vec<_>>();
+
+    insta::assert_debug_snapshot!(labels, @r###"
+    [
+        "mock.test.resource _for0[0] -> mock.test.resource mock_test_resource_96081a11  (for [0] at main.crn:1)",
+        "mock.test.resource (name: one)  (for [0] at main.crn:1)",
+    ]
+    "###);
 }
 
 #[test]
@@ -555,6 +625,7 @@ fn build_moved_with_changes_plan() -> Plan {
         to: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "ec2.Vpc", "new_vpc",
         )),
+        origin: None,
     });
     plan.add(Effect::Update {
         identifier: crate::fixture_applied_identifier("new-vpc-id"),
@@ -615,6 +686,7 @@ fn build_moved_pure_plan() -> Plan {
         to: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "ec2.Vpc", "new_vpc",
         )),
+        origin: None,
     });
     plan
 }

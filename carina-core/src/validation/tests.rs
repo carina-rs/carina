@@ -1,7 +1,7 @@
 use super::*;
 use crate::parser::{
-    ArgumentOrigin, BindingName, ModuleArgument, ParsedFile, ProviderContext, UntilPredicateAst,
-    WaitBinding,
+    ArgumentOrigin, BindingName, LoadedProviderContext, ModuleArgument, ParsedFile,
+    ProviderContext, UntilPredicateAst, WaitBinding,
 };
 use crate::resource::{
     CompositionCall, CompositionCallPath, DataSource, LiveComposition, LiveCompositionArgument,
@@ -32,7 +32,7 @@ fn rendered_typecheck_result(
     value: &Value,
     config: &ProviderContext,
 ) -> Option<String> {
-    typecheck::check_type_expr_value(
+    typecheck::check_type_expr_value_with_context(
         type_expr,
         value,
         config,
@@ -226,7 +226,7 @@ fn empty_parsed() -> ParsedFile {
 fn module_call_findings_for_test(
     parsed: &ParsedFile,
     signatures: &crate::module_resolver::ResolvedModuleSignatures,
-    provider_context: &ProviderContext,
+    provider_context: &LoadedProviderContext,
 ) -> Vec<ModuleCallFinding> {
     let schemas = SchemaRegistry::new();
     let binding_use_report = check_bare_binding_uses(
@@ -430,9 +430,19 @@ fn schema_source_is_assignable_to_lifted_sink(
         .is_assignable_to(crate::schema::TypeInSchema::schemaless(&sink))
 }
 
-fn context_with_iam_policy_arn_validator() -> ProviderContext {
+fn loaded_context_for_test(mut context: ProviderContext) -> LoadedProviderContext {
+    if !context.custom_types_loaded() {
+        context.custom_types = crate::parser::ProviderCustomTypes::loaded(
+            HashSet::new(),
+            Box::new(|_target, _value| Ok(())),
+        );
+    }
+    LoadedProviderContext::for_test(context)
+}
+
+fn context_with_iam_policy_arn_validator() -> LoadedProviderContext {
     let identity = TypeIdentity::bare("IamPolicyArn");
-    ProviderContext {
+    loaded_context_for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
@@ -460,13 +470,13 @@ fn context_with_iam_policy_arn_validator() -> ProviderContext {
             }),
         ),
         ..ProviderContext::default()
-    }
+    })
 }
 
 fn context_with_known_custom_types(
     known: HashSet<crate::parser::OwnedTypeIdentity>,
-) -> ProviderContext {
-    ProviderContext {
+) -> LoadedProviderContext {
+    loaded_context_for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             known,
             Box::new(|target, _value| {
@@ -486,19 +496,19 @@ fn context_with_known_custom_types(
             }),
         ),
         ..ProviderContext::default()
-    }
+    })
 }
 
 fn context_with_accepting_custom_type_resolver(
     known: HashSet<crate::parser::OwnedTypeIdentity>,
-) -> ProviderContext {
-    ProviderContext {
+) -> LoadedProviderContext {
+    loaded_context_for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             known,
             Box::new(|_target, _value| Ok(())),
         ),
         ..ProviderContext::default()
-    }
+    })
 }
 
 fn iam_policy_arn_type_expr() -> TypeExpr {
@@ -695,10 +705,12 @@ fn state_block_targets_only_count_managed_resources_as_used() {
     );
     parsed.state_blocks.push(crate::parser::StateBlock::Import {
         to: crate::parser::StateBlockAddress::new("mock", "test.resource", "managed"),
+        to_span: None,
         id: Value::Concrete(ConcreteValue::String("existing-1".into())),
     });
     parsed.state_blocks.push(crate::parser::StateBlock::Import {
         to: crate::parser::StateBlockAddress::new("mock", "test.resource", "read_target"),
+        to_span: None,
         id: Value::Concrete(ConcreteValue::String("existing-2".into())),
     });
 
@@ -941,8 +953,12 @@ fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
     let schemas = SchemaRegistry::new();
     let provider_context = ProviderContext::default();
     let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
-    let context =
-        ValidationTypeContext::new(&parsed, &schemas, &provider_context, &module_signatures);
+    let context = ValidationTypeContext::new_providerless(
+        &parsed,
+        &schemas,
+        &provider_context,
+        &module_signatures,
+    );
     let report = check_bare_binding_uses(&parsed, &context);
     let finding = report.findings().first().expect("binding-use finding");
     let detail = finding.error.to_string();
@@ -1266,7 +1282,7 @@ mock.test.Consumer { name = shared }
     let schemas = SchemaRegistry::new();
     let mut parsed = crate::config_loader::parse_directory(fixture.path(), &config)
         .expect("load module fixture");
-    crate::module_resolver::resolve_modules_with_config(
+    crate::module_resolver::resolve_modules_with_providerless_config(
         &mut parsed,
         fixture.path(),
         &config,
@@ -1338,6 +1354,7 @@ fn make_composition(binding: &str, attributes: &[&str]) -> LiveComposition {
         instance: binding.to_string(),
         module_source: None,
         module_directory: None,
+        loop_origin: None,
     };
     LiveComposition {
         id: crate::resource::ResolvedResourceId::with_identity(
@@ -1378,6 +1395,7 @@ fn set_composition_module(composition: &mut LiveComposition, module_name: &str) 
         instance: composition.instance.clone(),
         module_source: None,
         module_directory: None,
+        loop_origin: None,
     };
     composition.call_path = CompositionCallPath::direct(call);
 }
@@ -3655,8 +3673,11 @@ fn check_module_calls_rejects_literal_union_mismatch() {
         },
     )]);
 
-    let findings =
-        module_call_findings_for_test(&parsed, &imported_modules, &ProviderContext::default());
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &imported_modules,
+        &LoadedProviderContext::empty_for_test(),
+    );
 
     assert!(
         findings.iter().any(|finding| finding
@@ -3850,8 +3871,11 @@ let inst = m { n = 'abc' }
         },
     )]);
 
-    let findings =
-        module_call_findings_for_test(&parsed, &imported_modules, &ProviderContext::default());
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &imported_modules,
+        &LoadedProviderContext::empty_for_test(),
+    );
     let finding = findings
         .first()
         .expect("the string argument must be rejected");
@@ -3889,7 +3913,11 @@ child {}
         },
     )]);
 
-    let findings = module_call_findings_for_test(&parsed, &signatures, &ProviderContext::default());
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &signatures,
+        &LoadedProviderContext::empty_for_test(),
+    );
     let first_call = &parsed.module_calls[0];
     let second_call = &parsed.module_calls[1];
     let surprise_span = first_call
@@ -3958,7 +3986,11 @@ for item in ["first", "second"] {
         },
     )]);
 
-    let findings = module_call_findings_for_test(&parsed, &signatures, &ProviderContext::default());
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &signatures,
+        &LoadedProviderContext::empty_for_test(),
+    );
     let mismatches = findings
         .iter()
         .filter(|finding| finding.kind() == ModuleCallFindingKind::ValueType)
@@ -4001,7 +4033,11 @@ child { values = [vpc] }
         },
     )]);
 
-    let findings = module_call_findings_for_test(&parsed, &signatures, &ProviderContext::default());
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &signatures,
+        &LoadedProviderContext::empty_for_test(),
+    );
 
     assert_eq!(
         findings
@@ -4048,7 +4084,12 @@ child { values = [vpc] }
     let schemas = SchemaRegistry::new();
     let report = check_bare_binding_uses(
         &parsed,
-        &ValidationTypeContext::new(&parsed, &schemas, &ProviderContext::default(), &signatures),
+        &ValidationTypeContext::new_providerless(
+            &parsed,
+            &schemas,
+            &ProviderContext::default(),
+            &signatures,
+        ),
     );
     assert!(!report.is_ready(), "fixture must produce a binding finding");
 
@@ -4100,7 +4141,12 @@ let child = child_module { value = forwarded }
     )]);
     let report = check_bare_binding_uses(
         &parsed,
-        &ValidationTypeContext::new(&parsed, &schemas, &ProviderContext::default(), &signatures),
+        &ValidationTypeContext::new_providerless(
+            &parsed,
+            &schemas,
+            &ProviderContext::default(),
+            &signatures,
+        ),
     );
     assert_eq!(report.findings().len(), 1, "unexpected report: {report:#?}");
     assert!(matches!(
@@ -4108,7 +4154,7 @@ let child = child_module { value = forwarded }
         BindingResolutionError::ReferenceType(_)
     ));
     let bindings = BindingIndex::from_parsed_with_module_signatures(&parsed, &schemas, &signatures);
-    let authored = check_module_calls(ModuleCallCheckInput {
+    let authored = check_module_calls_providerless(ModuleCallCheckInput {
         authored: &parsed,
         semantic: Some(&parsed),
         base_dir: None,
@@ -4177,8 +4223,11 @@ fn check_module_calls_defers_compatible_binding_refs_to_binding_use_authority() 
         },
     )]);
 
-    let findings =
-        module_call_findings_for_test(&parsed, &imported_modules, &ProviderContext::default());
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &imported_modules,
+        &LoadedProviderContext::empty_for_test(),
+    );
     assert!(
         findings.is_empty(),
         "compatible binding-owned module arguments must not be rechecked: {findings:#?}"
@@ -4205,7 +4254,7 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
     let seen = Arc::new(Mutex::new(Vec::new()));
     let seen_by_validator = Arc::clone(&seen);
     let declaration = enum_type.clone();
-    let config = ProviderContext {
+    let config = loaded_context_for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             HashSet::from([crate::parser::OwnedTypeIdentity::provider("test", identity)]),
             Box::new(move |target, value| {
@@ -4227,7 +4276,7 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         ),
         resource_types: HashSet::from([("test".to_string(), "widget".to_string())]),
         ..ProviderContext::default()
-    };
+    });
     let authored = || Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
     let mut module_parsed = empty_parsed();
     module_parsed.module_calls = vec![ModuleCall::test(
@@ -4568,6 +4617,7 @@ fn composition_ref_error_dedup_uses_the_full_call_path() {
             instance: label.to_string(),
             module_source: None,
             module_directory: None,
+            loop_origin: None,
         }
     }
 
@@ -5355,7 +5405,7 @@ fn simple_annotated_plain_ref_reports_unknown_attribute_once() {
 
 fn resolve_and_validate_export_params(
     exports: &[crate::parser::InferredExportParam],
-    config: &ProviderContext,
+    config: &LoadedProviderContext,
 ) -> Result<(), String> {
     check_export_values_pre_apply(
         exports,
@@ -5363,6 +5413,63 @@ fn resolve_and_validate_export_params(
         config,
     )
     .map(|_| ())
+}
+
+#[test]
+fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_types() {
+    use crate::binding_index::ResolvedBindings;
+    use crate::parser::InferredExportParam;
+
+    let builtin = InferredExportParam {
+        name: "flag".to_string(),
+        static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::Bool),
+        value: Some(Value::Concrete(ConcreteValue::String("not-a-bool".into()))),
+    };
+    let error = check_export_values_pre_apply_providerless(
+        std::slice::from_ref(&builtin),
+        &ResolvedBindings::default(),
+        &ProviderContext::default(),
+    )
+    .expect_err("built-in mismatch must still be diagnosed")
+    .to_string();
+    assert!(error.contains("expected Bool, got string"), "error={error}");
+
+    let custom = InferredExportParam {
+        name: "identifiers".to_string(),
+        static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::List(Box::new(
+            TypeExpr::SchemaType {
+                owned: crate::parser::OwnedTypeIdentity::provider(
+                    "mock",
+                    TypeIdentity::bare("RecoveryProbe"),
+                ),
+            },
+        ))),
+        value: Some(Value::Concrete(ConcreteValue::StringList(vec![
+            "identifier".to_string().into(),
+        ]))),
+    };
+    check_export_values_pre_apply_providerless(
+        std::slice::from_ref(&custom),
+        &ResolvedBindings::default(),
+        &ProviderContext::default(),
+    )
+    .expect("providerless export checks must skip only the custom-type leaf");
+
+    let builtin_custom = InferredExportParam {
+        name: "cidr".to_string(),
+        static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::Simple(
+            "ipv4_cidr".to_string(),
+        )),
+        value: Some(Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string().into(),
+        ))),
+    };
+    check_export_values_pre_apply_providerless(
+        std::slice::from_ref(&builtin_custom),
+        &ResolvedBindings::default(),
+        &ProviderContext::default(),
+    )
+    .expect("built-in custom types remain checkable without providers");
 }
 
 #[test]
@@ -5434,7 +5541,7 @@ fn validate_export_params_skips_unchecked_inference() {
     };
 
     // Unchecked exports do not invent a real type for value validation.
-    let config = ProviderContext::default();
+    let config = loaded_context_for_test(ProviderContext::default());
     let exports = vec![InferredExportParam {
         name: "raw".to_string(),
         static_type: ExportStaticType::Inferred(StaticType::Unchecked(
@@ -5450,7 +5557,7 @@ fn validate_export_params_skips_unchecked_inference() {
 fn validate_export_params_rejects_type_mismatch() {
     use crate::parser::InferredExportParam;
 
-    let config = ProviderContext::default();
+    let config = loaded_context_for_test(ProviderContext::default());
     let exports = vec![InferredExportParam {
         name: "flag".to_string(),
         static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Bool)),
@@ -5468,10 +5575,10 @@ fn validate_export_params_rejects_decrypt_result_as_secret_export() {
     use crate::parser::InferredExportParam;
 
     let plaintext = "hunter2SECRET";
-    let config = ProviderContext {
+    let config = loaded_context_for_test(ProviderContext {
         decryptor: Some(Box::new(move |_, _| Ok(plaintext.to_string()))),
         ..ProviderContext::default()
-    };
+    });
     let value = crate::builtins::evaluate_builtin_with_config_to_value(
         "decrypt",
         &[Value::Concrete(ConcreteValue::String("ciphertext".into()))],
@@ -5507,10 +5614,10 @@ fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
     };
     let builtin = crate::builtins::evaluate_builtin_to_value("upper", &[secret_string()])
         .expect("upper(secret(...)) must evaluate");
-    let config = ProviderContext {
+    let config = loaded_context_for_test(ProviderContext {
         decryptor: Some(Box::new(|_, _| Ok("decrypted-secret".to_string()))),
         ..ProviderContext::default()
-    };
+    });
     let decrypt = crate::builtins::evaluate_builtin_with_config_to_value(
         "decrypt",
         &[Value::Concrete(ConcreteValue::String("ciphertext".into()))],
@@ -5615,20 +5722,18 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
         static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
         value: Some(Value::resource_ref("r", "identifier", vec![])),
     }];
+    let provider_context = loaded_context_for_test(ProviderContext::default());
     let pre_apply =
-        check_export_values_pre_apply(&exports, &bindings("alpha-id"), &ProviderContext::default())
+        check_export_values_pre_apply(&exports, &bindings("alpha-id"), &provider_context)
             .expect("pre-apply export check");
     assert_eq!(
         pre_apply.display_values()[0].value,
         Some(Value::Concrete(ConcreteValue::String("alpha-id".into()))),
     );
 
-    let post_apply = resolve_export_values_post_apply(
-        &pre_apply,
-        &bindings("beta-id"),
-        &ProviderContext::default(),
-    )
-    .expect("post-apply export resolution");
+    let post_apply =
+        resolve_export_values_post_apply(&pre_apply, &bindings("beta-id"), &provider_context)
+            .expect("post-apply export resolution");
     assert_eq!(
         post_apply.as_slice()[0].value,
         Some(Value::Concrete(ConcreteValue::String("beta-id".into()))),
@@ -6707,7 +6812,7 @@ fn mode_known() -> HashSet<String> {
     known
 }
 
-fn mode_context() -> ProviderContext {
+fn mode_context() -> LoadedProviderContext {
     let identity = crate::schema::enum_identity("Mode", Some("test.r"));
     context_with_accepting_custom_type_resolver(HashSet::from([
         crate::parser::OwnedTypeIdentity::provider("test", identity),
@@ -7444,7 +7549,7 @@ fn value_contains_unresolved_ref_unwraps_secret() {
 // exercised by `carina-cli/tests/validate_unknown_custom_type_e2e.rs`.
 // ---------------------------------------------------------------------------
 
-fn enriched_context_with_iam_policy_arn() -> ProviderContext {
+fn enriched_context_with_iam_policy_arn() -> LoadedProviderContext {
     context_with_iam_policy_arn_validator()
 }
 

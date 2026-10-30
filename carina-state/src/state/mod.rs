@@ -14,15 +14,16 @@ pub use carina_core::provider::PreviousSecretHashAuthority;
 use carina_core::provider::{
     AppliedIdentifier, CreateObservation, EmptyAppliedIdentifier, InFlightCreate,
     InFlightPersistence, NestedWriteOnlyRecord, ObservedCreate, PersistedAttributes,
-    PersistedAttributesError, RawSavedAttrs, Sent, SentRecord, StateRowInFlightCreate,
-    StateTransformMap, merge_previous_secret_hashes_into_provider_value, previous_hash,
+    PersistedAttributesError, RawSavedAttrs, Sent, SentDesiredAttributes, SentRecord,
+    StateRowInFlightCreate, StateTransformMap, merge_previous_secret_hashes_into_provider_value,
+    previous_hash,
 };
 pub use carina_core::resource::DeposedKey;
 #[cfg(test)]
 use carina_core::resource::Resource;
 use carina_core::resource::{
     ConcreteValue, Current, DataSource, Directives, PartialReadMarker, PendingReRead,
-    ResolvedResource, ResourceId, ResourceIdentity, State, Value,
+    PersistedDirectives, ResolvedResource, ResourceId, ResourceIdentity, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys};
 use carina_core::value::{
@@ -385,10 +386,11 @@ pub enum RowBasis<'a> {
     Carried,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum DesiredAuthoringBasis {
-    AppliedDesired,
-    CarryPrior,
+#[derive(Debug, Clone)]
+enum DesiredAuthoringBasis<'a> {
+    Sent(SentDesiredAttributes<'a>),
+    DesiredRead,
+    CarriedRead,
 }
 
 /// Published values read without decoding managed resource rows.
@@ -1055,7 +1057,7 @@ impl StateFile {
         let mut directives_map = HashMap::new();
         for rs in &self.resources {
             let id = Self::id_for_resource_state(rs);
-            directives_map.insert(id, rs.directives.clone());
+            directives_map.insert(id, Directives::from(&rs.directives));
         }
         directives_map
     }
@@ -1247,13 +1249,13 @@ impl StateFile {
             let orphan = match self.build_state_for_resource(&id) {
                 Current::Absent(_state) => continue,
                 Current::Present(present) => {
-                    Orphan::present(present, rs.binding.clone(), rs.directives.clone())
+                    Orphan::present(present, rs.binding.clone(), (&rs.directives).into())
                 }
                 Current::CreateInFlight(pending) => {
-                    Orphan::create_in_flight(pending, rs.binding.clone(), rs.directives.clone())
+                    Orphan::create_in_flight(pending, rs.binding.clone(), (&rs.directives).into())
                 }
                 Current::MissingIdentifier(state) => {
-                    Orphan::missing_identifier(state, rs.binding.clone(), rs.directives.clone())
+                    Orphan::missing_identifier(state, rs.binding.clone(), (&rs.directives).into())
                 }
             };
             loaded.insert(orphan);
@@ -2111,7 +2113,7 @@ pub struct ResourceState {
     pub protected: bool,
     /// Carina-side directives persisted from the DSL `directives` block.
     #[serde(default)]
-    pub directives: Directives,
+    pub directives: PersistedDirectives,
     /// Attribute prefixes used to generate names (e.g., {"bucket_name": "my-app-"})
     #[serde(default)]
     pub prefixes: HashMap<String, String>,
@@ -2127,9 +2129,8 @@ pub struct ResourceState {
     ///
     /// Replaces the flat `desired_keys: Vec<String>` (state ≤ v5);
     /// the v5 reader lifts each top-level key to a `Leaf` child of
-    /// the root `Struct`. A later applied/imported desired write rebuilds a
-    /// full tree from the resource's authored `Value` via the aligned
-    /// `carina_core::explicit::build_from_resource_for_stored_values`.
+    /// the root `Struct`. Later writes rebuild a full tree from the resource's
+    /// authored `Value` via an evidence-specific aligned builder.
     #[serde(default, skip_serializing_if = "is_empty_explicit")]
     pub explicit: ExplicitFields,
     /// The binding name for this resource (from `let` bindings in DSL).
@@ -2189,7 +2190,7 @@ struct EncodedResourceState {
     #[serde(default)]
     protected: bool,
     #[serde(default)]
-    directives: Directives,
+    directives: PersistedDirectives,
     #[serde(default)]
     prefixes: HashMap<String, String>,
     #[serde(default)]
@@ -2467,9 +2468,9 @@ impl ResourceState {
     /// deposed generations. This controls removal of an empty shell only; it
     /// must not be used to classify [`CurrentInstance::None`] while loading.
     fn is_deposed_only_shell(&self) -> bool {
-        let shell_directives = Directives {
+        let shell_directives = PersistedDirectives {
             provider_instance: self.directives.provider_instance.clone(),
-            ..Directives::default()
+            ..PersistedDirectives::default()
         };
         matches!(self.current, CurrentInstance::None)
             && !self.deposed.is_empty()
@@ -2638,7 +2639,7 @@ impl ResourceState {
             current: CurrentInstance::None,
             deposed: Vec::new(),
             protected: false,
-            directives: Directives::default(),
+            directives: PersistedDirectives::default(),
             prefixes: HashMap::new(),
             name_overrides: HashMap::new(),
             explicit: ExplicitFields::default(),
@@ -2896,24 +2897,44 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         stored_attributes: &HashMap<String, Value>,
         schema: Option<&ResourceSchema>,
-        authoring_basis: DesiredAuthoringBasis,
+        authoring_basis: DesiredAuthoringBasis<'_>,
     ) {
         if let Some(existing) = existing {
             self.protected = existing.protected;
             self.name_overrides = existing.name_overrides.clone();
         }
-        self.directives = resource.directives.clone();
+        self.directives = PersistedDirectives::from(&resource.directives);
         if self.directives.provider_instance.is_none() {
             self.directives.provider_instance = resource.id.provider_instance.clone();
         }
         self.prefixes = resource.prefixes.clone();
         self.explicit = match authoring_basis {
-            // An empty Struct is a complete record that the applied desired
-            // resource authored no attributes.
-            DesiredAuthoringBasis::AppliedDesired => {
-                explicit::build_from_resource_for_stored_values(resource, stored_attributes, schema)
+            DesiredAuthoringBasis::Sent(sent_desired) => {
+                let prior_stored_attributes = existing.map(|existing| {
+                    existing
+                        .persisted_attributes()
+                        .map(PersistedAttributes::to_values)
+                        .unwrap_or_default()
+                });
+                let prior_stored_authoring = existing
+                    .zip(prior_stored_attributes.as_ref())
+                    .map(|(existing, attributes)| (attributes, &existing.explicit));
+                explicit::build_from_resource_for_stored_values_after_send(
+                    resource,
+                    prior_stored_authoring,
+                    stored_attributes,
+                    &sent_desired,
+                    schema,
+                )
             }
-            DesiredAuthoringBasis::CarryPrior => Self::carried_explicit_for_stored_values(
+            DesiredAuthoringBasis::DesiredRead => {
+                explicit::build_from_read_resource_for_stored_values(
+                    resource,
+                    stored_attributes,
+                    schema,
+                )
+            }
+            DesiredAuthoringBasis::CarriedRead => Self::carried_explicit_for_stored_values(
                 resource,
                 existing,
                 stored_attributes,
@@ -2934,7 +2955,7 @@ impl ResourceState {
         schema: Option<&ResourceSchema>,
     ) -> ExplicitFields {
         let Some(existing) = existing else {
-            return explicit::build_from_resource_for_stored_values(
+            return explicit::build_from_read_resource_for_stored_values(
                 resource,
                 stored_attributes,
                 schema,
@@ -2970,6 +2991,7 @@ impl ResourceState {
             .resolved_desired_attributes()
             .map(|attributes| resource_with_secret_shape_union(resource, attributes));
         let writeback_resource = applied_desired.as_ref().unwrap_or(resource);
+        let sent_desired = created.sent_desired_attributes_for(writeback_resource);
         let previous = existing.and_then(ResourceState::persisted_attributes);
         let no_observed_values = HashMap::new();
         let (observed_values, pending_reread) = match created.observation() {
@@ -3058,12 +3080,15 @@ impl ResourceState {
             nested_write_only,
             partial_read,
         };
+        let authoring_basis = sent_desired
+            .map(DesiredAuthoringBasis::Sent)
+            .unwrap_or(DesiredAuthoringBasis::CarriedRead);
         row.populate_desired_metadata(
             resource,
             existing,
             &stored_attributes,
             schema,
-            DesiredAuthoringBasis::AppliedDesired,
+            authoring_basis,
         );
         Ok(row)
     }
@@ -3080,7 +3105,7 @@ impl ResourceState {
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
     ) -> Result<Self, ResourceStateEncodingError> {
-        let (persisted, authoring_basis) = match pending.persistence() {
+        let (persisted, sent_desired) = match pending.persistence() {
             InFlightPersistence::Persisted => {
                 if let Some(existing) = existing {
                     let mut row = existing.clone();
@@ -3107,7 +3132,7 @@ impl ResourceState {
                     // Only a legacy unknown record can be safely seeded from
                     // the desired resource.
                     if matches!(row.explicit, ExplicitFields::Unrecorded) {
-                        row.explicit = explicit::build_from_resource_for_stored_values(
+                        row.explicit = explicit::build_from_read_resource_for_stored_values(
                             resource,
                             &HashMap::new(),
                             schema,
@@ -3115,7 +3140,7 @@ impl ResourceState {
                     }
                     return Ok(row);
                 }
-                (pending.clone(), DesiredAuthoringBasis::CarryPrior)
+                (pending.clone(), None)
             }
             InFlightPersistence::Fresh(fresh) => {
                 let selected = Self::selected_sent_attributes(
@@ -3136,7 +3161,7 @@ impl ResourceState {
                 });
                 (
                     fresh.persist(write_only, secrets),
-                    DesiredAuthoringBasis::AppliedDesired,
+                    Some(fresh.sent_desired_attributes_for(resource)),
                 )
             }
         };
@@ -3147,6 +3172,9 @@ impl ResourceState {
             resource.id.provider.clone(),
         );
         row.current = CurrentInstance::CreateInFlight { pending: persisted };
+        let authoring_basis = sent_desired
+            .map(DesiredAuthoringBasis::Sent)
+            .unwrap_or(DesiredAuthoringBasis::CarriedRead);
         row.populate_desired_metadata(resource, existing, &HashMap::new(), schema, authoring_basis);
         Ok(row)
     }
@@ -3332,8 +3360,11 @@ impl ResourceState {
             },
         };
         let authoring_basis = match row_basis {
-            RowBasis::Applied(_) | RowBasis::Imported => DesiredAuthoringBasis::AppliedDesired,
-            RowBasis::Carried => DesiredAuthoringBasis::CarryPrior,
+            RowBasis::Applied(request) => {
+                DesiredAuthoringBasis::Sent(request.sent_desired_attributes(writeback_resource))
+            }
+            RowBasis::Imported => DesiredAuthoringBasis::DesiredRead,
+            RowBasis::Carried => DesiredAuthoringBasis::CarriedRead,
         };
         rs.populate_desired_metadata(
             resource,
@@ -3369,7 +3400,7 @@ struct ResourceStateV14CurrentDto {
     #[serde(default)]
     protected: bool,
     #[serde(default)]
-    directives: Directives,
+    directives: PersistedDirectives,
     #[serde(default)]
     prefixes: HashMap<String, String>,
     #[serde(default)]
@@ -3405,9 +3436,9 @@ fn migrate_v14_current_instance(content: &str) -> Result<String, BackendError> {
                     "Failed to migrate state file from v14: {error}"
                 ))
             })?;
-        let shell_directives = Directives {
+        let shell_directives = PersistedDirectives {
             provider_instance: legacy.directives.provider_instance.clone(),
-            ..Directives::default()
+            ..PersistedDirectives::default()
         };
         let is_deposed_only_shell = legacy.identifier.is_none()
             && !legacy.deposed.is_empty()

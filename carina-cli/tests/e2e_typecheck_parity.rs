@@ -58,13 +58,11 @@ fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
     if provider_names.is_empty() {
         DiagnosticEngine::without_loaded_provider_schemas()
     } else {
-        let loaded_schemas =
-            carina_core::provider::provider_loaded_schema_registry_from_factories(&factories);
-        DiagnosticEngine::new(
-            Arc::new(loaded_schemas),
-            provider_names,
+        let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
             Arc::new(factories),
-        )
+            std::iter::empty(),
+        );
+        DiagnosticEngine::new(Arc::new(loaded_providers), provider_names)
     }
 }
 
@@ -296,32 +294,29 @@ fn module_call_parity_schemas() -> SchemaRegistry {
 }
 
 fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &SchemaRegistry) {
-    let context = carina_core::parser::ProviderContext {
-        decryptor: None,
-        custom_types: carina_core::provider::provider_custom_types_from_factories(Arc::new(
-            factories_for(schemas),
-        )),
-        resource_types: carina_core::parser::ProviderContext::resource_types_from_schema_registry(
-            schemas,
-        ),
-    };
+    let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(factories_for(schemas)),
+        std::iter::empty(),
+    );
+    let context = loaded_providers.provider_context();
+    let schemas = loaded_providers.schema_registry();
     let directory = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
         base_dir,
-        &context,
+        context,
         &HashMap::new(),
     )
     .expect("the fixture directory must parse before module expansion");
     let signatures = carina_core::module_resolver::load_resolved_module_signatures(
         &directory.parsed,
         base_dir,
-        &context,
+        context,
     );
     let binding_use_report = carina_core::validation::check_bare_binding_uses(
         &directory.parsed,
         &carina_core::validation::ValidationTypeContext::new(
             &directory.parsed,
             schemas,
-            &context,
+            context,
             &signatures,
         ),
     );
@@ -336,7 +331,7 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
             semantic: Some(&directory.parsed),
             base_dir: Some(base_dir),
             imported_signatures: &signatures,
-            provider_context: &context,
+            provider_context: context,
             schemas,
             binding_use_report: &binding_use_report,
             bindings: &bindings,
@@ -346,7 +341,7 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
     match carina_core::module_resolver::resolve_modules_with_diagnostics(
         &directory.parsed,
         base_dir,
-        &context,
+        context,
         schemas,
         &covered_findings,
     ) {
@@ -1373,6 +1368,91 @@ attributes { loaded: Bool = true }
             "each concrete constraint message must underline its own root call",
         );
     }
+}
+
+#[test]
+fn ignore_changes_validation_has_cli_lsp_parity_for_every_v1_error() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "backend.crn",
+            "backend local { path = \"carina.state.json\" }\n",
+        ),
+        (
+            "main.crn",
+            r#"let missing = mock.test.resource {
+  name = "missing"
+  directives { ignore_changes = [does_not_exist] }
+}
+let read_only = mock.test.resource {
+  name = "read-only"
+  directives { ignore_changes = [identifier] }
+}
+let indexed = mock.test.resource {
+  name = "indexed"
+  rule { action = "allow" }
+  directives { ignore_changes = [rule[0].action] }
+}
+let through_list = mock.test.resource {
+  name = "through-list"
+  rule { action = "allow" }
+  directives { ignore_changes = [rule.action] }
+}
+let union_path = mock.test.resource {
+  name = "union"
+  choice = { value = "selected" }
+  directives { ignore_changes = [choice.value] }
+}
+let unwritten = mock.test.resource {
+  name = "unwritten"
+  directives { ignore_changes = [comment] }
+}
+let duplicate = mock.test.resource {
+  name = "duplicate"
+  comment = "recorded"
+  directives { ignore_changes = [comment, comment] }
+}
+"#,
+        ),
+    ]);
+    let schemas = carina_provider_mock::builtin_schemas().into_iter().fold(
+        SchemaRegistry::new(),
+        |mut registry, schema| {
+            registry.insert("mock", schema);
+            registry
+        },
+    );
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    let extract = |message: &str| {
+        message
+            .find("ignore_changes path")
+            .map(|start| message[start..].to_string())
+    };
+    let mut cli_messages = cli
+        .iter()
+        .filter_map(|message| extract(message))
+        .collect::<Vec<_>>();
+    let mut lsp_messages = lsp
+        .iter()
+        .filter_map(|diagnostic| extract(&diagnostic.message))
+        .collect::<Vec<_>>();
+    cli_messages.sort();
+    lsp_messages.sort();
+
+    assert_eq!(cli_messages, lsp_messages, "CLI={cli:#?}; LSP={lsp:#?}");
+    assert_eq!(
+        cli_messages,
+        [
+            "ignore_changes path `choice.value` passes through a union",
+            "ignore_changes path `comment` is listed more than once",
+            "ignore_changes path `comment` is not written in this resource block",
+            "ignore_changes path `does_not_exist` does not exist in the resource schema",
+            "ignore_changes path `identifier` reaches a read-only or provider-populated node",
+            "ignore_changes path `rule.action` passes through a list, which is not supported",
+            "ignore_changes path `rule[0].action` contains a list index, which is not supported",
+        ]
+    );
 }
 
 #[test]
@@ -3340,7 +3420,7 @@ awscc.cloudfront.Distribution {
         &schemas,
     )
     .expect("load caller configuration");
-    carina_core::module_resolver::resolve_modules_with_config(
+    carina_core::module_resolver::resolve_modules_with_providerless_config(
         &mut loaded.parsed,
         fixture.path(),
         &config,
@@ -4263,8 +4343,11 @@ fn wasm_style_factories() -> Vec<Box<dyn ProviderFactory>> {
 fn wasm_style_engine() -> DiagnosticEngine {
     let factories: Vec<Box<dyn ProviderFactory>> = wasm_style_factories();
     let provider_names = vec!["awsccmock".to_string()];
-    let schemas = carina_core::provider::provider_loaded_schema_registry_from_factories(&factories);
-    DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(factories))
+    let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(factories),
+        std::iter::empty(),
+    );
+    DiagnosticEngine::new(Arc::new(loaded_providers), provider_names)
 }
 
 fn wasm_style_flow_log_schema() -> ResourceSchema {
@@ -4420,8 +4503,11 @@ awsccmock.ec2.subnet {
     )]);
     let provider_names = vec!["awsccmock".to_string()];
     let factories = wasm_style_subnet_factories();
-    let schemas = carina_core::provider::provider_loaded_schema_registry_from_factories(&factories);
-    let engine = DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(factories));
+    let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(factories),
+        std::iter::empty(),
+    );
+    let engine = DiagnosticEngine::new(Arc::new(loaded_providers), provider_names);
 
     let lsp_diags = lsp_diagnostics(&engine, &fixture, "main.crn");
     let cli_diags = cli_diagnostics(wasm_style_subnet_factories(), &fixture);
@@ -4529,12 +4615,11 @@ fn factories_2358() -> Vec<Box<dyn ProviderFactory>> {
 
 fn engine_2358() -> DiagnosticEngine {
     let factories = factories_2358();
-    let schemas = carina_core::provider::provider_loaded_schema_registry_from_factories(&factories);
-    DiagnosticEngine::new(
-        Arc::new(schemas),
-        vec!["awscc2358".to_string()],
+    let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(factories),
-    )
+        std::iter::empty(),
+    );
+    DiagnosticEngine::new(Arc::new(loaded_providers), vec!["awscc2358".to_string()])
 }
 
 #[test]

@@ -114,13 +114,11 @@ pub fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
     if provider_names.is_empty() {
         DiagnosticEngine::without_loaded_provider_schemas()
     } else {
-        let loaded_schemas =
-            carina_core::provider::provider_loaded_schema_registry_from_factories(&factories);
-        DiagnosticEngine::new(
-            Arc::new(loaded_schemas),
-            provider_names,
+        let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
             Arc::new(factories),
-        )
+            std::iter::empty(),
+        );
+        DiagnosticEngine::new(Arc::new(loaded_providers), provider_names)
     }
 }
 

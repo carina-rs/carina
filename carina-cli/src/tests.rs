@@ -6,17 +6,23 @@ use indexmap::IndexMap;
 
 use serde_json::json;
 
-use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
+use carina_core::data_source_value::{
+    DataSourceValue, DataSourceValues, ExecutableDataSourceValues,
+};
 use carina_core::effect::Effect;
-use carina_core::executor::{AcceptedRequest, Applied};
-use carina_core::parser::{ParsedFile, ProviderConfig, ProviderContext};
+use carina_core::executor::{
+    AcceptedRequest, Applied, ExecutionCheckpointSink, ExecutionEvent, ExecutionObserver,
+    ExecutionOutcome, LiveExecutionInput, ProviderCheckInputs,
+};
+use carina_core::parser::{LoadedProviderContext, ParsedFile, ProviderConfig, ProviderContext};
 use carina_core::plan::Plan;
 use carina_core::provider::{
-    AppliedIdentifier, BoxFuture, ProviderError, ProviderResult, ReadOutcome,
+    AppliedIdentifier, AppliedState, BoxFuture, NoopNormalizer, ProviderError, ProviderResult,
+    ReadOutcome, UpdateOutcome,
 };
 use carina_core::resource::{
-    ConcreteValue, Current, DataSource, DeferredValue, Directives, ResolvedDataSource,
-    ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
+    ConcreteValue, Current, DataSource, DeferredValue, Directives, ParsedIgnorePath,
+    ResolvedDataSource, ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
 };
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedValue;
@@ -51,6 +57,10 @@ use std::sync::Mutex;
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+fn loaded_provider_context() -> LoadedProviderContext {
+    LoadedProviderContext::empty_for_test()
 }
 
 #[test]
@@ -220,7 +230,7 @@ fn checked_exports(
     carina_core::validation::check_export_values_pre_apply(
         params,
         &carina_core::binding_index::ResolvedBindings::default(),
-        &ProviderContext::default(),
+        &loaded_provider_context(),
     )
     .expect("test exports must pass the secret boundary")
 }
@@ -253,6 +263,7 @@ fn saved_provider_configs(
 
 struct TestProvider {
     read_results: HashMap<(String, String), Result<State, String>>,
+    update_result: Option<AppliedState>,
 }
 
 impl TestProvider {
@@ -267,7 +278,17 @@ impl TestProvider {
     fn with_read_result(id: &ResourceId, identifier: &str, result: Result<State, String>) -> Self {
         let mut read_results = HashMap::new();
         read_results.insert((id.to_string(), identifier.to_string()), result);
-        Self { read_results }
+        Self {
+            read_results,
+            update_result: None,
+        }
+    }
+
+    fn with_update_state(state: AppliedState) -> Self {
+        Self {
+            read_results: HashMap::new(),
+            update_result: Some(state),
+        }
     }
 }
 
@@ -332,7 +353,11 @@ impl Provider for TestProvider {
         _identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
-        Box::pin(async { Err(ProviderError::internal("unexpected update")) })
+        let state = self
+            .update_result
+            .clone()
+            .expect("missing update state for test provider");
+        Box::pin(async move { Ok(UpdateOutcome::Success { state }) })
     }
 
     fn delete(
@@ -351,6 +376,165 @@ impl Provider for TestProvider {
     ) -> ProviderResult<Vec<String>> {
         Ok(Vec::new())
     }
+}
+
+struct NoopExecutionObserver;
+
+impl ExecutionObserver for NoopExecutionObserver {
+    fn on_event(&self, _event: &ExecutionEvent<'_>) {}
+}
+
+#[tokio::test]
+async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps_create_record() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("password", AttributeType::string())
+                    .write_only()
+                    .build(),
+            )
+            .validate()
+            .expect("write-only fixture schema is valid"),
+    );
+
+    let ignored_password: ParsedIgnorePath = serde_json::from_value(serde_json::json!({
+        "segments": [{ "kind": "attribute", "value": "password" }]
+    }))
+    .expect("valid ignored password path");
+    let resource = |comment: &str| {
+        let mut resource = Resource::with_provider("mock", "test.resource", "ignored", None)
+            .with_attribute(
+                "comment",
+                Value::Concrete(ConcreteValue::String(comment.into())),
+            )
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String("create-time".into())),
+            );
+        resource.directives.ignore_changes = vec![ignored_password.clone()];
+        resource
+    };
+
+    let created = ResolvedResource::resolve_with_schemas(resource("before"), &schemas)
+        .expect("create resource resolves ignore_changes");
+    let updated = ResolvedResource::resolve_with_schemas(resource("after"), &schemas)
+        .expect("update resource resolves ignore_changes");
+    let id = updated.id.clone();
+    let schema = schemas
+        .get_for(updated.as_resource())
+        .expect("fixture schema is registered")
+        .schema()
+        .as_schema();
+
+    let create_request = AcceptedRequest::create_for_test();
+    let create_state = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "comment".to_string(),
+            Value::Concrete(ConcreteValue::String("before".into())),
+        )]),
+    )
+    .with_identifier("provider-id");
+    let created_row = ResourceState::from_provider_state_for_resource_and_schema(
+        &created,
+        &create_state,
+        None,
+        Some(schema),
+        RowBasis::Applied(&create_request),
+        None,
+    )
+    .expect("create-time row records the unobserved write-only value");
+    let mut existing = StateFile::new();
+    existing
+        .upsert_resource(created_row)
+        .expect("create-time row is valid");
+
+    let from = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "comment".to_string(),
+            Value::Concrete(ConcreteValue::String("before".into())),
+        )]),
+    )
+    .with_identifier("provider-id");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(from),
+        identifier: AppliedIdentifier::new("provider-id").expect("non-empty identifier"),
+        to: updated.clone(),
+        changed_attributes: vec!["comment".to_string()],
+    });
+    let provider = TestProvider::with_update_state(
+        AppliedState::new(
+            id.clone(),
+            "provider-id",
+            HashMap::from([(
+                "comment".to_string(),
+                Value::Concrete(ConcreteValue::String("after".into())),
+            )]),
+        )
+        .expect("non-empty applied identifier"),
+    );
+    let outcome = carina_core::executor::execute_live_plan(
+        &provider,
+        LiveExecutionInput {
+            plan: &plan,
+            provider_check_inputs: ProviderCheckInputs::Authored,
+            compositions: &[],
+            bindings: Default::default(),
+            managed_current: HashMap::new(),
+            data_source_values: ExecutableDataSourceValues::empty(),
+            normalizer: &NoopNormalizer,
+            provider_configs: &[],
+            factories: &[],
+            schemas: &schemas,
+            parallelism: std::num::NonZeroUsize::new(1).expect("one is non-zero"),
+            precompleted_success_count: 0,
+            checkpoint_sink: ExecutionCheckpointSink::noop(),
+        },
+        &NoopExecutionObserver,
+        carina_core::shutdown::ShutdownToken::running(),
+    )
+    .await;
+    let ExecutionOutcome::Completed(execution) = outcome else {
+        panic!("uncancelled update must complete");
+    };
+    let Some(Applied::Complete { request, .. }) = execution.applied_states.get(&id) else {
+        panic!("successful update must retain accepted-request evidence");
+    };
+    assert!(request.sent_attributes().contains("comment"));
+    assert!(
+        !request.sent_attributes().contains("password"),
+        "an ignored write-only attribute omitted from the patch is not sent"
+    );
+
+    let saved = build_state_after_apply(
+        ApplyStateSave {
+            state_file: existing,
+            sorted_resources: std::slice::from_ref(&updated),
+            runtime_synthesized_resources: &[],
+            managed_current: &HashMap::new(),
+            applied_states: &execution.applied_states,
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        },
+        None,
+    )
+    .expect("accepted update writes state");
+    let password = saved
+        .find_resource_for_id(&id)
+        .and_then(ResourceState::persisted_attributes)
+        .and_then(|attributes| attributes.get("password"));
+    assert_eq!(
+        password,
+        Some(Value::Concrete(ConcreteValue::String("create-time".into()))),
+        "writeback must retain the last accepted create-time write-only value"
+    );
 }
 
 #[tokio::test]
@@ -711,10 +895,14 @@ fn plan_file_serde_round_trip() {
         Some(SavedModuleSource::Module {
             name: "web_tier".to_string(),
             instance: "web".to_string(),
+            scope_key: None,
+            scope_description: None,
         }),
         "a decoded plan must keep module metadata attached to its saved resource",
     );
-    let Effect::Create(resource) = &deserialized.plan.effects()[0] else {
+    let carina_core::effect::UnresolvedSavedEffect::Create(resource) =
+        &deserialized.plan.effects()[0]
+    else {
         panic!("fixture effect must remain a create");
     };
     assert_eq!(
@@ -722,6 +910,8 @@ fn plan_file_serde_round_trip() {
         Some(SavedModuleSource::Module {
             name: "web_tier".to_string(),
             instance: "web".to_string(),
+            scope_key: None,
+            scope_description: None,
         }),
         "a decoded plan effect must retain its saved module-source type",
     );
@@ -1961,10 +2151,10 @@ async fn lock_released_on_write_state_failure() {
                 export_params: &checked_exports(&[]),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -2111,10 +2301,10 @@ async fn finalize_apply_uses_write_state_locked() {
                 export_params: &checked_exports(&[]),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -2458,10 +2648,10 @@ async fn finalize_apply_without_lock_uses_write_state() {
                 export_params: &checked_exports(&[]),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: state_lock.as_ref(),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -2544,10 +2734,10 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
                 export_params: &checked_exports(&export_params),
                 data_source_values: &data_source_values,
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -3458,6 +3648,146 @@ fn plan_file_validation_rejects_missing_resource_identity() {
     assert!(error.contains("sorted_resources[0]"), "got: {error}");
 }
 
+#[test]
+fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
+    let parsed = carina_core::parser::parse_file(
+        "let upstream = upstream_state { source = '../upstream' }\n\
+         let children = for value in upstream.values {\n\
+           mock.test.resource { name = value }\n\
+         }\n",
+        std::path::Path::new("main.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("bound deferred loop parses");
+    let template = parsed.deferred_for_expressions[0].clone();
+    assert!(matches!(
+        template.target,
+        carina_core::parser::DeferredForTarget::Bound { .. }
+    ));
+    let mut plan = Plan::new();
+    plan.add(Effect::DeferredCreate {
+        id: carina_core::resource::ResolvedResourceId::with_provider_identity(
+            "mock",
+            "__deferred_for",
+            "children",
+            None,
+        ),
+        template: Box::new(template),
+    });
+    let plan_file = record_test_plan(
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-10-30T00:00:00Z".to_string(),
+            source_path: "main.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
+            backend_config: None,
+            plan,
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        },
+        &["mock"],
+    );
+    let mut json = serde_json::to_value(plan_file).expect("serialize valid bound template");
+    json["plan"]["effects"][0]["DeferredCreate"]["template"]["template_resource"]["id"]
+        .as_object_mut()
+        .expect("template resource id")
+        .remove("identity");
+
+    let decoded: PlanFile = serde_json::from_value(json)
+        .expect("field codec admits pending templates before semantic validation");
+    let error = decoded
+        .validate_resource_identities()
+        .expect_err("bound deferred templates require a resolved identity");
+
+    assert!(
+        error.contains("plan.effects[0].template_resource"),
+        "unexpected validation error: {error}",
+    );
+}
+
+#[test]
+fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
+    let parsed = carina_core::parser::parse_file(
+        "let upstream = upstream_state { source = '../upstream' }\n\
+         for value in upstream.values {\n\
+           mock.test.resource { name = value }\n\
+         }\n",
+        std::path::Path::new("main.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("unbound deferred loop parses");
+    let mut template = parsed.deferred_for_expressions[0].clone();
+    assert!(matches!(
+        template.target,
+        carina_core::parser::DeferredForTarget::Unbound { .. }
+    ));
+    template.template_resource.id = carina_core::resource::ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "incorrectly_resolved",
+        None,
+    );
+    let mut plan = Plan::new();
+    plan.add(Effect::DeferredCreate {
+        id: carina_core::resource::ResolvedResourceId::with_provider_identity(
+            "mock",
+            "__deferred_for",
+            "unbound_loop",
+            None,
+        ),
+        template: Box::new(template),
+    });
+    let plan_file = record_test_plan(
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-10-30T00:00:00Z".to_string(),
+            source_path: "main.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
+            backend_config: None,
+            plan,
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        },
+        &["mock"],
+    );
+
+    let error = plan_file
+        .validate_resource_identities()
+        .expect_err("unbound deferred templates require a pending identity");
+    assert!(
+        error.contains("plan.effects[0].template_resource")
+            && error.contains("unbound deferred target")
+            && error.contains("pending"),
+        "unexpected validation error: {error}",
+    );
+}
+
 fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
     use std::time::Duration;
 
@@ -4128,7 +4458,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
         &carina_core::schema::SchemaRegistry::new(),
         &[],
         &std::collections::HashMap::new(),
-        &ProviderContext::default(),
+        &loaded_provider_context(),
     )
     .await;
 
@@ -4173,7 +4503,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
         &carina_core::schema::SchemaRegistry::new(),
         &[],
         &std::collections::HashMap::new(),
-        &ProviderContext::default(),
+        &loaded_provider_context(),
     )
     .await;
 
@@ -4222,7 +4552,7 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
         &carina_core::schema::SchemaRegistry::new(),
         &[],
         &HashMap::new(),
-        &ProviderContext::default(),
+        &loaded_provider_context(),
     )
     .await;
 
@@ -4298,10 +4628,10 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
                 export_params: &checked_exports(&[]),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -4365,7 +4695,6 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
             export_resolution_inputs: None,
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -4462,10 +4791,10 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
                 export_params: &checked_exports(&export_params),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &export_resources,
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -4570,10 +4899,10 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
                 export_params: &checked_exports(&export_params),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &export_resources,
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },

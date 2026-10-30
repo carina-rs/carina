@@ -59,7 +59,7 @@ pub fn managed_binding_stability(
             prev_explicit.get(&resource.id),
             schema,
         ) {
-            PresentDiff::NoChange => {
+            PresentDiff::NoChange { .. } => {
                 result.insert(
                     resource.id.clone(),
                     ManagedBindingStability::NoPlannedEffect,
@@ -218,11 +218,13 @@ impl Orphan {
                     id: self.current.id().clone(),
                     attributes: Default::default(),
                     directives: self.directives.clone(),
+                    resolved_ignore_changes: Default::default(),
                     prefixes: Default::default(),
                     binding: self.binding.clone(),
                     dependency_bindings: Default::default(),
                     module_source: None,
                     default_tag_keys: Default::default(),
+                    loop_provenance: Default::default(),
                     quoted_string_attrs: Default::default(),
                 };
             }
@@ -238,11 +240,13 @@ impl Orphan {
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
             directives: self.directives.clone(),
+            resolved_ignore_changes: Default::default(),
             prefixes: Default::default(),
             binding: self.binding.clone(),
             dependency_bindings: dependency_bindings.clone(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: Default::default(),
         }
     }
@@ -753,8 +757,9 @@ fn create_plan_for_tests(
     orphans: &Orphans,
     wait_bindings: &[crate::parser::WaitBinding],
 ) -> crate::plan::Plan {
-    let managed = ResolvedResource::collect_resolved(managed.iter().cloned())
-        .expect("differ test resources must have resolved identities");
+    let managed =
+        ResolvedResource::collect_resolved_with_schemas(managed.iter().cloned(), registry)
+            .expect("differ test resources must have resolved identities and valid ignore paths");
     plan::create_plan(
         &managed,
         data_sources,
@@ -789,13 +794,19 @@ fn empty_lifted_saved_attrs() -> crate::provider::LiftedSavedAttrs {
 // and executor patch construction uses the same key/value gate.
 pub(crate) use comparison::{
     AttrComparison, LeafProvenance, TypedAttr, key_should_enter_patch,
-    secret_grafted_comparison_view, type_aware_equal,
+    key_should_enter_patch_with_ignores, secret_grafted_comparison_view, type_aware_equal,
 };
 
 /// Returns true when `binding` is one direct child emitted by the deferred-for
 /// template. List children use a numeric index (`items[0]`); map children use
 /// the canonical address spelling (`items.key` or `items['key with space']`).
-pub fn binding_matches_deferred_template(binding: &str, template_binding_name: &str) -> bool {
+pub fn binding_matches_deferred_template(
+    binding: &str,
+    target: &crate::parser::DeferredForTarget,
+) -> bool {
+    let Some(template_binding_name) = target.bound_binding() else {
+        return target.matches_legacy_binding(binding);
+    };
     let Some(suffix) = binding.strip_prefix(template_binding_name) else {
         return false;
     };
@@ -843,8 +854,11 @@ enum PresentDiff {
         from: Box<State>,
         to: Box<Resource>,
         changed_attributes: Vec<String>,
+        ignored_readable_differences: usize,
     },
-    NoChange,
+    NoChange {
+        ignored_readable_differences: usize,
+    },
 }
 
 fn diff_present(
@@ -873,23 +887,27 @@ fn diff_existing_state(
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> PresentDiff {
-    let changed = comparison::find_changed_attributes(
+    let changes = comparison::find_changed_attributes_with_ignores(
         &desired.resolved_attributes(),
         &current.attributes,
         saved,
         nested_write_only,
         prev_explicit,
         schema,
+        desired.ignore_changes(),
     );
 
-    if changed.is_empty() {
-        PresentDiff::NoChange
+    if changes.changed.is_empty() {
+        PresentDiff::NoChange {
+            ignored_readable_differences: changes.ignored_readable_differences,
+        }
     } else {
         PresentDiff::Update {
             id: desired.id.clone(),
             from: Box::new(current.clone()),
             to: Box::new(desired.as_resource().clone()),
-            changed_attributes: changed,
+            changed_attributes: changes.changed,
+            ignored_readable_differences: changes.ignored_readable_differences,
         }
     }
 }
@@ -900,11 +918,13 @@ fn diff_existing_state(
 /// desired before comparison, preventing false diffs when AWS returns extra
 /// fields. Requiring the paired input prevents callers from silently dropping
 /// nested write-only provenance.
-/// If `prev_explicit` is provided, the actual-state side is projected through
-/// the authoring tree before comparison so server-side default fields the
-/// user never wrote do not surface as diffs (refs awscc#206). The same
-/// tree drives explicit-removal detection for attributes the user
-/// previously wrote but no longer mentions.
+/// If the resource has `prev_explicit`, the actual-state side is projected
+/// through that authoring context before comparison so server-side defaults
+/// the user never wrote do not surface as diffs (refs awscc#206 and
+/// carina-provider-awscc#511). Saved attributes anchor per-element list
+/// records when present; otherwise projection uses their legacy union. The
+/// authoring tree also drives explicit-removal detection for attributes the
+/// user previously wrote but no longer mentions.
 /// If `schema` is provided, type-aware comparison is used (e.g., Int/Float coercion,
 /// case-insensitive enum matching).
 ///
@@ -973,13 +993,14 @@ fn diff_with_saved_parts(
             from,
             to,
             changed_attributes,
+            ..
         } => Diff::Update {
             id,
             from,
             to: *to,
             changed_attributes,
         },
-        PresentDiff::NoChange => Diff::NoChange(desired.id.clone()),
+        PresentDiff::NoChange { .. } => Diff::NoChange(desired.id.clone()),
     }
 }
 

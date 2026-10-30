@@ -557,6 +557,11 @@ pub enum AppError {
     #[error(transparent)]
     PendingResourceIdentity(#[from] carina_core::resource::PendingResourceIdentityError),
 
+    /// A resource's authored lifecycle paths could not cross the
+    /// schema-resolved planning boundary.
+    #[error(transparent)]
+    ResolvedResource(Box<carina_core::resource::ResolvedResourceError>),
+
     /// Persisted current state did not agree with the validated move source.
     #[error(transparent)]
     CurrentMoveRouting(#[from] carina_core::differ::CurrentMoveRoutingMismatch),
@@ -722,6 +727,10 @@ pub enum AppError {
     /// Configuration errors (missing attributes, invalid paths, etc.)
     #[error("{0}")]
     Config(String),
+
+    /// Anonymous resource identity could not be assigned safely.
+    #[error(transparent)]
+    AnonymousIdentity(#[from] carina_core::identifier::AnonymousIdentityError),
 
     /// The path passed to `apply` does not exist, so its input kind is unknown.
     #[error(
@@ -896,6 +905,12 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
         source = current.source();
     }
     messages.join("\n")
+}
+
+impl From<carina_core::resource::ResolvedResourceError> for AppError {
+    fn from(error: carina_core::resource::ResolvedResourceError) -> Self {
+        Self::ResolvedResource(Box::new(error))
+    }
 }
 
 impl From<String> for AppError {
@@ -1116,7 +1131,7 @@ mod tests {
         }
         let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
         let provider_context = carina_core::parser::ProviderContext::default();
-        let context = carina_core::validation::ValidationTypeContext::new(
+        let context = carina_core::validation::ValidationTypeContext::new_providerless(
             &parsed,
             &schemas,
             &provider_context,

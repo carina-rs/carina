@@ -1,0 +1,71 @@
+{
+  "version": 19,
+  "exports_version": 1,
+  "serial": 1,
+  "lineage": "test-ignore-changes-readable",
+  "carina_version": "0.7.1",
+  "resources": [
+    {
+      "resource_type": "test.resource",
+      "identity": "ignored_only",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "ignored-only",
+        "attributes": {
+          "name": "ignored-only",
+          "comment": "external"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": { "kind": "leaf" },
+          "comment": { "kind": "leaf" }
+        }
+      },
+      "binding": "ignored_only",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "test.resource",
+      "identity": "sibling_update",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "sibling-update",
+        "attributes": {
+          "name": "sibling-update",
+          "comment": "external",
+          "tags": {
+            "Owner": "old"
+          }
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": { "kind": "leaf" },
+          "comment": { "kind": "leaf" },
+          "tags": { "kind": "leaf" }
+        }
+      },
+      "binding": "sibling_update",
+      "dependency_bindings": []
+    }
+  ],
+  "exports": {
+    "ignored_only_comment": "desired",
+    "sibling_update_comment": "desired"
+  }
+}

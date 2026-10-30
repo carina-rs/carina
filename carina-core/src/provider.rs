@@ -634,6 +634,101 @@ impl std::error::Error for FlattenedWireCause {}
 
 pub type ProviderResult<T> = Result<T, ProviderError>;
 
+/// Top-level desired attributes proven to have been sent by one provider
+/// operation.
+///
+/// Construction is restricted to checked create requests, executed update
+/// patches, and validated create typestate. Consumers can test membership but
+/// cannot relabel an arbitrary string collection as send evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentAttributes {
+    attributes: BTreeSet<String>,
+    #[cfg(any(test, feature = "test-utils"))]
+    all_for_test: bool,
+}
+
+impl SentAttributes {
+    pub(crate) fn from_resource<S>(resource: &Resource<S>) -> Self {
+        Self::only(resource.attributes.keys().cloned().collect())
+    }
+
+    pub(crate) fn only(attributes: BTreeSet<String>) -> Self {
+        Self {
+            attributes,
+            #[cfg(any(test, feature = "test-utils"))]
+            all_for_test: false,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn all_for_test() -> Self {
+        Self {
+            attributes: BTreeSet::new(),
+            all_for_test: true,
+        }
+    }
+
+    fn from_update_patch(patch: &UpdatePatch) -> Self {
+        Self::only(
+            patch
+                .ops
+                .iter()
+                .filter_map(|op| op.sent_value().map(|_| op.key().to_string()))
+                .collect(),
+        )
+    }
+
+    fn from_create_sent<S>(sent: &Sent, resource: &Resource<S>) -> Self {
+        match sent {
+            Sent::AllRequestAttributes => Self::from_resource(resource),
+            Sent::Only(attributes) => Self::only(attributes.clone()),
+        }
+    }
+
+    /// Whether this operation sent `attribute` with a desired value.
+    pub fn contains(&self, attribute: &str) -> bool {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.all_for_test {
+            return true;
+        }
+        self.attributes.contains(attribute)
+    }
+}
+
+/// Desired values paired with the send evidence from the same provider
+/// operation.
+///
+/// Keeping these together prevents state writeback from combining checked
+/// [`SentAttributes`] with an unrelated authored resource whose values may
+/// still contain unresolved expressions.
+#[derive(Debug, Clone)]
+pub struct SentDesiredAttributes<'a> {
+    attributes: Vec<(&'a String, &'a Value)>,
+    sent: SentAttributes,
+}
+
+impl<'a> SentDesiredAttributes<'a> {
+    pub(crate) fn new(
+        attributes: impl IntoIterator<Item = (&'a String, &'a Value)>,
+        sent: SentAttributes,
+    ) -> Self {
+        Self {
+            attributes: attributes.into_iter().collect(),
+            sent,
+        }
+    }
+
+    /// Provider-ready desired values retained by the accepted operation.
+    pub fn values(&self) -> impl Iterator<Item = (&String, &Value)> {
+        self.attributes.iter().map(|(key, value)| (*key, *value))
+    }
+
+    /// Whether this operation sent `attribute` with a desired value.
+    pub fn contains(&self, attribute: &str) -> bool {
+        self.sent.contains(attribute)
+    }
+}
+
 /// Per-operation request record for [`Provider::create`].
 ///
 /// Mirrors `create-request` in `wit/types.wit`.
@@ -660,6 +755,10 @@ impl CreateRequest {
     /// Full desired state after provider-boundary checks.
     pub fn resource(&self) -> &ProviderReadyResource {
         &self.resource
+    }
+
+    pub(crate) fn sent_attributes(&self) -> SentAttributes {
+        SentAttributes::from_resource(self.resource.as_resource())
     }
 }
 
@@ -721,9 +820,9 @@ impl UpdateRequest {
         changed_attributes: &[String],
         resource: &ProviderReadyResource,
         schema: &ResourceSchema,
-    ) -> Self {
-        let patch = build_update_patch(changed_attributes, resource, &from, schema);
-        Self { from, patch }
+    ) -> Result<Self, IgnoredWriteOnlyValueError> {
+        let patch = build_update_patch(changed_attributes, resource, &from, schema)?;
+        Ok(Self { from, patch })
     }
 
     /// Current provider-side state.
@@ -779,6 +878,32 @@ pub enum PatchOp {
     Remove { key: String },
 }
 
+/// Sending a top-level value would overwrite an ignored write-only leaf whose
+/// current provider value cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "resource '{resource}' cannot send attribute '{attribute}' because ignored write-only path '{path}' must be preserved, but its current value cannot be known"
+)]
+pub struct IgnoredWriteOnlyValueError {
+    resource: Box<ResourceId>,
+    attribute: String,
+    path: Box<crate::resource::ParsedIgnorePath>,
+}
+
+impl IgnoredWriteOnlyValueError {
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource
+    }
+
+    pub fn attribute(&self) -> &str {
+        &self.attribute
+    }
+
+    pub fn path(&self) -> &crate::resource::ParsedIgnorePath {
+        &self.path
+    }
+}
+
 impl PatchOp {
     /// Top-level attribute name. Nested-field patches are a future extension.
     pub fn key(&self) -> &str {
@@ -798,6 +923,12 @@ impl PatchOp {
             | Self::Reassert { value, .. } => Some(value),
             Self::Remove { .. } => None,
         }
+    }
+}
+
+impl UpdatePatch {
+    pub(crate) fn sent_attributes(&self) -> SentAttributes {
+        SentAttributes::from_update_patch(self)
     }
 }
 
@@ -830,56 +961,119 @@ pub fn build_update_patch(
     to: &ProviderReadyResource,
     from: &State,
     schema: &ResourceSchema,
-) -> UpdatePatch {
+) -> Result<UpdatePatch, IgnoredWriteOnlyValueError> {
+    plan_update_patch(changed_attributes, to.as_inner(), from, schema)
+}
+
+/// Decide every update operation from one resolved desired/current pair.
+/// Planning discards the returned patch after validating it; apply retains it
+/// as the provider request payload.
+pub(crate) fn plan_update_patch<S>(
+    changed_attributes: &[String],
+    to: &crate::resource::ResolvedResource<S>,
+    from: &State,
+    schema: &ResourceSchema,
+) -> Result<UpdatePatch, IgnoredWriteOnlyValueError> {
+    let ignore_changes = to.ignore_changes();
     let to = to.as_resource();
     let mut patched_keys = HashSet::new();
-    let mut ops = changed_attributes
-        .iter()
-        .filter_map(|key| {
-            let value = to.attributes.get(key);
-            let in_from = from.attributes.contains_key(key);
-            if value.is_none() && !in_from {
-                return None;
-            }
-            if !patched_keys.insert(key.clone()) {
-                return None;
-            }
-            match (value, in_from) {
-                (Some(value), false) => Some(PatchOp::Add {
-                    key: key.clone(),
-                    value: value.clone(),
-                }),
-                (Some(value), true) => Some(PatchOp::Replace {
-                    key: key.clone(),
-                    value: value.clone(),
-                }),
-                (None, true) => Some(PatchOp::Remove { key: key.clone() }),
-                (None, false) => None,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    if ops.is_empty() {
-        return UpdatePatch { ops };
+    let mut ops = Vec::new();
+    for key in changed_attributes {
+        if ignore_changes.ignores_whole_attribute(key) {
+            continue;
+        }
+        let value = to.attributes.get(key);
+        let in_from = from.attributes.contains_key(key);
+        if value.is_none() && !in_from {
+            continue;
+        }
+        if !patched_keys.insert(key.clone()) {
+            continue;
+        }
+        if value.is_some()
+            && let Some(path) = ignore_changes
+                .for_attribute(key)
+                .find(|path| path.is_write_only())
+        {
+            return Err(ignored_write_only_error(&to.id, key, path));
+        }
+        let sent_value = value.map(|value| {
+            ignore_changes.with_observed_readable_leaves(key, value, from.attributes.get(key))
+        });
+        match (sent_value, in_from) {
+            (Some(value), false) => ops.push(PatchOp::Add {
+                key: key.clone(),
+                value,
+            }),
+            (Some(value), true) => ops.push(PatchOp::Replace {
+                key: key.clone(),
+                value,
+            }),
+            (None, true) => ops.push(PatchOp::Remove { key: key.clone() }),
+            (None, false) => {}
+        }
     }
 
-    let mut reasserts = to
-        .attributes
-        .iter()
-        .filter_map(|(key, value)| {
-            let attribute = schema.attributes.get(key)?;
-            ((attribute.write_only || schema.write_only_bearing(key))
-                && !attribute.create_only
-                && !patched_keys.contains(key))
-            .then(|| PatchOp::Reassert {
-                key: key.clone(),
-                value: value.clone(),
-            })
-        })
-        .collect::<Vec<_>>();
+    if ops.is_empty() {
+        return Ok(UpdatePatch { ops });
+    }
+
+    let mut reasserts = Vec::new();
+    for (key, value) in &to.attributes {
+        let Some(attribute) = schema.attributes.get(key) else {
+            continue;
+        };
+        if (!attribute.write_only && !schema.write_only_bearing(key))
+            || attribute.create_only
+            || patched_keys.contains(key)
+        {
+            continue;
+        }
+        let ignored_write_only = ignore_changes
+            .for_attribute(key)
+            .filter(|path| path.is_write_only())
+            .collect::<Vec<_>>();
+        if attribute.write_only {
+            if ignore_changes.ignores_whole_attribute(key) {
+                continue;
+            }
+            if let Some(path) = ignored_write_only.first() {
+                return Err(ignored_write_only_error(&to.id, key, path));
+            }
+        } else if !ignored_write_only.is_empty() {
+            let desired_write_only = schema.write_only_leaf_projection(key, value);
+            if desired_write_only
+                .iter()
+                .all(|(leaf, _, _)| ignore_changes.ignores_leaf(key, leaf))
+            {
+                continue;
+            }
+            return Err(ignored_write_only_error(&to.id, key, ignored_write_only[0]));
+        }
+        reasserts.push(PatchOp::Reassert {
+            key: key.clone(),
+            value: ignore_changes.with_observed_readable_leaves(
+                key,
+                value,
+                from.attributes.get(key),
+            ),
+        });
+    }
     reasserts.sort_by(|left, right| left.key().cmp(right.key()));
     ops.extend(reasserts);
-    UpdatePatch { ops }
+    Ok(UpdatePatch { ops })
+}
+
+fn ignored_write_only_error(
+    resource: &ResourceId,
+    attribute: &str,
+    path: &crate::resource::ResolvedIgnorePath,
+) -> IgnoredWriteOnlyValueError {
+    IgnoredWriteOnlyValueError {
+        resource: Box::new(resource.clone()),
+        attribute: attribute.to_string(),
+        path: Box::new(path.authored().clone()),
+    }
 }
 
 /// Return type for async operations
@@ -1895,6 +2089,17 @@ impl FreshPendingCreate {
         &self.sent
     }
 
+    /// Desired values and send evidence retained by this fresh continuation.
+    pub fn sent_desired_attributes_for<'a, S>(
+        &self,
+        resource: &'a Resource<S>,
+    ) -> SentDesiredAttributes<'a> {
+        SentDesiredAttributes::new(
+            resource.attributes.iter(),
+            SentAttributes::from_create_sent(&self.sent, resource),
+        )
+    }
+
     pub fn poll_after_secs(&self) -> u32 {
         self.poll_after_secs
     }
@@ -2175,6 +2380,18 @@ pub enum SentRecord {
     Persisted(PendingEnvelope),
 }
 
+impl SentRecord {
+    /// Recover attribute send evidence while it is still retained in request
+    /// form. Persisted continuations intentionally omit ordinary observable
+    /// attribute names, so they cannot claim a sent desired basis.
+    fn sent_attributes_for<S>(&self, resource: &Resource<S>) -> Option<SentAttributes> {
+        match self {
+            Self::Request(sent) => Some(SentAttributes::from_create_sent(sent, resource)),
+            Self::Persisted(_envelope) => None,
+        }
+    }
+}
+
 /// What carina-core knows about a create for which the provider reported an
 /// identifier.
 #[derive(Debug)]
@@ -2273,6 +2490,19 @@ impl ObservedCreate {
 
     pub fn sent(&self) -> &SentRecord {
         &self.sent
+    }
+
+    /// Resolved desired values and send evidence retained by the accepted
+    /// create observation.
+    pub fn sent_desired_attributes_for<'a, S>(
+        &'a self,
+        fallback_resource: &'a Resource<S>,
+    ) -> Option<SentDesiredAttributes<'a>> {
+        let sent = self.sent.sent_attributes_for(fallback_resource)?;
+        Some(match self.resolved_desired_attributes.as_ref() {
+            Some(attributes) => SentDesiredAttributes::new(attributes.values().iter(), sent),
+            None => SentDesiredAttributes::new(fallback_resource.attributes.iter(), sent),
+        })
     }
 
     pub(crate) fn with_resolved_desired_attributes(
@@ -5053,42 +5283,70 @@ impl ProviderLoadedSchemaRegistry {
     }
 }
 
-/// Collect all resource schemas from loaded factories and retain proof of that
-/// provider-loading boundary.
+/// Provider factories and both proofs minted from one captured load.
 ///
-/// Each schema is inserted under the factory's `name()` plus `schema.kind`,
-/// so a given `(provider, resource_type)` pair may have both a `Managed`
-/// and a `DataSource` entry registered side by side.
-pub fn provider_loaded_schema_registry_from_factories(
-    factories: &[Box<dyn ProviderFactory>],
-) -> ProviderLoadedSchemaRegistry {
-    provider_loaded_schema_registry_from_factories_with_supplements(
-        factories,
-        std::iter::empty::<(String, ValidatedResourceSchema)>(),
-    )
+/// Production consumers retain this bundle so schema evidence and the loaded
+/// custom-type context cannot be supplied from separate construction paths.
+pub struct LoadedProviderSnapshot {
+    factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>>,
+    schemas: ProviderLoadedSchemaRegistry,
+    provider_context: crate::parser::LoadedProviderContext,
 }
 
-/// Construct provider-loaded schema evidence with supplemental schemas that
-/// are inserted before factory schemas.
-pub fn provider_loaded_schema_registry_from_factories_with_supplements(
-    factories: &[Box<dyn ProviderFactory>],
-    supplemental_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
-) -> ProviderLoadedSchemaRegistry {
-    let mut registry = SchemaRegistry::new();
-    for (provider, schema) in supplemental_schemas {
-        registry.insert(provider, schema);
+impl LoadedProviderSnapshot {
+    pub fn factories(&self) -> &[Box<dyn ProviderFactory>] {
+        &self.factories
     }
+
+    pub fn factories_arc(&self) -> std::sync::Arc<Vec<Box<dyn ProviderFactory>>> {
+        std::sync::Arc::clone(&self.factories)
+    }
+
+    pub fn schemas(&self) -> &ProviderLoadedSchemaRegistry {
+        &self.schemas
+    }
+
+    pub fn schema_registry(&self) -> &SchemaRegistry {
+        self.schemas.schemas()
+    }
+
+    pub fn provider_context(&self) -> &crate::parser::LoadedProviderContext {
+        &self.provider_context
+    }
+
+    /// Build a deliberately synthetic loaded snapshot for cross-crate tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(
+        schemas: SchemaRegistry,
+        factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>>,
+    ) -> Self {
+        let provider_context =
+            crate::parser::LoadedProviderContext::new(crate::parser::ProviderContext {
+                decryptor: None,
+                custom_types: provider_custom_types_from_factories(std::sync::Arc::clone(
+                    &factories,
+                )),
+                resource_types: crate::parser::ProviderContext::resource_types_from_schema_registry(
+                    &schemas,
+                ),
+            });
+        Self {
+            factories,
+            schemas: ProviderLoadedSchemaRegistry::from_registry(schemas),
+            provider_context,
+        }
+    }
+}
+
+/// Collect all resource schemas from the given factories into a [`SchemaRegistry`].
+pub fn collect_schemas(factories: &[Box<dyn ProviderFactory>]) -> SchemaRegistry {
+    let mut registry = SchemaRegistry::new();
     for factory in factories {
         for schema in factory.schemas() {
             registry.insert(factory.name(), schema);
         }
     }
-    ProviderLoadedSchemaRegistry::from_registry(registry)
-}
-
-/// Collect all resource schemas from the given factories into a [`SchemaRegistry`].
-pub fn collect_schemas(factories: &[Box<dyn ProviderFactory>]) -> SchemaRegistry {
-    provider_loaded_schema_registry_from_factories(factories).into_registry()
+    registry
 }
 
 /// Collect custom type identities from a registry for completion display.
@@ -5552,6 +5810,25 @@ struct OwnerCustomTypeIndex {
     declarations: BTreeMap<TypeIdentity, Vec<AttributeType>>,
 }
 
+struct ProviderFactorySchemaSnapshot {
+    name: String,
+    schemas: Vec<ValidatedResourceSchema>,
+    config: ValidatedConfigSchema,
+}
+
+fn capture_provider_factory_schema_snapshot(
+    factories: &[Box<dyn ProviderFactory>],
+) -> Vec<ProviderFactorySchemaSnapshot> {
+    factories
+        .iter()
+        .map(|factory| ProviderFactorySchemaSnapshot {
+            name: factory.name().to_string(),
+            schemas: factory.schemas(),
+            config: factory.provider_config_attribute_types(),
+        })
+        .collect()
+}
+
 pub(crate) trait ProviderFactorySource: Send + Sync {
     fn as_factories(&self) -> &[Box<dyn ProviderFactory>];
 }
@@ -5581,7 +5858,12 @@ where
     F: ProviderFactorySource,
 {
     pub(crate) fn new(factories: F) -> Self {
-        let index = build_owner_custom_type_index(factories.as_factories());
+        let snapshot = capture_provider_factory_schema_snapshot(factories.as_factories());
+        let index = build_owner_custom_type_index(&snapshot);
+        Self { factories, index }
+    }
+
+    fn with_index(factories: F, index: BTreeMap<String, OwnerCustomTypeIndex>) -> Self {
         Self { factories, index }
     }
 
@@ -5689,20 +5971,20 @@ where
 }
 
 fn build_owner_custom_type_index(
-    factories: &[Box<dyn ProviderFactory>],
+    snapshot: &[ProviderFactorySchemaSnapshot],
 ) -> BTreeMap<String, OwnerCustomTypeIndex> {
-    factories
+    snapshot
         .iter()
         .enumerate()
         .map(|(factory_index, factory)| {
-            let schemas = factory.schemas();
-            let config = factory.provider_config_attribute_types();
             let mut declarations = BTreeMap::<TypeIdentity, Vec<AttributeType>>::new();
-            for (identity, declaration) in identified_types_from_witnesses(&schemas, &config) {
+            for (identity, declaration) in
+                identified_types_from_witnesses(&factory.schemas, &factory.config)
+            {
                 declarations.entry(identity).or_default().push(declaration);
             }
             (
-                factory.name().to_string(),
+                factory.name.clone(),
                 OwnerCustomTypeIndex {
                     factory_index,
                     declarations,
@@ -5720,6 +6002,45 @@ pub fn provider_custom_types_from_factories(
 ) -> crate::parser::ProviderCustomTypes {
     let resolver = FactoryCustomTypeResolver::new(factories);
     crate::parser::ProviderCustomTypes::from_source(resolver)
+}
+
+/// Capture provider schemas once and mint the loaded context and schema proof
+/// shared by validation, planning, apply, state writeback, and the LSP.
+///
+/// Returning one retained bundle makes it impossible for production callers
+/// to pair proofs produced by different provider/schema snapshots.
+pub fn loaded_provider_snapshot_from_factories(
+    factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>>,
+    supplemental_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
+) -> LoadedProviderSnapshot {
+    let snapshot = capture_provider_factory_schema_snapshot(&factories);
+    let mut schemas = SchemaRegistry::new();
+    for (provider, schema) in supplemental_schemas {
+        schemas.insert(provider, schema);
+    }
+    for factory in &snapshot {
+        for schema in &factory.schemas {
+            schemas.insert(&factory.name, schema.clone());
+        }
+    }
+    let custom_types =
+        crate::parser::ProviderCustomTypes::from_source(FactoryCustomTypeResolver::with_index(
+            std::sync::Arc::clone(&factories),
+            build_owner_custom_type_index(&snapshot),
+        ));
+    let provider_context =
+        crate::parser::LoadedProviderContext::new(crate::parser::ProviderContext {
+            decryptor: None,
+            custom_types,
+            resource_types: crate::parser::ProviderContext::resource_types_from_schema_registry(
+                &schemas,
+            ),
+        });
+    LoadedProviderSnapshot {
+        factories,
+        schemas: ProviderLoadedSchemaRegistry::from_registry(schemas),
+        provider_context,
+    }
 }
 
 fn validate_custom_type_annotation(
@@ -6333,6 +6654,89 @@ mod tests {
             &Value::Concrete(ConcreteValue::String("https://example.test".into())),
         )
         .expect("the same factory source must drive recognition and resolution");
+    }
+
+    struct SnapshotCountingFactory {
+        schema_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ProviderFactory for SnapshotCountingFactory {
+        fn name(&self) -> &str {
+            "snapshot"
+        }
+
+        fn display_name(&self) -> &str {
+            "snapshot fixture"
+        }
+
+        fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+            self.schema_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![
+                ResourceSchema::new("test.Item")
+                    .attribute(
+                        crate::schema::AttributeSchema::optional(
+                            "identifier",
+                            AttributeType::refined_string(
+                                Some(TypeIdentity::new(Some("test"), ["item"], "Identifier")),
+                                None,
+                                None,
+                                None,
+                            ),
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .expect("snapshot fixture schema must validate"),
+            ]
+        }
+
+        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+            ValidatedConfigSchema::default()
+        }
+
+        fn validate_config(
+            &self,
+            _attributes: &CanonicalProviderConfigAttributes,
+        ) -> ProviderResult<()> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "test".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &crate::executor::ProviderReadyConfig,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            Box::pin(async { Err(ProviderError::internal("not used")) })
+        }
+    }
+
+    #[test]
+    fn loaded_provider_snapshot_mints_both_proofs_from_one_schema_capture() {
+        let schema_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>> =
+            std::sync::Arc::new(vec![Box::new(SnapshotCountingFactory {
+                schema_calls: std::sync::Arc::clone(&schema_calls),
+            })]);
+
+        let snapshot = loaded_provider_snapshot_from_factories(factories, std::iter::empty());
+
+        assert_eq!(
+            schema_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "schema evidence and the custom-type index must share one capture"
+        );
+        assert_eq!(snapshot.schema_registry().len(), 1);
+        assert!(snapshot.provider_context().known_custom_types().contains(
+            &crate::parser::OwnedTypeIdentity::provider(
+                "snapshot",
+                TypeIdentity::new(Some("test"), ["item"], "Identifier"),
+            )
+        ));
     }
 
     #[test]
@@ -8455,7 +8859,7 @@ mod tests {
         let to = resolved_for_test(to);
         let schema = ResourceSchema::new("test");
         let changed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let patch = build_update_patch(&changed, &to, &from, &schema);
+        let patch = build_update_patch(&changed, &to, &from, &schema).expect("valid patch");
         assert_eq!(patch.ops.len(), 3);
 
         let by_key: HashMap<&str, &PatchOp> = patch.ops.iter().map(|op| (op.key(), op)).collect();
@@ -8537,6 +8941,264 @@ mod tests {
         (schema, value)
     }
 
+    fn nested_struct_write_only_patch_fixture() -> (ResourceSchema, Value) {
+        use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+        let schema = ResourceSchema::new("test")
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "default_actions",
+                    AttributeType::struct_(
+                        "Action",
+                        vec![
+                            StructField::optional(
+                                "authenticate_oidc_config",
+                                AttributeType::struct_(
+                                    "AuthenticateOidcConfig",
+                                    vec![
+                                        StructField::optional("issuer", AttributeType::string())
+                                            .build(),
+                                        StructField::optional(
+                                            "client_secret",
+                                            AttributeType::string(),
+                                        )
+                                        .write_only()
+                                        .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            );
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "authenticate_oidc_config".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "issuer".to_string(),
+                    patch_test_value("https://issuer.example.com"),
+                ),
+                (
+                    "client_secret".to_string(),
+                    Value::Deferred(DeferredValue::Secret(Box::new(patch_test_value(
+                        "client-secret",
+                    )))),
+                ),
+            ]))),
+        )])));
+        (schema, value)
+    }
+
+    fn ignored_path(parts: &[&str]) -> crate::resource::ParsedIgnorePath {
+        crate::resource::ParsedIgnorePath::new(
+            parts
+                .iter()
+                .map(|part| {
+                    crate::resource::ParsedIgnorePathSegment::Attribute((*part).to_string())
+                })
+                .collect(),
+        )
+    }
+
+    fn ready_with_ignored_path(
+        mut resource: Resource,
+        schema: &ResourceSchema,
+        path: crate::resource::ParsedIgnorePath,
+    ) -> ProviderReadyResource {
+        resource.directives.ignore_changes = vec![path];
+        let mut registry = crate::schema::SchemaRegistry::new();
+        registry.insert(
+            "",
+            schema
+                .clone()
+                .validate()
+                .expect("ignore_changes patch schema must be valid"),
+        );
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let context = crate::executor::ProviderPreparationContext::new(
+            &bindings,
+            &gate,
+            &[],
+            &NoopNormalizer,
+            &[],
+            &registry,
+        );
+        futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
+            resource, &context,
+        ))
+        .expect("ignore_changes path must resolve during provider preparation")
+    }
+
+    #[test]
+    fn ignored_nested_write_only_leaf_prevents_parent_reassert() {
+        let (schema, default_actions) = nested_struct_write_only_patch_fixture();
+        let from = State::existing(
+            ResourceId::with_identity("test", "example"),
+            HashMap::from([
+                ("description".to_string(), patch_test_value("before")),
+                (
+                    "default_actions".to_string(),
+                    schema.strip_write_only_leaves("default_actions", &default_actions),
+                ),
+            ]),
+        );
+        let to = ready_with_ignored_path(
+            Resource::new("test", "example")
+                .with_attribute("description", patch_test_value("after"))
+                .with_attribute("default_actions", default_actions),
+            &schema,
+            ignored_path(&[
+                "default_actions",
+                "authenticate_oidc_config",
+                "client_secret",
+            ]),
+        );
+
+        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema)
+            .expect("fully ignored write-only leaves need no reassertion");
+
+        assert!(matches!(
+            &patch.ops[..],
+            [PatchOp::Replace { key, .. }] if key == "description"
+        ));
+    }
+
+    #[test]
+    fn plan_and_apply_use_the_same_update_patch_decision() {
+        let (schema, default_actions) = nested_struct_write_only_patch_fixture();
+        let from = State::existing(
+            ResourceId::with_identity("test", "example"),
+            HashMap::from([
+                ("description".to_string(), patch_test_value("before")),
+                (
+                    "default_actions".to_string(),
+                    schema.strip_write_only_leaves("default_actions", &default_actions),
+                ),
+            ]),
+        );
+        let to = ready_with_ignored_path(
+            Resource::new("test", "example")
+                .with_attribute("description", patch_test_value("after"))
+                .with_attribute("default_actions", default_actions),
+            &schema,
+            ignored_path(&[
+                "default_actions",
+                "authenticate_oidc_config",
+                "client_secret",
+            ]),
+        );
+        let changed = ["description".to_string()];
+
+        let planned = plan_update_patch(&changed, to.as_inner(), &from, &schema)
+            .expect("planning must accept the patch");
+        let applied = build_update_patch(&changed, &to, &from, &schema)
+            .expect("apply must accept the same patch");
+
+        assert_eq!(planned.ops, applied.ops);
+    }
+
+    #[test]
+    fn ignored_readable_leaf_uses_observed_value_when_sibling_is_sent() {
+        use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+        let schema = ResourceSchema::new("test").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("version", AttributeType::string()).build(),
+                        StructField::optional("memory", AttributeType::int()).build(),
+                    ],
+                ),
+            )
+            .build(),
+        );
+        let struct_value = |version: &str, memory: i64| {
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                ("version".to_string(), patch_test_value(version)),
+                (
+                    "memory".to_string(),
+                    Value::Concrete(ConcreteValue::Int(memory)),
+                ),
+            ])))
+        };
+        let from = State::existing(
+            ResourceId::with_identity("test", "example"),
+            HashMap::from([("config".to_string(), struct_value("external", 128))]),
+        );
+        let to = ready_with_ignored_path(
+            Resource::new("test", "example")
+                .with_attribute("config", struct_value("recorded", 256)),
+            &schema,
+            ignored_path(&["config", "version"]),
+        );
+
+        let patch = build_update_patch(&["config".to_string()], &to, &from, &schema)
+            .expect("readable ignored leaf can be filled from the read");
+        let PatchOp::Replace { value, .. } = &patch.ops[0] else {
+            panic!("expected config replacement: {:?}", patch.ops);
+        };
+        let Value::Concrete(ConcreteValue::Map(config)) = value else {
+            panic!("expected config map")
+        };
+        assert_eq!(config["version"], patch_test_value("external"));
+        assert_eq!(config["memory"], Value::Concrete(ConcreteValue::Int(256)));
+    }
+
+    #[test]
+    fn sending_parent_of_ignored_write_only_leaf_is_a_typed_error() {
+        use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+        let schema = ResourceSchema::new("test").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("secret", AttributeType::string())
+                            .write_only()
+                            .build(),
+                        StructField::optional("memory", AttributeType::int()).build(),
+                    ],
+                ),
+            )
+            .build(),
+        );
+        let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("secret".to_string(), patch_test_value("recorded")),
+            (
+                "memory".to_string(),
+                Value::Concrete(ConcreteValue::Int(256)),
+            ),
+        ])));
+        let observed = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "memory".to_string(),
+            Value::Concrete(ConcreteValue::Int(128)),
+        )])));
+        let from = State::existing(
+            ResourceId::with_identity("test", "example"),
+            HashMap::from([("config".to_string(), observed)]),
+        );
+        let to = ready_with_ignored_path(
+            Resource::new("test", "example").with_attribute("config", desired),
+            &schema,
+            ignored_path(&["config", "secret"]),
+        );
+
+        let error = build_update_patch(&["config".to_string()], &to, &from, &schema)
+            .expect_err("the current ignored write-only value is unknowable");
+
+        assert_eq!(error.resource_id(), &to.id);
+        assert_eq!(error.attribute(), "config");
+        assert_eq!(error.path().to_string(), "config.secret");
+        assert!(error.to_string().contains("current value cannot be known"));
+    }
+
     #[test]
     fn nested_write_only_record_sent_skips_non_bearing_keys() {
         use crate::schema::{AttributeSchema, AttributeType, StructField};
@@ -8600,7 +9262,8 @@ mod tests {
             .expect("fixture includes default_actions")
             .clone();
 
-        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema);
+        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema)
+            .expect("valid reassert patch");
 
         assert!(matches!(
             &patch.ops[..],
@@ -8659,7 +9322,8 @@ mod tests {
                     .build(),
             );
 
-        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema);
+        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema)
+            .expect("valid write-only patch");
 
         assert!(matches!(
             &patch.ops[0],
@@ -8719,7 +9383,8 @@ mod tests {
             &to,
             &from,
             &schema,
-        );
+        )
+        .expect("valid changed write-only patch");
 
         assert!(matches!(
             &patch.ops[0],
@@ -8754,9 +9419,15 @@ mod tests {
                 .build(),
         );
 
-        assert!(build_update_patch(&[], &to, &from, &schema).ops.is_empty());
+        assert!(
+            build_update_patch(&[], &to, &from, &schema)
+                .expect("empty patch is valid")
+                .ops
+                .is_empty()
+        );
         assert!(
             build_update_patch(&["absent".to_string()], &to, &from, &schema)
+                .expect("absent patch is valid")
                 .ops
                 .is_empty(),
             "a changed key absent from both sides must be dropped and cannot trigger reassertion"
@@ -8771,7 +9442,10 @@ mod tests {
             Resource::new("test", "nested").with_attribute("default_actions", default_actions),
         );
         assert!(
-            build_update_patch(&[], &to, &from, &schema).ops.is_empty(),
+            build_update_patch(&[], &to, &from, &schema)
+                .expect("empty nested patch is valid")
+                .ops
+                .is_empty(),
             "a write-only-bearing attribute cannot create a reassert-only patch"
         );
     }
@@ -8820,7 +9494,8 @@ mod tests {
 
                             let from = State::existing(id, from_attributes);
                             let desired = resolved_for_test(desired);
-                            let patch = build_update_patch(&changed, &desired, &from, &schema);
+                            let patch = build_update_patch(&changed, &desired, &from, &schema)
+                                .expect("generated fixture has no ignored paths");
                             let patch_keys: Vec<&str> =
                                 patch.ops.iter().map(PatchOp::key).collect();
                             let unique: std::collections::HashSet<_> =
@@ -8899,7 +9574,8 @@ mod tests {
         let from = State::existing(id.clone(), HashMap::new());
         let ready = resolved_for_test(Resource::with_provider("mock", "test", "example", None));
         let schema = crate::schema::ResourceSchema::new("test");
-        let request = UpdateRequest::checked(from, &[], &ready, &schema);
+        let request = UpdateRequest::checked(from, &[], &ready, &schema)
+            .expect("fixture has no ignored write-only paths");
         let identifier =
             AppliedIdentifier::new("mock-id-123").expect("fixture identifier is non-empty");
         let state = router

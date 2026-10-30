@@ -7,6 +7,126 @@ use crate::schema::{ResourceSchema, TypeIdentity};
 use crate::value::value_to_json;
 use indexmap::IndexMap;
 
+fn resolved_ignored_resource(
+    mut resource: Resource,
+    schema: ResourceSchema,
+    path: &[&str],
+) -> (ResolvedResource, SchemaRegistry) {
+    resource.directives.ignore_changes = vec![crate::resource::ParsedIgnorePath::new(
+        path.iter()
+            .map(|part| crate::resource::ParsedIgnorePathSegment::Attribute((*part).to_string()))
+            .collect(),
+    )];
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        resource.id.provider.clone(),
+        schema.validate().expect("ignore_changes schema is valid"),
+    );
+    let resource = ResolvedResource::resolve_with_schemas(resource, &registry)
+        .expect("ignore_changes path resolves");
+    (resource, registry)
+}
+
+#[test]
+fn ignored_top_level_readable_and_create_only_attributes_do_not_diff() {
+    use crate::schema::AttributeSchema;
+
+    let schema = ResourceSchema::new("Widget")
+        .attribute(
+            AttributeSchema::optional("function_version", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(AttributeSchema::optional("comment", AttributeType::string()).build());
+    let desired = Resource::with_provider("test", "Widget", "alias", None)
+        .with_attribute(
+            "function_version",
+            Value::Concrete(ConcreteValue::String("1".into())),
+        )
+        .with_attribute(
+            "comment",
+            Value::Concrete(ConcreteValue::String("same".into())),
+        );
+    let (desired, registry) = resolved_ignored_resource(desired, schema, &["function_version"]);
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([
+            (
+                "function_version".to_string(),
+                Value::Concrete(ConcreteValue::String("42".into())),
+            ),
+            (
+                "comment".to_string(),
+                Value::Concrete(ConcreteValue::String("same".into())),
+            ),
+        ]),
+    );
+    let saved = crate::provider::RawSavedAttrs::default().lift(&registry);
+    let schema = registry
+        .get_for(desired.as_resource())
+        .expect("schema")
+        .schema()
+        .as_schema();
+
+    assert!(matches!(
+        diff(&desired, &current, &saved, None, Some(schema)),
+        Diff::NoChange(_)
+    ));
+}
+
+#[test]
+fn ignored_readable_struct_leaf_does_not_hide_changed_sibling() {
+    use crate::schema::{AttributeSchema, StructField};
+
+    let schema = ResourceSchema::new("Widget").attribute(
+        AttributeSchema::optional(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional("function_version", AttributeType::string()).build(),
+                    StructField::optional("memory", AttributeType::int()).build(),
+                ],
+            ),
+        )
+        .build(),
+    );
+    let config = |version: &str, memory: i64| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "function_version".to_string(),
+                Value::Concrete(ConcreteValue::String(version.into())),
+            ),
+            (
+                "memory".to_string(),
+                Value::Concrete(ConcreteValue::Int(memory)),
+            ),
+        ])))
+    };
+    let desired = Resource::with_provider("test", "Widget", "function", None)
+        .with_attribute("config", config("recorded", 256));
+    let (desired, registry) =
+        resolved_ignored_resource(desired, schema, &["config", "function_version"]);
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([("config".to_string(), config("external", 128))]),
+    );
+    let saved = crate::provider::RawSavedAttrs::default().lift(&registry);
+    let schema = registry
+        .get_for(desired.as_resource())
+        .expect("schema")
+        .schema()
+        .as_schema();
+
+    let Diff::Update {
+        changed_attributes, ..
+    } = diff(&desired, &current, &saved, None, Some(schema))
+    else {
+        panic!("memory change must still produce an update")
+    };
+    assert_eq!(changed_attributes, ["config"]);
+}
+
 fn persisted_secret(encoded: &serde_json::Value) -> Value {
     crate::value::PersistedValue::from_serialized_json(encoded.clone())
         .expect("valid persisted secret")
@@ -2786,6 +2906,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
         "distribution_config".to_string(),
         Value::Concrete(ConcreteValue::Map(state_dc)),
     );
+    let saved_attrs = state_attrs.clone();
     let mut id = ResourceId::with_identity("cloudfront.Distribution", "d1");
     id.provider = "awscc".to_string();
     let mut states = std::collections::HashMap::new();
@@ -2808,7 +2929,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     let result = diff_test(
         &resources[0],
         current,
-        None,
+        Some(&saved_attrs),
         Some(&prev_explicit),
         Some(&schema),
     );
@@ -3031,5 +3152,77 @@ fn find_changed_attributes_unrecorded_prev_explicit_still_detects_real_drift() {
         changed,
         vec!["principal_type".to_string()],
         "real drift under `Unrecorded` must still be reported"
+    );
+}
+
+#[test]
+fn find_changed_attributes_keeps_legacy_unrecorded_list_element_still_in_desired() {
+    let route_table_ids = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::String("rtb-1".into()),
+    )]));
+    let desired = HashMap::from([("route_table_ids".to_string(), route_table_ids.clone())]);
+    let current = desired.clone();
+    let saved = desired.clone();
+    let prev_explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "route_table_ids".to_string(),
+            ExplicitFields::ListElements {
+                elements: vec![ExplicitFields::Unrecorded],
+            },
+        )]),
+    };
+
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        Some(&saved),
+        &NestedWriteOnlyRecord::new(),
+        Some(&prev_explicit),
+        None,
+    );
+
+    assert!(
+        changed.is_empty(),
+        "a desired element is authored even when legacy state recorded it as Unrecorded: {changed:?}"
+    );
+}
+
+#[test]
+fn find_changed_attributes_keeps_nested_legacy_unrecorded_list_element_in_desired() {
+    let network = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "route_table_ids".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("rtb-1".into()),
+        )])),
+    )])));
+    let desired = HashMap::from([("network".to_string(), network)]);
+    let current = desired.clone();
+    let saved = desired.clone();
+    let prev_explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "network".to_string(),
+            ExplicitFields::Struct {
+                children: HashMap::from([(
+                    "route_table_ids".to_string(),
+                    ExplicitFields::ListElements {
+                        elements: vec![ExplicitFields::Unrecorded],
+                    },
+                )]),
+            },
+        )]),
+    };
+
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        Some(&saved),
+        &NestedWriteOnlyRecord::new(),
+        Some(&prev_explicit),
+        None,
+    );
+
+    assert!(
+        changed.is_empty(),
+        "desired matching must reach nested ListElements records recursively: {changed:?}"
     );
 }

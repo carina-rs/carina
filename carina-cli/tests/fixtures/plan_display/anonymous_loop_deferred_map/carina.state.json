@@ -1,0 +1,39 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "anonymous-loop-deferred-map",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "sso.Assignment",
+      "identity": "_accounts.alpha",
+      "provider": "awscc",
+      "identifier": "assignment-alpha",
+      "attributes": {
+        "instance_arn": "arn:aws:sso:::instance/ssoins-example",
+        "permission_set_arn": "arn:aws:sso:::permissionSet/ssoins-example/ps-example",
+        "principal_id": "group-alpha",
+        "principal_type": "GROUP",
+        "target_id": "111111111111",
+        "target_type": "AWS_ACCOUNT"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "_accounts.alpha",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "instance_arn": { "kind": "leaf" },
+          "permission_set_arn": { "kind": "leaf" },
+          "principal_id": { "kind": "leaf" },
+          "principal_type": { "kind": "leaf" },
+          "target_id": { "kind": "leaf" },
+          "target_type": { "kind": "leaf" }
+        }
+      }
+    }
+  ]
+}

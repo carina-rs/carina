@@ -2537,7 +2537,7 @@ fn deferred_template_contains_redacted_secret<S>(
         header: _header,
         resource_type: _resource_type,
         attributes,
-        binding_name: _binding_name,
+        target: _target,
         iterable,
         binding: _binding,
         template_resource,
@@ -2545,6 +2545,37 @@ fn deferred_template_contains_redacted_secret<S>(
     contains_redacted_secret(iterable)
         || attributes_contain_redacted_secret(attributes.iter().map(|(_, value)| value))
         || attributes_contain_redacted_secret(template_resource.attributes.values())
+}
+
+pub(crate) fn unresolved_effect_contains_redacted_secret(
+    effect: &crate::effect::UnresolvedSavedEffect,
+) -> bool {
+    use crate::effect::UnresolvedSavedEffect;
+
+    match effect {
+        UnresolvedSavedEffect::Read { resource } => {
+            attributes_contain_redacted_secret(resource.attributes.values())
+        }
+        UnresolvedSavedEffect::Create(resource)
+        | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
+            attributes_contain_redacted_secret(resource.attributes.values())
+        }
+        UnresolvedSavedEffect::Update { from, to, .. } => {
+            attributes_contain_redacted_secret(from.attributes.values())
+                || attributes_contain_redacted_secret(to.attributes.values())
+        }
+        UnresolvedSavedEffect::Import { identifier, .. } => contains_redacted_secret(identifier),
+        UnresolvedSavedEffect::Wait { until, .. } => contains_redacted_secret(until.value()),
+        UnresolvedSavedEffect::DeferredCreate { template, .. } => {
+            deferred_template_contains_redacted_secret(template)
+        }
+        UnresolvedSavedEffect::DeferredReplace(payload) => {
+            deferred_template_contains_redacted_secret(&payload.template)
+        }
+        UnresolvedSavedEffect::Delete { .. }
+        | UnresolvedSavedEffect::Remove { .. }
+        | UnresolvedSavedEffect::Move { .. } => false,
+    }
 }
 
 pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<S>) -> bool {
@@ -2587,6 +2618,7 @@ pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<
         Effect::Move {
             from: _from,
             to: _to,
+            origin: _origin,
         } => false,
         Effect::Wait {
             identity: _identity,
@@ -3975,9 +4007,10 @@ pub fn redact_secrets_in_effect(
             identifier: redact_secrets_in_value(identifier)?,
         },
         Effect::Remove { id } => Effect::Remove { id: id.clone() },
-        Effect::Move { from, to } => Effect::Move {
+        Effect::Move { from, to, origin } => Effect::Move {
             from: from.clone(),
             to: to.clone(),
+            origin: origin.clone(),
         },
         // Wait effects carry no secret-bearing fields — `until` is a
         // typed predicate over scalar values, surface form is the
@@ -4232,13 +4265,13 @@ fn rehydrate_deferred_template<S: Clone, T>(
     let candidate = candidates
         .iter()
         .find(|candidate| {
-            candidate.binding_name == saved.binding_name
+            candidate.target.same_system_target(&saved.target)
                 && candidate.resource_type == saved.resource_type
                 && candidate.root_bindings() == saved.root_bindings()
         })
         .ok_or_else(|| {
             SecretRehydrationSiteError::new(
-                format!("deferred for {}", saved.binding_name),
+                format!("deferred for {}", saved.target.display_name()),
                 SecretRehydrationError::ShapeMismatch,
             )
         })?;
@@ -4246,7 +4279,7 @@ fn rehydrate_deferred_template<S: Clone, T>(
     if let Some(value) = rehydrate_secret_entry(
         &saved.iterable,
         Some(&candidate.iterable),
-        format!("deferred iterable {}", saved.binding_name),
+        format!("deferred iterable {}", saved.target.display_name()),
         SecretRehydrationCandidate::Evaluated,
     )? {
         out.iterable = value;
@@ -4256,7 +4289,7 @@ fn rehydrate_deferred_template<S: Clone, T>(
         if let Some(value) = rehydrate_secret_entry(
             saved_value,
             candidate.template_resource.attributes.get(key),
-            format!("deferred resource {}.{key}", saved.binding_name),
+            format!("deferred resource {}.{key}", saved.target.display_name()),
             SecretRehydrationCandidate::Evaluated,
         )? {
             *saved_value = value;
@@ -4273,7 +4306,10 @@ fn rehydrate_deferred_template<S: Clone, T>(
                 .attributes
                 .iter()
                 .find_map(|(candidate_key, value)| (candidate_key == key).then_some(value)),
-            format!("deferred display resource {}.{key}", saved.binding_name),
+            format!(
+                "deferred display resource {}.{key}",
+                saved.target.display_name()
+            ),
             SecretRehydrationCandidate::Evaluated,
         )? {
             *saved_value = value;
@@ -5082,6 +5118,78 @@ fn canonicalize_desired_with_type_and_ancestry(
     Ok(canonical)
 }
 
+/// Canonicalize one authored desired attribute through its resource schema.
+///
+/// Identity and reconciliation seams use this before reducing a value to a
+/// comparison string, so parser-surface enum identifiers and already
+/// canonical enum values share the same API-value representation.
+pub(crate) fn canonicalize_desired_attribute_value_with_schema(
+    mut value: Value,
+    schema: &crate::schema::ResourceSchema,
+    attribute: &str,
+) -> Result<Value, crate::schema::TypeError> {
+    // Already-canonical enums may carry an equivalent historical provider
+    // namespace. Their API spelling is the comparison identity at this seam,
+    // so only parser-surface EnumIdentifier values need schema resolution.
+    if first_enum_identifier(&value).is_none() {
+        return Ok(value);
+    }
+    reparse_canonical_enum_leaves(&mut value);
+    let Some(attribute_schema) = schema.attributes.get(attribute) else {
+        return Ok(value);
+    };
+    canonicalize_desired_with_type_and_ancestry(
+        value,
+        &attribute_schema.attr_type,
+        &schema.defs,
+        crate::schema::FieldAncestry::from_input_mode(attribute_schema.input_mode()),
+        DesiredValueSource::AuthoredDsl,
+    )
+}
+
+/// Re-enter already-canonical enum leaves through their API spelling when a
+/// container also contains parser-surface enum identifiers. This keeps the
+/// identity/reconciliation seam's documented API-value identity rule stable
+/// for mixed List/Map values, including historical provider namespaces.
+fn reparse_canonical_enum_leaves(value: &mut Value) {
+    match value {
+        Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
+            *value = Value::Concrete(ConcreteValue::enum_identifier(
+                canonical.api_value().to_string(),
+            ));
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
+            for item in items {
+                reparse_canonical_enum_leaves(item);
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            for item in map.values_mut() {
+                reparse_canonical_enum_leaves(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Canonicalize one provider or persisted-state attribute through its resource
+/// schema while preserving the attribute's effective input ancestry.
+pub(crate) fn canonicalize_state_attribute_value_with_schema(
+    value: Value,
+    schema: &crate::schema::ResourceSchema,
+    attribute: &str,
+) -> Value {
+    let Some(attribute_schema) = schema.attributes.get(attribute) else {
+        return value;
+    };
+    canonicalize_state_with_type_and_ancestry(
+        value,
+        &attribute_schema.attr_type,
+        &schema.defs,
+        crate::schema::FieldAncestry::from_input_mode(attribute_schema.input_mode()),
+    )
+}
+
 /// Canonicalize provider or persisted state. Unrecognized enum-positioned
 /// strings legitimately remain strings for validation and comparison.
 #[cfg(test)]
@@ -5848,7 +5956,7 @@ pub struct CanonicalizedResources<'a, S = crate::resource::ModuleSource> {
 }
 
 impl<'a, S> CanonicalizedResources<'a, S> {
-    pub fn as_mut_slice(&mut self) -> &mut [crate::resource::Resource<S>] {
+    pub(crate) fn into_mut_slice(self) -> &'a mut [crate::resource::Resource<S>] {
         self.resources
     }
 }
@@ -12229,11 +12337,13 @@ mod tests {
             id: ResourceId::with_provider_identity("aws", "iam.policy", "p1", None),
             attributes,
             directives: Default::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("p1".to_string()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: HashSet::new(),
         }
     }
@@ -12942,7 +13052,9 @@ mod tests {
                     ("name".to_string(), placeholder.clone()),
                     ("comment".to_string(), secret),
                 ],
-                binding_name: "validation_records".to_string(),
+                target: crate::parser::DeferredForTarget::Bound {
+                    binding: "validation_records".to_string(),
+                },
                 iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
@@ -13032,7 +13144,9 @@ mod tests {
                 header: "for opt in cert.options".to_string(),
                 resource_type: "aws.route53.RecordSet".to_string(),
                 attributes: vec![("comment".to_string(), secret("stale-projection"))],
-                binding_name: "records".to_string(),
+                target: crate::parser::DeferredForTarget::Bound {
+                    binding: "records".to_string(),
+                },
                 iterable: Value::resource_ref("cert", "options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
@@ -13091,7 +13205,9 @@ mod tests {
                 ("comment".to_string(), canonical),
                 ("identifier".to_string(), display_only.clone()),
             ],
-            binding_name: "children".to_string(),
+            target: crate::parser::DeferredForTarget::Bound {
+                binding: "children".to_string(),
+            },
             iterable: Value::resource_ref("parent", "children", Vec::new()),
             binding: ForBinding::Simple("child".to_string()),
             template_resource,

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use carina_cli::commands::plan::PlanFile;
-use carina_core::effect::Effect;
+use carina_core::effect::UnresolvedSavedEffect as Effect;
 use carina_state::StateFile;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -397,6 +397,7 @@ mock.test.short_budget {
                 Effect::Move {
                     from: _from,
                     to: _to,
+                    ..
                 }
             )),
             "WASM plan must retain the in-flight move"
@@ -467,7 +468,8 @@ let new = mock.test.resource {
             effect,
             Effect::Move {
                 from: _from,
-                to: _to
+                to: _to,
+                ..
             }
         )),
         "moved in-flight plan must retain its explicit state move"

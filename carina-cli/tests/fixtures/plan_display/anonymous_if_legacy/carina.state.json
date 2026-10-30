@@ -1,0 +1,22 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "anonymous-if-legacy",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "_if0",
+      "provider": "awscc",
+      "identifier": "vpc-if0",
+      "attributes": { "vpc_id": "vpc-if0", "cidr_block": "10.0.0.0/16" },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "_if0",
+      "dependency_bindings": [],
+      "explicit": { "kind": "struct", "children": { "cidr_block": { "kind": "leaf" } } }
+    }
+  ]
+}

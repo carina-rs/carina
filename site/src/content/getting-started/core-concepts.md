@@ -146,3 +146,7 @@ Available directives:
 | `prevent_destroy` | `false` | Block any plan that would destroy this resource |
 | `depends_on` | `[]` | Explicit ordering edges to sibling `let` bindings |
 | `provider` | (kind default) | Route this resource to a named provider instance — see [Named provider instances](/reference/dsl/syntax#named-provider-instances) |
+| `ignore_changes` | `[]` | Let another system own selected authored attribute paths after creation |
+
+For syntax, validation rules, and lifecycle semantics, see the
+[directives reference](/reference/dsl/directives/).

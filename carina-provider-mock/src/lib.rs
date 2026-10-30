@@ -34,6 +34,12 @@ pub const BUILTIN_PROVIDER_NAME: &str = "mock";
 const WRITE_ONLY_PASSWORD_ATTRIBUTE: &str = "password";
 const NESTED_WRITE_ONLY_ATTRIBUTE: &str = "oidc_config";
 const NESTED_WRITE_ONLY_FIELD: &str = "client_secret";
+const SERVER_ADDED_LIST_RESOURCE_TYPE: &str = "test.server_added_list";
+const SERVER_ADDED_LIST_ATTRIBUTE: &str = "target_group_attributes";
+const SERVER_ADDED_LIST_DEFAULTS: &[(&str, &str)] = &[
+    ("stickiness.type", "lb_cookie"),
+    ("load_balancing.algorithm.type", "round_robin"),
+];
 
 const MOCK_STATE_VERSION: u32 = 2;
 
@@ -205,9 +211,47 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                     .create_only()
                     .build(),
             )
+            .attribute(
+                AttributeSchema::optional(
+                    "choice",
+                    AttributeType::union(vec![
+                        AttributeType::struct_(
+                            "StringChoice",
+                            vec![StructField::required("value", AttributeType::string()).build()],
+                        ),
+                        AttributeType::struct_(
+                            "IntegerChoice",
+                            vec![StructField::required("number", AttributeType::int()).build()],
+                        ),
+                    ]),
+                )
+                .build(),
+            )
             .attribute(AttributeSchema::optional("web_acl_arn", AttributeType::string()).build())
             .attribute(AttributeSchema::optional("parent", AttributeType::string()).build())
             .attribute(AttributeSchema::optional("parent_name", AttributeType::string()).build())
+            .with_unique_name_attribute("name"),
+        ResourceSchema::new(SERVER_ADDED_LIST_RESOURCE_TYPE)
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    SERVER_ADDED_LIST_ATTRIBUTE,
+                    AttributeType::list(AttributeType::struct_(
+                        "ServerAddedAttribute",
+                        vec![
+                            StructField::required("key", AttributeType::string()).build(),
+                            StructField::required("value", AttributeType::string()).build(),
+                        ],
+                    )),
+                )
+                .with_block_name("target_group_attribute")
+                .build(),
+            )
             .with_unique_name_attribute("name"),
         ResourceSchema::new("test.deferred_source")
             .attribute(
@@ -703,6 +747,83 @@ impl MockProvider {
         config.shift_remove(NESTED_WRITE_ONLY_FIELD);
     }
 
+    fn add_server_list_defaults(id: &ResourceId, attributes: &mut HashMap<String, Value>) {
+        if id.resource_type != SERVER_ADDED_LIST_RESOURCE_TYPE {
+            return;
+        }
+
+        let list = attributes
+            .entry(SERVER_ADDED_LIST_ATTRIBUTE.to_string())
+            .or_insert_with(|| Value::Concrete(ConcreteValue::List(Vec::new())));
+        let Value::Concrete(ConcreteValue::List(items)) = list else {
+            return;
+        };
+
+        for (default_key, default_value) in SERVER_ADDED_LIST_DEFAULTS {
+            let already_present = items.iter().any(|item| {
+                let Value::Concrete(ConcreteValue::Map(fields)) = item else {
+                    return false;
+                };
+                matches!(
+                    fields.get("key"),
+                    Some(Value::Concrete(ConcreteValue::String(key)))
+                        if key.expose_plaintext() == *default_key
+                )
+            });
+            if already_present {
+                continue;
+            }
+
+            items.push(Value::Concrete(ConcreteValue::Map(
+                [
+                    (
+                        "key".to_string(),
+                        Value::Concrete(ConcreteValue::String((*default_key).into())),
+                    ),
+                    (
+                        "value".to_string(),
+                        Value::Concrete(ConcreteValue::String((*default_value).into())),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )));
+        }
+    }
+
+    fn add_server_list_update_out_of_band_element(
+        id: &ResourceId,
+        attributes: &mut HashMap<String, Value>,
+    ) {
+        if id.resource_type != SERVER_ADDED_LIST_RESOURCE_TYPE {
+            return;
+        }
+        let Ok(key) = env::var("CARINA_MOCK_UPDATE_SERVER_LIST_OUT_OF_BAND_KEY") else {
+            return;
+        };
+        let value = env::var("CARINA_MOCK_UPDATE_SERVER_LIST_OUT_OF_BAND_VALUE")
+            .unwrap_or_else(|_| "enabled".to_string());
+        let Some(Value::Concrete(ConcreteValue::List(items))) =
+            attributes.get_mut(SERVER_ADDED_LIST_ATTRIBUTE)
+        else {
+            return;
+        };
+        items.push(Value::Concrete(ConcreteValue::Map(
+            [
+                (
+                    "key".to_string(),
+                    Value::Concrete(ConcreteValue::String(key.into())),
+                ),
+                (
+                    "value".to_string(),
+                    Value::Concrete(ConcreteValue::String(value.into())),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )));
+    }
+
     fn delete_delay_for(id: &ResourceId) -> Option<Duration> {
         let target = env::var("CARINA_MOCK_DELETE_DELAY_MS_FOR").ok()?;
         if Some(target) != Self::resource_key(id) {
@@ -818,8 +939,9 @@ impl MockProvider {
             Err(error) => return Err(attempt.untracked(error)),
         };
 
-        let attrs = resource
-            .attributes
+        let mut persisted_values = resource.resolved_attributes();
+        Self::add_server_list_defaults(&id, &mut persisted_values);
+        let attrs = persisted_values
             .iter()
             .map(|(k, v)| PersistedValue::encode_provider_value(v, None).map(|jv| (k.clone(), jv)))
             .collect::<Result<_, _>>()
@@ -845,7 +967,7 @@ impl MockProvider {
             return Err(attempt.untracked(error));
         }
 
-        let mut state_attrs = resource.resolved_attributes();
+        let mut state_attrs = persisted_values;
         Self::populate_test_resource_identifier_value(&id, &mut state_attrs);
         Self::strip_unobservable_nested_write_only(&mut state_attrs);
         if let Some(config) = partial_create {
@@ -889,8 +1011,9 @@ impl MockProvider {
         let _state_guard = Self::lock_state_file()?;
         let mut states = self.load_states_for_operation()?;
         let key = Self::resolved_resource_key(id)?;
-        let mut persisted = resource
-            .attributes
+        let mut persisted_values = resource.resolved_attributes();
+        Self::add_server_list_defaults(id, &mut persisted_values);
+        let mut persisted = persisted_values
             .iter()
             .map(|(key, value)| {
                 PersistedValue::encode_provider_value(value, None).map(|value| (key.clone(), value))
@@ -911,7 +1034,7 @@ impl MockProvider {
             )
         })?;
 
-        let mut attributes = resource.resolved_attributes();
+        let mut attributes = persisted_values;
         Self::populate_test_resource_identifier_value(id, &mut attributes);
         Self::strip_unobservable_nested_write_only(&mut attributes);
         Ok(attributes)
@@ -1002,6 +1125,51 @@ fn append_update_trace(event: &str, resource: &str, active: Option<usize>) {
         format!("{event} {resource}\n")
     };
     let _ = file.write_all(line.as_bytes());
+}
+
+fn append_update_patch_log(id: &ResourceId, ops: &[PatchOp]) -> ProviderResult<()> {
+    let Some(path) = env::var_os("CARINA_MOCK_UPDATE_PATCH_LOG").map(PathBuf::from) else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            ProviderError::internal_caused_by(
+                "Failed to create mock update patch log directory",
+                error,
+            )
+        })?;
+    }
+    let operations = ops
+        .iter()
+        .map(|op| match op {
+            PatchOp::Add { key, .. } => serde_json::json!({ "op": "add", "key": key }),
+            PatchOp::Replace { key, .. } => {
+                serde_json::json!({ "op": "replace", "key": key })
+            }
+            PatchOp::Reassert { key, .. } => {
+                serde_json::json!({ "op": "reassert", "key": key })
+            }
+            PatchOp::Remove { key } => serde_json::json!({ "op": "remove", "key": key }),
+        })
+        .collect::<Vec<_>>();
+    let line = serde_json::to_string(&serde_json::json!({
+        "resource": id.to_string(),
+        "operations": operations,
+    }))
+    .map_err(|error| {
+        ProviderError::internal_caused_by("Failed to encode mock update patch log", error)
+    })?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| {
+            ProviderError::internal_caused_by("Failed to open mock update patch log", error)
+        })?;
+    file.write_all(format!("{line}\n").as_bytes())
+        .map_err(|error| {
+            ProviderError::internal_caused_by("Failed to append mock update patch log", error)
+        })
 }
 
 impl MockProvider {
@@ -1263,11 +1431,22 @@ impl Provider for MockProvider {
             if let Some(error) = Self::update_fail_error_for(&id) {
                 return Err(error);
             }
-            // Apply the patch on top of `from` to construct the post-update
-            // attribute map. The mock writes only what the user changed —
-            // matching the Level 3 contract that providers MUST NOT touch
-            // unspecified fields.
-            let mut attributes = request.from().attributes.clone();
+            append_update_patch_log(&id, &request.patch().ops)?;
+
+            let _state_guard = Self::lock_state_file()?;
+            let mut states = self.load_states_for_operation()?;
+            // Apply only the requested operations to the provider's current
+            // value. In particular, a read may omit write-only leaves that
+            // still exist in the backend and must survive an unrelated patch.
+            let mut attributes = states.get(&key).map_or_else(
+                || request.from().attributes.clone(),
+                |attributes| {
+                    attributes
+                        .iter()
+                        .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
+                        .collect()
+                },
+            );
             for op in &request.patch().ops {
                 match op {
                     PatchOp::Add { key, value }
@@ -1280,9 +1459,11 @@ impl Provider for MockProvider {
                     }
                 }
             }
+            // This test hook models a service-side addition after saved-plan
+            // drift verification but before the update response is read back.
+            Self::add_server_list_update_out_of_band_element(&id, &mut attributes);
+            Self::add_server_list_defaults(&id, &mut attributes);
 
-            let _state_guard = Self::lock_state_file()?;
-            let mut states = self.load_states_for_operation()?;
             let partial_update = self.partial_update_config_for(&id);
             let mut attrs: HashMap<String, PersistedValue> = attributes
                 .iter()

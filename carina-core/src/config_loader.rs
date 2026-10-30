@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 
+use crate::binding_index::BindingNameSet;
 use crate::parser::{self, File, InferredFile, ParsedFile, ProviderContext};
 use crate::resource::Value;
 use crate::schema::SchemaRegistry;
@@ -1016,6 +1017,18 @@ pub(crate) fn parse_directory_files_located(
     files: &[(PathBuf, String)],
     config: &ProviderContext,
 ) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, LocatedParseError> {
+    let display_root = files
+        .first()
+        .and_then(|(path, _)| path.parent())
+        .unwrap_or_else(|| Path::new(""));
+    parse_directory_files_located_from_root(files, config, display_root)
+}
+
+pub(crate) fn parse_directory_files_located_from_root(
+    files: &[(PathBuf, String)],
+    config: &ProviderContext,
+    display_root: &Path,
+) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, LocatedParseError> {
     let directory_functions = parser::top_level_user_functions_in_files(files, config)
         .map_err(LocatedParseError::directory_wide)?;
     let mut directory_module_parameters = HashSet::new();
@@ -1144,7 +1157,7 @@ pub(crate) fn parse_directory_files_located(
             true,
         )
         .map_err(|error| LocatedParseError::in_file(path, error))?;
-        record_parsed_file_source_metadata(&mut parsed, path);
+        record_parsed_file_source_metadata(&mut parsed, path, display_root);
         out.push((
             path.clone(),
             DirectoryResolvedFile {
@@ -1153,10 +1166,21 @@ pub(crate) fn parse_directory_files_located(
             },
         ));
     }
+    let mut merged = ParsedFile::default();
+    for (_, file) in &out {
+        merge_parsed_file(&mut merged, file.parsed.clone());
+    }
+    let binding_scope = BindingNameSet::from_parsed(&merged)
+        .iter_names()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    for (_, file) in &mut out {
+        file.parsed.set_loop_binding_scope(binding_scope.clone());
+    }
     Ok(out)
 }
 
-fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path) {
+fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, display_root: &Path) {
     parsed
         .parser_binding_metadata
         .set_pending_function_source_file(path);
@@ -1185,12 +1209,38 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path) {
     for function in parsed.user_functions.values_mut() {
         function.body.source_file = Some(path.to_path_buf());
     }
-    let file = Some(path.display().to_string());
-    for warning in &mut parsed.warnings {
-        warning.file = file.clone();
+    let display_file = path
+        .strip_prefix(display_root)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(|relative| relative.to_string_lossy().into_owned())
+        .or_else(|| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| path.display().to_string());
+    for resource in &mut parsed.resources {
+        resource.loop_provenance.set_display_file(&display_file);
+    }
+    for call in &mut parsed.module_calls {
+        if let Some(origin) = call.loop_origin_mut() {
+            origin.set_display_file(&display_file);
+        }
     }
     for deferred in &mut parsed.deferred_for_expressions {
-        deferred.file = file.clone();
+        deferred.target.set_loop_display_file(&display_file);
+        deferred
+            .template_resource
+            .loop_provenance
+            .set_display_file(&display_file);
+    }
+
+    let warning_file = Some(path.display().to_string());
+    for warning in &mut parsed.warnings {
+        warning.file = warning_file.clone();
+    }
+    for deferred in &mut parsed.deferred_for_expressions {
+        deferred.file = warning_file.clone();
     }
 }
 
@@ -2015,6 +2065,60 @@ let _ = for unused_var in empty_list {
             stamped,
             &crn_path.display().to_string(),
             "warning.file must carry the full source path, not a bare filename",
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn resolved_directory_deferred_loop_removes_its_not_yet_available_warning() {
+        let dir = create_temp_dir("resolved_deferred_warning");
+        let crn_path = dir.join("main.crn");
+        fs::write(
+            &crn_path,
+            r#"let orgs = upstream_state { source = "../orgs" }
+
+for account_id in orgs.accounts {
+    mock.test.resource { name = account_id }
+}
+"#,
+        )
+        .unwrap();
+
+        let mut config = load_configuration(&dir).expect("directory fixture loads");
+        assert_eq!(config.parsed.deferred_for_expressions.len(), 1);
+        let deferred_line = config.parsed.deferred_for_expressions[0].line;
+        config.parsed.warnings.push(crate::parser::ParseWarning {
+            file: Some(crn_path.display().to_string()),
+            line: deferred_line,
+            kind: crate::parser::WarningKind::DeferredFor,
+            span: None,
+            message: "upstream iterable is not yet available".to_string(),
+        });
+
+        let bindings =
+            crate::binding_index::IterableBindings::from_upstream_only(HashMap::from([(
+                "orgs".to_string(),
+                HashMap::from([(
+                    "accounts".to_string(),
+                    Value::Concrete(crate::resource::ConcreteValue::List(vec![Value::Concrete(
+                        crate::resource::ConcreteValue::String("123456789012".into()),
+                    )])),
+                )]),
+            )]));
+        config
+            .parsed
+            .expand_deferred_for_expressions(&bindings)
+            .expect("resolved upstream iterable expands");
+
+        assert!(config.parsed.deferred_for_expressions.is_empty());
+        assert!(
+            config
+                .parsed
+                .warnings
+                .iter()
+                .all(|warning| warning.kind != crate::parser::WarningKind::DeferredFor),
+            "resolved loop retained stale warnings: {:?}",
+            config.parsed.warnings,
         );
         cleanup(&dir);
     }

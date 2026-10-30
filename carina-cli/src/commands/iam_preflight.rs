@@ -6,8 +6,9 @@ use aws_sdk_iam::operation::simulate_principal_policy::SimulatePrincipalPolicyEr
 use aws_sdk_iam::types::PolicyEvaluationDecisionType;
 use carina_core::effect::{Effect, PlanOp};
 use carina_core::plan::Plan;
-use carina_core::provider::{Provider, ProviderResult};
-use carina_core::resource::{ResolvedResource, ResourceId};
+use carina_core::provider::Provider;
+use carina_core::resource::{ResolvedResource, ResolvedResourceError, ResourceId};
+use carina_core::schema::SchemaRegistry;
 use colored::Colorize;
 use serde_json::Value as JsonValue;
 
@@ -188,9 +189,10 @@ enum SimulateError {
 pub(crate) async fn run_iam_preflight(
     plan: &Plan,
     provider: &dyn Provider,
+    schemas: &SchemaRegistry,
     strict: bool,
-) -> ProviderResult<IamPreflightResult> {
-    let required = collect_required_actions(plan, provider)?;
+) -> Result<IamPreflightResult, crate::error::AppError> {
+    let required = collect_required_actions(plan, provider, schemas)?;
     if required.is_empty() {
         return Ok(IamPreflightResult::Checked(IamPreflightReport {
             actor_arn: String::new(),
@@ -271,10 +273,11 @@ pub(crate) async fn run_iam_preflight(
 pub(crate) fn collect_required_actions(
     plan: &Plan,
     provider: &dyn Provider,
-) -> ProviderResult<Vec<RequiredAction>> {
+    schemas: &SchemaRegistry,
+) -> Result<Vec<RequiredAction>, crate::error::AppError> {
     let mut required = Vec::new();
     for effect in plan.effects() {
-        for (id, op) in effect_required_ops(effect) {
+        for (id, op) in effect_required_ops(effect, schemas)? {
             let actions = provider.required_permissions(&id, op)?;
             for action in actions {
                 required.push(RequiredAction {
@@ -290,30 +293,40 @@ pub(crate) fn collect_required_actions(
     Ok(required)
 }
 
-fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
-    match effect {
+fn effect_required_ops(
+    effect: &Effect,
+    schemas: &SchemaRegistry,
+) -> Result<Vec<(ResourceId, PlanOp)>, ResolvedResourceError> {
+    let ops = match effect {
         Effect::Read { resource } => vec![(resource.id.clone(), PlanOp::Read)],
         Effect::Create(resource) => vec![(resource.id.clone(), PlanOp::Create)],
         Effect::ResumeCreate { resource, .. } => vec![(resource.id.clone(), PlanOp::Create)],
         Effect::Update { to, .. } => vec![(to.id.clone(), PlanOp::Update)],
         Effect::Delete { id, .. } => vec![(id.clone().into_inner(), PlanOp::Delete)],
         Effect::Import { id, .. } => vec![(id.clone().into_inner(), PlanOp::Read)],
-        Effect::DeferredCreate { template, .. } => effect_required_ops(&Effect::Create(
-            ResolvedResource::new(template.template_resource.clone()),
-        )),
+        Effect::DeferredCreate { template, .. } => {
+            let resource = ResolvedResource::resolve_with_schemas(
+                template.template_resource.clone(),
+                schemas,
+            )?;
+            vec![(resource.id.clone(), PlanOp::Create)]
+        }
         Effect::DeferredReplace(payload) => {
             let mut ops: Vec<_> = payload
                 .deletes
                 .iter()
                 .map(|delete| (delete.id.clone().into_inner(), PlanOp::Delete))
                 .collect();
-            ops.extend(effect_required_ops(&Effect::Create(ResolvedResource::new(
+            let resource = ResolvedResource::resolve_with_schemas(
                 payload.template.template_resource.clone(),
-            ))));
+                schemas,
+            )?;
+            ops.push((resource.id.clone(), PlanOp::Create));
             ops
         }
         Effect::Remove { .. } | Effect::Move { .. } | Effect::Wait { .. } => Vec::new(),
-    }
+    };
+    Ok(ops)
 }
 
 fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
@@ -325,7 +338,7 @@ fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
         Effect::Delete { id, .. } => vec![id.as_inner()],
         Effect::Import { id, .. } => vec![id.as_inner()],
         Effect::Remove { id, .. } => vec![id.as_inner()],
-        Effect::Move { from, to } => vec![from.as_inner(), to.as_inner()],
+        Effect::Move { from, to, .. } => vec![from.as_inner(), to.as_inner()],
         Effect::Wait { .. } => Vec::new(),
         Effect::DeferredCreate { id, .. } => vec![id.as_inner()],
         Effect::DeferredReplace(payload) => {
@@ -759,6 +772,7 @@ mod tests {
     use carina_core::resource::{
         ConcreteValue, DataSource, ResolvedDataSource, ResolvedResource, Resource, State, Value,
     };
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
@@ -916,10 +930,15 @@ mod tests {
                 "y",
                 None,
             )),
+            origin: None,
         });
 
-        let entries = collect_required_actions(&plan, &PermissionProvider { fail: false })
-            .expect("permission lookup should succeed");
+        let entries = collect_required_actions(
+            &plan,
+            &PermissionProvider { fail: false },
+            &SchemaRegistry::new(),
+        )
+        .expect("permission lookup should succeed");
         let actions: Vec<_> = entries.into_iter().map(|entry| entry.action).collect();
 
         assert_eq!(
@@ -952,18 +971,74 @@ mod tests {
                 header: "for opt in cert.domain_validation_options".to_string(),
                 resource_type: "aws.route53.RecordSet".to_string(),
                 attributes: Default::default(),
-                binding_name: "validation_records".to_string(),
+                target: carina_core::parser::DeferredForTarget::Bound {
+                    binding: "validation_records".to_string(),
+                },
                 iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
         });
 
-        let entries = collect_required_actions(&plan, &PermissionProvider { fail: false })
-            .expect("permission lookup should succeed");
+        let entries = collect_required_actions(
+            &plan,
+            &PermissionProvider { fail: false },
+            &SchemaRegistry::new(),
+        )
+        .expect("permission lookup should succeed");
         let actions: Vec<_> = entries.into_iter().map(|entry| entry.action).collect();
 
         assert_eq!(actions, vec!["test:create:route53.RecordSet"]);
+    }
+
+    #[test]
+    fn collect_required_actions_accepts_deferred_template_with_ignore_changes() {
+        let mut template_resource =
+            Resource::with_provider("aws", "route53.RecordSet", "validation_records", None)
+                .with_attribute(
+                    "comment",
+                    Value::Concrete(ConcreteValue::String("managed-elsewhere".into())),
+                );
+        template_resource.directives.ignore_changes = vec![
+            serde_json::from_value(serde_json::json!({
+                "segments": [{ "kind": "attribute", "value": "comment" }]
+            }))
+            .expect("valid ignore path"),
+        ];
+        let mut plan = Plan::new();
+        plan.add(Effect::DeferredCreate {
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "__deferred_for",
+                "validation_records",
+            )),
+            template: Box::new(DeferredForExpression {
+                file: None,
+                line: 1,
+                header: "for opt in cert.domain_validation_options".to_string(),
+                resource_type: "aws.route53.RecordSet".to_string(),
+                attributes: Default::default(),
+                target: carina_core::parser::DeferredForTarget::Bound {
+                    binding: "validation_records".to_string(),
+                },
+                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                binding: ForBinding::Simple("opt".to_string()),
+                template_resource,
+            }),
+        });
+
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "aws",
+            ResourceSchema::new("route53.RecordSet")
+                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+                .validate()
+                .expect("valid IAM preflight schema"),
+        );
+        let entries =
+            collect_required_actions(&plan, &PermissionProvider { fail: false }, &schemas)
+                .expect("permission lookup should resolve authored ignore paths");
+
+        assert_eq!(entries[0].action, "test:create:route53.RecordSet");
     }
 
     #[test]
@@ -973,8 +1048,12 @@ mod tests {
             "awscc", "ec2.Vpc", "main", None,
         ))));
 
-        let error = collect_required_actions(&plan, &PermissionProvider { fail: true })
-            .expect_err("permission lookup failures must abort IAM preflight");
+        let error = collect_required_actions(
+            &plan,
+            &PermissionProvider { fail: true },
+            &SchemaRegistry::new(),
+        )
+        .expect_err("permission lookup failures must abort IAM preflight");
 
         assert!(
             error

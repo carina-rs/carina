@@ -802,7 +802,7 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
             identity,
             rs.directives.provider_instance.clone(),
         );
-        resource.directives = rs.directives.clone();
+        resource.directives = rs.directives.clone().into();
 
         // Set typed metadata fields from state
         resource.binding = rs.binding.clone();
@@ -1467,7 +1467,10 @@ pub(crate) async fn run_state_refresh_locked(
         ctx.schemas(),
     );
 
-    let resolved_resources = ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?;
+    let resolved_resources = ResolvedResource::collect_resolved_with_schemas(
+        sorted_resources.iter().cloned(),
+        ctx.schemas(),
+    )?;
 
     let mut state = state_file.take().unwrap();
 
@@ -1549,7 +1552,7 @@ pub(crate) async fn run_state_refresh_locked(
         let checked_exports = carina_core::validation::check_export_values_pre_apply(
             &parsed.export_params,
             &carina_core::binding_index::ResolvedBindings::for_validation(parsed),
-            provider_context,
+            ctx.provider_context(),
         )
         .map_err(AppError::Validation)?;
         let values = crate::commands::shared::state_writeback::resolve_export_values_post_apply(
@@ -1560,7 +1563,7 @@ pub(crate) async fn run_state_refresh_locked(
                 post_apply_states: &post_apply_states,
                 schemas: ctx.schemas(),
                 wait_aliases: &wait_aliases,
-                provider_context,
+                provider_context: ctx.provider_context(),
             },
         )?;
         let resolution = crate::commands::shared::state_writeback::materialize_exports(&values)?;
@@ -3595,20 +3598,21 @@ mod tests {
         assert!(!fixture.lock_path().exists(), "lock must be released");
     }
 
-    #[tokio::test]
-    async fn state_refresh_expansion_hydrates_lifted_saved_enum_attrs() {
-        let parsed = parse_file(
-            r#"
+    async fn assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs(loop_target: &str) {
+        let source = r#"
                 let source = aws.service.Source {
                     name = "source"
                 }
 
-                for (_, item) in source.items {
+                LOOP_TARGETfor (_, item) in source.items {
                     aws.service.Widget {
                         name = item
                     }
                 }
-            "#,
+            "#
+        .replacen("LOOP_TARGET", loop_target, 1);
+        let parsed = parse_file(
+            &source,
             std::path::Path::new("state_refresh.crn"),
             &ProviderContext::default(),
         )
@@ -3634,15 +3638,37 @@ mod tests {
                 .with_identifier("source-id"),
             ),
         )]);
+        let widget_schema = ResourceSchema::new("service.Widget")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "status",
+                    AttributeType::enum_(
+                        carina_core::schema::enum_identity("Status", Some("aws.service.Widget")),
+                        Some(vec!["Enabled".to_string()]),
+                        vec![("Enabled".to_string(), "enabled".to_string())],
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("aws", widget_schema.clone());
 
         let preview = crate::wiring::expand_same_config_deferred_for(
             &parsed,
             &sorted_resources,
             &current_states,
             &carina_core::data_source_value::DataSourceValues::empty(),
-            &SchemaRegistry::new(),
-            &carina_core::provider::RawSavedAttrs::default()
-                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &schemas,
+            &carina_core::provider::RawSavedAttrs::default().lift(&schemas),
             &HashMap::new(),
             &HashMap::new(),
             &[],
@@ -3657,6 +3683,12 @@ mod tests {
             .expect("materialized child")
             .clone();
         assert_eq!(preview.new_child_ids, HashSet::from([child.id.clone()]));
+        if loop_target.is_empty() {
+            assert!(child.binding.is_none());
+            assert!(child.loop_provenance.display_origin().is_some());
+        } else {
+            assert_eq!(child.binding.as_deref(), Some("widgets[0]"));
+        }
 
         let mut state_file = StateFile::new();
         let mut child_state = ResourceState::try_applied(
@@ -3671,24 +3703,6 @@ mod tests {
         state_file
             .upsert_resource(child_state)
             .expect("test state setup must be valid");
-
-        let widget_schema = (ResourceSchema::new("service.Widget").attribute(
-            AttributeSchema::optional(
-                "status",
-                AttributeType::enum_(
-                    carina_core::schema::enum_identity("Status", Some("aws.service.Widget")),
-                    Some(vec!["Enabled".to_string()]),
-                    vec![("Enabled".to_string(), "enabled".to_string())],
-                    None,
-                    None,
-                ),
-            )
-            .build(),
-        ))
-        .validate()
-        .expect("schema fixture must be valid");
-        let mut schemas = SchemaRegistry::new();
-        schemas.insert("aws", widget_schema.clone());
 
         let desired_ids = sorted_resources
             .iter()
@@ -3768,6 +3782,16 @@ mod tests {
             ),
             "saved enum must be lifted before hydration, got {hydrated:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn state_refresh_expansion_hydrates_lifted_saved_enum_attrs() {
+        assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs("let widgets = ").await;
+    }
+
+    #[tokio::test]
+    async fn state_refresh_unbound_expansion_hydrates_lifted_saved_enum_attrs() {
+        assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs("").await;
     }
 
     fn deposed_format_state() -> StateFile {
@@ -4908,7 +4932,9 @@ mod tests {
             prevent_destroy: true,
             depends_on: vec!["security_group".to_string()],
             provider_instance: Some("west".to_string()),
-        };
+            ignore_changes: Vec::new(),
+        }
+        .into();
         row.prefixes = HashMap::from([("name".to_string(), "prod-".to_string())]);
         row.protected = true;
         row.name_overrides.insert(
@@ -4987,6 +5013,7 @@ mod tests {
                 prevent_destroy: true,
                 depends_on: vec!["security_group".to_string()],
                 provider_instance: Some("west".to_string()),
+                ignore_changes: Vec::new(),
             }
         );
         assert_eq!(

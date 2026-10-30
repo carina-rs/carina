@@ -810,7 +810,7 @@ mod error_format_tests {
         }
         let provider_context = carina_core::parser::ProviderContext::default();
         let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
-        let context = carina_core::validation::ValidationTypeContext::new(
+        let context = carina_core::validation::ValidationTypeContext::new_providerless(
             &parsed,
             &schemas,
             &provider_context,
@@ -932,7 +932,7 @@ mod error_format_tests {
         .expect("rendered import block should parse");
         assert_eq!(parsed.state_blocks.len(), 1);
         match &parsed.state_blocks[0] {
-            carina_core::parser::StateBlock::Import { to, id } => {
+            carina_core::parser::StateBlock::Import { to, to_span: _, id } => {
                 assert_eq!(to.provider, "aws");
                 assert_eq!(to.resource_type, "s3.Bucket");
                 assert_eq!(to.name_str(), "state_bucket");

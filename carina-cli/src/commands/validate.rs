@@ -157,7 +157,7 @@ enum ValidatedEntry<'a> {
     /// repeated twice).
     DeferredLoop {
         resource_type: &'a str,
-        binding_name: &'a str,
+        target: &'a carina_core::parser::DeferredForTarget,
         header: &'a str,
         file: Option<&'a str>,
         line: usize,
@@ -176,19 +176,27 @@ impl std::fmt::Display for ValidatedEntry<'_> {
             }
             ValidatedEntry::DeferredLoop {
                 resource_type,
-                binding_name,
+                target,
                 header,
                 file,
                 line,
             } => {
-                let location = match file {
-                    Some(file) => format!("{file}:{line}"),
-                    None => line.to_string(),
+                let location = match target {
+                    carina_core::parser::DeferredForTarget::Bound { .. } => match file {
+                        Some(file) => format!("{file}:{line}"),
+                        None => line.to_string(),
+                    },
+                    carina_core::parser::DeferredForTarget::Unbound { .. } => target.display_name(),
                 };
-                write!(
-                    f,
-                    "{resource_type}.{binding_name}[?] (deferred: {header} @ {location})"
-                )
+                match target {
+                    carina_core::parser::DeferredForTarget::Bound { binding } => write!(
+                        f,
+                        "{resource_type}.{binding}[?] (deferred: {header} @ {location})"
+                    ),
+                    carina_core::parser::DeferredForTarget::Unbound { .. } => {
+                        write!(f, "{resource_type}.<pending> (deferred for at {location})")
+                    }
+                }
             }
         }
     }
@@ -220,7 +228,7 @@ fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
         .map(|rref| match rref {
             ResourceRef::Deferred { deferred: d, .. } => ValidatedEntry::DeferredLoop {
                 resource_type: &d.resource_type,
-                binding_name: &d.binding_name,
+                target: &d.target,
                 header: &d.header,
                 file: d.file.as_deref(),
                 line: d.line,
@@ -542,7 +550,8 @@ backend s3 {
         assert!(
             listed.iter().any(|r| {
                 let s = r.as_str().unwrap();
-                s.contains("route53.RecordSet") && s.contains("[?]") && s.contains("(deferred:")
+                s.contains("route53.RecordSet.<pending>")
+                    && s.contains("(deferred for at validate_fixture.crn:7)")
             }),
             "json must list the deferred for-loop body as a placeholder \
              entry; got: {listed:?}"

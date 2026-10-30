@@ -121,8 +121,9 @@ use carina_core::parser::{
 };
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::provider::{
-    self as provider_mod, AppliedIdentifier, LiftedSavedAttrs, Provider, ProviderError,
-    ProviderFactory, ProviderLoadedSchemaRegistry, ProviderNormalizer, ProviderRouter,
+    self as provider_mod, AppliedIdentifier, LiftedSavedAttrs, LoadedProviderSnapshot, Provider,
+    ProviderError, ProviderFactory, ProviderLoadedSchemaRegistry, ProviderNormalizer,
+    ProviderRouter,
 };
 use carina_core::provider_source::ProviderSource;
 use carina_core::resource::{
@@ -360,9 +361,7 @@ pub struct StateBlockResolution {
 /// extracts schemas from its private context and never exposes the context
 /// itself.
 pub struct WiringContext {
-    factories: Arc<Vec<Box<dyn ProviderFactory>>>,
-    custom_types: carina_core::parser::ProviderCustomTypes,
-    schemas: ProviderLoadedSchemaRegistry,
+    loaded_providers: Arc<LoadedProviderSnapshot>,
     known_providers: HashSet<String>,
     uses_builtin_mock: bool,
     provider_artifacts: BTreeMap<String, LoadedProviderArtifact>,
@@ -450,7 +449,8 @@ pub(crate) struct CheckedSavedPlanInputs {
         Box<ValidationReady<CanonicalResourcePair<carina_core::parser::InferredExportParam>>>,
 }
 
-/// Schema-only provider state used by collect-all validation and lint.
+/// Schema and custom-type provider state used by collect-all validation and
+/// lint.
 ///
 /// A hard loader failure may produce this value with an empty context. It has
 /// no transition into [`CompleteProviderLoad`] or [`ValidatedConfig`].
@@ -806,14 +806,13 @@ fn resolve_file_binding_uses<E>(
     base_dir: &Path,
     context: &WiringContext,
 ) -> Result<carina_core::validation::ResolvedFile<E>, AppError> {
-    let provider_context =
-        crate::commands::enrich_provider_context(context.schemas(), context.factories_arc());
+    let provider_context = context.provider_context();
     let module_signatures =
-        module_resolver::load_resolved_module_signatures(&file, base_dir, &provider_context);
+        module_resolver::load_resolved_module_signatures(&file, base_dir, provider_context);
     carina_core::validation::resolve_bare_binding_uses(
         file,
         context.schemas(),
-        &provider_context,
+        provider_context,
         &module_signatures,
     )
     .map_err(binding_use_report_error)
@@ -1137,6 +1136,16 @@ impl ReportingProviderLoad {
     pub(crate) fn schemas(&self) -> &SchemaRegistry {
         self.context.schemas()
     }
+
+    pub(crate) fn loaded_provider_context(
+        &self,
+    ) -> Option<&carina_core::parser::LoadedProviderContext> {
+        if self.load_errors.is_empty() {
+            Some(self.context.provider_context())
+        } else {
+            None
+        }
+    }
 }
 
 impl ValidatedWiring {
@@ -1262,16 +1271,11 @@ impl<R> ValidatedConfig<R> {
 
     #[cfg(test)]
     pub(crate) fn from_wiring_ref_for_test(wiring: &ValidatedWiring, resources: R) -> Self {
-        let factories = Arc::clone(&wiring.load.context.factories);
-        let custom_types =
-            carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
         Self {
             wiring: ValidatedWiring {
                 load: CompleteProviderLoad {
                     context: WiringContext {
-                        factories,
-                        custom_types,
-                        schemas: wiring.load.context.schemas.clone(),
+                        loaded_providers: Arc::clone(&wiring.load.context.loaded_providers),
                         known_providers: wiring.load.context.known_providers.clone(),
                         uses_builtin_mock: wiring.load.context.uses_builtin_mock,
                         provider_artifacts: wiring.load.context.provider_artifacts.clone(),
@@ -1499,6 +1503,7 @@ impl<E: Clone> ValidatedConfig<carina_core::parser::File<E>> {
                 saved_dep_bindings,
                 refresh_phase,
                 schemas: wiring.context().schemas(),
+                identity_context: wiring.context(),
             },
         )
         .await
@@ -1546,12 +1551,7 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
         let Self { wiring, resources } = self;
         let (resources, expansion) = resources
             .try_map_with_output_preserving_binding_use_resolution(|resources| {
-                prepared.expand(
-                    resources,
-                    wiring.context().schemas(),
-                    remote_bindings,
-                    warning_policy,
-                )
+                prepared.expand(resources, wiring.context(), remote_bindings, warning_policy)
             })?;
         Ok((ValidatedConfig { wiring, resources }, expansion))
     }
@@ -1569,12 +1569,7 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
         let (resources, ()) =
             resources.try_map_with_output_preserving_binding_use_resolution(|resources| {
                 prepared
-                    .expand_for_plan(
-                        resources,
-                        wiring.context().schemas(),
-                        remote_bindings,
-                        warning_policy,
-                    )
+                    .expand_for_plan(resources, wiring.context(), remote_bindings, warning_policy)
                     .map(|expanded| (expanded, ()))
             })?;
         Ok(ValidatedConfig { wiring, resources })
@@ -1625,9 +1620,9 @@ impl FormattingProviderLoad {
     ) -> Result<Self, AppError> {
         let (factories, load_errors) =
             build_factories_from_providers_for_formatting(user_dirs, providers, base_dir)?;
-        let WiringContext { schemas, .. } = WiringContext::new(factories, providers);
+        let context = WiringContext::new(factories, providers);
         Ok(Self {
-            schemas: schemas.into_registry(),
+            schemas: context.schemas().clone(),
             load_errors,
         })
     }
@@ -1642,9 +1637,9 @@ impl FormattingProviderLoad {
         provider_configs: &[ProviderConfig],
         load_errors: HashMap<String, ProviderFactoryDiagnostic>,
     ) -> Self {
-        let WiringContext { schemas, .. } = WiringContext::new(factories, provider_configs);
+        let context = WiringContext::new(factories, provider_configs);
         Self {
-            schemas: schemas.into_registry(),
+            schemas: context.schemas().clone(),
             load_errors,
         }
     }
@@ -1710,10 +1705,6 @@ impl WiringContext {
                 }
             }
         }
-        let schemas = provider_mod::provider_loaded_schema_registry_from_factories_with_supplements(
-            &factories,
-            supplemental_schemas,
-        );
         let mut known_providers = factories
             .iter()
             .map(|factory| factory.name().to_string())
@@ -1722,12 +1713,12 @@ impl WiringContext {
             known_providers.insert(BUILTIN_PROVIDER_NAME.to_string());
         }
         let factories = Arc::new(factories);
-        let custom_types =
-            carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
+        let loaded_providers = Arc::new(provider_mod::loaded_provider_snapshot_from_factories(
+            Arc::clone(&factories),
+            supplemental_schemas,
+        ));
         Self {
-            factories,
-            custom_types,
-            schemas,
+            loaded_providers,
             known_providers,
             uses_builtin_mock,
             provider_artifacts,
@@ -1756,23 +1747,27 @@ impl WiringContext {
     }
 
     pub fn factories(&self) -> &[Box<dyn ProviderFactory>] {
-        &self.factories
+        self.loaded_providers.factories()
     }
 
     pub fn factories_arc(&self) -> Arc<Vec<Box<dyn ProviderFactory>>> {
-        Arc::clone(&self.factories)
+        self.loaded_providers.factories_arc()
     }
 
     pub fn custom_type_resolver(&self) -> &dyn carina_core::parser::CustomTypeResolver {
-        &self.custom_types
+        self.provider_context().custom_type_resolver()
+    }
+
+    pub fn provider_context(&self) -> &carina_core::parser::LoadedProviderContext {
+        self.loaded_providers.provider_context()
     }
 
     pub fn schemas(&self) -> &SchemaRegistry {
-        self.schemas.schemas()
+        self.loaded_providers.schema_registry()
     }
 
     pub(crate) fn loaded_provider_schemas(&self) -> &ProviderLoadedSchemaRegistry {
-        &self.schemas
+        self.loaded_providers.schemas()
     }
 
     pub fn known_providers(&self) -> &HashSet<String> {
@@ -2354,6 +2349,7 @@ fn prefix_state_key(provider: &str, resource_type: &str, identity: &str) -> Pref
 /// The private variants distinguish a legitimate no-state-file path from a
 /// computed map and prevent an empty "not computed" map from reaching
 /// canonical deferred-for expansion.
+#[derive(Clone)]
 enum RefreshedPrefixStateInfo {
     NoStateFile,
     Computed(HashMap<PrefixStateKey, PrefixStateInfo>),
@@ -2408,33 +2404,29 @@ fn refreshed_prefix_state_info(
     )
 }
 
-/// Look up a provider's identity attributes through its factory.
-fn identity_attributes_for_provider(ctx: &WiringContext, name: &str) -> Vec<String> {
-    provider_mod::find_factory(ctx.factories(), name)
-        .map(|f| {
-            f.identity_attributes()
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn provider_config_schema_for(
-    ctx: &WiringContext,
-    provider_name: &str,
-) -> Option<carina_core::schema::ValidatedConfigSchema> {
-    provider_mod::find_factory(ctx.factories(), provider_name)
-        .map(|factory| factory.provider_config_attribute_types())
-}
-
 /// Persisted rows indexed at their effective addresses after every move that
 /// has already been applied to [`AddressedState`].
 struct AnonymousReconciliationStateView {
     by_type: HashMap<(String, String), Vec<AnonymousIdStateInfo>>,
     existence_only_by_type: HashMap<(String, String), HashSet<String>>,
     origins_by_projected_name: HashMap<(String, String), HashMap<String, Vec<ResourceId>>>,
-    by_binding: HashMap<String, Vec<AnonymousIdBindingStateInfo>>,
+    by_binding: HashMap<String, Vec<AnonymousIdBindingViewEntry>>,
+}
+
+struct AnonymousIdBindingViewEntry {
+    value: AnonymousIdBindingStateInfo,
+    origin: ResourceId,
+    effective: ResourceId,
+}
+
+impl AnonymousIdBindingViewEntry {
+    fn is_visible_to_binding_resolution(&self, claims: &StateBlockClaims) -> bool {
+        // A claimed source is normally unavailable to heuristic reads. A
+        // moved row is the exception: its matching target claim makes the
+        // projected address readable. A removed row has no target claim and
+        // therefore remains hidden even if another phase projected it.
+        !claims.claims_from(&self.origin) || claims.claims_to(&self.effective)
+    }
 }
 
 impl AnonymousReconciliationStateView {
@@ -2451,8 +2443,6 @@ impl AnonymousReconciliationStateView {
             .iter()
             .map(|(from, to)| (from.as_inner().clone(), to.clone()))
             .collect::<HashMap<_, _>>();
-        let mut create_only_by_type = HashMap::<(String, String), Vec<String>>::new();
-
         for state_resource in state_file.resources() {
             let state_row_id = resolved_state_row_id(
                 state_resource,
@@ -2463,80 +2453,65 @@ impl AnonymousReconciliationStateView {
                 .cloned()
                 .unwrap_or_else(|| state_row_id.clone());
             let has_persisted_attributes = state_resource.persisted_attributes().is_some();
-            let attribute_values = match state_resource.persisted_attributes() {
-                Some(persisted) => persisted
-                    .to_values()
-                    .into_iter()
-                    .filter_map(|(attribute, value)| {
-                        identifier::canonical_create_only_value_string(&value)
-                            .map(|value| (attribute, value))
-                    })
-                    .collect::<HashMap<_, _>>(),
-                None => HashMap::new(),
-            };
+            let attribute_values = state_resource
+                .persisted_attributes()
+                .map(|persisted| persisted.to_values())
+                .unwrap_or_default();
             let type_key = (
                 projected_id.provider().to_string(),
                 projected_id.resource_type().to_string(),
             );
-            let create_only_attributes = create_only_by_type
-                .entry(type_key.clone())
-                .or_insert_with(|| {
-                    ctx.schemas()
-                        .get(
-                            projected_id.provider(),
-                            projected_id.resource_type(),
-                            carina_core::schema::SchemaKind::Resource,
-                        )
-                        .map(|schema| {
-                            schema
-                                .schema()
-                                .as_schema()
-                                .create_only_attributes()
-                                .into_iter()
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                });
-            let create_only_values = create_only_attributes
-                .iter()
-                .filter_map(|attribute| {
-                    attribute_values
-                        .get(attribute)
-                        .cloned()
-                        .map(|value| (attribute.clone(), value))
-                })
-                .collect();
+            let state_info = if let Some(schema) = ctx.schemas().get(
+                projected_id.provider(),
+                projected_id.resource_type(),
+                carina_core::schema::SchemaKind::Resource,
+            ) {
+                AnonymousIdStateInfo::try_from_state_attributes(
+                    state_row_id.clone(),
+                    projected_target.cloned(),
+                    schema.schema(),
+                    &attribute_values,
+                )
+            } else {
+                AnonymousIdStateInfo::try_without_comparable_attributes(
+                    state_row_id.clone(),
+                    projected_target.cloned(),
+                )
+            };
             let projected_name = projected_id.identity_str().to_string();
-            origins_by_projected_name
-                .entry(type_key.clone())
-                .or_default()
-                .entry(projected_name.clone())
-                .or_default()
-                .push(state_row_id.as_inner().clone());
-            if !has_persisted_attributes {
-                existence_only_by_type
+            if let Some(state_info) = state_info {
+                origins_by_projected_name
                     .entry(type_key.clone())
                     .or_default()
-                    .insert(projected_name.clone());
-            }
-
-            by_type
-                .entry(type_key)
-                .or_default()
-                .push(AnonymousIdStateInfo {
-                    name: projected_name.clone(),
-                    provider_instance: projected_id.provider_instance().map(str::to_string),
-                    create_only_values,
-                });
-            if let Some(binding) = &state_resource.binding {
-                by_binding
-                    .entry(binding.clone())
+                    .entry(projected_name.clone())
                     .or_default()
-                    .push(AnonymousIdBindingStateInfo {
-                        name: projected_name,
-                        attribute_values,
-                    });
+                    .push(state_row_id.as_inner().clone());
+                if !has_persisted_attributes {
+                    existence_only_by_type
+                        .entry(type_key.clone())
+                        .or_default()
+                        .insert(projected_name.clone());
+                }
+
+                by_type.entry(type_key).or_default().push(state_info);
+            }
+            let projected = projected_target.is_some();
+            let effective_binding = if projected {
+                Some(projected_name.clone())
+            } else {
+                state_resource.binding.clone()
+            };
+            if let Some(effective_binding) = effective_binding {
+                by_binding.entry(effective_binding).or_default().push(
+                    AnonymousIdBindingViewEntry {
+                        value: AnonymousIdBindingStateInfo {
+                            name: projected_name,
+                            attribute_values,
+                        },
+                        origin: state_row_id.as_inner().clone(),
+                        effective: projected_id.as_inner().clone(),
+                    },
+                );
             }
         }
 
@@ -2570,17 +2545,25 @@ impl AnonymousReconciliationStateView {
             })
             .collect::<HashSet<_>>();
         claims
-            .screen_entries(provider, resource_type, entries, |entry| {
-                entry.name.as_str()
-            })
+            .screen_entries(provider, resource_type, entries, AnonymousIdStateInfo::name)
             .exclude_candidates(|entry| {
-                existence_only.is_some_and(|names| names.contains(&entry.name))
-                    || claimed_origin_names.contains(entry.name.as_str())
+                existence_only.is_some_and(|names| names.contains(entry.name()))
+                    || claimed_origin_names.contains(entry.name())
             })
     }
 
-    fn entries_by_binding(&self, binding: &str) -> Vec<AnonymousIdBindingStateInfo> {
-        self.by_binding.get(binding).cloned().unwrap_or_default()
+    fn entries_by_binding(
+        &self,
+        claims: &StateBlockClaims,
+        binding: &str,
+    ) -> Vec<AnonymousIdBindingStateInfo> {
+        self.by_binding
+            .get(binding)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.is_visible_to_binding_resolution(claims))
+            .map(|entry| entry.value.clone())
+            .collect()
     }
 }
 
@@ -2596,30 +2579,130 @@ fn reconcile_anonymous_identifiers_with_ctx(
         data_sources,
         ctx.schemas(),
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
-        &|binding| state_view.entries_by_binding(binding),
+        &|binding| state_view.entries_by_binding(claims, binding),
         claims,
+    )
+}
+
+fn detect_legacy_loop_moves_with_ctx(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    state_view: &AnonymousReconciliationStateView,
+    claims: &StateBlockClaims,
+    reserved_moves: &[ResolvedMove],
+) -> Vec<ResolvedMove> {
+    identifier::detect_legacy_loop_address_moves(
+        resources,
+        ctx.schemas(),
+        &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
+        &|binding| state_view.entries_by_binding(claims, binding),
+        claims,
+        reserved_moves,
     )
 }
 
 fn detect_anonymous_to_named_moves_with_ctx(
     ctx: &WiringContext,
     resources: &[Resource],
+    candidates: &HashSet<ResourceId>,
     providers: &[ProviderConfig],
     state_view: &AnonymousReconciliationStateView,
     claims: &StateBlockClaims,
-) -> Result<Vec<ResolvedMove>, AppError> {
+    claimed_origins: &identifier::AnonymousToNamedClaimedOrigins,
+) -> Result<identifier::AnonymousToNamedRenameDetection, AppError> {
     let canonical_providers = carina_core::value::canonicalize_provider_configs_with_schemas(
         providers,
-        &|provider_name| provider_config_schema_for(ctx, provider_name),
+        &|provider_name| {
+            provider_mod::find_factory(ctx.factories(), provider_name)
+                .map(ProviderFactory::provider_config_attribute_types)
+        },
     )?;
     Ok(identifier::detect_anonymous_to_named_renames(
-        resources,
+        identifier::AnonymousToNamedCandidates::new(resources, candidates, claimed_origins),
         ctx.schemas(),
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
+        &|binding| state_view.entries_by_binding(claims, binding),
         &canonical_providers,
-        &|name| identity_attributes_for_provider(ctx, name),
+        &|name| {
+            provider_mod::find_factory(ctx.factories(), name)
+                .map(|factory| {
+                    factory
+                        .identity_attributes()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        },
         claims,
     ))
+}
+
+fn detect_anonymous_to_named_moves_to_fixed_point(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    providers: &[ProviderConfig],
+    state_file: &StateFile,
+    initial_moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
+    claims: &StateBlockClaims,
+) -> Result<Vec<ResolvedMove>, AppError> {
+    let mut contested_resources = HashSet::new();
+
+    'recompute: loop {
+        let mut projected_pairs = initial_moved_pairs.to_vec();
+        let mut detected = Vec::new();
+        let mut unsatisfied = resources
+            .iter()
+            .filter(|resource| resource.binding.is_some())
+            .map(|resource| resource.id.clone())
+            .filter(|resource_id| !contested_resources.contains(resource_id))
+            .collect::<HashSet<_>>();
+
+        while !unsatisfied.is_empty() {
+            let state_view =
+                AnonymousReconciliationStateView::new(ctx, state_file, &projected_pairs);
+            let claimed_origins = identifier::AnonymousToNamedClaimedOrigins::from_moves(&detected);
+            let detection = detect_anonymous_to_named_moves_with_ctx(
+                ctx,
+                resources,
+                &unsatisfied,
+                providers,
+                &state_view,
+                claims,
+                &claimed_origins,
+            )?;
+            let (pass, cross_pass_contests) = detection.into_parts();
+            if !cross_pass_contests.is_empty() {
+                for contest in cross_pass_contests {
+                    let (origin, incumbent, contender) = contest.into_parts();
+                    debug_assert!(
+                        detected
+                            .iter()
+                            .any(|resolved_move| resolved_move.from() == &origin)
+                    );
+                    contested_resources.insert(incumbent);
+                    contested_resources.insert(contender);
+                }
+                continue 'recompute;
+            }
+            if pass.is_empty() {
+                break;
+            }
+            let satisfied = pass
+                .iter()
+                .map(|resolved_move| resolved_move.to().as_inner())
+                .collect::<HashSet<_>>();
+            unsatisfied.retain(|resource_id| !satisfied.contains(resource_id));
+            projected_pairs.extend(
+                pass.iter().map(|resolved_move| {
+                    (resolved_move.from().clone(), resolved_move.to().clone())
+                }),
+            );
+            detected.extend(pass);
+        }
+
+        return Ok(detected);
+    }
 }
 
 pub(crate) struct LateAnonymousIdentityInputs<'a> {
@@ -2637,11 +2720,12 @@ pub struct ResolvedDesiredIds {
 }
 
 impl ResolvedDesiredIds {
-    fn from_resources(resources: &[Resource]) -> Result<Self, AppError> {
-        let ids = ResolvedResource::collect_resolved(resources.iter().cloned())?
-            .into_iter()
-            .map(|resource| resource.resolved_id())
-            .collect();
+    fn from_resources(resources: &[Resource], schemas: &SchemaRegistry) -> Result<Self, AppError> {
+        let ids =
+            ResolvedResource::collect_resolved_with_schemas(resources.iter().cloned(), schemas)?
+                .into_iter()
+                .map(|resource| resource.resolved_id())
+                .collect();
         Ok(Self { ids })
     }
 }
@@ -2654,22 +2738,53 @@ pub(crate) fn reconcile_late_anonymous_identities(
         inputs.resources.resources_mut(),
         ctx.schemas(),
     )?;
-    let errors = compute_anonymous_identifiers_with_ctx(ctx, canonical_resources, inputs.providers);
-    if let Some(error) = errors.into_iter().next() {
-        return Err(error);
-    }
+    compute_anonymous_identifiers_result_with_ctx(
+        ctx,
+        canonical_resources,
+        inputs.providers,
+        identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+    )?;
 
-    let moves = inputs.state_file.map_or_else(Vec::new, |state_file| {
+    let mut moves = Vec::new();
+    if let Some(state_file) = inputs.state_file {
         let state_view =
             AnonymousReconciliationStateView::new(ctx, state_file, &inputs.addressed.moved_pairs);
-        reconcile_anonymous_identifiers_with_ctx(
+        moves = detect_legacy_loop_moves_with_ctx(
+            ctx,
+            inputs.resources.resources(),
+            &state_view,
+            inputs.state_block_claims,
+            &[],
+        );
+        let mut projected_pairs = inputs.addressed.moved_pairs.clone();
+        projected_pairs.extend(
+            moves
+                .iter()
+                .map(|migration| (migration.from().clone(), migration.to().clone())),
+        );
+        let state_view = AnonymousReconciliationStateView::new(ctx, state_file, &projected_pairs);
+        moves.extend(reconcile_anonymous_identifiers_with_ctx(
             ctx,
             inputs.resources.resources(),
             inputs.data_sources,
             &state_view,
             inputs.state_block_claims,
-        )
-    });
+        ));
+        let mut projected_pairs = inputs.addressed.moved_pairs.clone();
+        projected_pairs.extend(
+            moves
+                .iter()
+                .map(|resolved_move| (resolved_move.from().clone(), resolved_move.to().clone())),
+        );
+        moves.extend(detect_anonymous_to_named_moves_to_fixed_point(
+            ctx,
+            inputs.resources.resources(),
+            inputs.providers,
+            state_file,
+            &projected_pairs,
+            inputs.state_block_claims,
+        )?);
+    }
 
     let unavailable_schema_errors = validation::validate_anonymous_resource_schemas(
         inputs.resources.resources(),
@@ -2692,7 +2807,7 @@ pub(crate) fn reconcile_late_anonymous_identities(
     // execution as duplicates.
     inputs.resources.unresolved_by_resolved_id()?;
 
-    let desired = ResolvedDesiredIds::from_resources(inputs.resources.resources())?;
+    let desired = ResolvedDesiredIds::from_resources(inputs.resources.resources(), ctx.schemas())?;
     apply_detected_resource_moves(
         inputs.addressed,
         moves,
@@ -2704,58 +2819,114 @@ pub(crate) fn reconcile_late_anonymous_identities(
 
 pub fn compute_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
-    mut resources: carina_core::value::CanonicalizedResources<'_>,
+    resources: carina_core::value::CanonicalizedResources<'_>,
     providers: &[ProviderConfig],
 ) -> Vec<AppError> {
-    let canonical_providers = match canonicalized_provider_configs_for_identifiers(ctx, providers) {
-        Ok(providers) => providers,
-        Err(error) => return vec![error],
-    };
+    compute_anonymous_identifiers_with_policy_with_ctx(
+        ctx,
+        resources,
+        providers,
+        identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+    )
+}
 
-    match identifier::compute_anonymous_identifiers_with_provider_configs(
-        resources.as_mut_slice(),
-        &canonical_providers,
-        ctx.schemas(),
-        &|name| identity_attributes_for_provider(ctx, name),
-    ) {
+pub(crate) fn compute_anonymous_identifiers_with_policy_with_ctx(
+    ctx: &WiringContext,
+    resources: carina_core::value::CanonicalizedResources<'_>,
+    providers: &[ProviderConfig],
+    conflict_policy: identifier::AnonymousIdentityConflictPolicy,
+) -> Vec<AppError> {
+    match compute_anonymous_identifiers_result_with_ctx(ctx, resources, providers, conflict_policy)
+    {
         Ok(()) => Vec::new(),
-        Err(msg) => vec![AppError::Config(msg)],
+        Err(AppError::AnonymousIdentity(error)) => error
+            .into_individual_errors()
+            .into_iter()
+            .map(AppError::from)
+            .collect(),
+        Err(error) => vec![error],
     }
 }
 
+fn compute_anonymous_identifiers_result_with_ctx(
+    ctx: &WiringContext,
+    resources: carina_core::value::CanonicalizedResources<'_>,
+    providers: &[ProviderConfig],
+    conflict_policy: identifier::AnonymousIdentityConflictPolicy,
+) -> Result<(), AppError> {
+    match identifier::compute_anonymous_identifiers_with_factories(
+        resources,
+        providers,
+        ctx.factories(),
+        ctx.schemas(),
+        conflict_policy,
+    ) {
+        Ok(()) => Ok(()),
+        Err(identifier::AnonymousIdentityComputationError::ProviderConfig(error)) => {
+            Err(error.into())
+        }
+        Err(identifier::AnonymousIdentityComputationError::Identity(error)) => {
+            Err(AppError::AnonymousIdentity(error))
+        }
+    }
+}
+
+fn compute_canonical_pair_anonymous_identifiers_result_with_ctx<E>(
+    ctx: &WiringContext,
+    resources: &mut CanonicalResourcePair<E>,
+    providers: &[ProviderConfig],
+    conflict_policy: identifier::AnonymousIdentityConflictPolicy,
+) -> Result<(), AppError> {
+    match resources.canonicalize_and_compute_anonymous_identifiers(
+        ctx.schemas(),
+        providers,
+        ctx.factories(),
+        conflict_policy,
+    ) {
+        Ok(()) => Ok(()),
+        Err(CanonicalResourceIdentityError::EnumCanonicalization(error)) => Err(error.into()),
+        Err(CanonicalResourceIdentityError::ProviderConfig(error)) => Err(error.into()),
+        Err(CanonicalResourceIdentityError::Identity(error)) => {
+            Err(AppError::AnonymousIdentity(error))
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn compute_canonical_pair_anonymous_identifiers_with_ctx<E>(
     ctx: &WiringContext,
     resources: &mut CanonicalResourcePair<E>,
     providers: &[ProviderConfig],
 ) -> Result<Vec<AppError>, AppError> {
-    let canonical_providers = match canonicalized_provider_configs_for_identifiers(ctx, providers) {
-        Ok(providers) => providers,
-        Err(error) => return Ok(vec![error]),
-    };
+    compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx(
+        ctx,
+        resources,
+        providers,
+        identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+    )
+}
 
+pub(crate) fn compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx<E>(
+    ctx: &WiringContext,
+    resources: &mut CanonicalResourcePair<E>,
+    providers: &[ProviderConfig],
+    conflict_policy: identifier::AnonymousIdentityConflictPolicy,
+) -> Result<Vec<AppError>, AppError> {
     match resources.canonicalize_and_compute_anonymous_identifiers(
         ctx.schemas(),
-        &canonical_providers,
-        &|name| identity_attributes_for_provider(ctx, name),
+        providers,
+        ctx.factories(),
+        conflict_policy,
     ) {
         Ok(()) => Ok(Vec::new()),
         Err(CanonicalResourceIdentityError::EnumCanonicalization(error)) => Err(error.into()),
-        Err(CanonicalResourceIdentityError::Identity(message)) => {
-            Ok(vec![AppError::Config(message)])
-        }
+        Err(CanonicalResourceIdentityError::ProviderConfig(error)) => Ok(vec![error.into()]),
+        Err(CanonicalResourceIdentityError::Identity(error)) => Ok(error
+            .into_individual_errors()
+            .into_iter()
+            .map(AppError::from)
+            .collect()),
     }
-}
-
-fn canonicalized_provider_configs_for_identifiers(
-    ctx: &WiringContext,
-    providers: &[ProviderConfig],
-) -> Result<carina_core::value::CanonicalizedProviderConfigs, AppError> {
-    Ok(
-        carina_core::value::canonicalize_provider_configs_with_schemas(
-            providers,
-            &|provider_name| provider_config_schema_for(ctx, provider_name),
-        )?,
-    )
 }
 
 /// Encapsulates the plan-time normalization pipeline.
@@ -3279,7 +3450,7 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
 pub(crate) fn validate_module_internal_ref_types(
     ctx: &WiringContext,
     module_walk: &ModuleWalk,
-    config: &carina_core::parser::ProviderContext,
+    config: &carina_core::parser::LoadedProviderContext,
 ) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
@@ -3767,7 +3938,8 @@ pub struct DeferredCreateTarget {
 impl DeferredCreateTarget {
     fn from_deferred(deferred: &carina_core::parser::DeferredForExpression) -> Option<Self> {
         let template_id = &deferred.template_resource.id;
-        let identity = match ResourceIdentity::try_from(deferred.binding_name.clone()) {
+        let identity = match ResourceIdentity::try_from(deferred.target.scheduler_key().to_string())
+        {
             Ok(identity) => identity,
             Err(ResourceIdentityError::Empty) => return None,
         };
@@ -3801,6 +3973,7 @@ impl DeferredCreateTarget {
 
 /// State and metadata maps that have crossed the shared address-reconciliation
 /// boundary.
+#[derive(Clone)]
 pub(crate) struct AddressedState {
     managed_current: HashMap<ResourceId, Current>,
     orphans: Orphans,
@@ -3965,7 +4138,7 @@ impl<'state> ProjectedStateRead<'state> {
                     .target_by_source
                     .get(source.as_inner())
                     .map_or_else(|| source.into_inner(), |target| target.as_inner().clone());
-                (id, row.directives.clone())
+                (id, row.directives.clone().into())
             })
             .collect()
     }
@@ -4016,12 +4189,15 @@ fn conflicting_move<'a>(
     policy: MoveOverlapPolicy,
 ) -> Option<&'a (ResolvedResourceId, ResolvedResourceId)> {
     moved_pairs.iter().find(|(existing_from, existing_to)| {
-        let continues_forward = existing_to == resolved_move.from()
+        let continues_forward = existing_to == resolved_move.projected_from()
+            && existing_from == resolved_move.from()
             && existing_from != resolved_move.to()
-            && resolved_move.from() != resolved_move.to();
+            && resolved_move.projected_from() != resolved_move.to();
         let overlaps = existing_from == resolved_move.from()
+            || existing_from == resolved_move.projected_from()
             || existing_from == resolved_move.to()
             || existing_to == resolved_move.from()
+            || existing_to == resolved_move.projected_from()
             || existing_to == resolved_move.to();
         let composition_is_allowed = match policy {
             MoveOverlapPolicy::ComposeForward => continues_forward,
@@ -4070,11 +4246,12 @@ fn apply_detected_resource_moves(
         addressed
             .saved_attrs
             .remap_resource_id(authority.from(), authority.to().clone());
+        let projected_from = resolved_move.projected_from().clone();
         let (from, to) = resolved_move.into_parts();
         if let Some((_origin, prior_target)) = addressed
             .moved_pairs
             .iter_mut()
-            .find(|(_origin, prior_target)| prior_target == &from)
+            .find(|(origin, prior_target)| prior_target == &projected_from && origin == &from)
         {
             *prior_target = to;
         } else {
@@ -4304,12 +4481,12 @@ impl<'state> DeferredForExpansionPrelude<'state> {
     ) -> Result<DetectedDeferredForExpansionPrelude<'state>, AppError> {
         let moves = if let Some(state_file) = self.state_file.as_ref() {
             let state_view = AnonymousReconciliationStateView::new(ctx, state_file, &[]);
-            let mut moves = reconcile_anonymous_identifiers_with_ctx(
+            let mut moves = detect_legacy_loop_moves_with_ctx(
                 ctx,
                 &self.sorted_resources,
-                data_sources,
                 &state_view,
                 claims,
+                &[],
             );
             let projected_pairs = moves
                 .iter()
@@ -4317,11 +4494,23 @@ impl<'state> DeferredForExpansionPrelude<'state> {
                 .collect::<Vec<_>>();
             let state_view =
                 AnonymousReconciliationStateView::new(ctx, state_file, &projected_pairs);
-            moves.extend(detect_anonymous_to_named_moves_with_ctx(
+            moves.extend(reconcile_anonymous_identifiers_with_ctx(
+                ctx,
+                &self.sorted_resources,
+                data_sources,
+                &state_view,
+                claims,
+            ));
+            let projected_pairs = moves
+                .iter()
+                .map(|resolved_move| (resolved_move.from().clone(), resolved_move.to().clone()))
+                .collect::<Vec<_>>();
+            moves.extend(detect_anonymous_to_named_moves_to_fixed_point(
                 ctx,
                 &self.sorted_resources,
                 providers,
-                &state_view,
+                state_file,
+                &projected_pairs,
                 claims,
             )?);
             moves
@@ -4545,6 +4734,7 @@ impl ProjectedDeferredForExpansionPrelude<'_> {
     }
 }
 
+#[derive(Clone)]
 struct AddressedDeferredForExpansionInputs {
     sorted_resources: Vec<Resource>,
     wait_aliases: Vec<WaitAliasSpec>,
@@ -4887,22 +5077,19 @@ pub fn derive_managed_binding_stability<E>(
     // cannot have a refreshed row addressed to them yet, so they are
     // conservatively unavailable; resolved resources can be diffed normally.
     let mut pending_stability = HashMap::new();
-    let resolved = resolved
-        .into_iter()
-        .filter_map(|resource| {
-            let id = resource.id.clone();
-            match ResolvedResource::try_new(resource) {
-                Some(resource) => Some(resource),
-                None => {
-                    pending_stability.insert(
-                        id,
-                        carina_core::binding_index::ManagedBindingStability::Unavailable,
-                    );
-                    None
-                }
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut schema_resolved = Vec::new();
+    for resource in resolved {
+        let id = resource.id.clone();
+        if resource.id.identity_str().is_none() {
+            pending_stability.insert(
+                id,
+                carina_core::binding_index::ManagedBindingStability::Unavailable,
+            );
+        } else {
+            schema_resolved.push(ResolvedResource::resolve_with_schemas(resource, schemas)?);
+        }
+    }
+    let resolved = schema_resolved;
     let mut stability = carina_core::differ::managed_binding_stability(
         &resolved,
         &plan_input_current,
@@ -5523,8 +5710,10 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         context.schemas(),
         override_aware_resources.resources(),
     );
-    let stability_resources =
-        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
+    let stability_resources = ResolvedResource::collect_resolved_with_schemas(
+        override_aware_resources.resources().iter().cloned(),
+        context.schemas(),
+    )?;
     let managed_stability = carina_core::differ::managed_binding_stability(
         &stability_resources,
         &reconciled_input_current,
@@ -5550,10 +5739,14 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         .build_directives();
     let paired_unresolved_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
-    let resolved_resources =
-        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
-    let resolved_unresolved_resources =
-        ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
+    let resolved_resources = ResolvedResource::collect_resolved_with_schemas(
+        override_aware_resources.resources().iter().cloned(),
+        context.schemas(),
+    )?;
+    let resolved_unresolved_resources = ResolvedResource::collect_resolved_with_schemas(
+        paired_unresolved_resources.iter().cloned(),
+        context.schemas(),
+    )?;
     let plan_input_current = carina_core::resource::into_plan_input_current_map(
         addressed.managed_current.clone(),
         context.schemas(),
@@ -5730,7 +5923,7 @@ impl PreparedDeferredForExpansion {
     pub(crate) fn expand<E: Clone>(
         &self,
         mut resources: CanonicalResourcePair<E>,
-        schemas: &SchemaRegistry,
+        ctx: &WiringContext,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         warning_policy: DeferredForWarningPolicy,
     ) -> Result<(ExpandedCanonicalResources<E>, DeferredForExpansion), AppError> {
@@ -5745,7 +5938,7 @@ impl PreparedDeferredForExpansion {
             &sorted_resources,
             &self.0.addressed.state.managed_current,
             &self.0.data_source_values,
-            schemas,
+            ctx.schemas(),
             &self.0.addressed.state.saved_attrs,
             &self.0.addressed.state.prev_explicit,
             remote_bindings,
@@ -5753,6 +5946,7 @@ impl PreparedDeferredForExpansion {
             &self.0.addressed.state.moved_pairs,
             &self.0.addressed.already_refreshed,
             warning_policy,
+            ctx,
         )?;
         Ok((ExpandedCanonicalResources { resources }, expansion))
     }
@@ -5763,12 +5957,12 @@ impl PreparedDeferredForExpansion {
     pub(crate) fn expand_for_plan<E: Clone>(
         self,
         resources: CanonicalResourcePair<E>,
-        schemas: &SchemaRegistry,
+        ctx: &WiringContext,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         warning_policy: DeferredForWarningPolicy,
     ) -> Result<PostExpansionPlanView<E, ChildrenPending>, AppError> {
         let (expanded_resources, expansion) =
-            self.expand(resources, schemas, remote_bindings, warning_policy)?;
+            self.expand(resources, ctx, remote_bindings, warning_policy)?;
         let PreparedDeferredForExpansionParts {
             addressed,
             data_source_values,
@@ -5813,6 +6007,7 @@ impl PreparedAddressPreservingDeferredForExpansion {
         schemas: &SchemaRegistry,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         warning_policy: DeferredForWarningPolicy,
+        identity_context: &WiringContext,
     ) -> Result<DeferredForExpansion, AppError> {
         expand_same_config_deferred_for_target(
             parsed,
@@ -5827,6 +6022,7 @@ impl PreparedAddressPreservingDeferredForExpansion {
             &self.0.addressed.state.moved_pairs,
             &self.0.addressed.already_refreshed,
             warning_policy,
+            identity_context,
         )
     }
 }
@@ -5868,6 +6064,12 @@ impl PreparedAddressPreservingDeferredForExpansion {
 pub(crate) trait DeferredExpansionTarget<E> {
     fn parsed(&self) -> &carina_core::parser::File<E>;
 
+    fn compute_anonymous_identifiers(
+        &mut self,
+        ctx: &WiringContext,
+        providers: &[ProviderConfig],
+    ) -> Result<(), AppError>;
+
     fn expand_partitioned<F>(
         &mut self,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
@@ -5883,6 +6085,19 @@ pub(crate) trait DeferredExpansionTarget<E> {
 impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
     fn parsed(&self) -> &carina_core::parser::File<E> {
         self.parsed()
+    }
+
+    fn compute_anonymous_identifiers(
+        &mut self,
+        ctx: &WiringContext,
+        providers: &[ProviderConfig],
+    ) -> Result<(), AppError> {
+        compute_canonical_pair_anonymous_identifiers_result_with_ctx(
+            ctx,
+            self,
+            providers,
+            identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+        )
     }
 
     fn expand_partitioned<F>(
@@ -5903,6 +6118,23 @@ impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
 impl<E> DeferredExpansionTarget<E> for carina_core::parser::File<E> {
     fn parsed(&self) -> &carina_core::parser::File<E> {
         self
+    }
+
+    fn compute_anonymous_identifiers(
+        &mut self,
+        ctx: &WiringContext,
+        providers: &[ProviderConfig],
+    ) -> Result<(), AppError> {
+        let resources = carina_core::value::canonicalize_resources_with_schemas(
+            &mut self.resources,
+            ctx.schemas(),
+        )?;
+        compute_anonymous_identifiers_result_with_ctx(
+            ctx,
+            resources,
+            providers,
+            identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+        )
     }
 
     fn expand_partitioned<F>(
@@ -5948,6 +6180,7 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
     already_refreshed: &HashSet<ResourceId>,
     warning_policy: DeferredForWarningPolicy,
+    identity_context: &WiringContext,
 ) -> Result<DeferredForExpansion, AppError> {
     let parsed = target.parsed();
     // Common case: no deferred-for at all. Skip the binding projection
@@ -6024,6 +6257,8 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
             }
         })
         .map_err(|error| AppError::Validation(error.to_string()))?;
+    let providers = target.parsed().providers.clone();
+    target.compute_anonymous_identifiers(identity_context, &providers)?;
     let printed_warnings =
         warning_policy == DeferredForWarningPolicy::Print && target.parsed().print_warnings();
     #[cfg(test)]
@@ -6130,12 +6365,20 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
         },
         data_source_values: data_source_values.clone(),
     });
+    let identity_context = WiringContext::new_for_test_with_additional_schemas(
+        Vec::new(),
+        &parsed.providers,
+        schemas
+            .iter()
+            .map(|(provider, _, _, schema)| (provider.to_string(), schema.clone())),
+    );
     let mut expanded = parsed.clone();
     prepared.expand_parsed(
         &mut expanded,
         schemas,
         remote_bindings,
         DeferredForWarningPolicy::Print,
+        &identity_context,
     )
 }
 
@@ -6187,6 +6430,7 @@ pub(crate) struct ExpandRefreshAndLiftInputs<'a, 'backend, P: Provider + Provide
     pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
     pub refresh_phase: &'a RefreshPhase<'backend>,
     pub schemas: &'a carina_core::schema::SchemaRegistry,
+    pub identity_context: &'a WiringContext,
 }
 
 /// Refresh-and-lift inputs whose schema registry is supplied by the validated
@@ -6236,6 +6480,7 @@ async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormaliz
         inputs.schemas,
         inputs.remote_bindings,
         inputs.warning_policy,
+        inputs.identity_context,
     )?;
     finish_expanded_refresh_state(expansion, inputs).await
 }
@@ -6267,12 +6512,13 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
         refresh_phase,
     } = inputs;
     let resources = {
-        let schemas = wiring.context().schemas();
+        let identity_context = wiring.context();
+        let schemas = identity_context.schemas();
         canonical_resources
             .try_map_async_preserving_binding_use_resolution(|canonical_resources| async move {
                 let pending = expansion.expand_for_plan(
                     canonical_resources,
-                    schemas,
+                    identity_context,
                     remote_bindings,
                     warning_policy,
                 )?;
@@ -6749,7 +6995,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     // state transitions below.
     let pending_expansion = prepared_expansion.expand_for_plan(
         canonical_resources,
-        ctx.schemas(),
+        ctx,
         remote_bindings,
         DeferredForWarningPolicy::Print,
     )?;
@@ -7265,7 +7511,7 @@ pub fn add_state_block_effects(
 
     for block in state_blocks {
         match block {
-            StateBlock::Import { to, id } => {
+            StateBlock::Import { to, to_span: _, id } => {
                 let effective_to = resolve_import_target(to, desired_resources);
 
                 // Skip if resource already exists in state
@@ -7362,6 +7608,11 @@ pub fn add_state_block_effects(
         new_effects.push(Effect::Move {
             from: from.clone(),
             to: to.clone(),
+            origin: desired_resources
+                .iter()
+                .find(|resource| resource.id == *to.as_inner())
+                .and_then(|resource| resource.loop_provenance.display_origin())
+                .cloned(),
         });
     }
 
@@ -7431,7 +7682,7 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
                     identifier,
                     generation: EffectGeneration::Current,
                     directives,
-                    binding: Some(binding),
+                    binding,
                     dependencies,
                     explicit_dependencies,
                     blocked_by_updates,
@@ -7440,21 +7691,26 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
                     return None;
                 };
 
-                if id.resource_type == target.template.template_resource.id.resource_type
-                    && binding_matches_deferred_template(binding, &target.template.binding_name)
+                if deletes_to_absorb.contains(id.as_inner())
+                    || id.provider != target.template.template_resource.id.provider
+                    || id.resource_type != target.template.template_resource.id.resource_type
+                    || id.provider_instance
+                        != target.template.template_resource.id.provider_instance
                 {
-                    Some(DeferredReplaceDelete {
-                        id: id.clone(),
-                        identifier: identifier.clone(),
-                        directives: directives.clone(),
-                        binding: Some(binding.clone()),
-                        dependencies: dependencies.clone(),
-                        explicit_dependencies: explicit_dependencies.clone(),
-                        blocked_by_updates: blocked_by_updates.clone(),
-                    })
-                } else {
-                    None
+                    return None;
                 }
+                let matches = binding.as_deref().is_some_and(|binding| {
+                    binding_matches_deferred_template(binding, &target.template.target)
+                });
+                matches.then(|| DeferredReplaceDelete {
+                    id: id.clone(),
+                    identifier: identifier.clone(),
+                    directives: directives.clone(),
+                    binding: binding.clone(),
+                    dependencies: dependencies.clone(),
+                    explicit_dependencies: explicit_dependencies.clone(),
+                    blocked_by_updates: blocked_by_updates.clone(),
+                })
             })
             .collect();
 

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use super::*;
 use crate::document::Document;
 use carina_core::parser::ProviderContext;
-use carina_core::provider::{self as provider_mod, ProviderFactory};
+use carina_core::provider::ProviderFactory;
 use carina_core::schema::SchemaRegistry;
 
 mod basic;
@@ -25,10 +25,24 @@ pub(super) fn test_engine() -> DiagnosticEngine {
     DiagnosticEngine::without_loaded_provider_schemas()
 }
 
-fn loaded_test_schemas(
+fn loaded_test_providers(
     schemas: SchemaRegistry,
-) -> Arc<carina_core::provider::ProviderLoadedSchemaRegistry> {
-    Arc::new(carina_core::provider::ProviderLoadedSchemaRegistry::for_test(schemas))
+) -> Arc<carina_core::provider::LoadedProviderSnapshot> {
+    Arc::new(carina_core::provider::LoadedProviderSnapshot::for_test(
+        schemas,
+        Arc::new(Vec::new()),
+    ))
+}
+
+fn loaded_providers_from_factories(
+    factories: Vec<Box<dyn ProviderFactory>>,
+) -> Arc<carina_core::provider::LoadedProviderSnapshot> {
+    Arc::new(
+        carina_core::provider::loaded_provider_snapshot_from_factories(
+            Arc::new(factories),
+            std::iter::empty(),
+        ),
+    )
 }
 
 struct RegionConfigFactory {
@@ -97,9 +111,8 @@ impl ProviderFactory for RegionConfigFactory {
 pub(super) fn test_engine_with_region_config_provider(name: &'static str) -> DiagnosticEngine {
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(RegionConfigFactory { name })];
     DiagnosticEngine::new(
-        Arc::new(provider_mod::provider_loaded_schema_registry_from_factories(&factories)),
+        loaded_providers_from_factories(factories),
         vec![name.to_string()],
-        Arc::new(factories),
     )
 }
 
@@ -246,9 +259,8 @@ impl ProviderFactory for SuspendedValidationFactory {
 pub(super) fn test_engine_with_suspended_validation_provider() -> DiagnosticEngine {
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(SuspendedValidationFactory)];
     DiagnosticEngine::new(
-        Arc::new(provider_mod::provider_loaded_schema_registry_from_factories(&factories)),
+        loaded_providers_from_factories(factories),
         vec!["mock".to_string()],
-        Arc::new(factories),
     )
 }
 
@@ -343,12 +355,9 @@ pub(super) fn test_engine_with_enum_declared_custom_type()
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(EnumDeclaredCustomTypeFactory {
         seen: Arc::clone(&seen),
     })];
-    let schemas =
-        Arc::new(provider_mod::provider_loaded_schema_registry_from_factories(&factories));
     let engine = DiagnosticEngine::new(
-        Arc::clone(&schemas),
+        loaded_providers_from_factories(factories),
         vec!["mock".to_string()],
-        Arc::new(factories),
     );
     (engine, seen)
 }
@@ -450,12 +459,9 @@ pub(super) fn shared_role_arn_engine(awscc_accepted: &'static str) -> Diagnostic
             accepted: awscc_accepted,
         }),
     ];
-    let schemas =
-        Arc::new(provider_mod::provider_loaded_schema_registry_from_factories(&factories));
     DiagnosticEngine::new(
-        schemas,
+        loaded_providers_from_factories(factories),
         vec!["aws".to_string(), "awscc".to_string()],
-        Arc::new(factories),
     )
 }
 
@@ -539,9 +545,8 @@ impl ProviderFactory for BareTypeFactory {
 pub(super) fn bare_type_engine() -> DiagnosticEngine {
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(BareTypeFactory)];
     DiagnosticEngine::new(
-        Arc::new(provider_mod::provider_loaded_schema_registry_from_factories(&factories)),
+        loaded_providers_from_factories(factories),
         vec!["test".to_string()],
-        Arc::new(factories),
     )
 }
 
@@ -578,11 +583,7 @@ pub(super) fn test_engine_with_nested_structs() -> DiagnosticEngine {
         schema.validate().expect("schema fixture must be valid"),
     );
 
-    DiagnosticEngine::new(
-        loaded_test_schemas(schemas),
-        vec!["test".to_string()],
-        Arc::new(vec![]),
-    )
+    DiagnosticEngine::new(loaded_test_providers(schemas), vec!["test".to_string()])
 }
 
 /// Engine carrying a managed `aws.acm.Certificate` schema with `status`
@@ -615,11 +616,7 @@ pub(super) fn test_engine_with_wait_target() -> DiagnosticEngine {
             .validate()
             .expect("schema fixture must be valid"),
     );
-    DiagnosticEngine::new(
-        loaded_test_schemas(schemas),
-        vec!["aws".to_string()],
-        Arc::new(vec![]),
-    )
+    DiagnosticEngine::new(loaded_test_providers(schemas), vec!["aws".to_string()])
 }
 
 pub(super) fn test_engine_with_iam_policy_arn_custom_type() -> DiagnosticEngine {
@@ -665,11 +662,7 @@ pub(super) fn test_engine_with_enum_attr() -> DiagnosticEngine {
         schema.validate().expect("schema fixture must be valid"),
     );
 
-    DiagnosticEngine::new(
-        loaded_test_schemas(schemas),
-        vec!["test".to_string()],
-        Arc::new(vec![]),
-    )
+    DiagnosticEngine::new(loaded_test_providers(schemas), vec!["test".to_string()])
 }
 
 /// Variant of `test_engine_with_enum_attr` whose `mode` attribute is a
@@ -696,11 +689,7 @@ pub(super) fn test_engine_with_namespaced_enum_attr() -> DiagnosticEngine {
         schema.validate().expect("schema fixture must be valid"),
     );
 
-    DiagnosticEngine::new(
-        loaded_test_schemas(schemas),
-        vec!["test".to_string()],
-        Arc::new(vec![]),
-    )
+    DiagnosticEngine::new(loaded_test_providers(schemas), vec!["test".to_string()])
 }
 
 /// Engine whose `mode` attribute is a `Custom` type with a namespace — the
@@ -740,11 +729,7 @@ pub(super) fn test_engine_with_custom_namespaced_attr() -> DiagnosticEngine {
         schema.validate().expect("schema fixture must be valid"),
     );
 
-    DiagnosticEngine::new(
-        loaded_test_schemas(schemas),
-        vec!["test".to_string()],
-        Arc::new(vec![]),
-    )
+    DiagnosticEngine::new(loaded_test_providers(schemas), vec!["test".to_string()])
 }
 
 pub(super) fn test_engine_with_block_name_nested() -> DiagnosticEngine {
@@ -777,11 +762,7 @@ pub(super) fn test_engine_with_block_name_nested() -> DiagnosticEngine {
         schema.validate().expect("schema fixture must be valid"),
     );
 
-    DiagnosticEngine::new(
-        loaded_test_schemas(schemas),
-        vec!["test".to_string()],
-        Arc::new(vec![]),
-    )
+    DiagnosticEngine::new(loaded_test_providers(schemas), vec!["test".to_string()])
 }
 
 /// Engine carrying a single resource whose `lifecycle_configuration`
@@ -834,11 +815,7 @@ pub(super) fn test_engine_with_ref_lifecycle_like_schema() -> DiagnosticEngine {
         schema.validate().expect("schema fixture must be valid"),
     );
 
-    DiagnosticEngine::new(
-        loaded_test_schemas(schemas),
-        vec!["awscc".to_string()],
-        Arc::new(vec![]),
-    )
+    DiagnosticEngine::new(loaded_test_providers(schemas), vec!["awscc".to_string()])
 }
 
 struct SchemaFixtureFactory {
@@ -910,9 +887,5 @@ pub(super) fn custom_engine(schemas: SchemaRegistry) -> DiagnosticEngine {
         .iter()
         .map(|factory| factory.name().to_string())
         .collect();
-    DiagnosticEngine::new(
-        Arc::new(provider_mod::provider_loaded_schema_registry_from_factories(&factories)),
-        provider_names,
-        Arc::new(factories),
-    )
+    DiagnosticEngine::new(loaded_providers_from_factories(factories), provider_names)
 }

@@ -17,8 +17,8 @@ use carina_core::provider::{
     AppliedIdentifier, InFlightCreate, InFlightPersistence, ObservedCreate, PersistedAttributes,
 };
 use carina_core::resource::{
-    ConcreteValue, Current, DefaultTagKeys, ModuleSource, ResolvedResource, ResolvedResourceId,
-    Resource, ResourceId, State, Value,
+    ConcreteValue, Current, ModuleSource, ResolvedResource, ResolvedResourceId, Resource,
+    ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedExportValue;
@@ -216,6 +216,9 @@ pub(crate) struct ExportResolutionInputs<'a> {
     /// entries before this reaches export resolution.
     pub data_source_values: &'a DataSourceValues,
     pub resources: &'a [Resource],
+    /// Loaded provider custom types used when post-apply bindings make a
+    /// previously deferred export expression concrete.
+    pub provider_context: &'a carina_core::parser::LoadedProviderContext,
 }
 
 /// Input parameters for `finalize_apply`.
@@ -237,9 +240,6 @@ pub(crate) struct FinalizeApplyInput<'a, S = ModuleSource> {
     pub export_resolution_inputs: Option<ExportResolutionInputs<'a>>,
     pub backend: &'a dyn StateBackend,
     pub lock: StateLockRef<'a>,
-    /// Provider-aware builtin context used when post-apply bindings make a
-    /// previously deferred export expression concrete.
-    pub provider_context: &'a carina_core::parser::ProviderContext,
     /// Wait-binding aliases (carina#3085). When export expressions
     /// reference a `wait` binding (`exports { x = cert_issued.arn }`),
     /// these make `<wait-binding>.<attr>` resolve to `<target>.<attr>`
@@ -467,7 +467,7 @@ pub(crate) struct ResolveExportValuesPostApplyInput<'a> {
     pub post_apply_states: &'a PostApplyStates,
     pub schemas: &'a SchemaRegistry,
     pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
-    pub provider_context: &'a carina_core::parser::ProviderContext,
+    pub provider_context: &'a carina_core::parser::LoadedProviderContext,
 }
 
 pub(crate) fn resolve_export_values_post_apply(
@@ -1567,17 +1567,13 @@ pub(crate) fn build_orphan_resource(
         .persisted_attributes()
         .map(PersistedAttributes::to_values)
         .unwrap_or_default();
-    Resource {
-        id: id.as_inner().clone(),
-        attributes: attributes.into_iter().collect(),
-        directives: rs.directives.clone(),
-        prefixes: rs.prefixes.clone(),
-        binding: rs.binding.clone(),
-        dependency_bindings: rs.dependency_bindings.clone(),
-        module_source: None,
-        default_tag_keys: DefaultTagKeys::default(),
-        quoted_string_attrs: HashSet::new(),
-    }
+    let mut resource = Resource::from_id(id.as_inner().clone());
+    resource.attributes = attributes.into_iter().collect();
+    resource.directives = rs.directives.clone().into();
+    resource.prefixes = rs.prefixes.clone();
+    resource.binding = rs.binding.clone();
+    resource.dependency_bindings = rs.dependency_bindings.clone();
+    resource
 }
 
 #[cfg(test)]
@@ -3431,6 +3427,7 @@ mod apply_state_save_tests {
         let move_effect = Effect::Move {
             from: ResolvedResourceId::new(source.clone()),
             to: ResolvedResourceId::new(destination.clone()),
+            origin: None,
         };
         let authority = move_effect
             .move_authority()
@@ -3532,6 +3529,7 @@ mod apply_state_save_tests {
         plan.add(Effect::Move {
             from: ResolvedResourceId::new(source.clone()),
             to: ResolvedResourceId::new(destination.clone()),
+            origin: None,
         });
 
         // Crash-shaped checkpoint: the provider Update on `b` has completed,
@@ -3791,6 +3789,7 @@ mod apply_state_save_tests {
         plan.add(Effect::Move {
             from: ResolvedResourceId::new(source.clone()),
             to: ResolvedResourceId::new(destination.clone()),
+            origin: None,
         });
         let saved = build_state_after_apply(
             ApplyStateSave {
@@ -4332,7 +4331,9 @@ mod apply_state_save_tests {
                 header: "for opt in cert.domain_validation_options".to_string(),
                 resource_type: "aws.route53.Record".to_string(),
                 attributes: vec![],
-                binding_name: "validation_records".to_string(),
+                target: carina_core::parser::DeferredForTarget::Bound {
+                    binding: "validation_records".to_string(),
+                },
                 iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource: Resource::with_provider(
@@ -4412,7 +4413,9 @@ mod apply_state_save_tests {
                 header: "for opt in cert.domain_validation_options".to_string(),
                 resource_type: "aws.route53.Record".to_string(),
                 attributes: vec![],
-                binding_name: "validation_records".to_string(),
+                target: carina_core::parser::DeferredForTarget::Bound {
+                    binding: "validation_records".to_string(),
+                },
                 iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
@@ -6497,6 +6500,7 @@ mod apply_state_save_tests {
                 "validation_records[1]",
                 None,
             )),
+            origin: None,
         });
         let current_states = HashMap::new();
         let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);
@@ -6563,7 +6567,7 @@ mod export_writeback_tests {
         let checked = carina_core::validation::check_export_values_pre_apply(
             export_params,
             &carina_core::binding_index::ResolvedBindings::default(),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
         )
         .expect("test exports must pass the secret boundary");
         let values = resolve_export_values_post_apply(ResolveExportValuesPostApplyInput {
@@ -6573,7 +6577,7 @@ mod export_writeback_tests {
             post_apply_states: &post_apply_states,
             schemas: &carina_core::schema::SchemaRegistry::new(),
             wait_aliases: &[],
-            provider_context: &carina_core::parser::ProviderContext::default(),
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
         })
         .expect("post-apply export resolution should succeed");
         materialize_exports(&values)
@@ -6611,7 +6615,7 @@ mod export_writeback_tests {
         let checked = carina_core::validation::check_export_values_pre_apply(
             &export_params,
             &carina_core::binding_index::ResolvedBindings::default(),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
         )
         .expect("test export must pass the secret boundary");
         let post_apply_states = PostApplyStates::from_current_and_state(
@@ -6650,7 +6654,7 @@ mod export_writeback_tests {
             post_apply_states: &post_apply_states,
             schemas: &carina_core::schema::SchemaRegistry::new(),
             wait_aliases: &[],
-            provider_context: &carina_core::parser::ProviderContext::default(),
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
         })
         .expect("post-apply export resolution should succeed");
 

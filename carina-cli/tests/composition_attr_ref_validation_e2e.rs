@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
@@ -635,16 +636,19 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
         "exports.crn",
         "exports {\n  x = instance.target_group_ar\n}\n",
     )]);
-    let provider_context = carina_core::parser::ProviderContext::default();
-    let mut parsed =
-        carina_core::config_loader::parse_directory(&fixture.caller, &provider_context)
-            .expect("parse directory-scoped fixture");
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AwsccTestFactory)];
-    let schemas = carina_core::provider::provider_loaded_schema_registry_from_factories(&factories);
+    let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(factories),
+        std::iter::empty(),
+    );
+    let provider_context = loaded_providers.provider_context();
+    let schemas = loaded_providers.schemas();
+    let mut parsed = carina_core::config_loader::parse_directory(&fixture.caller, provider_context)
+        .expect("parse directory-scoped fixture");
     carina_core::module_resolver::resolve_modules_with_config(
         &mut parsed,
         carina_core::config_loader::get_base_dir(&fixture.caller),
-        &provider_context,
+        provider_context,
         schemas.schemas(),
     )
     .expect("expand module call");
@@ -653,7 +657,7 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
     // CLI validation, where both stages can otherwise report this one typo.
     let inferred_exports =
         carina_core::validation::inference::infer_export_params_with_loaded_provider_schemas(
-            &parsed, &schemas,
+            &parsed, schemas,
         );
     let bindings =
         carina_core::binding_index::BindingIndex::from_parsed(&parsed, schemas.schemas());
