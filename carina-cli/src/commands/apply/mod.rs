@@ -1910,6 +1910,7 @@ async fn run_apply_locked_owned(
             )?
             .detect_moves(
                 ctx,
+                &provider,
                 &parsed.data_sources,
                 raw_provider_configs,
                 &state_block_claims,
@@ -2245,8 +2246,12 @@ async fn run_apply_locked_owned(
                 None,
                 &provider,
             )?;
-            let moved_hints =
-                crate::moved_hint::detect_moved_block_hints(&plan, &managed_current, ctx.schemas());
+            let moved_hints = crate::moved_hint::detect_moved_block_hints(
+                &plan,
+                &managed_current,
+                ctx.schemas(),
+                &provider,
+            )?;
             moved_hints.eprint();
 
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
@@ -2687,6 +2692,8 @@ async fn prepare_saved_plan_secret_candidates(
     let wiring = validated_config.context();
     let canonical_resources = validated_config.resources();
     let parsed = canonical_resources.parsed();
+    let provider =
+        create_providers_from_configs_with_ctx(wiring, provider_inputs.configs()).await?;
     let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new(
         canonical_resources,
         &candidate_state,
@@ -2694,6 +2701,7 @@ async fn prepare_saved_plan_secret_candidates(
     )?
     .detect_moves(
         wiring,
+        &provider,
         &parsed.data_sources,
         provider_inputs.configs().as_provider_configs(),
         &state_blocks.claims,
@@ -2705,8 +2713,6 @@ async fn prepare_saved_plan_secret_candidates(
         &candidate_state,
     )?;
     let data_source_values = pending_plan.data_source_values(&parsed.data_sources)?;
-    let provider =
-        create_providers_from_configs_with_ctx(wiring, provider_inputs.configs()).await?;
     pending_plan.verify_provider_scopes(&provider, apply_target)?;
     let prepared_expansion = expansion_prelude
         .bind_projected_phase1_state(
@@ -3478,7 +3484,8 @@ async fn run_apply_from_plan_locked_owned(
                 plan,
                 &managed_current,
                 wiring.schemas(),
-            );
+                &provider,
+            )?;
             moved_hints.eprint();
 
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());

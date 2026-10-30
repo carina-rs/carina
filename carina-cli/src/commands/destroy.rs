@@ -308,6 +308,15 @@ async fn run_destroy_locked_owned(
     )
     .await?;
 
+    // Select the initialized provider before address reconciliation so every
+    // create-only comparison uses the owning instance's reference scope.
+    let provider = get_provider_with_ctx(
+        ctx,
+        provider_inputs.configs(),
+        ProgressSink::Human,
+    )
+    .await?;
+
     // Collect all resources (managed + orphans) before sorting.
     // We use the unsorted list for state reads, then sort once at the end.
     let mut all_resources = crate::wiring::DeferredForExpansionPrelude::new_for_state_refresh(
@@ -317,6 +326,7 @@ async fn run_destroy_locked_owned(
     )?
     .detect_moves(
         ctx,
+        &provider,
         &parsed.data_sources,
         provider_inputs.configs().as_provider_configs(),
         &state_block_claims,
@@ -329,14 +339,6 @@ async fn run_destroy_locked_owned(
             "Warning: using cached managed-resource state (--refresh=false). The plan may not reflect actual managed infrastructure.".yellow()
         );
     }
-
-    // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(
-        ctx,
-        provider_inputs.configs(),
-        ProgressSink::Human,
-    )
-    .await?;
 
     // Build managed current state -- either from the provider or the state file.
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();

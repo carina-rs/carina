@@ -18,6 +18,98 @@ use carina_core::resource::{
 use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
+fn comparison_provider_for_resources(
+    schemas: &SchemaRegistry,
+    resources: &[Resource],
+) -> ProviderRouter {
+    carina_core::provider::comparison_fixture_for_test(
+        schemas,
+        resources.iter().map(|resource| &resource.id),
+    )
+    .1
+}
+
+fn reconcile_anonymous_identifiers_with_ctx(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    data_sources: &[DataSource],
+    state_view: &AnonymousReconciliationStateView,
+    claims: &StateBlockClaims,
+) -> Vec<ResolvedMove> {
+    let comparison_provider = comparison_provider_for_resources(ctx.schemas(), resources);
+    super::reconcile_anonymous_identifiers_with_ctx(
+        ctx,
+        &comparison_provider,
+        resources,
+        data_sources,
+        state_view,
+        claims,
+    )
+    .expect("anonymous reconciliation comparison fixture must resolve")
+}
+
+fn detect_legacy_loop_moves_with_ctx(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    state_view: &AnonymousReconciliationStateView,
+    claims: &StateBlockClaims,
+    reserved_moves: &[ResolvedMove],
+) -> Vec<ResolvedMove> {
+    let comparison_provider = comparison_provider_for_resources(ctx.schemas(), resources);
+    super::detect_legacy_loop_moves_with_ctx(
+        ctx,
+        &comparison_provider,
+        resources,
+        state_view,
+        claims,
+        reserved_moves,
+    )
+    .expect("legacy-loop comparison fixture must resolve")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn detect_anonymous_to_named_moves_with_ctx(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    candidates: &HashSet<ResourceId>,
+    providers: &[ProviderConfig],
+    state_view: &AnonymousReconciliationStateView,
+    claims: &StateBlockClaims,
+    claimed_origins: &identifier::AnonymousToNamedClaimedOrigins,
+) -> Result<identifier::AnonymousToNamedRenameDetection, AppError> {
+    let comparison_provider = comparison_provider_for_resources(ctx.schemas(), resources);
+    super::detect_anonymous_to_named_moves_with_ctx(
+        ctx,
+        &comparison_provider,
+        resources,
+        candidates,
+        providers,
+        state_view,
+        claims,
+        claimed_origins,
+    )
+}
+
+fn detect_anonymous_to_named_moves_to_fixed_point(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    providers: &[ProviderConfig],
+    state_file: &StateFile,
+    initial_moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
+    claims: &StateBlockClaims,
+) -> Result<Vec<ResolvedMove>, AppError> {
+    let comparison_provider = comparison_provider_for_resources(ctx.schemas(), resources);
+    super::detect_anonymous_to_named_moves_to_fixed_point(
+        ctx,
+        &comparison_provider,
+        resources,
+        providers,
+        state_file,
+        initial_moved_pairs,
+        claims,
+    )
+}
+
 #[test]
 fn saved_plan_validation_ready_constructor_is_unit_typed() {
     let ready: ValidationReady<()> = ValidationReady::from_saved_plan_artifact();
@@ -7067,9 +7159,16 @@ fn resource_move_invariants_projected_state_read_preserves_dependency_bindings()
     let state = Some(state_file);
     let mut parsed = carina_core::parser::InferredFile::default();
     parsed.resources = resources;
+    let comparison_provider = comparison_provider_for_resources(ctx.schemas(), &parsed.resources);
     let detected = DeferredForExpansionPrelude::new_for_test(&parsed, &state, ctx.schemas())
         .expect("build expansion prelude")
-        .detect_moves(&ctx, &[], &[], &StateBlockClaims::empty())
+        .detect_moves(
+            &ctx,
+            &comparison_provider,
+            &[],
+            &[],
+            &StateBlockClaims::empty(),
+        )
         .expect("the automatic move projection must resolve");
     let (loaded_id, loaded) = detected.build_current(&parsed.resources[0].id);
     let saved = detected.saved_dependency_bindings();
@@ -7126,10 +7225,17 @@ fn detect_moves_prefers_exact_legacy_before_heuristic() {
         .upsert_resource(association_state(heuristic_name, "rtb-private", "subnet-a"))
         .expect("heuristic candidate state row");
     let state = Some(state_file);
+    let comparison_provider = comparison_provider_for_resources(ctx.schemas(), &parsed.resources);
 
     let detected = DeferredForExpansionPrelude::new_for_test(&parsed, &state, ctx.schemas())
         .expect("build expansion prelude")
-        .detect_moves(&ctx, &[], &[], &StateBlockClaims::empty())
+        .detect_moves(
+            &ctx,
+            &comparison_provider,
+            &[],
+            &[],
+            &StateBlockClaims::empty(),
+        )
         .expect("automatic move detection succeeds");
 
     assert_eq!(
@@ -9157,6 +9263,8 @@ fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
         prev_explicit: HashMap::new(),
         moved_pairs: Vec::new(),
     };
+    let comparison_provider =
+        comparison_provider_for_resources(ctx.schemas(), resources.resources());
 
     let result = reconcile_late_anonymous_identities(
         &ctx,
@@ -9167,6 +9275,7 @@ fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
             state_file: None,
             state_block_claims: &claims,
             providers: &[],
+            comparison_provider: &comparison_provider,
         },
     );
     let error = match result {
@@ -9208,6 +9317,8 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
         prev_explicit: HashMap::new(),
         moved_pairs: Vec::new(),
     };
+    let comparison_provider =
+        comparison_provider_for_resources(ctx.schemas(), resources.resources());
 
     let result = reconcile_late_anonymous_identities(
         &ctx,
@@ -9218,6 +9329,7 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
             state_file: None,
             state_block_claims: &claims,
             providers: &[],
+            comparison_provider: &comparison_provider,
         },
     );
 
@@ -9339,6 +9451,8 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
     let early_pair = (early_source_id, desired_id.clone());
     assert_eq!(addressed.moved_pairs, vec![early_pair.clone()]);
     assert!(addressed.orphans.contains_key(other_orphan_id.as_inner()));
+    let comparison_provider =
+        comparison_provider_for_resources(ctx.schemas(), resources.resources());
 
     reconcile_late_anonymous_identities(
         &ctx,
@@ -9349,6 +9463,7 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
             state_file: Some(&state_file),
             state_block_claims: &claims,
             providers: &[],
+            comparison_provider: &comparison_provider,
         },
     )
     .expect("late anonymous identity must resolve");
@@ -9448,6 +9563,8 @@ fn late_anonymous_reconciliation_composes_from_projected_source_to_new_hash() {
         None,
     );
     let late_id = ResolvedResourceId::new(resources.resources()[0].id.clone());
+    let comparison_provider =
+        comparison_provider_for_resources(ctx.schemas(), resources.resources());
 
     reconcile_late_anonymous_identities(
         &ctx,
@@ -9458,6 +9575,7 @@ fn late_anonymous_reconciliation_composes_from_projected_source_to_new_hash() {
             state_file: Some(&state_file),
             state_block_claims: &claims,
             providers: &[],
+            comparison_provider: &comparison_provider,
         },
     )
     .expect("late reconciliation must extend the early move chain");
@@ -9529,6 +9647,8 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
         moved_pairs: Vec::new(),
     };
     let claims = StateBlockClaims::empty();
+    let comparison_provider =
+        comparison_provider_for_resources(ctx.schemas(), resources.resources());
 
     reconcile_late_anonymous_identities(
         &ctx,
@@ -9539,6 +9659,7 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
             state_file: Some(&state_file),
             state_block_claims: &claims,
             providers: &[],
+            comparison_provider: &comparison_provider,
         },
     )
     .expect("late anonymous identity and exact migration resolve");

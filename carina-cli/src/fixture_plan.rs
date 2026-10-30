@@ -494,6 +494,7 @@ where
     let expansion_prelude = expansion_prelude
         .detect_moves(
             wiring,
+            &provider_router,
             &data_sources,
             raw_provider_configs,
             &state_block_claims,
@@ -629,7 +630,9 @@ where
                 prev_explicit,
                 wait_aliases: _,
             } = diagnostics.into_artifacts();
-            let moved_hints = detect_moved_block_hints(&plan, &managed_current, &schemas);
+            let moved_hints =
+                detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
+                    .expect("fixture moved-hint comparisons must resolve");
             FixturePlan {
                 plan,
                 moved_hints,
@@ -674,7 +677,9 @@ where
                 prev_explicit,
                 wait_aliases: _,
             } = artifacts;
-            let moved_hints = detect_moved_block_hints(&plan, &managed_current, &schemas);
+            let moved_hints =
+                detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
+                    .expect("fixture moved-hint comparisons must resolve");
             let resources_for_exports = resolved_resources
                 .iter()
                 .map(|resource| resource.as_inner().clone())

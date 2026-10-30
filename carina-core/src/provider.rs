@@ -5278,6 +5278,19 @@ pub fn comparison_fixture_for_test<'a>(
     registry: &SchemaRegistry,
     ids: impl IntoIterator<Item = &'a ResourceId>,
 ) -> (SchemaRegistry, ProviderRouter) {
+    comparison_fixture_with_scope_for_test(registry, ids, ReferenceScope::Unavailable)
+}
+
+/// Build a comparison fixture with one explicit scope for every requested
+/// route. Reference-form tests use this to exercise the production resolver
+/// without constructing a dispatch-capable provider.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn comparison_fixture_with_scope_for_test<'a>(
+    registry: &SchemaRegistry,
+    ids: impl IntoIterator<Item = &'a ResourceId>,
+    reference_scope: ReferenceScope,
+) -> (SchemaRegistry, ProviderRouter) {
     let ids = ids.into_iter().cloned().collect::<Vec<_>>();
     let mut registry = registry.clone();
     let missing_schemas = ids
@@ -5310,7 +5323,10 @@ pub fn comparison_fixture_for_test<'a>(
     for route in routes {
         router.add_provider_instance(
             route,
-            InitializedProvider::unavailable(Box::new(ComparisonFixtureProvider)),
+            InitializedProvider::for_test(
+                Box::new(ComparisonFixtureProvider),
+                reference_scope.clone(),
+            ),
         );
     }
     (registry, router)

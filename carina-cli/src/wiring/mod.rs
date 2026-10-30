@@ -2624,40 +2624,45 @@ impl AnonymousReconciliationStateView {
 
 fn reconcile_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
+    comparison_provider: &ProviderRouter,
     resources: &[Resource],
     data_sources: &[DataSource],
     state_view: &AnonymousReconciliationStateView,
     claims: &StateBlockClaims,
-) -> Vec<ResolvedMove> {
-    identifier::reconcile_anonymous_identifiers(
+) -> Result<Vec<ResolvedMove>, AppError> {
+    Ok(identifier::reconcile_anonymous_identifiers(
         resources,
         data_sources,
         ctx.schemas(),
+        comparison_provider,
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &|binding| state_view.entries_by_binding(claims, binding),
         claims,
-    )
+    )?)
 }
 
 fn detect_legacy_loop_moves_with_ctx(
     ctx: &WiringContext,
+    comparison_provider: &ProviderRouter,
     resources: &[Resource],
     state_view: &AnonymousReconciliationStateView,
     claims: &StateBlockClaims,
     reserved_moves: &[ResolvedMove],
-) -> Vec<ResolvedMove> {
-    identifier::detect_legacy_loop_address_moves(
+) -> Result<Vec<ResolvedMove>, AppError> {
+    Ok(identifier::detect_legacy_loop_address_moves(
         resources,
         ctx.schemas(),
+        comparison_provider,
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &|binding| state_view.entries_by_binding(claims, binding),
         claims,
         reserved_moves,
-    )
+    )?)
 }
 
 fn detect_anonymous_to_named_moves_with_ctx(
     ctx: &WiringContext,
+    comparison_provider: &ProviderRouter,
     resources: &[Resource],
     candidates: &HashSet<ResourceId>,
     providers: &[ProviderConfig],
@@ -2675,6 +2680,7 @@ fn detect_anonymous_to_named_moves_with_ctx(
     Ok(identifier::detect_anonymous_to_named_renames(
         identifier::AnonymousToNamedCandidates::new(resources, candidates, claimed_origins),
         ctx.schemas(),
+        comparison_provider,
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &|binding| state_view.entries_by_binding(claims, binding),
         &canonical_providers,
@@ -2690,11 +2696,12 @@ fn detect_anonymous_to_named_moves_with_ctx(
                 .unwrap_or_default()
         },
         claims,
-    ))
+    )?)
 }
 
 fn detect_anonymous_to_named_moves_to_fixed_point(
     ctx: &WiringContext,
+    comparison_provider: &ProviderRouter,
     resources: &[Resource],
     providers: &[ProviderConfig],
     state_file: &StateFile,
@@ -2719,6 +2726,7 @@ fn detect_anonymous_to_named_moves_to_fixed_point(
             let claimed_origins = identifier::AnonymousToNamedClaimedOrigins::from_moves(&detected);
             let detection = detect_anonymous_to_named_moves_with_ctx(
                 ctx,
+                comparison_provider,
                 resources,
                 &unsatisfied,
                 providers,
@@ -2767,6 +2775,7 @@ pub(crate) struct LateAnonymousIdentityInputs<'a> {
     pub state_file: Option<&'a StateFile>,
     pub state_block_claims: &'a StateBlockClaims,
     pub providers: &'a [ProviderConfig],
+    pub comparison_provider: &'a ProviderRouter,
 }
 
 /// Desired resource identities captured only after late identity resolution.
@@ -2805,11 +2814,12 @@ pub(crate) fn reconcile_late_anonymous_identities(
             AnonymousReconciliationStateView::new(ctx, state_file, &inputs.addressed.moved_pairs);
         moves = detect_legacy_loop_moves_with_ctx(
             ctx,
+            inputs.comparison_provider,
             inputs.resources.resources(),
             &state_view,
             inputs.state_block_claims,
             &[],
-        );
+        )?;
         let mut projected_pairs = inputs.addressed.moved_pairs.clone();
         projected_pairs.extend(
             moves
@@ -2819,11 +2829,12 @@ pub(crate) fn reconcile_late_anonymous_identities(
         let state_view = AnonymousReconciliationStateView::new(ctx, state_file, &projected_pairs);
         moves.extend(reconcile_anonymous_identifiers_with_ctx(
             ctx,
+            inputs.comparison_provider,
             inputs.resources.resources(),
             inputs.data_sources,
             &state_view,
             inputs.state_block_claims,
-        ));
+        )?);
         let mut projected_pairs = inputs.addressed.moved_pairs.clone();
         projected_pairs.extend(
             moves
@@ -2832,6 +2843,7 @@ pub(crate) fn reconcile_late_anonymous_identities(
         );
         moves.extend(detect_anonymous_to_named_moves_to_fixed_point(
             ctx,
+            inputs.comparison_provider,
             inputs.resources.resources(),
             inputs.providers,
             state_file,
@@ -4544,6 +4556,7 @@ impl<'state> DeferredForExpansionPrelude<'state> {
     pub(crate) fn detect_moves(
         self,
         ctx: &WiringContext,
+        comparison_provider: &ProviderRouter,
         data_sources: &[DataSource],
         providers: &[ProviderConfig],
         claims: &StateBlockClaims,
@@ -4552,11 +4565,12 @@ impl<'state> DeferredForExpansionPrelude<'state> {
             let state_view = AnonymousReconciliationStateView::new(ctx, state_file, &[]);
             let mut moves = detect_legacy_loop_moves_with_ctx(
                 ctx,
+                comparison_provider,
                 &self.sorted_resources,
                 &state_view,
                 claims,
                 &[],
-            );
+            )?;
             let projected_pairs = moves
                 .iter()
                 .map(|resolved_move| (resolved_move.from().clone(), resolved_move.to().clone()))
@@ -4565,17 +4579,19 @@ impl<'state> DeferredForExpansionPrelude<'state> {
                 AnonymousReconciliationStateView::new(ctx, state_file, &projected_pairs);
             moves.extend(reconcile_anonymous_identifiers_with_ctx(
                 ctx,
+                comparison_provider,
                 &self.sorted_resources,
                 data_sources,
                 &state_view,
                 claims,
-            ));
+            )?);
             let projected_pairs = moves
                 .iter()
                 .map(|resolved_move| (resolved_move.from().clone(), resolved_move.to().clone()))
                 .collect::<Vec<_>>();
             moves.extend(detect_anonymous_to_named_moves_to_fixed_point(
                 ctx,
+                comparison_provider,
                 &self.sorted_resources,
                 providers,
                 state_file,
@@ -5766,6 +5782,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             state_file: state_file.as_ref(),
             state_block_claims,
             providers: provider_configs,
+            comparison_provider: provider,
         },
     )?;
     validate_plan_time_state_block_collisions(
@@ -6922,10 +6939,14 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     // managed resources participate in the dependency sort; data sources
     // are refreshed in a later phase against the already-populated
     // `managed_current`.
+    // Initialize the exact provider routes before automatic move detection;
+    // create-only matching needs each owning instance's comparison scope.
+    let provider = get_provider_with_ctx(ctx, provider_configs, progress_sink).await?;
     let expansion_prelude =
         DeferredForExpansionPrelude::new(&canonical_resources, state_file, ctx.schemas())?
             .detect_moves(
                 ctx,
+                &provider,
                 &parsed.data_sources,
                 raw_provider_configs,
                 state_block_claims,
@@ -6934,9 +6955,6 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     // second owned resource graph can diverge before the transition below.
     let sorted_resources = expansion_prelude.sorted_resources();
     let data_sources: Vec<DataSource> = parsed.data_sources.clone();
-    // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(ctx, provider_configs, progress_sink).await?;
-
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
 
     // The prelude owns lifted saved attributes, authoring metadata, wait

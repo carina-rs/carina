@@ -4426,7 +4426,8 @@ pub async fn run_plan(
         &ctx.plan,
         &ctx.managed_current,
         ctx_wiring.schemas(),
-    );
+        &ctx.provider,
+    )?;
 
     if json {
         if let Some(note) = drift_note.as_ref() {
