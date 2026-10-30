@@ -75,6 +75,18 @@ pub(super) enum BasicEffectResult {
     },
 }
 
+/// Terminal ownership outcome of a processed provider mutation.
+///
+/// In particular, `Deleted` is produced only after the provider delete has
+/// succeeded, so schedulers can release current-state identity ownership
+/// without inferring success from effect shape or completion timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BasicEffectCompletion {
+    Succeeded,
+    Failed,
+    Deleted,
+}
+
 /// A completed basic provider future that still owns the obligation to emit
 /// its one terminal effect event.
 pub(super) struct StartedBasicEffectResult<'a, S> {
@@ -595,11 +607,14 @@ fn pick_unresolved_binding_for_diagnostic<'a>(
 pub(super) fn process_basic_result<S: Clone>(
     result: StartedBasicEffectResult<'_, S>,
     exec: &mut ExecutionState<'_, S>,
-) {
-    process_basic_outcome(result.emit_terminal(), exec);
+) -> BasicEffectCompletion {
+    process_basic_outcome(result.emit_terminal(), exec)
 }
 
-fn process_basic_outcome<S: Clone>(result: BasicEffectResult, exec: &mut ExecutionState<'_, S>) {
+fn process_basic_outcome<S: Clone>(
+    result: BasicEffectResult,
+    exec: &mut ExecutionState<'_, S>,
+) -> BasicEffectCompletion {
     let idx = exec.idx;
     let failed_indices = &mut *exec.failed_indices;
     let pending_refreshes = &mut *exec.pending_refreshes;
@@ -628,6 +643,7 @@ fn process_basic_outcome<S: Clone>(result: BasicEffectResult, exec: &mut Executi
                 },
                 &state,
             );
+            BasicEffectCompletion::Succeeded
         }
         BasicEffectResult::Failure { error: _, refresh } => {
             exec.accumulator
@@ -636,6 +652,7 @@ fn process_basic_outcome<S: Clone>(result: BasicEffectResult, exec: &mut Executi
             if let Some((id, identifier)) = &refresh {
                 queue_state_refresh(pending_refreshes, id, identifier);
             }
+            BasicEffectCompletion::Failed
         }
         BasicEffectResult::ResumeSuccess {
             completed,
@@ -655,6 +672,7 @@ fn process_basic_outcome<S: Clone>(result: BasicEffectResult, exec: &mut Executi
                 Applied::Observed(std::sync::Arc::new(completed.into_observed_create())),
                 &state,
             );
+            BasicEffectCompletion::Succeeded
         }
         BasicEffectResult::ClassifiedFailure {
             error: _,
@@ -665,6 +683,7 @@ fn process_basic_outcome<S: Clone>(result: BasicEffectResult, exec: &mut Executi
                 .mutate(|accumulated| accumulated.failure_count += 1);
             failed_indices.insert(idx);
             exec.accumulator.insert_unpublished(resource_id, applied);
+            BasicEffectCompletion::Failed
         }
         BasicEffectResult::PartialSuccess {
             completed: CompletedEffect { state, request },
@@ -693,12 +712,14 @@ fn process_basic_outcome<S: Clone>(result: BasicEffectResult, exec: &mut Executi
                 },
                 &state,
             );
+            BasicEffectCompletion::Succeeded
         }
         BasicEffectResult::Deleted { instance_key } => {
             exec.accumulator.mutate(|accumulated| {
                 accumulated.success_count += 1;
                 accumulated.successfully_deleted.insert(instance_key);
             });
+            BasicEffectCompletion::Deleted
         }
     }
 }
@@ -778,21 +799,18 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     );
                 }
             };
+            let request = CreateRequest::checked(resolved);
+            let accepted_request = AcceptedRequest::from_create_request(&request)
+                .with_resolved_desired_attributes(resolved_attrs.clone());
             let (attempt, cancellation) =
                 crate::provider::CreateAttempt::with_cancellation_report(resource.id.clone());
             started_effect.track_create_cancellation(cancellation);
-            match super::dispatch_create_with_attempt(
-                provider,
-                &resource.id,
-                CreateRequest::checked(resolved),
-                attempt,
-            )
-            .await
+            match super::dispatch_create_with_attempt(provider, &resource.id, request, attempt)
+                .await
             {
                 Ok(outcome) => {
                     let (state, request, diagnostic) =
-                        super::complete_create_for_writeback(outcome);
-                    let request = request.with_resolved_desired_attributes(resolved_attrs.clone());
+                        super::complete_create_for_writeback(outcome, accepted_request);
                     if let Some(diagnostic) = diagnostic {
                         BasicEffectResult::PartialSuccess {
                             completed: CompletedEffect {
@@ -891,8 +909,10 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     );
                 }
             };
-            let request = match ResumeCreateRequest::new(pending, CreateRequest::checked(resolved))
-            {
+            let create_request = CreateRequest::checked(resolved);
+            let accepted_request = AcceptedRequest::from_create_request(&create_request)
+                .with_resolved_desired_attributes(resolved_attrs.clone());
+            let request = match ResumeCreateRequest::new(pending, create_request) {
                 Ok(request) => request,
                 Err(error) => {
                     let error = error.to_string();
@@ -922,8 +942,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 }
                 Ok(ResumeOutcomeKind::Resent(outcome)) => {
                     let (state, request, diagnostic) =
-                        super::complete_create_for_writeback(*outcome);
-                    let request = request.with_resolved_desired_attributes(resolved_attrs.clone());
+                        super::complete_create_for_writeback(*outcome, accepted_request);
                     if let Some(diagnostic) = diagnostic {
                         BasicEffectResult::PartialSuccess {
                             completed: CompletedEffect {
@@ -1059,6 +1078,14 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             };
             for (key, new_value) in &resolved_resource.attributes {
                 if effective_changed.iter().any(|k| k == key) {
+                    continue;
+                }
+                // The plan already decided literal attributes. Reconsider a
+                // key only when resolution or provider normalization changed
+                // its desired value at apply time; otherwise raw provider
+                // defaults could turn an unrelated saved-plan update into a
+                // wider patch than the plan authorized.
+                if resolve_source.attributes.get(key) == Some(new_value) {
                     continue;
                 }
                 let type_info = schema.attributes.get(key).map(|attr| TypedAttr {
@@ -1249,7 +1276,8 @@ mod process_basic_result_tests {
 
     #[test]
     fn partial_success_records_state_and_diagnostic() {
-        let id = ResourceId::with_provider_identity("mock", "test.resource", "r1", None);
+        let resource = Resource::with_provider("mock", "test.resource", "r1", None);
+        let id = resource.id.clone();
         let state = State::existing(id.clone(), HashMap::new()).with_identifier("mock-id");
         let diagnostic = PartialReadDiagnostic::new(
             "mock partial create".to_string(),
@@ -1271,7 +1299,7 @@ mod process_basic_result_tests {
             BasicEffectResult::PartialSuccess {
                 completed: CompletedEffect {
                     state: Box::new(writeback_state),
-                    request: AcceptedRequest::create(),
+                    request: AcceptedRequest::create_for_test(),
                 },
                 resource_id: id.clone(),
                 diagnostic: diagnostic.clone(),

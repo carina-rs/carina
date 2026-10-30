@@ -289,20 +289,15 @@ fn validate_enumerates_deferred_for_body_over_same_config_read_attr() {
     // entirely absent from the list. It must now appear, tagged as
     // deferred, so the user can see the resource the planner intends
     // to manage instead of silent data loss.
-    // Pin the actual feature shape, not just loose substrings: the
-    // placeholder address form `{type}.{binding}[?]`, the
-    // `(deferred: <header>)` suffix, AND the `@ <file>:<line>`
-    // location (which keeps two distinct loops over the same iterable
-    // distinguishable) are the whole point of fix A — a regression
-    // that dropped any of them must fail this test.
+    // carina#4109: an unbound loop has no synthetic live binding. Pin the
+    // pending placeholder plus its authored source location instead.
     assert!(
         ids.iter().any(|id| id.contains("route53.RecordSet")
-            && id.contains("[?]")
-            && id.contains("(deferred:")
-            && id.contains(" @ ")),
+            && id.contains(".<pending>")
+            && id.contains("(deferred for at records.crn:1)")),
         "the for-loop body (aws.route53.RecordSet) over a same-config \
          read attribute must be enumerated as a deferred placeholder \
-         entry (`route53.RecordSet…[?] (deferred: … @ <file>:<line>)`); \
+         entry (`route53.RecordSet.<pending> (deferred for at <file>:<line>)`); \
          got: {:?}",
         ids
     );

@@ -565,6 +565,11 @@ impl<'a, S> TreeRenderContext<'a, S> {
         let attr_base = ATTR_BASE;
 
         let mut has_displayed_attrs = false;
+        let mut origin_note = String::new();
+        if let Some(origin) = effect.loop_origin() {
+            origin_note.push_str("  ");
+            origin.append_display_suffix(&mut origin_note);
+        }
 
         // --- Resource header line ---
         match effect {
@@ -588,23 +593,25 @@ impl<'a, S> TreeRenderContext<'a, S> {
                         );
                         writeln!(
                             self.out,
-                            "{}{} {} {}{}",
+                            "{}{} {} {}{}{}",
                             line_prefix,
                             id.display_type().cyan().bold(),
                             name_part.magenta().bold(),
                             replace_note.magenta(),
-                            moved_note.as_deref().unwrap_or("").magenta()
+                            moved_note.as_deref().unwrap_or("").magenta(),
+                            origin_note.dimmed(),
                         )
                         .unwrap();
                     } else {
                         writeln!(
                             self.out,
-                            "{}{} {} {}{}",
+                            "{}{} {} {}{}{}",
                             line_prefix,
                             id.display_type().cyan().bold(),
                             r.identity_str().magenta().bold(),
                             replace_note.magenta(),
-                            moved_note.as_deref().unwrap_or("").magenta()
+                            moved_note.as_deref().unwrap_or("").magenta(),
+                            origin_note.dimmed(),
                         )
                         .unwrap();
                     }
@@ -616,19 +623,21 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     );
                     writeln!(
                         self.out,
-                        "{}{} {}",
+                        "{}{} {}{}",
                         line_prefix,
                         r.id.display_type().cyan().bold(),
-                        name_part.white().bold()
+                        name_part.white().bold(),
+                        origin_note.dimmed(),
                     )
                     .unwrap();
                 } else {
                     writeln!(
                         self.out,
-                        "{}{} {}",
+                        "{}{} {}{}",
                         line_prefix,
                         r.id.display_type().cyan().bold(),
-                        r.identity_str().white().bold()
+                        r.identity_str().white().bold(),
+                        origin_note.dimmed(),
                     )
                     .unwrap();
                 }
@@ -640,11 +649,12 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 let since = format!("(in flight since {started_at})");
                 writeln!(
                     self.out,
-                    "{}{} {} {}",
+                    "{}{} {} {}{}",
                     line_prefix,
                     "resume create".cyan().bold(),
                     resource.id.human().to_string().cyan().bold(),
                     since.dimmed(),
+                    origin_note.dimmed(),
                 )
                 .unwrap();
             }
@@ -662,21 +672,23 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     );
                     writeln!(
                         self.out,
-                        "{}{} {}{}",
+                        "{}{} {}{}{}",
                         line_prefix,
                         id.display_type().cyan().bold(),
                         name_part.yellow().bold(),
-                        moved_note.as_deref().unwrap_or("").yellow()
+                        moved_note.as_deref().unwrap_or("").yellow(),
+                        origin_note.dimmed(),
                     )
                     .unwrap();
                 } else {
                     writeln!(
                         self.out,
-                        "{}{} {}{}",
+                        "{}{} {}{}{}",
                         line_prefix,
                         id.display_type().cyan().bold(),
                         to.identity_str().yellow().bold(),
-                        moved_note.as_deref().unwrap_or("").yellow()
+                        moved_note.as_deref().unwrap_or("").yellow(),
+                        origin_note.dimmed(),
                     )
                     .unwrap();
                 }
@@ -795,7 +807,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     has_displayed_attrs = true;
                 }
             }
-            Effect::Move { from, to } => {
+            Effect::Move { from, to, .. } => {
                 // Skip Move line display when an Update/Replace effect already exists
                 // for this target — those effects show "(moved from: ...)" annotation.
                 // Pure moves (no Update/Replace) must be displayed.
@@ -804,11 +816,12 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 }
                 writeln!(
                     self.out,
-                    "{}{} {} {}",
+                    "{}{} {} {}{}",
                     line_prefix,
                     to.display_type().cyan().bold(),
                     to.identity_str().yellow().bold(),
-                    format!("(moved from: {})", from.identity_str()).dimmed()
+                    format!("(moved from: {})", from.identity_str()).dimmed(),
+                    origin_note.dimmed(),
                 )
                 .unwrap();
             }
@@ -2049,7 +2062,7 @@ fn render_modified_fields(fields: &[ListOfMapsDiffField]) -> String {
 }
 
 pub fn format_effect<S>(effect: &Effect<S>) -> String {
-    match effect {
+    let mut rendered = match effect {
         Effect::Create(r) => format!("Create {}", r.id.human()),
         Effect::ResumeCreate { resource, .. } => {
             format!("Resume create {}", resource.id.human())
@@ -2091,7 +2104,7 @@ pub fn format_effect<S>(effect: &Effect<S>) -> String {
         Effect::Remove { id } => {
             format!("Remove {} from state", id.human())
         }
-        Effect::Move { from, to } => {
+        Effect::Move { from, to, .. } => {
             format!("Move {} -> {}", from.human(), to.human())
         }
         Effect::Wait {
@@ -2116,7 +2129,12 @@ pub fn format_effect<S>(effect: &Effect<S>) -> String {
                 payload.template.binding_description()
             )
         }
+    };
+    if let Some(origin) = effect.loop_origin() {
+        rendered.push_str("  ");
+        origin.append_display_suffix(&mut rendered);
     }
+    rendered
 }
 
 #[cfg(test)]

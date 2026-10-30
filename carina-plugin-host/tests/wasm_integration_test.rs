@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use carina_core::effect::PlanOp;
-use carina_core::executor::complete_create_for_writeback;
+use carina_core::executor::{AcceptedRequest, complete_create_for_writeback};
 use carina_core::provider::{
     AppliedIdentifier, BoxFuture, CreateFailure, CreateFailureKind, CreateObservation,
     CreateOutcome, CreateOutcomeKind, CreateRequest, DeleteRequest, InFlightCreate, Provider,
@@ -51,7 +51,8 @@ fn provider_resources(resources: Vec<Resource>) -> Vec<ProviderResource> {
 }
 
 fn create_state_for_writeback(outcome: CreateOutcome) -> State {
-    complete_create_for_writeback(outcome).0
+    let request = AcceptedRequest::create_for_test();
+    complete_create_for_writeback(outcome, request).0
 }
 
 fn lifted_saved_attrs(

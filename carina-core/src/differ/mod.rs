@@ -237,6 +237,7 @@ impl Orphan {
                     dependency_bindings: Default::default(),
                     module_source: None,
                     default_tag_keys: Default::default(),
+                    loop_provenance: Default::default(),
                     quoted_string_attrs: Default::default(),
                 };
             }
@@ -250,6 +251,7 @@ impl Orphan {
                     dependency_bindings: Default::default(),
                     module_source: None,
                     default_tag_keys: Default::default(),
+                    loop_provenance: Default::default(),
                     quoted_string_attrs: Default::default(),
                 };
             }
@@ -270,6 +272,7 @@ impl Orphan {
             dependency_bindings: dependency_bindings.clone(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: Default::default(),
         }
     }
@@ -835,7 +838,13 @@ pub(crate) use comparison::{
 /// Returns true when `binding` is one direct child emitted by the deferred-for
 /// template. List children use a numeric index (`items[0]`); map children use
 /// the canonical address spelling (`items.key` or `items['key with space']`).
-pub fn binding_matches_deferred_template(binding: &str, template_binding_name: &str) -> bool {
+pub fn binding_matches_deferred_template(
+    binding: &str,
+    target: &crate::parser::DeferredForTarget,
+) -> bool {
+    let Some(template_binding_name) = target.bound_binding() else {
+        return target.matches_legacy_binding(binding);
+    };
     let Some(suffix) = binding.strip_prefix(template_binding_name) else {
         return false;
     };
@@ -944,11 +953,13 @@ fn diff_existing_state(
 /// desired before comparison, preventing false diffs when AWS returns extra
 /// fields. Requiring the paired input prevents callers from silently dropping
 /// nested write-only provenance.
-/// If `prev_explicit` is provided, the actual-state side is projected through
-/// the authoring tree before comparison so server-side default fields the
-/// user never wrote do not surface as diffs (refs awscc#206). The same
-/// tree drives explicit-removal detection for attributes the user
-/// previously wrote but no longer mentions.
+/// If the resource has `prev_explicit`, the actual-state side is projected
+/// through that authoring context before comparison so server-side defaults
+/// the user never wrote do not surface as diffs (refs awscc#206 and
+/// carina-provider-awscc#511). Saved attributes anchor per-element list
+/// records when present; otherwise projection uses their legacy union. The
+/// authoring tree also drives explicit-removal detection for attributes the
+/// user previously wrote but no longer mentions.
 /// If `schema` is provided, type-aware comparison is used (e.g., Int/Float coercion,
 /// case-insensitive enum matching).
 ///

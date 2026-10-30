@@ -1803,6 +1803,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     let move_effect: Effect = Effect::Move {
         from: ResolvedResourceId::new(old_id.clone()),
         to: ResolvedResourceId::new(target_id.clone()),
+        origin: None,
     };
     let authority = move_effect
         .move_authority()
@@ -4339,6 +4340,7 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
     // is responsible for lifting routing from the matched Create.
     let state_blocks = vec![StateBlock::Import {
         to: StateBlockAddress::new("aws", "route53.RecordSet", "r.delegation_ns"),
+        to_span: None,
         id: Value::Concrete(ConcreteValue::String(
             "|hosted-zone-id|registry-dev.carina-rs.dev|NS"
                 .to_string()
@@ -4411,6 +4413,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
     let state_file = Some(state);
     let state_blocks = vec![StateBlock::Import {
         to: address.clone(),
+        to_span: None,
         id: Value::Concrete(ConcreteValue::String("provider-id".to_string().into())),
     }];
 
@@ -4513,6 +4516,7 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
     let state_file = Some(state);
     let state_blocks = vec![StateBlock::Import {
         to: StateBlockAddress::new("mock", "test.Resource", "shared"),
+        to_span: None,
         id: Value::Concrete(ConcreteValue::String("provider-id".to_string().into())),
     }];
 
@@ -5842,6 +5846,62 @@ fn resource_move_invariants_projected_state_read_preserves_dependency_bindings()
         saved.get(&parsed.resources[0].id),
         Some(&["private_rtb".to_string()].into_iter().collect()),
         "phase-1 metadata lookup must read the moved source row"
+    );
+}
+
+#[test]
+fn detect_moves_prefers_exact_legacy_before_heuristic() {
+    use carina_state::state::{ResourceState, StateFile};
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let mut parsed = parse(
+        "for subnet in ['subnet-a'] {\n\
+           awscc.ec2.SubnetRouteTableAssociation {\n\
+             route_table_id = 'rtb-private'\n\
+             subnet_id = subnet\n\
+           }\n\
+         }\n",
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("legacy-loop fixture parses");
+    let canonical = carina_core::value::canonicalize_resources_with_schemas(
+        &mut parsed.resources,
+        ctx.schemas(),
+    )
+    .expect("fixture canonicalizes");
+    assert!(compute_anonymous_identifiers_with_ctx(&ctx, canonical, &[]).is_empty());
+    let destination = parsed.resources[0]
+        .id
+        .identity_str()
+        .expect("anonymous destination assigned")
+        .to_string();
+
+    let exact_legacy = ResourceState::try_applied(
+        "ec2.SubnetRouteTableAssociation",
+        test_identity("_for0[0]"),
+        "awscc",
+        "exact-provider-id",
+    )
+    .expect("non-empty provider id");
+    let heuristic_name = "awscc_ec2_subnet_route_table_association_11111111";
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(exact_legacy)
+        .expect("exact legacy state row");
+    state_file
+        .upsert_resource(association_state(heuristic_name, "rtb-private", "subnet-a"))
+        .expect("heuristic candidate state row");
+    let state = Some(state_file);
+
+    let detected = DeferredForExpansionPrelude::new_for_test(&parsed, &state, ctx.schemas())
+        .expect("build expansion prelude")
+        .detect_moves(&ctx, &[], &[], &StateBlockClaims::empty())
+        .expect("automatic move detection succeeds");
+
+    assert_eq!(
+        detected_move_identity_pairs(&detected.automatic_moves.moves),
+        vec![("_for0[0]".to_string(), destination)],
+        "the exact attr-less legacy row must be projected before the heuristic can consume its destination",
     );
 }
 
@@ -7321,7 +7381,9 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
         header: "for item in pending.items".to_string(),
         resource_type: "test.thing".to_string(),
         attributes: vec![("rule".to_string(), rule)],
-        binding_name: "items".to_string(),
+        target: carina_core::parser::DeferredForTarget::Bound {
+            binding: "items".to_string(),
+        },
         iterable: Value::resource_ref("pending", "items", Vec::new()),
         binding: carina_core::parser::ForBinding::Simple("item".to_string()),
         template_resource,
@@ -7780,6 +7842,107 @@ fn anonymous_route_resource() -> Resource {
     resource
 }
 
+fn two_anonymous_loop_collision_file() -> carina_core::parser::ParsedFile {
+    carina_core::parser::parse_file(
+        "for subnet in ['same', 'same'] {\n  awscc.ec2.SubnetRouteTableAssociation { route_table_id = 'rtb-a' subnet_id = subnet }\n}\n\
+         for subnet in ['same', 'same'] {\n  awscc.ec2.SubnetRouteTableAssociation { route_table_id = 'rtb-b' subnet_id = subnet }\n}\n",
+        std::path::Path::new("aggregate.crn"),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("two-loop identity fixture parses")
+}
+
+fn assert_two_loop_identity_aggregate(error: AppError) {
+    let rendered = error.to_string();
+    assert!(
+        matches!(
+            error,
+            AppError::AnonymousIdentity(
+                carina_core::identifier::AnonymousIdentityError::Aggregate(_)
+            )
+        ),
+        "identity failures must retain the typed aggregate: {rendered}",
+    );
+    assert!(rendered.contains("at aggregate.crn:1"), "{rendered}");
+    assert!(rendered.contains("at aggregate.crn:4"), "{rendered}");
+}
+
+#[test]
+fn file_deferred_expansion_target_reports_all_anonymous_identity_errors() {
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let mut parsed = two_anonymous_loop_collision_file();
+
+    let error = <carina_core::parser::ParsedFile as DeferredExpansionTarget<
+        carina_core::parser::ParsedExportParam,
+    >>::compute_anonymous_identifiers(&mut parsed, &ctx, &[])
+    .expect_err("both loop collisions must fail identity assignment");
+
+    assert_two_loop_identity_aggregate(error);
+}
+
+#[test]
+fn canonical_pair_deferred_expansion_target_reports_all_anonymous_identity_errors() {
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let parsed = two_anonymous_loop_collision_file();
+    let mut pair = canonical_pair(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        ctx.schemas(),
+    );
+
+    let error = <CanonicalResourcePair<carina_core::parser::ParsedExportParam> as DeferredExpansionTarget<
+        carina_core::parser::ParsedExportParam,
+    >>::compute_anonymous_identifiers(&mut pair, &ctx, &[])
+    .expect_err("both pair-owned loop collisions must fail identity assignment");
+
+    assert_two_loop_identity_aggregate(error);
+}
+
+#[test]
+fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let parsed = two_anonymous_loop_collision_file();
+    let (mut resources, _) = build_override_aware_pair_for_test(
+        canonical_unresolved(parsed.resources, ctx.schemas()),
+        None::<&StateFile>,
+        LivePreApplyInputs {
+            managed: &[],
+            compositions: &[],
+            managed_current: &HashMap::new(),
+            data_source_values: &DataSourceValues::empty(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        },
+    )
+    .expect("identity fixture has no unresolved references");
+    let claims = StateBlockClaims::empty();
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
+
+    let result = reconcile_late_anonymous_identities(
+        &ctx,
+        LateAnonymousIdentityInputs {
+            resources: &mut resources,
+            addressed: &mut addressed,
+            data_sources: &[],
+            state_file: None,
+            state_block_claims: &claims,
+            providers: &[],
+        },
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("late identity assignment must retain both loop failures"),
+    };
+
+    assert_two_loop_identity_aggregate(error);
+}
+
 #[test]
 fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas() {
     let ctx = WiringContext::new_for_test(vec![], &[]);
@@ -7964,6 +8127,100 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
     assert!(
         addressed.orphans.contains_key(other_orphan_id.as_inner()),
         "the other matching row must remain an orphan and therefore a Delete candidate",
+    );
+}
+
+#[test]
+fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
+    use carina_state::state::{ResourceState, StateFile};
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let parsed = parse(
+        "let upstream = upstream_state { source = '../upstream' }\n\
+         for key, subnet in upstream.subnets {\n\
+           awscc.ec2.SubnetRouteTableAssociation {\n\
+             route_table_id = 'rtb-private'\n\
+             subnet_id = subnet\n\
+           }\n\
+         }\n",
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("deferred map loop parses");
+    let children = carina_core::parser::expand_deferred_children(
+        &parsed.deferred_for_expressions[0],
+        &Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "alpha".to_string(),
+            Value::Concrete(ConcreteValue::String("subnet-a".into())),
+        )]))),
+        carina_core::resource::AccessMissPolicy::Error,
+    )
+    .expect("planning-time upstream map expands");
+    assert_eq!(children[0].id.identity_str(), None);
+
+    let (mut resources, _) = build_override_aware_pair_for_test(
+        canonical_unresolved(children, ctx.schemas()),
+        None::<&StateFile>,
+        LivePreApplyInputs {
+            managed: &[],
+            compositions: &[],
+            managed_current: &HashMap::new(),
+            data_source_values: &DataSourceValues::empty(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        },
+    )
+    .expect("expanded deferred child has no unresolved references");
+
+    let legacy = ResourceState::try_applied(
+        "ec2.SubnetRouteTableAssociation",
+        test_identity("_subnets.alpha"),
+        "awscc",
+        "legacy-provider-id",
+    )
+    .expect("non-empty provider id");
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(legacy)
+        .expect("legacy deferred row");
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: state_file
+            .build_orphans(&HashSet::new())
+            .into_plan_orphans(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
+    let claims = StateBlockClaims::empty();
+
+    reconcile_late_anonymous_identities(
+        &ctx,
+        LateAnonymousIdentityInputs {
+            resources: &mut resources,
+            addressed: &mut addressed,
+            data_sources: &[],
+            state_file: Some(&state_file),
+            state_block_claims: &claims,
+            providers: &[],
+        },
+    )
+    .expect("late anonymous identity and exact migration resolve");
+
+    let destination = resources.resources()[0]
+        .id
+        .identity_str()
+        .expect("late identity assigned")
+        .to_string();
+    assert_eq!(
+        addressed
+            .moved_pairs
+            .iter()
+            .map(|(from, to)| (
+                from.identity_str().to_string(),
+                to.identity_str().to_string(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![("_subnets.alpha".to_string(), destination)],
     );
 }
 
@@ -8532,25 +8789,28 @@ mod read_with_retry_identifier_tests {
 // ---------------------------------------------------------------------
 #[test]
 fn deferred_template_binding_match_requires_single_numeric_index() {
+    let target = carina_core::parser::DeferredForTarget::Bound {
+        binding: "validation_records".to_string(),
+    };
     assert!(binding_matches_deferred_template(
         "validation_records[0]",
-        "validation_records"
+        &target
     ));
     assert!(binding_matches_deferred_template(
         "validation_records[42]",
-        "validation_records"
+        &target
     ));
     assert!(!binding_matches_deferred_template(
         "validation_records[]",
-        "validation_records"
+        &target
     ));
     assert!(!binding_matches_deferred_template(
         "validation_records[abc]",
-        "validation_records"
+        &target
     ));
     assert!(!binding_matches_deferred_template(
         "validation_records[0][1]",
-        "validation_records"
+        &target
     ));
 }
 
@@ -8565,7 +8825,9 @@ fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpressio
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
         attributes: vec![],
-        binding_name: "validation_records".to_string(),
+        target: carina_core::parser::DeferredForTarget::Bound {
+            binding: "validation_records".to_string(),
+        },
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
@@ -8628,7 +8890,7 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
         template.root_bindings(),
         std::collections::BTreeSet::from(["cert".to_string()])
     );
-    assert_eq!(template.binding_name, "validation_records");
+    assert_eq!(template.target.bound_binding(), Some("validation_records"));
     assert_eq!(deletes.len(), 1);
     assert_eq!(
         deletes[0].id,
@@ -8654,6 +8916,111 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
             .iter()
             .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
         "absorbed target must not also remain as DeferredCreate"
+    );
+}
+
+fn unbound_deferred_test_target() -> DeferredCreateTarget {
+    let parsed = parse(
+        "let upstream = upstream_state { source = '../upstream' }\n\
+         for value in upstream.accounts {\n\
+           mock.test.Child { identity_input = value }\n\
+         }\n",
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("unbound deferred loop parses");
+    DeferredCreateTarget::from_deferred(&parsed.deferred_for_expressions[0])
+        .expect("deferred target has a system identity")
+}
+
+fn delete_effect_for_unbound_child(
+    identity: &str,
+    binding: Option<&str>,
+) -> (carina_core::resource::ResolvedResourceId, Effect) {
+    let id = ResolvedResourceId::with_provider_identity(
+        "mock",
+        "test.Child",
+        carina_core::resource::ResourceIdentity::try_from(identity.to_string())
+            .expect("test identity is non-empty"),
+        None,
+    );
+    let effect = Effect::Delete {
+        id: id.clone(),
+        identifier: crate::fixture_applied_identifier("old-child"),
+        generation: carina_core::effect::EffectGeneration::Current,
+        directives: Directives::default(),
+        binding: binding.map(str::to_string),
+        dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: std::collections::HashSet::new(),
+    };
+    (id, effect)
+}
+
+#[test]
+fn unbound_deferred_create_absorbs_exact_legacy_current_delete() {
+    let target = unbound_deferred_test_target();
+    let (legacy_id, legacy_delete) =
+        delete_effect_for_unbound_child("_accounts.alpha", Some("_accounts.alpha"));
+    let mut plan = Plan::new();
+    plan.add(legacy_delete);
+
+    add_deferred_create_effects(&mut plan, &[target]);
+
+    let payload = plan
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::DeferredReplace(payload) => Some(payload),
+            _ => None,
+        })
+        .expect("the exact legacy row must be owned by DeferredReplace");
+    assert_eq!(payload.deletes.len(), 1);
+    assert_eq!(payload.deletes[0].id, legacy_id);
+    assert_eq!(
+        payload.deletes[0].binding.as_deref(),
+        Some("_accounts.alpha")
+    );
+    assert!(
+        plan.effects()
+            .iter()
+            .all(|effect| !matches!(effect, Effect::Delete { .. })),
+        "the legacy delete must not race the runtime recreate",
+    );
+}
+
+#[test]
+fn unbound_deferred_create_keeps_unrelated_anonymous_delete_plain() {
+    let target = unbound_deferred_test_target();
+    let anonymous_id = ResolvedResourceId::with_provider_identity(
+        "mock",
+        "test.Child",
+        "mock_test_child_deadbeef",
+        None,
+    );
+    let (_, anonymous_delete) = delete_effect_for_unbound_child("mock_test_child_deadbeef", None);
+    let mut plan = Plan::new();
+    plan.add(anonymous_delete);
+
+    add_deferred_create_effects(&mut plan, &[target]);
+
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
+        "an unrelated anonymous row does not belong to this loop",
+    );
+    assert!(
+        plan
+        .effects()
+        .iter()
+            .any(|effect| matches!(effect, Effect::Delete { id, binding: None, .. } if id == &anonymous_id)),
+        "the unrelated anonymous row must remain a standalone Delete",
+    );
+    assert!(
+        plan.effects()
+            .iter()
+            .all(|effect| !matches!(effect, Effect::DeferredReplace(_))),
+        "an unrelated anonymous row must not be absorbed",
     );
 }
 
@@ -8882,6 +9249,7 @@ mod expand_same_config_deferred_for_tests {
         let mut parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
         let state_file = None;
         let schemas = SchemaRegistry::new();
+        let identity_context = WiringContext::new_for_test(Vec::new(), &[]);
         let prelude = DeferredForExpansionPrelude::new_for_test(&parsed, &state_file, &schemas)
             .expect("build expansion prelude");
         let prepared = prelude
@@ -8899,6 +9267,7 @@ mod expand_same_config_deferred_for_tests {
                 &HashMap::new(),
                 DeferredForWarningPolicy::Suppress,
                 &ProviderRouter::new(),
+                &identity_context,
             )
             .expect("deferred-for expansion should succeed");
         assert!(
@@ -9475,7 +9844,7 @@ mod expand_same_config_deferred_for_tests {
                 validation_method = "DNS"
             }
 
-            for (_, opt) in cert.domain_validation_options {
+            let records = for (_, opt) in cert.domain_validation_options {
                 aws.route53.RecordSet {
                     name             = opt.resource_record.name
                     type             = "CNAME"
@@ -9590,7 +9959,7 @@ mod expand_same_config_deferred_for_tests {
                 validation_method = "DNS"
             }
 
-            for (_, opt) in cert.domain_validation_options {
+            let records = for (_, opt) in cert.domain_validation_options {
                 aws.route53.RecordSet {
                     name             = opt.resource_record.name
                     type             = "CNAME"
@@ -9712,7 +10081,7 @@ mod expand_same_config_deferred_for_tests {
                 validation_method = "DNS"
             }
 
-            for (_, opt) in cert.domain_validation_options {
+            let records = for (_, opt) in cert.domain_validation_options {
                 aws.route53.RecordSet {
                     name             = opt.resource_record.name
                     type             = "CNAME"

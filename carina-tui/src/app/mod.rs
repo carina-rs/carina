@@ -753,10 +753,26 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                     r.id().identity_display().to_string()
                 }
             };
+            let mut name_part = name_part;
+            if let Some(origin) = effect.loop_origin() {
+                name_part.push_str("  ");
+                origin.append_display_suffix(&mut name_part);
+            }
 
             nodes[idx].resource_type = display_type.clone();
             nodes[idx].name_part = name_part.clone();
             nodes[idx].effect_label = format!("{} {}", display_type, name_part);
+        } else if let Effect::Move { to, .. } = effect {
+            let display_type = to.display_type();
+            let mut name_part = to.identity_str().to_string();
+            if let Some(origin) = effect.loop_origin() {
+                name_part.push_str("  ");
+                origin.append_display_suffix(&mut name_part);
+                nodes[idx].effect_label.push_str("  ");
+                origin.append_display_suffix(&mut nodes[idx].effect_label);
+            }
+            nodes[idx].resource_type = display_type.clone();
+            nodes[idx].name_part = name_part;
         } else if let Effect::Delete {
             id,
             identifier,
@@ -993,7 +1009,7 @@ fn effect_to_node_with_rows(
             depth: 0,
             parent: None,
         },
-        Effect::Move { from, to } => TreeNode {
+        Effect::Move { from, to, .. } => TreeNode {
             effect_label: format!("{} -> {}", from.human(), to.human()),
             resource_type: to.display_type(),
             name_part: to.identity_str().to_string(),

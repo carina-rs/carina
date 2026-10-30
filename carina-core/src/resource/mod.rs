@@ -5,8 +5,12 @@
 //! yet" forms.
 //! `notes/specs/2026-10-29-unknown-forms-current-state.md` explains each form,
 //! which stage produces and consumes it, and how validation treats it.
+//!
+//! Legacy loop addresses remain crate-private migration provenance rather than
+//! public live resource identities.
 
 mod enum_value;
+mod loop_origin;
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -35,6 +39,11 @@ pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
 };
 pub(crate) use enum_value::{enum_value_comparison_key, enum_values_equal};
+pub use loop_origin::{
+    ForLoopElement, LoopElementOrigin, LoopKind, LoopOriginKind, LoopProvenance, LoopSource,
+    UnboundLoopTemplate,
+};
+pub(crate) use loop_origin::{LegacyLoopAddress, LoopModulePrefixOrigin};
 
 #[derive(Clone, Copy)]
 pub struct EnumAttr<'a> {
@@ -5752,12 +5761,9 @@ fn merge_lists(
     // cannot transfer a pending nested removal to a uniquely identified list
     // element. Merging individual saved elements here would fill the removed
     // child back in and hide the very diff the fallback represents.
-    let aligned_elements = match prior_explicit {
+    let stored_elements = match prior_explicit {
         ExplicitFields::WholeValue { .. } => return desired.to_vec(),
-        ExplicitFields::ListElements { elements }
-            if elements.len() == projected_saved.len()
-                && raw_saved.len() == projected_saved.len() =>
-        {
+        ExplicitFields::ListElements { elements } if elements.len() == raw_saved.len() => {
             Some(elements)
         }
         ExplicitFields::Leaf
@@ -5770,6 +5776,16 @@ fn merge_lists(
     let item_type = list_element_type(attr_type, defs);
     let projected_pairs = pair_list_elements(desired, projected_saved, item_type, defs, context);
     let raw_pairs = pair_list_elements(desired, raw_saved, item_type, defs, context);
+    let projected_origins = if projected_saved.len() == raw_saved.len() {
+        // Projection preserves order when it retains every stored element.
+        // Keeping the direct index mapping also preserves the established
+        // conservative behavior for indistinguishable duplicate peers.
+        (0..projected_saved.len())
+            .map(ListElementPairing::Unique)
+            .collect()
+    } else {
+        pair_list_elements_with_uniqueness(projected_saved, raw_saved, item_type, defs, context)
+    };
 
     projected_pairs
         .into_iter()
@@ -5779,15 +5795,28 @@ fn merge_lists(
             |(desired_index, (projected_index, raw_index))| match projected_index {
                 Some(projected_index) => {
                     // Writeback assigned `elements` using raw-list pairing, while the legacy value
-                    // merge pairs against the projected list. Only matching indices corroborate the
-                    // authored claim; disagreement is uncertainty and must stay conservative.
-                    let authoring = aligned_elements
-                        .filter(|_| raw_index == Some(projected_index))
-                        .map(|elements| &elements[projected_index])
+                    // merge pairs against a projection that may have removed server-added
+                    // elements. Resolve the projected element back to its stored index and require
+                    // the independent raw pairing to corroborate that identity. Ambiguity or
+                    // disagreement is uncertainty and must stay conservative.
+                    let stored_index = match projected_origins[projected_index] {
+                        ListElementPairing::Unique(stored_index)
+                            if raw_index == Some(stored_index) =>
+                        {
+                            Some(stored_index)
+                        }
+                        ListElementPairing::Unique(_)
+                        | ListElementPairing::Ambiguous
+                        | ListElementPairing::Unmatched => None,
+                    };
+                    let authoring = stored_index
+                        .and_then(|stored_index| {
+                            stored_elements.map(|elements| &elements[stored_index])
+                        })
                         .unwrap_or(&ExplicitFields::Unrecorded);
                     let projected_value = &projected_saved[projected_index];
-                    let saved_views = raw_saved
-                        .get(projected_index)
+                    let saved_views = stored_index
+                        .and_then(|stored_index| raw_saved.get(stored_index))
                         .map(|raw_value| SavedValueViews::new(projected_value, raw_value))
                         .unwrap_or_else(|| SavedValueViews::same(projected_value));
                     merge_with_saved(
@@ -5995,7 +6024,14 @@ impl ModuleCallSource {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SavedModuleSource {
     Root,
-    Module { name: String, instance: String },
+    Module {
+        name: String,
+        instance: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_description: Option<String>,
+    },
 }
 
 /// Source marker for resources after module provenance has been deliberately
@@ -6007,14 +6043,81 @@ pub enum SavedModuleSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderModuleSource {}
 
+/// Module metadata needed while assigning an anonymous resource identity.
+///
+/// Live and saved plans carry different source types, but apply-time deferred
+/// expansion must derive the same instance-qualified identity from either.
+#[doc(hidden)]
+pub trait AnonymousIdentityModuleSource {
+    fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity>;
+
+    fn anonymous_scope(&self) -> Option<(String, String)>;
+}
+
+impl AnonymousIdentityModuleSource for ModuleSource {
+    fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity> {
+        self.outer_instance_identity()
+    }
+
+    fn anonymous_scope(&self) -> Option<(String, String)> {
+        self.identity_scope()
+            .map(|scope| (scope.key().to_string(), scope.description()))
+    }
+}
+
+impl AnonymousIdentityModuleSource for SavedModuleSource {
+    fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity> {
+        match self {
+            Self::Root => None,
+            Self::Module { instance, .. } => ResourceIdentity::try_from(instance.clone()).ok(),
+        }
+    }
+
+    fn anonymous_scope(&self) -> Option<(String, String)> {
+        match self {
+            Self::Root => None,
+            Self::Module {
+                instance,
+                scope_key,
+                scope_description,
+                ..
+            } => Some((
+                scope_key.clone().unwrap_or_else(|| instance.clone()),
+                scope_description
+                    .clone()
+                    .unwrap_or_else(|| format!("module instance '{instance}'")),
+            )),
+        }
+    }
+}
+
+impl AnonymousIdentityModuleSource for ProviderModuleSource {
+    fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity> {
+        match *self {}
+    }
+
+    fn anonymous_scope(&self) -> Option<(String, String)> {
+        match *self {}
+    }
+}
+
 impl From<&ModuleSource> for SavedModuleSource {
     fn from(source: &ModuleSource) -> Self {
         match source {
             ModuleSource::Root => Self::Root,
-            ModuleSource::Module(module) => Self::Module {
-                name: module.name.clone(),
-                instance: module.instance.clone(),
-            },
+            ModuleSource::Module(module) => {
+                let direct_description = format!("module instance '{}'", module.instance);
+                let scope_key =
+                    (module.scope.key() != module.instance).then(|| module.scope.key().to_string());
+                let description = module.scope.description();
+                let scope_description = (description != direct_description).then_some(description);
+                Self::Module {
+                    name: module.name.clone(),
+                    instance: module.instance.clone(),
+                    scope_key,
+                    scope_description,
+                }
+            }
         }
     }
 }
@@ -6180,6 +6283,12 @@ pub struct Resource<S = ModuleSource> {
     /// after a plan round-trip, but it never enters persisted provider state.
     #[serde(default, skip_serializing_if = "DefaultTagKeys::is_empty")]
     pub default_tag_keys: DefaultTagKeys,
+    /// Source provenance for resources emitted by an unbound `for` or `if`.
+    ///
+    /// This host-owned metadata is serialized in saved plans for migration and
+    /// display, but never enters provider payloads or persisted state rows.
+    #[serde(default, skip_serializing_if = "LoopProvenance::is_empty")]
+    pub loop_provenance: LoopProvenance,
     /// Top-level attribute names whose value was written as a quoted
     /// string literal (`attr = "..."`) in the source `.crn`.
     ///
@@ -6225,6 +6334,7 @@ impl From<Resource> for SavedResource {
             dependency_bindings,
             module_source,
             default_tag_keys,
+            loop_provenance,
             quoted_string_attrs,
         } = resource;
         Self {
@@ -6236,6 +6346,7 @@ impl From<Resource> for SavedResource {
             dependency_bindings,
             module_source: module_source.as_ref().map(SavedModuleSource::from),
             default_tag_keys,
+            loop_provenance,
             quoted_string_attrs,
         }
     }
@@ -6252,6 +6363,7 @@ impl Resource {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: DefaultTagKeys::default(),
+            loop_provenance: LoopProvenance::default(),
             quoted_string_attrs: HashSet::new(),
         }
     }
@@ -6327,6 +6439,7 @@ impl<S> Resource<S> {
             dependency_bindings,
             module_source: _,
             default_tag_keys,
+            loop_provenance: _,
             quoted_string_attrs,
         } = self;
         ProviderResource {
@@ -6338,6 +6451,7 @@ impl<S> Resource<S> {
             dependency_bindings,
             module_source: None,
             default_tag_keys,
+            loop_provenance: LoopProvenance::default(),
             quoted_string_attrs,
         }
     }
@@ -6346,6 +6460,7 @@ impl<S> Resource<S> {
     /// saved module provenance already attached to this resource.
     pub(crate) fn apply_provider_resource(&mut self, provider: ProviderResource) {
         let module_source = self.module_source.take();
+        let loop_provenance = std::mem::take(&mut self.loop_provenance);
         let Resource {
             id,
             attributes,
@@ -6355,6 +6470,7 @@ impl<S> Resource<S> {
             dependency_bindings,
             module_source: _,
             default_tag_keys,
+            loop_provenance: _,
             quoted_string_attrs,
         } = provider;
         *self = Self {
@@ -6366,6 +6482,7 @@ impl<S> Resource<S> {
             dependency_bindings,
             module_source,
             default_tag_keys,
+            loop_provenance,
             quoted_string_attrs,
         };
     }

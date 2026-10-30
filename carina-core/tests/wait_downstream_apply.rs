@@ -48,7 +48,8 @@ use carina_core::resource::{
     ConcreteValue, Current, PlanInputCurrent, ResolvedResource, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{
-    ResourceSchema, SchemaRegistry, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, ValidatedConfigSchema,
+    ValidatedProviderSchemaWitness,
 };
 
 fn empty_lifted_saved_attrs() -> carina_core::provider::LiftedSavedAttrs {
@@ -96,12 +97,19 @@ fn fixture_schemas(resources: &[Resource]) -> SchemaRegistry {
         })
         .collect::<std::collections::BTreeSet<_>>();
     for (provider, resource_type) in owners {
+        let mut schema = ResourceSchema::new(resource_type.clone());
+        if resource_type == "acm.Certificate" {
+            schema = schema
+                .attribute(
+                    AttributeSchema::provider_populated("status", AttributeType::string()).build(),
+                )
+                .attribute(
+                    AttributeSchema::provider_populated("certificate_arn", AttributeType::string())
+                        .build(),
+                );
+        }
         let witness = ValidatedProviderSchemaWitness::new(
-            vec![
-                ResourceSchema::new(resource_type)
-                    .validate()
-                    .expect("fixture schema is valid"),
-            ],
+            vec![schema.validate().expect("fixture schema is valid")],
             ValidatedConfigSchema::default(),
             Default::default(),
         )

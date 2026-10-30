@@ -1717,6 +1717,7 @@ pub(crate) fn build_orphan_resource(
         dependency_bindings: rs.dependency_bindings.clone(),
         module_source: None,
         default_tag_keys: DefaultTagKeys::default(),
+        loop_provenance: Default::default(),
         quoted_string_attrs: HashSet::new(),
     }
 }
@@ -2001,7 +2002,9 @@ mod apply_state_save_tests {
                 header: "for opt in cert.domain_validation_options".to_string(),
                 resource_type: "aws.route53.Record".to_string(),
                 attributes: Vec::new(),
-                binding_name: "validation_records".to_string(),
+                target: carina_core::parser::DeferredForTarget::Bound {
+                    binding: "validation_records".to_string(),
+                },
                 iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource: Resource::with_provider(
@@ -3708,6 +3711,7 @@ mod apply_state_save_tests {
         let move_effect = Effect::Move {
             from: ResolvedResourceId::new(source.clone()),
             to: ResolvedResourceId::new(destination.clone()),
+            origin: None,
         };
         let authority = move_effect
             .move_authority()
@@ -3809,6 +3813,7 @@ mod apply_state_save_tests {
         plan.add(Effect::Move {
             from: ResolvedResourceId::new(source.clone()),
             to: ResolvedResourceId::new(destination.clone()),
+            origin: None,
         });
 
         // Crash-shaped checkpoint: the provider Update on `b` has completed,
@@ -4088,6 +4093,7 @@ mod apply_state_save_tests {
         plan.add(Effect::Move {
             from: ResolvedResourceId::new(source.clone()),
             to: ResolvedResourceId::new(destination.clone()),
+            origin: None,
         });
         let saved = build_state_after_apply(
             ApplyStateSave {
@@ -4629,7 +4635,9 @@ mod apply_state_save_tests {
                 header: "for opt in cert.domain_validation_options".to_string(),
                 resource_type: "aws.route53.Record".to_string(),
                 attributes: vec![],
-                binding_name: "validation_records".to_string(),
+                target: carina_core::parser::DeferredForTarget::Bound {
+                    binding: "validation_records".to_string(),
+                },
                 iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource: Resource::with_provider(
@@ -4709,7 +4717,9 @@ mod apply_state_save_tests {
                 header: "for opt in cert.domain_validation_options".to_string(),
                 resource_type: "aws.route53.Record".to_string(),
                 attributes: vec![],
-                binding_name: "validation_records".to_string(),
+                target: carina_core::parser::DeferredForTarget::Bound {
+                    binding: "validation_records".to_string(),
+                },
                 iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
@@ -6800,6 +6810,7 @@ mod apply_state_save_tests {
                 "validation_records[1]",
                 None,
             )),
+            origin: None,
         });
         let current_states = HashMap::new();
         let applied_states = HashMap::from([(id.clone(), complete_create(applied_state))]);

@@ -14,8 +14,8 @@ pub use carina_core::provider::PreviousSecretHashAuthority;
 use carina_core::provider::{
     AppliedIdentifier, CreateObservation, EmptyAppliedIdentifier, InFlightCreate,
     InFlightPersistence, NestedWriteOnlyRecord, ObservedCreate, PersistedAttributes,
-    PersistedAttributesError, RawSavedAttrs, Sent, SentRecord, StateRowInFlightCreate,
-    StateRowUnknownCreateOutcome, StateTransformMap, UnknownCreateOutcome,
+    PersistedAttributesError, RawSavedAttrs, Sent, SentDesiredAttributes, SentRecord,
+    StateRowInFlightCreate, StateRowUnknownCreateOutcome, StateTransformMap, UnknownCreateOutcome,
     merge_previous_secret_hashes_into_provider_value, previous_hash,
 };
 pub use carina_core::resource::DeposedKey;
@@ -386,10 +386,11 @@ pub enum RowBasis<'a> {
     Carried,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum DesiredAuthoringBasis {
-    AppliedDesired,
-    CarryPrior,
+#[derive(Debug, Clone)]
+enum DesiredAuthoringBasis<'a> {
+    Sent(SentDesiredAttributes<'a>),
+    DesiredRead,
+    CarriedRead,
 }
 
 /// Published values read without decoding managed resource rows.
@@ -2036,7 +2037,7 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             let pre_outcome_unknown_migration = migrated_v18
                 .as_deref()
                 .unwrap_or(pre_partial_read_migration);
-            let migrated_v19 = if v == 19 {
+            let migrated_v19 = if v <= 19 {
                 Some(migrate_v19_create_outcome_unknown(
                     pre_outcome_unknown_migration,
                 )?)
@@ -2366,9 +2367,8 @@ pub struct ResourceState {
     ///
     /// Replaces the flat `desired_keys: Vec<String>` (state ≤ v5);
     /// the v5 reader lifts each top-level key to a `Leaf` child of
-    /// the root `Struct`. A later applied/imported desired write rebuilds a
-    /// full tree from the resource's authored `Value` via the aligned
-    /// `carina_core::explicit::build_from_resource_for_stored_values`.
+    /// the root `Struct`. Later writes rebuild a full tree from the resource's
+    /// authored `Value` via an evidence-specific aligned builder.
     #[serde(default, skip_serializing_if = "is_empty_explicit")]
     pub explicit: ExplicitFields,
     /// The binding name for this resource (from `let` bindings in DSL).
@@ -3177,7 +3177,7 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         stored_attributes: &HashMap<String, Value>,
         schema: Option<&ResourceSchema>,
-        authoring_basis: DesiredAuthoringBasis,
+        authoring_basis: DesiredAuthoringBasis<'_>,
         comparison: &ComparisonContext<'_>,
     ) {
         if let Some(existing) = existing {
@@ -3190,17 +3190,34 @@ impl ResourceState {
         }
         self.prefixes = resource.prefixes.clone();
         self.explicit = match authoring_basis {
-            // An empty Struct is a complete record that the applied desired
-            // resource authored no attributes.
-            DesiredAuthoringBasis::AppliedDesired => {
-                explicit::build_from_resource_for_stored_values(
+            DesiredAuthoringBasis::Sent(sent_desired) => {
+                let prior_stored_attributes = existing.map(|existing| {
+                    existing
+                        .persisted_attributes()
+                        .map(PersistedAttributes::to_values)
+                        .unwrap_or_default()
+                });
+                let prior_stored_authoring = existing
+                    .zip(prior_stored_attributes.as_ref())
+                    .map(|(existing, attributes)| (attributes, &existing.explicit));
+                explicit::build_from_resource_for_stored_values_after_send(
+                    resource,
+                    prior_stored_authoring,
+                    stored_attributes,
+                    &sent_desired,
+                    schema,
+                    comparison,
+                )
+            }
+            DesiredAuthoringBasis::DesiredRead => {
+                explicit::build_from_read_resource_for_stored_values(
                     resource,
                     stored_attributes,
                     schema,
                     comparison,
                 )
             }
-            DesiredAuthoringBasis::CarryPrior => Self::carried_explicit_for_stored_values(
+            DesiredAuthoringBasis::CarriedRead => Self::carried_explicit_for_stored_values(
                 resource,
                 existing,
                 stored_attributes,
@@ -3223,7 +3240,7 @@ impl ResourceState {
         comparison: &ComparisonContext<'_>,
     ) -> ExplicitFields {
         let Some(existing) = existing else {
-            return explicit::build_from_resource_for_stored_values(
+            return explicit::build_from_read_resource_for_stored_values(
                 resource,
                 stored_attributes,
                 schema,
@@ -3262,6 +3279,7 @@ impl ResourceState {
             .resolved_desired_attributes()
             .map(|attributes| resource_with_secret_shape_union(resource, attributes));
         let writeback_resource = applied_desired.as_ref().unwrap_or(resource);
+        let sent_desired = created.sent_desired_attributes_for(writeback_resource);
         let previous = existing.and_then(ResourceState::persisted_attributes);
         let no_observed_values = HashMap::new();
         let (observed_values, pending_reread) = match created.observation() {
@@ -3350,12 +3368,15 @@ impl ResourceState {
             nested_write_only,
             partial_read,
         };
+        let authoring_basis = sent_desired
+            .map(DesiredAuthoringBasis::Sent)
+            .unwrap_or(DesiredAuthoringBasis::CarriedRead);
         row.populate_desired_metadata(
             resource,
             existing,
             &stored_attributes,
             schema,
-            DesiredAuthoringBasis::AppliedDesired,
+            authoring_basis,
             comparison,
         );
         Ok(row)
@@ -3374,7 +3395,7 @@ impl ResourceState {
         preferred_hashes: Option<&PersistedAttributes>,
         comparison: &ComparisonContext<'_>,
     ) -> Result<Self, ResourceStateEncodingError> {
-        let (persisted, authoring_basis) = match pending.persistence() {
+        let (persisted, sent_desired) = match pending.persistence() {
             InFlightPersistence::Persisted => {
                 if let Some(existing) = existing {
                     let mut row = existing.clone();
@@ -3401,7 +3422,7 @@ impl ResourceState {
                     // Only a legacy unknown record can be safely seeded from
                     // the desired resource.
                     if matches!(row.explicit, ExplicitFields::Unrecorded) {
-                        row.explicit = explicit::build_from_resource_for_stored_values(
+                        row.explicit = explicit::build_from_read_resource_for_stored_values(
                             resource,
                             &HashMap::new(),
                             schema,
@@ -3410,7 +3431,7 @@ impl ResourceState {
                     }
                     return Ok(row);
                 }
-                (pending.clone(), DesiredAuthoringBasis::CarryPrior)
+                (pending.clone(), None)
             }
             InFlightPersistence::Fresh(fresh) => {
                 let selected = Self::selected_sent_attributes(
@@ -3431,7 +3452,7 @@ impl ResourceState {
                 });
                 (
                     fresh.persist(write_only, secrets),
-                    DesiredAuthoringBasis::AppliedDesired,
+                    Some(fresh.sent_desired_attributes_for(resource)),
                 )
             }
         };
@@ -3442,6 +3463,9 @@ impl ResourceState {
             resource.id.provider.clone(),
         );
         row.current = CurrentInstance::CreateInFlight { pending: persisted };
+        let authoring_basis = sent_desired
+            .map(DesiredAuthoringBasis::Sent)
+            .unwrap_or(DesiredAuthoringBasis::CarriedRead);
         row.populate_desired_metadata(
             resource,
             existing,
@@ -3480,7 +3504,7 @@ impl ResourceState {
             existing,
             &HashMap::new(),
             schema,
-            DesiredAuthoringBasis::AppliedDesired,
+            DesiredAuthoringBasis::DesiredRead,
             comparison,
         );
         row
@@ -3668,8 +3692,11 @@ impl ResourceState {
             },
         };
         let authoring_basis = match row_basis {
-            RowBasis::Applied(_) | RowBasis::Imported => DesiredAuthoringBasis::AppliedDesired,
-            RowBasis::Carried => DesiredAuthoringBasis::CarryPrior,
+            RowBasis::Applied(request) => {
+                DesiredAuthoringBasis::Sent(request.sent_desired_attributes(writeback_resource))
+            }
+            RowBasis::Imported => DesiredAuthoringBasis::DesiredRead,
+            RowBasis::Carried => DesiredAuthoringBasis::CarriedRead,
         };
         rs.populate_desired_metadata(
             resource,
@@ -3896,7 +3923,7 @@ fn migrate_v18_partial_read_reason(content: &str) -> Result<String, BackendError
             }),
         );
     }
-    root["version"] = serde_json::json!(StateFile::CURRENT_VERSION);
+    root["version"] = serde_json::json!(19);
     root.as_object_mut()
         .expect("a state file root validated as an object")
         .entry("exports_version".to_string())

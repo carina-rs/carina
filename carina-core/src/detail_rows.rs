@@ -16,6 +16,7 @@ use crate::differ::{
     AttrComparison, ComparisonContext, LeafProvenance, TypedAttr, key_should_enter_patch,
 };
 use crate::effect::{DeletedInstanceKey, Effect, EffectGeneration};
+use crate::explicit::{ExplicitProjection, ProjectedAuthoring};
 use crate::non_empty::NonEmptyVec;
 use crate::plan::{Plan, ReplaceDisplayInfo};
 use crate::provider::{NestedWriteOnlyRecord, PersistedAttributes};
@@ -192,13 +193,20 @@ fn semantic_similarity_score(a: &Value, b: &Value) -> usize {
 /// state directly, and keeps the update view out of the deleted-instance map.
 #[derive(Debug, Clone)]
 pub struct HistoricalDisplayAttributes {
-    updates: HashMap<ResourceId, HashMap<String, Value>>,
+    updates: HashMap<ResourceId, HistoricalUpdateAttributes>,
     deletes: HashMap<DeletedInstanceKey, HistoricalDeleteAttributes>,
+}
+
+#[derive(Debug, Clone)]
+struct HistoricalUpdateAttributes {
+    attributes: HashMap<String, Value>,
+    stored_attributes: Option<HashMap<String, Value>>,
 }
 
 #[derive(Debug, Clone)]
 struct HistoricalDeleteAttributes {
     attributes: HashMap<String, Value>,
+    stored_attributes: Option<HashMap<String, Value>>,
     nested_write_only: NestedWriteOnlyRecord,
 }
 
@@ -217,7 +225,13 @@ impl HistoricalDisplayAttributes {
                 Effect::Update { from, to, .. } => {
                     display.updates.insert(
                         from.id.clone(),
-                        mask_attributes_using_secret_shape(&from.attributes, &to.attributes),
+                        HistoricalUpdateAttributes {
+                            attributes: mask_attributes_using_secret_shape(
+                                &from.attributes,
+                                &to.attributes,
+                            ),
+                            stored_attributes: None,
+                        },
                     );
                 }
                 Effect::Delete {
@@ -234,6 +248,7 @@ impl HistoricalDisplayAttributes {
                         ),
                         HistoricalDeleteAttributes {
                             attributes: HashMap::new(),
+                            stored_attributes: None,
                             nested_write_only: NestedWriteOnlyRecord::new(),
                         },
                     );
@@ -266,6 +281,7 @@ impl HistoricalDisplayAttributes {
                         replacement.previous_attributes,
                         &to.attributes,
                     ),
+                    stored_attributes: None,
                     nested_write_only: NestedWriteOnlyRecord::new(),
                 },
             );
@@ -284,8 +300,15 @@ impl HistoricalDisplayAttributes {
     ) {
         let persisted_masked =
             mask_attributes_using_persisted_shape(provider_attributes, persisted_attributes);
-        let masked = combine_with_desired_secret_shape(persisted_masked, self.updates.get(&id));
-        self.updates.insert(id, masked);
+        let desired_shape = self.updates.get(&id).map(|entry| &entry.attributes);
+        let masked = combine_with_desired_secret_shape(persisted_masked, desired_shape);
+        self.updates.insert(
+            id,
+            HistoricalUpdateAttributes {
+                attributes: masked,
+                stored_attributes: persisted_attributes.map(PersistedAttributes::to_values),
+            },
+        );
     }
 
     /// Replace a Delete generation's view using provider values and the
@@ -305,6 +328,7 @@ impl HistoricalDisplayAttributes {
             key,
             HistoricalDeleteAttributes {
                 attributes: masked,
+                stored_attributes: persisted_attributes.map(PersistedAttributes::to_values),
                 nested_write_only: nested_write_only.clone(),
             },
         );
@@ -324,6 +348,7 @@ impl HistoricalDisplayAttributes {
             key,
             HistoricalDeleteAttributes {
                 attributes: masked,
+                stored_attributes: Some(persisted_attributes.to_values()),
                 // State v18 introduced provenance only for the current
                 // instance; historical generations have no leaf record.
                 nested_write_only: NestedWriteOnlyRecord::new(),
@@ -331,7 +356,7 @@ impl HistoricalDisplayAttributes {
         );
     }
 
-    fn update(&self, id: &ResourceId) -> Option<&HashMap<String, Value>> {
+    fn update(&self, id: &ResourceId) -> Option<&HistoricalUpdateAttributes> {
         self.updates.get(id)
     }
 
@@ -701,21 +726,36 @@ pub fn build_detail_rows_by_instance<S>(
             ..
         } => {
             let explicit = prev_explicit.and_then(|map| map.get(&to.id));
-            let Some(masked_from) = historical_attributes.update(&from.id) else {
+            let Some(historical) = historical_attributes.update(&from.id) else {
                 return Ok(Vec::new());
             };
-            match registry.and_then(|registry| registry.get_for(to)) {
-                Some(owner_schema) => build_update_rows(
-                    masked_from,
+            match registry {
+                Some(registry) if registry.get_for(to).is_some() => {
+                    let resolved = provider.comparison_for(registry, &to.id)?;
+                    build_update_rows(
+                        &historical.attributes,
+                        historical.stored_attributes.as_ref(),
+                        to,
+                        changed_attributes,
+                        Some(resolved.owner_schema().schema().as_schema()),
+                        detail,
+                        explicit,
+                        DetailComparison::Typed(*resolved.context()),
+                    )
+                }
+                None => build_update_rows(
+                    &historical.attributes,
+                    historical.stored_attributes.as_ref(),
                     to,
                     changed_attributes,
-                    Some(owner_schema.schema().as_schema()),
+                    None,
                     detail,
                     explicit,
-                    DetailComparison::Typed(provider.comparison_context_for(&to.id, owner_schema)?),
+                    DetailComparison::SchemaBlind,
                 ),
-                None => build_update_rows(
-                    masked_from,
+                Some(_) => build_update_rows(
+                    &historical.attributes,
+                    historical.stored_attributes.as_ref(),
                     to,
                     changed_attributes,
                     None,
@@ -796,12 +836,13 @@ pub fn build_detail_rows_by_instance_for_test<S>(
             changed_attributes,
             ..
         } => {
-            let Some(masked_from) = historical_attributes.update(&from.id) else {
+            let Some(historical) = historical_attributes.update(&from.id) else {
                 return Vec::new();
             };
             match registry.and_then(|registry| registry.get_for(to)) {
                 Some(owner_schema) => build_update_rows(
-                    masked_from,
+                    &historical.attributes,
+                    historical.stored_attributes.as_ref(),
                     to,
                     changed_attributes,
                     Some(owner_schema.schema().as_schema()),
@@ -810,7 +851,8 @@ pub fn build_detail_rows_by_instance_for_test<S>(
                     DetailComparison::Typed(*comparison),
                 ),
                 None => build_update_rows(
-                    masked_from,
+                    &historical.attributes,
+                    historical.stored_attributes.as_ref(),
                     to,
                     changed_attributes,
                     None,
@@ -990,6 +1032,7 @@ fn default_tag_annotation(default_tag_keys: &DefaultTagKeys, key: &str) -> Optio
 
 fn build_update_rows<S>(
     historical_attributes: &HashMap<String, Value>,
+    stored_attributes: Option<&HashMap<String, Value>>,
     to: &crate::resource::Resource<S>,
     changed_attributes: &[String],
     schema: Option<&ResourceSchema>,
@@ -1002,20 +1045,28 @@ fn build_update_rows<S>(
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
     let from_attributes = historical_attributes;
-    let from_attrs_projected = project_from_attrs(from_attributes, explicit);
+    let projected = project_from_attrs(
+        from_attributes,
+        stored_attributes,
+        &to.attributes,
+        explicit,
+        schema,
+        comparison,
+    );
+    let from_attrs_projected = projected.attributes();
 
     let attr_rows = build_attribute_diff_rows(
         to,
         AttributeDiffContext::for_update(
             from_attributes,
-            &from_attrs_projected,
+            from_attrs_projected,
             schema,
             defs,
             detail,
             changed_attributes,
             comparison,
         )
-        .with_explicit(explicit),
+        .with_explicit(Some(&projected.authoring)),
     );
     rows.extend(attr_rows.rows);
 
@@ -1041,7 +1092,7 @@ fn build_update_rows<S>(
     // In Full mode, show count of unchanged attributes hidden
     if detail == DetailLevel::Full {
         let unchanged_count = comparison.unchanged_count(
-            &from_attrs_projected,
+            from_attrs_projected,
             &to.resolved_attributes(),
             None,
             schema,
@@ -1131,7 +1182,7 @@ struct AttributeDiffContext<'a> {
     leaf_provenance: DetailLeafProvenance<'a>,
     forces_replacement_keys: Option<&'a HashSet<&'a str>>,
     cascade_ref_hints: &'a [(String, String)],
-    explicit: Option<&'a crate::explicit::ExplicitFields>,
+    explicit: Option<&'a ProjectedAuthoring>,
     comparison: DetailComparison<'a>,
 }
 
@@ -1194,7 +1245,7 @@ impl<'a> AttributeDiffContext<'a> {
         }
     }
 
-    fn with_explicit(mut self, explicit: Option<&'a crate::explicit::ExplicitFields>) -> Self {
+    fn with_explicit(mut self, explicit: Option<&'a ProjectedAuthoring>) -> Self {
         self.explicit = explicit;
         self
     }
@@ -1212,78 +1263,99 @@ impl<'a> AttributeDiffContext<'a> {
         }
     }
 
-    fn explicit_for_key(&self, key: &str) -> Option<&'a crate::explicit::ExplicitFields> {
+    fn explicit_for_key(&self, key: &str) -> Option<&'a ProjectedAuthoring> {
         explicit_child(self.explicit, key)
     }
 }
 
 fn explicit_child<'a>(
-    explicit: Option<&'a crate::explicit::ExplicitFields>,
+    explicit: Option<&'a ProjectedAuthoring>,
     key: &str,
-) -> Option<&'a crate::explicit::ExplicitFields> {
+) -> Option<&'a ProjectedAuthoring> {
     match explicit {
-        Some(crate::explicit::ExplicitFields::Struct { children }) => children.get(key),
+        Some(ProjectedAuthoring::Struct { children }) => children.get(key),
         Some(
-            crate::explicit::ExplicitFields::Leaf
-            | crate::explicit::ExplicitFields::List { .. }
-            | crate::explicit::ExplicitFields::ListElements { .. }
-            | crate::explicit::ExplicitFields::WholeValue { .. }
-            | crate::explicit::ExplicitFields::Unrecorded,
+            ProjectedAuthoring::Opaque
+            | ProjectedAuthoring::WholeValue
+            | ProjectedAuthoring::LegacyList { .. }
+            | ProjectedAuthoring::AlignedList { .. }
+            | ProjectedAuthoring::UnalignedList,
         )
         | None => None,
     }
 }
 
 fn explicit_list_element(
-    explicit: Option<&crate::explicit::ExplicitFields>,
-    stored_index: usize,
-) -> Option<&crate::explicit::ExplicitFields> {
+    explicit: Option<&ProjectedAuthoring>,
+    projected_index: usize,
+) -> Option<&ProjectedAuthoring> {
     match explicit {
-        Some(crate::explicit::ExplicitFields::ListElements { elements }) => {
-            elements.get(stored_index)
-        }
-        Some(crate::explicit::ExplicitFields::List { element }) => Some(element),
+        Some(ProjectedAuthoring::AlignedList { elements }) => elements.get(projected_index),
+        Some(ProjectedAuthoring::LegacyList { element }) => Some(element),
         Some(
-            crate::explicit::ExplicitFields::Leaf
-            | crate::explicit::ExplicitFields::Struct { .. }
-            | crate::explicit::ExplicitFields::WholeValue { .. }
-            | crate::explicit::ExplicitFields::Unrecorded,
+            ProjectedAuthoring::Opaque
+            | ProjectedAuthoring::Struct { .. }
+            | ProjectedAuthoring::WholeValue
+            | ProjectedAuthoring::UnalignedList,
         )
         | None => None,
     }
 }
 
-fn is_whole_value(explicit: Option<&crate::explicit::ExplicitFields>) -> bool {
-    matches!(
-        explicit,
-        Some(crate::explicit::ExplicitFields::WholeValue { .. })
-    )
+fn is_whole_value(explicit: Option<&ProjectedAuthoring>) -> bool {
+    matches!(explicit, Some(ProjectedAuthoring::WholeValue))
 }
 
 fn project_from_attrs(
     from_attributes: &HashMap<String, Value>,
+    stored_attributes: Option<&HashMap<String, Value>>,
+    desired_attributes: &IndexMap<String, Value>,
     explicit: Option<&crate::explicit::ExplicitFields>,
-) -> HashMap<String, Value> {
+    schema: Option<&ResourceSchema>,
+    comparison: DetailComparison<'_>,
+) -> crate::explicit::ProjectedAttributes {
     // Project `from.attributes` through the user-authoring tree so
     // server-side default fields the user never wrote don't inflate
-    // the unchanged-count summary (refs awscc#206). Idempotent and a
-    // no-op when `explicit` is None.
-    match explicit {
-        Some(e) => crate::explicit::project_attributes(from_attributes.clone(), e),
-        None => from_attributes.clone(),
+    // the unchanged-count summary (refs awscc#206). Stored values anchor
+    // per-element list records when present; otherwise the projection uses
+    // the legacy union fallback.
+    let empty_stored = HashMap::new();
+    match (explicit, comparison) {
+        (Some(explicit), DetailComparison::Typed(comparison)) => ExplicitProjection::for_desired(
+            stored_attributes.unwrap_or(&empty_stored),
+            desired_attributes,
+            explicit,
+            schema,
+            &comparison,
+        )
+        .project_attributes(from_attributes.clone()),
+        (Some(explicit), DetailComparison::SchemaBlind) => {
+            crate::explicit::ProjectedAttributes::legacy(from_attributes.clone(), explicit)
+        }
+        (None, _) => {
+            crate::explicit::ProjectedAttributes::unprojected(from_attributes.clone(), None)
+        }
     }
 }
 
 fn project_previous_attrs(
     previous_attributes: &HashMap<String, Value>,
+    stored_attributes: Option<&HashMap<String, Value>>,
+    desired_attributes: &IndexMap<String, Value>,
     explicit: Option<&crate::explicit::ExplicitFields>,
-) -> HashMap<String, Value> {
+    schema: Option<&ResourceSchema>,
+    comparison: DetailComparison<'_>,
+) -> crate::explicit::ProjectedAttributes {
     // Same projection as `project_from_attrs`, but sourced from
     // replacement-display metadata instead of a replace effect state.
-    match explicit {
-        Some(e) => crate::explicit::project_attributes(previous_attributes.clone(), e),
-        None => previous_attributes.clone(),
-    }
+    project_from_attrs(
+        previous_attributes,
+        stored_attributes,
+        desired_attributes,
+        explicit,
+        schema,
+        comparison,
+    )
 }
 
 fn build_attribute_diff_rows<S>(
@@ -1315,11 +1387,17 @@ fn build_attribute_diff_rows<S>(
         let forces_replacement = ctx
             .forces_replacement_keys
             .is_some_and(|keys| keys.contains(key.as_str()));
-        let old_value = if forces_replacement {
-            ctx.from_attrs_raw.get(key)
-        } else {
-            ctx.from_attrs_projected.get(key)
-        };
+        let old_value = ctx.from_attrs_projected.get(key).or_else(|| {
+            // A forcing key can be absent from the authoring projection (for
+            // example, a legacy replacement record). Fall back to raw only in
+            // that case; when projection retained the key, keep its nested
+            // server-added fields/elements filtered for replacement display.
+            if forces_replacement {
+                ctx.from_attrs_raw.get(key)
+            } else {
+                None
+            }
+        });
         let attr_type = ctx
             .schema
             .and_then(|s| s.attributes.get(key.as_str()))
@@ -1508,21 +1586,27 @@ pub fn build_replace_detail_rows_from_display<S>(
     let Some(historical_attributes) = historical_display.delete(&key) else {
         return Ok(Vec::new());
     };
-    match registry.and_then(|registry| registry.get_for(to)) {
-        Some(owner_schema) => Ok(build_replace_rows_from_attributes(
+    if let Some(registry) = registry
+        && registry.get_for(to).is_some()
+    {
+        let resolved = provider.comparison_for(registry, &to.id)?;
+        Ok(build_replace_rows_from_attributes(
             &historical_attributes.attributes,
+            historical_attributes.stored_attributes.as_ref(),
             &historical_attributes.nested_write_only,
             to,
             replacement.changed_create_only,
             replacement.temporary_name,
             replacement.cascade_ref_hints,
-            Some(owner_schema.schema().as_schema()),
+            Some(resolved.owner_schema().schema().as_schema()),
             detail,
             explicit,
-            DetailComparison::Typed(provider.comparison_context_for(&to.id, owner_schema)?),
-        )),
-        None => Ok(build_replace_rows_from_attributes(
+            DetailComparison::Typed(*resolved.context()),
+        ))
+    } else {
+        Ok(build_replace_rows_from_attributes(
             &historical_attributes.attributes,
+            historical_attributes.stored_attributes.as_ref(),
             &historical_attributes.nested_write_only,
             to,
             replacement.changed_create_only,
@@ -1532,7 +1616,7 @@ pub fn build_replace_detail_rows_from_display<S>(
             detail,
             explicit,
             DetailComparison::SchemaBlind,
-        )),
+        ))
     }
 }
 
@@ -1569,6 +1653,7 @@ pub fn build_replace_detail_rows_from_display_for_test<S>(
     match registry.and_then(|registry| registry.get_for(to)) {
         Some(owner_schema) => build_replace_rows_from_attributes(
             &historical_attributes.attributes,
+            historical_attributes.stored_attributes.as_ref(),
             &historical_attributes.nested_write_only,
             to,
             replacement.changed_create_only,
@@ -1581,6 +1666,7 @@ pub fn build_replace_detail_rows_from_display_for_test<S>(
         ),
         None => build_replace_rows_from_attributes(
             &historical_attributes.attributes,
+            historical_attributes.stored_attributes.as_ref(),
             &historical_attributes.nested_write_only,
             to,
             replacement.changed_create_only,
@@ -1597,6 +1683,7 @@ pub fn build_replace_detail_rows_from_display_for_test<S>(
 #[allow(clippy::too_many_arguments)]
 fn build_replace_rows_from_attributes<S>(
     previous_attributes: &HashMap<String, Value>,
+    stored_attributes: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
     to: &crate::resource::Resource<S>,
     changed_create_only: &[String],
@@ -1611,14 +1698,22 @@ fn build_replace_rows_from_attributes<S>(
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
-    let from_attrs_projected = project_previous_attrs(previous_attributes, explicit);
+    let projected = project_previous_attrs(
+        previous_attributes,
+        stored_attributes,
+        &to.attributes,
+        explicit,
+        schema,
+        comparison,
+    );
+    let from_attrs_projected = projected.attributes();
     let force_keys: HashSet<&str> = changed_create_only.iter().map(|s| s.as_str()).collect();
 
     let attr_rows = build_attribute_diff_rows(
         to,
         AttributeDiffContext::for_replace(
             previous_attributes,
-            &from_attrs_projected,
+            from_attrs_projected,
             schema,
             defs,
             detail,
@@ -1629,7 +1724,7 @@ fn build_replace_rows_from_attributes<S>(
             },
             comparison,
         )
-        .with_explicit(explicit),
+        .with_explicit(Some(&projected.authoring)),
     );
     rows.extend(attr_rows.rows);
 
@@ -1680,7 +1775,7 @@ fn build_replace_rows_from_attributes<S>(
     // In Full mode, show count of unchanged attributes hidden.
     if detail == DetailLevel::Full {
         let unchanged_count = comparison.unchanged_count(
-            &from_attrs_projected,
+            from_attrs_projected,
             &to.resolved_attributes(),
             Some(&force_keys),
             schema,
@@ -1878,7 +1973,7 @@ fn build_map_diff_row(
     detail: DetailLevel,
     forces_replacement: bool,
     default_tag_keys: Option<&DefaultTagKeys>,
-    explicit: Option<&crate::explicit::ExplicitFields>,
+    explicit: Option<&ProjectedAuthoring>,
     comparison: DetailComparison<'_>,
 ) -> Option<DetailRow> {
     let mut entries = compute_map_diff_entries_with_explicit(
@@ -1926,7 +2021,7 @@ fn compute_map_diff_entries_with_explicit(
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
-    explicit: Option<&crate::explicit::ExplicitFields>,
+    explicit: Option<&ProjectedAuthoring>,
     comparison: DetailComparison<'_>,
 ) -> Vec<MapDiffEntryIR> {
     let new_map = match new_value {
@@ -2140,7 +2235,7 @@ fn compute_list_of_maps_diff_parts_with_explicit(
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
-    explicit: Option<&crate::explicit::ExplicitFields>,
+    explicit: Option<&ProjectedAuthoring>,
     comparison: DetailComparison<'_>,
 ) -> (
     Vec<RenderedValue>,
@@ -2692,6 +2787,11 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(effect.clone());
         let mut historical_attributes = HistoricalDisplayAttributes::for_plan(&plan);
+        if let Effect::Update { from, .. } = effect
+            && let Some(update) = historical_attributes.updates.get_mut(&from.id)
+        {
+            update.stored_attributes = Some(from.attributes.clone());
+        }
         let empty_nested_write_only = NestedWriteOnlyRecord::new();
         if let Some(delete_attributes) = delete_attributes {
             for key in effect.deleted_resource_attribute_keys() {
@@ -2730,6 +2830,7 @@ mod tests {
             .collect();
         build_replace_rows_from_attributes(
             &from.attributes,
+            Some(&from.attributes),
             &NestedWriteOnlyRecord::new(),
             &to,
             &changed_create_only,
@@ -3926,9 +4027,13 @@ mod tests {
         let desired =
             Resource::new("test.Listener", "listener").with_attribute("rules", desired_rules);
         let stored = HashMap::from([("rules".to_string(), applied_rules.clone())]);
-        let prior = crate::explicit::build_from_resource_for_stored_values(
+        let sent = crate::executor::AcceptedRequest::create_for_test();
+        let sent_desired = sent.sent_desired_attributes(&applied);
+        let prior = crate::explicit::build_from_resource_for_stored_values_after_send(
             &applied,
+            None,
             &stored,
+            &sent_desired,
             None,
             &crate::differ::exact_comparison_context_for_tests(),
         );
@@ -4675,6 +4780,71 @@ mod tests {
             )),
             "forcing key should use raw state old value even when projection omits it: {rows:?}"
         );
+    }
+
+    #[test]
+    fn replace_forcing_list_prefers_projected_old_value_over_raw_server_elements() {
+        let keyed = |key: &str, value: &str| {
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "key".to_string(),
+                    Value::Concrete(ConcreteValue::String(key.to_string().into())),
+                ),
+                (
+                    "value".to_string(),
+                    Value::Concrete(ConcreteValue::String(value.to_string().into())),
+                ),
+            ])))
+        };
+        let id = ResourceId::with_identity("test.Widget", "w");
+        let from = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "attributes".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![
+                    keyed("authored", "old"),
+                    keyed("server-default", "filled"),
+                ])),
+            )]),
+        );
+        let to = Resource::new("test.Widget", "w").with_attribute(
+            "attributes",
+            Value::Concrete(ConcreteValue::List(vec![keyed("authored", "new")])),
+        );
+        let authored_element = ExplicitFields::Struct {
+            children: HashMap::from([
+                ("key".to_string(), ExplicitFields::Leaf),
+                ("value".to_string(), ExplicitFields::Leaf),
+            ]),
+        };
+        let explicit = HashMap::from([(
+            id,
+            ExplicitFields::Struct {
+                children: HashMap::from([(
+                    "attributes".to_string(),
+                    ExplicitFields::ListElements {
+                        elements: vec![authored_element, ExplicitFields::Unrecorded],
+                    },
+                )]),
+            },
+        )]);
+
+        let rows = replace_rows_for_test(
+            from,
+            to,
+            &["attributes"],
+            DetailLevel::Full,
+            vec![],
+            Some(&explicit),
+        );
+
+        let [DetailRow::ListOfMapsDiffForcesReplacement { key, block }] = rows.as_slice() else {
+            panic!("forcing list must render a list diff: {rows:#?}");
+        };
+        assert_eq!(key, "attributes");
+        assert_eq!(block.modified().len(), 1);
+        assert!(block.removed().is_empty());
+        assert!(block.added().is_empty());
     }
 
     #[test]

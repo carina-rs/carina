@@ -1,0 +1,36 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "anonymous-loop-new-id-exists",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "_for0[0]",
+      "provider": "awscc",
+      "identifier": "vpc-legacy",
+      "attributes": { "vpc_id": "vpc-legacy", "cidr_block": "10.0.0.0/16" },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "_for0[0]",
+      "dependency_bindings": [],
+      "explicit": { "kind": "struct", "children": { "cidr_block": { "kind": "leaf" } } }
+    },
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "awscc_ec2_vpc_0bc2a2bb",
+      "provider": "awscc",
+      "identifier": "vpc-current",
+      "attributes": { "vpc_id": "vpc-current", "cidr_block": "10.0.0.0/16" },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": null,
+      "dependency_bindings": [],
+      "explicit": { "kind": "struct", "children": { "cidr_block": { "kind": "leaf" } } }
+    }
+  ]
+}

@@ -227,13 +227,16 @@ let vpcs = for cidr in ['10.0.0.0/16'] {
 ```
 
 A map loop uses `'vpcs.key'` for an identifier-safe key, or
-`"vpcs['key with space']"` when the key needs quoting. For an unbound loop over
-a literal or function call, the address is positional, such as `'_for0[0]'`.
-An unbound loop over a reference uses its final path segment instead: `for x in
-a.b` produces `'_b[0]'`. Copy the exact address from the plan output or moved
-warning. Positional addresses may change when
-[carina#4109](https://github.com/carina-rs/carina/issues/4109) changes the
-address scheme.
+`"vpcs['key with space']"` when the key needs quoting. Elements from unbound
+`for` and `if` expressions are anonymous: Carina derives their stable identity
+from the resource schema instead of their position. Legacy `_forN[i]` state
+rows migrate automatically the first time you plan or apply the updated
+configuration.
+
+To move an existing resource into an unbound loop, use the anonymous address
+shown by `carina plan` as the `to` address. To give loop elements explicit
+names instead, bind the loop with `let` and target the expanded bound address,
+as in the example above.
 
 ## Removing resources from state
 

@@ -370,6 +370,16 @@ where
         name == "moved_claims_precede_heuristics"
             || name == "anonymous_old_identity_name_override"
             || name == "anonymous_old_identity_update"
+            || name == "anonymous_loop_insert_before"
+            || name == "anonymous_loop_reorder"
+            || name == "anonymous_loop_delete_earlier"
+            || name == "anonymous_loop_sibling_files"
+            || name == "anonymous_loop_same_tail"
+            || name == "anonymous_if_legacy"
+            || name == "anonymous_loop_deferred_map"
+            || name == "anonymous_loop_module_call"
+            || name == "anonymous_loop_claimed_legacy"
+            || name == "anonymous_loop_new_id_exists"
     }) {
         // These fixtures exercise pre-refresh anonymous reconciliation, so
         // compute their desired addresses before claims and move detection.

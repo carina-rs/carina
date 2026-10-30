@@ -18,7 +18,7 @@ use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::data_source_value::{DataSourceValues, ExecutableDataSourceValues};
 use carina_core::differ::Orphans;
 use carina_core::executor::{
-    ExecutionCheckpointSink, ExecutionObserver, ExecutionOutcome, ExecutionResult,
+    AcceptedRequest, ExecutionCheckpointSink, ExecutionObserver, ExecutionOutcome, ExecutionResult,
     LiveExecutionInput, ProviderCheckInputs, SavedExecutionInput, UnresolvedResource,
 };
 use carina_core::plan::Plan;
@@ -232,11 +232,12 @@ async fn create_checked_bootstrap_resource(
     let owner_schema = resolved_comparison.owner_schema();
     let comparison = resolved_comparison.context();
     let schema = Some(owner_schema.schema().as_schema());
+    let accepted_request = AcceptedRequest::from_create_request(&request);
     match carina_core::executor::dispatch_create(operation_provider, &id, request).await {
         Ok(outcome) => {
             let identifier = outcome.identifier().as_str().to_string();
             let (state, accepted_request, diagnostic) =
-                carina_core::executor::complete_create_for_writeback(outcome);
+                carina_core::executor::complete_create_for_writeback(outcome, accepted_request);
             let row = carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                 &resolved,
                 &state,
@@ -2631,9 +2632,11 @@ fn import_identifiers_from_current_config<S>(
             continue;
         };
         if let Some(value) = parsed.state_blocks.iter().find_map(|block| match block {
-            carina_core::parser::StateBlock::Import { to, id: value }
-                if crate::wiring::resolve_import_target(to, &parsed.resources) == *id =>
-            {
+            carina_core::parser::StateBlock::Import {
+                to,
+                to_span: _,
+                id: value,
+            } if crate::wiring::resolve_import_target(to, &parsed.resources) == *id => {
                 Some(carina_core::resolver::resolve_value_for_plan(
                     value,
                     &bindings,
