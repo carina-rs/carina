@@ -269,10 +269,12 @@ impl std::error::Error for WasmAppliedStateDecodeError {}
 /// `Value::Deferred(DeferredValue::ResourceRef)`, `Value::Deferred(DeferredValue::Interpolation)`, and
 /// `Value::Deferred(DeferredValue::FunctionCall)` / `Unavailable`. The scoped transport wrapper in
 /// `WasmProviderNormalizer::normalize_desired` strips ref/Unknown-bearing
-/// attributes before conversion and restores them after the guest call, so
-/// reaching any of these arms is a producer-side bug — the diagnostic
-/// identifies which variant leaked. See RFC #2371 stage 2 (#2378) for
-/// `Unknown` and #2387 for `ResourceRef` / `Interpolation` / `FunctionCall`.
+/// attributes before conversion, reports their top-level names through the
+/// WIT `desired-resource.deferred` field, and restores their values after the
+/// guest call. Reaching any of these arms is therefore a producer-side bug —
+/// the diagnostic identifies which variant leaked. See RFC #2371 stage 2
+/// (#2378) for `Unknown` and #2387 for `ResourceRef` / `Interpolation` /
+/// `FunctionCall`.
 ///
 /// `Value::Deferred(DeferredValue::Secret(inner))` is encoded as the `secret-val` WIT variant
 /// (#2390): the inner is JSON-encoded the same way `list-val` / `map-val`
@@ -3640,10 +3642,11 @@ mod tests {
     /// #2387: `Value::Deferred(DeferredValue::ResourceRef)` reaching `core_to_wit_value` is a
     /// stage-2 invariant violation now — the scoped strip-and-restore wrapper
     /// in `WasmProviderNormalizer::normalize_desired` removes any attribute
-    /// that recursively contains a `ResourceRef` before this boundary. The
-    /// converter returns `Err(UnresolvedResourceRef)` so a regression
-    /// surfaces as a typed error at the call site instead of a
-    /// debug-format string silently flowing into the provider.
+    /// that recursively contains a `ResourceRef` before this boundary and
+    /// marks its top-level name deferred for the guest. The converter returns
+    /// `Err(UnresolvedResourceRef)` so a regression surfaces as a typed error
+    /// at the call site instead of a debug-format string silently flowing into
+    /// the provider.
     #[test]
     fn resource_ref_returns_err_in_core_to_wit_value() {
         use carina_core::resource::AccessPath;

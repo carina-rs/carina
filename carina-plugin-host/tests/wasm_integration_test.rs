@@ -3440,6 +3440,68 @@ async fn test_wasm_normalize_desired_preserves_ref_and_unknown_bearing_attribute
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wasm_normalize_desired_rejects_absent_required_together_attribute() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("normalizer should initialize");
+    let mut resource = Resource::with_provider(
+        "mock",
+        "test.normalize_required_together",
+        "absent-companion",
+        None,
+    );
+    resource.set_attr(
+        "primary",
+        Value::Concrete(ConcreteValue::String("configured".into())),
+    );
+    let mut resources = provider_resources(vec![resource]);
+
+    let error = normalizer
+        .normalize_desired(&mut resources)
+        .await
+        .expect_err("an absent companion must fail during desired normalization");
+
+    assert_eq!(error.variant_name(), "invalid_input");
+    assert_eq!(
+        error.detail().context(),
+        "test.normalize_required_together companion is required when primary is present"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_normalize_desired_accepts_and_restores_deferred_required_together_attribute() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("normalizer should initialize");
+    let mut resource = Resource::with_provider(
+        "mock",
+        "test.normalize_required_together",
+        "deferred-companion",
+        None,
+    );
+    resource.set_attr(
+        "primary",
+        Value::Concrete(ConcreteValue::String("configured".into())),
+    );
+    let deferred = Value::resource_ref("upstream", "identifier", Vec::new());
+    resource.set_attr("companion", deferred.clone());
+    let mut resources = provider_resources(vec![resource]);
+
+    normalizer
+        .normalize_desired(&mut resources)
+        .await
+        .expect("a deferred companion must postpone the required-together check");
+
+    assert_eq!(resources[0].get_attr("companion"), Some(&deferred));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_results() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;

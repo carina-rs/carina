@@ -494,6 +494,8 @@ A schema with `kind: SchemaKind::DataSource` declares a data source. The host ca
 
 `required_permissions` feeds the IAM preflight check that `carina plan --check-iam` runs, which warns about missing AWS IAM actions before an apply. Return an empty list unless your provider manages AWS resources. `normalize_desired`, `normalize_state` and `hydrate_read_state` are optional hooks for providers whose API changes values on the way in or out. Their default implementations return the values unchanged, so implement them only when you need them.
 
+Desired normalization has a three-way attribute contract. `DesiredResource::attribute` and `attributes` distinguish a `Known` value from an `Absent` attribute and a `Deferred` value that the host withheld until its dependency resolves. A deferred attribute is not absent: mutate only `Known` values, use `insert_absent` when adding a default, and return the opaque result from `finish`. This prevents normalization from replacing a deferred value by treating its missing map entry as user-authored absence.
+
 ## Next steps
 
 [Testing](/providers/writing/testing/) tests these operations against a fake API, then end to end against a real account.
