@@ -182,7 +182,7 @@ enum ValidatedEntry<'a> {
     /// `header` alone are identical for `for _, opt in cert.dvo { … }`
     /// repeated twice).
     DeferredLoop {
-        resource_type: &'a str,
+        resource_type: String,
         target: &'a carina_core::parser::DeferredForTarget,
         header: &'a str,
         file: Option<&'a str>,
@@ -253,16 +253,25 @@ fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
         })
         .map(|rref| match rref {
             ResourceRef::Deferred { deferred: d, .. } => ValidatedEntry::DeferredLoop {
-                resource_type: &d.resource_type,
+                resource_type: d.resource_type.clone(),
                 target: &d.target,
                 header: &d.header,
                 file: d.file.as_deref(),
                 line: d.line,
             },
+            ResourceRef::ParsedDeferred { resource, deferred } => ValidatedEntry::DeferredLoop {
+                resource_type: resource.id.display_type(),
+                target: &deferred.target,
+                header: &deferred.header,
+                file: deferred.file.as_deref(),
+                line: deferred.line,
+            },
             // Managed / Virtual / DataSource — all direct, classified
             // by whether the id has a resolved identity.
-            other => {
-                let id = other.id();
+            ResourceRef::Resource(_)
+            | ResourceRef::LiveComposition(_)
+            | ResourceRef::DataSource(_) => {
+                let id = rref.id();
                 if id.identity_str().is_some() {
                     ValidatedEntry::Resolved(id)
                 } else {

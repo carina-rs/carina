@@ -66,7 +66,9 @@ pub fn validate_wait_bindings<E>(
         if let Some(b) = rref.binding() {
             let id = rref.id();
             let target = match rref {
-                ResourceRef::Resource(_) | ResourceRef::Deferred { .. } => WaitTarget::Pollable {
+                ResourceRef::Resource(_)
+                | ResourceRef::Deferred { .. }
+                | ResourceRef::ParsedDeferred { .. } => WaitTarget::Pollable {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
                 },

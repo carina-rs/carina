@@ -1377,7 +1377,10 @@ impl DiagnosticEngine {
             return Vec::new();
         };
         let relative_message = residual.display_relative_to(base_path);
-        if let carina_core::module_resolver::ResidualModuleResolutionDiagnostic::Parse {
+        if matches!(
+            call_source,
+            carina_core::module_resolver::ModuleErrorCallSource::Unavailable
+        ) && let carina_core::module_resolver::ResidualModuleResolutionDiagnostic::Parse {
             source_path: Some(error_source),
             error,
         } = &residual_diagnostic
@@ -1905,7 +1908,7 @@ impl DiagnosticEngine {
         // would otherwise collide on the error's `(name, line)` key.
         let deferred_sites = merged
             .deferred_for_sites()
-            .map(|deferred| (deferred.file(), deferred.line(), deferred.root_bindings()));
+            .map(|deferred| (deferred.file, deferred.line, deferred.root_bindings()));
         for (file, line, root_bindings) in deferred_sites {
             if !deferred_in_current_file(file, current_file_name) {
                 continue;
@@ -2675,7 +2678,7 @@ impl DiagnosticEngine {
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        for rref in super::diagnostic_resources(parsed) {
+        for rref in parsed.iter_all_resources() {
             let attrs = rref.attributes();
             for attr_value in attrs.values() {
                 self.collect_ref_attr_diagnostics(doc, attr_value, binding_index, &mut diagnostics);

@@ -82,25 +82,6 @@ pub fn validate_deferred_populate_refs<E>(
             );
         }
     }
-    for deferred in &parsed.parsed_deferred_for_expressions {
-        match &deferred.body {
-            crate::parser::DeferredForBody::Resource(resource) => {
-                if let Some(binding) = resource.binding.as_deref() {
-                    by_binding.insert(
-                        binding.to_string(),
-                        (
-                            resource.id.provider.clone(),
-                            resource.id.resource_type.clone(),
-                        ),
-                    );
-                }
-            }
-            // Read and module-call templates are rejected at the module-resolution
-            // seam and cannot participate in managed-resource synchronization.
-            crate::parser::DeferredForBody::Read(_)
-            | crate::parser::DeferredForBody::ModuleCall(_) => {}
-        }
-    }
     if by_binding.is_empty() {
         return Vec::new();
     }
@@ -127,27 +108,6 @@ pub fn validate_deferred_populate_refs<E>(
                 schemas,
                 &mut out,
             );
-        }
-    }
-    for deferred in &parsed.parsed_deferred_for_expressions {
-        match &deferred.body {
-            crate::parser::DeferredForBody::Resource(resource) => {
-                for (key, value) in &resource.attributes {
-                    collect_unsynchronized_refs(
-                        value,
-                        key,
-                        resource.binding.as_deref(),
-                        &by_binding,
-                        &synchronized,
-                        schemas,
-                        &mut out,
-                    );
-                }
-            }
-            // These bodies never cross the resource-only resolution seam, so
-            // this managed-resource diagnostic has no work to perform for them.
-            crate::parser::DeferredForBody::Read(_)
-            | crate::parser::DeferredForBody::ModuleCall(_) => {}
         }
     }
     out

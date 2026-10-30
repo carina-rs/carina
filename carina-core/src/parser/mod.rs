@@ -26,10 +26,10 @@ pub use ast::{
     ExportParameter, File, FnParam, InferredExportParam, InferredFile, ModuleArgument, ModuleCall,
     ModuleCallDiagnosticSource, ModuleCallId, MovedAddresses, ParsedBindingUses,
     ParsedDeferredForExpression, ParsedExportParam, ParsedFile, ParserBindingMetadata,
-    PendingValueSlot, ProviderConfig, RequireBlock, ResourceAddress, ResourceContext, ResourceRef,
-    ResourceTypePath, SavedDeferredForExpression, ShapeMismatch, SourceFileId, SourceSpan,
-    StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst, UpstreamState, UseStatement,
-    UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding,
+    PendingValueSlot, ProviderConfig, RequireBlock, ResourceAddress, ResourceContext, ResourceMut,
+    ResourceRef, ResourceTypePath, SavedDeferredForExpression, ShapeMismatch, SourceFileId,
+    SourceSpan, StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst, UpstreamState,
+    UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding,
     expand_deferred_children,
 };
 pub(crate) use ast::{BareBindingSource, ParsedBareBindingUse};

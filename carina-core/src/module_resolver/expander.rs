@@ -67,14 +67,50 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         binding_index: Option<&BindingIndex<'_>>,
         resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
     ) -> Result<ParsedFile, ModuleError> {
-        self.expand_module_call_inner(
-            call,
-            instance_prefix,
-            ref_check,
-            binding_index,
-            resolved_bindings,
-        )
-        .map_err(|error| error.with_failing_call(call.id().clone()))
+        let expanded = self
+            .expand_module_call_inner(
+                call,
+                instance_prefix,
+                ref_check,
+                binding_index,
+                resolved_bindings,
+            )
+            .map_err(|error| error.with_failing_call(call.id().clone()))?;
+        if let Some(error) = super::resolver::deferred_for_body_errors(&expanded)
+            .into_iter()
+            .next()
+        {
+            return Err(error.with_failing_call(call.id().clone()));
+        }
+        Ok(expanded)
+    }
+
+    pub(super) fn expand_module_call_checked_collecting(
+        &self,
+        call: &ModuleCall,
+        instance_prefix: &str,
+        ref_check: &super::resolver::RefCheckWitness,
+        binding_index: Option<&BindingIndex<'_>>,
+        resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
+    ) -> Result<ParsedFile, Vec<ModuleError>> {
+        let expanded = self
+            .expand_module_call_inner(
+                call,
+                instance_prefix,
+                ref_check,
+                binding_index,
+                resolved_bindings,
+            )
+            .map_err(|error| vec![error.with_failing_call(call.id().clone())])?;
+        let errors = super::resolver::deferred_for_body_errors(&expanded)
+            .into_iter()
+            .map(|error| error.with_failing_call(call.id().clone()))
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            Ok(expanded)
+        } else {
+            Err(errors)
+        }
     }
 
     fn expand_module_call_inner(

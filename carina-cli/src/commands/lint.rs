@@ -128,6 +128,9 @@ pub fn run_lint(
             carina_core::parser::ResourceRef::Deferred { resource, .. } => {
                 schemas.get_for(resource)
             }
+            carina_core::parser::ResourceRef::ParsedDeferred { resource, .. } => {
+                schemas.get_for(resource)
+            }
         };
         if let Some(schema) = schema {
             let schema = schema.as_schema();

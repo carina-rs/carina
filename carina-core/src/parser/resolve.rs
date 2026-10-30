@@ -1313,7 +1313,7 @@ fn accumulate_deferred_iterable_errors(
     known: &std::collections::HashSet<&str>,
     errors: &mut Vec<ParseError>,
 ) {
-    for deferred in &parsed.parsed_deferred_for_expressions {
+    for deferred in parsed.deferred_for_sites() {
         for root in deferred.root_bindings() {
             if known.contains(root.as_str()) {
                 continue;

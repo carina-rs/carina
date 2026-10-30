@@ -805,22 +805,12 @@ fn resource_sink<'a, E>(
         Some(ResourceRef::DataSource(data_source)) => {
             schemas.get_for_data_source(data_source)?.schema()
         }
-        Some(ResourceRef::Resource(resource) | ResourceRef::Deferred { resource, .. }) => {
-            schemas.get_for(resource)?.schema()
-        }
-        None => file
-            .parsed_deferred_for_expressions
-            .iter()
-            .find_map(|deferred| match &deferred.body {
-                crate::parser::DeferredForBody::Resource(resource)
-                    if resource.id == *address.resource_id() =>
-                {
-                    schemas.get_for(resource).map(|schema| schema.schema())
-                }
-                crate::parser::DeferredForBody::Resource(_)
-                | crate::parser::DeferredForBody::Read(_)
-                | crate::parser::DeferredForBody::ModuleCall(_) => None,
-            })?,
+        Some(
+            ResourceRef::Resource(resource)
+            | ResourceRef::Deferred { resource, .. }
+            | ResourceRef::ParsedDeferred { resource, .. },
+        ) => schemas.get_for(resource)?.schema(),
+        None => return None,
     };
     let mut segments = path.segments().iter();
     let crate::parser::AttributePathSegment::Attribute(root) = segments.next()? else {
@@ -2249,19 +2239,6 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
             check_function_calls(value, None, None, bindings, unknown_policy, &mut errors);
         }
     }
-    for deferred in &parsed.parsed_deferred_for_expressions {
-        match &deferred.body {
-            crate::parser::DeferredForBody::Resource(resource) => {
-                for value in resource.attributes.values() {
-                    check_function_calls(value, None, None, bindings, unknown_policy, &mut errors);
-                }
-            }
-            // Read and module-call bodies are rejected at the resolution seam;
-            // neither was represented by the former resource projection.
-            crate::parser::DeferredForBody::Read(_)
-            | crate::parser::DeferredForBody::ModuleCall(_) => {}
-        }
-    }
     for call in &parsed.module_calls {
         for (_, value) in call.arguments() {
             check_function_calls(
@@ -2641,25 +2618,16 @@ pub fn validate_resources<E>(
     // root configuration. Keep every other schema/type check below active for
     // modules; only defer this provider-availability diagnostic.
     if !is_module_definition(parsed) {
-        let parser_side_templates =
-            parsed
-                .parsed_deferred_for_expressions
-                .iter()
-                .filter_map(|deferred| match &deferred.body {
-                    crate::parser::DeferredForBody::Resource(resource) => Some(resource.as_ref()),
-                    crate::parser::DeferredForBody::Read(_)
-                    | crate::parser::DeferredForBody::ModuleCall(_) => None,
-                });
         all_errors.extend(
             validate_anonymous_resource_schemas(
                 parsed
                     .iter_all_resources()
                     .filter_map(|resource| match resource {
                         ResourceRef::Resource(resource)
-                        | ResourceRef::Deferred { resource, .. } => Some(resource),
+                        | ResourceRef::Deferred { resource, .. }
+                        | ResourceRef::ParsedDeferred { resource, .. } => Some(resource),
                         ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
-                    })
-                    .chain(parser_side_templates),
+                    }),
                 registry,
                 known_providers,
             )
@@ -2746,7 +2714,9 @@ pub fn validate_resources<E>(
             ResourceRef::DataSource(d) => {
                 (ValidatableKind::DataSource, registry.get_for_data_source(d))
             }
-            ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => {
+            ResourceRef::Resource(m)
+            | ResourceRef::Deferred { resource: m, .. }
+            | ResourceRef::ParsedDeferred { resource: m, .. } => {
                 (ValidatableKind::Resource, registry.get_for(m))
             }
         };
@@ -2757,21 +2727,6 @@ pub fn validate_resources<E>(
             rref.quoted_string_attrs(),
             rref.resolved_attributes(),
         );
-    }
-    for deferred in &parsed.parsed_deferred_for_expressions {
-        match &deferred.body {
-            crate::parser::DeferredForBody::Resource(resource) => validate_resource(
-                ValidatableKind::Resource,
-                registry.get_for(resource),
-                &resource.id,
-                &resource.quoted_string_attrs,
-                resource.resolved_attributes(),
-            ),
-            // Unsupported parser-side bodies are diagnosed at the resolution
-            // seam; the old resource projection never exposed them here.
-            crate::parser::DeferredForBody::Read(_)
-            | crate::parser::DeferredForBody::ModuleCall(_) => {}
-        }
     }
     if all_errors.is_empty() {
         Ok(())
@@ -2900,9 +2855,9 @@ fn validate_resource_ref_types_inner<E>(
         let schema = match rref {
             ResourceRef::LiveComposition(_) => continue,
             ResourceRef::DataSource(d) => registry.get_for_data_source(d),
-            ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => {
-                registry.get_for(m)
-            }
+            ResourceRef::Resource(m)
+            | ResourceRef::Deferred { resource: m, .. }
+            | ResourceRef::ParsedDeferred { resource: m, .. } => registry.get_for(m),
         };
         let Some(validated_schema) = schema else {
             continue;
@@ -2913,29 +2868,13 @@ fn validate_resource_ref_types_inner<E>(
             ResourceContext::Deferred(deferred) => {
                 format!("for-body `{}` {}", deferred.header, resource_id)
             }
+            ResourceContext::ParsedDeferred(deferred) => {
+                format!("for-body `{}` {}", deferred.header, resource_id)
+            }
         };
 
         let attrs = rref.attributes();
         validate_resource(resource_id, resource_location, &attrs, validated_schema);
-    }
-    for deferred in &parsed.parsed_deferred_for_expressions {
-        match &deferred.body {
-            crate::parser::DeferredForBody::Resource(resource) => {
-                let Some(schema) = registry.get_for(resource) else {
-                    continue;
-                };
-                validate_resource(
-                    &resource.id,
-                    format!("for-body `{}` {}", deferred.header, resource.id),
-                    &resource.attributes,
-                    schema,
-                );
-            }
-            // These body variants never appeared in the old resource-only
-            // projection and are rejected at the module-resolution seam.
-            crate::parser::DeferredForBody::Read(_)
-            | crate::parser::DeferredForBody::ModuleCall(_) => {}
-        }
     }
 
     all_errors.extend(
@@ -3000,19 +2939,19 @@ fn validate_deferred_for_iterable_types_with_bindings<E>(
 ) -> Vec<DeferredForIterableTypeDiagnostic> {
     let mut diagnostics = Vec::new();
     for deferred in parsed.deferred_for_sites() {
-        let expected = match deferred.binding() {
+        let expected = match deferred.binding {
             ForBinding::Simple(_) | ForBinding::Indexed(_, _) => DeferredIterableKind::List,
             ForBinding::Map(_, _) => DeferredIterableKind::Map,
         };
         validate_deferred_iterable_operand(
-            deferred.iterable(),
+            deferred.iterable,
             DeferredIterableValidationContext {
                 expected,
                 bindings,
                 schemas,
-                file: deferred.file(),
-                line: deferred.line(),
-                expression: deferred.iterable(),
+                file: deferred.file,
+                line: deferred.line,
+                expression: deferred.iterable,
             },
             &mut diagnostics,
         );
@@ -6123,26 +6062,6 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
             }
         }
     }
-    for deferred in &parsed.parsed_deferred_for_expressions {
-        match &deferred.body {
-            crate::parser::DeferredForBody::Resource(resource) => {
-                if let Some(binding_name) = &resource.binding
-                    && binding_name != "_"
-                {
-                    let scope = parsed
-                        .parser_binding_metadata
-                        .resource_source_file(&resource.id)
-                        .map(crate::parser::BindingScopeId::root);
-                    defined_bindings.push((binding_name.clone(), scope));
-                }
-            }
-            // Unsupported bodies never contributed a resource binding to the
-            // legacy projection, so unused-binding validation leaves them to
-            // the module-resolution diagnostic seam.
-            crate::parser::DeferredForBody::Read(_)
-            | crate::parser::DeferredForBody::ModuleCall(_) => {}
-        }
-    }
 
     if defined_bindings.is_empty() {
         return Vec::new();
@@ -6162,22 +6081,8 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
             referenced.insert(dep.clone());
         }
     }
-    for deferred in &parsed.parsed_deferred_for_expressions {
-        match &deferred.body {
-            crate::parser::DeferredForBody::Resource(resource) => {
-                for value in resource.attributes.values() {
-                    collect_dependencies(value, &mut referenced);
-                }
-                for dependency in &resource.directives.depends_on {
-                    referenced.insert(dependency.clone());
-                }
-            }
-            crate::parser::DeferredForBody::Read(_)
-            | crate::parser::DeferredForBody::ModuleCall(_) => {}
-        }
-    }
     for deferred in parsed.deferred_for_sites() {
-        collect_dependencies(deferred.iterable(), &mut referenced);
+        collect_dependencies(deferred.iterable, &mut referenced);
     }
     for call in &parsed.module_calls {
         for (_, value) in call.arguments() {

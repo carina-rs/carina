@@ -82,13 +82,9 @@ pub(crate) enum LoopParseTarget {
     Unbound(UnboundLoopTemplate),
 }
 
-struct RetryableProvisionalBodyError {
-    error: ParseError,
-}
-
 enum DeferredForBodyTemplateParse {
     Parsed(DeferredForBody),
-    RetryableProvisional(RetryableProvisionalBodyError),
+    RetryableProvisional,
 }
 
 fn parse_deferred_for_body_template(
@@ -143,10 +139,8 @@ fn parse_deferred_for_body_template(
     );
     let result = match parsed {
         Ok(result) => result,
-        Err(error) if ctx.defer_provisional_static_conditions => {
-            return Ok(DeferredForBodyTemplateParse::RetryableProvisional(
-                RetryableProvisionalBodyError { error },
-            ));
+        Err(_) if ctx.defer_provisional_static_conditions => {
+            return Ok(DeferredForBodyTemplateParse::RetryableProvisional);
         }
         Err(error) => return Err(error),
     };
@@ -189,12 +183,11 @@ fn record_deferred_for_expression(
         source_file,
     )? {
         DeferredForBodyTemplateParse::Parsed(body) => body,
-        DeferredForBodyTemplateParse::RetryableProvisional(retryable) => {
+        DeferredForBodyTemplateParse::RetryableProvisional => {
             // This pass exists only to classify provisional directory
             // bindings. The final pass reparses the exact body with fully
             // classified bindings and either succeeds or propagates this
             // body-local parser error.
-            let RetryableProvisionalBodyError { error: _error } = retryable;
             return Ok(());
         }
     };
@@ -351,7 +344,6 @@ pub(crate) fn parse_for_expr(
 
     // Parse the iterable expression
     let iterable_pair = next_pair(&mut inner, "iterable", "for expression")?;
-    let iterable_surface = iterable_pair.as_str().trim().to_string();
     let ParsedForIterable {
         value: iterable,
         bare_unbound_identifier,
@@ -540,6 +532,7 @@ pub(crate) fn parse_for_expr(
         // not collapse to the default before the reference snapshot is known
         // to be complete.
         (_, iterable @ Value::Deferred(_)) => {
+            let iterable_surface = crate::value::format_value(iterable);
             let header = deferred_for_header(&binding, &iterable_surface);
             record_deferred_for_expression(
                 body_pair.clone(),
@@ -564,7 +557,7 @@ pub(crate) fn parse_for_expr(
                 .as_ref()
                 .or(provisional_binding.as_ref())
             {
-                let header = deferred_for_header(&binding, &iterable_surface);
+                let header = deferred_for_header(&binding, s);
                 record_deferred_for_expression(
                     body_pair.clone(),
                     &binding,

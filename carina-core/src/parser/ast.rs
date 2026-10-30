@@ -7,7 +7,7 @@
 //! which stage produces and consumes it, and how validation treats it.
 
 use super::display_string_literal;
-use super::error::{ParseWarning, WarningKind};
+use super::error::{DeferredForBodyKind, ParseWarning, WarningKind};
 use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
@@ -136,6 +136,18 @@ pub struct DeferredForExpression<S = ModuleSource> {
     pub template_resource: Resource<S>,
 }
 
+impl<S> DeferredForExpression<S> {
+    pub fn site(&self) -> DeferredForSite<'_> {
+        DeferredForSite {
+            file: self.file.as_deref(),
+            line: self.line,
+            header: &self.header,
+            binding: &self.binding,
+            iterable: &self.iterable,
+        }
+    }
+}
+
 /// Typed parser-side body of a deferred `for` expression.
 ///
 /// Every grammar-supported body kind is retained until module expansion has
@@ -162,7 +174,7 @@ pub struct ParsedDeferredForExpression {
     pub line: usize,
     /// Exact authored span of the complete `for` expression.
     pub span: SourceSpan,
-    /// Authored loop header, for example `for item in names`.
+    /// Canonically rendered loop header, for example `for item in names`.
     pub header: String,
     pub target: DeferredForTarget,
     pub iterable: Value,
@@ -172,13 +184,22 @@ pub struct ParsedDeferredForExpression {
 
 impl ParsedDeferredForExpression {
     pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
-        self.iterable.root_bindings()
+        self.site().root_bindings()
+    }
+
+    pub fn site(&self) -> DeferredForSite<'_> {
+        DeferredForSite {
+            file: self.file.as_deref(),
+            line: self.line,
+            header: &self.header,
+            binding: &self.binding,
+            iterable: &self.iterable,
+        }
     }
 
     pub(crate) fn into_resource_expression(
         self,
-        template_resource: Resource,
-    ) -> DeferredForExpression {
+    ) -> Result<DeferredForExpression, DeferredForBodyKind> {
         let Self {
             file,
             line,
@@ -187,8 +208,21 @@ impl ParsedDeferredForExpression {
             target,
             iterable,
             binding,
-            body: _,
+            body,
         } = self;
+        let template_resource = match body {
+            DeferredForBody::Resource(resource) => *resource,
+            DeferredForBody::Read(data_source) => {
+                return Err(DeferredForBodyKind::Read {
+                    resource_type: data_source.id.display_type(),
+                });
+            }
+            DeferredForBody::ModuleCall(call) => {
+                return Err(DeferredForBodyKind::ModuleCall {
+                    name: call.module_name,
+                });
+            }
+        };
         let resource_type = if template_resource.id.provider.is_empty() {
             template_resource.id.resource_type.clone()
         } else {
@@ -197,12 +231,8 @@ impl ParsedDeferredForExpression {
                 template_resource.id.provider, template_resource.id.resource_type
             )
         };
-        let attributes = template_resource
-            .attributes
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
-        DeferredForExpression {
+        let attributes = template_resource.attributes.clone().into_iter().collect();
+        Ok(DeferredForExpression {
             file,
             line,
             header,
@@ -212,7 +242,7 @@ impl ParsedDeferredForExpression {
             iterable,
             binding,
             template_resource,
-        }
+        })
     }
 }
 
@@ -224,34 +254,14 @@ impl ParsedDeferredForExpression {
 /// typestate.
 #[derive(Debug, Clone, Copy)]
 pub struct DeferredForSite<'a> {
-    file: Option<&'a str>,
-    line: usize,
-    header: &'a str,
-    binding: &'a ForBinding,
-    iterable: &'a Value,
+    pub file: Option<&'a str>,
+    pub line: usize,
+    pub header: &'a str,
+    pub binding: &'a ForBinding,
+    pub iterable: &'a Value,
 }
 
 impl<'a> DeferredForSite<'a> {
-    pub fn file(&self) -> Option<&'a str> {
-        self.file
-    }
-
-    pub fn line(&self) -> usize {
-        self.line
-    }
-
-    pub fn header(&self) -> &'a str {
-        self.header
-    }
-
-    pub fn binding(&self) -> &'a ForBinding {
-        self.binding
-    }
-
-    pub fn iterable(&self) -> &'a Value {
-        self.iterable
-    }
-
     pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
         self.iterable.root_bindings()
     }
@@ -428,7 +438,7 @@ impl<S> DeferredForExpression<S> {
     /// Every binding that can affect the iterable, including references in a
     /// coalesce fallback.
     pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
-        self.iterable.root_bindings()
+        self.site().root_bindings()
     }
 
     /// Every direct reference spelling that may contribute the iterable.
@@ -518,29 +528,25 @@ impl ShapeMismatch {
 /// Origin of a resource yielded by [`ParsedFile::iter_all_resources`].
 ///
 /// `Direct` means the resource was declared at top-level and its iterable
-/// (if any) resolved at parse time. `Deferred` means the resource is the
-/// template body of a `for` expression whose iterable resolves later;
-/// consumers that care about loop-variable placeholders need the
-/// `DeferredForExpression` reference to filter them out.
+/// (if any) resolved at parse time. The deferred arms identify the template
+/// body before or after the post-module-expansion typestate seam.
 #[derive(Debug)]
 pub enum ResourceContext<'a, S = ModuleSource> {
     Direct,
     Deferred(&'a DeferredForExpression<S>),
+    ParsedDeferred(&'a ParsedDeferredForExpression),
 }
 
 /// A resource yielded by [`File::iter_all_resources`], discriminated by
 /// its typestate arm.
 ///
-/// Part of the carina#3181 resource typestate split. The three typed
-/// arms borrow from `File`'s typed slices ([`File::resources`] managed
-/// rows, [`File::compositions`], [`File::data_sources`]); the
-/// `Deferred` arm is a `for`-expression template body that still lives
-/// as a legacy [`Resource`] in [`File::deferred_for_expressions`].
+/// Part of the carina#3181 resource typestate split. The top-level arms borrow
+/// from [`File::resources`], [`File::compositions`], and
+/// [`File::data_sources`]. The deferred arms borrow the managed-resource
+/// template on either side of module resolution.
 ///
-/// Read-only consumers reach the shared accessors via
-/// [`ResourceRef::as_resource_like`] (or the `id` / `attributes` /
-/// `binding` passthroughs); callers that branch on the kind match the
-/// enum arm directly.
+/// Read-only consumers use the `id`, `attributes`, and `binding` passthroughs;
+/// callers that branch on the kind match the enum arm directly.
 #[derive(Debug)]
 pub enum ResourceRef<'a, S = ModuleSource> {
     /// A top-level resource.
@@ -549,12 +555,33 @@ pub enum ResourceRef<'a, S = ModuleSource> {
     LiveComposition(&'a LiveComposition),
     /// A top-level data source (`read`-keyword resource).
     DataSource(&'a DataSource<S>),
-    /// The template body of a deferred `for` expression — always a
-    /// resource (`for` bodies never carry `read` / composition).
+    /// The template body of a resolved deferred `for` expression.
     Deferred {
         resource: &'a Resource<S>,
         deferred: &'a DeferredForExpression<S>,
     },
+    /// The managed-resource body of a parser-side deferred `for`
+    /// expression. Parser-side `read` and module-call bodies are not
+    /// resources and are never yielded.
+    ParsedDeferred {
+        resource: &'a Resource,
+        deferred: &'a ParsedDeferredForExpression,
+    },
+}
+
+/// Mutable counterpart of [`ResourceRef`] used by whole-file resource
+/// transformations. The resolved deferred arm also exposes its denormalized
+/// attribute projection so callers can keep it synchronized after mutation.
+#[derive(Debug)]
+pub enum ResourceMut<'a> {
+    Resource(&'a mut Resource),
+    LiveComposition(&'a mut LiveComposition),
+    DataSource(&'a mut DataSource),
+    Deferred {
+        resource: &'a mut Resource,
+        attributes: &'a mut Vec<(String, Value)>,
+    },
+    ParsedDeferred(&'a mut Resource),
 }
 
 impl<S> Copy for ResourceContext<'_, S> {}
@@ -581,6 +608,7 @@ impl<'a, S> ResourceRef<'a, S> {
             ResourceRef::LiveComposition(v) => &v.id,
             ResourceRef::DataSource(d) => &d.id,
             ResourceRef::Deferred { resource, .. } => &resource.id,
+            ResourceRef::ParsedDeferred { resource, .. } => &resource.id,
         }
     }
 
@@ -590,10 +618,9 @@ impl<'a, S> ResourceRef<'a, S> {
     /// [`LiveComposition`] stores its attributes typed as
     /// [`LiveCompositionAttribute`](crate::resource::LiveCompositionAttribute)
     /// since #3294, and must materialize a `Value`-typed view on
-    /// demand. The other three variants ([`Resource`],
-    /// [`DataSource`], [`Deferred`](Self::Deferred)) return a borrowed
-    /// reference. Callers `.iter()` / `.contains_key()` / `.get()`
-    /// through the `Cow` directly via `Deref`.
+    /// demand. Every other variant returns a borrowed reference. Callers
+    /// `.iter()` / `.contains_key()` / `.get()` through the `Cow` directly
+    /// via `Deref`.
     pub fn attributes(&self) -> std::borrow::Cow<'a, IndexMap<String, Value>> {
         match self {
             ResourceRef::Resource(r) => std::borrow::Cow::Borrowed(&r.attributes),
@@ -608,6 +635,9 @@ impl<'a, S> ResourceRef<'a, S> {
             ResourceRef::Deferred { resource, .. } => {
                 std::borrow::Cow::Borrowed(&resource.attributes)
             }
+            ResourceRef::ParsedDeferred { resource, .. } => {
+                std::borrow::Cow::Borrowed(&resource.attributes)
+            }
         }
     }
 
@@ -618,6 +648,7 @@ impl<'a, S> ResourceRef<'a, S> {
             ResourceRef::LiveComposition(v) => v.binding.as_deref(),
             ResourceRef::DataSource(d) => d.binding.as_deref(),
             ResourceRef::Deferred { resource, .. } => resource.binding.as_deref(),
+            ResourceRef::ParsedDeferred { resource, .. } => resource.binding.as_deref(),
         }
     }
 
@@ -633,6 +664,7 @@ impl<'a, S> ResourceRef<'a, S> {
             ResourceRef::LiveComposition(v) => &v.dependency_bindings,
             ResourceRef::DataSource(d) => &d.dependency_bindings,
             ResourceRef::Deferred { resource, .. } => &resource.dependency_bindings,
+            ResourceRef::ParsedDeferred { resource, .. } => &resource.dependency_bindings,
         }
     }
 
@@ -645,6 +677,7 @@ impl<'a, S> ResourceRef<'a, S> {
             ResourceRef::LiveComposition(_) => None,
             ResourceRef::DataSource(d) => Some(&d.directives),
             ResourceRef::Deferred { resource, .. } => Some(&resource.directives),
+            ResourceRef::ParsedDeferred { resource, .. } => Some(&resource.directives),
         }
     }
 
@@ -655,16 +688,21 @@ impl<'a, S> ResourceRef<'a, S> {
             ResourceRef::LiveComposition(v) => &v.quoted_string_attrs,
             ResourceRef::DataSource(d) => &d.quoted_string_attrs,
             ResourceRef::Deferred { resource, .. } => &resource.quoted_string_attrs,
+            ResourceRef::ParsedDeferred { resource, .. } => &resource.quoted_string_attrs,
         }
     }
 
-    /// The [`ResourceContext`] an old `iter_all_resources` caller would
-    /// have seen — `Deferred` for a for-expression template, `Direct`
-    /// otherwise.
+    /// Source context for this resource: top-level, resolved deferred, or
+    /// parser-side deferred.
     pub fn context(&self) -> ResourceContext<'a, S> {
         match self {
             ResourceRef::Deferred { deferred, .. } => ResourceContext::Deferred(deferred),
-            _ => ResourceContext::Direct,
+            ResourceRef::ParsedDeferred { deferred, .. } => {
+                ResourceContext::ParsedDeferred(deferred)
+            }
+            ResourceRef::Resource(_)
+            | ResourceRef::LiveComposition(_)
+            | ResourceRef::DataSource(_) => ResourceContext::Direct,
         }
     }
 
@@ -2867,9 +2905,9 @@ impl<E> Default for File<E> {
 impl<E> File<E> {
     /// Parser-side deferred loops awaiting the module-resolution body seam.
     ///
-    /// This slice is empty after successful resolution. Pre-resolution
-    /// diagnostics must match every [`DeferredForBody`] variant explicitly;
-    /// only the resource arm participates in resource-schema passes.
+    /// This slice is empty after successful resolution. Body-specific
+    /// consumers must match every [`DeferredForBody`] variant explicitly;
+    /// resource consumers should use [`Self::iter_all_resources`].
     pub fn parsed_deferred_for_expressions(&self) -> &[ParsedDeferredForExpression] {
         &self.parsed_deferred_for_expressions
     }
@@ -2883,23 +2921,11 @@ impl<E> File<E> {
     pub fn deferred_for_sites(&self) -> impl Iterator<Item = DeferredForSite<'_>> {
         self.parsed_deferred_for_expressions
             .iter()
-            .map(|deferred| DeferredForSite {
-                file: deferred.file.as_deref(),
-                line: deferred.line,
-                header: &deferred.header,
-                binding: &deferred.binding,
-                iterable: &deferred.iterable,
-            })
+            .map(ParsedDeferredForExpression::site)
             .chain(
                 self.deferred_for_expressions
                     .iter()
-                    .map(|deferred| DeferredForSite {
-                        file: deferred.file.as_deref(),
-                        line: deferred.line,
-                        header: &deferred.header,
-                        binding: &deferred.binding,
-                        iterable: &deferred.iterable,
-                    }),
+                    .map(DeferredForExpression::site),
             )
     }
 
@@ -3093,11 +3119,54 @@ impl<E> File<E> {
             .chain(self.compositions.iter().map(ResourceRef::LiveComposition))
             .chain(self.data_sources.iter().map(ResourceRef::DataSource))
             .chain(
+                self.parsed_deferred_for_expressions
+                    .iter()
+                    .filter_map(|deferred| match &deferred.body {
+                        DeferredForBody::Resource(resource) => {
+                            Some(ResourceRef::ParsedDeferred { resource, deferred })
+                        }
+                        DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => None,
+                    }),
+            )
+            .chain(
                 self.deferred_for_expressions
                     .iter()
                     .map(|d| ResourceRef::Deferred {
                         resource: &d.template_resource,
                         deferred: d,
+                    }),
+            )
+    }
+
+    /// Mutable traversal matching [`Self::iter_all_resources`]. Parser-side
+    /// `read` and module-call bodies are excluded because they are not managed
+    /// resources.
+    pub fn iter_all_resources_mut(&mut self) -> impl Iterator<Item = ResourceMut<'_>> {
+        self.resources
+            .iter_mut()
+            .map(ResourceMut::Resource)
+            .chain(
+                self.compositions
+                    .iter_mut()
+                    .map(ResourceMut::LiveComposition),
+            )
+            .chain(self.data_sources.iter_mut().map(ResourceMut::DataSource))
+            .chain(
+                self.parsed_deferred_for_expressions
+                    .iter_mut()
+                    .filter_map(|deferred| match &mut deferred.body {
+                        DeferredForBody::Resource(resource) => {
+                            Some(ResourceMut::ParsedDeferred(resource))
+                        }
+                        DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => None,
+                    }),
+            )
+            .chain(
+                self.deferred_for_expressions
+                    .iter_mut()
+                    .map(|deferred| ResourceMut::Deferred {
+                        resource: &mut deferred.template_resource,
+                        attributes: &mut deferred.attributes,
                     }),
             )
     }

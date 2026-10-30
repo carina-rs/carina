@@ -6708,14 +6708,9 @@ let second = for item in source.second {
         .into_iter()
         .rev()
         .map(|expression| {
-            let template = match &expression.body {
-                DeferredForBody::Resource(resource) => resource.as_ref().clone(),
-                DeferredForBody::Read(_) => panic!("fixture body must be a resource, not a read"),
-                DeferredForBody::ModuleCall(_) => {
-                    panic!("fixture body must be a resource, not a module call")
-                }
-            };
-            expression.into_resource_expression(template)
+            expression
+                .into_resource_expression()
+                .expect("fixture body must be a resource")
         })
         .collect();
     resolve_modules(&mut parsed, tmp.path()).expect("deferred loops finalize");

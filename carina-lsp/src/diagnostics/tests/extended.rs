@@ -6387,6 +6387,55 @@ let b = selector { items = ['x', 'y'] }\n";
 }
 
 #[test]
+fn imported_deferred_body_rejection_is_anchored_in_the_caller() {
+    let caller = "let parent = use { source = './parent' }\n\
+let instance = parent { names = ['one'] }\n";
+    let fixture = write_tag_key_fixture(&[
+        ("caller.crn", caller),
+        (
+            "parent/main.crn",
+            "arguments { names: list(String) }\n\
+             let grandchild = use { source = './grandchild' }\n\
+             let children = for name in names { grandchild { name = name } }\n",
+        ),
+        ("parent/grandchild/main.crn", "arguments { name: String }\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), fixture.path(), "caller.crn", caller);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("cannot use module call `grandchild`")
+        })
+        .unwrap_or_else(|| panic!("missing deferred-body diagnostic: {diagnostics:#?}"));
+    assert_eq!(diagnostic.range.start.line, 1, "{diagnostic:#?}");
+    assert_eq!(diagnostic.range.start.character, 15, "{diagnostic:#?}");
+}
+
+#[test]
+fn imported_syntax_error_remains_anchored_at_the_owning_call() {
+    let caller = "let broken = use { source = './broken' }\n\
+broken {}\n";
+    let fixture = write_tag_key_fixture(&[
+        ("caller.crn", caller),
+        ("broken/main.crn", "arguments { value: String\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), fixture.path(), "caller.crn", caller);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Syntax error"))
+        .unwrap_or_else(|| panic!("missing imported syntax diagnostic: {diagnostics:#?}"));
+    assert_eq!(diagnostic.range.start.line, 1, "{diagnostic:#?}");
+    assert_eq!(diagnostic.range.start.character, 0, "{diagnostic:#?}");
+    assert_eq!(diagnostic.range.end.character, 6, "{diagnostic:#?}");
+    assert!(diagnostic.message.contains("broken/main.crn"));
+    assert!(!diagnostic.message.contains("module call in caller.crn"));
+}
+
+#[test]
 fn heredoc_argument_type_diagnostic_anchors_the_argument_value() {
     let main = r#"let m = use { source = './m' }
 let inst = m {

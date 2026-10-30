@@ -10527,71 +10527,61 @@ fn resolve_file_block_names<E>(
     parsed: &mut crate::parser::File<E>,
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
-    let mut conflicts = resolve_block_names_detailed(&mut parsed.resources, registry);
-    for data_source in &mut parsed.data_sources {
-        if let Some(schema) = registry.get_for_data_source(data_source) {
-            conflicts.extend(resolve_attribute_block_names(
-                &data_source.id,
-                &mut data_source.attributes,
-                None,
-                schema.as_schema(),
-            ));
-        }
-    }
-    for deferred in &mut parsed.parsed_deferred_for_expressions {
-        match &mut deferred.body {
-            crate::parser::DeferredForBody::Resource(resource) => {
+    let mut conflicts = Vec::new();
+    for resource in parsed.iter_all_resources_mut() {
+        match resource {
+            crate::parser::ResourceMut::Resource(resource)
+            | crate::parser::ResourceMut::ParsedDeferred(resource) => {
                 conflicts.extend(resolve_block_names_detailed(
-                    std::slice::from_mut(resource.as_mut()),
+                    std::slice::from_mut(resource),
                     registry,
                 ));
             }
-            // These bodies never cross the module-resolution seam, so block
-            // aliases cannot affect a materialized resource. Their typed body
-            // error remains the authoritative diagnostic.
-            crate::parser::DeferredForBody::Read(_)
-            | crate::parser::DeferredForBody::ModuleCall(_) => {}
+            crate::parser::ResourceMut::Deferred {
+                resource,
+                attributes,
+            } => {
+                conflicts.extend(resolve_block_names_detailed(
+                    std::slice::from_mut(resource),
+                    registry,
+                ));
+                *attributes = resource.attributes.clone().into_iter().collect();
+            }
+            crate::parser::ResourceMut::DataSource(data_source) => {
+                if let Some(schema) = registry.get_for_data_source(data_source) {
+                    conflicts.extend(resolve_attribute_block_names(
+                        &data_source.id,
+                        &mut data_source.attributes,
+                        None,
+                        schema.as_schema(),
+                    ));
+                }
+            }
+            crate::parser::ResourceMut::LiveComposition(_) => {}
         }
-    }
-    // This function is also part of the post-resolution schema API. Synthetic
-    // resolved fixtures and finalized production files carry only this arm;
-    // raw parser output leaves it empty.
-    for deferred in &mut parsed.deferred_for_expressions {
-        conflicts.extend(resolve_block_names_detailed(
-            std::slice::from_mut(&mut deferred.template_resource),
-            registry,
-        ));
-        deferred.attributes = deferred
-            .template_resource
-            .attributes
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
     }
     conflicts
 }
 
-fn deferred_resource_by_id<'a, E>(
+fn managed_resource_by_id<'a, E>(
     parsed: &'a crate::parser::File<E>,
     id: &crate::resource::ResourceId,
 ) -> Option<&'a Resource> {
     parsed
-        .parsed_deferred_for_expressions
-        .iter()
-        .find_map(|deferred| match &deferred.body {
-            crate::parser::DeferredForBody::Resource(resource) if resource.id == *id => {
-                Some(resource.as_ref())
+        .iter_all_resources()
+        .find_map(|resource| match resource {
+            crate::parser::ResourceRef::Resource(resource)
+            | crate::parser::ResourceRef::Deferred { resource, .. }
+            | crate::parser::ResourceRef::ParsedDeferred { resource, .. }
+                if resource.id == *id =>
+            {
+                Some(resource)
             }
-            crate::parser::DeferredForBody::Resource(_)
-            | crate::parser::DeferredForBody::Read(_)
-            | crate::parser::DeferredForBody::ModuleCall(_) => None,
-        })
-        .or_else(|| {
-            parsed
-                .deferred_for_expressions
-                .iter()
-                .find(|deferred| deferred.template_resource.id == *id)
-                .map(|deferred| &deferred.template_resource)
+            crate::parser::ResourceRef::Resource(_)
+            | crate::parser::ResourceRef::Deferred { .. }
+            | crate::parser::ResourceRef::ParsedDeferred { .. }
+            | crate::parser::ResourceRef::LiveComposition(_)
+            | crate::parser::ResourceRef::DataSource(_) => None,
         })
 }
 
@@ -10600,59 +10590,51 @@ fn resolve_file_block_names_with_authored<E, A>(
     authored: &crate::parser::File<A>,
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
-    let mut conflicts = resolve_block_names_detailed_with_authored(
-        &mut parsed.resources,
-        &authored.resources,
-        registry,
-    );
-    for data_source in &mut parsed.data_sources {
-        if let Some(schema) = registry.get_for_data_source(data_source) {
-            let authored_attributes = authored
-                .data_sources
-                .iter()
-                .find(|candidate| candidate.id == data_source.id)
-                .map(|candidate| &candidate.attributes);
-            conflicts.extend(resolve_attribute_block_names(
-                &data_source.id,
-                &mut data_source.attributes,
-                authored_attributes,
-                schema.as_schema(),
-            ));
-        }
-    }
-    for deferred in &mut parsed.parsed_deferred_for_expressions {
-        match &mut deferred.body {
-            crate::parser::DeferredForBody::Resource(resource) => {
-                let authored_resources = deferred_resource_by_id(authored, &resource.id)
+    let mut conflicts = Vec::new();
+    for resource in parsed.iter_all_resources_mut() {
+        match resource {
+            crate::parser::ResourceMut::Resource(resource)
+            | crate::parser::ResourceMut::ParsedDeferred(resource) => {
+                let authored_resources = managed_resource_by_id(authored, &resource.id)
                     .map(std::slice::from_ref)
                     .unwrap_or_default();
                 conflicts.extend(resolve_block_names_detailed_with_authored(
-                    std::slice::from_mut(resource.as_mut()),
+                    std::slice::from_mut(resource),
                     authored_resources,
                     registry,
                 ));
             }
-            // Read and module-call bodies are rejected before they can enter
-            // the canonical evaluated/authored resource pair.
-            crate::parser::DeferredForBody::Read(_)
-            | crate::parser::DeferredForBody::ModuleCall(_) => {}
+            crate::parser::ResourceMut::Deferred {
+                resource,
+                attributes,
+            } => {
+                let authored_resources = managed_resource_by_id(authored, &resource.id)
+                    .map(std::slice::from_ref)
+                    .unwrap_or_default();
+                conflicts.extend(resolve_block_names_detailed_with_authored(
+                    std::slice::from_mut(resource),
+                    authored_resources,
+                    registry,
+                ));
+                *attributes = resource.attributes.clone().into_iter().collect();
+            }
+            crate::parser::ResourceMut::DataSource(data_source) => {
+                if let Some(schema) = registry.get_for_data_source(data_source) {
+                    let authored_attributes = authored
+                        .data_sources
+                        .iter()
+                        .find(|candidate| candidate.id == data_source.id)
+                        .map(|candidate| &candidate.attributes);
+                    conflicts.extend(resolve_attribute_block_names(
+                        &data_source.id,
+                        &mut data_source.attributes,
+                        authored_attributes,
+                        schema.as_schema(),
+                    ));
+                }
+            }
+            crate::parser::ResourceMut::LiveComposition(_) => {}
         }
-    }
-    for deferred in &mut parsed.deferred_for_expressions {
-        let authored_resources = deferred_resource_by_id(authored, &deferred.template_resource.id)
-            .map(std::slice::from_ref)
-            .unwrap_or_default();
-        conflicts.extend(resolve_block_names_detailed_with_authored(
-            std::slice::from_mut(&mut deferred.template_resource),
-            authored_resources,
-            registry,
-        ));
-        deferred.attributes = deferred
-            .template_resource
-            .attributes
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
     }
     conflicts
 }

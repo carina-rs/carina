@@ -88,23 +88,10 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
     // no `depends_on` set, and the checks below allocate per-resource.
     // Walk top-level + for-body template resources so loops are covered
     // (per the carina-core "directory-scoped, never single-file" rule).
-    let resolved_bodies_have_no_depends_on = parsed
+    let resources_have_no_depends_on = parsed
         .iter_all_resources()
         .all(|rref| depends_on_of(rref).is_empty());
-    let parser_bodies_have_no_depends_on =
-        parsed
-            .parsed_deferred_for_expressions
-            .iter()
-            .all(|deferred| match &deferred.body {
-                crate::parser::DeferredForBody::Resource(resource) => {
-                    resource.directives.depends_on.is_empty()
-                }
-                // These body kinds are rejected at the resource-only resolution
-                // seam, and neither can declare a managed-resource dependency.
-                crate::parser::DeferredForBody::Read(_)
-                | crate::parser::DeferredForBody::ModuleCall(_) => true,
-            });
-    if resolved_bodies_have_no_depends_on && parser_bodies_have_no_depends_on {
+    if resources_have_no_depends_on {
         return Vec::new();
     }
 
@@ -113,15 +100,6 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
     let bindings_by_name: HashMap<&str, ResourceRef<'_>> = parsed
         .iter_all_resources()
         .filter_map(|rref| rref.binding().map(|n| (n, rref)))
-        .collect();
-    let parser_resource_bindings: HashSet<&str> = parsed
-        .parsed_deferred_for_expressions
-        .iter()
-        .filter_map(|deferred| match &deferred.body {
-            crate::parser::DeferredForBody::Resource(resource) => resource.binding.as_deref(),
-            crate::parser::DeferredForBody::Read(_)
-            | crate::parser::DeferredForBody::ModuleCall(_) => None,
-        })
         .collect();
     let upstream_names: HashSet<&str> = parsed
         .upstream_states
@@ -201,9 +179,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
             }
 
             let Some(target) = bindings_by_name.get(dep_name.as_str()) else {
-                if module_parameter_names.contains(dep_name.as_str())
-                    || parser_resource_bindings.contains(dep_name.as_str())
-                {
+                if module_parameter_names.contains(dep_name.as_str()) {
                     continue;
                 }
                 diags.push(
@@ -249,19 +225,6 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
             resource.dependency_bindings(),
             depends_on_of(resource),
         );
-    }
-    for deferred in &parsed.parsed_deferred_for_expressions {
-        match &deferred.body {
-            crate::parser::DeferredForBody::Resource(resource) => check_resource(
-                resource.binding.as_deref(),
-                &resource.attributes,
-                &resource.dependency_bindings,
-                &resource.directives.depends_on,
-            ),
-            // Unsupported body kinds cannot carry managed-resource directives.
-            crate::parser::DeferredForBody::Read(_)
-            | crate::parser::DeferredForBody::ModuleCall(_) => {}
-        }
     }
 
     // Cycle detection over the unioned graph (value-refs ∪ depends_on).

@@ -264,7 +264,35 @@ impl ModuleError {
     /// (notably from the LSP) or `.` (from the CLI); diagnostics should expose
     /// the same stable, project-relative path in either case.
     pub fn display_relative_to(&self, root: &Path) -> String {
-        match self.root_cause() {
+        match self {
+            Self::AtCall { call, error } if error.is_deferred_for_body_rejection() => format!(
+                "module call in {} at line {}: {}",
+                display_source_path_relative_to(call.source_file(), root),
+                call.call_span().start_line(),
+                error.display_relative_to(root),
+            ),
+            Self::OwnedByCalls { calls, error }
+                if !calls.is_empty() && error.is_deferred_for_body_rejection() =>
+            {
+                let owners = calls
+                    .iter()
+                    .map(|call| {
+                        format!(
+                            "{} at line {}",
+                            display_source_path_relative_to(call.source_file(), root),
+                            call.call_span().start_line(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "module call in {owners}: {}",
+                    error.display_relative_to(root)
+                )
+            }
+            Self::OwnedByCalls { calls: _, error } | Self::AtCall { call: _, error } => {
+                error.display_relative_to(root)
+            }
             Self::BareStructuralHandleArgument {
                 module,
                 argument,
@@ -295,8 +323,76 @@ impl ModuleError {
                 display_source_path_relative_to(path, root),
                 display_parse_error_relative_to(error, root),
             ),
-            _ => self.to_string(),
+            Self::NotFound(_)
+            | Self::CircularImport(_)
+            | Self::MissingArgument { .. }
+            | Self::InvalidArgumentType { .. }
+            | Self::ReferenceType(_)
+            | Self::Io(_)
+            | Self::UnknownArgument { .. }
+            | Self::UnknownModule(_)
+            | Self::ProviderInModule
+            | Self::StateBlockInModule
+            | Self::BackendInModule
+            | Self::UpstreamStateInModule
+            | Self::ExportsInModule
+            | Self::Constraint(_)
+            | Self::NotADirectory { .. } => self.to_string(),
         }
+    }
+
+    fn is_deferred_for_body_rejection(&self) -> bool {
+        match self.root_cause() {
+            Self::Parse(error) => parse_error_is_deferred_for_body_rejection(error),
+            Self::ParseInFile { path: _, error } => {
+                parse_error_is_deferred_for_body_rejection(error)
+            }
+            Self::OwnedByCalls { .. }
+            | Self::AtCall { .. }
+            | Self::NotFound(_)
+            | Self::CircularImport(_)
+            | Self::MissingArgument { .. }
+            | Self::InvalidArgumentType { .. }
+            | Self::BareStructuralHandleArgument { .. }
+            | Self::ArgumentValueAccess { .. }
+            | Self::ReferenceType(_)
+            | Self::Io(_)
+            | Self::UnknownArgument { .. }
+            | Self::UnknownModule(_)
+            | Self::ProviderInModule
+            | Self::StateBlockInModule
+            | Self::BackendInModule
+            | Self::UpstreamStateInModule
+            | Self::ExportsInModule
+            | Self::Constraint(_)
+            | Self::NotADirectory { .. } => false,
+        }
+    }
+}
+
+fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
+    match error {
+        ParseError::DeferredForBodyUnsupported(_) => true,
+        ParseError::Located { path: _, error } => parse_error_is_deferred_for_body_rejection(error),
+        ParseError::Syntax(_)
+        | ParseError::InvalidExpression { .. }
+        | ParseError::UnboundLoopRead { .. }
+        | ParseError::UnresolvedDeclarationType { .. }
+        | ParseError::UnknownFunction { .. }
+        | ParseError::ReservedResourceAttribute { .. }
+        | ParseError::SecretDerivedBackendAttribute { .. }
+        | ParseError::InterpolationNotAllowedInLiteralString { .. }
+        | ParseError::InvalidResourceIdentity { .. }
+        | ParseError::UndefinedVariable(_)
+        | ParseError::InvalidResourceType(_)
+        | ParseError::DuplicateModule(_)
+        | ParseError::DuplicateBinding { .. }
+        | ParseError::UndefinedIdentifier { .. }
+        | ParseError::ModuleNotFound(_)
+        | ParseError::InternalError { .. }
+        | ParseError::RecursiveFunction(_)
+        | ParseError::CyclicLetBinding { .. }
+        | ParseError::UserFunctionError(_) => false,
     }
 }
 

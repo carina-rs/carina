@@ -10082,6 +10082,59 @@ let calls = for x in src.list { child { item = x } }
 }
 
 #[test]
+fn iter_all_resources_yields_parser_side_deferred_resource_bodies_only() {
+    let parsed = parse(
+        r#"let child = use { source = "./child" }
+let src = mock.test.resource { name = "src" }
+let resources = for x in src.list { mock.test.resource { name = x } }
+let reads = for x in src.list { read mock.iam.Roles { name_regex = x } }
+let calls = for x in src.list { child { item = x } }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("the parser must retain all deferred body kinds");
+
+    let resources = parsed.iter_all_resources().collect::<Vec<_>>();
+    assert_eq!(
+        resources.len(),
+        2,
+        "the direct resource and parser-side deferred resource body must be yielded; \
+         read and module-call bodies must not be resources"
+    );
+    assert!(
+        resources
+            .iter()
+            .all(|resource| resource.id().resource_type == "test.resource")
+    );
+    assert!(matches!(resources[0], ResourceRef::Resource(_)));
+    assert!(matches!(resources[1], ResourceRef::ParsedDeferred { .. }));
+    assert!(matches!(
+        resources[1].context(),
+        ResourceContext::ParsedDeferred(_)
+    ));
+}
+
+#[test]
+fn deferred_for_header_formats_multiline_iterable_without_comments() {
+    let parsed = parse(
+        r#"let src = mock.test.resource { name = "src" }
+let resources = for x in (
+  src.list
+  // fall back while the provider value is absent
+  ?? []
+) { mock.test.resource { name = x } }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("the multiline deferred iterable must parse");
+
+    let [deferred] = parsed.parsed_deferred_for_expressions.as_slice() else {
+        panic!("expected one deferred loop")
+    };
+    assert_eq!(deferred.header, "for x in src.list ?? []");
+}
+
+#[test]
 fn deferred_for_module_call_body_with_bare_unbound_iterable_reports_identifier_error() {
     let parsed = parse(
         r#"let child = use { source = "./child" }

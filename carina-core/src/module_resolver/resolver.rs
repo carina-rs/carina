@@ -1235,9 +1235,7 @@ pub fn resolve_modules_with_diagnostics<E: crate::parser::ExportParamLike + Clon
         )),
         Err(error) => errors.push(error),
     }
-    if let Err(error) = finalize_deferred_for_bodies(&mut graph) {
-        errors.push(error);
-    }
+    errors.extend(finalize_deferred_for_bodies_collecting(&mut graph));
     let constraint_reports = resolver
         .constraint_reports
         .into_inner()
@@ -1272,66 +1270,112 @@ pub fn resolve_modules_with_diagnostics<E: crate::parser::ExportParamLike + Clon
 /// typed rejection seam, with enough information to distinguish a genuinely
 /// residual iterable from one that became concrete during module expansion.
 fn finalize_deferred_for_bodies<E>(parsed: &mut crate::parser::File<E>) -> Result<(), ModuleError> {
-    if parsed.parsed_deferred_for_expressions.is_empty() {
-        return Ok(());
-    }
-
-    let pending = std::mem::take(&mut parsed.parsed_deferred_for_expressions);
-    let resolved = pending
+    match finalize_deferred_for_bodies_collecting(parsed)
         .into_iter()
-        .map(|expression| match &expression.body {
-            crate::parser::DeferredForBody::Resource(resource) => {
-                let template = resource.as_ref().clone();
-                Ok(expression.into_resource_expression(template))
-            }
-            crate::parser::DeferredForBody::Read(data_source) => {
-                Err(unsupported_deferred_for_body(
-                    &expression,
-                    crate::parser::DeferredForBodyKind::Read {
-                        resource_type: data_source.id.display_type(),
-                    },
-                ))
-            }
-            crate::parser::DeferredForBody::ModuleCall(call) => Err(unsupported_deferred_for_body(
-                &expression,
-                crate::parser::DeferredForBodyKind::ModuleCall {
-                    name: call.module_name.clone(),
-                },
-            )),
-        })
-        .collect::<Result<Vec<_>, ModuleError>>()?;
-    parsed.deferred_for_expressions = resolved;
-    Ok(())
+        .next()
+    {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
-fn unsupported_deferred_for_body(
-    expression: &crate::parser::ParsedDeferredForExpression,
-    body: crate::parser::DeferredForBodyKind,
-) -> ModuleError {
-    let iterable_resolution = match &expression.iterable {
-        crate::resource::Value::Concrete(_) => {
-            crate::parser::DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution
+fn finalize_deferred_for_bodies_collecting<E>(
+    parsed: &mut crate::parser::File<E>,
+) -> Vec<ModuleError> {
+    let pending = std::mem::take(&mut parsed.parsed_deferred_for_expressions);
+    let mut resolved = Vec::with_capacity(pending.len());
+    let mut errors = Vec::new();
+    for expression in pending {
+        let rejection_site = match &expression.body {
+            crate::parser::DeferredForBody::Resource(_) => None,
+            crate::parser::DeferredForBody::Read(_)
+            | crate::parser::DeferredForBody::ModuleCall(_) => {
+                Some(DeferredForRejectionSite::from(&expression))
+            }
+        };
+        match expression.into_resource_expression() {
+            Ok(expression) => resolved.push(expression),
+            Err(body) => errors.push(
+                rejection_site
+                    .expect("unsupported deferred body must retain its rejection site")
+                    .into_error(body),
+            ),
         }
-        crate::resource::Value::Deferred(_) => {
-            crate::parser::DeferredForIterableResolution::StillDeferred
-        }
-    };
-    let error = ParseError::DeferredForBodyUnsupported(Box::new(
-        crate::parser::DeferredForBodyUnsupportedError {
+    }
+    parsed.deferred_for_expressions = resolved;
+    errors
+}
+
+struct DeferredForRejectionSite {
+    file: Option<String>,
+    line: usize,
+    header: String,
+    span: crate::parser::SourceSpan,
+    iterable_resolution: crate::parser::DeferredForIterableResolution,
+}
+
+impl From<&crate::parser::ParsedDeferredForExpression> for DeferredForRejectionSite {
+    fn from(expression: &crate::parser::ParsedDeferredForExpression) -> Self {
+        let iterable_resolution = match &expression.iterable {
+            crate::resource::Value::Concrete(_) => {
+                crate::parser::DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution
+            }
+            crate::resource::Value::Deferred(_) => {
+                crate::parser::DeferredForIterableResolution::StillDeferred
+            }
+        };
+        Self {
+            file: expression.file.clone(),
             line: expression.line,
             header: expression.header.clone(),
-            body,
             span: expression.span,
             iterable_resolution,
-        },
-    ));
-    match &expression.file {
-        Some(path) => ModuleError::ParseInFile {
-            path: std::path::PathBuf::from(path),
-            error: Box::new(error),
-        },
-        None => ModuleError::Parse(error),
+        }
     }
+}
+
+impl DeferredForRejectionSite {
+    fn into_error(self, body: crate::parser::DeferredForBodyKind) -> ModuleError {
+        let error = ParseError::DeferredForBodyUnsupported(Box::new(
+            crate::parser::DeferredForBodyUnsupportedError {
+                line: self.line,
+                header: self.header,
+                body,
+                span: self.span,
+                iterable_resolution: self.iterable_resolution,
+            },
+        ));
+        match self.file {
+            Some(path) => ModuleError::ParseInFile {
+                path: std::path::PathBuf::from(path),
+                error: Box::new(error),
+            },
+            None => ModuleError::Parse(error),
+        }
+    }
+}
+
+pub(super) fn deferred_for_body_errors<E>(parsed: &crate::parser::File<E>) -> Vec<ModuleError> {
+    parsed
+        .parsed_deferred_for_expressions
+        .iter()
+        .filter_map(|expression| {
+            let body = match &expression.body {
+                crate::parser::DeferredForBody::Resource(_) => return None,
+                crate::parser::DeferredForBody::Read(data_source) => {
+                    crate::parser::DeferredForBodyKind::Read {
+                        resource_type: data_source.id.display_type(),
+                    }
+                }
+                crate::parser::DeferredForBody::ModuleCall(call) => {
+                    crate::parser::DeferredForBodyKind::ModuleCall {
+                        name: call.module_name.clone(),
+                    }
+                }
+            };
+            Some(DeferredForRejectionSite::from(expression).into_error(body))
+        })
+        .collect()
 }
 
 fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
@@ -1359,7 +1403,7 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
             continue;
         }
         let instance_prefix = instance_prefix_for_call(call);
-        match resolver.expand_module_call_checked(
+        match resolver.expand_module_call_checked_collecting(
             call,
             &instance_prefix,
             ref_check,
@@ -1369,7 +1413,7 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
             Ok(expanded) => {
                 expanded_calls.push(crate::config_loader::relabel_export_phase(expanded));
             }
-            Err(error) => errors.push(error),
+            Err(call_errors) => errors.extend(call_errors),
         }
     }
     drop(binding_index);
