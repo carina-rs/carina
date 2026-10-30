@@ -579,7 +579,7 @@ mod tests {
         .unwrap();
 
         let lock = fs::read_to_string(project.path().join("carina-providers.lock")).unwrap();
-        assert!(lock.contains("version = 4"), "{lock}");
+        assert!(lock.contains("version = 5"), "{lock}");
         assert!(
             lock.contains("signature_state = \"required_current\""),
             "{lock}"

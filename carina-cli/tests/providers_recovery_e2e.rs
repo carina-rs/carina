@@ -194,7 +194,7 @@ transparency_log_present = false
 fn write_current_signer_lock(base_dir: &Path) {
     fs::write(
         base_dir.join("carina-providers.lock"),
-        r#"version = 4
+        r#"version = 5
 
 [registry_host."registry.carina-rs.dev"]
 discovery_pin_present = true
@@ -249,11 +249,32 @@ fn fixture_artifact_sha256() -> String {
 }
 
 fn registry_fixture(sequence: Option<u64>) -> FixtureRegistryHttp {
+    registry_fixture_with_observations(sequence, None, false)
+}
+
+fn registry_fixture_with_observations(
+    sequence: Option<u64>,
+    valid_until: Option<&str>,
+    yanked: bool,
+) -> FixtureRegistryHttp {
     let mut listing = serde_json::json!({
         "versions": [{"version": FIXTURE_VERSION, "protocols": ["1"]}]
     });
+    if yanked {
+        listing["versions"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "version": "0.4.0",
+                "protocols": ["1"],
+                "yanked": true
+            }));
+    }
     if let Some(sequence) = sequence {
         listing["sequence"] = serde_json::json!(sequence);
+    }
+    if let Some(valid_until) = valid_until {
+        listing["valid_until"] = serde_json::json!(valid_until);
     }
     let shasum = fixture_artifact_sha256();
     FixtureRegistryHttp::default()
@@ -279,7 +300,7 @@ fn write_unsigned_anchored_lock(base_dir: &Path, sequence: u64) {
     fs::write(
         base_dir.join("carina-providers.lock"),
         format!(
-            r#"version = 4
+            r#"version = 5
 
 [registry_host."registry.carina-rs.dev"]
 discovery_pin_present = true
@@ -434,12 +455,12 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
         );
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(
-            stderr.contains("Provider lock format migration: version 2 -> version 4"),
+            stderr.contains("Provider lock format migration: version 2 -> version 5"),
             "{operation}: {stderr}"
         );
         assert_eq!(
             stderr
-                .matches("Provider lock format migration: version 2 -> version 4")
+                .matches("Provider lock format migration: version 2 -> version 5")
                 .count(),
             1,
             "{operation} must report migration exactly once: {stderr}"
@@ -467,7 +488,7 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
         );
 
         let saved = fs::read_to_string(dir.path().join("carina-providers.lock")).unwrap();
-        assert!(saved.starts_with("version = 4\n"), "{operation}: {saved}");
+        assert!(saved.starts_with("version = 5\n"), "{operation}: {saved}");
         assert!(
             saved.contains("discovery_pin_present = false"),
             "{operation}: {saved}"
@@ -568,7 +589,7 @@ fn v1_lock_migration_keeps_discovery_repin_reachable() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    let header = "Provider lock format migration: version 1 -> version 4";
+    let header = "Provider lock format migration: version 1 -> version 5";
     assert_eq!(stderr.matches(header).count(), 1, "{stderr}");
     assert!(
         stderr.contains("Discarding v1 pinned discovery API base"),
@@ -576,7 +597,7 @@ fn v1_lock_migration_keeps_discovery_repin_reachable() {
     );
 
     let saved = fs::read_to_string(dir.path().join("carina-providers.lock")).unwrap();
-    assert!(saved.starts_with("version = 4\n"), "{saved}");
+    assert!(saved.starts_with("version = 5\n"), "{saved}");
     assert!(!saved.contains("migration_pending_discovery_pin"));
     assert!(saved.contains("sequence = 7"), "{saved}");
     assert!(saved.contains("signature_state = \"required_legacy\""));
@@ -597,7 +618,7 @@ fn v1_discovery_repin_previews_and_clears_every_pending_pin_for_the_host() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(
         stderr
-            .matches("Provider lock format migration: version 1 -> version 4")
+            .matches("Provider lock format migration: version 1 -> version 5")
             .count(),
         1,
         "{stderr}"
@@ -613,7 +634,7 @@ fn v1_discovery_repin_previews_and_clears_every_pending_pin_for_the_host() {
     );
 
     let saved = fs::read_to_string(dir.path().join("carina-providers.lock")).unwrap();
-    assert!(saved.starts_with("version = 4\n"), "{saved}");
+    assert!(saved.starts_with("version = 5\n"), "{saved}");
     assert!(
         !saved.contains("migration_pending_discovery_pin"),
         "{saved}"
@@ -635,7 +656,7 @@ fn v1_discovery_repin_preview_folds_the_complete_migration_report() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    let header = "Provider lock format migration: version 1 -> version 4";
+    let header = "Provider lock format migration: version 1 -> version 5";
     assert_eq!(stderr.matches(header).count(), 1, "{stderr}");
     assert!(
         stderr.contains(
@@ -692,7 +713,7 @@ fn init_reports_v2_lock_migration_once_before_authorization_error() {
         "migration-pending discovery must remain blocked"
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    let header = "Provider lock format migration: version 2 -> version 4";
+    let header = "Provider lock format migration: version 2 -> version 5";
     assert!(stderr.contains(header), "{stderr}");
     let repin_command =
         ProjectCommand::new("providers repin-discovery", dir.path()).with_argument(HOST);
@@ -736,7 +757,7 @@ fn init_reports_v1_lock_migration_once_before_authorization_error() {
         "migration-pending discovery must remain blocked"
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    let header = "Provider lock format migration: version 1 -> version 4";
+    let header = "Provider lock format migration: version 1 -> version 5";
     assert!(stderr.contains(header), "{stderr}");
     assert_eq!(
         stderr.matches(header).count(),
@@ -1186,6 +1207,48 @@ fn sequence_less_registry_first_contact_prints_no_reference_point_notice_once() 
     assert!(
         !stderr.contains("carina: established registry sequence anchor"),
         "{stderr}"
+    );
+}
+
+#[test]
+fn sequence_less_first_contact_with_persisted_observations_prints_notice_once() {
+    const CHILD_ENV: &str = "CARINA_TEST_FIRST_CONTACT_OBSERVATION_NOTICE";
+    const TEST_NAME: &str =
+        "sequence_less_first_contact_with_persisted_observations_prints_notice_once";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        for http in [
+            registry_fixture_with_observations(None, Some("2999-01-01T00:00:00Z"), false),
+            registry_fixture_with_observations(None, None, true),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let user_root = tempfile::tempdir().unwrap();
+            let user_dirs = UserDirs::under(user_root.path());
+
+            // No version constraint makes resolution validate the listing
+            // during selection and again before pinning the artifact.
+            resolve_with_fixture(project.path(), &user_dirs, &http);
+            assert_eq!(
+                http.requested_urls()
+                    .iter()
+                    .filter(|url| url.ends_with("/carina-rs/aws/versions"))
+                    .count(),
+                2,
+                "first contact must exercise the double-fetch path"
+            );
+            resolve_with_fixture(project.path(), &user_dirs, &http);
+        }
+        return;
+    }
+
+    let output = run_child_test(TEST_NAME, CHILD_ENV);
+    assert!(output.status.success(), "child test failed: {output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let notice = "carina: registry listing for carina-rs/aws has no sequence; no reference point established";
+    assert_eq!(
+        stderr.matches(notice).count(),
+        2,
+        "valid_until and yanked first contacts must each announce exactly once: {stderr}"
     );
 }
 
