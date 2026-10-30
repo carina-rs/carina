@@ -312,7 +312,10 @@ fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
             ))));
             ops
         }
-        Effect::Remove { .. } | Effect::Move { .. } | Effect::Wait { .. } => Vec::new(),
+        Effect::Remove { .. }
+        | Effect::Move { .. }
+        | Effect::ReleaseListKeys { .. }
+        | Effect::Wait { .. } => Vec::new(),
     }
 }
 
@@ -325,6 +328,7 @@ fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
         Effect::Delete { id, .. } => vec![id.as_inner()],
         Effect::Import { id, .. } => vec![id.as_inner()],
         Effect::Remove { id, .. } => vec![id.as_inner()],
+        Effect::ReleaseListKeys { id, .. } => vec![id.as_inner()],
         Effect::Move { from, to } => vec![from.as_inner(), to.as_inner()],
         Effect::Wait { .. } => Vec::new(),
         Effect::DeferredCreate { id, .. } => vec![id.as_inner()],

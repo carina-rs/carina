@@ -6734,6 +6734,58 @@ pub struct CompletionValue {
     pub description: String,
 }
 
+/// Canonical name of a field in a struct-valued schema node.
+///
+/// The wrapper keeps keyed-list declarations from degrading into unrelated
+/// strings once they cross schema validation. Its constructor is private:
+/// provider authors name the field through the attribute builder, while
+/// consumers receive it only from a validated [`EffectiveAttribute`].
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct FieldName(String);
+
+impl FieldName {
+    pub(crate) fn declared(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for FieldName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Validated declaration that omission from a keyed list does not reset the
+/// provider-side entry.
+///
+/// The value is readable only through [`EffectiveAttribute`], whose public
+/// constructors require a [`ValidatedResourceSchema`] witness. Therefore a
+/// consumer can rely on `key_field` naming a scalar-string field of the list
+/// element struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyedPartialUpdate {
+    key_field: FieldName,
+}
+
+impl KeyedPartialUpdate {
+    fn declared(key_field: impl Into<String>) -> Self {
+        Self {
+            key_field: FieldName::declared(key_field),
+        }
+    }
+
+    pub fn key_field(&self) -> &FieldName {
+        &self.key_field
+    }
+}
+
 impl CompletionValue {
     pub fn new(value: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
@@ -6783,6 +6835,7 @@ impl CompletionValue {
 ///     removable,
 ///     block_name,
 ///     write_only,
+///     keyed_partial_update,
 ///     identity,
 ///     deferred_populate,
 /// } = attribute.parts();
@@ -6798,6 +6851,7 @@ impl CompletionValue {
 ///     removable,
 ///     block_name,
 ///     write_only,
+///     keyed_partial_update,
 ///     identity,
 ///     deferred_populate,
 /// );
@@ -6828,6 +6882,9 @@ pub struct AttributeSchema {
     /// appear in read responses. This is NOT related to sensitive/secret values — it
     /// indicates a CloudFormation `writeOnlyProperties` attribute.
     pub(crate) write_only: bool,
+    /// Key field for a list-of-structs whose provider API updates only the
+    /// entries it receives and leaves omitted keys unchanged.
+    pub(crate) keyed_partial_update: Option<KeyedPartialUpdate>,
     /// Whether this attribute contributes to anonymous resource identity.
     /// Identity attributes are included in the hash when computing anonymous resource
     /// identifiers, alongside create-only attributes. Use this for attributes that
@@ -6871,6 +6928,7 @@ pub struct AttributeSchemaParts<'a> {
     pub removable: Option<bool>,
     pub block_name: Option<&'a str>,
     pub write_only: bool,
+    pub keyed_partial_update: Option<&'a KeyedPartialUpdate>,
     pub identity: bool,
     pub deferred_populate: bool,
 }
@@ -6908,6 +6966,7 @@ impl AttributeSchema {
             removable: None,
             block_name: None,
             write_only: false,
+            keyed_partial_update: None,
             identity: false,
             deferred_populate: false,
         }
@@ -6953,6 +7012,7 @@ impl AttributeSchema {
             removable: self.removable,
             block_name: self.block_name.as_deref(),
             write_only: self.write_only,
+            keyed_partial_update: self.keyed_partial_update.as_ref(),
             identity: self.identity,
             deferred_populate: self.deferred_populate,
         }
@@ -7033,6 +7093,11 @@ macro_rules! impl_user_input_attribute_builder {
         impl $builder {
             pub fn write_only(mut self) -> Self {
                 self.attribute.write_only = true;
+                self
+            }
+
+            pub fn keyed_partial_update(mut self, key_field: impl Into<String>) -> Self {
+                self.attribute.keyed_partial_update = Some(KeyedPartialUpdate::declared(key_field));
                 self
             }
 
@@ -7508,6 +7573,12 @@ impl<'a> EffectiveAttribute<'a> {
 
     pub fn is_write_only(&self) -> bool {
         self.attribute.write_only
+    }
+
+    /// Return keyed partial-update semantics proven by whole-schema
+    /// validation.
+    pub fn keyed_partial_update(&self) -> Option<&'a KeyedPartialUpdate> {
+        self.attribute.keyed_partial_update.as_ref()
     }
 
     pub fn is_deferred_populate(&self) -> bool {
@@ -8895,6 +8966,54 @@ fn first_write_only_conflict_in(
     })
 }
 
+fn validate_keyed_partial_update(
+    attribute: &AttributeSchema,
+    defs: &BTreeMap<String, AttributeType>,
+    location: &SchemaValidationIssueLocation,
+    issues: &mut Vec<SchemaDefinitionIssue>,
+) {
+    let Some(keyed) = attribute.keyed_partial_update.as_ref() else {
+        return;
+    };
+
+    let Shape::List { element_type, .. } = attribute.attr_type.shape_with_defs(defs) else {
+        push_schema_issue(
+            issues,
+            location,
+            "keyed partial-update attribute must be a list of structs",
+        );
+        return;
+    };
+    let Shape::Struct { name: struct_name } = element_type.shape_with_defs(defs) else {
+        push_schema_issue(
+            issues,
+            location,
+            "keyed partial-update attribute must be a list of structs",
+        );
+        return;
+    };
+    let fields = struct_fields_with_defs(element_type, defs)
+        .expect("Shape::Struct must expose fields after reference resolution");
+    let key_name = keyed.key_field.as_str();
+    let Some(field) = fields.iter().find(|field| field.name == key_name) else {
+        push_schema_issue(
+            issues,
+            location,
+            format!(
+                "keyed partial-update key `{key_name}` is not a field of list element struct `{struct_name}`"
+            ),
+        );
+        return;
+    };
+    if !matches!(field.field_type.shape_with_defs(defs), Shape::String { .. }) {
+        push_schema_issue(
+            issues,
+            location,
+            format!("keyed partial-update key field `{key_name}` must be a scalar string"),
+        );
+    }
+}
+
 fn project_write_only_leaves<'schema>(
     attr_type: &'schema AttributeType,
     value: &Value,
@@ -9210,6 +9329,7 @@ impl ResourceSchema {
         for (name, attribute) in &self.attributes {
             let location = SchemaValidationIssueLocation::Attribute(name.clone());
             validate_attribute_mode(attribute, &location, &mut issues);
+            validate_keyed_partial_update(attribute, &self.defs, &location, &mut issues);
             if let Some(default) = &attribute.default {
                 validate_portable_default(default, location.clone(), &mut issues);
             }

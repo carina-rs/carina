@@ -8698,11 +8698,12 @@ mod saved_plan_version_tests {
     }
 
     #[tokio::test]
-    async fn previous_plan_version_is_rejected_before_payload_decoding() {
+    async fn version_30_plan_is_rejected_before_payload_decoding() {
         let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("previous-plan.json");
-        let previous = crate::commands::plan::PlanFile::CURRENT_VERSION - 1;
+        let previous = 30;
+        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 31);
         let old_plan = serde_json::json!({
             "version": previous,
             "timestamp": "2026-10-29T00:00:00Z",

@@ -784,6 +784,7 @@ impl<S> Plan<S> {
                 Effect::Import { .. } => summary.import += 1,
                 Effect::Remove { .. } => summary.remove += 1,
                 Effect::Move { .. } => summary.moved += 1,
+                Effect::ReleaseListKeys { keys, .. } => summary.release += keys.len(),
                 Effect::Wait { .. } => summary.wait += 1,
                 Effect::DeferredCreate { .. } => {}
             }
@@ -804,6 +805,8 @@ pub struct PlanSummary {
     pub import: usize,
     pub remove: usize,
     pub moved: usize,
+    /// Number of keyed list entries released from authored state.
+    pub release: usize,
     pub wait: usize,
 }
 
@@ -830,6 +833,7 @@ pub enum PlanSummaryPart {
     Delete { count: usize },
     Remove { count: usize },
     Move { count: usize },
+    Release { count: usize },
     Wait { count: usize },
 }
 
@@ -856,6 +860,11 @@ impl PlanSummary {
         if self.moved > 0 {
             parts.push(PlanSummaryPart::Move { count: self.moved });
         }
+        if self.release > 0 {
+            parts.push(PlanSummaryPart::Release {
+                count: self.release,
+            });
+        }
         if self.wait > 0 {
             parts.push(PlanSummaryPart::Wait { count: self.wait });
         }
@@ -878,6 +887,7 @@ impl PlanSummary {
                 PlanSummaryPart::Delete { count } => format!("{count} to delete"),
                 PlanSummaryPart::Remove { count } => format!("{count} to remove from state"),
                 PlanSummaryPart::Move { count } => format!("{count} to move"),
+                PlanSummaryPart::Release { count } => format!("{count} to release"),
                 PlanSummaryPart::Wait { count } => format!("{count} to wait"),
             })
             .collect::<Vec<_>>()

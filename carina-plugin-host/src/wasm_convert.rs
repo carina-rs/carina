@@ -2109,6 +2109,7 @@ mod tests {
             name: name.to_string(),
             attr_type,
             required: false,
+            keyed_partial_update: None,
             default: None,
             description: None,
             create_only: false,
@@ -2246,6 +2247,20 @@ mod tests {
                 AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
                     .build(),
             )
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::list(AttributeType::struct_(
+                        "Setting",
+                        vec![
+                            StructField::required("key", AttributeType::string()).build(),
+                            StructField::required("value", AttributeType::string()).build(),
+                        ],
+                    )),
+                )
+                .keyed_partial_update("key")
+                .build(),
+            )
             .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
             .validate()
             .expect("SDK resource fixture must validate");
@@ -2259,6 +2274,16 @@ mod tests {
             .expect("nested output path must survive transport");
         assert!(resource_record.is_read_only());
         assert!(resource_record.is_deferred_populate());
+        assert_eq!(
+            decoded[0]
+                .effective_attribute("settings")
+                .expect("settings attribute survives SDK/host JSON")
+                .keyed_partial_update()
+                .expect("keyed partial-update metadata survives SDK/host JSON")
+                .key_field()
+                .as_str(),
+            "key"
+        );
 
         let config = ValidatedConfigSchema::validate(BTreeMap::from([(
             "assume_role".to_string(),
@@ -2784,6 +2809,7 @@ mod tests {
             removable,
             block_name,
             write_only,
+            keyed_partial_update,
             identity,
             deferred_populate,
         } = round_tripped_attr.parts();
@@ -2807,6 +2833,7 @@ mod tests {
         assert_eq!(removable, Some(false));
         assert_eq!(block_name, Some("status_block"));
         assert!(write_only);
+        assert!(keyed_partial_update.is_none());
         assert!(identity);
         assert!(!deferred_populate);
 
@@ -4260,7 +4287,7 @@ mod tests {
     }
 
     #[test]
-    fn released_protocol_v12_schema_fixtures_load_through_the_core_seam() {
+    fn released_protocol_v12_schema_fixtures_require_keyed_metadata_before_core_decode() {
         let fixtures = [
             (
                 "acm.Certificate",
@@ -4281,9 +4308,41 @@ mod tests {
         ];
 
         for (expected_resource_type, json) in fixtures {
-            let schemas = json_to_schemas(json).unwrap_or_else(|error| {
+            let error = json_to_schemas(json)
+                .expect_err("released v12 bytes predate required keyed-list metadata");
+            assert!(
+                render_error_chain(&error).contains("missing field `keyed_partial_update`"),
+                "released fixture {expected_resource_type} crossed the required-field gate: {}",
+                render_error_chain(&error),
+            );
+
+            // #4118 is queued behind the protocol-v13 change. The protocol
+            // constant deliberately remains unchanged on this branch, while
+            // the new field is deliberately required. Add the v13 field only
+            // in-memory so these immutable v12 bytes still exercise every
+            // older conversion rule after the required-field gate is pinned.
+            let mut augmented: serde_json::Value =
+                serde_json::from_str(json).expect("released fixture is valid JSON");
+            for schema in augmented
+                .as_array_mut()
+                .expect("released schema fixture is an array")
+            {
+                for attribute in schema["attributes"]
+                    .as_object_mut()
+                    .expect("released resource attributes are an object")
+                    .values_mut()
+                {
+                    attribute
+                        .as_object_mut()
+                        .expect("released attribute schema is an object")
+                        .insert("keyed_partial_update".to_string(), serde_json::Value::Null);
+                }
+            }
+            let augmented =
+                serde_json::to_string(&augmented).expect("augmented fixture serializes");
+            let schemas = json_to_schemas(&augmented).unwrap_or_else(|error| {
                 panic!(
-                    "released fixture {expected_resource_type} must load: {}",
+                    "augmented released fixture {expected_resource_type} must load: {}",
                     render_error_chain(&error)
                 )
             });
@@ -4476,6 +4535,7 @@ mod tests {
                             "ordered":true
                         },
                         "required":false,
+                        "keyed_partial_update":null,
                         "read_only":true,
                         "write_only":false,
                         "provider_name":"DomainValidationOptions"
@@ -4483,7 +4543,7 @@ mod tests {
                 }
             }]"#,
         )
-        .expect("the released version-12 ACM schema must remain loadable");
+        .expect("the released ACM semantics must load with required v13 metadata");
 
         let validated_schema = &schemas[0];
         let schema = validated_schema.as_schema();
@@ -4569,7 +4629,8 @@ mod tests {
                                 "required":true
                             }]
                         },
-                        "required":true
+                        "required":true,
+                        "keyed_partial_update":null
                     }
                 }
             }]"#,
@@ -4579,6 +4640,27 @@ mod tests {
         let rendered = render_error_chain(&err);
         assert!(rendered.contains("schema JSON parse error"));
         assert!(rendered.contains("missing field `write_only`"));
+    }
+
+    #[test]
+    fn test_json_to_schemas_requires_keyed_partial_update_field() {
+        let err = json_to_schemas(
+            r#"[{
+                "resource_type":"test.Resource",
+                "attributes":{
+                    "name":{
+                        "name":"name",
+                        "attr_type":{"type":"String"},
+                        "required":true
+                    }
+                }
+            }]"#,
+        )
+        .expect_err("schema JSON must declare keyed_partial_update explicitly");
+
+        let rendered = render_error_chain(&err);
+        assert!(rendered.contains("schema JSON parse error"));
+        assert!(rendered.contains("missing field `keyed_partial_update`"));
     }
 
     #[test]

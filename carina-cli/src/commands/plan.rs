@@ -355,7 +355,8 @@ pub struct PlanFileContents<S = ModuleSource> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 27 adds a mandatory normalized module-call origin path to
+    /// Plan format 31 adds the typed keyed-list release effect; formats 29 and
+    /// 30 are reserved by parallel changes. Plan format 27 adds a mandatory normalized module-call origin path to
     /// every saved composition. Plan format 26 adds mandatory identities for
     /// every loaded provider artifact. Plan format 25 adds the mandatory typed
     /// `data_source_values` outcomes and removes duplicate data-source rows
@@ -1122,6 +1123,9 @@ impl<S> PlanFileContents<S> {
                     insert(&mut references, from, SchemaKind::Resource);
                     insert(&mut references, to, SchemaKind::Resource);
                 }
+                Effect::ReleaseListKeys { id, .. } => {
+                    insert(&mut references, id, SchemaKind::Resource);
+                }
                 Effect::Wait {
                     identity: _identity,
                     target_id,
@@ -1174,7 +1178,7 @@ impl<S> PlanFileContents<S> {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 28;
+    pub const CURRENT_VERSION: u32 = 31;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> PlanFileContents<SavedModuleSource> {
@@ -1514,9 +1518,10 @@ impl PlanFile {
                     require_identity(&from.id, &format!("{location}.from"))?;
                     require_identity(&to.id, &format!("{location}.to"))?;
                 }
-                Effect::Delete { id, .. } | Effect::Import { id, .. } | Effect::Remove { id } => {
-                    require_identity(id, &location)?
-                }
+                Effect::Delete { id, .. }
+                | Effect::Import { id, .. }
+                | Effect::Remove { id }
+                | Effect::ReleaseListKeys { id, .. } => require_identity(id, &location)?,
                 Effect::Wait {
                     identity,
                     target_id,
@@ -1617,7 +1622,17 @@ impl PlanFile {
                         replacement.delete_idx
                     ));
                 }
-                _ => {
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Update { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => {
                     return Err(format!(
                         "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].delete_idx {} points at {}, expected Delete",
                         replacement.delete_idx,
@@ -2034,7 +2049,17 @@ impl MovedOrigins {
             .iter()
             .filter_map(|effect| match effect {
                 Effect::Move { from, to } => Some((to.as_inner().clone(), from.as_inner().clone())),
-                _ => None,
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Update { .. }
+                | Effect::Delete { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => None,
             })
             .collect();
         Self { by_destination }
@@ -3023,6 +3048,9 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
+        // carina#4118: bumped 28→31 — 29 and 30 are reserved by parallel
+        // saved-plan changes; keyed partial-update releases add a serialized
+        // state-only Effect variant.
         // carina#3883: bumped 27→28 — pending re-read unknowns now persist a
         // typed reason shared with state markers. V27 plans carry the removed
         // untyped unknown shape and must be regenerated.

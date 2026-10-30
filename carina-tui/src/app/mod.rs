@@ -162,8 +162,17 @@ impl App {
                 Effect::Create(r) if replacement_create_info.contains_key(&idx) => {
                     Some(r.id.clone())
                 }
-                Effect::DeferredReplace(_) => None,
-                _ => None,
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Delete { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => None,
             })
             .collect();
 
@@ -895,6 +904,17 @@ fn effect_to_node(
             effect_label: format!("{} -> {}", from.human(), to.human()),
             resource_type: to.display_type(),
             name_part: to.identity_str().to_string(),
+            symbol: effect.display_glyph().to_string(),
+            kind: EffectKind::Update,
+            detail_rows,
+            children: Vec::new(),
+            depth: 0,
+            parent: None,
+        },
+        Effect::ReleaseListKeys { id, .. } => TreeNode {
+            effect_label: format!("{} (release keyed list entries)", id.human()),
+            resource_type: id.display_type(),
+            name_part: id.identity_str().to_string(),
             symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Update,
             detail_rows,

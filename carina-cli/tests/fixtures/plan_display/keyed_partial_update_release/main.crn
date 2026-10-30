@@ -1,0 +1,8 @@
+mock.test.keyed_partial_update_list {
+  name = 'target'
+
+  target_group_attribute {
+    key   = 'a'
+    value = '1'
+  }
+}

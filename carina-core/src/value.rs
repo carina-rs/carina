@@ -2588,6 +2588,14 @@ pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<
             from: _from,
             to: _to,
         } => false,
+        Effect::ReleaseListKeys {
+            id: _id,
+            attribute: _attribute,
+            key_field: _key_field,
+            keys,
+        } => keys
+            .iter()
+            .any(|key| contains_redacted_secret(key.retained_value())),
         Effect::Wait {
             identity: _identity,
             target_id: _target_id,
@@ -3979,6 +3987,26 @@ pub fn redact_secrets_in_effect(
             from: from.clone(),
             to: to.clone(),
         },
+        Effect::ReleaseListKeys {
+            id,
+            attribute,
+            key_field,
+            keys,
+        } => Effect::ReleaseListKeys {
+            id: id.clone(),
+            attribute: attribute.clone(),
+            key_field: key_field.clone(),
+            keys: crate::effect::ReleasedListKeys::try_new(
+                keys.iter()
+                    .map(|key| {
+                        redact_secrets_in_value(key.retained_value()).map(|retained| {
+                            crate::effect::ReleasedListKey::new(key.key(), retained)
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .expect("redaction preserves non-empty unique release keys"),
+        },
         // Wait effects carry no secret-bearing fields — `until` is a
         // typed predicate over scalar values, surface form is the
         // user-authored source. Clone through unchanged.
@@ -4009,7 +4037,17 @@ fn create_effect_ids<S>(plan: &crate::plan::Plan<S>) -> Vec<Option<crate::resour
         .iter()
         .map(|effect| match effect {
             crate::effect::Effect::Create(resource) => Some(resource.id.clone()),
-            _ => None,
+            crate::effect::Effect::Read { .. }
+            | crate::effect::Effect::ResumeCreate { .. }
+            | crate::effect::Effect::Update { .. }
+            | crate::effect::Effect::Delete { .. }
+            | crate::effect::Effect::Import { .. }
+            | crate::effect::Effect::Remove { .. }
+            | crate::effect::Effect::Move { .. }
+            | crate::effect::Effect::ReleaseListKeys { .. }
+            | crate::effect::Effect::Wait { .. }
+            | crate::effect::Effect::DeferredCreate { .. }
+            | crate::effect::Effect::DeferredReplace(_) => None,
         })
         .collect()
 }
@@ -4056,7 +4094,16 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
                     },
                     changed_attributes: changed_attributes.clone(),
                 },
-                _ => redact_secrets_in_effect(effect)?,
+                crate::effect::Effect::Read { .. }
+                | crate::effect::Effect::ResumeCreate { .. }
+                | crate::effect::Effect::Delete { .. }
+                | crate::effect::Effect::Import { .. }
+                | crate::effect::Effect::Remove { .. }
+                | crate::effect::Effect::Move { .. }
+                | crate::effect::Effect::ReleaseListKeys { .. }
+                | crate::effect::Effect::Wait { .. }
+                | crate::effect::Effect::DeferredCreate { .. }
+                | crate::effect::Effect::DeferredReplace(_) => redact_secrets_in_effect(effect)?,
             };
             if let crate::effect::Effect::Update { from, .. } = &mut effect {
                 if let Some(state) = historical.get(&from.id) {
@@ -4211,7 +4258,13 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                     template: Box::new(template),
                 })))
             }
-            _ => Ok(effect.clone()),
+            Effect::ResumeCreate { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. } => Ok(effect.clone()),
         })
         .collect::<Result<Vec<_>, SecretRehydrationSiteError>>()?;
     *out.effects_mut() = effects;
@@ -4433,7 +4486,18 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<S: Clone>(
                     changed_attributes: changed_attributes.clone(),
                 })
             }
-            _ => Ok(effect.clone()),
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => Ok(effect.clone()),
         })
         .collect::<Result<Vec<_>, SecretRehydrationSiteError>>()?;
     *out.effects_mut() = effects;

@@ -2187,8 +2187,9 @@ async fn run_apply_locked_owned(
             let checkpoint_sink = ExecutionCheckpointSink::new(move |snapshot| {
                 publisher.send_replace(Some(snapshot));
             });
-            // Remove and Move need no provider call. Report them now; every
-            // checkpoint's state writeback materializes them from the plan.
+            // Remove, Move, and keyed-list release need no provider call.
+            // Report them now; every checkpoint's state writeback materializes
+            // them from the plan.
             let state_only_success_count = execute_state_only_effects(&plan);
             let outcome = execute_effects_with_observer(
                 &plan,
@@ -2829,7 +2830,9 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 27
+    // Validate version compatibility before decoding the payload. Format 31
+    // adds the typed keyed-list release effect; 29 and 30 are reserved by
+    // parallel changes. Format 27
     // requires normalized composition call origins. Plan-file version 26
     // persists the exact provider artifacts used to compute the plan. Plan-file
     // version 25 persists every data-source outcome so apply never re-derives
@@ -3436,8 +3439,9 @@ async fn run_apply_from_plan_locked_owned(
             let checkpoint_sink = ExecutionCheckpointSink::new(move |snapshot| {
                 publisher.send_replace(Some(snapshot));
             });
-            // Remove and Move need no provider call. Report them now; every
-            // checkpoint's state writeback materializes them from the plan.
+            // Remove, Move, and keyed-list release need no provider call.
+            // Report them now; every checkpoint's state writeback materializes
+            // them from the plan.
             let state_only_success_count = execute_state_only_effects(plan);
             let outcome = execute_rehydrated_saved_plan(
                 &rehydrated_plan_file,

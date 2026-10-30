@@ -25,8 +25,8 @@ use carina_core::value::PersistedExportValue;
 #[cfg(test)]
 use carina_core::value::PersistedValue;
 use carina_state::{
-    DeposedAttributes, DeposedInstance, DeposedKey, PreviousSecretHashAuthority, ResourceState,
-    RowBasis, StateBackend, StateFile,
+    BackendError, DeposedAttributes, DeposedInstance, DeposedKey, PreviousSecretHashAuthority,
+    ResourceState, RowBasis, StateBackend, StateFile,
 };
 use colored::Colorize;
 
@@ -1113,6 +1113,7 @@ fn create_side_upsert_ids<S>(plan: &Plan<S>) -> HashSet<ResourceId> {
             | Effect::Delete { .. }
             | Effect::Remove { .. }
             | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
             | Effect::Import { .. }
             | Effect::DeferredCreate { .. }
             | Effect::Wait { .. } => {}
@@ -1487,6 +1488,50 @@ pub(crate) fn build_state_after_apply<S: Clone>(
 
     for id in &writeback.cleanups {
         state.remove_resource(&id.provider, &id.resource_type, id.identity_str());
+    }
+
+    // State-only keyed-list releases are intentionally applied after all
+    // upserts, so release-only and mixed Update+release plans converge through
+    // one final row write. This helper has no provider handle and accepts only
+    // the typed capability minted by `Effect::as_release_list_keys`.
+    for effect in plan.effects() {
+        let Some(release) = effect.as_release_list_keys() else {
+            continue;
+        };
+        let schema = schemas
+            .get(
+                &release.id().provider,
+                &release.id().resource_type,
+                carina_core::schema::SchemaKind::Resource,
+            )
+            .ok_or_else(|| {
+                BackendError::InvalidState(format!(
+                    "cannot apply keyed list release for {}: validated schema is missing",
+                    release.id()
+                ))
+            })?;
+        let keyed = schema
+            .schema()
+            .effective_attribute(release.attribute())
+            .and_then(|attribute| attribute.keyed_partial_update())
+            .ok_or_else(|| {
+                BackendError::InvalidState(format!(
+                    "cannot apply keyed list release for {}.{}: validated keyed partial-update declaration is missing",
+                    release.id(),
+                    release.attribute(),
+                ))
+            })?;
+        if keyed.key_field() != release.key_field() {
+            return Err(BackendError::InvalidState(format!(
+                "cannot apply keyed list release for {}.{}: saved key field '{}' does not match validated schema key field '{}'",
+                release.id(),
+                release.attribute(),
+                release.key_field(),
+                keyed.key_field(),
+            ))
+            .into());
+        }
+        state.release_list_keys(release, keyed.key_field())?;
     }
 
     for effect in plan.effects() {

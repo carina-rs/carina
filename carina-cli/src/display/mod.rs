@@ -116,6 +116,7 @@ impl Sigil {
             // and the trailing `(remove from state)` annotation
             // disambiguates from Update's `~` line.
             Effect::Remove { .. } | Effect::Move { .. } => raw.yellow().bold(),
+            Effect::ReleaseListKeys { .. } => raw.yellow().bold(),
             Effect::Wait { .. } => raw.magenta().bold(),
         };
         Self { raw, rendered }
@@ -399,6 +400,9 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
                 format!("{} to remove from state", count.to_string().yellow())
             }
             PlanSummaryPart::Move { count } => format!("{} to move", count.to_string().yellow()),
+            PlanSummaryPart::Release { count } => {
+                format!("{} to release", count.to_string().yellow())
+            }
             PlanSummaryPart::Wait { count } => format!("{} to wait", count.to_string().magenta()),
         })
         .collect();
@@ -803,6 +807,17 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 )
                 .unwrap();
             }
+            Effect::ReleaseListKeys { id, .. } => {
+                writeln!(
+                    self.out,
+                    "{}{} {} {}",
+                    line_prefix,
+                    id.display_type().cyan().bold(),
+                    id.identity_str().yellow().bold(),
+                    "(release keyed list entries from state)".dimmed(),
+                )
+                .unwrap();
+            }
             Effect::Wait {
                 identity,
                 until_surface,
@@ -1000,6 +1015,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
             | Effect::Read { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
+            | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
             | Effect::DeferredCreate { .. }
             | Effect::DeferredReplace(_) => true,
@@ -1137,8 +1153,17 @@ fn format_plan_tree<'a, S>(
         .filter_map(|(idx, e)| match e {
             Effect::Update { to, .. } => Some(to.id.clone()),
             Effect::Create(r) if replacement_create_info.contains_key(&idx) => Some(r.id.clone()),
-            Effect::DeferredReplace(_) => None,
-            _ => None,
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => None,
         })
         .collect();
 
@@ -1450,6 +1475,22 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
         DetailRow::Text { text } => {
             writeln!(out, "{}{}", attr_prefix, text).unwrap();
         }
+        DetailRow::ReleasedListKey {
+            attribute,
+            key,
+            retained_value,
+        } => {
+            writeln!(
+                out,
+                "{}{} {}[{:?}]: left as {} (AWS does not revert omitted keys; write the default value to revert)",
+                attr_prefix,
+                "!".yellow().bold(),
+                attribute,
+                key,
+                colored_value(retained_value),
+            )
+            .unwrap();
+        }
         DetailRow::Attribute {
             key,
             value,
@@ -1460,7 +1501,17 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 Effect::Delete { .. } => {
                     render_value_ansi(value, AnsiValueStyle::RedStrikethrough, None)
                 }
-                _ => colored_value(value),
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Update { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => colored_value(value),
             };
             let annotation_suffix = annotation_suffix(annotation.as_deref());
             writeln!(out, "{}{}: {}{}", attr_prefix, key, cv, annotation_suffix).unwrap();
@@ -1476,7 +1527,19 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 Effect::Delete { .. } => {
                     render_value_ansi(&pretty, AnsiValueStyle::RedStrikethrough, Some(attr_prefix))
                 }
-                _ => render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix)),
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Update { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => {
+                    render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix))
+                }
             };
             writeln!(out, "{}{}: {}", attr_prefix, key, cv).unwrap();
         }
@@ -1504,7 +1567,19 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                         AnsiValueStyle::RedStrikethrough,
                         Some(attr_prefix),
                     ),
-                    _ => render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix)),
+                    Effect::Read { .. }
+                    | Effect::Create(_)
+                    | Effect::ResumeCreate { .. }
+                    | Effect::Update { .. }
+                    | Effect::Import { .. }
+                    | Effect::Remove { .. }
+                    | Effect::Move { .. }
+                    | Effect::ReleaseListKeys { .. }
+                    | Effect::Wait { .. }
+                    | Effect::DeferredCreate { .. }
+                    | Effect::DeferredReplace(_) => {
+                        render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix))
+                    }
                 };
                 let annotation_suffix = annotation_suffix(entry.annotation.as_deref());
                 writeln!(
@@ -2080,6 +2155,14 @@ pub fn format_effect<S>(effect: &Effect<S>) -> String {
         }
         Effect::Move { from, to } => {
             format!("Move {} -> {}", from.human(), to.human())
+        }
+        Effect::ReleaseListKeys { id, keys, .. } => {
+            format!(
+                "Release {} keyed list entr{} for {}",
+                keys.len(),
+                if keys.len() == 1 { "y" } else { "ies" },
+                id.human()
+            )
         }
         Effect::Wait {
             identity,

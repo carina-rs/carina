@@ -20,11 +20,12 @@ use crate::non_empty::NonEmptyVec;
 use crate::parser::{DeferredForExpression, MovedAddresses, StateBlockAddress};
 use crate::provider::AppliedIdentifier;
 #[cfg(test)]
-use crate::resource::{DataSource, DeferredValue, Resource, Value};
+use crate::resource::{DataSource, DeferredValue, Resource};
 use crate::resource::{
     DeposedKey, Directives, ModuleSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId,
-    ResourceId, ResourceIdentity, SavedModuleSource, State,
+    ResourceId, ResourceIdentity, SavedModuleSource, State, Value,
 };
+use crate::schema::FieldName;
 use crate::wait::ManagedWaitTarget;
 use crate::wait::predicate::WaitPredicate;
 
@@ -278,6 +279,84 @@ pub struct DeferredReplacePayload<S = ModuleSource> {
     pub id: ResolvedResourceId,
     /// The for-expression body, replayed against the upstream state.
     pub template: Box<DeferredForExpression<S>>,
+}
+
+/// One keyed list entry released from Carina's authored-value projection.
+///
+/// `retained_value` is the provider value that remains after omission. It is
+/// carried in the plan so every display frontend can explain the state-only
+/// action without re-reading provider state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReleasedListKey {
+    key: String,
+    retained_value: Value,
+}
+
+impl ReleasedListKey {
+    pub fn new(key: impl Into<String>, retained_value: Value) -> Self {
+        Self {
+            key: key.into(),
+            retained_value,
+        }
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn retained_value(&self) -> &Value {
+        &self.retained_value
+    }
+}
+
+/// Invalid payload for [`Effect::ReleaseListKeys`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidReleasedListKeys {
+    #[error("a keyed partial-update release must contain at least one key")]
+    Empty,
+    #[error("a keyed partial-update release contains duplicate key '{0}'")]
+    Duplicate(String),
+}
+
+/// Non-empty, duplicate-free keys released by one state-only effect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<ReleasedListKey>", into = "Vec<ReleasedListKey>")]
+pub struct ReleasedListKeys(NonEmptyVec<ReleasedListKey>);
+
+impl ReleasedListKeys {
+    pub fn try_new(keys: Vec<ReleasedListKey>) -> Result<Self, InvalidReleasedListKeys> {
+        let mut seen = HashSet::new();
+        for key in &keys {
+            if !seen.insert(key.key.clone()) {
+                return Err(InvalidReleasedListKeys::Duplicate(key.key.clone()));
+            }
+        }
+        NonEmptyVec::from_vec(keys)
+            .map(Self)
+            .ok_or(InvalidReleasedListKeys::Empty)
+    }
+}
+
+impl Deref for ReleasedListKeys {
+    type Target = [ReleasedListKey];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_slice()
+    }
+}
+
+impl TryFrom<Vec<ReleasedListKey>> for ReleasedListKeys {
+    type Error = InvalidReleasedListKeys;
+
+    fn try_from(keys: Vec<ReleasedListKey>) -> Result<Self, Self::Error> {
+        Self::try_new(keys)
+    }
+}
+
+impl From<ReleasedListKeys> for Vec<ReleasedListKey> {
+    fn from(keys: ReleasedListKeys) -> Self {
+        keys.0.into_vec()
+    }
 }
 
 fn deferred_replace_delete_dependencies(deletes: &[DeferredReplaceDelete]) -> BTreeSet<String> {
@@ -586,6 +665,17 @@ pub enum EffectWithSource<S> {
         to: ResolvedResourceId,
     },
 
+    /// Stop treating omitted keys of a keyed partial-update list as authored.
+    ///
+    /// This effect is applied only to locked local state. It is deliberately
+    /// excluded from [`BasicEffect`] so it cannot enter a provider call path.
+    ReleaseListKeys {
+        id: ResolvedResourceId,
+        attribute: String,
+        key_field: FieldName,
+        keys: ReleasedListKeys,
+    },
+
     /// Wait for `target` to satisfy `until` by polling `read()`.
     ///
     /// Emitted by the differ for a `let <binding> = wait <target> { ... }`
@@ -695,6 +785,17 @@ impl From<Effect> for SavedEffect {
             Effect::Import { id, identifier } => Self::Import { id, identifier },
             Effect::Remove { id } => Self::Remove { id },
             Effect::Move { from, to } => Self::Move { from, to },
+            Effect::ReleaseListKeys {
+                id,
+                attribute,
+                key_field,
+                keys,
+            } => Self::ReleaseListKeys {
+                id,
+                attribute,
+                key_field,
+                keys,
+            },
             Effect::Wait {
                 identity,
                 target_id,
@@ -745,7 +846,7 @@ impl<S> AsRef<EffectWithSource<S>> for EffectWithSource<S> {
 /// The basic executor was previously typed on `&Effect` and used a
 /// `_ => unreachable!("execute_basic_effect called with non-basic
 /// effect")` arm to reject `Read`/`Import`/`Remove`/`Move`/
-/// `Wait`. Callers' filters were the *only* thing keeping non-basic
+/// `ReleaseListKeys`/`Wait`. Callers' filters were the *only* thing keeping non-basic
 /// effects out; a single missed filter (#3164) panicked apply at
 /// runtime and left the state lock acquired.
 ///
@@ -786,6 +887,38 @@ pub enum BasicEffect<'a, S = ModuleSource> {
     },
 }
 
+/// Type-level capability for applying a keyed-list release to locked state.
+///
+/// The fields are private and this value can only be minted by
+/// [`Effect::as_release_list_keys`]. State writeback accepts this type rather
+/// than `&Effect`, while provider executors accept [`BasicEffect`]; the two
+/// paths are disjoint by construction.
+#[derive(Debug, Clone, Copy)]
+pub struct ReleaseListKeysEffect<'a> {
+    id: &'a ResolvedResourceId,
+    attribute: &'a str,
+    key_field: &'a FieldName,
+    keys: &'a ReleasedListKeys,
+}
+
+impl<'a> ReleaseListKeysEffect<'a> {
+    pub fn id(self) -> &'a ResolvedResourceId {
+        self.id
+    }
+
+    pub fn attribute(self) -> &'a str {
+        self.attribute
+    }
+
+    pub fn keys(self) -> &'a ReleasedListKeys {
+        self.keys
+    }
+
+    pub fn key_field(self) -> &'a FieldName {
+        self.key_field
+    }
+}
+
 impl<'a, S> BasicEffect<'a, S> {
     /// Returns the source `&Effect` this `BasicEffect` was narrowed
     /// from. Used by `execute_basic_effect` to forward the original
@@ -806,7 +939,46 @@ impl<S> EffectWithSource<S> {
     pub fn move_authority(&self) -> Option<MoveAuthority<'_>> {
         match self {
             Self::Move { from, to } => Some(MoveAuthority { from, to }),
-            _ => None,
+            Self::Read { .. }
+            | Self::Create(_)
+            | Self::ResumeCreate { .. }
+            | Self::Update { .. }
+            | Self::Delete { .. }
+            | Self::Import { .. }
+            | Self::Remove { .. }
+            | Self::ReleaseListKeys { .. }
+            | Self::Wait { .. }
+            | Self::DeferredCreate { .. }
+            | Self::DeferredReplace(_) => None,
+        }
+    }
+
+    /// Narrow this effect to the capability accepted by keyed-list state
+    /// writeback. No provider handle is present on that path.
+    pub fn as_release_list_keys(&self) -> Option<ReleaseListKeysEffect<'_>> {
+        match self {
+            Self::ReleaseListKeys {
+                id,
+                attribute,
+                key_field,
+                keys,
+            } => Some(ReleaseListKeysEffect {
+                id,
+                attribute,
+                key_field,
+                keys,
+            }),
+            Self::Read { .. }
+            | Self::Create(_)
+            | Self::ResumeCreate { .. }
+            | Self::Update { .. }
+            | Self::Delete { .. }
+            | Self::Import { .. }
+            | Self::Remove { .. }
+            | Self::Move { .. }
+            | Self::Wait { .. }
+            | Self::DeferredCreate { .. }
+            | Self::DeferredReplace(_) => None,
         }
     }
 }
@@ -847,7 +1019,7 @@ impl EffectWithSource<ModuleSource> {
                 }
                 assert_eq!(
                     effects.len(),
-                    11,
+                    12,
                     "display_glyph_effects must list every Effect variant exactly once"
                 );
                 effects
@@ -918,6 +1090,19 @@ impl EffectWithSource<ModuleSource> {
                     )),
                 },
                 Effect::Move { .. }
+            ),
+            (
+                Effect::ReleaseListKeys {
+                    id: crate::resource::ResolvedResourceId::new(id.clone()),
+                    attribute: "settings".to_string(),
+                    key_field: FieldName::declared("key"),
+                    keys: ReleasedListKeys::try_new(vec![ReleasedListKey::new(
+                        "enabled",
+                        Value::Concrete(ConcreteValue::String("true".into())),
+                    )])
+                    .expect("test release has one key"),
+                },
+                Effect::ReleaseListKeys { .. }
             ),
             (
                 Effect::Wait {
@@ -1016,6 +1201,7 @@ impl<S> EffectWithSource<S> {
             Effect::Import { .. } => "<-",
             Effect::Remove { .. } => "~",
             Effect::Move { .. } => "->",
+            Effect::ReleaseListKeys { .. } => "!",
             Effect::Wait { .. } => ">",
             Effect::DeferredCreate { .. } => "+",
             Effect::DeferredReplace(_) => "+/-",
@@ -1025,7 +1211,7 @@ impl<S> EffectWithSource<S> {
     /// Narrow this effect to a [`BasicEffect`] if it is one of the
     /// variants the basic executor handles (`Create`, `Update`,
     /// `Delete`). Returns `None` for `Read`, `Import`,
-    /// `Remove`, `Move`, and `Wait` — those route through other
+    /// `Remove`, `Move`, `ReleaseListKeys`, and `Wait` — those route through other
     /// executor paths or are state-only (applied by the CLI's
     /// `execute_state_only_effects` step).
     ///
@@ -1090,6 +1276,7 @@ impl<S> EffectWithSource<S> {
             | Effect::Import { .. }
             | Effect::Remove { .. }
             | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
             | Effect::DeferredCreate { .. }
             | Effect::DeferredReplace(_) => None,
@@ -1115,6 +1302,7 @@ impl<S> EffectWithSource<S> {
             Effect::Import { .. } => "import",
             Effect::Remove { .. } => "remove",
             Effect::Move { .. } => "move",
+            Effect::ReleaseListKeys { .. } => "release_list_keys",
             Effect::Wait { .. } => "wait",
             Effect::DeferredCreate { .. } => "deferred_create",
             Effect::DeferredReplace(_) => "deferred_replace",
@@ -1132,6 +1320,7 @@ impl<S> EffectWithSource<S> {
             Effect::Import { .. } => true,
             Effect::Remove { .. } => true,
             Effect::Move { .. } => true,
+            Effect::ReleaseListKeys { .. } => true,
             Effect::Wait { .. } => false,
             Effect::DeferredCreate { .. } => true,
             Effect::DeferredReplace(_) => true,
@@ -1149,6 +1338,7 @@ impl<S> EffectWithSource<S> {
             Effect::Import { .. } => true,
             Effect::Remove { .. } => true,
             Effect::Move { .. } => true,
+            Effect::ReleaseListKeys { .. } => true,
             Effect::Wait { .. } => false,
             Effect::DeferredCreate { .. } => false,
             Effect::DeferredReplace(_) => true,
@@ -1167,6 +1357,7 @@ impl<S> EffectWithSource<S> {
             Effect::Import { .. } => false,
             Effect::Remove { .. } => false,
             Effect::Move { .. } => false,
+            Effect::ReleaseListKeys { .. } => false,
             Effect::Wait { .. } => false,
             Effect::DeferredCreate { .. } => true,
             Effect::DeferredReplace(_) => true,
@@ -1184,6 +1375,7 @@ impl<S> EffectWithSource<S> {
             Effect::Import { id, .. } => id,
             Effect::Remove { id, .. } => id,
             Effect::Move { to, .. } => to,
+            Effect::ReleaseListKeys { id, .. } => id,
             Effect::Wait { target_id, .. } => target_id.id(),
             Effect::DeferredCreate { id, .. } => id,
             Effect::DeferredReplace(payload) => &payload.id,
@@ -1204,6 +1396,7 @@ impl<S> EffectWithSource<S> {
             Effect::Delete { id, .. }
             | Effect::Import { id, .. }
             | Effect::Remove { id }
+            | Effect::ReleaseListKeys { id, .. }
             | Effect::DeferredCreate { id, .. } => id.identity().clone(),
             Effect::Move { to, .. } => to.identity().clone(),
             Effect::Wait { identity, .. } => identity.clone(),
@@ -1220,7 +1413,17 @@ impl<S> EffectWithSource<S> {
             Effect::Delete { id, generation, .. } => {
                 EffectInstanceKey::new(id.identity().clone(), generation.clone())
             }
-            _ => EffectInstanceKey::current(self.identity()),
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => EffectInstanceKey::current(self.identity()),
         }
     }
 
@@ -1246,6 +1449,7 @@ impl<S> EffectWithSource<S> {
             | Effect::Import { .. }
             | Effect::Remove { .. }
             | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
             | Effect::DeferredCreate { .. }
             | Effect::DeferredReplace(_) => None,
@@ -1263,6 +1467,7 @@ impl<S> EffectWithSource<S> {
             Effect::Import { .. } => None,
             Effect::Remove { .. } => None,
             Effect::Move { .. } => None,
+            Effect::ReleaseListKeys { .. } => None,
             Effect::Wait { identity, .. } => Some(identity.to_string()),
             // INVARIANT: DeferredCreate has no binding identity until the
             // upstream resolves at apply time (the iterable's cardinality is
@@ -1313,6 +1518,7 @@ impl<S> EffectWithSource<S> {
             Effect::Import { .. } => Vec::new(),
             Effect::Remove { id } => vec![id.clone()],
             Effect::Move { from, .. } => vec![from.clone()],
+            Effect::ReleaseListKeys { .. } => Vec::new(),
             Effect::Wait { .. } => Vec::new(),
             Effect::DeferredCreate { .. } => Vec::new(),
             // Absorbed deletes are replacement outcomes, not ordinary
@@ -1346,6 +1552,7 @@ impl<S> EffectWithSource<S> {
             Effect::Import { .. } => Vec::new(),
             Effect::Remove { .. } => Vec::new(),
             Effect::Move { .. } => Vec::new(),
+            Effect::ReleaseListKeys { .. } => Vec::new(),
             Effect::Wait { .. } => Vec::new(),
             Effect::DeferredCreate { .. } => Vec::new(),
             Effect::DeferredReplace(payload) => payload
@@ -1373,7 +1580,7 @@ impl<S> EffectWithSource<S> {
     /// at construction time, because the originating resource is gone
     /// by the time the executor runs (#2871).
     ///
-    /// State-only effects (Import, Remove, Move) return an empty set —
+    /// State-only effects (Import, Remove, Move, ReleaseListKeys) return an empty set —
     /// they are scheduling primitives, not resource-state operations.
     pub fn explicit_dependencies(&self) -> HashSet<String> {
         match self {
@@ -1390,6 +1597,7 @@ impl<S> EffectWithSource<S> {
             Effect::Import { .. } => HashSet::new(),
             Effect::Remove { .. } => HashSet::new(),
             Effect::Move { .. } => HashSet::new(),
+            Effect::ReleaseListKeys { .. } => HashSet::new(),
             Effect::Wait {
                 explicit_dependencies,
                 ..
@@ -1437,7 +1645,8 @@ impl<S> EffectWithSource<S> {
             | Effect::Delete { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
-            | Effect::Move { .. } => {
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. } => {
                 let mut deps = BTreeSet::new();
                 if let Some(resource) = self.as_resource_ref() {
                     deps.extend(crate::deps::get_resource_value_ref_dependencies(resource));
@@ -1495,7 +1704,8 @@ impl<S> EffectWithSource<S> {
             | Effect::Update { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
-            | Effect::Move { .. } => Vec::new(),
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. } => Vec::new(),
         }
     }
 
@@ -1519,6 +1729,7 @@ impl<S> EffectWithSource<S> {
             | Effect::Import { .. }
             | Effect::Remove { .. }
             | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
             | Effect::DeferredCreate { .. }
             | Effect::DeferredReplace(_) => Vec::new(),
@@ -1603,7 +1814,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    const EFFECT_VARIANT_COUNT: usize = 10;
+    const EFFECT_VARIANT_COUNT: usize = 12;
 
     fn deserialize_effect(json: &str) -> SavedEffect {
         serde_json::from_str::<SavedEffect>(json).expect("deserialize saved effect")
@@ -1707,6 +1918,14 @@ mod tests {
                 Effect::Create(ResolvedResource::new(Resource::new("test", "x"))),
             ),
             (
+                "ResumeCreate",
+                Effect::ResumeCreate {
+                    resource: ResolvedResource::new(Resource::new("test", "x")),
+                    started_at: crate::provider::Timestamp::try_from("2026-10-30T00:00:00Z")
+                        .expect("valid timestamp"),
+                },
+            ),
+            (
                 "Update",
                 Effect::Update {
                     from: Box::new(
@@ -1753,10 +1972,23 @@ mod tests {
                 },
             ),
             (
+                "ReleaseListKeys",
+                Effect::ReleaseListKeys {
+                    id: ResolvedResourceId::new(rid.clone()),
+                    attribute: "settings".to_string(),
+                    key_field: FieldName::declared("key"),
+                    keys: ReleasedListKeys::try_new(vec![ReleasedListKey::new(
+                        "enabled",
+                        Value::Concrete(ConcreteValue::String("true".into())),
+                    )])
+                    .expect("fixture has one release key"),
+                },
+            ),
+            (
                 "Wait",
                 Effect::Wait {
                     identity: ResourceIdentity::new("w"),
-                    target_id: fixture_managed_wait_target(rid),
+                    target_id: fixture_managed_wait_target(rid.clone()),
                     until: WaitPredicate::equals(
                         AttrPath::single("status"),
                         Value::Concrete(ConcreteValue::String("ready".into())),
@@ -2063,7 +2295,10 @@ mod tests {
         for (label, effect) in every_effect_variant() {
             assert_eq!(
                 effect.is_state_operation(),
-                matches!(label, "Import" | "Remove" | "Move" | "DeferredReplace"),
+                matches!(
+                    label,
+                    "Import" | "Remove" | "Move" | "ReleaseListKeys" | "DeferredReplace"
+                ),
                 "{label} state-operation classification mismatch",
             );
         }
@@ -2076,6 +2311,30 @@ mod tests {
             resource: ResolvedDataSource::new(resource),
         };
         assert!(!effect.is_mutating());
+    }
+
+    #[test]
+    fn release_list_keys_saved_effect_round_trips() {
+        let effect = every_effect_variant()
+            .into_iter()
+            .find_map(|(label, effect)| (label == "ReleaseListKeys").then_some(effect))
+            .expect("release fixture");
+        let json = serde_json::to_string(&SavedEffect::from(effect.clone()))
+            .expect("serialize release effect");
+        let decoded = deserialize_effect(&json);
+        assert_eq!(decoded, SavedEffect::from(effect));
+        let Effect::ReleaseListKeys {
+            attribute,
+            key_field,
+            keys,
+            ..
+        } = decoded
+        else {
+            panic!("expected release effect")
+        };
+        assert_eq!(attribute, "settings");
+        assert_eq!(key_field.as_str(), "key");
+        assert_eq!(keys[0].key(), "enabled");
     }
 
     #[test]

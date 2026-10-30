@@ -488,6 +488,7 @@ pub fn attribute_schema_to_protocol(
         removable,
         block_name,
         write_only,
+        keyed_partial_update,
         identity,
         deferred_populate,
     } = attribute.parts();
@@ -503,6 +504,8 @@ pub fn attribute_schema_to_protocol(
         name: name.to_string(),
         attr_type: attribute_type_to_protocol(attr_type)?,
         required,
+        keyed_partial_update: keyed_partial_update
+            .map(|keyed| keyed.key_field().as_str().to_string()),
         default,
         description: description.map(str::to_owned),
         create_only,
@@ -798,6 +801,7 @@ pub fn protocol_to_attribute_schema(
         name,
         attr_type,
         required,
+        keyed_partial_update,
         default,
         description,
         create_only,
@@ -862,6 +866,9 @@ pub fn protocol_to_attribute_schema(
             if *identity {
                 builder = builder.identity();
             }
+            if let Some(key_field) = keyed_partial_update {
+                builder = builder.keyed_partial_update(key_field.clone());
+            }
             Ok(builder.build())
         }
         InputMode::Required => {
@@ -904,6 +911,9 @@ pub fn protocol_to_attribute_schema(
             if *identity {
                 builder = builder.identity();
             }
+            if let Some(key_field) = keyed_partial_update {
+                builder = builder.keyed_partial_update(key_field.clone());
+            }
             Ok(builder.build())
         }
         InputMode::ProviderPopulated => {
@@ -914,6 +924,7 @@ pub fn protocol_to_attribute_schema(
                 (block_name.is_some(), "block_name"),
                 (removable.is_some(), "removable"),
                 (*identity, "identity"),
+                (keyed_partial_update.is_some(), "keyed_partial_update"),
             ] {
                 if present {
                     return Err(SchemaDecodeError::incompatible_attribute_modifier(
@@ -2585,6 +2596,20 @@ mod tests {
                 AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
                     .build(),
             )
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::list(AttributeType::struct_(
+                        "Setting",
+                        vec![
+                            StructField::required("key", AttributeType::string()).build(),
+                            StructField::required("value", AttributeType::string()).build(),
+                        ],
+                    )),
+                )
+                .keyed_partial_update("key")
+                .build(),
+            )
             .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
             .with_default_wait_timeout(std::time::Duration::from_secs(30))
             .with_default_wait_interval(std::time::Duration::from_secs(2))
@@ -2633,11 +2658,55 @@ mod tests {
             ResourceValidation::Declared(validators)
                 if validators == &[ValidatorType::TagsKeyValueCheck]
         ));
+        assert_eq!(
+            decoded
+                .effective_attribute("settings")
+                .expect("settings attribute")
+                .keyed_partial_update()
+                .expect("keyed partial-update metadata")
+                .key_field()
+                .as_str(),
+            "key"
+        );
 
         assert!(
             decoded.validate(&invalid_tags).is_err(),
             "declared tags validation must execute after JSON decode"
         );
+    }
+
+    #[test]
+    fn protocol_decode_rejects_invalid_keyed_partial_update_through_schema_validation() {
+        let schema = ResourceSchema::new("test.Settings")
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::list(AttributeType::struct_(
+                        "Setting",
+                        vec![StructField::required("key", AttributeType::string()).build()],
+                    )),
+                )
+                .keyed_partial_update("key")
+                .build(),
+            )
+            .validate()
+            .expect("fixture schema validates");
+        let mut wire = resource_schema_to_protocol(&schema).expect("schema encodes");
+        wire.attributes
+            .get_mut("settings")
+            .expect("settings wire attribute")
+            .keyed_partial_update = Some("missing".to_string());
+
+        let error = protocol_to_resource_schema(&wire)
+            .expect_err("wire key must be checked by whole-schema validation");
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<ResourceSchemaValidationError>())
+            .expect("typed resource-schema validation error remains in the source chain");
+        assert!(source.issues().any(|(path, message)| {
+            path == "settings"
+                && message
+                    == "keyed partial-update key `missing` is not a field of list element struct `Setting`"
+        }));
     }
 
     #[test]
@@ -2732,6 +2801,7 @@ mod tests {
                         identity: Some(positive_int.to_string()),
                     },
                     required: false,
+                    keyed_partial_update: None,
                     default: None,
                     description: None,
                     create_only: false,

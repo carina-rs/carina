@@ -35,6 +35,7 @@ const WRITE_ONLY_PASSWORD_ATTRIBUTE: &str = "password";
 const NESTED_WRITE_ONLY_ATTRIBUTE: &str = "oidc_config";
 const NESTED_WRITE_ONLY_FIELD: &str = "client_secret";
 const SERVER_ADDED_LIST_RESOURCE_TYPE: &str = "test.server_added_list";
+const KEYED_PARTIAL_UPDATE_RESOURCE_TYPE: &str = "test.keyed_partial_update_list";
 const SERVER_ADDED_LIST_ATTRIBUTE: &str = "target_group_attributes";
 const SERVER_ADDED_LIST_DEFAULTS: &[(&str, &str)] = &[
     ("stickiness.type", "lb_cookie"),
@@ -234,6 +235,29 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                     )),
                 )
                 .with_block_name("target_group_attribute")
+                .build(),
+            )
+            .with_unique_name_attribute("name"),
+        ResourceSchema::new(KEYED_PARTIAL_UPDATE_RESOURCE_TYPE)
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    SERVER_ADDED_LIST_ATTRIBUTE,
+                    AttributeType::list(AttributeType::struct_(
+                        "KeyedPartialUpdateAttribute",
+                        vec![
+                            StructField::required("key", AttributeType::string()).build(),
+                            StructField::required("value", AttributeType::string()).build(),
+                        ],
+                    )),
+                )
+                .with_block_name("target_group_attribute")
+                .keyed_partial_update("key")
                 .build(),
             )
             .with_unique_name_attribute("name"),
@@ -611,6 +635,57 @@ impl MockProvider {
         Ok(())
     }
 
+    fn append_update_request_if_configured(request: &UpdateRequest) -> ProviderResult<()> {
+        let Some(path) = env::var_os("CARINA_MOCK_UPDATE_REQUEST_LOG").map(PathBuf::from) else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                ProviderError::internal_caused_by("Failed to create update request log", error)
+            })?;
+        }
+        let ops = request
+            .patch()
+            .ops
+            .iter()
+            .map(|op| {
+                let (operation, key, value) = match op {
+                    PatchOp::Add { key, value } => ("add", key, Some(value)),
+                    PatchOp::Replace { key, value } => ("replace", key, Some(value)),
+                    PatchOp::Reassert { key, value } => ("reassert", key, Some(value)),
+                    PatchOp::Remove { key } => ("remove", key, None),
+                };
+                let value = value
+                    .map(carina_core::value::value_to_json)
+                    .transpose()
+                    .map_err(|error| {
+                        ProviderError::internal(format!(
+                            "Failed to encode mock update request: {error}"
+                        ))
+                    })?;
+                Ok(serde_json::json!({
+                    "op": operation,
+                    "key": key,
+                    "value": value,
+                }))
+            })
+            .collect::<ProviderResult<Vec<_>>>()?;
+        let line = serde_json::to_string(&serde_json::json!({ "ops": ops })).map_err(|error| {
+            ProviderError::internal_caused_by("Failed to serialize update request log", error)
+        })?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|error| {
+                ProviderError::internal_caused_by("Failed to open update request log", error)
+            })?;
+        file.write_all(format!("{line}\n").as_bytes())
+            .map_err(|error| {
+                ProviderError::internal_caused_by("Failed to append update request log", error)
+            })
+    }
+
     fn append_normalizer_log_if_configured(op: &str, id: &ResourceId) -> ProviderResult<()> {
         if let Some(path) = env::var_os("CARINA_MOCK_OP_LOG").map(PathBuf::from) {
             let key = Self::resource_key(id).unwrap_or_else(|| id.to_string());
@@ -732,7 +807,9 @@ impl MockProvider {
     }
 
     fn add_server_list_defaults(id: &ResourceId, attributes: &mut HashMap<String, Value>) {
-        if id.resource_type != SERVER_ADDED_LIST_RESOURCE_TYPE {
+        if id.resource_type != SERVER_ADDED_LIST_RESOURCE_TYPE
+            && id.resource_type != KEYED_PARTIAL_UPDATE_RESOURCE_TYPE
+        {
             return;
         }
 
@@ -806,6 +883,58 @@ impl MockProvider {
             .into_iter()
             .collect(),
         )));
+    }
+
+    fn merge_keyed_partial_update_list(
+        id: &ResourceId,
+        attributes: &mut HashMap<String, Value>,
+        key: &str,
+        value: &Value,
+    ) -> bool {
+        if id.resource_type != KEYED_PARTIAL_UPDATE_RESOURCE_TYPE
+            || key != SERVER_ADDED_LIST_ATTRIBUTE
+        {
+            return false;
+        }
+        let Value::Concrete(ConcreteValue::List(sent)) = value else {
+            return false;
+        };
+        let current = attributes
+            .entry(key.to_string())
+            .or_insert_with(|| Value::Concrete(ConcreteValue::List(Vec::new())));
+        let Value::Concrete(ConcreteValue::List(current)) = current else {
+            return false;
+        };
+        for sent_element in sent {
+            let sent_key = match sent_element {
+                Value::Concrete(ConcreteValue::Map(fields)) => match fields.get("key") {
+                    Some(Value::Concrete(ConcreteValue::String(key))) => {
+                        Some(key.expose_plaintext())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(sent_key) = sent_key else {
+                continue;
+            };
+            if let Some(existing) = current.iter_mut().find(|element| {
+                matches!(
+                    element,
+                    Value::Concrete(ConcreteValue::Map(fields))
+                        if matches!(
+                            fields.get("key"),
+                            Some(Value::Concrete(ConcreteValue::String(key)))
+                                if key.expose_plaintext() == sent_key
+                        )
+                )
+            }) {
+                *existing = sent_element.clone();
+            } else {
+                current.push(sent_element.clone());
+            }
+        }
+        true
     }
 
     fn delete_delay_for(id: &ResourceId) -> Option<Duration> {
@@ -1370,6 +1499,7 @@ impl Provider for MockProvider {
             if let Some(error) = Self::update_fail_error_for(&id) {
                 return Err(error);
             }
+            Self::append_update_request_if_configured(&request)?;
 
             // Apply the patch on top of `from` to construct the post-update
             // attribute map. The mock writes only what the user changed —
@@ -1381,7 +1511,10 @@ impl Provider for MockProvider {
                     PatchOp::Add { key, value }
                     | PatchOp::Replace { key, value }
                     | PatchOp::Reassert { key, value } => {
-                        attributes.insert(key.clone(), value.clone());
+                        if !Self::merge_keyed_partial_update_list(&id, &mut attributes, key, value)
+                        {
+                            attributes.insert(key.clone(), value.clone());
+                        }
                     }
                     PatchOp::Remove { key } => {
                         attributes.remove(key);

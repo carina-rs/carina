@@ -12573,3 +12573,136 @@ fn resource_schema_semantic_fingerprint_covers_planning_and_apply_fields() {
         );
     }
 }
+
+#[test]
+fn resource_schema_semantic_fingerprint_covers_keyed_partial_update() {
+    let element = || {
+        AttributeType::list(AttributeType::struct_(
+            "Setting",
+            vec![
+                StructField::required("key", AttributeType::string()).build(),
+                StructField::required("value", AttributeType::string()).build(),
+            ],
+        ))
+    };
+    let ordinary = ResourceSchema::new("test.Settings")
+        .attribute(AttributeSchema::optional("settings", element()).build());
+    let keyed = ResourceSchema::new("test.Settings").attribute(
+        AttributeSchema::optional("settings", element())
+            .keyed_partial_update("key")
+            .build(),
+    );
+
+    assert_ne!(
+        ordinary.semantic_fingerprint(),
+        keyed.semantic_fingerprint(),
+        "keyed partial-update semantics affect saved-plan compatibility"
+    );
+}
+
+fn keyed_partial_update_schema(
+    attr_type: AttributeType,
+    key_field: &str,
+) -> Result<ValidatedResourceSchema, ResourceSchemaValidationError> {
+    ResourceSchema::new("test.KeyedPartialUpdate")
+        .attribute(
+            AttributeSchema::optional("settings", attr_type)
+                .keyed_partial_update(key_field)
+                .build(),
+        )
+        .validate()
+}
+
+#[test]
+fn keyed_partial_update_validation_accepts_a_string_key_field() {
+    let schema = keyed_partial_update_schema(
+        AttributeType::list(AttributeType::struct_(
+            "Setting",
+            vec![
+                StructField::required("key", AttributeType::string()).build(),
+                StructField::required("value", AttributeType::string()).build(),
+            ],
+        )),
+        "key",
+    )
+    .expect("a list-of-structs string key is valid");
+
+    let keyed = schema
+        .effective_attribute("settings")
+        .expect("settings attribute")
+        .keyed_partial_update()
+        .expect("validated keyed partial-update property");
+    assert_eq!(keyed.key_field().as_str(), "key");
+}
+
+#[test]
+fn keyed_partial_update_validation_rejects_an_unknown_key_field() {
+    let error = keyed_partial_update_schema(
+        AttributeType::list(AttributeType::struct_(
+            "Setting",
+            vec![StructField::required("value", AttributeType::string()).build()],
+        )),
+        "key",
+    )
+    .expect_err("the declared key must name a real element field");
+
+    let issues = error.located_issues().collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        vec![(
+            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            "keyed partial-update key `key` is not a field of list element struct `Setting`"
+        )]
+    );
+}
+
+#[test]
+fn keyed_partial_update_validation_rejects_a_non_struct_list_shape() {
+    let error = keyed_partial_update_schema(AttributeType::list(AttributeType::string()), "key")
+        .expect_err("the attribute must be a list of structs");
+
+    let issues = error.located_issues().collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        vec![(
+            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            "keyed partial-update attribute must be a list of structs"
+        )]
+    );
+}
+
+#[test]
+fn keyed_partial_update_validation_rejects_a_non_list_shape() {
+    let error = keyed_partial_update_schema(AttributeType::string(), "key")
+        .expect_err("the attribute must be a list of structs");
+
+    let issues = error.located_issues().collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        vec![(
+            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            "keyed partial-update attribute must be a list of structs"
+        )]
+    );
+}
+
+#[test]
+fn keyed_partial_update_validation_rejects_a_non_string_key_field() {
+    let error = keyed_partial_update_schema(
+        AttributeType::list(AttributeType::struct_(
+            "Setting",
+            vec![StructField::required("key", AttributeType::int()).build()],
+        )),
+        "key",
+    )
+    .expect_err("the key field must be a scalar string");
+
+    let issues = error.located_issues().collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        vec![(
+            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            "keyed partial-update key field `key` must be a scalar string"
+        )]
+    );
+}

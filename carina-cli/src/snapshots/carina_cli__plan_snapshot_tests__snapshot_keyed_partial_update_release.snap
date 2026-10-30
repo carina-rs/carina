@@ -1,0 +1,10 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  ! mock.test.keyed_partial_update_list mock_test_keyed_partial_update_list_e646b73c (release keyed list entries from state)
+      ! target_group_attributes["b"]: left as '2' (AWS does not revert omitted keys; write the default value to revert)
+
+Plan: 0 to add, 0 to change, 0 to destroy, 1 to release.

@@ -229,7 +229,18 @@ pub fn detect_moved_block_hints<S>(
                     .filter(|attributes| !attributes.is_empty())
                     .map(|attributes| DestroyCandidate { id, attributes })
             }
-            _ => None,
+            Effect::Delete { .. }
+            | Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => None,
         })
         .collect::<Vec<_>>();
     let created = plan
@@ -240,7 +251,18 @@ pub fn detect_moved_block_hints<S>(
             Effect::Create(resource) if !replacement_creates.contains(&index) => {
                 create_candidate(resource, schemas)
             }
-            _ => None,
+            Effect::Create(_)
+            | Effect::Read { .. }
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => None,
         })
         .collect::<Vec<_>>();
 

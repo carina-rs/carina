@@ -1165,6 +1165,11 @@ pub struct AttributeSchema {
     pub name: String,
     pub attr_type: AttributeType,
     pub required: bool,
+    /// Key field for list elements whose provider-side values are updated only
+    /// when that key is sent. Required metadata: `None` is encoded as JSON
+    /// `null` so protocol-version mismatches fail at schema load.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub keyed_partial_update: Option<String>,
     #[serde(default)]
     pub default: Option<Value>,
     #[serde(default)]
@@ -1190,6 +1195,14 @@ pub struct AttributeSchema {
     /// Whether this attribute is populated asynchronously after Create returns.
     #[serde(default)]
     pub deferred_populate: bool,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1854,11 +1867,51 @@ mod tests {
             r#"{
                 "name":"status",
                 "attr_type":{"type":"String"},
-                "required":false
+                "required":false,
+                "keyed_partial_update":null
             }"#,
         )
         .unwrap();
         assert!(!attr.deferred_populate);
+    }
+
+    #[test]
+    fn attribute_schema_missing_keyed_partial_update_is_rejected() {
+        let error = serde_json::from_str::<AttributeSchema>(
+            r#"{
+                "name":"settings",
+                "attr_type":{"type":"list","element_type":{"type":"String"}},
+                "required":false
+            }"#,
+        )
+        .expect_err("keyed_partial_update is required protocol metadata");
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing field `keyed_partial_update`")
+        );
+    }
+
+    #[test]
+    fn attribute_schema_keyed_partial_update_round_trips_and_serializes_none() {
+        for keyed_partial_update in [serde_json::Value::Null, serde_json::json!("key")] {
+            let mut json = serde_json::json!({
+                "name": "settings",
+                "attr_type": {"type": "list", "element_type": {"type": "String"}},
+                "required": false,
+                "keyed_partial_update": keyed_partial_update,
+            });
+            let attr: AttributeSchema = serde_json::from_value(json.clone()).unwrap();
+            json = serde_json::to_value(attr).unwrap();
+            assert!(
+                json.as_object()
+                    .expect("attribute schema object")
+                    .contains_key("keyed_partial_update"),
+                "None must be serialized explicitly: {json}"
+            );
+            assert_eq!(json["keyed_partial_update"], keyed_partial_update);
+        }
     }
 
     #[test]

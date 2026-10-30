@@ -40,7 +40,8 @@ impl<'a, S> PureMetaStep<'a, S> {
             | Effect::Read { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
-            | Effect::Move { .. } => None,
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. } => None,
         }
     }
 }
@@ -70,7 +71,16 @@ pub(super) fn failure_binding_name<S>(effect: &Effect<S>) -> Option<String> {
     match effect {
         Effect::DeferredCreate { template, .. } => Some(template.binding_name.clone()),
         Effect::DeferredReplace(payload) => Some(payload.template.binding_name.clone()),
-        _ => effect.binding_name(),
+        Effect::ReleaseListKeys { .. } => None,
+        Effect::Read { .. }
+        | Effect::Create(_)
+        | Effect::ResumeCreate { .. }
+        | Effect::Update { .. }
+        | Effect::Delete { .. }
+        | Effect::Import { .. }
+        | Effect::Remove { .. }
+        | Effect::Move { .. }
+        | Effect::Wait { .. } => effect.binding_name(),
     }
 }
 
