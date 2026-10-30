@@ -16,9 +16,7 @@ use carina_core::parser::{
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::suggest_similar_name;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
-use carina_core::validation::typecheck::{
-    self, TypeExprValueCheckAvailability, TypecheckInference,
-};
+use carina_core::validation::typecheck::{self, TypecheckInference};
 
 use super::{DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic};
 
@@ -2146,23 +2144,16 @@ impl DiagnosticEngine {
                             },
                         )
                         .err(),
-                        None => match typecheck::classify_type_expr_value_check(type_expr) {
-                            TypeExprValueCheckAvailability::ProviderIndependent(expected) => {
-                                typecheck::check_provider_independent_type_expr_value(
-                                    expected,
-                                    semantic_value,
-                                    &self.provider_context,
-                                    TypecheckInference::Available {
-                                        bindings: inference_bindings,
-                                        schemas: &self.schemas,
-                                    },
-                                )
-                                .err()
-                            }
-                            TypeExprValueCheckAvailability::RequiresLoadedProviderCustomTypes => {
-                                None
-                            }
-                        },
+                        None => typecheck::check_type_expr_value_providerless(
+                            type_expr,
+                            semantic_value,
+                            &self.provider_context,
+                            TypecheckInference::Available {
+                                bindings: inference_bindings,
+                                schemas: &self.schemas,
+                            },
+                        )
+                        .err(),
                     };
                     if let Some(type_error) = type_error
                         && let Some((line, col)) =
@@ -2330,23 +2321,12 @@ impl DiagnosticEngine {
                     provider_context,
                 )
                 .err(),
-                None => match carina_core::validation::classify_export_value_check(semantic_param) {
-                    carina_core::validation::ExportValueCheckAvailability::ProviderIndependent(
-                        export,
-                    ) => carina_core::validation::check_provider_independent_export_value_pre_apply(
-                        export,
-                        value_bindings,
-                        &self.provider_context,
-                    )
-                    .err(),
-                    carina_core::validation::ExportValueCheckAvailability::RequiresLoadedProviderCustomTypes => {
-                        // Orphaned buffers have no provider set from which to
-                        // load a custom-type catalog. The typed classification
-                        // keeps that export out of value validation entirely;
-                        // it is not accepted by an unloaded resolver.
-                        None
-                    }
-                },
+                None => carina_core::validation::check_export_values_pre_apply_providerless(
+                    std::slice::from_ref(semantic_param),
+                    value_bindings,
+                    &self.provider_context,
+                )
+                .err(),
             };
             if let Some(message) = message
                 && let Some((line, col)) = self.find_exports_param_position(doc, &param.name)

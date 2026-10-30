@@ -329,8 +329,8 @@ impl<'a> ValidationTypeContext<'a> {
     }
 
     /// Build the validation view used by bootstrap/editor callers that have
-    /// no loaded provider custom-type catalog. Provider-owned value types are
-    /// classified as unavailable and never reach the resolver.
+    /// no loaded provider custom-type catalog. Structural checks still run,
+    /// while provider-owned leaves never reach the resolver.
     pub fn new_providerless<E>(
         file: &'a crate::parser::File<E>,
         schemas: &'a SchemaRegistry,
@@ -818,9 +818,7 @@ fn resolve_value_source_against_sink(
         .map_err(BindingResolutionError::Type),
         RefSink::TypeExpr(type_expr) => context
             .provider_context
-            .check_if_available(type_expr, value, typecheck::TypecheckInference::Unavailable)
-            .transpose()
-            .map(|_| ())
+            .check(type_expr, value, typecheck::TypecheckInference::Unavailable)
             .map_err(|error| BindingResolutionError::ValueType(Box::new(error))),
     }
 }
@@ -5296,11 +5294,10 @@ impl ModuleCallChecker<'_> {
             } else {
                 typecheck::TypecheckInference::Unavailable
             };
-            if let Some(Err(error)) = self.provider_context.check_if_available(
-                &resolved_parameter.as_type_expr(),
-                value,
-                inference,
-            ) {
+            if let Err(error) =
+                self.provider_context
+                    .check(&resolved_parameter.as_type_expr(), value, inference)
+            {
                 self.push_finding(ModuleCallFinding::argument_value(
                     ModuleCallFindingKind::ValueType,
                     owner.clone(),
@@ -5763,8 +5760,8 @@ pub fn check_module_calls<E>(
 }
 
 /// Providerless module-call diagnostics for bootstrap and orphan-editor
-/// contexts. Provider-owned value types are unavailable rather than sent to
-/// an unloaded resolver.
+/// contexts. Structural checks still run, while provider-owned leaves are not
+/// sent to an unloaded resolver.
 pub fn check_module_calls_providerless<E>(
     input: ModuleCallCheckInput<'_, '_, E, ProviderContext>,
 ) -> Vec<ModuleCallFinding> {
@@ -5956,7 +5953,7 @@ where
                     resolved_param.set_value(Some(resolved));
                     if let (Some(type_expr), Some(value)) =
                         (resolved_param.type_expr_opt(), resolved_param.value())
-                        && let Some(Err(error)) = config.check_if_available(
+                        && let Err(error) = config.check(
                             type_expr,
                             value,
                             typecheck::TypecheckInference::Unavailable,
@@ -5978,63 +5975,24 @@ where
     }
 }
 
-/// An export whose declared type cannot reach provider custom-type
-/// validation.
-///
-/// The field is private so callers with an unloaded [`ProviderContext`] can
-/// only enter the provider-independent value checker after the exhaustive
-/// [`classify_export_value_check`] walk has ruled out every resolved
-/// provider-owned [`TypeExpr::SchemaType`]. Unresolved dotted types retain
-/// their parser-level structural mismatch checks.
-pub struct ProviderIndependentExportValue<'a, P> {
-    param: &'a P,
-}
-
-/// Whether an export value can be checked without a loaded provider catalog.
-pub enum ExportValueCheckAvailability<'a, P> {
-    ProviderIndependent(ProviderIndependentExportValue<'a, P>),
-    RequiresLoadedProviderCustomTypes,
-}
-
-/// Classify an export for diagnostics contexts that explicitly have no loaded
-/// providers.
-pub fn classify_export_value_check<P>(param: &P) -> ExportValueCheckAvailability<'_, P>
-where
-    P: crate::parser::ExportParamLike,
-{
-    let provider_independent = param.type_expr_opt().is_none_or(|type_expr| {
-        matches!(
-            typecheck::classify_type_expr_value_check(type_expr),
-            typecheck::TypeExprValueCheckAvailability::ProviderIndependent(_)
-        )
-    });
-    if provider_independent {
-        ExportValueCheckAvailability::ProviderIndependent(ProviderIndependentExportValue { param })
-    } else {
-        ExportValueCheckAvailability::RequiresLoadedProviderCustomTypes
-    }
-}
-
-/// Check one export whose annotation cannot reach provider custom-type
-/// validation. This preserves structural diagnostics for orphaned LSP buffers
-/// without treating an unloaded provider resolver as if custom-type validation
-/// had succeeded.
-pub fn check_provider_independent_export_value_pre_apply<P>(
-    export: ProviderIndependentExportValue<'_, P>,
+/// Resolve and structurally validate exports without loaded providers.
+/// Provider-owned custom-type leaves are left unchecked, while container
+/// shapes and provider-independent sibling values retain normal diagnostics.
+pub fn check_export_values_pre_apply_providerless<P>(
+    export_params: &[P],
     bindings: &crate::binding_index::ResolvedBindings,
     config: &ProviderContext,
 ) -> Result<ExportsCheckedPreApply<P>, String>
 where
     P: crate::parser::ExportParamLike + Clone,
 {
-    let param = export.param;
     let display_params = resolve_and_validate_export_values(
-        std::slice::from_ref(param),
+        export_params,
         bindings,
         typecheck::TypecheckProviderContext::providerless(config),
     )?;
     Ok(ExportsCheckedPreApply {
-        original_params: vec![param.clone()],
+        original_params: export_params.to_vec(),
         display_params,
     })
 }

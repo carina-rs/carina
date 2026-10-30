@@ -5240,13 +5240,8 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
         type_expr: TypeExpr::Bool,
         value: Some(Value::Concrete(ConcreteValue::String("not-a-bool".into()))),
     };
-    let ExportValueCheckAvailability::ProviderIndependent(builtin) =
-        classify_export_value_check(&builtin)
-    else {
-        panic!("Bool must be provider-independent");
-    };
-    let error = check_provider_independent_export_value_pre_apply(
-        builtin,
+    let error = check_export_values_pre_apply_providerless(
+        std::slice::from_ref(&builtin),
         &ResolvedBindings::default(),
         &ProviderContext::default(),
     )
@@ -5266,10 +5261,12 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
             "identifier".to_string().into(),
         ]))),
     };
-    assert!(matches!(
-        classify_export_value_check(&custom),
-        ExportValueCheckAvailability::RequiresLoadedProviderCustomTypes
-    ));
+    check_export_values_pre_apply_providerless(
+        std::slice::from_ref(&custom),
+        &ResolvedBindings::default(),
+        &ProviderContext::default(),
+    )
+    .expect("providerless export checks must skip only the custom-type leaf");
 
     let builtin_custom = InferredExportParam {
         name: "cidr".to_string(),
@@ -5278,10 +5275,12 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
             "10.0.0.0/16".to_string().into(),
         ))),
     };
-    assert!(matches!(
-        classify_export_value_check(&builtin_custom),
-        ExportValueCheckAvailability::ProviderIndependent(_)
-    ));
+    check_export_values_pre_apply_providerless(
+        std::slice::from_ref(&builtin_custom),
+        &ResolvedBindings::default(),
+        &ProviderContext::default(),
+    )
+    .expect("built-in custom types remain checkable without providers");
 }
 
 #[test]

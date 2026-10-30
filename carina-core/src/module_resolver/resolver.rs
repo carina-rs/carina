@@ -1140,8 +1140,8 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike> RefCheckedModuleGraph<'pa
         Self::check_with_resolver(parsed, resolver)
     }
 
-    /// Bootstrap/editor variant whose value checks are restricted to
-    /// provider-independent type expressions.
+    /// Bootstrap/editor variant that retains structural value checks while
+    /// skipping provider-owned custom-type leaves.
     pub fn check_providerless(
         parsed: &'parsed mut crate::parser::File<E>,
         base_dir: &Path,

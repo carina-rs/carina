@@ -312,17 +312,17 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .value()
                 .expect("value-shaped module argument was matched above");
             let resolved_type = resolved_parameter.as_type_expr();
-            if let Some(result) = self.provider_context.check_if_available(
-                &resolved_type,
-                value,
-                crate::validation::typecheck::TypecheckInference::Unavailable,
-            ) {
-                result.map_err(|mismatch| ModuleError::InvalidArgumentType {
+            self.provider_context
+                .check(
+                    &resolved_type,
+                    value,
+                    crate::validation::typecheck::TypecheckInference::Unavailable,
+                )
+                .map_err(|mismatch| ModuleError::InvalidArgumentType {
                     module: call.module_name.clone(),
                     argument: arg.name.clone(),
                     mismatch,
                 })?;
-            }
         }
 
         // Collect and evaluate argument-local validations and module-level
@@ -1748,19 +1748,18 @@ fn check_composition_argument_type(
         return Ok(());
     }
 
-    let Some(result) = config.check_if_available(
-        &resolved_parameter.as_type_expr(),
-        argument.value(),
-        crate::validation::typecheck::TypecheckInference::Unavailable,
-    ) else {
-        return Ok(());
-    };
-    result.map_err(|mismatch| ArgumentSubstitutionError {
-        source_file: None,
-        line,
-        message: format!("parameter '{parameter}': {mismatch}"),
-        parse_error: None,
-    })
+    config
+        .check(
+            &resolved_parameter.as_type_expr(),
+            argument.value(),
+            crate::validation::typecheck::TypecheckInference::Unavailable,
+        )
+        .map_err(|mismatch| ArgumentSubstitutionError {
+            source_file: None,
+            line,
+            message: format!("parameter '{parameter}': {mismatch}"),
+            parse_error: None,
+        })
 }
 
 /// Instance-prefix a [`DeferredForExpression`] crossing a module

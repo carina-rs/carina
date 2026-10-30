@@ -450,7 +450,8 @@ pub(crate) struct CheckedSavedPlanInputs {
         Box<ValidationReady<CanonicalResourcePair<carina_core::parser::InferredExportParam>>>,
 }
 
-/// Schema-only provider state used by collect-all validation and lint.
+/// Schema and custom-type provider state used by collect-all validation and
+/// lint.
 ///
 /// A hard loader failure may produce this value with an empty context. It has
 /// no transition into [`CompleteProviderLoad`] or [`ValidatedConfig`].
@@ -1151,6 +1152,16 @@ impl ReportingProviderLoad {
 
     pub(crate) fn schemas(&self) -> &SchemaRegistry {
         self.context.schemas()
+    }
+
+    pub(crate) fn loaded_provider_context(
+        &self,
+    ) -> Option<&carina_core::parser::LoadedProviderContext> {
+        if self.load_errors.is_empty() {
+            Some(self.context.provider_context())
+        } else {
+            None
+        }
     }
 }
 

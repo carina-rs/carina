@@ -68,6 +68,59 @@ let admin_access_roles = ["admin-role", "audit-role"]
     fn replace_exports(&self, source: &str) {
         fs::write(self.project.join("exports.crn"), source).expect("replace typed exports");
     }
+
+    fn write_guarded_module_call(&self) {
+        let module = self.project.join("guarded");
+        fs::create_dir(&module).expect("create guarded module");
+        fs::write(
+            module.join("main.crn"),
+            r#"arguments {
+  token: mock.test.sdk_validator.Guarded
+}
+"#,
+        )
+        .expect("write guarded module");
+        fs::write(
+            self.project.join("main.crn"),
+            r#"let guarded_module = use { source = "./guarded" }
+let guarded = guarded_module {
+  token = "reject-me"
+}
+"#,
+        )
+        .expect("write guarded module call");
+        fs::write(self.project.join("exports.crn"), "").expect("clear unrelated exports");
+    }
+
+    fn write_resource_attribute_exports(&self) {
+        fs::write(
+            self.project.join("main.crn"),
+            r#"let registry_prod = mock.test.recovery_probe {
+  value = "prod-account"
+}
+
+let registry_dev = mock.test.recovery_probe {
+  value = "dev-account"
+}
+"#,
+        )
+        .expect("write export source resources");
+        fs::write(
+            self.project.join("exports.crn"),
+            r#"exports {
+  accounts: map(mock.RecoveryProbe) = {
+    registry_prod = registry_prod.value
+    registry_dev  = registry_dev.value
+  }
+  admin_access_role_arns: list(mock.RecoveryProbe) = [
+    registry_prod.value,
+    registry_dev.value,
+  ]
+}
+"#,
+        )
+        .expect("write resource-attribute exports");
+    }
 }
 
 fn wasm_mock_path() -> PathBuf {
@@ -142,6 +195,33 @@ fn provider_custom_type_exports_plan_and_validate_map_and_list() {
         "carina plan",
         &scenario.carina(&["plan", "--refresh=false", "."]),
     );
+}
+
+#[test]
+fn provider_custom_type_resource_attribute_exports_apply_then_plan_from_state() {
+    let scenario = Scenario::new();
+    scenario.write_resource_attribute_exports();
+
+    assert_success(
+        "carina apply",
+        &scenario.carina(&["apply", "--auto-approve", "."]),
+    );
+    assert!(
+        scenario.project.join("carina.state.json").is_file(),
+        "apply must persist state before the plan regression step"
+    );
+    assert_success(
+        "carina plan with existing state",
+        &scenario.carina(&["plan", "--refresh=false", "."]),
+    );
+}
+
+#[test]
+fn provider_custom_type_module_rejection_lint_uses_loaded_provider() {
+    let scenario = Scenario::new();
+    scenario.write_guarded_module_call();
+
+    assert_provider_rejection("carina lint", &scenario.carina(&["lint", "."]));
 }
 
 #[test]

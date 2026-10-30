@@ -268,17 +268,12 @@ fn render_value_type_error(
             provider_context,
             carina_core::validation::typecheck::TypecheckInference::Unavailable,
         ),
-        None => match carina_core::validation::typecheck::classify_type_expr_value_check(type_expr) {
-            carina_core::validation::typecheck::TypeExprValueCheckAvailability::ProviderIndependent(expected) =>
-                carina_core::validation::typecheck::check_provider_independent_type_expr_value(
-                    expected,
-                    value,
-                    &engine.provider_context,
-                    carina_core::validation::typecheck::TypecheckInference::Unavailable,
-                ),
-            carina_core::validation::typecheck::TypeExprValueCheckAvailability::RequiresLoadedProviderCustomTypes =>
-                panic!("test helper requires loaded providers for {type_expr}"),
-        },
+        None => carina_core::validation::typecheck::check_type_expr_value_providerless(
+            type_expr,
+            value,
+            &engine.provider_context,
+            carina_core::validation::typecheck::TypecheckInference::Unavailable,
+        ),
     };
     result.err().map(|error| error.to_string())
 }
@@ -4683,7 +4678,7 @@ attributes {
         diagnostics.iter().all(|diagnostic| !diagnostic
             .message
             .contains("provider custom types are not loaded")),
-        "custom exports in orphan buffers must take the typed unavailable branch: {:?}",
+        "custom leaves in orphan buffers must not call the unloaded resolver: {:?}",
         diagnostics
             .iter()
             .map(|diagnostic| &diagnostic.message)
