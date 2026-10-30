@@ -4358,29 +4358,50 @@ impl<'borrow, 'lock> PersistentLockFile<'borrow, 'lock> {
         self.lock_file.install_lock()
     }
 
+    fn persist_lock_file_update(
+        &mut self,
+        observation: &str,
+        update: impl FnOnce(&mut GuardedLockFile<'lock>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let path = provider_lock_path(self.lock_file.install_lock().project_dir());
+        let mut persisted = self.lock_file.clone_for_save();
+        let result = update(&mut persisted).and_then(|()| {
+            persisted.save().map_err(|error| {
+                format!(
+                    "Failed to persist registry {observation} observation to {}: {error}",
+                    path.display()
+                )
+            })
+        });
+
+        match result {
+            Ok(()) => {
+                *self.lock_file = persisted;
+                Ok(())
+            }
+            Err(error) => {
+                self.lock_file
+                    .restore_registry_sequence_notices_from(&mut persisted);
+                Err(error)
+            }
+        }
+    }
+
     fn persist_registry_ratchets(
         &mut self,
         source: &RemoteSourceKey,
         observation: &str,
         update: impl FnOnce(&mut RegistryRatchets) -> Result<(), String>,
     ) -> Result<(), String> {
-        let mut persisted = self.lock_file.clone_for_save();
-        let mut ratchets = persisted
-            .known_registry_ratchets_by_source_key(source)
-            .map_err(|error| error.to_string())?;
-        update(&mut ratchets)?;
-        persisted
-            .store_registry_ratchets(source.as_str(), ratchets)
-            .map_err(|error| error.to_string())?;
-        persisted.save().map_err(|error| {
-            let path = provider_lock_path(self.lock_file.install_lock().project_dir());
-            format!(
-                "Failed to persist registry {observation} observation to {}: {error}",
-                path.display()
-            )
-        })?;
-        *self.lock_file = persisted;
-        Ok(())
+        self.persist_lock_file_update(observation, |persisted| {
+            let mut ratchets = persisted
+                .known_registry_ratchets_by_source_key(source)
+                .map_err(|error| error.to_string())?;
+            update(&mut ratchets)?;
+            persisted
+                .store_registry_ratchets(source.as_str(), ratchets)
+                .map_err(|error| error.to_string())
+        })
     }
 
     fn validate_and_record_registry_listing(
@@ -4457,17 +4478,9 @@ impl<'borrow, 'lock> PersistentLockFile<'borrow, 'lock> {
     ) -> Result<(), String> {
         let SignerAcceptance { next, transition } = acceptance;
         if transition == SignerTransition::LegacyConverted {
-            let mut persisted = self.lock_file.clone_for_save();
-            persisted.replace_legacy_signer_pin(source.as_str(), next)?;
-            persisted.save().map_err(|error| {
-                let path = provider_lock_path(self.lock_file.install_lock().project_dir());
-                format!(
-                    "Failed to persist registry verified signature observation to {}: {error}",
-                    path.display()
-                )
-            })?;
-            *self.lock_file = persisted;
-            return Ok(());
+            return self.persist_lock_file_update("verified signature", |persisted| {
+                persisted.replace_legacy_signer_pin(source.as_str(), next)
+            });
         }
         let verified = RegistryRatchets {
             signature: RegistrySignatureProtection::Required(next.clone()),
@@ -5681,6 +5694,16 @@ impl RegistryRefusals {
         }
     }
 
+    fn prepend(self, refusal: RegistryRefusal) -> Self {
+        let mut rest = Vec::with_capacity(self.rest.len() + 1);
+        rest.push(self.first);
+        rest.extend(self.rest);
+        Self {
+            first: refusal,
+            rest,
+        }
+    }
+
     fn iter(&self) -> impl Iterator<Item = &RegistryRefusal> {
         std::iter::once(&self.first).chain(&self.rest)
     }
@@ -6273,10 +6296,6 @@ mod registry_listing_validation {
                     Ok(RegistrySequenceTransition::Advanced { previous, current })
                 }
             };
-            if let Err(refusal) = &sequence_transition {
-                RegistryRefusals::insert(&mut refusals, refusal.clone());
-            }
-
             let stripped_versions = locked.yanked_versions.stripped_from(&versions.versions);
             if !stripped_versions.is_empty() {
                 RegistryRefusals::insert(
@@ -6293,10 +6312,21 @@ mod registry_listing_validation {
                     RegistryRefusal::ValidUntilFieldDisappeared { target },
                 );
             }
-            if let Some(refusals) = refusals {
-                return Err(refusals.to_string());
-            }
-            let sequence_transition = sequence_transition.map_err(|refusal| refusal.to_string())?;
+            let sequence_transition = match sequence_transition {
+                Ok(transition) => {
+                    if let Some(refusals) = refusals {
+                        return Err(refusals.to_string());
+                    }
+                    transition
+                }
+                Err(refusal) => {
+                    let refusals = match refusals {
+                        Some(refusals) => refusals.prepend(refusal),
+                        None => RegistryRefusals::new(refusal),
+                    };
+                    return Err(refusals.to_string());
+                }
+            };
 
             let valid_until = versions
                 .valid_until
@@ -13063,6 +13093,150 @@ sha256 = "abc"
             !stderr.contains("carina: established registry sequence anchor"),
             "{stderr}"
         );
+    }
+
+    #[test]
+    fn registry_sequence_notice_has_one_owner_across_intermediate_ratchet_saves() {
+        const CHILD_ENV: &str = "CARINA_TEST_SEQUENCE_NOTICE_RATCHET_SAVE";
+        const TEST_NAME: &str = "provider_resolver::tests::registry_sequence_notice_has_one_owner_across_intermediate_ratchet_saves";
+        const NOTICE: &str = "carina: established registry sequence anchor for carina-rs/aws: 7";
+
+        if let Ok(scenario) = std::env::var(CHILD_ENV) {
+            let project = tempfile::tempdir().unwrap();
+            let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+            let mut lock = install_lock.guard_lock_file_for_test(LockFile::default());
+            let source = registry_source("carina-rs/aws");
+            let source_key = source.source_key();
+            let listing = RegistryVersions {
+                sequence: Some(7),
+                valid_until: None,
+                versions: Vec::new(),
+            };
+            {
+                let mut persistent = PersistentLockFile::new(&mut lock);
+                let validated_sequence = persistent
+                    .validate_and_record_registry_listing(&source, &source_key, &listing)
+                    .unwrap();
+                persistent
+                    .upsert_registry_provider(RegistryProviderLockEntry {
+                        name: "aws".into(),
+                        source: source_key.clone(),
+                        kind: LockEntryKind::Version {
+                            version: "0.5.0".into(),
+                            constraint: None,
+                        },
+                        sha256: "fixture-sha256".into(),
+                        registry: resolved_registry(
+                            "registry.carina-rs.dev",
+                            "https://registry.carina-rs.dev/v1/providers/",
+                        ),
+                        validated_sequence,
+                    })
+                    .unwrap();
+            }
+
+            match scenario.as_str() {
+                "sole-owner" => {
+                    let mut persisted = lock.clone_for_save();
+                    persisted.save().unwrap();
+                    lock.save().unwrap();
+                }
+                "success" => {
+                    PersistentLockFile::new(&mut lock)
+                        .persist_registry_ratchets(&source_key, "test", |_| Ok(()))
+                        .unwrap();
+                    lock.save().unwrap();
+                }
+                "failure-only" | "failure-recovery" => {
+                    let error = with_lock_file_rename_hook(
+                        |_, _| Err(io::Error::other("injected intermediate save failure")),
+                        || {
+                            PersistentLockFile::new(&mut lock).persist_registry_ratchets(
+                                &source_key,
+                                "test",
+                                |_| Ok(()),
+                            )
+                        },
+                    )
+                    .expect_err("the injected intermediate save failure must be reported");
+                    assert!(
+                        error.contains("injected intermediate save failure"),
+                        "{error}"
+                    );
+                    if scenario == "failure-recovery" {
+                        lock.save().unwrap();
+                    }
+                }
+                other => panic!("unknown child scenario: {other}"),
+            }
+            return;
+        }
+
+        for (scenario, expected_notices) in [
+            ("sole-owner", 1),
+            ("success", 1),
+            ("failure-only", 0),
+            ("failure-recovery", 1),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([TEST_NAME, "--exact", "--nocapture"])
+                .env(CHILD_ENV, scenario)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{scenario} child test failed: {output:?}"
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(
+                stderr.matches(NOTICE).count(),
+                expected_notices,
+                "{scenario}: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_provider_configs_sharing_registry_source_queue_one_sequence_notice() {
+        const CHILD_ENV: &str = "CARINA_TEST_SHARED_SOURCE_SEQUENCE_NOTICE";
+        const TEST_NAME: &str = "provider_resolver::tests::two_provider_configs_sharing_registry_source_queue_one_sequence_notice";
+        const NOTICE: &str = "carina: established registry sequence anchor for carina-rs/aws: 7";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            const ARTIFACT: &[u8] = b"shared registry source fixture";
+
+            let user_dirs = carina_core::TestUserDirs::new();
+            let project = tempfile::tempdir().unwrap();
+            let shasum = sha256_bytes(ARTIFACT);
+            let http = registry_http_with_listing(
+                ARTIFACT,
+                &shasum,
+                r#"{"sequence":7,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
+            );
+            let mut primary = provider_config("carina-rs/aws", None);
+            primary.name = "aws-primary".into();
+            let mut alias = provider_config("carina-rs/aws", None);
+            alias.name = "aws-alias".into();
+
+            resolve_all_with_http(
+                &user_dirs,
+                project.path(),
+                &[primary, alias],
+                LockMode::Normal,
+                &http,
+            )
+            .unwrap();
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([TEST_NAME, "--exact", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "child test failed: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(stderr.matches(NOTICE).count(), 1, "{stderr}");
     }
 
     #[test]

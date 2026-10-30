@@ -52,13 +52,27 @@ impl<'lock> GuardedLockFile<'lock> {
         self.install_lock
     }
 
-    pub(crate) fn clone_for_save(&self) -> GuardedLockFile<'lock> {
+    /// Clone the durable state for a transactional save and transfer sole
+    /// ownership of any notices awaiting that save.
+    pub(crate) fn clone_for_save(&mut self) -> GuardedLockFile<'lock> {
         GuardedLockFile {
             install_lock: self.install_lock,
             lock_file: self.lock_file.clone(),
             migration: None,
-            pending_registry_sequence_notices: self.pending_registry_sequence_notices.clone(),
+            pending_registry_sequence_notices: std::mem::take(
+                &mut self.pending_registry_sequence_notices,
+            ),
         }
+    }
+
+    /// Return notices from a transactional clone whose update or save failed.
+    pub(crate) fn restore_registry_sequence_notices_from(
+        &mut self,
+        failed_save: &mut GuardedLockFile<'lock>,
+    ) {
+        debug_assert!(self.pending_registry_sequence_notices.is_empty());
+        self.pending_registry_sequence_notices
+            .append(&mut failed_save.pending_registry_sequence_notices);
     }
 
     pub fn save(&mut self) -> io::Result<()> {
