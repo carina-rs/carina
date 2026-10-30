@@ -325,19 +325,36 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
     );
 
     let claims = crate::identifier::StateBlockClaims::empty();
-    let state_entry = crate::identifier::AnonymousIdStateInfo {
-        name: "_for0[0]._for0[0]".to_string(),
-        provider_instance: None,
-        create_only_values: HashMap::from([("name".to_string(), "inner".to_string())]),
-    };
+    let state_entry = crate::identifier::AnonymousIdStateInfo::try_from_state_attributes(
+        crate::resource::ResolvedResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            ResourceIdentity::new("_for0[0]._for0[0]"),
+            None,
+        ),
+        None,
+        registry
+            .get("mock", "test.resource", crate::schema::SchemaKind::Resource)
+            .expect("state fixture schema")
+            .schema(),
+        &HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("inner".into())),
+        )]),
+    )
+    .expect("state fixture has a valid resolved address");
     let moves = crate::identifier::detect_legacy_loop_address_moves(
         &parsed.resources,
         &registry,
         &|provider, resource_type| {
-            claims.screen_entries(provider, resource_type, [state_entry.clone()], |entry| {
-                entry.name.as_str()
-            })
+            claims.screen_entries(
+                provider,
+                resource_type,
+                [state_entry.clone()],
+                crate::identifier::AnonymousIdStateInfo::name,
+            )
         },
+        &|_binding| Vec::new(),
         &claims,
         &[],
     );

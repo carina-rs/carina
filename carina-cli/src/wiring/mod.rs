@@ -2421,7 +2421,23 @@ struct AnonymousReconciliationStateView {
     by_type: HashMap<(String, String), Vec<AnonymousIdStateInfo>>,
     existence_only_by_type: HashMap<(String, String), HashSet<String>>,
     origins_by_projected_name: HashMap<(String, String), HashMap<String, Vec<ResourceId>>>,
-    by_binding: HashMap<String, Vec<AnonymousIdBindingStateInfo>>,
+    by_binding: HashMap<String, Vec<AnonymousIdBindingViewEntry>>,
+}
+
+struct AnonymousIdBindingViewEntry {
+    value: AnonymousIdBindingStateInfo,
+    origin: ResourceId,
+    effective: ResourceId,
+}
+
+impl AnonymousIdBindingViewEntry {
+    fn is_visible_to_binding_resolution(&self, claims: &StateBlockClaims) -> bool {
+        // A claimed source is normally unavailable to heuristic reads. A
+        // moved row is the exception: its matching target claim makes the
+        // projected address readable. A removed row has no target claim and
+        // therefore remains hidden even if another phase projected it.
+        !claims.claims_from(&self.origin) || claims.claims_to(&self.effective)
+    }
 }
 
 impl AnonymousReconciliationStateView {
@@ -2438,8 +2454,6 @@ impl AnonymousReconciliationStateView {
             .iter()
             .map(|(from, to)| (from.as_inner().clone(), to.clone()))
             .collect::<HashMap<_, _>>();
-        let mut stable_identity_by_type = HashMap::<(String, String), Vec<String>>::new();
-
         for state_resource in state_file.resources() {
             let state_row_id = resolved_state_row_id(
                 state_resource,
@@ -2450,82 +2464,65 @@ impl AnonymousReconciliationStateView {
                 .cloned()
                 .unwrap_or_else(|| state_row_id.clone());
             let has_persisted_attributes = state_resource.persisted_attributes().is_some();
-            let attribute_values = match state_resource.persisted_attributes() {
-                Some(persisted) => persisted
-                    .to_values()
-                    .into_iter()
-                    .filter_map(|(attribute, value)| {
-                        identifier::canonical_create_only_value_string(&value)
-                            .map(|value| (attribute, value))
-                    })
-                    .collect::<HashMap<_, _>>(),
-                None => HashMap::new(),
-            };
+            let attribute_values = state_resource
+                .persisted_attributes()
+                .map(|persisted| persisted.to_values())
+                .unwrap_or_default();
             let type_key = (
                 projected_id.provider().to_string(),
                 projected_id.resource_type().to_string(),
             );
-            let stable_identity_attributes = stable_identity_by_type
-                .entry(type_key.clone())
-                .or_insert_with(|| {
-                    ctx.schemas()
-                        .get(
-                            projected_id.provider(),
-                            projected_id.resource_type(),
-                            carina_core::schema::SchemaKind::Resource,
-                        )
-                        .map(|schema| {
-                            let schema = schema.schema().as_schema();
-                            schema
-                                .create_only_attributes()
-                                .into_iter()
-                                .chain(schema.identity_attributes())
-                                .map(str::to_string)
-                                .collect::<BTreeSet<_>>()
-                                .into_iter()
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                });
-            let create_only_values = stable_identity_attributes
-                .iter()
-                .filter_map(|attribute| {
-                    attribute_values
-                        .get(attribute)
-                        .cloned()
-                        .map(|value| (attribute.clone(), value))
-                })
-                .collect();
+            let state_info = if let Some(schema) = ctx.schemas().get(
+                projected_id.provider(),
+                projected_id.resource_type(),
+                carina_core::schema::SchemaKind::Resource,
+            ) {
+                AnonymousIdStateInfo::try_from_state_attributes(
+                    state_row_id.clone(),
+                    projected_target.cloned(),
+                    schema.schema(),
+                    &attribute_values,
+                )
+            } else {
+                AnonymousIdStateInfo::try_without_comparable_attributes(
+                    state_row_id.clone(),
+                    projected_target.cloned(),
+                )
+            };
             let projected_name = projected_id.identity_str().to_string();
-            origins_by_projected_name
-                .entry(type_key.clone())
-                .or_default()
-                .entry(projected_name.clone())
-                .or_default()
-                .push(state_row_id.as_inner().clone());
-            if !has_persisted_attributes {
-                existence_only_by_type
+            if let Some(state_info) = state_info {
+                origins_by_projected_name
                     .entry(type_key.clone())
                     .or_default()
-                    .insert(projected_name.clone());
-            }
-
-            by_type
-                .entry(type_key)
-                .or_default()
-                .push(AnonymousIdStateInfo {
-                    name: projected_name.clone(),
-                    provider_instance: projected_id.provider_instance().map(str::to_string),
-                    create_only_values,
-                });
-            if let Some(binding) = &state_resource.binding {
-                by_binding
-                    .entry(binding.clone())
+                    .entry(projected_name.clone())
                     .or_default()
-                    .push(AnonymousIdBindingStateInfo {
-                        name: projected_name,
-                        attribute_values,
-                    });
+                    .push(state_row_id.as_inner().clone());
+                if !has_persisted_attributes {
+                    existence_only_by_type
+                        .entry(type_key.clone())
+                        .or_default()
+                        .insert(projected_name.clone());
+                }
+
+                by_type.entry(type_key).or_default().push(state_info);
+            }
+            let projected = projected_target.is_some();
+            let effective_binding = if projected {
+                Some(projected_name.clone())
+            } else {
+                state_resource.binding.clone()
+            };
+            if let Some(effective_binding) = effective_binding {
+                by_binding.entry(effective_binding).or_default().push(
+                    AnonymousIdBindingViewEntry {
+                        value: AnonymousIdBindingStateInfo {
+                            name: projected_name,
+                            attribute_values,
+                        },
+                        origin: state_row_id.as_inner().clone(),
+                        effective: projected_id.as_inner().clone(),
+                    },
+                );
             }
         }
 
@@ -2559,17 +2556,25 @@ impl AnonymousReconciliationStateView {
             })
             .collect::<HashSet<_>>();
         claims
-            .screen_entries(provider, resource_type, entries, |entry| {
-                entry.name.as_str()
-            })
+            .screen_entries(provider, resource_type, entries, AnonymousIdStateInfo::name)
             .exclude_candidates(|entry| {
-                existence_only.is_some_and(|names| names.contains(&entry.name))
-                    || claimed_origin_names.contains(entry.name.as_str())
+                existence_only.is_some_and(|names| names.contains(entry.name()))
+                    || claimed_origin_names.contains(entry.name())
             })
     }
 
-    fn entries_by_binding(&self, binding: &str) -> Vec<AnonymousIdBindingStateInfo> {
-        self.by_binding.get(binding).cloned().unwrap_or_default()
+    fn entries_by_binding(
+        &self,
+        claims: &StateBlockClaims,
+        binding: &str,
+    ) -> Vec<AnonymousIdBindingStateInfo> {
+        self.by_binding
+            .get(binding)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.is_visible_to_binding_resolution(claims))
+            .map(|entry| entry.value.clone())
+            .collect()
     }
 }
 
@@ -2585,7 +2590,7 @@ fn reconcile_anonymous_identifiers_with_ctx(
         data_sources,
         ctx.schemas(),
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
-        &|binding| state_view.entries_by_binding(binding),
+        &|binding| state_view.entries_by_binding(claims, binding),
         claims,
     )
 }
@@ -2601,6 +2606,7 @@ fn detect_legacy_loop_moves_with_ctx(
         resources,
         ctx.schemas(),
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
+        &|binding| state_view.entries_by_binding(claims, binding),
         claims,
         reserved_moves,
     )
@@ -2609,10 +2615,12 @@ fn detect_legacy_loop_moves_with_ctx(
 fn detect_anonymous_to_named_moves_with_ctx(
     ctx: &WiringContext,
     resources: &[Resource],
+    candidates: &HashSet<ResourceId>,
     providers: &[ProviderConfig],
     state_view: &AnonymousReconciliationStateView,
     claims: &StateBlockClaims,
-) -> Result<Vec<ResolvedMove>, AppError> {
+    claimed_origins: &identifier::AnonymousToNamedClaimedOrigins,
+) -> Result<identifier::AnonymousToNamedRenameDetection, AppError> {
     let canonical_providers = carina_core::value::canonicalize_provider_configs_with_schemas(
         providers,
         &|provider_name| {
@@ -2621,9 +2629,10 @@ fn detect_anonymous_to_named_moves_with_ctx(
         },
     )?;
     Ok(identifier::detect_anonymous_to_named_renames(
-        resources,
+        identifier::AnonymousToNamedCandidates::new(resources, candidates, claimed_origins),
         ctx.schemas(),
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
+        &|binding| state_view.entries_by_binding(claims, binding),
         &canonical_providers,
         &|name| {
             provider_mod::find_factory(ctx.factories(), name)
@@ -2638,6 +2647,73 @@ fn detect_anonymous_to_named_moves_with_ctx(
         },
         claims,
     ))
+}
+
+fn detect_anonymous_to_named_moves_to_fixed_point(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    providers: &[ProviderConfig],
+    state_file: &StateFile,
+    initial_moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
+    claims: &StateBlockClaims,
+) -> Result<Vec<ResolvedMove>, AppError> {
+    let mut contested_resources = HashSet::new();
+
+    'recompute: loop {
+        let mut projected_pairs = initial_moved_pairs.to_vec();
+        let mut detected = Vec::new();
+        let mut unsatisfied = resources
+            .iter()
+            .filter(|resource| resource.binding.is_some())
+            .map(|resource| resource.id.clone())
+            .filter(|resource_id| !contested_resources.contains(resource_id))
+            .collect::<HashSet<_>>();
+
+        while !unsatisfied.is_empty() {
+            let state_view =
+                AnonymousReconciliationStateView::new(ctx, state_file, &projected_pairs);
+            let claimed_origins = identifier::AnonymousToNamedClaimedOrigins::from_moves(&detected);
+            let detection = detect_anonymous_to_named_moves_with_ctx(
+                ctx,
+                resources,
+                &unsatisfied,
+                providers,
+                &state_view,
+                claims,
+                &claimed_origins,
+            )?;
+            let (pass, cross_pass_contests) = detection.into_parts();
+            if !cross_pass_contests.is_empty() {
+                for contest in cross_pass_contests {
+                    let (origin, incumbent, contender) = contest.into_parts();
+                    debug_assert!(
+                        detected
+                            .iter()
+                            .any(|resolved_move| resolved_move.from() == &origin)
+                    );
+                    contested_resources.insert(incumbent);
+                    contested_resources.insert(contender);
+                }
+                continue 'recompute;
+            }
+            if pass.is_empty() {
+                break;
+            }
+            let satisfied = pass
+                .iter()
+                .map(|resolved_move| resolved_move.to().as_inner())
+                .collect::<HashSet<_>>();
+            unsatisfied.retain(|resource_id| !satisfied.contains(resource_id));
+            projected_pairs.extend(
+                pass.iter().map(|resolved_move| {
+                    (resolved_move.from().clone(), resolved_move.to().clone())
+                }),
+            );
+            detected.extend(pass);
+        }
+
+        return Ok(detected);
+    }
 }
 
 pub(crate) struct LateAnonymousIdentityInputs<'a> {
@@ -2679,10 +2755,11 @@ pub(crate) fn reconcile_late_anonymous_identities(
         identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
     )?;
 
-    let moves = inputs.state_file.map_or_else(Vec::new, |state_file| {
+    let mut moves = Vec::new();
+    if let Some(state_file) = inputs.state_file {
         let state_view =
             AnonymousReconciliationStateView::new(ctx, state_file, &inputs.addressed.moved_pairs);
-        let mut moves = detect_legacy_loop_moves_with_ctx(
+        moves = detect_legacy_loop_moves_with_ctx(
             ctx,
             inputs.resources.resources(),
             &state_view,
@@ -2703,8 +2780,21 @@ pub(crate) fn reconcile_late_anonymous_identities(
             &state_view,
             inputs.state_block_claims,
         ));
-        moves
-    });
+        let mut projected_pairs = inputs.addressed.moved_pairs.clone();
+        projected_pairs.extend(
+            moves
+                .iter()
+                .map(|resolved_move| (resolved_move.from().clone(), resolved_move.to().clone())),
+        );
+        moves.extend(detect_anonymous_to_named_moves_to_fixed_point(
+            ctx,
+            inputs.resources.resources(),
+            inputs.providers,
+            state_file,
+            &projected_pairs,
+            inputs.state_block_claims,
+        )?);
+    }
 
     let unavailable_schema_errors = validation::validate_anonymous_resource_schemas(
         inputs.resources.resources(),
@@ -4109,12 +4199,15 @@ fn conflicting_move<'a>(
     policy: MoveOverlapPolicy,
 ) -> Option<&'a (ResolvedResourceId, ResolvedResourceId)> {
     moved_pairs.iter().find(|(existing_from, existing_to)| {
-        let continues_forward = existing_to == resolved_move.from()
+        let continues_forward = existing_to == resolved_move.projected_from()
+            && existing_from == resolved_move.from()
             && existing_from != resolved_move.to()
-            && resolved_move.from() != resolved_move.to();
+            && resolved_move.projected_from() != resolved_move.to();
         let overlaps = existing_from == resolved_move.from()
+            || existing_from == resolved_move.projected_from()
             || existing_from == resolved_move.to()
             || existing_to == resolved_move.from()
+            || existing_to == resolved_move.projected_from()
             || existing_to == resolved_move.to();
         let composition_is_allowed = match policy {
             MoveOverlapPolicy::ComposeForward => continues_forward,
@@ -4163,11 +4256,12 @@ fn apply_detected_resource_moves(
         addressed
             .saved_attrs
             .remap_resource_id(authority.from(), authority.to().clone());
+        let projected_from = resolved_move.projected_from().clone();
         let (from, to) = resolved_move.into_parts();
         if let Some((_origin, prior_target)) = addressed
             .moved_pairs
             .iter_mut()
-            .find(|(_origin, prior_target)| prior_target == &from)
+            .find(|(origin, prior_target)| prior_target == &projected_from && origin == &from)
         {
             *prior_target = to;
         } else {
@@ -4421,13 +4515,12 @@ impl<'state> DeferredForExpansionPrelude<'state> {
                 .iter()
                 .map(|resolved_move| (resolved_move.from().clone(), resolved_move.to().clone()))
                 .collect::<Vec<_>>();
-            let state_view =
-                AnonymousReconciliationStateView::new(ctx, state_file, &projected_pairs);
-            moves.extend(detect_anonymous_to_named_moves_with_ctx(
+            moves.extend(detect_anonymous_to_named_moves_to_fixed_point(
                 ctx,
                 &self.sorted_resources,
                 providers,
-                &state_view,
+                state_file,
+                &projected_pairs,
                 claims,
             )?);
             moves
