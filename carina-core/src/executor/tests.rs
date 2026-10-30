@@ -3771,7 +3771,10 @@ fn pending_module_composition(
                         name.to_string(),
                         LiveCompositionArgument::from_value(
                             value,
-                            TypeExpr::String,
+                            crate::validation::resolve_consumer_static_type_for_signature(
+                                &TypeExpr::String,
+                                &crate::parser::ProviderContext::default(),
+                            ),
                             crate::parser::ArgumentOrigin::Defaulted,
                         ),
                     )

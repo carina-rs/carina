@@ -78,22 +78,47 @@ impl ProviderState {
                     .any(|factory| factory.name() == provider_name)
             },
         );
-        let mut schemas = provider_mod::collect_schemas(&factories);
         let mut provider_names: Vec<String> =
             factories.iter().map(|f| f.name().to_string()).collect();
         let mut known_provider_names = HashSet::new();
-        if use_builtin_mock {
-            for schema in carina_provider_mock::builtin_schemas() {
-                schemas.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME, schema);
-            }
+        let supplemental_schemas = if use_builtin_mock {
             provider_names.push(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
             known_provider_names.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
-        }
-        let schemas = Arc::new(schemas);
+            carina_provider_mock::builtin_schemas()
+                .into_iter()
+                .map(|schema| {
+                    (
+                        carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string(),
+                        schema,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let region_completions: Vec<CompletionValue> = factories
             .iter()
             .flat_map(|f| f.config_completions().remove("region").unwrap_or_default())
             .collect();
+        let factories = Arc::new(factories);
+        let (schemas, diagnostic_engine) = if provider_names.is_empty() {
+            (
+                Arc::new(SchemaRegistry::new()),
+                DiagnosticEngine::without_loaded_provider_schemas(),
+            )
+        } else {
+            let loaded_providers = Arc::new(provider_mod::loaded_provider_snapshot_from_factories(
+                Arc::clone(&factories),
+                supplemental_schemas,
+            ));
+            let schemas = loaded_providers.schemas().schemas_arc();
+            let engine = DiagnosticEngine::new_with_known_providers(
+                loaded_providers,
+                provider_names.clone(),
+                known_provider_names,
+            );
+            (schemas, engine)
+        };
         // Extract custom type names from provider schemas for completion.
         // The structured identities render to their dotted display form
         // (`aws.iam.Role.Arn`, `Ipv4Cidr`), which is also the spelling a
@@ -102,16 +127,10 @@ impl ProviderState {
             .iter()
             .map(|id| id.to_string())
             .collect();
-        let factories_arc = Arc::new(factories);
+        let diagnostic_engine = diagnostic_engine.with_provider_errors(provider_errors);
         Self {
             schemas: Arc::clone(&schemas),
-            diagnostic_engine: DiagnosticEngine::new_with_known_providers(
-                Arc::clone(&schemas),
-                provider_names.clone(),
-                factories_arc,
-                known_provider_names,
-            )
-            .with_provider_errors(provider_errors),
+            diagnostic_engine,
             completion_provider: CompletionProvider::new(
                 Arc::clone(&schemas),
                 provider_names,

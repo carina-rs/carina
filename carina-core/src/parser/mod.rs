@@ -21,15 +21,16 @@ pub use crate::eval_value::StructuralHandleKind;
 pub use ast::{
     ArgumentOrigin, ArgumentParameter, AttributeParameter, AttributePath, AttributePathSegment,
     AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingName,
-    BindingScopeId, BindingUseOwner, CallExpansion, DeferredForExpansionError,
-    DeferredForExpression, DeferredForTarget, ExpansionKey, ExportParamLike, ExportParameter, File,
-    FnParam, InferredExportParam, InferredFile, ModuleArgument, ModuleCall,
-    ModuleCallDiagnosticSource, ModuleCallId, MovedAddresses, ParsedBindingUses, ParsedExportParam,
-    ParsedFile, ParserBindingMetadata, PendingValueSlot, ProviderConfig, RequireBlock,
-    ResourceAddress, ResourceContext, ResourceRef, ResourceTypePath, SavedDeferredForExpression,
-    ShapeMismatch, SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TypeExpr,
-    UntilPredicateAst, UpstreamState, UseStatement, UserFunction, UserFunctionBody, ValidateExpr,
-    ValidationBlock, WaitBinding, expand_deferred_children,
+    BindingScopeId, BindingUseOwner, CallExpansion, ConsumerArgumentParameter,
+    ConsumerAttributeParameter, DeferredForExpansionError, DeferredForExpression,
+    DeferredForTarget, ExpansionKey, ExportParamLike, ExportParameter, File, FnParam,
+    InferredExportParam, InferredFile, ModuleArgument, ModuleCall, ModuleCallDiagnosticSource,
+    ModuleCallId, MovedAddresses, ParsedBindingUses, ParsedExportParam, ParsedFile,
+    ParserBindingMetadata, PendingValueSlot, ProviderConfig, RequireBlock, ResourceAddress,
+    ResourceContext, ResourceRef, ResourceTypePath, SavedDeferredForExpression, ShapeMismatch,
+    SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst,
+    UpstreamState, UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock,
+    WaitBinding, expand_deferred_children,
 };
 pub(crate) use ast::{BareBindingSource, ParsedBareBindingUse};
 pub(crate) use config::ProviderCustomTypeSource;
@@ -87,7 +88,7 @@ pub(crate) use resolve::{
 pub use static_eval::evaluate_static_value_for_validation;
 pub use types::BUILTIN_BARE_CUSTOM_TYPES;
 pub use types::parse_type_expr_str;
-pub(crate) use types::{resolve_known_bare_custom_type, unknown_custom_type_message};
+pub(crate) use types::{resolve_known_bare_custom_type, unknown_custom_type_error};
 pub(crate) use util::eval_type_name;
 pub use util::{pascal_to_snake, snake_to_pascal};
 

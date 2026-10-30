@@ -298,7 +298,7 @@ impl HoverProvider {
                     .unwrap_or_default();
                 content.push_str(&format!(
                     "- `{}`: `{}`{}{}\n",
-                    arg.name, arg.type_expr, desc, required
+                    arg.name, arg.static_type, desc, required
                 ));
             }
         }
@@ -308,9 +308,9 @@ impl HoverProvider {
             content.push_str("\n### Attributes\n\n");
             for attr in &module_parsed.attribute_params {
                 let type_str = attr
-                    .type_expr
+                    .static_type
                     .as_ref()
-                    .map(|t| format!("`{}`", t))
+                    .map(|type_expr| format!("`{type_expr}`"))
                     .unwrap_or_default();
                 content.push_str(&format!("- `{}`: {}\n", attr.name, type_str));
             }
@@ -358,7 +358,8 @@ impl HoverProvider {
             content.push_str("\n\n");
         }
 
-        content.push_str(&format!("- **Type**: {}\n", arg.type_expr));
+        let type_expr = &arg.static_type;
+        content.push_str(&format!("- **Type**: {type_expr}\n"));
 
         if let Some(default) = &arg.default {
             let default_str = format_value_for_hover(default);
@@ -1988,7 +1989,7 @@ EOT
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let arg = ArgumentParameter {
             name: "vpc".to_string(),
-            type_expr: TypeExpr::Ref(carina_core::parser::ResourceTypePath::new(
+            static_type: TypeExpr::Ref(carina_core::parser::ResourceTypePath::new(
                 "awscc", "ec2.Vpc",
             )),
             default: None,
@@ -2034,7 +2035,7 @@ EOT
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let arg = ArgumentParameter {
             name: "port".to_string(),
-            type_expr: TypeExpr::Int,
+            static_type: TypeExpr::Int,
             default: Some(Value::Concrete(ConcreteValue::Int(8080))),
             description: Some("Web server port".to_string()),
             validations: vec![],
@@ -2068,7 +2069,7 @@ EOT
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let arg = ArgumentParameter {
             name: "env".to_string(),
-            type_expr: TypeExpr::String,
+            static_type: TypeExpr::String,
             default: None,
             description: None,
             validations: vec![],

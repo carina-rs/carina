@@ -3633,7 +3633,6 @@ pub async fn run_plan(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
 
@@ -3644,7 +3643,6 @@ pub async fn run_plan(
         loaded.unresolved_parsed,
         base_dir,
         false,
-        &inference_errors,
         &duplicate_declarations,
     )?;
     let parsed = validated_config.resources().parsed();
@@ -4248,10 +4246,7 @@ pub fn compute_export_diffs(
         let Some(ref value) = param.value else {
             continue;
         };
-        // Unknown sentinels carry no usable type information for the
-        // plan display; surface as `None` so the diff prints without
-        // a type tag.
-        let type_expr = param.type_expr.clone().into_known();
+        let type_expr = param.static_type.known().cloned();
         // Plan display tolerates `Value::Deferred(DeferredValue::Unknown)` in the export rhs
         // (the deferred-for body will resolve it later). Map both the
         // skip variants and the Unknown error to `None`; the diff
@@ -5545,7 +5540,10 @@ mod run_plan_out_tests {
     fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
         LiveCompositionArgument::from_value(
             value,
-            carina_core::parser::TypeExpr::String,
+            carina_core::validation::resolve_consumer_static_type_for_signature(
+                &carina_core::parser::TypeExpr::String,
+                &carina_core::parser::ProviderContext::default(),
+            ),
             carina_core::parser::ArgumentOrigin::Defaulted,
         )
     }
@@ -6348,7 +6346,7 @@ mod run_plan_out_tests {
 #[cfg(test)]
 mod export_diff_tests {
     use super::*;
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::InferredExportParam;
     use carina_core::resource::DeferredValue;
 
     fn persisted(value: serde_json::Value) -> PersistedExportValue {
@@ -6358,7 +6356,15 @@ mod export_diff_tests {
     fn param(name: &str, value: Value) -> InferredExportParam {
         InferredExportParam {
             name: name.to_string(),
-            type_expr: TypeExpr::Unknown,
+            static_type: carina_core::static_type::ExportStaticType::Inferred(
+                carina_core::static_type::StaticType::Unchecked(
+                    carina_core::static_type::InferredUncheckedReason::NotInferable(
+                        carina_core::static_type::NotInferableReason::SchemaUnavailable {
+                            binding: "test fixture".to_string(),
+                        },
+                    ),
+                ),
+            ),
             value: Some(value),
         }
     }

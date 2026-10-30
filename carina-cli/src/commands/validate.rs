@@ -73,19 +73,12 @@ pub fn validate_with_factories(
             .iter()
             .map(ToString::to_string),
     );
-    // Surface inference failures from `apply_inference` (#2360 stage 2).
-    // Each `Unknown` sentinel in `parsed.export_params` has a paired
-    // entry here; reporting the underlying reason gives the user the
-    // actionable "type annotation required" guidance.
-    error_reports.extend(format_inference_errors(&loaded.inference_errors));
-
     error_reports.extend(
         super::validate_and_resolve_errors(
             &mut parsed,
             base_dir,
             &providers,
             false,
-            &loaded.inference_errors,
             &loaded.duplicate_declarations,
         )
         .iter()
@@ -130,31 +123,12 @@ pub fn validated_resource_ids_with_factories(
         base_dir,
         &providers,
         false,
-        &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
 
     validated_entries(&parsed)
         .iter()
         .map(ToString::to_string)
-        .collect()
-}
-
-/// Format `LoadedConfig.inference_errors` into "export '<name>': type
-/// annotation required: <reason>" strings via the shared
-/// `inference::format_inference_error` helper so the CLI and LSP keep
-/// emitting the same wording.
-fn format_inference_errors(
-    errors: &[carina_core::validation::inference::ExportInferenceError],
-) -> Vec<String> {
-    errors
-        .iter()
-        .map(|inference_error| {
-            carina_core::validation::inference::format_inference_error(
-                &inference_error.name,
-                &inference_error.error,
-            )
-        })
         .collect()
 }
 
@@ -298,7 +272,6 @@ pub fn run_validate(
             .iter()
             .map(ToString::to_string),
     );
-    error_reports.extend(format_inference_errors(&loaded.inference_errors));
     if let Err(AppError::Validation(msg)) =
         check_upstream_state_sources(base_dir, &parsed.upstream_states)
     {
@@ -315,13 +288,8 @@ pub fn run_validate(
     let (providers, provider_load_error) =
         ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
     error_reports.extend(provider_load_error.iter().map(ToString::to_string));
-    let validation_report = providers.validation_report(
-        &mut parsed,
-        base_dir,
-        false,
-        &loaded.inference_errors,
-        &loaded.duplicate_declarations,
-    );
+    let validation_report =
+        providers.validation_report(&mut parsed, base_dir, false, &loaded.duplicate_declarations);
     parsed.print_warnings_from(printed_warning_count);
     error_reports.extend(
         validation_report

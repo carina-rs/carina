@@ -16,7 +16,7 @@ use carina_core::parser::{
     ParseError, ParsedFile, ResourceRef, SourceSpan, WarningKind, contains_function_call,
 };
 use carina_core::provider::{
-    HostErrorCause, ProviderError, ProviderFactory, SuspendedValidationId,
+    HostErrorCause, LoadedProviderSnapshot, ProviderError, ProviderFactory, SuspendedValidationId,
 };
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
@@ -190,6 +190,7 @@ impl std::ops::Deref for DiagnosticProviderContext {
 
 pub struct DiagnosticEngine {
     schemas: Arc<SchemaRegistry>,
+    loaded_providers: Option<Arc<LoadedProviderSnapshot>>,
     provider_names: Vec<String>,
     known_provider_names: HashSet<String>,
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
@@ -200,58 +201,48 @@ pub struct DiagnosticEngine {
 }
 
 impl DiagnosticEngine {
-    pub fn new(
-        schemas: Arc<SchemaRegistry>,
-        provider_names: Vec<String>,
-        factories: Arc<Vec<Box<dyn ProviderFactory>>>,
-    ) -> Self {
-        Self::new_with_known_providers(schemas, provider_names, factories, HashSet::new())
+    /// Construct diagnostics backed by one loaded-provider snapshot.
+    pub fn new(loaded_providers: Arc<LoadedProviderSnapshot>, provider_names: Vec<String>) -> Self {
+        Self::new_with_known_providers(loaded_providers, provider_names, HashSet::new())
+    }
+
+    /// Construct diagnostics for the orphaned-file fallback with no loaded
+    /// providers. This path deliberately cannot mint provider-schema inference
+    /// evidence.
+    pub fn without_loaded_provider_schemas() -> Self {
+        let schemas = Arc::new(SchemaRegistry::new());
+        Self {
+            schemas: Arc::clone(&schemas),
+            loaded_providers: None,
+            provider_names: Vec::new(),
+            known_provider_names: HashSet::new(),
+            factories: Arc::new(Vec::new()),
+            provider_errors: HashMap::new(),
+            provider_context: DiagnosticProviderContext::Unloaded(
+                carina_core::parser::ProviderContext {
+                    decryptor: None,
+                    custom_types: carina_core::parser::ProviderCustomTypes::default(),
+                    resource_types:
+                        carina_core::parser::ProviderContext::resource_types_from_schema_registry(
+                            &schemas,
+                        ),
+                },
+            ),
+        }
     }
 
     pub(crate) fn new_with_known_providers(
-        schemas: Arc<SchemaRegistry>,
+        loaded_providers: Arc<LoadedProviderSnapshot>,
         provider_names: Vec<String>,
-        factories: Arc<Vec<Box<dyn ProviderFactory>>>,
         known_provider_names: HashSet<String>,
     ) -> Self {
-        // carina#3239 gate: the strict "unknown custom type in type
-        // position" parser check requires the project to actually
-        // *have* a provider surface to compare against. The LSP
-        // backend keeps an *empty* fallback `ProviderState` for files
-        // that don't belong to any known config directory and aren't
-        // reachable through the import map (`carina-lsp/src/backend.rs`'s
-        // `ProviderStates::empty`); for that fallback, no provider
-        // was ever declared and the orphaned file has no way to
-        // resolve a custom type name, so disabling the strict check
-        // avoids a flood of false positives.
-        //
-        // The flag keys off `provider_names` rather than
-        // `factories.is_empty()` so a project whose declared
-        // providers failed to load (network error, missing install,
-        // …) still gets the strict check — the user sees the provider
-        // load error and the unknown-custom-type error together
-        // instead of having the carina#3239 fix silently masked by an
-        // unrelated install failure.
-        let has_loaded_providers = !provider_names.is_empty();
-        let provider_context = if has_loaded_providers {
-            DiagnosticProviderContext::Loaded(
-                carina_core::provider::loaded_provider_context_from_factories(
-                    &schemas,
-                    Arc::clone(&factories),
-                ),
-            )
-        } else {
-            DiagnosticProviderContext::Unloaded(carina_core::parser::ProviderContext {
-                decryptor: None,
-                custom_types: carina_core::parser::ProviderCustomTypes::default(),
-                resource_types:
-                    carina_core::parser::ProviderContext::resource_types_from_schema_registry(
-                        &schemas,
-                    ),
-            })
-        };
+        let schemas = loaded_providers.schemas().schemas_arc();
+        let factories = loaded_providers.factories_arc();
+        let provider_context =
+            DiagnosticProviderContext::Loaded(loaded_providers.provider_context().clone());
         Self {
             schemas,
+            loaded_providers: Some(loaded_providers),
             provider_names,
             known_provider_names,
             factories,

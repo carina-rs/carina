@@ -2245,7 +2245,7 @@ impl DiagnosticEngine {
                     // the parser's enum-identifier fallback until directory
                     // binding authority is available here.
                     Value::Concrete(ConcreteValue::EnumIdentifier(identifier))
-                        if attr_param.type_expr.is_none()
+                        if attr_param.static_type.is_none()
                             && !identifier.as_str().contains('.')
                             && !known_bindings.contains(identifier.as_str()) =>
                     {
@@ -2269,7 +2269,7 @@ impl DiagnosticEngine {
                     ));
                 }
 
-                if let Some(type_expr) = &attr_param.type_expr
+                if let Some(type_expr) = &attr_param.static_type
                     && let Some(semantic_value) = semantic_view.value_for_typecheck(attr_param)
                 {
                     let type_error = match self.provider_context.loaded() {
@@ -2316,21 +2316,18 @@ impl DiagnosticEngine {
         // directional check. Expanded compositions handle imported-module
         // boundaries; this source-local walk covers the open module's own
         // `attributes {}` declaration.
-        let mut resolved_attribute_params = semantic_params
+        let attribute_params = semantic_params
             .into_iter()
             .flatten()
             .cloned()
             .collect::<Vec<_>>();
-        for parameter in &mut resolved_attribute_params {
-            if let Some(type_expr) = &parameter.type_expr
-                && let Ok(resolved) =
-                    carina_core::validation::resolve_type_expr(type_expr, &self.provider_context)
-            {
-                parameter.type_expr = Some(resolved);
-            }
-        }
+        let resolved_attribute_params =
+            carina_core::validation::resolve_attribute_static_types_for_consumer(
+                &attribute_params,
+                &self.provider_context,
+            );
         if let Err(ref_errors) =
-            carina_core::validation::validate_attribute_param_ref_types_with_bindings(
+            carina_core::validation::validate_consumer_attribute_param_ref_types_with_bindings(
                 &resolved_attribute_params,
                 binding_index,
             )
@@ -2482,7 +2479,7 @@ impl DiagnosticEngine {
 
         // Check for unknown type names in type annotations
         for param in &parsed.export_params {
-            if let Some(type_expr) = &param.type_expr
+            if let Some(type_expr) = &param.static_type
                 && let Some(error) = self.check_unknown_type_names(type_expr)
                 && let Some((line, col)) = self.find_exports_param_position(doc, &param.name)
             {
@@ -2506,43 +2503,46 @@ impl DiagnosticEngine {
         let Some(inference_input) = semantic_view.parsed() else {
             return diagnostics;
         };
-        let (inferred_export_params, inference_errors) =
-            carina_core::validation::inference::infer_export_params(inference_input, &self.schemas);
-        // Surface inference failures as "type annotation required"
-        // diagnostics, anchored at the export name. Errors for
-        // exports declared in sibling `.crn` files (visible only via
-        // `merged`) won't anchor in this buffer and are skipped here —
-        // the buffer that owns the export will surface them on its
-        // own pass.
-        for inference_error in &inference_errors {
-            if let Some((line, col)) = self.find_exports_param_position(doc, &inference_error.name)
-            {
-                diagnostics.push(carina_diagnostic(
-                    line,
-                    col,
-                    col + inference_error.name.len() as u32,
-                    DiagnosticSeverity::WARNING,
-                    carina_core::validation::inference::format_inference_error(
-                        &inference_error.name,
-                        &inference_error.error,
-                    ),
-                ));
+        let inferred_export_params = if let Some(loaded_providers) = &self.loaded_providers {
+            let provider_inferred = carina_core::validation::inference::
+                infer_export_params_with_loaded_provider_schemas(
+                    inference_input,
+                    loaded_providers.schemas(),
+                );
+            // Surface inference failures as "type annotation required"
+            // diagnostics, anchored at the export name. Errors for
+            // exports declared in sibling `.crn` files (visible only via
+            // `merged`) won't anchor in this buffer and are skipped here —
+            // the buffer that owns the export will surface them on its
+            // own pass.
+            for inference_error in carina_core::validation::inference::attached_inference_failures(
+                provider_inferred.checked_exports(),
+            ) {
+                if let Some((line, col)) =
+                    self.find_exports_param_position(doc, inference_error.name)
+                {
+                    diagnostics.push(carina_diagnostic(
+                        line,
+                        col,
+                        col + inference_error.name.len() as u32,
+                        DiagnosticSeverity::WARNING,
+                        carina_core::validation::inference::format_inference_error(
+                            inference_error.name,
+                            inference_error.error,
+                        ),
+                    ));
+                }
             }
-        }
-        // Inference and the Unknown-type existence walk share export-param
-        // indices as their diagnostic identity. The LSP inference input is
-        // post-expansion, so it can report composition misses through a
-        // `Virtual` binding; suppressing those exact indices prevents the
-        // composition authority from reporting the same typo again.
-        let reported_inference_error_indices: HashSet<usize> =
-            inference_errors.iter().map(|error| error.index).collect();
+            provider_inferred.into_inferred_export_params()
+        } else {
+            self.infer_export_params_without_loaded_provider_schemas(inference_input)
+        };
         let export_bindings =
             carina_core::binding_index::BindingIndex::from_parsed(inference_input, &self.schemas);
         if let Err(ref_errors) =
             carina_core::validation::validate_export_param_ref_types_with_bindings(
-                &inferred_export_params,
+                inferred_export_params.parameters(),
                 &export_bindings,
-                &reported_inference_error_indices,
             )
         {
             for error_msg in ref_errors.split('\n') {
@@ -2559,6 +2559,13 @@ impl DiagnosticEngine {
         }
 
         diagnostics
+    }
+
+    fn infer_export_params_without_loaded_provider_schemas(
+        &self,
+        parsed: &ParsedFile,
+    ) -> carina_core::validation::inference::SchemaCheckedExportParams {
+        carina_core::validation::inference::infer_export_params(parsed, &self.schemas)
     }
 
     /// Find the position of a ref type error in exports by extracting the param name.
@@ -2630,7 +2637,18 @@ impl DiagnosticEngine {
             TypeExpr::Struct { fields } => fields
                 .iter()
                 .find_map(|(_, ty)| self.check_unknown_type_names(ty)),
-            _ => None,
+            TypeExpr::Union(members) => members
+                .iter()
+                .find_map(|member| self.check_unknown_type_names(member)),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::StringLiteral(_) => None,
         }
     }
 

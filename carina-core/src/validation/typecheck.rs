@@ -99,7 +99,7 @@ pub enum TypeExprValueError {
         field: String,
     },
     InvalidAccess {
-        message: String,
+        error: crate::static_type::InferenceError,
     },
     CustomTypeValidation {
         path: Vec<TypeExprValuePathSegment>,
@@ -168,7 +168,7 @@ impl fmt::Display for TypeExprValueError {
                 write_path(f, path)?;
                 write!(f, "expected struct, unknown field '{field}'.")
             }
-            Self::InvalidAccess { message } => f.write_str(message),
+            Self::InvalidAccess { error } => error.fmt(f),
             Self::CustomTypeValidation {
                 path,
                 expected,
@@ -251,15 +251,22 @@ fn check_type_expr_value_inner_with_mode(
     inference: TypecheckInference<'_>,
     provider_custom_types: ProviderCustomTypeValidation,
 ) -> Result<(), TypeExprValueError> {
-    if matches!(expected, TypeExpr::Unknown) {
-        return Ok(());
-    }
-
     match value {
         Value::Deferred(DeferredValue::ResourceRef { .. }) => match expected {
             TypeExpr::StringLiteral(_) => return Err(mismatch(expected, value)),
             TypeExpr::Union(_) => {}
-            _ => return Ok(()),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. } => return Ok(()),
         },
         Value::Deferred(
             DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
@@ -279,13 +286,24 @@ fn check_type_expr_value_inner_with_mode(
             return match inferred {
                 Ok(actual) if inferred_type_fits(expected, &actual) => Ok(()),
                 Ok(_) => Err(mismatch(expected, value)),
-                Err(error @ super::inference::InferenceError::InvalidAccess { .. })
-                | Err(error @ super::inference::InferenceError::UnknownAttribute { .. }) => {
-                    Err(TypeExprValueError::InvalidAccess {
-                        message: error.to_string(),
-                    })
-                }
-                Err(_) => Ok(()),
+                Err(crate::static_type::InferenceIssue::Failed(
+                    error @ super::inference::InferenceError::InvalidAccess { .. },
+                ))
+                | Err(crate::static_type::InferenceIssue::Failed(
+                    error @ super::inference::InferenceError::UnknownAttribute { .. },
+                )) => Err(TypeExprValueError::InvalidAccess { error }),
+                Err(crate::static_type::InferenceIssue::Failed(
+                    super::inference::InferenceError::UnknownType { .. }
+                    | super::inference::InferenceError::HeterogeneousCollection { .. }
+                    | super::inference::InferenceError::IncompatibleCoalesceTypes { .. }
+                    | super::inference::InferenceError::UnknownBinding { .. }
+                    | super::inference::InferenceError::CyclicVirtualBinding { .. },
+                ))
+                | Err(crate::static_type::InferenceIssue::NotInferable(
+                    crate::static_type::NotInferableReason::MissingValue
+                    | crate::static_type::NotInferableReason::NonInferableBinding { .. }
+                    | crate::static_type::NotInferableReason::SchemaUnavailable { .. },
+                )) => Ok(()),
             };
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => return Ok(()),
@@ -517,7 +535,6 @@ fn check_type_expr_value_inner_with_mode(
                 Err(mismatch(expected, value))
             }
         }
-        TypeExpr::Unknown => Ok(()),
     }
 }
 
@@ -645,7 +662,7 @@ fn is_qualified_enum_identifier(identifier: &str) -> bool {
 }
 
 fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
-    if expected == actual || matches!(expected, TypeExpr::Unknown) {
+    if expected == actual {
         return true;
     }
     match (expected, actual) {
@@ -663,7 +680,95 @@ fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
             .any(|member| inferred_type_fits(member, actual)),
         (TypeExpr::List(expected), TypeExpr::List(actual))
         | (TypeExpr::Map(expected), TypeExpr::Map(actual)) => inferred_type_fits(expected, actual),
-        _ => false,
+        (
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        )
+        | (
+            TypeExpr::Float,
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        )
+        | (
+            TypeExpr::SchemaType { .. },
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        )
+        | (
+            TypeExpr::List(_),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        )
+        | (
+            TypeExpr::Map(_),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        ) => false,
     }
 }
 
@@ -825,7 +930,6 @@ mod tests {
                 TypeExpr::StringLiteral("dev".to_string()),
                 TypeExpr::StringLiteral("prod".to_string()),
             ]),
-            TypeExpr::Unknown,
         ]
     }
 
@@ -1054,7 +1158,6 @@ mod tests {
                 ),
             },
             TypeExpr::Struct { fields: Vec::new() },
-            TypeExpr::Unknown,
         ] {
             assert!(
                 check(&expected, &resource_ref).is_ok(),

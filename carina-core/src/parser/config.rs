@@ -735,10 +735,10 @@ impl ProviderContext {
 /// catalog.
 ///
 /// Production code can obtain this witness only through
-/// [`crate::provider::loaded_provider_context_from_factories`], which builds
-/// the context from one provider-factory and schema snapshot. Value-checking
-/// APIs that can reach provider custom types accept this type so a bootstrap
-/// [`ProviderContext`] cannot be passed accidentally.
+/// [`crate::provider::loaded_provider_snapshot_from_factories`], which retains
+/// it together with schema evidence from one provider-factory snapshot.
+/// Value-checking APIs that can reach provider custom types accept this type
+/// so a bootstrap [`ProviderContext`] cannot be passed accidentally.
 ///
 /// ```compile_fail
 /// use carina_core::parser::{LoadedProviderContext, ProviderContext};
