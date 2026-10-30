@@ -831,10 +831,7 @@ fn module_argument_type<E>(
             .iter()
             .find(|parameter| parameter.name == argument)
             .map(|parameter| &parameter.static_type)?;
-        return match static_type {
-            StaticType::Known(type_expr) => Some(type_expr.clone()),
-            StaticType::Unchecked(_reason) => None,
-        };
+        return static_type.known().cloned();
     }
     file.compositions
         .iter()
@@ -845,10 +842,7 @@ fn module_argument_type<E>(
                 .any(|call| &call.id == call_id)
         })
         .and_then(|composition| composition.signature.arguments.get(argument))
-        .and_then(|argument| match argument.declared_type() {
-            StaticType::Known(type_expr) => Some(type_expr.clone()),
-            StaticType::Unchecked(_reason) => None,
-        })
+        .and_then(|argument| argument.declared_type().known().cloned())
 }
 
 fn module_enum_declaration(
@@ -1487,17 +1481,17 @@ pub fn check_deferred_access_type(
 
     let actual = match inference::infer_type_from_value(value, bindings, schemas) {
         Ok(actual) => actual,
-        Err(crate::static_type::InferenceIssue::InvalidAccess { base_type, step }) => {
-            return Err(DeferredAccessTypeError::InvalidAccess {
-                error: inference::InferenceError::InvalidAccess { base_type, step },
-            });
+        Err(crate::static_type::InferenceIssue::Failed(
+            error @ inference::InferenceError::InvalidAccess { .. },
+        ))
+        | Err(crate::static_type::InferenceIssue::Failed(
+            error @ inference::InferenceError::UnknownAttribute { .. },
+        )) => {
+            return Err(DeferredAccessTypeError::InvalidAccess { error });
         }
-        Err(crate::static_type::InferenceIssue::UnknownAttribute { binding, attribute }) => {
-            return Err(DeferredAccessTypeError::InvalidAccess {
-                error: inference::InferenceError::UnknownAttribute { binding, attribute },
-            });
-        }
-        Err(crate::static_type::InferenceIssue::IncompatibleCoalesceTypes { left, default }) => {
+        Err(crate::static_type::InferenceIssue::Failed(
+            inference::InferenceError::IncompatibleCoalesceTypes { left, default },
+        )) => {
             return Err(DeferredAccessTypeError::TypeMismatch {
                 expected: left,
                 actual: default,
@@ -1507,12 +1501,17 @@ pub fn check_deferred_access_type(
         // Dynamic result types and unavailable authorities cannot be checked
         // soundly at this phase. Spell every inference variant out so adding a
         // new failure reason forces an explicit checked/unchecked decision.
-        Err(crate::static_type::InferenceIssue::UnknownType { .. })
-        | Err(crate::static_type::InferenceIssue::HeterogeneousCollection { .. })
-        | Err(crate::static_type::InferenceIssue::UnknownBinding { .. })
-        | Err(crate::static_type::InferenceIssue::NonInferableBinding { .. })
-        | Err(crate::static_type::InferenceIssue::SchemaUnavailable { .. })
-        | Err(crate::static_type::InferenceIssue::CyclicVirtualBinding { .. }) => return Ok(()),
+        Err(crate::static_type::InferenceIssue::Failed(
+            inference::InferenceError::UnknownType { .. }
+            | inference::InferenceError::HeterogeneousCollection { .. }
+            | inference::InferenceError::UnknownBinding { .. }
+            | inference::InferenceError::CyclicVirtualBinding { .. },
+        ))
+        | Err(crate::static_type::InferenceIssue::NotInferable(
+            crate::static_type::NotInferableReason::MissingValue
+            | crate::static_type::NotInferableReason::NonInferableBinding { .. }
+            | crate::static_type::NotInferableReason::SchemaUnavailable { .. },
+        )) => return Ok(()),
     };
     let Some(actual) = lift_type_expr(&actual) else {
         return Ok(());
@@ -1571,6 +1570,12 @@ pub enum ModuleCallRefErrorKind {
 enum UnknownReferencePolicy {
     Report,
     Defer,
+}
+
+#[derive(Clone, Copy)]
+enum ExportReferenceValidationMode {
+    TypeAndExistence,
+    InferenceFailureExistence,
 }
 
 /// Whether a missing reference is the optional, absence-selecting operand of
@@ -1691,10 +1696,7 @@ fn validate_module_call_argument_ref_types_inner(
                         .iter()
                         .find(|argument| argument.name == argument_name)
                 })
-                .and_then(|argument| match &argument.static_type {
-                    StaticType::Known(type_expr) => Some(type_expr),
-                    StaticType::Unchecked(_reason) => None,
-                });
+                .and_then(|argument| argument.static_type.known());
 
             visit_refs_with_sink(
                 value.walker_value(),
@@ -2269,10 +2271,7 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
     for parameter in &parsed.arguments {
         if let Some(value) = &parameter.default {
             let context = format!("argument '{}' default", parameter.name);
-            let expected = match &parameter.static_type {
-                StaticType::Known(type_expr) => Some(type_expr),
-                StaticType::Unchecked(_reason) => None,
-            };
+            let expected = parameter.static_type.known();
             check_function_calls(
                 value,
                 expected,
@@ -2286,11 +2285,7 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
     for parameter in &parsed.attribute_params {
         if let Some(value) = &parameter.value {
             let context = format!("attribute '{}'", parameter.name);
-            let expected = match &parameter.static_type {
-                Some(StaticType::Known(type_expr)) => Some(type_expr),
-                Some(StaticType::Unchecked(_reason)) => None,
-                None => None,
-            };
+            let expected = parameter.static_type.as_ref().and_then(StaticType::known);
             check_function_calls(
                 value,
                 expected,
@@ -2304,33 +2299,7 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
     for parameter in &parsed.export_params {
         if let Some(value) = parameter.value() {
             let context = format!("export '{}'", parameter.name());
-            let expected = match parameter.static_type() {
-                crate::parser::ExportParamStaticTypeRef::Parsed(Some(StaticType::Known(
-                    type_expr,
-                ))) => Some(type_expr),
-                crate::parser::ExportParamStaticTypeRef::Parsed(Some(StaticType::Unchecked(
-                    _reason,
-                ))) => None,
-                crate::parser::ExportParamStaticTypeRef::Parsed(None) => None,
-                crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Declared(
-                    StaticType::Unchecked(_reason),
-                )) => None,
-                crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Inferred(
-                    StaticType::Unchecked(InferredUncheckedReason::InferenceFailed(_error)),
-                )) => None,
-                crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Inferred(
-                    StaticType::Unchecked(InferredUncheckedReason::NotInferable(_reason)),
-                )) => None,
-                crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Inferred(
-                    StaticType::Unchecked(InferredUncheckedReason::UnnameableInConsumer(_reason)),
-                )) => None,
-                crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Declared(
-                    StaticType::Known(type_expr),
-                ))
-                | crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Inferred(
-                    StaticType::Known(type_expr),
-                )) => Some(type_expr),
-            };
+            let expected = parameter.static_type().known();
             check_function_calls(
                 value,
                 expected,
@@ -2451,10 +2420,7 @@ pub fn validate_composition_ref_types_with_bindings(
         for (argument_name, argument) in &composition.signature.arguments {
             let (declared_type, origin) = argument.validation_metadata();
             let mut reference_position = 0;
-            let declared_sink = match declared_type {
-                StaticType::Known(type_expr) => Some(RefSink::TypeExpr(type_expr)),
-                StaticType::Unchecked(_reason) => None,
-            };
+            let declared_sink = declared_type.known().map(RefSink::TypeExpr);
             visit_refs_with_sink(
                 argument.value(),
                 declared_sink,
@@ -2494,11 +2460,10 @@ pub fn validate_composition_ref_types_with_bindings(
             }
             let value = attribute.to_value();
             let mut reference_position = 0;
-            let declared_sink = match attribute.declared_type() {
-                Some(StaticType::Known(type_expr)) => Some(RefSink::TypeExpr(type_expr)),
-                Some(StaticType::Unchecked(_reason)) => None,
-                None => None,
-            };
+            let declared_sink = attribute
+                .declared_type()
+                .and_then(StaticType::known)
+                .map(RefSink::TypeExpr);
             visit_refs_with_sink(
                 &value,
                 declared_sink,
@@ -3085,26 +3050,33 @@ fn validate_deferred_iterable_operand(
 
     let inferred = match deferred_iterable_shape(value, bindings, schemas) {
         Ok(inferred) => Some(inferred),
-        Err(crate::static_type::InferenceIssue::IncompatibleCoalesceTypes { left, default }) => {
+        Err(crate::static_type::InferenceIssue::Failed(
+            inference::InferenceError::IncompatibleCoalesceTypes { left, default },
+        )) => {
             diagnostics.push(deferred_iterable_diagnostic(
                 deferred,
                 format!("coalesce default type `{default}` does not match left type `{left}`"),
             ));
             None
         }
-        Err(crate::static_type::InferenceIssue::HeterogeneousCollection { reason }) => {
+        Err(crate::static_type::InferenceIssue::Failed(
+            inference::InferenceError::HeterogeneousCollection { reason },
+        )) => {
             diagnostics.push(deferred_iterable_diagnostic(deferred, reason));
             None
         }
-        Err(
-            crate::static_type::InferenceIssue::UnknownType { .. }
-            | crate::static_type::InferenceIssue::UnknownBinding { .. }
-            | crate::static_type::InferenceIssue::NonInferableBinding { .. }
-            | crate::static_type::InferenceIssue::UnknownAttribute { .. }
-            | crate::static_type::InferenceIssue::SchemaUnavailable { .. }
-            | crate::static_type::InferenceIssue::InvalidAccess { .. }
-            | crate::static_type::InferenceIssue::CyclicVirtualBinding { .. },
-        ) => None,
+        Err(crate::static_type::InferenceIssue::Failed(
+            inference::InferenceError::UnknownType { .. }
+            | inference::InferenceError::UnknownBinding { .. }
+            | inference::InferenceError::UnknownAttribute { .. }
+            | inference::InferenceError::InvalidAccess { .. }
+            | inference::InferenceError::CyclicVirtualBinding { .. },
+        ))
+        | Err(crate::static_type::InferenceIssue::NotInferable(
+            crate::static_type::NotInferableReason::MissingValue
+            | crate::static_type::NotInferableReason::NonInferableBinding { .. }
+            | crate::static_type::NotInferableReason::SchemaUnavailable { .. },
+        )) => None,
     };
 
     let Some(inferred) = inferred else {
@@ -3177,11 +3149,11 @@ fn validate_attribute_param_ref_types_inner(
 
         visit_refs_with_sink(
             value,
-            match &param.static_type {
-                Some(StaticType::Known(type_expr)) => Some(RefSink::TypeExpr(type_expr)),
-                Some(StaticType::Unchecked(_reason)) => None,
-                None => None,
-            },
+            param
+                .static_type
+                .as_ref()
+                .and_then(StaticType::known)
+                .map(RefSink::TypeExpr),
             &mut |path, sink, usage, _candidate| {
                 check_attribute_param_ref(
                     &param.name,
@@ -3247,13 +3219,34 @@ pub fn validate_export_param_ref_types_with_bindings(
     export_params: &[crate::parser::InferredExportParam],
     bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
-    validate_export_param_ref_types_inner(export_params, bindings, UnknownReferencePolicy::Report)
+    validate_export_param_ref_types_inner(
+        export_params,
+        bindings,
+        UnknownReferencePolicy::Report,
+        ExportReferenceValidationMode::TypeAndExistence,
+    )
+}
+
+/// Existence-check exports whose inference failure is intentionally not
+/// reported by the caller. Recovery commands skip type diagnostics but must
+/// still reject references to bindings or attributes that do not exist.
+pub fn validate_inference_failed_export_ref_existence_with_bindings(
+    export_params: &[crate::parser::InferredExportParam],
+    bindings: &BindingIndex<'_>,
+) -> Result<(), String> {
+    validate_export_param_ref_types_inner(
+        export_params,
+        bindings,
+        UnknownReferencePolicy::Report,
+        ExportReferenceValidationMode::InferenceFailureExistence,
+    )
 }
 
 fn validate_export_param_ref_types_inner<E: crate::parser::ExportParamLike>(
     export_params: &[E],
     bindings: &BindingIndex<'_>,
     unknown_policy: UnknownReferencePolicy,
+    mode: ExportReferenceValidationMode,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
 
@@ -3261,38 +3254,28 @@ fn validate_export_param_ref_types_inner<E: crate::parser::ExportParamLike>(
         let Some(value) = param.value() else {
             continue;
         };
-        let (type_expr, inference_failure) = match param.static_type() {
-            crate::parser::ExportParamStaticTypeRef::Parsed(Some(StaticType::Known(type_expr))) => {
-                (Some(type_expr), false)
+        let static_type = param.static_type();
+        let inference_failure = matches!(
+            static_type,
+            crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Inferred(
+                StaticType::Unchecked(InferredUncheckedReason::InferenceFailed(_error))
+            ))
+        );
+        let type_expr = static_type.known();
+        let sink = match mode {
+            ExportReferenceValidationMode::TypeAndExistence => {
+                if inference_failure {
+                    continue;
+                }
+                type_expr.map(RefSink::TypeExpr)
             }
-            crate::parser::ExportParamStaticTypeRef::Parsed(Some(StaticType::Unchecked(
-                _reason,
-            ))) => (None, false),
-            crate::parser::ExportParamStaticTypeRef::Parsed(None) => (None, false),
-            crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Declared(
-                StaticType::Known(type_expr),
-            )) => (Some(type_expr), false),
-            crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Declared(
-                StaticType::Unchecked(_reason),
-            )) => (None, false),
-            crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Inferred(
-                StaticType::Known(type_expr),
-            )) => (Some(type_expr), false),
-            crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Inferred(
-                StaticType::Unchecked(InferredUncheckedReason::InferenceFailed(_error)),
-            )) => (None, true),
-            crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Inferred(
-                StaticType::Unchecked(InferredUncheckedReason::NotInferable(_reason)),
-            )) => (None, false),
-            crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Inferred(
-                StaticType::Unchecked(InferredUncheckedReason::UnnameableInConsumer(_reason)),
-            )) => (None, false),
+            ExportReferenceValidationMode::InferenceFailureExistence => {
+                if !inference_failure {
+                    continue;
+                }
+                None
+            }
         };
-        if inference_failure {
-            continue;
-        }
-
-        let sink = type_expr.map(RefSink::TypeExpr);
         visit_refs_with_sink(value, sink, &mut |path, sink, usage, _candidate| {
             check_export_ref(
                 param.name(),
@@ -3351,7 +3334,17 @@ fn check_export_ref(
                 errors.push(format!("export '{}': {}", param_name, error));
             }
         }
-        RefType::Unchecked | RefType::UnknownBinding { .. } => {}
+        RefType::UnknownBinding { .. } => {
+            if matches!(unknown_policy, UnknownReferencePolicy::Report) {
+                errors.push(format!(
+                    "export '{}': unknown binding '{}' in reference {}",
+                    param_name,
+                    path.binding(),
+                    path.to_dot_string(),
+                ));
+            }
+        }
+        RefType::Unchecked => {}
     }
 }
 
@@ -3382,6 +3375,7 @@ pub(crate) fn validate_expansion_boundary_ref_types_with_bindings<
         &parsed.export_params,
         bindings,
         UnknownReferencePolicy::Defer,
+        ExportReferenceValidationMode::TypeAndExistence,
     ) {
         errors.extend(message.lines().map(str::to_string));
     }
@@ -3553,40 +3547,8 @@ pub fn validate_argument_custom_types<E: crate::parser::ExportParamLike>(
         }
     }
     for ep in &parsed.export_params {
-        match ep.static_type() {
-            crate::parser::ExportParamStaticTypeRef::Parsed(Some(StaticType::Known(type_expr))) => {
-                collect_unknown_simple_types_in(
-                    type_expr,
-                    config,
-                    "export",
-                    ep.name(),
-                    &mut errors,
-                );
-            }
-            crate::parser::ExportParamStaticTypeRef::Parsed(Some(StaticType::Unchecked(
-                _reason,
-            ))) => {}
-            crate::parser::ExportParamStaticTypeRef::Parsed(None) => {}
-            crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Declared(
-                StaticType::Unchecked(_reason),
-            )) => {}
-            crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Inferred(
-                StaticType::Unchecked(InferredUncheckedReason::InferenceFailed(_error)),
-            )) => {}
-            crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Inferred(
-                StaticType::Unchecked(InferredUncheckedReason::NotInferable(_reason)),
-            )) => {}
-            crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Inferred(
-                StaticType::Unchecked(InferredUncheckedReason::UnnameableInConsumer(_reason)),
-            )) => {}
-            crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Declared(
-                StaticType::Known(type_expr),
-            ))
-            | crate::parser::ExportParamStaticTypeRef::Inferred(ExportStaticType::Inferred(
-                StaticType::Known(type_expr),
-            )) => {
-                collect_unknown_simple_types_in(type_expr, config, "export", ep.name(), &mut errors)
-            }
+        if let Some(type_expr) = ep.static_type().known() {
+            collect_unknown_simple_types_in(type_expr, config, "export", ep.name(), &mut errors);
         }
     }
     errors
@@ -3596,15 +3558,7 @@ fn unknown_type_resolution_error(
     authored_name: &str,
     config: &ProviderContext,
 ) -> TypeResolutionError {
-    match crate::parser::suggest_registered_dotted_custom_type(authored_name, config) {
-        Some(suggestion) => TypeResolutionError::UnknownCustomTypeWithSuggestion {
-            name: authored_name.to_string(),
-            suggestion,
-        },
-        None => TypeResolutionError::UnknownCustomType {
-            name: authored_name.to_string(),
-        },
-    }
+    crate::parser::unknown_custom_type_error(authored_name, config)
 }
 
 fn resolve_dotted_unresolved(
@@ -3935,27 +3889,41 @@ pub fn resolve_file_type_exprs<E: crate::parser::ExportParamLike>(
     errors
 }
 
-/// Resolve static types with an intentionally incomplete consumer context.
-///
+/// Resolve a signature snapshot when the consumer's provider catalog may be
+/// incomplete. The snapshot does not own diagnostics, so a resolution failure
+/// retains the authored declaration for the later authoritative module load.
+pub fn resolve_consumer_static_type_for_signature(
+    static_type: &ConsumerStaticType,
+    config: &ProviderContext,
+) -> ConsumerStaticType {
+    match static_type {
+        StaticType::Known(original) => StaticType::Known(
+            resolve_type_expr(original, config).unwrap_or_else(|_error| original.clone()),
+        ),
+        StaticType::Unchecked(reason) => StaticType::Unchecked(reason.clone()),
+    }
+}
+
+/// Resolve a declared type in an intentionally incomplete consumer context.
 /// Upstream export discovery runs in the consumer process, whose providers
 /// need not include every provider used by the upstream project. A type that
 /// cannot be named in that context carries no sound consumer-side constraint.
+///
+/// Unnameable declarations retain both their authored type and the typed
+/// resolution failure instead of remaining ambiguously unresolved.
 fn resolve_consumer_static_type_or_unchecked(
-    static_type: &mut ConsumerStaticType,
+    static_type: &ConsumerStaticType,
     config: &ProviderContext,
-) {
-    let replacement = match static_type {
+) -> ConsumerStaticType {
+    match static_type {
         StaticType::Known(original) => match resolve_type_expr(original, config) {
-            Ok(resolved) => Some(StaticType::Known(resolved)),
-            Err(resolution_error) => Some(StaticType::Unchecked(UnnameableInConsumer {
+            Ok(resolved) => StaticType::Known(resolved),
+            Err(resolution_error) => StaticType::Unchecked(UnnameableInConsumer {
                 original: original.clone(),
                 resolution_error,
-            })),
+            }),
         },
-        StaticType::Unchecked(_reason) => None,
-    };
-    if let Some(replacement) = replacement {
-        *static_type = replacement;
+        StaticType::Unchecked(reason) => StaticType::Unchecked(reason.clone()),
     }
 }
 
@@ -3987,22 +3955,24 @@ pub fn resolve_file_static_types_for_consumer<E: crate::parser::ExportParamLike>
     config: &ProviderContext,
 ) {
     for arg in &mut parsed.arguments {
-        resolve_consumer_static_type_or_unchecked(&mut arg.static_type, config);
+        arg.static_type = resolve_consumer_static_type_or_unchecked(&arg.static_type, config);
     }
     for parameter in &mut parsed.attribute_params {
         if let Some(static_type) = &mut parameter.static_type {
-            resolve_consumer_static_type_or_unchecked(static_type, config);
+            *static_type = resolve_consumer_static_type_or_unchecked(static_type, config);
         }
     }
     for parameter in &mut parsed.export_params {
         match parameter.static_type_mut() {
             crate::parser::ExportParamStaticTypeMut::Parsed(Some(static_type)) => {
-                resolve_consumer_static_type_or_unchecked(static_type, config);
+                *static_type = resolve_consumer_static_type_or_unchecked(static_type, config);
             }
             crate::parser::ExportParamStaticTypeMut::Parsed(None) => {}
             crate::parser::ExportParamStaticTypeMut::Inferred(ExportStaticType::Declared(
                 static_type,
-            )) => resolve_consumer_static_type_or_unchecked(static_type, config),
+            )) => {
+                *static_type = resolve_consumer_static_type_or_unchecked(static_type, config);
+            }
             crate::parser::ExportParamStaticTypeMut::Inferred(ExportStaticType::Inferred(
                 static_type,
             )) => resolve_inferred_static_type_or_unchecked(static_type, config),
@@ -4283,9 +4253,8 @@ fn validate_module_calls_inner(
                         arg_name,
                         source_file.display(),
                     );
-                    let type_expr = match &arg_param.static_type {
-                        StaticType::Known(type_expr) => type_expr,
-                        StaticType::Unchecked(_reason) => continue,
+                    let Some(type_expr) = arg_param.static_type.known() else {
+                        continue;
                     };
                     let resolved_parameter =
                         match resolve_parameter_type_for_check(type_expr, config) {
@@ -4413,39 +4382,7 @@ where
                 }
                 Ok(resolved) => {
                     resolved_param.set_value(Some(resolved));
-                    let known_type = match resolved_param.static_type() {
-                        crate::parser::ExportParamStaticTypeRef::Parsed(Some(
-                            StaticType::Known(type_expr),
-                        )) => Some(type_expr),
-                        crate::parser::ExportParamStaticTypeRef::Parsed(Some(
-                            StaticType::Unchecked(_reason),
-                        )) => None,
-                        crate::parser::ExportParamStaticTypeRef::Parsed(None) => None,
-                        crate::parser::ExportParamStaticTypeRef::Inferred(
-                            ExportStaticType::Declared(StaticType::Known(type_expr)),
-                        ) => Some(type_expr),
-                        crate::parser::ExportParamStaticTypeRef::Inferred(
-                            ExportStaticType::Declared(StaticType::Unchecked(_reason)),
-                        ) => None,
-                        crate::parser::ExportParamStaticTypeRef::Inferred(
-                            ExportStaticType::Inferred(StaticType::Known(type_expr)),
-                        ) => Some(type_expr),
-                        crate::parser::ExportParamStaticTypeRef::Inferred(
-                            ExportStaticType::Inferred(StaticType::Unchecked(
-                                InferredUncheckedReason::InferenceFailed(_error),
-                            )),
-                        ) => None,
-                        crate::parser::ExportParamStaticTypeRef::Inferred(
-                            ExportStaticType::Inferred(StaticType::Unchecked(
-                                InferredUncheckedReason::NotInferable(_reason),
-                            )),
-                        ) => None,
-                        crate::parser::ExportParamStaticTypeRef::Inferred(
-                            ExportStaticType::Inferred(StaticType::Unchecked(
-                                InferredUncheckedReason::UnnameableInConsumer(_reason),
-                            )),
-                        ) => None,
-                    };
+                    let known_type = resolved_param.static_type().known();
                     if let (Some(type_expr), Some(value)) = (known_type, resolved_param.value())
                         && let Err(error) = typecheck::check_type_expr_value(
                             type_expr,

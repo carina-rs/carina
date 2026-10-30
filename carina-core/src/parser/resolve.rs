@@ -863,45 +863,10 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
         // See the matching attribute-output guard above. Annotated exports
         // need their concrete values for boundary checking; unannotated
         // exports must retain the expression for return-type inference.
-        let has_static_type = match export.static_type() {
-            crate::parser::ExportParamStaticTypeRef::Parsed(static_type) => static_type.is_some(),
-            crate::parser::ExportParamStaticTypeRef::Inferred(
-                crate::static_type::ExportStaticType::Declared(
-                    crate::static_type::StaticType::Known(_type_expr),
-                ),
-            ) => true,
-            crate::parser::ExportParamStaticTypeRef::Inferred(
-                crate::static_type::ExportStaticType::Declared(
-                    crate::static_type::StaticType::Unchecked(_unnameable),
-                ),
-            ) => true,
-            crate::parser::ExportParamStaticTypeRef::Inferred(
-                crate::static_type::ExportStaticType::Inferred(
-                    crate::static_type::StaticType::Known(_type_expr),
-                ),
-            ) => true,
-            crate::parser::ExportParamStaticTypeRef::Inferred(
-                crate::static_type::ExportStaticType::Inferred(
-                    crate::static_type::StaticType::Unchecked(
-                        crate::static_type::InferredUncheckedReason::InferenceFailed(_error),
-                    ),
-                ),
-            ) => true,
-            crate::parser::ExportParamStaticTypeRef::Inferred(
-                crate::static_type::ExportStaticType::Inferred(
-                    crate::static_type::StaticType::Unchecked(
-                        crate::static_type::InferredUncheckedReason::NotInferable(_reason),
-                    ),
-                ),
-            ) => true,
-            crate::parser::ExportParamStaticTypeRef::Inferred(
-                crate::static_type::ExportStaticType::Inferred(
-                    crate::static_type::StaticType::Unchecked(
-                        crate::static_type::InferredUncheckedReason::UnnameableInConsumer(_reason),
-                    ),
-                ),
-            ) => true,
-        };
+        let has_static_type = !matches!(
+            export.static_type(),
+            crate::parser::ExportParamStaticTypeRef::Parsed(None)
+        );
         if has_static_type {
             let resolved = export
                 .value()

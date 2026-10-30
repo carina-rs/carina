@@ -282,9 +282,8 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 ArgumentOrigin::Authored { value_span, .. } => value_span.start_line(),
                 ArgumentOrigin::Defaulted => call_line,
             };
-            let type_expr = match &arg.static_type {
-                crate::static_type::StaticType::Known(type_expr) => type_expr,
-                crate::static_type::StaticType::Unchecked(_reason) => continue,
+            let Some(type_expr) = arg.static_type.known() else {
+                continue;
             };
             let Some(resolved_parameter) =
                 crate::validation::resolve_parameter_type_for_check(type_expr, self.config)
@@ -1682,9 +1681,8 @@ fn check_composition_argument_type(
     config: &crate::parser::ProviderContext,
     line: usize,
 ) -> Result<(), ArgumentSubstitutionError> {
-    let declared_type = match argument.declared_type() {
-        crate::static_type::StaticType::Known(type_expr) => type_expr,
-        crate::static_type::StaticType::Unchecked(_reason) => return Ok(()),
+    let Some(declared_type) = argument.declared_type().known() else {
+        return Ok(());
     };
     let Some(resolved_parameter) =
         crate::validation::resolve_parameter_type_for_check(declared_type, config).map_err(

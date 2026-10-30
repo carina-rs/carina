@@ -5272,6 +5272,34 @@ let sg = aws.ec2.SecurityGroup {
 }
 
 #[test]
+fn open_module_attribute_resolution_preserves_unnameable_type_for_best_effort_snapshot() {
+    let parsed = carina_core::parser::parse_file(
+        "attributes {\n  out: missing.types.Identifier = 'value'\n}\n",
+        std::path::Path::new("module.crn"),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("open-module fixture must parse");
+    let mut parameters = parsed.attribute_params;
+
+    super::super::checks::resolve_attribute_static_types_for_consumer(
+        &mut parameters,
+        &carina_core::parser::ProviderContext::default(),
+    );
+
+    assert!(matches!(
+        &parameters[0].static_type,
+        Some(carina_core::static_type::StaticType::Known(type_expr))
+            if *type_expr
+                == TypeExpr::DottedUnresolved(
+                    carina_core::parser::ResourceTypePath::new(
+                        "missing",
+                        "types.Identifier",
+                    ),
+                )
+    ));
+}
+
+#[test]
 fn module_argument_postfix_access_uses_declared_type_in_open_module_document() {
     let engine = module_boundary_identity_engine();
     let tmp = tempfile::tempdir().unwrap();

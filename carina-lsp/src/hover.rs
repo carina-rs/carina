@@ -12,6 +12,7 @@ use carina_core::schema::EffectiveSchemaNode;
 #[cfg(test)]
 use carina_core::schema::ResourceSchema;
 use carina_core::schema::{CompletionValue, SchemaRegistry, ValidatedResourceSchema};
+use carina_core::static_type::consumer_static_type_label;
 
 /// Find the `source` path of a `let <alias> = use {...}` declaration
 /// for `alias`. Tries the buffer's own parse first, then walks sibling
@@ -299,12 +300,7 @@ impl HoverProvider {
                 content.push_str(&format!(
                     "- `{}`: `{}`{}{}\n",
                     arg.name,
-                    match &arg.static_type {
-                        carina_core::static_type::StaticType::Known(type_expr) => type_expr,
-                        carina_core::static_type::StaticType::Unchecked(unnameable) => {
-                            &unnameable.original
-                        }
-                    },
+                    consumer_static_type_label(&arg.static_type),
                     desc,
                     required
                 ));
@@ -318,14 +314,7 @@ impl HoverProvider {
                 let type_str = attr
                     .static_type
                     .as_ref()
-                    .map(|static_type| match static_type {
-                        carina_core::static_type::StaticType::Known(type_expr) => {
-                            format!("`{type_expr}`")
-                        }
-                        carina_core::static_type::StaticType::Unchecked(unnameable) => {
-                            format!("`{}`", unnameable.original)
-                        }
-                    })
+                    .map(|static_type| format!("`{}`", consumer_static_type_label(static_type)))
                     .unwrap_or_default();
                 content.push_str(&format!("- `{}`: {}\n", attr.name, type_str));
             }
@@ -373,10 +362,7 @@ impl HoverProvider {
             content.push_str("\n\n");
         }
 
-        let type_expr = match &arg.static_type {
-            carina_core::static_type::StaticType::Known(type_expr) => type_expr,
-            carina_core::static_type::StaticType::Unchecked(unnameable) => &unnameable.original,
-        };
+        let type_expr = consumer_static_type_label(&arg.static_type);
         content.push_str(&format!("- **Type**: {type_expr}\n"));
 
         if let Some(default) = &arg.default {

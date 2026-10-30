@@ -86,8 +86,7 @@ pub use static_eval::evaluate_static_value_for_validation;
 pub use types::BUILTIN_BARE_CUSTOM_TYPES;
 pub use types::parse_type_expr_str;
 pub(crate) use types::{
-    resolve_known_bare_custom_type, suggest_registered_dotted_custom_type,
-    unknown_custom_type_message,
+    resolve_known_bare_custom_type, unknown_custom_type_error, unknown_custom_type_message,
 };
 pub(crate) use util::eval_type_name;
 pub use util::{pascal_to_snake, snake_to_pascal};

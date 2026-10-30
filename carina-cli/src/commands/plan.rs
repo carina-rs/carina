@@ -3972,34 +3972,7 @@ pub fn compute_export_diffs(
         let Some(ref value) = param.value else {
             continue;
         };
-        let type_expr = match &param.static_type {
-            carina_core::static_type::ExportStaticType::Declared(
-                carina_core::static_type::StaticType::Known(type_expr),
-            )
-            | carina_core::static_type::ExportStaticType::Inferred(
-                carina_core::static_type::StaticType::Known(type_expr),
-            ) => Some(type_expr.clone()),
-            carina_core::static_type::ExportStaticType::Declared(
-                carina_core::static_type::StaticType::Unchecked(_unnameable),
-            ) => None,
-            carina_core::static_type::ExportStaticType::Inferred(
-                carina_core::static_type::StaticType::Unchecked(
-                    carina_core::static_type::InferredUncheckedReason::InferenceFailed(_error),
-                ),
-            ) => None,
-            carina_core::static_type::ExportStaticType::Inferred(
-                carina_core::static_type::StaticType::Unchecked(
-                    carina_core::static_type::InferredUncheckedReason::NotInferable(_reason),
-                ),
-            ) => None,
-            carina_core::static_type::ExportStaticType::Inferred(
-                carina_core::static_type::StaticType::Unchecked(
-                    carina_core::static_type::InferredUncheckedReason::UnnameableInConsumer(
-                        _unnameable,
-                    ),
-                ),
-            ) => None,
-        };
+        let type_expr = param.static_type.known().cloned();
         // Plan display tolerates `Value::Deferred(DeferredValue::Unknown)` in the export rhs
         // (the deferred-for body will resolve it later). Map both the
         // skip variants and the Unknown error to `None`; the diff

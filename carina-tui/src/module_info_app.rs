@@ -1,7 +1,7 @@
 //! Application state for the TUI module info viewer
 
 use carina_core::module::{FileSignature, ModuleSignature, RootConfigSignature};
-use carina_core::static_type::{ConsumerStaticType, StaticType};
+use carina_core::static_type::{ConsumerStaticType, consumer_static_type_label};
 use ratatui::widgets::ListState;
 
 use crate::app::FocusedPanel;
@@ -46,10 +46,7 @@ pub struct ModuleInfoApp {
 
 impl ModuleInfoApp {
     fn type_label(static_type: &ConsumerStaticType) -> String {
-        match static_type {
-            StaticType::Known(type_expr) => type_expr.to_string(),
-            StaticType::Unchecked(unnameable) => unnameable.original.to_string(),
-        }
+        consumer_static_type_label(static_type).to_string()
     }
 
     pub fn new(signature: &FileSignature) -> Self {

@@ -4,7 +4,7 @@ use std::path::Path;
 use indexmap::IndexMap;
 
 use crate::parser::{ArgumentParameter, File, ParsedFile, ProviderContext, RequireBlock};
-use crate::static_type::{ConsumerStaticType, StaticType};
+use crate::static_type::ConsumerStaticType;
 
 /// The statically declared boundary of one imported module after dotted type
 /// expressions have been resolved against the caller's provider context.
@@ -19,11 +19,10 @@ pub struct ResolvedModuleSignature {
 pub type ResolvedModuleSignatures = HashMap<String, ResolvedModuleSignature>;
 
 // This snapshot loader does not own diagnostics. It keeps an unresolved type
-// when best-effort resolution fails so callers can still inspect the imported
-// signature; ModuleResolver::load_directory_module later runs
-// resolve_file_type_exprs over the imported module itself and rejects the
-// authored declaration before expansion. The end-to-end guarantee is pinned
-// by `carina-cli/tests/validate_unknown_custom_type_e2e.rs`.
+// when best-effort resolution fails; the strict module load later rejects
+// genuinely invalid authored declarations before expansion. The end-to-end
+// guarantee is pinned by
+// `carina-cli/tests/validate_unknown_custom_type_e2e.rs`.
 pub(super) fn resolved_signature(
     parsed: &ParsedFile,
     config: &ProviderContext,
@@ -33,14 +32,10 @@ pub(super) fn resolved_signature(
         .iter()
         .cloned()
         .map(|mut argument| {
-            match &mut argument.static_type {
-                StaticType::Known(type_expr) => {
-                    if let Ok(resolved) = crate::validation::resolve_type_expr(type_expr, config) {
-                        *type_expr = resolved;
-                    }
-                }
-                StaticType::Unchecked(_reason) => {}
-            }
+            argument.static_type = crate::validation::resolve_consumer_static_type_for_signature(
+                &argument.static_type,
+                config,
+            );
             argument
         })
         .collect();
@@ -48,18 +43,9 @@ pub(super) fn resolved_signature(
         .attribute_params
         .iter()
         .map(|attribute| {
-            let resolved = attribute
-                .static_type
-                .as_ref()
-                .map(|static_type| match static_type {
-                    StaticType::Known(type_expr) => {
-                        match crate::validation::resolve_type_expr(type_expr, config) {
-                            Ok(resolved) => StaticType::Known(resolved),
-                            Err(_error) => StaticType::Known(type_expr.clone()),
-                        }
-                    }
-                    StaticType::Unchecked(reason) => StaticType::Unchecked(reason.clone()),
-                });
+            let resolved = attribute.static_type.as_ref().map(|static_type| {
+                crate::validation::resolve_consumer_static_type_for_signature(static_type, config)
+            });
             (attribute.name.clone(), resolved)
         })
         .collect();

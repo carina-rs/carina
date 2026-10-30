@@ -8,7 +8,7 @@ use crate::parser::{
     ResourceTypePath, TypeExpr, display_double_quoted_literal_part, display_string_literal,
 };
 use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
-use crate::static_type::{ConsumerStaticType, StaticType};
+use crate::static_type::{ConsumerStaticType, StaticType, consumer_static_type_label};
 
 /// Dependency between resources
 #[derive(Debug, Clone)]
@@ -904,11 +904,11 @@ impl ModuleSignature {
         let argument_types: HashMap<String, TypeExpr> = parsed
             .arguments
             .iter()
-            .filter_map(|argument| match &argument.static_type {
-                StaticType::Known(type_expr) => {
-                    Some((argument.name.clone(), Self::signature_type_expr(type_expr)))
-                }
-                StaticType::Unchecked(_reason) => None,
+            .filter_map(|argument| {
+                argument
+                    .static_type
+                    .known()
+                    .map(|type_expr| (argument.name.clone(), Self::signature_type_expr(type_expr)))
             })
             .collect();
 
@@ -1206,19 +1206,12 @@ impl ModuleSignature {
                     .as_ref()
                     .map(|d| format!(" {}={} {}{}{}", c.dim, c.reset, c.green, d, c.reset))
                     .unwrap_or_default();
-                match &input.static_type {
-                    StaticType::Known(type_expr) => {
-                        let type_str = self.format_type_expr(type_expr, &c);
-                        output.push_str(&format!(
-                            "  {}{}{}: {}{}  {}\n",
-                            c.white, input.name, c.reset, type_str, default_str, required_str
-                        ));
-                    }
-                    StaticType::Unchecked(_reason) => output.push_str(&format!(
-                        "  {}{}{}{}  {}\n",
-                        c.white, input.name, c.reset, default_str, required_str
-                    )),
-                }
+                let type_str =
+                    self.format_type_expr(consumer_static_type_label(&input.static_type), &c);
+                output.push_str(&format!(
+                    "  {}{}{}: {}{}  {}\n",
+                    c.white, input.name, c.reset, type_str, default_str, required_str
+                ));
                 if let Some(desc) = &input.description {
                     output.push_str(&format!("    {}{}{}\n", c.dim, desc, c.reset));
                 }
@@ -1266,15 +1259,13 @@ impl ModuleSignature {
         } else {
             for attr_param in &self.exposes {
                 match &attr_param.static_type {
-                    Some(StaticType::Known(type_expr)) => {
-                        let type_str = self.format_type_expr(type_expr, &c);
+                    Some(static_type) => {
+                        let type_str =
+                            self.format_type_expr(consumer_static_type_label(static_type), &c);
                         output.push_str(&format!(
                             "  {}{}{}: {}\n",
                             c.white, attr_param.name, c.reset, type_str
                         ));
-                    }
-                    Some(StaticType::Unchecked(_reason)) => {
-                        output.push_str(&format!("  {}{}{}\n", c.white, attr_param.name, c.reset));
                     }
                     None => {
                         output.push_str(&format!("  {}{}{}\n", c.white, attr_param.name, c.reset));
@@ -1640,6 +1631,34 @@ mod tests {
         // Check tree structure shows resources
         assert!(display.contains("web_sg: aws.security_group"));
         assert!(display.contains("http_rule: aws.security_group.ingress_rule"));
+    }
+
+    #[test]
+    fn module_info_display_labels_unnameable_types_with_original_declaration() {
+        use crate::parser::{ProviderContext, parse};
+
+        let mut parsed = parse(
+            "arguments {\n  input: missing.types.Identifier\n}\n\
+             attributes {\n  output: missing.types.Identifier = input\n}\n",
+            &ProviderContext::default(),
+        )
+        .expect("module fixture must parse");
+        crate::validation::resolve_file_static_types_for_consumer(
+            &mut parsed,
+            &ProviderContext::default(),
+        );
+
+        let signature = ModuleSignature::from_directory_module(&parsed, "unnameable");
+        let display = signature.display_with_color(false);
+
+        assert!(
+            display.contains("input: missing.types.Identifier"),
+            "argument type label was dropped: {display}",
+        );
+        assert!(
+            display.contains("output: missing.types.Identifier"),
+            "attribute type label was dropped: {display}",
+        );
     }
 
     #[test]

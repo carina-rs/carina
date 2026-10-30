@@ -788,10 +788,12 @@ impl<'a> BindingIndex<'a> {
                                 Err(error) => RefType::UnknownAttribute(error),
                             }
                         }
-                        Some(crate::static_type::StaticType::Unchecked(_reason)) => {
+                        Some(crate::static_type::StaticType::Unchecked(_reason))
+                            if attribute.source_argument().is_some() =>
+                        {
                             RefType::Unchecked
                         }
-                        None => {
+                        Some(crate::static_type::StaticType::Unchecked(_)) | None => {
                             if let Some(forwarded) = attribute.forwarded_path() {
                                 match self.ref_type_inner(
                                     ReferencePathRef::Access(forwarded),
@@ -832,12 +834,9 @@ impl<'a> BindingIndex<'a> {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
-                    let type_expr = match static_type {
-                        crate::static_type::StaticType::Known(type_expr) => type_expr,
-                        crate::static_type::StaticType::Unchecked(_reason) => {
-                            visiting.remove(&key);
-                            return RefType::Unchecked;
-                        }
+                    let Some(type_expr) = static_type.known() else {
+                        visiting.remove(&key);
+                        return RefType::Unchecked;
                     };
                     let Some(declared) = crate::validation::lift_type_expr(type_expr) else {
                         visiting.remove(&key);
@@ -947,68 +946,9 @@ impl<'a> BindingIndex<'a> {
                             known_exports,
                         });
                     };
-                    let type_expr = match &export.static_type {
-                        crate::upstream_exports::UpstreamExportType::Static(
-                            crate::static_type::ExportStaticType::Declared(
-                                crate::static_type::StaticType::Known(type_expr),
-                            ),
-                        ) => type_expr,
-                        crate::upstream_exports::UpstreamExportType::Static(
-                            crate::static_type::ExportStaticType::Declared(
-                                crate::static_type::StaticType::Unchecked(_reason),
-                            ),
-                        ) => {
-                            visiting.remove(&key);
-                            return RefType::Unchecked;
-                        }
-                        crate::upstream_exports::UpstreamExportType::Static(
-                            crate::static_type::ExportStaticType::Inferred(
-                                crate::static_type::StaticType::Known(_type_expr),
-                            ),
-                        ) => {
-                            visiting.remove(&key);
-                            return RefType::Unchecked;
-                        }
-                        crate::upstream_exports::UpstreamExportType::Static(
-                            crate::static_type::ExportStaticType::Inferred(
-                                crate::static_type::StaticType::Unchecked(
-                                    crate::static_type::InferredUncheckedReason::InferenceFailed(
-                                        _error,
-                                    ),
-                                ),
-                            ),
-                        ) => {
-                            visiting.remove(&key);
-                            return RefType::Unchecked;
-                        }
-                        crate::upstream_exports::UpstreamExportType::Static(
-                            crate::static_type::ExportStaticType::Inferred(
-                                crate::static_type::StaticType::Unchecked(
-                                    crate::static_type::InferredUncheckedReason::NotInferable(
-                                        _reason,
-                                    ),
-                                ),
-                            ),
-                        ) => {
-                            visiting.remove(&key);
-                            return RefType::Unchecked;
-                        }
-                        crate::upstream_exports::UpstreamExportType::Static(
-                            crate::static_type::ExportStaticType::Inferred(
-                                crate::static_type::StaticType::Unchecked(
-                                    crate::static_type::InferredUncheckedReason::UnnameableInConsumer(
-                                        _reason,
-                                    ),
-                                ),
-                            ),
-                        ) => {
-                            visiting.remove(&key);
-                            return RefType::Unchecked;
-                        }
-                        crate::upstream_exports::UpstreamExportType::InferenceNotRun => {
-                            visiting.remove(&key);
-                            return RefType::Unchecked;
-                        }
+                    let Some(type_expr) = export.static_type.declared_known() else {
+                        visiting.remove(&key);
+                        return RefType::Unchecked;
                     };
                     let Some(declared) = crate::validation::lift_type_expr(type_expr) else {
                         visiting.remove(&key);
@@ -2827,6 +2767,47 @@ let vpc = aws.ec2.Vpc {
 
         let RefType::Typed(resolved) = index.ref_type(&AccessPath::new("instance", "cidr")) else {
             panic!("forwarded composition attribute must inherit its source type");
+        };
+        assert_eq!(resolved.display_type_name(), "String");
+    }
+
+    #[test]
+    fn ref_type_infers_forwarded_composition_attribute_with_unnameable_declaration() {
+        let mut parsed = parse(
+            r#"
+let vpc = aws.ec2.Vpc {
+    name = "v"
+    cidr_block = "10.0.0.0/16"
+}
+"#,
+            &Default::default(),
+        )
+        .expect("parse");
+        let mut output = composition("instance");
+        output.signature.attributes.insert(
+            "cidr".to_string(),
+            LiveCompositionAttribute::from_value_with_static_type(
+                Value::resource_ref("vpc".to_string(), "cidr_block", vec![]),
+                Some(crate::static_type::StaticType::Unchecked(
+                    crate::static_type::UnnameableInConsumer {
+                        original: TypeExpr::DottedUnresolved(ResourceTypePath::new(
+                            "some",
+                            "unnameable.Type",
+                        )),
+                        resolution_error:
+                            crate::static_type::TypeResolutionError::UnknownCustomType {
+                                name: "some.unnameable.Type".to_string(),
+                            },
+                    },
+                )),
+            ),
+        );
+        parsed.compositions.push(output);
+        let registry = registry_with_vpc();
+        let index = BindingIndex::from_parsed(&parsed, &registry);
+
+        let RefType::Typed(resolved) = index.ref_type(&AccessPath::new("instance", "cidr")) else {
+            panic!("plain forwarded alias must inherit its source type");
         };
         assert_eq!(resolved.display_type_name(), "String");
     }

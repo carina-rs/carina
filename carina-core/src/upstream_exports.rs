@@ -21,12 +21,30 @@ use crate::config_loader::{find_crn_files_in_dir, parse_directory};
 use crate::parser::{ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState};
 use crate::resource::{DeferredValue, Subscript, Value};
 use crate::schema::suggest_similar_name;
-use crate::static_type::{ExportStaticType, StaticType};
+use crate::static_type::ExportStaticType;
+#[cfg(test)]
+use crate::static_type::StaticType;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpstreamExportType {
     Static(ExportStaticType),
     InferenceNotRun,
+}
+
+impl UpstreamExportType {
+    pub fn known(&self) -> Option<&TypeExpr> {
+        match self {
+            Self::Static(static_type) => static_type.known(),
+            Self::InferenceNotRun => None,
+        }
+    }
+
+    pub fn declared_known(&self) -> Option<&TypeExpr> {
+        match self {
+            Self::Static(static_type) => static_type.declared_known(),
+            Self::InferenceNotRun => None,
+        }
+    }
 }
 
 /// One export's static-type provenance and literal value, as carried through
@@ -37,30 +55,6 @@ pub enum UpstreamExportType {
 pub struct UpstreamExportEntry {
     pub static_type: UpstreamExportType,
     pub value: Option<Value>,
-}
-
-fn declared_known_type(entry: &UpstreamExportEntry) -> Option<&TypeExpr> {
-    match &entry.static_type {
-        UpstreamExportType::Static(ExportStaticType::Declared(StaticType::Known(type_expr))) => {
-            Some(type_expr)
-        }
-        UpstreamExportType::Static(ExportStaticType::Declared(StaticType::Unchecked(_reason))) => {
-            None
-        }
-        UpstreamExportType::Static(ExportStaticType::Inferred(StaticType::Known(_type_expr))) => {
-            None
-        }
-        UpstreamExportType::Static(ExportStaticType::Inferred(StaticType::Unchecked(
-            crate::static_type::InferredUncheckedReason::InferenceFailed(_error),
-        ))) => None,
-        UpstreamExportType::Static(ExportStaticType::Inferred(StaticType::Unchecked(
-            crate::static_type::InferredUncheckedReason::NotInferable(_reason),
-        ))) => None,
-        UpstreamExportType::Static(ExportStaticType::Inferred(StaticType::Unchecked(
-            crate::static_type::InferredUncheckedReason::UnnameableInConsumer(_reason),
-        ))) => None,
-        UpstreamExportType::InferenceNotRun => None,
-    }
 }
 
 /// Exports for a single `upstream_state` binding: export name → entry.
@@ -231,6 +225,12 @@ pub fn resolve_upstream_exports_with_schemas(
         }
         match parse_directory(&source_abs, config) {
             Ok(mut parsed) => {
+                // Normalize every consumer-visible declaration before module
+                // expansion and export inference. Inference compares the
+                // structural TypeExpr values it receives, so leaving one
+                // declaration as DottedUnresolved while an equivalent schema
+                // projection is already SchemaType creates a false mismatch.
+                crate::validation::resolve_file_static_types_for_consumer(&mut parsed, config);
                 // Expand module calls before inference so that
                 // `attributes { ... }`-typed `Virtual` resources land in
                 // `parsed.resources` (#2493). Without this the inferer
@@ -258,9 +258,10 @@ pub fn resolve_upstream_exports_with_schemas(
                     });
                     continue;
                 }
-                // Run inference before resolving names in the consumer's
-                // provider context. Failures and names unavailable to the
-                // consumer remain attached as distinct unchecked reasons.
+                // Declarations were resolved before expansion so inference
+                // compares canonical identities. Resolve once more afterward
+                // to classify newly inferred names that the consumer cannot
+                // name, preserving that distinction from inference failure.
                 let entries: UpstreamExportEntries = match schemas {
                     Some(s) => {
                         let mut inferred = crate::validation::inference::apply_inference(parsed, s);
@@ -673,7 +674,7 @@ pub fn check_upstream_state_for_iterable_shapes<E>(
             let Some(entry) = fields.get(path.attribute()) else {
                 return;
             };
-            let Some(export_type) = declared_known_type(entry) else {
+            let Some(export_type) = entry.static_type.declared_known() else {
                 return;
             };
             let export_kind = match export_type {
@@ -915,7 +916,7 @@ fn visit_attribute_access(
         let Some(entry) = fields.get(attribute) else {
             return;
         };
-        let Some(export_type) = declared_known_type(entry) else {
+        let Some(export_type) = entry.static_type.declared_known() else {
             return;
         };
         let walk_result = walk_type_expr_fields(export_type, &leading);
@@ -1094,7 +1095,7 @@ fn visit_subscript_access(
         let Some(entry) = fields.get(attribute) else {
             return;
         };
-        let Some(export_type) = declared_known_type(entry) else {
+        let Some(export_type) = entry.static_type.declared_known() else {
             return;
         };
         // If the field path itself doesn't resolve, the
@@ -1396,7 +1397,10 @@ mod tests {
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
         let entry = keys.get("accounts").expect("accounts export");
-        let ty = declared_known_type(entry).expect("type annotation present");
+        let ty = entry
+            .static_type
+            .declared_known()
+            .expect("type annotation present");
         assert!(
             matches!(ty, TypeExpr::Struct { fields } if fields.len() == 2),
             "expected struct with 2 fields, got {ty:?}"
@@ -1434,7 +1438,7 @@ mod tests {
         let entries = got.get("orgs").expect("resolved");
         let entry = entries.get("accounts").expect("accounts export");
         assert!(
-            declared_known_type(entry).is_some(),
+            entry.static_type.declared_known().is_some(),
             "type annotation must still be present"
         );
         let value = entry.value.as_ref().expect("export value must be carried");
@@ -4000,6 +4004,64 @@ mod tests {
             region_entry.static_type,
             UpstreamExportType::Static(ExportStaticType::Inferred(StaticType::Known(
                 TypeExpr::String
+            )))
+        );
+    }
+
+    #[test]
+    fn resolve_upstream_exports_resolves_declarations_before_inference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_dir = tmp.path().join("upstream");
+        fs::create_dir(&upstream_dir).unwrap();
+        write_crn(
+            &upstream_dir,
+            "main.crn",
+            "arguments { value: test.types.Identifier }\n\
+             let item = test.Item {}\n\
+             exports { out = [value, item.identifier] }\n",
+        );
+
+        let identity = crate::schema::TypeIdentity::from_schema_type("test", "types", "Identifier");
+        let owned = crate::parser::OwnedTypeIdentity::provider("test", identity);
+        let config = ProviderContext {
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                std::collections::HashSet::from([owned.clone()]),
+                Box::new(|_target, _value| Ok(())),
+            ),
+            ..ProviderContext::default()
+        };
+        let mut schemas = crate::schema::SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            crate::schema::ResourceSchema::new("Item")
+                .attribute(
+                    crate::schema::AttributeSchema::optional(
+                        "identifier",
+                        crate::schema::AttributeType::refined_string(
+                            Some(owned.identity().clone()),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .expect("schema fixture must be valid"),
+        );
+
+        let (exports, errors) = resolve_upstream_exports_with_schemas(
+            tmp.path(),
+            &[upstream("ups", "upstream")],
+            &config,
+            Some(&schemas),
+        );
+
+        assert!(errors.is_empty(), "unexpected resolve errors: {errors:?}");
+        assert_eq!(
+            exports["ups"]["out"].static_type,
+            UpstreamExportType::Static(ExportStaticType::Inferred(StaticType::Known(
+                TypeExpr::List(Box::new(TypeExpr::SchemaType { owned })),
             )))
         );
     }

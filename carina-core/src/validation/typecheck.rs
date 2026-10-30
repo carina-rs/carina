@@ -47,7 +47,7 @@ pub enum TypeExprValueError {
         field: String,
     },
     InvalidAccess {
-        message: String,
+        error: crate::static_type::InferenceError,
     },
     CustomTypeValidation {
         path: Vec<TypeExprValuePathSegment>,
@@ -116,7 +116,7 @@ impl fmt::Display for TypeExprValueError {
                 write_path(f, path)?;
                 write!(f, "expected struct, unknown field '{field}'.")
             }
-            Self::InvalidAccess { message } => f.write_str(message),
+            Self::InvalidAccess { error } => error.fmt(f),
             Self::CustomTypeValidation {
                 path,
                 expected,
@@ -175,32 +175,24 @@ pub fn check_type_expr_value(
             return match inferred {
                 Ok(actual) if inferred_type_fits(expected, &actual) => Ok(()),
                 Ok(_) => Err(mismatch(expected, value)),
-                Err(crate::static_type::InferenceIssue::InvalidAccess { base_type, step }) => {
-                    Err(TypeExprValueError::InvalidAccess {
-                        message: super::inference::InferenceError::InvalidAccess {
-                            base_type,
-                            step,
-                        }
-                        .to_string(),
-                    })
-                }
-                Err(crate::static_type::InferenceIssue::UnknownAttribute {
-                    binding,
-                    attribute,
-                }) => Err(TypeExprValueError::InvalidAccess {
-                    message: super::inference::InferenceError::UnknownAttribute {
-                        binding,
-                        attribute,
-                    }
-                    .to_string(),
-                }),
-                Err(crate::static_type::InferenceIssue::UnknownType { .. })
-                | Err(crate::static_type::InferenceIssue::HeterogeneousCollection { .. })
-                | Err(crate::static_type::InferenceIssue::IncompatibleCoalesceTypes { .. })
-                | Err(crate::static_type::InferenceIssue::UnknownBinding { .. })
-                | Err(crate::static_type::InferenceIssue::NonInferableBinding { .. })
-                | Err(crate::static_type::InferenceIssue::SchemaUnavailable { .. })
-                | Err(crate::static_type::InferenceIssue::CyclicVirtualBinding { .. }) => Ok(()),
+                Err(crate::static_type::InferenceIssue::Failed(
+                    error @ super::inference::InferenceError::InvalidAccess { .. },
+                ))
+                | Err(crate::static_type::InferenceIssue::Failed(
+                    error @ super::inference::InferenceError::UnknownAttribute { .. },
+                )) => Err(TypeExprValueError::InvalidAccess { error }),
+                Err(crate::static_type::InferenceIssue::Failed(
+                    super::inference::InferenceError::UnknownType { .. }
+                    | super::inference::InferenceError::HeterogeneousCollection { .. }
+                    | super::inference::InferenceError::IncompatibleCoalesceTypes { .. }
+                    | super::inference::InferenceError::UnknownBinding { .. }
+                    | super::inference::InferenceError::CyclicVirtualBinding { .. },
+                ))
+                | Err(crate::static_type::InferenceIssue::NotInferable(
+                    crate::static_type::NotInferableReason::MissingValue
+                    | crate::static_type::NotInferableReason::NonInferableBinding { .. }
+                    | crate::static_type::NotInferableReason::SchemaUnavailable { .. },
+                )) => Ok(()),
             };
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => return Ok(()),

@@ -15,7 +15,7 @@ use carina_core::parser::{
 };
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::suggest_similar_name;
-use carina_core::static_type::{StaticType, UnnameableInConsumer};
+use carina_core::static_type::StaticType;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
 use super::{DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic};
@@ -29,6 +29,20 @@ pub(super) struct MergedParseResult {
     pub(super) directory: DirectoryParseResult,
     pub(super) module_error: Option<carina_core::module_resolver::ModuleError>,
     pub(super) module_constraint_reports: carina_core::module_resolver::ModuleCallConstraintReports,
+}
+
+pub(super) fn resolve_attribute_static_types_for_consumer(
+    parameters: &mut [AttributeParameter],
+    provider_context: &carina_core::parser::ProviderContext,
+) {
+    for parameter in parameters {
+        if let Some(static_type) = &mut parameter.static_type {
+            *static_type = carina_core::validation::resolve_consumer_static_type_for_signature(
+                static_type,
+                provider_context,
+            );
+        }
+    }
 }
 
 fn source_span_position(span: SourceSpan) -> (u32, u32) {
@@ -1959,9 +1973,8 @@ impl DiagnosticEngine {
 
                     // Type validation for known parameters
                     let arg = matching_arg.unwrap();
-                    let argument_type = match &arg.static_type {
-                        StaticType::Known(type_expr) => type_expr,
-                        StaticType::Unchecked(_unnameable) => continue,
+                    let Some(argument_type) = arg.static_type.known() else {
+                        continue;
                     };
                     let Ok(Some(resolved_parameter)) =
                         carina_core::validation::resolve_parameter_type_for_check(
@@ -2477,29 +2490,10 @@ impl DiagnosticEngine {
             .flatten()
             .cloned()
             .collect::<Vec<_>>();
-        for parameter in &mut resolved_attribute_params {
-            let replacement = match &parameter.static_type {
-                Some(StaticType::Known(type_expr)) => {
-                    match carina_core::validation::resolve_type_expr(
-                        type_expr,
-                        &self.provider_context,
-                    ) {
-                        Ok(resolved) => Some(StaticType::Known(resolved)),
-                        Err(resolution_error) => {
-                            Some(StaticType::Unchecked(UnnameableInConsumer {
-                                original: type_expr.clone(),
-                                resolution_error,
-                            }))
-                        }
-                    }
-                }
-                Some(StaticType::Unchecked(_unnameable)) => None,
-                None => None,
-            };
-            if let Some(replacement) = replacement {
-                parameter.static_type = Some(replacement);
-            }
-        }
+        resolve_attribute_static_types_for_consumer(
+            &mut resolved_attribute_params,
+            &self.provider_context,
+        );
         if let Err(ref_errors) =
             carina_core::validation::validate_attribute_param_ref_types_with_bindings(
                 &resolved_attribute_params,

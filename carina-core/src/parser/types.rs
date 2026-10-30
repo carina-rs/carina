@@ -4,6 +4,7 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::schema::{TypeIdentity, levenshtein_distance};
+use crate::static_type::TypeResolutionError;
 
 use super::ast::{ResourceTypePath, TypeExpr};
 use super::error::{ParseError, ParseWarning};
@@ -169,13 +170,23 @@ pub(crate) fn suggest_registered_dotted_custom_type(
         })
 }
 
-pub(crate) fn unknown_custom_type_message(input: &str, config: &ProviderContext) -> String {
+pub(crate) fn unknown_custom_type_error(
+    input: &str,
+    config: &ProviderContext,
+) -> TypeResolutionError {
     match suggest_registered_dotted_custom_type(input, config) {
-        Some(suggestion) => {
-            format!("unknown custom type '{input}'; suggestion: use '{suggestion}'")
-        }
-        None => format!("unknown custom type '{input}'"),
+        Some(suggestion) => TypeResolutionError::UnknownCustomTypeWithSuggestion {
+            name: input.to_string(),
+            suggestion,
+        },
+        None => TypeResolutionError::UnknownCustomType {
+            name: input.to_string(),
+        },
     }
+}
+
+pub(crate) fn unknown_custom_type_message(input: &str, config: &ProviderContext) -> String {
+    unknown_custom_type_error(input, config).to_string()
 }
 
 fn parse_type_expr_atom(

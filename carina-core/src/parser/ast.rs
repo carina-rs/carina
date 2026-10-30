@@ -796,9 +796,19 @@ pub trait ExportParamLike {
     fn static_type_mut(&mut self) -> ExportParamStaticTypeMut<'_>;
 }
 
+#[derive(Clone, Copy)]
 pub enum ExportParamStaticTypeRef<'a> {
     Parsed(&'a Option<ConsumerStaticType>),
     Inferred(&'a ExportStaticType),
+}
+
+impl<'a> ExportParamStaticTypeRef<'a> {
+    pub fn known(self) -> Option<&'a TypeExpr> {
+        match self {
+            Self::Parsed(static_type) => static_type.as_ref().and_then(StaticType::known),
+            Self::Inferred(static_type) => static_type.known(),
+        }
+    }
 }
 
 pub enum ExportParamStaticTypeMut<'a> {

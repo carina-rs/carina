@@ -15,7 +15,7 @@ use super::resolver::ModuleResolver;
 use super::*;
 use crate::parser::{
     ArgumentOrigin, ArgumentParameter, AttributePathSegment, BindingUseOwner, ModuleArgument,
-    ModuleCall, ParsedFile, ProviderContext, TypeExpr,
+    ModuleCall, ParsedFile, ProviderContext, ResourceTypePath, TypeExpr,
 };
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, RawEnumIdentifier, Resource,
@@ -7207,5 +7207,32 @@ fn resolved_module_signature_groups_all_owners_of_a_dotted_annotation() {
                 if matches!(inner.as_ref(), TypeExpr::SchemaType { .. })
         ),
         "module signatures must not retain DottedUnresolved for a known shared identity: {resolved:?}"
+    );
+}
+
+#[test]
+fn resolved_module_signature_preserves_unresolvable_attribute_type_for_best_effort_snapshot() {
+    let parsed = crate::parser::parse(
+        "attributes {\n  out: missing.types.Identifier = 'value'\n}\n",
+        &ProviderContext::default(),
+    )
+    .expect("module signature fixture must parse");
+
+    let signature = super::signature::resolved_signature(&parsed, &ProviderContext::default());
+    let static_type = signature.attributes["out"]
+        .as_ref()
+        .expect("declared attribute type");
+
+    assert!(
+        matches!(
+            static_type,
+            crate::static_type::StaticType::Known(type_expr)
+                if *type_expr
+                    == TypeExpr::DottedUnresolved(ResourceTypePath::new(
+                        "missing",
+                        "types.Identifier",
+                    ))
+        ),
+        "best-effort module signature must retain the authored type: {static_type:?}",
     );
 }

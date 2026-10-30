@@ -735,6 +735,21 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         )
     };
 
+    if skip_resource_validation {
+        let bindings = carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
+        if let Err(message) =
+            carina_core::validation::validate_inference_failed_export_ref_existence_with_bindings(
+                &parsed.export_params,
+                &bindings,
+            )
+        {
+            errors.extend(split_validation_message(&message));
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+    }
+
     if !skip_resource_validation {
         // Mid-edit `${}` is parser-accepted (#2480) so the AST stays
         // intact for LSP diagnostics, but it must not reach a provider —
@@ -1264,6 +1279,73 @@ exports {
             result.is_ok(),
             "skip_resource_validation=true must bypass upstream field check, got: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    fn inference_failed_export_uses_existence_check_on_recovery_paths() {
+        fn validation_messages(errors: &[AppError]) -> impl Iterator<Item = &str> {
+            errors.iter().filter_map(|error| {
+                if let AppError::Validation(message) = error {
+                    Some(message.as_str())
+                } else {
+                    None
+                }
+            })
+        }
+
+        let user_dirs = carina_core::TestUserDirs::new();
+        let base = tempfile::tempdir().unwrap();
+        std::fs::write(
+            base.path().join("main.crn"),
+            "exports { x = typo_binding.attr }\n",
+        )
+        .unwrap();
+
+        let loaded = carina_core::config_loader::load_configuration_with_config(
+            base.path(),
+            &ProviderContext::default(),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .expect("load");
+        let duplicate_declarations = loaded.duplicate_declarations;
+        let parsed = loaded.parsed;
+        let providers =
+            ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).expect("providers");
+
+        let full_errors = validate_and_resolve_errors(
+            &mut parsed.clone(),
+            base.path(),
+            &providers,
+            false,
+            &duplicate_declarations,
+        );
+        assert_eq!(
+            validation_messages(&full_errors)
+                .filter(|message| message.contains("export 'x'"))
+                .count(),
+            1,
+            "normal validation must report only the inference diagnostic: {full_errors:?}",
+        );
+
+        let recovery_errors = validate_and_resolve_errors(
+            &mut parsed.clone(),
+            base.path(),
+            &providers,
+            true,
+            &duplicate_declarations,
+        );
+        assert_eq!(
+            validation_messages(&recovery_errors)
+                .filter(|message| message.contains("export 'x'"))
+                .count(),
+            1,
+            "recovery validation must report exactly one existence diagnostic: {recovery_errors:?}",
+        );
+        assert!(
+            validation_messages(&recovery_errors)
+                .any(|message| message.contains("unknown binding 'typo_binding'")),
+            "recovery validation must existence-check the failed export: {recovery_errors:?}",
         );
     }
 
