@@ -6090,7 +6090,7 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
     let mut state_block_targets = Vec::new();
     for state_block in &parsed.state_blocks {
         match state_block {
-            crate::parser::StateBlock::Import { to, id } => {
+            crate::parser::StateBlock::Import { to, to_span: _, id } => {
                 collect_dependencies(id, &mut referenced);
                 state_block_targets.push(to.clone());
             }

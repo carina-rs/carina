@@ -11,14 +11,18 @@ use carina_core::binding_index::{
 };
 use carina_core::config_loader::{DeclarationKind, DirectoryParseResult, DuplicateDeclaration};
 use carina_core::parser::{
-    AttributeParameter, ModuleCall, ParsedExportParam, ParsedFile, SourceSpan, TypeExpr,
+    AttributeParameter, ModuleCall, ParsedExportParam, ParsedFile, SourceSpan,
+    TopLevelBlockSourceSpan, TypeExpr,
 };
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::suggest_similar_name;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::typecheck::{self, TypecheckInference};
 
-use super::{DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic};
+use super::{
+    DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic, carina_diagnostic_range,
+    parser_span_range,
+};
 
 /// Directory parse plus the typed module-resolution outcome.
 pub(super) struct MergedParseResult {
@@ -42,6 +46,39 @@ fn source_span_position(span: SourceSpan) -> (u32, u32) {
         span.start_line().saturating_sub(1) as u32,
         span.start_column().saturating_sub(1) as u32,
     )
+}
+
+fn top_level_anonymous_resources_with_spans<'a>(
+    doc: &Document,
+    current_file: &'a ParsedFile,
+) -> Vec<(&'a carina_core::resource::Resource, TopLevelBlockSourceSpan)> {
+    let Ok(authored_spans) = carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
+    else {
+        return Vec::new();
+    };
+    let mut spans_by_kind = HashMap::<(String, String), VecDeque<_>>::new();
+    for authored in authored_spans {
+        spans_by_kind
+            .entry((authored.provider, authored.resource_type))
+            .or_default()
+            .push_back(authored.span);
+    }
+
+    current_file
+        .resources
+        .iter()
+        .filter(|resource| resource.binding.is_none() && resource.loop_provenance.is_empty())
+        .filter_map(|resource| {
+            let key = (
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+            );
+            spans_by_kind
+                .get_mut(&key)
+                .and_then(VecDeque::pop_front)
+                .map(|span| (resource, span))
+        })
+        .collect()
 }
 
 fn module_call_position(call: &ModuleCall) -> (u32, u32) {
@@ -555,33 +592,8 @@ impl DiagnosticEngine {
             return Vec::new();
         }
 
-        let Ok(authored_spans) =
-            carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
-        else {
-            return Vec::new();
-        };
-        let mut spans_by_kind = HashMap::<(String, String), VecDeque<_>>::new();
-        for authored in authored_spans {
-            spans_by_kind
-                .entry((authored.provider, authored.resource_type))
-                .or_default()
-                .push_back(authored.span);
-        }
-
         let mut diagnostics = Vec::new();
-        for resource in current_file
-            .resources
-            .iter()
-            .filter(|resource| resource.binding.is_none())
-        {
-            let key = (
-                resource.id.provider.clone(),
-                resource.id.resource_type.clone(),
-            );
-            let Some(span) = spans_by_kind.get_mut(&key).and_then(VecDeque::pop_front) else {
-                continue;
-            };
-
+        for (resource, span) in top_level_anonymous_resources_with_spans(doc, current_file) {
             // The general schema diagnostic below is the actionable error in
             // this situation. Without a schema, the identity-basis classifier
             // returns no classification, so LSP must not infer an
@@ -607,6 +619,133 @@ impl DiagnosticEngine {
             ));
         }
 
+        diagnostics
+    }
+
+    fn generated_identity_for_plain_resource(
+        &self,
+        resource: &carina_core::resource::Resource,
+        providers: &[carina_core::parser::ProviderConfig],
+    ) -> Option<String> {
+        let mut candidate = vec![resource.clone()];
+        let canonical =
+            carina_core::value::canonicalize_resources_with_schemas(&mut candidate, &self.schemas)
+                .ok()?;
+        carina_core::identifier::compute_anonymous_identifiers_with_factories(
+            canonical,
+            providers,
+            &self.factories,
+            &self.schemas,
+            carina_core::identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+        )
+        .ok()?;
+        candidate[0].id.identity_str().map(str::to_string)
+    }
+
+    /// Run the same typed anonymous-identity checks as validate/plan and anchor
+    /// messages on the authored resource, loop, or state-block destination.
+    pub(super) fn loop_anonymous_identity_diagnostics(
+        &self,
+        doc: &Document,
+        current_file: &ParsedFile,
+        directory: &ParsedFile,
+        configuration_root: Option<&std::path::Path>,
+    ) -> Vec<Diagnostic> {
+        let mut resources = directory.resources.clone();
+        let canonical_resources = match carina_core::value::canonicalize_resources_with_schemas(
+            &mut resources,
+            &self.schemas,
+        ) {
+            Ok(resources) => resources,
+            Err(_) => return Vec::new(),
+        };
+        let identity_result = carina_core::identifier::compute_anonymous_identifiers_with_factories(
+            canonical_resources,
+            &directory.providers,
+            &self.factories,
+            &self.schemas,
+            carina_core::identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+        );
+        let current_name = configuration_root
+            .and_then(|root| doc.source_file().strip_prefix(root).ok())
+            .unwrap_or_else(|| doc.source_file())
+            .to_string_lossy();
+        let mut diagnostics = Vec::new();
+        if let Err(carina_core::identifier::AnonymousIdentityComputationError::Identity(error)) =
+            identity_result
+        {
+            for error in error.into_individual_errors() {
+                match error {
+                    carina_core::identifier::AnonymousIdentityError::Loop(conflict) => {
+                        if current_name != conflict.file() {
+                            continue;
+                        }
+                        let Some(span) = conflict.source_span() else {
+                            continue;
+                        };
+                        let Some(range) = parser_span_range(doc, span) else {
+                            continue;
+                        };
+                        diagnostics.push(carina_diagnostic_range(
+                            range,
+                            DiagnosticSeverity::ERROR,
+                            conflict.to_string(),
+                        ));
+                    }
+                    carina_core::identifier::AnonymousIdentityError::Collision(collision) => {
+                        let message = collision.to_string();
+                        for (resource, span) in
+                            top_level_anonymous_resources_with_spans(doc, current_file)
+                        {
+                            if self.generated_identity_for_plain_resource(
+                                resource,
+                                &directory.providers,
+                            ) != Some(collision.identifier().to_string())
+                            {
+                                continue;
+                            }
+                            let line = span.start_line.saturating_sub(1) as u32;
+                            let col = span.start_column.saturating_sub(1) as u32;
+                            diagnostics.push(carina_diagnostic(
+                                line,
+                                col,
+                                span.end_column.saturating_sub(1) as u32,
+                                DiagnosticSeverity::ERROR,
+                                message.clone(),
+                            ));
+                        }
+                    }
+                    carina_core::identifier::AnonymousIdentityError::AttributeDerived(_) => {
+                        // The directory-scoped declaration mapper above owns
+                        // these diagnostics and their exact authored ranges.
+                    }
+                    carina_core::identifier::AnonymousIdentityError::LegacyMoveTarget(_) => {
+                        // State-target errors are computed from the current
+                        // file below so their parser spans remain available.
+                    }
+                    carina_core::identifier::AnonymousIdentityError::Aggregate(_) => {
+                        unreachable!("anonymous identity aggregates are flattened")
+                    }
+                }
+            }
+        }
+
+        diagnostics.extend(
+            carina_core::identifier::check_legacy_loop_move_targets(
+                &current_file.state_blocks,
+                &resources,
+            )
+            .into_iter()
+            .filter_map(|error| {
+                let span = error.source_span()?;
+                let range = parser_span_range(doc, span)?;
+                Some(carina_diagnostic_range(
+                    range,
+                    DiagnosticSeverity::ERROR,
+                    error.to_string(),
+                ))
+            }),
+        );
         diagnostics
     }
 

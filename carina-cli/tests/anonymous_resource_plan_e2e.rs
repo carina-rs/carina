@@ -88,6 +88,13 @@ mock.test.Thing {
 }
 "#;
 
+const ATTRIBUTE_DERIVED_LOOP_ALPHA_AND_BETA: &str = r#"for name in ["alpha", "beta"] {
+  mock.test.Thing {
+    name = name
+  }
+}
+"#;
+
 const LET_ALPHA_AND_BETA: &str = r#"let alpha = mock.test.resource {
   name = "alpha"
 }
@@ -305,6 +312,49 @@ fn validate_rejects_multiple_attribute_derived_anonymous_resources() {
          status: {}\nstdout:\n{}\nstderr:\n{stderr}",
         validate.status,
         String::from_utf8_lossy(&validate.stdout),
+    );
+}
+
+#[test]
+fn destroy_recovery_allows_attribute_derived_anonymous_conflicts() {
+    for (label, resources) in [
+        (
+            "plain anonymous resources",
+            ATTRIBUTE_DERIVED_ALPHA_AND_BETA,
+        ),
+        (
+            "anonymous loop elements",
+            ATTRIBUTE_DERIVED_LOOP_ALPHA_AND_BETA,
+        ),
+    ] {
+        let scenario = Scenario::new();
+        scenario.write_main(resources);
+        assert_success("carina init", &scenario.carina(&["init", "."]));
+
+        let destroy = scenario.carina(&["destroy", "--auto-approve", "."]);
+        assert_success(label, &destroy);
+    }
+}
+
+#[test]
+fn destroy_recovery_still_rejects_identical_anonymous_identities() {
+    let scenario = Scenario::new();
+    scenario.write_main(
+        r#"for name in ["same", "same"] {
+  mock.test.resource {
+    name = name
+  }
+}
+"#,
+    );
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+
+    let destroy = scenario.carina(&["destroy", "--auto-approve", "."]);
+    let stderr = String::from_utf8_lossy(&destroy.stderr);
+    assert!(
+        !destroy.status.success() && stderr.contains("identical stable identity inputs"),
+        "destroy recovery must not admit duplicate generated identities\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&destroy.stdout),
     );
 }
 

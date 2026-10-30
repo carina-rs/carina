@@ -8,6 +8,325 @@ const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is d
 mutable attributes for multiple 'mock.test.resource' declarations using provider instance \
 '<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
 
+fn anonymous_loop_engine() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        (ResourceSchema::new("test.Thing")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        .validate()
+        .expect("mutable-identity fixture schema must be valid"),
+    );
+    schemas.insert(
+        "mock",
+        (ResourceSchema::new("test.resource").attribute(
+            AttributeSchema::optional("name", AttributeType::string())
+                .create_only()
+                .build(),
+        ))
+        .validate()
+        .expect("stable-identity fixture schema must be valid"),
+    );
+    custom_engine(schemas)
+}
+
+fn analyze_anonymous_loop_source(source: &str) -> Vec<Diagnostic> {
+    let temp = tempfile::tempdir().expect("create diagnostic fixture");
+    std::fs::write(temp.path().join("main.crn"), source).expect("write main fixture");
+    std::fs::write(temp.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write provider fixture");
+    let path = temp.path().join("main.crn");
+    anonymous_loop_engine().analyze(&create_document_at(source, path.clone()), Some(&path))
+}
+
+fn only_message_diagnostic<'a>(diagnostics: &'a [Diagnostic], needle: &str) -> &'a Diagnostic {
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains(needle))
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    matching[0]
+}
+
+#[test]
+fn anonymous_loop_attribute_derived_diagnostic_has_exact_range() {
+    let source = "for name in ['alpha', 'beta'] {\n  mock.test.Thing {\n    name = name\n  }\n}\n";
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let diagnostic =
+        only_message_diagnostic(&diagnostics, "derive identity from mutable attributes");
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(0, 0), Position::new(4, 1))
+    );
+    assert_eq!(
+        diagnostic.message,
+        concat!(
+            "Anonymous resources produced by the unbound `for` at main.crn:1 cannot be ",
+            "identified safely because multiple 'mock.test.Thing' elements derive identity ",
+            "from mutable attributes.\n",
+            "Rewrite the loop with a binding and migrate its existing state addresses:\n\n",
+            "let thing = for name in ['alpha', 'beta'] {\n",
+            "  mock.test.Thing {\n",
+            "    name = name\n",
+            "  }\n",
+            "}\n\n",
+            "moved {\n",
+            "  from = mock.test.Thing '_for0[0]'\n",
+            "  to = mock.test.Thing 'thing[0]'\n",
+            "}\n\n",
+            "moved {\n",
+            "  from = mock.test.Thing '_for0[1]'\n",
+            "  to = mock.test.Thing 'thing[1]'\n",
+            "}",
+        )
+    );
+}
+
+#[test]
+fn anonymous_plain_and_single_loop_member_both_receive_diagnostics() {
+    let source = concat!(
+        "mock.test.Thing { name = 'plain' }\n",
+        "for name in ['loop'] {\n",
+        "  mock.test.Thing { name = name }\n",
+        "}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+
+    let plain = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .starts_with("Anonymous resource identity is derived from mutable attributes")
+                && diagnostic.message.contains("'mock.test.Thing'")
+        })
+        .collect::<Vec<_>>();
+    let loops = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("produced by the unbound `for`"))
+        .collect::<Vec<_>>();
+    assert_eq!(plain.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(loops.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        loops[0].range,
+        Range::new(Position::new(1, 0), Position::new(3, 1))
+    );
+}
+
+#[test]
+fn distinct_single_element_loops_receive_two_diagnostics() {
+    let source = concat!(
+        "for name in ['alpha'] {\n  mock.test.Thing { name = name }\n}\n",
+        "for name in ['beta'] {\n  mock.test.Thing { name = name }\n}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let loops = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("produced by the unbound `for`"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(loops.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(loops[0].range.start.line, 0);
+    assert_eq!(loops[1].range.start.line, 3);
+}
+
+#[test]
+fn sibling_single_element_loops_each_receive_their_own_diagnostic() {
+    let temp = tempfile::tempdir().expect("create diagnostic fixture");
+    let a = "for name in ['alpha'] {\n  mock.test.Thing { name = name }\n}\n";
+    let b = "for name in ['beta'] {\n  mock.test.Thing { name = name }\n}\n";
+    std::fs::write(temp.path().join("a.crn"), a).expect("write a fixture");
+    std::fs::write(temp.path().join("b.crn"), b).expect("write b fixture");
+    std::fs::write(temp.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write provider fixture");
+
+    for (file, source) in [("a.crn", a), ("b.crn", b)] {
+        let path = temp.path().join(file);
+        let diagnostics =
+            anonymous_loop_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+        let loops = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("produced by the unbound `for`"))
+            .collect::<Vec<_>>();
+        assert_eq!(loops.len(), 1, "{file} diagnostics: {diagnostics:#?}");
+        assert!(loops[0].message.contains(&format!("at {file}:1")));
+    }
+}
+
+#[test]
+fn anonymous_loop_identical_identity_diagnostic_has_exact_range() {
+    let source =
+        "for name in ['same', 'same'] {\n  mock.test.resource {\n    name = name\n  }\n}\n";
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let diagnostic = only_message_diagnostic(&diagnostics, "identical stable identity inputs");
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(0, 0), Position::new(4, 1))
+    );
+    assert!(
+        diagnostic
+            .message
+            .contains("let resource = for name in ['same', 'same']")
+    );
+    assert!(
+        diagnostic
+            .message
+            .contains("from = mock.test.resource '_for0[1]'")
+    );
+    assert!(
+        diagnostic
+            .message
+            .contains("to = mock.test.resource 'resource[1]'")
+    );
+}
+
+#[test]
+fn anonymous_loop_moved_to_legacy_diagnostic_has_exact_range() {
+    let source = concat!(
+        "moved {\n",
+        "  from = mock.test.resource 'old'\n",
+        "  to = mock.test.resource '_for0[0]'\n",
+        "}\n\n",
+        "for name in ['one'] {\n",
+        "  mock.test.resource {\n",
+        "    name = name\n",
+        "  }\n",
+        "}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let diagnostic = only_message_diagnostic(&diagnostics, "legacy synthetic loop address");
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(2, 7), Position::new(2, 36))
+    );
+    assert_eq!(
+        diagnostic.message,
+        concat!(
+            "The `moved.to` address mock.test.resource '_for0[0]' is a legacy synthetic loop ",
+            "address and cannot be a destination. Use the current anonymous address ",
+            "mock.test.resource 'mock_test_resource_96081a11' instead.",
+        )
+    );
+}
+
+#[test]
+fn anonymous_loop_import_to_legacy_diagnostic_has_exact_range() {
+    let source = concat!(
+        "import {\n",
+        "  to = mock.test.resource '_for0[0]'\n",
+        "  id = 'resource-existing'\n",
+        "}\n\n",
+        "for name in ['one'] {\n",
+        "  mock.test.resource {\n",
+        "    name = name\n",
+        "  }\n",
+        "}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let diagnostic = only_message_diagnostic(&diagnostics, "legacy synthetic loop address");
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(1, 7), Position::new(1, 36))
+    );
+    assert_eq!(
+        diagnostic.message,
+        concat!(
+            "The `import.to` address mock.test.resource '_for0[0]' is a legacy synthetic loop ",
+            "address and cannot be a destination. Use the current anonymous address ",
+            "mock.test.resource 'mock_test_resource_96081a11' instead.",
+        )
+    );
+}
+
+#[test]
+fn plain_anonymous_identity_collision_is_reported_on_each_authored_resource() {
+    let source = concat!(
+        "mock.test.resource { name = 'same' }\n",
+        "\n",
+        "mock.test.resource { name = 'same' }\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let collisions = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Anonymous resource identifier collision")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(collisions.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(collisions[0].range.start.line, 0);
+    assert_eq!(collisions[1].range.start.line, 2);
+}
+
+#[test]
+fn anonymous_identity_and_legacy_move_target_diagnostics_are_both_reported() {
+    let source = concat!(
+        "moved {\n",
+        "  from = mock.test.resource 'old'\n",
+        "  to = mock.test.resource '_for9[0]'\n",
+        "}\n\n",
+        "for name in ['same', 'same'] {\n",
+        "  mock.test.resource { name = name }\n",
+        "}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic
+                .message
+                .contains("identical stable identity inputs"))
+            .count(),
+        1,
+        "identity diagnostic missing: {diagnostics:#?}",
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("legacy synthetic loop address"))
+            .count(),
+        1,
+        "legacy moved.to diagnostic missing: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn unbound_loop_read_diagnostics_require_let_at_the_loop_range() {
+    for (source, kind) in [
+        (
+            "for name in ['one'] {\n  read mock.test.resource { name = name }\n}\n",
+            "for",
+        ),
+        (
+            "if true {\n  read mock.test.resource { name = 'one' }\n}\n",
+            "if",
+        ),
+    ] {
+        let diagnostics = analyze_anonymous_loop_source(source);
+        let diagnostic = only_message_diagnostic(&diagnostics, "cannot contain `read`");
+        assert_eq!(
+            diagnostic.range,
+            Range::new(Position::new(0, 0), Position::new(2, 1)),
+            "{kind} diagnostic range",
+        );
+        assert!(
+            diagnostic
+                .message
+                .contains(&format!("bind the {kind} expression with `let`")),
+            "diagnostic: {diagnostic:#?}",
+        );
+    }
+}
+
 fn backend_directory_diagnostics(source: &str) -> Vec<Diagnostic> {
     backend_directory_diagnostics_with_sibling("\n", source)
 }
@@ -5519,6 +5838,7 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
             instance: call_binding.to_string(),
             module_source: Some("../missing".to_string()),
             module_directory: None,
+            loop_origin: None,
         };
         LiveComposition {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(

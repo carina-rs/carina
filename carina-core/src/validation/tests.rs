@@ -553,10 +553,12 @@ fn state_block_targets_only_count_managed_resources_as_used() {
     );
     parsed.state_blocks.push(crate::parser::StateBlock::Import {
         to: crate::parser::StateBlockAddress::new("mock", "test.resource", "managed"),
+        to_span: None,
         id: Value::Concrete(ConcreteValue::String("existing-1".into())),
     });
     parsed.state_blocks.push(crate::parser::StateBlock::Import {
         to: crate::parser::StateBlockAddress::new("mock", "test.resource", "read_target"),
+        to_span: None,
         id: Value::Concrete(ConcreteValue::String("existing-2".into())),
     });
 
@@ -1200,6 +1202,7 @@ fn make_composition(binding: &str, attributes: &[&str]) -> LiveComposition {
         instance: binding.to_string(),
         module_source: None,
         module_directory: None,
+        loop_origin: None,
     };
     LiveComposition {
         id: crate::resource::ResolvedResourceId::with_identity(
@@ -1240,6 +1243,7 @@ fn set_composition_module(composition: &mut LiveComposition, module_name: &str) 
         instance: composition.instance.clone(),
         module_source: None,
         module_directory: None,
+        loop_origin: None,
     };
     composition.call_path = CompositionCallPath::direct(call);
 }
@@ -4433,6 +4437,7 @@ fn composition_ref_error_dedup_uses_the_full_call_path() {
             instance: label.to_string(),
             module_source: None,
             module_directory: None,
+            loop_origin: None,
         }
     }
 

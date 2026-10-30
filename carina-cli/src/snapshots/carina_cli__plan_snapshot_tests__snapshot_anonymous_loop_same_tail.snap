@@ -1,0 +1,11 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  -> awscc.ec2.Vpc awscc_ec2_vpc_0bc2a2bb (moved from: _xs[0])  (for [0] at main.crn:8)
+  + awscc.ec2.Vpc awscc_ec2_vpc_0e88b44f  (for [0] at main.crn:14)
+      cidr_block: '10.5.0.0/16'
+
+Plan: 1 to add, 0 to change, 0 to destroy, 1 to move.

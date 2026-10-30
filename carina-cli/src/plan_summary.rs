@@ -152,7 +152,9 @@ mod tests {
             header: "for item in upstream.items".to_string(),
             resource_type: "test.Widget".to_string(),
             attributes: Vec::new(),
-            binding_name: "widgets".to_string(),
+            target: carina_core::parser::DeferredForTarget::Bound {
+                binding: "widgets".to_string(),
+            },
             iterable: Value::resource_ref("upstream", "items", Vec::new()),
             binding: ForBinding::Simple("item".to_string()),
             template_resource: Resource::new("test.Widget", "widgets"),

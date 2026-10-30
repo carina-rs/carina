@@ -434,6 +434,12 @@ impl DiagnosticEngine {
                 current_file,
                 merged.unwrap_or(current_file),
             ));
+            diagnostics.extend(self.loop_anonymous_identity_diagnostics(
+                doc,
+                current_file,
+                merged.unwrap_or(current_file),
+                base_path,
+            ));
         }
         let upstream_resolution = match (base_path, merged) {
             (Some(base), Some(merged)) => Some(match &self.provider_context {
@@ -2281,6 +2287,31 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             100,
             DiagnosticSeverity::ERROR,
             "interpolation is not allowed in this string literal".to_string(),
+        ),
+        ParseError::UnboundLoopRead {
+            span: Some(span), ..
+        } => carina_diagnostic_range(
+            Range {
+                start: Position {
+                    line: span.start_line().saturating_sub(1) as u32,
+                    character: span.start_column().saturating_sub(1) as u32,
+                },
+                end: Position {
+                    line: span.end_line().saturating_sub(1) as u32,
+                    character: span.end_column().saturating_sub(1) as u32,
+                },
+            },
+            DiagnosticSeverity::ERROR,
+            error.to_string(),
+        ),
+        ParseError::UnboundLoopRead {
+            line, span: None, ..
+        } => carina_diagnostic(
+            line.saturating_sub(1) as u32,
+            0,
+            100,
+            DiagnosticSeverity::ERROR,
+            error.to_string(),
         ),
         ParseError::InvalidResourceIdentity { line, error } => carina_diagnostic(
             (*line as u32).saturating_sub(1),

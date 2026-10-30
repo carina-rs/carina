@@ -609,7 +609,7 @@ fn node_from_effect(
 ) -> GraphNode {
     let module_label = module.map(|info| info.label.as_str());
     let anonymous_discriminator = effect_anonymous_discriminator(effect);
-    let (label, resource_type, kind, mut attribute_names, note) = match effect {
+    let (mut label, resource_type, kind, mut attribute_names, note) = match effect {
         Effect::Read { resource } => (
             resource_label(resource.binding.as_deref(), &resource.id, module_label),
             resource.id.display_type(),
@@ -690,7 +690,7 @@ fn node_from_effect(
             Vec::new(),
             Some("remove from state".to_string()),
         ),
-        Effect::Move { from, to } => (
+        Effect::Move { from, to, .. } => (
             to.identity_str().to_string(),
             to.display_type(),
             EffectKind::Move,
@@ -713,20 +713,25 @@ fn node_from_effect(
             None,
         ),
         Effect::DeferredCreate { id, template } => (
-            deferred_label(&template.binding_name, id),
+            deferred_label(template, id),
             id.display_type(),
             EffectKind::DeferredCreate,
             Vec::new(),
             deferred_after_note(template),
         ),
         Effect::DeferredReplace(payload) => (
-            deferred_label(&payload.template.binding_name, &payload.id),
+            deferred_label(&payload.template, &payload.id),
             payload.id.display_type(),
             EffectKind::DeferredReplace,
             Vec::new(),
             deferred_after_note(&payload.template),
         ),
     };
+
+    if let Some(origin) = effect.loop_origin() {
+        label.push_str("  ");
+        origin.append_display_suffix(&mut label);
+    }
 
     attribute_names.sort();
     attribute_names.dedup();
@@ -789,11 +794,19 @@ fn resource_label(binding: Option<&str>, id: &ResourceId, module_label: Option<&
         .unwrap_or_else(|| short_type.to_string())
 }
 
-fn deferred_label(binding: &str, id: &ResolvedResourceId) -> String {
-    if binding.is_empty() {
-        id.identity_str().to_string()
-    } else {
-        binding.to_string()
+fn deferred_label(
+    template: &carina_core::parser::DeferredForExpression,
+    id: &ResolvedResourceId,
+) -> String {
+    match &template.target {
+        carina_core::parser::DeferredForTarget::Bound { binding } => binding.clone(),
+        carina_core::parser::DeferredForTarget::Unbound { .. } => {
+            format!(
+                "{}.<pending> (deferred for at {})",
+                id.display_type(),
+                template.target.display_name(),
+            )
+        }
     }
 }
 
@@ -1241,7 +1254,9 @@ mod tests {
             header: "for item in literal".to_string(),
             resource_type: "test.Widget".to_string(),
             attributes: Vec::new(),
-            binding_name: "widgets".to_string(),
+            target: carina_core::parser::DeferredForTarget::Bound {
+                binding: "widgets".to_string(),
+            },
             iterable: Value::Concrete(ConcreteValue::String(ITERABLE_VALUE.into())),
             binding: ForBinding::Simple("item".to_string()),
             template_resource: Resource::new("test.Widget", "widgets"),
@@ -1255,6 +1270,81 @@ mod tests {
 
         assert_eq!(node.note, None);
         assert!(!format!("{node:?}").contains(ITERABLE_VALUE));
+    }
+
+    #[test]
+    fn deferred_unbound_label_survives_saved_plan_serde_round_trip() {
+        let fixture = tempfile::tempdir().expect("deferred label fixture");
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            "let upstream = upstream_state { source = '../upstream' }\n\
+             for value in upstream.accounts {\n\
+               mock.test.Child { identity_input = value }\n\
+             }\n",
+        )
+        .expect("write deferred loop fixture");
+        let mut parsed = carina_core::config_loader::parse_directory(
+            fixture.path(),
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .expect("parse deferred loop fixture");
+        let template = parsed
+            .deferred_for_expressions
+            .pop()
+            .expect("fixture contains one deferred loop");
+        assert_eq!(template.target.display_name(), "main.crn:2");
+        assert!(
+            template
+                .file
+                .as_deref()
+                .is_some_and(|file| file.contains(fixture.path().to_string_lossy().as_ref())),
+            "the live diagnostic path should be machine-local before serialization"
+        );
+
+        let saved = carina_core::parser::SavedDeferredForExpression::from(template);
+        let json = serde_json::to_string(&saved).expect("serialize saved deferred template");
+        let saved: carina_core::parser::SavedDeferredForExpression =
+            serde_json::from_str(&json).expect("deserialize saved deferred template");
+        let DeferredForExpression {
+            file,
+            line,
+            header,
+            resource_type,
+            attributes,
+            target,
+            iterable,
+            binding,
+            template_resource: _,
+        } = saved;
+        let round_tripped = DeferredForExpression {
+            file,
+            line,
+            header,
+            resource_type,
+            attributes,
+            target,
+            iterable,
+            binding,
+            template_resource: Resource::pending_with_provider("mock", "test.Child", None),
+        };
+
+        let mut plan = Plan::new();
+        plan.add(Effect::DeferredCreate {
+            id: ResolvedResourceId::with_provider_identity(
+                "mock",
+                "__deferred_for",
+                "pending_accounts",
+                None,
+            ),
+            template: Box::new(round_tripped),
+        });
+        let node = node_from_effect(0, &plan.effects()[0], None, None);
+
+        assert!(
+            node.label.contains("deferred for at main.crn:2"),
+            "saved-plan label lost its display-relative origin: {}",
+            node.label,
+        );
     }
 
     #[test]

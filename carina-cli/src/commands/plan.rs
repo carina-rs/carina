@@ -355,6 +355,9 @@ pub struct PlanFileContents<S = ModuleSource> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 29 persists anonymous-loop provenance, typed deferred-loop
+    /// targets, and Move origins. Plan format 28 added typed pending re-read
+    /// reasons.
     /// Plan format 27 adds a mandatory normalized module-call origin path to
     /// every saved composition. Plan format 26 adds mandatory identities for
     /// every loaded provider artifact. Plan format 25 adds the mandatory typed
@@ -560,9 +563,9 @@ struct ProviderEvidence {
 /// inventory to match every referenced type exactly and the provider-artifact
 /// keys to match the providers implied by the saved provider configurations.
 ///
-/// Format 27 persists saved compositions with mandatory normalized call-origin
-/// paths. Provider evidence is also validated both when recording and when
-/// decoding a saved plan.
+/// Format 29 persists anonymous-loop provenance, typed deferred-loop targets,
+/// and Move origins. Provider evidence is also validated both when recording
+/// and when decoding a saved plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(into = "PlanFileWire", try_from = "PlanFileWire")]
 pub struct PlanFile {
@@ -1118,7 +1121,7 @@ impl<S> PlanFileContents<S> {
                         SchemaKind::Resource,
                     );
                 }
-                Effect::Move { from, to } => {
+                Effect::Move { from, to, .. } => {
                     insert(&mut references, from, SchemaKind::Resource);
                     insert(&mut references, to, SchemaKind::Resource);
                 }
@@ -1174,7 +1177,7 @@ impl<S> PlanFileContents<S> {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 28;
+    pub const CURRENT_VERSION: u32 = 29;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> PlanFileContents<SavedModuleSource> {
@@ -1315,6 +1318,7 @@ impl PlanFile {
                 dependency_bindings: _dependency_bindings,
                 module_source: _module_source,
                 default_tag_keys: _default_tag_keys,
+                loop_provenance: _loop_provenance,
                 quoted_string_attrs: _quoted_string_attrs,
             } = resource;
             attributes
@@ -1421,6 +1425,35 @@ impl PlanFile {
                 ));
             }
             Ok(())
+        }
+
+        fn validate_deferred_template(
+            template: &carina_core::parser::SavedDeferredForExpression,
+            location: &str,
+        ) -> Result<(), String> {
+            match &template.target {
+                carina_core::parser::DeferredForTarget::Bound { binding } => {
+                    require_identity(&template.template_resource.id, location)?;
+                    if template.template_resource.id.identity_str() != Some(binding.as_str()) {
+                        return Err(format!(
+                            "Invalid saved plan: {location} identity does not match bound deferred target `{binding}`"
+                        ));
+                    }
+                    Ok(())
+                }
+                carina_core::parser::DeferredForTarget::Unbound { .. } => {
+                    if matches!(
+                        template.template_resource.id.identity_state(),
+                        carina_core::resource::ResourceIdentityState::Pending(_)
+                    ) {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "Invalid saved plan: {location} for an unbound deferred target must have a pending resource identity"
+                        ))
+                    }
+                }
+            }
         }
 
         for (index, resource) in self.sorted_resources.iter().enumerate() {
@@ -1538,22 +1571,19 @@ impl PlanFile {
                         ));
                     }
                 }
-                Effect::Move { from, to } => {
+                Effect::Move { from, to, .. } => {
                     require_identity(from, &format!("{location}.from"))?;
                     require_identity(to, &format!("{location}.to"))?;
                 }
                 Effect::DeferredCreate { id, template, .. } => {
                     require_identity(id, &location)?;
-                    require_identity(
-                        &template.template_resource.id,
-                        &format!("{location}.template"),
-                    )?;
+                    validate_deferred_template(template, &format!("{location}.template_resource"))?;
                 }
                 Effect::DeferredReplace(payload) => {
                     require_identity(&payload.id, &location)?;
-                    require_identity(
-                        &payload.template.template_resource.id,
-                        &format!("{location}.template"),
+                    validate_deferred_template(
+                        &payload.template,
+                        &format!("{location}.template_resource"),
                     )?;
                     for (delete_index, delete) in payload.deletes.iter().enumerate() {
                         require_identity(
@@ -2033,7 +2063,9 @@ impl MovedOrigins {
             .effects()
             .iter()
             .filter_map(|effect| match effect {
-                Effect::Move { from, to } => Some((to.as_inner().clone(), from.as_inner().clone())),
+                Effect::Move { from, to, .. } => {
+                    Some((to.as_inner().clone(), from.as_inner().clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -2758,6 +2790,7 @@ mod managed_current_serde_tests {
         contents.plan.add(Effect::Move {
             from: ResolvedResourceId::new(source),
             to: ResolvedResourceId::new(destination.clone()),
+            origin: None,
         });
         let plan = contents
             .record_for_test(&crate::wiring::ValidatedConfig::from_factories_for_test(
@@ -3023,6 +3056,9 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
+        // carina#4109: bumped 28→29 — saved plans persist anonymous-loop
+        // provenance, typed bound/unbound deferred targets, and Move origins.
+        // V28 plans carry the old deferred payload and must be regenerated.
         // carina#3883: bumped 27→28 — pending re-read unknowns now persist a
         // typed reason shared with state markers. V27 plans carry the removed
         // untyped unknown shape and must be regenerated.

@@ -1,0 +1,7 @@
+arguments {
+  vpc_cidr: String
+}
+
+let vpc = awscc.ec2.Vpc {
+  cidr_block = vpc_cidr
+}

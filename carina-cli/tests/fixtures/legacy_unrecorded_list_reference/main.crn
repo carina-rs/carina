@@ -1,0 +1,9 @@
+let route_table = mock.test.resource {
+  name = "route-table"
+}
+
+mock.example.consumer {
+  name  = "endpoint"
+  plain = "before"
+  list  = [route_table.identifier]
+}

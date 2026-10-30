@@ -1,0 +1,9 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  -> awscc.sso.Assignment awscc_sso_assignment_ad432333 (moved from: _accounts.alpha)  (for ['alpha'] at main.crn:9)
+
+Plan: 0 to add, 0 to change, 0 to destroy, 1 to move.
