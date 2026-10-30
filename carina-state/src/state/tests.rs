@@ -4052,6 +4052,26 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
 }
 
 #[test]
+fn state_json_cannot_persist_ignore_changes_paths() {
+    let runtime: Directives = serde_json::from_value(serde_json::json!({
+        "prevent_destroy": true,
+        "ignore_changes": [{
+            "segments": [{ "kind": "attribute", "value": "comment" }]
+        }]
+    }))
+    .expect("runtime directives decode");
+    assert_eq!(runtime.ignore_changes.len(), 1);
+
+    let mut row = ResourceState::new("test.Widget", "example", "mock");
+    row.directives = (&runtime).into();
+    let encoded = serde_json::to_string(&row).expect("state row serializes");
+
+    assert!(row.directives.prevent_destroy);
+    assert!(!encoded.contains("ignore_changes"), "{encoded}");
+    assert!(!encoded.contains("comment"), "{encoded}");
+}
+
+#[test]
 fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     use carina_core::resource::ResourceId;
 

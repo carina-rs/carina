@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::effect::{
     ChangedCreateOnly, Effect, EffectWithSource, MoveAuthority, SavedEffect, TemporaryName,
+    UnresolvedSavedEffect,
 };
 use crate::module_resolver::ModuleConstraintDiagnostic;
 use crate::name_override::NameOverride;
@@ -118,6 +119,12 @@ pub enum PlanErrorKind {
         /// Schema or provider-validator diagnostic.
         message: String,
     },
+    /// An update would have to resend an ignored write-only value that the
+    /// provider cannot return on read.
+    IgnoredWriteOnlyValueUnavailable {
+        attribute: String,
+        path: String,
+    },
     /// A module argument constraint failed after its inputs became known.
     ModuleConstraint(ModuleConstraintDiagnostic),
 }
@@ -158,6 +165,15 @@ impl From<CreateBeforeDestroyError> for PlanErrorKind {
             CreateBeforeDestroyError::ReplacementCannotCoexist(err) => {
                 Self::ReplacementCannotCoexist(err)
             }
+        }
+    }
+}
+
+impl From<crate::provider::IgnoredWriteOnlyValueError> for PlanErrorKind {
+    fn from(error: crate::provider::IgnoredWriteOnlyValueError) -> Self {
+        Self::IgnoredWriteOnlyValueUnavailable {
+            attribute: error.attribute().to_string(),
+            path: error.path().to_string(),
         }
     }
 }
@@ -271,6 +287,10 @@ impl std::fmt::Display for PlanErrorKind {
                     (true, true) => write!(f, "resolved value constraint failed: {message}"),
                 }
             }
+            Self::IgnoredWriteOnlyValueUnavailable { attribute, path } => write!(
+                f,
+                "cannot send attribute `{attribute}` because ignored write-only path `{path}` must be preserved, but its current value cannot be known"
+            ),
             Self::ModuleConstraint(diagnostic) => diagnostic.fmt(f),
         }
     }
@@ -419,6 +439,23 @@ struct AbandonedDeposedGeneration {
     key: DeposedKey,
 }
 
+/// Display-only count of readable drift hidden by `ignore_changes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IgnoredChangeSummary {
+    resource_id: ResourceId,
+    count: usize,
+}
+
+impl IgnoredChangeSummary {
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource_id
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+}
+
 /// Plan containing Effects to be executed
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
@@ -427,6 +464,8 @@ struct AbandonedDeposedGeneration {
 ))]
 pub struct Plan<S = ModuleSource> {
     effects: Vec<EffectWithSource<S>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ignored_change_summaries: Vec<IgnoredChangeSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) replace_display: Vec<ReplaceDisplayMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -444,6 +483,7 @@ impl<S> Default for Plan<S> {
     fn default() -> Self {
         Self {
             effects: Vec::new(),
+            ignored_change_summaries: Vec::new(),
             replace_display: Vec::new(),
             permanent_name_overrides: Vec::new(),
             errors: Vec::new(),
@@ -454,10 +494,124 @@ impl<S> Default for Plan<S> {
 
 pub type SavedPlan = Plan<SavedModuleSource>;
 
+/// Deserialized saved-plan effects before managed resources have crossed the
+/// fingerprint-checked schema-resolution boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnresolvedSavedPlan {
+    effects: Vec<UnresolvedSavedEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ignored_change_summaries: Vec<IgnoredChangeSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    replace_display: Vec<ReplaceDisplayMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    permanent_name_overrides: Vec<PermanentNameOverride>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<PlanError>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    abandoned_deposed: Vec<AbandonedDeposedGeneration>,
+}
+
+impl From<SavedPlan> for UnresolvedSavedPlan {
+    fn from(plan: SavedPlan) -> Self {
+        let Plan {
+            effects,
+            ignored_change_summaries,
+            replace_display,
+            permanent_name_overrides,
+            errors,
+            abandoned_deposed,
+        } = plan;
+        Self {
+            effects: effects
+                .into_iter()
+                .map(UnresolvedSavedEffect::from)
+                .collect(),
+            ignored_change_summaries,
+            replace_display,
+            permanent_name_overrides,
+            errors,
+            abandoned_deposed,
+        }
+    }
+}
+
+impl UnresolvedSavedPlan {
+    pub fn add(&mut self, effect: UnresolvedSavedEffect) {
+        self.effects.push(effect);
+    }
+
+    pub fn effects(&self) -> &[UnresolvedSavedEffect] {
+        &self.effects
+    }
+
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+
+    pub fn move_authority(&self, from: &ResourceId, to: &ResourceId) -> Option<MoveAuthority<'_>> {
+        self.effects.iter().find_map(|effect| {
+            let authority = effect.move_authority()?;
+            (authority.from() == from && authority.to() == to).then_some(authority)
+        })
+    }
+
+    pub fn contains_redacted_secret_placeholders(&self) -> bool {
+        self.effects
+            .iter()
+            .any(crate::value::unresolved_effect_contains_redacted_secret)
+            || self.replace_display.iter().any(|metadata| {
+                metadata
+                    .previous_attributes
+                    .values()
+                    .any(crate::value::contains_redacted_secret)
+            })
+    }
+
+    pub fn replace_display_info(&self) -> impl Iterator<Item = ReplaceDisplayInfo<'_>> {
+        self.replace_display
+            .iter()
+            .map(ReplaceDisplayInfo::from_metadata)
+    }
+
+    pub fn abandoned_deposed_generations(
+        &self,
+    ) -> impl Iterator<Item = (&ResolvedResourceId, &DeposedKey)> {
+        self.abandoned_deposed
+            .iter()
+            .map(|generation| (&generation.id, &generation.key))
+    }
+
+    pub fn resolve_with_schemas(
+        self,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> Result<SavedPlan, crate::resource::ResolvedResourceError> {
+        let Self {
+            effects,
+            ignored_change_summaries,
+            replace_display,
+            permanent_name_overrides,
+            errors,
+            abandoned_deposed,
+        } = self;
+        Ok(Plan {
+            effects: effects
+                .into_iter()
+                .map(|effect| effect.resolve_with_schemas(schemas))
+                .collect::<Result<Vec<_>, _>>()?,
+            ignored_change_summaries,
+            replace_display,
+            permanent_name_overrides,
+            errors,
+            abandoned_deposed,
+        })
+    }
+}
+
 impl From<Plan> for SavedPlan {
     fn from(plan: Plan) -> Self {
         let Plan {
             effects,
+            ignored_change_summaries,
             replace_display,
             permanent_name_overrides,
             errors,
@@ -465,6 +619,7 @@ impl From<Plan> for SavedPlan {
         } = plan;
         Self {
             effects: effects.into_iter().map(SavedEffect::from).collect(),
+            ignored_change_summaries,
             replace_display,
             permanent_name_overrides,
             errors,
@@ -539,6 +694,49 @@ impl<S> Plan<S> {
         &self.effects
     }
 
+    pub fn ignored_change_summaries(&self) -> &[IgnoredChangeSummary] {
+        &self.ignored_change_summaries
+    }
+
+    /// Refresh update inputs for ignored paths from the apply-time read.
+    ///
+    /// Other updates keep their plan-time source after drift verification;
+    /// ignored updates must use the fresh source so a value changed between
+    /// plan and apply is never written back accidentally.
+    pub fn rebase_ignored_update_sources(
+        &mut self,
+        actual_states: &HashMap<ResourceId, crate::resource::State>,
+    ) {
+        for effect in &mut self.effects {
+            if let Effect::Update { from, to, .. } = effect
+                && !to.ignore_changes().is_empty()
+                && let Some(actual) = actual_states.get(&to.id)
+            {
+                **from = actual.clone();
+            }
+        }
+    }
+
+    pub(crate) fn record_ignored_readable_differences(
+        &mut self,
+        resource_id: ResourceId,
+        count: usize,
+    ) {
+        if count == 0 {
+            return;
+        }
+        if let Some(summary) = self
+            .ignored_change_summaries
+            .iter_mut()
+            .find(|summary| summary.resource_id == resource_id)
+        {
+            summary.count = count;
+        } else {
+            self.ignored_change_summaries
+                .push(IgnoredChangeSummary { resource_id, count });
+        }
+    }
+
     /// Return the move capability for an exact route pair present in this
     /// plan.
     pub fn move_authority(&self, from: &ResourceId, to: &ResourceId) -> Option<MoveAuthority<'_>> {
@@ -557,6 +755,7 @@ impl<S> Plan<S> {
     pub fn contains_redacted_secret_placeholders(&self) -> bool {
         let Plan {
             effects,
+            ignored_change_summaries: _ignored_change_summaries,
             replace_display,
             permanent_name_overrides: _permanent_name_overrides,
             errors: _errors,

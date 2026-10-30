@@ -5,7 +5,7 @@ use std::fs;
 use std::process::{Command, Output};
 
 use carina_cli::commands::plan::PlanFile;
-use carina_core::effect::Effect;
+use carina_core::effect::UnresolvedSavedEffect;
 use carina_core::resource::{ConcreteValue, Value};
 use carina_state::{BackendLock, LockInfo, ResourceState, StateFile};
 use tempfile::TempDir;
@@ -534,7 +534,7 @@ mod backend_drift_gate {
             .expect("JSON plan must follow provider status lines");
         let plan: PlanFile = serde_json::from_str(&stdout[json_start..]).unwrap();
         let created_name = plan.plan.effects().iter().find_map(|effect| match effect {
-            Effect::Create(resource) => resource.get_attr("name"),
+            UnresolvedSavedEffect::Create(resource) => resource.get_attr("name"),
             _ => None,
         });
         assert_eq!(

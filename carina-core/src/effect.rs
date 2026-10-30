@@ -20,10 +20,11 @@ use crate::non_empty::NonEmptyVec;
 use crate::parser::{DeferredForExpression, MovedAddresses, StateBlockAddress};
 use crate::provider::AppliedIdentifier;
 #[cfg(test)]
-use crate::resource::{DataSource, DeferredValue, Resource, Value};
+use crate::resource::{DataSource, DeferredValue, Value};
 use crate::resource::{
     DeposedKey, Directives, LoopElementOrigin, ModuleSource, ResolvedDataSource, ResolvedResource,
-    ResolvedResourceId, ResourceId, ResourceIdentity, SavedModuleSource, State,
+    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, SavedModuleSource, State,
+    resolve_resource_ignore_changes,
 };
 use crate::wait::ManagedWaitTarget;
 use crate::wait::predicate::WaitPredicate;
@@ -681,6 +682,257 @@ pub enum EffectWithSource<S> {
 
 pub type Effect<S = ModuleSource> = EffectWithSource<S>;
 pub type SavedEffect = EffectWithSource<SavedModuleSource>;
+
+/// Saved-plan effect payload before authored resource directives have been
+/// resolved against the fingerprint-checked provider schemas.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum UnresolvedSavedEffect {
+    Read {
+        resource: ResolvedDataSource<SavedModuleSource>,
+    },
+    Create(Resource<SavedModuleSource>),
+    ResumeCreate {
+        resource: Resource<SavedModuleSource>,
+        started_at: crate::provider::Timestamp,
+    },
+    Update {
+        from: Box<State>,
+        identifier: AppliedIdentifier,
+        to: Resource<SavedModuleSource>,
+        changed_attributes: Vec<String>,
+    },
+    Delete {
+        id: ResolvedResourceId,
+        identifier: AppliedIdentifier,
+        #[serde(default, skip_serializing_if = "EffectGeneration::is_current")]
+        generation: EffectGeneration,
+        #[serde(default)]
+        directives: Directives,
+        #[serde(default)]
+        binding: Option<String>,
+        #[serde(default)]
+        dependencies: HashSet<String>,
+        #[serde(default)]
+        explicit_dependencies: HashSet<String>,
+        #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+        blocked_by_updates: HashSet<ResourceIdentity>,
+    },
+    Import {
+        id: ResolvedResourceId,
+        identifier: crate::resource::Value,
+    },
+    Remove {
+        id: ResolvedResourceId,
+    },
+    Move {
+        from: ResolvedResourceId,
+        to: ResolvedResourceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<LoopElementOrigin>,
+    },
+    Wait {
+        identity: ResourceIdentity,
+        target_id: ManagedWaitTarget,
+        until: WaitPredicate,
+        until_surface: String,
+        #[serde(with = "crate::resource::duration_secs")]
+        timeout: std::time::Duration,
+        #[serde(with = "crate::resource::duration_secs")]
+        interval: std::time::Duration,
+        #[serde(default)]
+        explicit_dependencies: HashSet<String>,
+    },
+    DeferredCreate {
+        id: ResolvedResourceId,
+        template: Box<DeferredForExpression<SavedModuleSource>>,
+    },
+    DeferredReplace(Box<DeferredReplacePayload<SavedModuleSource>>),
+}
+
+impl From<SavedEffect> for UnresolvedSavedEffect {
+    fn from(effect: SavedEffect) -> Self {
+        match effect {
+            Effect::Read { resource } => Self::Read { resource },
+            Effect::Create(resource) => Self::Create(resource.into_inner()),
+            Effect::ResumeCreate {
+                resource,
+                started_at,
+            } => Self::ResumeCreate {
+                resource: resource.into_inner(),
+                started_at,
+            },
+            Effect::Update {
+                from,
+                identifier,
+                to,
+                changed_attributes,
+            } => Self::Update {
+                from,
+                identifier,
+                to: to.into_inner(),
+                changed_attributes,
+            },
+            Effect::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            } => Self::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            },
+            Effect::Import { id, identifier } => Self::Import { id, identifier },
+            Effect::Remove { id } => Self::Remove { id },
+            Effect::Move { from, to, origin } => Self::Move { from, to, origin },
+            Effect::Wait {
+                identity,
+                target_id,
+                until,
+                until_surface,
+                timeout,
+                interval,
+                explicit_dependencies,
+            } => Self::Wait {
+                identity,
+                target_id,
+                until,
+                until_surface,
+                timeout,
+                interval,
+                explicit_dependencies,
+            },
+            Effect::DeferredCreate { id, template } => Self::DeferredCreate { id, template },
+            Effect::DeferredReplace(payload) => Self::DeferredReplace(payload),
+        }
+    }
+}
+
+impl UnresolvedSavedEffect {
+    pub fn move_authority(&self) -> Option<MoveAuthority<'_>> {
+        match self {
+            Self::Move { from, to, .. } => Some(MoveAuthority { from, to }),
+            _ => None,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Read { .. } => "read",
+            Self::Create(_) => "create",
+            Self::ResumeCreate { .. } => "resume_create",
+            Self::Update { .. } => "update",
+            Self::Delete { .. } => "delete",
+            Self::Import { .. } => "import",
+            Self::Remove { .. } => "remove",
+            Self::Move { .. } => "move",
+            Self::Wait { .. } => "wait",
+            Self::DeferredCreate { .. } => "deferred_create",
+            Self::DeferredReplace(_) => "deferred_replace",
+        }
+    }
+
+    pub fn resource_id(&self) -> &ResourceId {
+        match self {
+            Self::Read { resource } => &resource.id,
+            Self::Create(resource) | Self::ResumeCreate { resource, .. } => &resource.id,
+            Self::Update { to, .. } => &to.id,
+            Self::Delete { id, .. }
+            | Self::Import { id, .. }
+            | Self::Remove { id }
+            | Self::Move { to: id, .. }
+            | Self::DeferredCreate { id, .. } => id,
+            Self::Wait { target_id, .. } => target_id.id(),
+            Self::DeferredReplace(payload) => &payload.id,
+        }
+    }
+
+    pub fn resolve_with_schemas(
+        self,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> Result<SavedEffect, crate::resource::ResolvedResourceError> {
+        Ok(match self {
+            Self::Read { resource } => Effect::Read { resource },
+            Self::Create(resource) => {
+                Effect::Create(ResolvedResource::resolve_with_schemas(resource, schemas)?)
+            }
+            Self::ResumeCreate {
+                resource,
+                started_at,
+            } => Effect::ResumeCreate {
+                resource: ResolvedResource::resolve_with_schemas(resource, schemas)?,
+                started_at,
+            },
+            Self::Update {
+                from,
+                identifier,
+                to,
+                changed_attributes,
+            } => Effect::Update {
+                from,
+                identifier,
+                to: ResolvedResource::resolve_with_schemas(to, schemas)?,
+                changed_attributes,
+            },
+            Self::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            } => Effect::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            },
+            Self::Import { id, identifier } => Effect::Import { id, identifier },
+            Self::Remove { id } => Effect::Remove { id },
+            Self::Move { from, to, origin } => Effect::Move { from, to, origin },
+            Self::Wait {
+                identity,
+                target_id,
+                until,
+                until_surface,
+                timeout,
+                interval,
+                explicit_dependencies,
+            } => Effect::Wait {
+                identity,
+                target_id,
+                until,
+                until_surface,
+                timeout,
+                interval,
+                explicit_dependencies,
+            },
+            Self::DeferredCreate { id, mut template } => {
+                resolve_resource_ignore_changes(&mut template.template_resource, schemas)?;
+                Effect::DeferredCreate { id, template }
+            }
+            Self::DeferredReplace(mut payload) => {
+                resolve_resource_ignore_changes(&mut payload.template.template_resource, schemas)?;
+                Effect::DeferredReplace(payload)
+            }
+        })
+    }
+}
 
 impl From<Effect> for SavedEffect {
     fn from(effect: Effect) -> Self {

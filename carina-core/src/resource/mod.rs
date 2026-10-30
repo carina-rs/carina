@@ -10,6 +10,7 @@
 //! public live resource identities.
 
 mod enum_value;
+mod ignore_changes;
 mod loop_origin;
 
 use std::borrow::Borrow;
@@ -38,6 +39,11 @@ pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
 };
 pub(crate) use enum_value::{enum_value_comparison_key, enum_values_equal};
+pub(crate) use ignore_changes::value_at_leaf;
+pub use ignore_changes::{
+    IgnoreChangeError, ParsedIgnorePath, ParsedIgnorePathSegment, ResolvedIgnoreChanges,
+    ResolvedIgnorePath, resolve_ignore_changes,
+};
 pub use loop_origin::{
     ForLoopElement, LoopElementOrigin, LoopKind, LoopOriginKind, LoopProvenance, LoopSource,
     UnboundLoopTemplate,
@@ -806,6 +812,87 @@ pub struct PendingResourceIdentityError {
     id: ResourceId,
 }
 
+/// A resource could not enter the schema-resolved planning boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedResourceError {
+    PendingIdentity(PendingResourceIdentityError),
+    MissingSchema {
+        id: ResourceId,
+    },
+    InvalidIgnoreChanges {
+        id: ResourceId,
+        errors: Vec<IgnoreChangeError>,
+    },
+}
+
+impl Display for ResolvedResourceError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PendingIdentity(error) => Display::fmt(error, formatter),
+            Self::MissingSchema { id } => write!(
+                formatter,
+                "resource '{id}' has ignore_changes paths but no managed resource schema"
+            ),
+            Self::InvalidIgnoreChanges { id, errors } => {
+                write!(formatter, "resource '{id}': ")?;
+                for (index, error) in errors.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str("; ")?;
+                    }
+                    Display::fmt(error, formatter)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResolvedResourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PendingIdentity(error) => Some(error),
+            Self::MissingSchema { .. } | Self::InvalidIgnoreChanges { .. } => None,
+        }
+    }
+}
+
+impl From<PendingResourceIdentityError> for ResolvedResourceError {
+    fn from(error: PendingResourceIdentityError) -> Self {
+        Self::PendingIdentity(error)
+    }
+}
+
+/// Re-resolve authored resource directives that depend on the provider schema.
+///
+/// Deferred anonymous-loop templates intentionally still have pending identities
+/// when a saved plan is loaded. Their directives must nevertheless be checked
+/// against the fingerprint-validated schemas before apply; identity validation
+/// remains the responsibility of [`ResolvedResource::resolve_with_schemas`]
+/// after the template has been materialized.
+pub(crate) fn resolve_resource_ignore_changes<S>(
+    resource: &mut Resource<S>,
+    registry: &crate::schema::SchemaRegistry,
+) -> Result<(), ResolvedResourceError> {
+    let ignore_changes = if resource.directives.ignore_changes.is_empty() {
+        ResolvedIgnoreChanges::default()
+    } else {
+        let schema =
+            registry
+                .get_for(&*resource)
+                .ok_or_else(|| ResolvedResourceError::MissingSchema {
+                    id: resource.id.clone(),
+                })?;
+        resolve_ignore_changes(resource, &schema).map_err(|errors| {
+            ResolvedResourceError::InvalidIgnoreChanges {
+                id: resource.id.clone(),
+                errors,
+            }
+        })?
+    };
+    resource.resolved_ignore_changes = ignore_changes;
+    Ok(())
+}
+
 impl ResolvedResource {
     /// Construct a resource from an already-resolved id.
     pub fn from_id(id: ResolvedResourceId) -> Self {
@@ -814,7 +901,11 @@ impl ResolvedResource {
 }
 
 impl<S> ResolvedResource<S> {
-    /// Construct from a [`Resource`], panicking if identity is pending.
+    /// Construct from an already schema-resolved [`Resource`].
+    ///
+    /// Panics if identity is pending or authored `ignore_changes` paths do not
+    /// match the attached resolved metadata. Raw DSL and saved-plan resources
+    /// must enter through [`Self::resolve_with_schemas`] instead.
     pub fn new(resource: Resource<S>) -> Self {
         assert!(
             matches!(
@@ -823,6 +914,10 @@ impl<S> ResolvedResource<S> {
             ),
             "ResolvedResource requires identity"
         );
+        assert!(
+            resolved_ignore_changes_match(&resource),
+            "ResolvedResource with ignore_changes requires schema resolution"
+        );
         Self(resource)
     }
 
@@ -830,7 +925,7 @@ impl<S> ResolvedResource<S> {
     pub fn try_new(resource: Resource<S>) -> Option<Self> {
         match resource.id.identity_state() {
             ResourceIdentityState::Pending(_) => None,
-            ResourceIdentityState::Resolved(_) => Some(Self(resource)),
+            ResourceIdentityState::Resolved(_) => Some(Self::new(resource)),
         }
     }
 
@@ -845,9 +940,38 @@ impl<S> ResolvedResource<S> {
                 ResourceIdentityState::Pending(_) => {
                     Err(PendingResourceIdentityError { id: resource.id })
                 }
-                ResourceIdentityState::Resolved(_) => Ok(Self(resource)),
+                ResourceIdentityState::Resolved(_) => Ok(Self::new(resource)),
             })
             .collect()
+    }
+
+    /// Convert resources at the planning boundary and resolve every authored
+    /// ignore path against its managed resource schema.
+    pub fn collect_resolved_with_schemas(
+        resources: impl IntoIterator<Item = Resource<S>>,
+        registry: &crate::schema::SchemaRegistry,
+    ) -> Result<Vec<Self>, ResolvedResourceError> {
+        resources
+            .into_iter()
+            .map(|resource| Self::resolve_with_schemas(resource, registry))
+            .collect()
+    }
+
+    pub fn resolve_with_schemas(
+        mut resource: Resource<S>,
+        registry: &crate::schema::SchemaRegistry,
+    ) -> Result<Self, ResolvedResourceError> {
+        if matches!(
+            resource.id.identity_state(),
+            ResourceIdentityState::Pending(_)
+        ) {
+            return Err(PendingResourceIdentityError {
+                id: resource.id.clone(),
+            }
+            .into());
+        }
+        resolve_resource_ignore_changes(&mut resource, registry)?;
+        Ok(Self(resource))
     }
 
     /// Borrow the inner [`Resource`].
@@ -882,6 +1006,10 @@ impl<S> ResolvedResource<S> {
         ResolvedResourceId(self.0.id.clone())
     }
 
+    pub fn ignore_changes(&self) -> &ResolvedIgnoreChanges {
+        &self.0.resolved_ignore_changes
+    }
+
     /// Set an attribute without weakening the resolved-identity invariant.
     pub fn set_attr(&mut self, key: impl Into<String>, value: Value) {
         self.0.attributes.insert(key.into(), value);
@@ -906,8 +1034,28 @@ impl<S> TryFrom<Resource<S>> for ResolvedResource<S> {
     type Error = String;
 
     fn try_from(resource: Resource<S>) -> Result<Self, Self::Error> {
+        if !resolved_ignore_changes_match(&resource) {
+            return Err("ignore_changes requires schema resolution".to_string());
+        }
         Self::try_new(resource).ok_or_else(|| "identity is required".to_string())
     }
+}
+
+fn resolved_ignore_changes_match<S>(resource: &Resource<S>) -> bool {
+    let authored = resource
+        .directives
+        .ignore_changes
+        .iter()
+        .collect::<HashSet<_>>();
+    if authored.len() != resource.directives.ignore_changes.len() {
+        return false;
+    }
+    let resolved = resource
+        .resolved_ignore_changes
+        .iter()
+        .map(ResolvedIgnorePath::authored)
+        .collect::<HashSet<_>>();
+    authored == resolved
 }
 
 impl<S> AsRef<Resource<S>> for ResolvedResource<S> {
@@ -5832,8 +5980,8 @@ fn similarity_score(
 /// Carina-side directives for a resource.
 ///
 /// These are instructions to Carina about how to handle the resource,
-/// not metadata about the resource itself. Mirrors the WIT
-/// `directives` record.
+/// not metadata about the resource itself. The provider-visible subset
+/// mirrors the WIT `directives` record; host-only fields remain outside it.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Directives {
     /// If true, force-delete the resource (e.g., non-empty S3 buckets)
@@ -5851,12 +5999,92 @@ pub struct Directives {
     /// Vec to preserve source order for `carina fmt` round-tripping.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// Authored attribute paths whose external changes Carina must preserve.
+    /// These remain syntax-only until resolved against the resource schema.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_changes: Vec<ParsedIgnorePath>,
     /// Binding name of the provider instance to use for this resource.
     /// `None` resolves to the kind's default instance. Phase 2 only
     /// holds the slot; `directives { provider = ... }` reading and
     /// routing land in Phase 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_instance: Option<String>,
+}
+
+/// State-file projection of [`Directives`].
+///
+/// `ignore_changes` is deliberately absent: it is configuration and saved-plan
+/// metadata, never persistent resource state. Keeping a separate type makes it
+/// impossible for a state row to retain an ignore path accidentally.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PersistedDirectives {
+    #[serde(default)]
+    pub force_delete: bool,
+    #[serde(default)]
+    pub create_before_destroy: bool,
+    #[serde(default)]
+    pub prevent_destroy: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_instance: Option<String>,
+}
+
+impl From<&Directives> for PersistedDirectives {
+    fn from(directives: &Directives) -> Self {
+        let Directives {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            depends_on,
+            ignore_changes: _ignore_changes,
+            provider_instance,
+        } = directives;
+        Self {
+            force_delete: *force_delete,
+            create_before_destroy: *create_before_destroy,
+            prevent_destroy: *prevent_destroy,
+            depends_on: depends_on.clone(),
+            provider_instance: provider_instance.clone(),
+        }
+    }
+}
+
+impl From<Directives> for PersistedDirectives {
+    fn from(directives: Directives) -> Self {
+        Self::from(&directives)
+    }
+}
+
+impl From<&PersistedDirectives> for Directives {
+    fn from(directives: &PersistedDirectives) -> Self {
+        Self {
+            force_delete: directives.force_delete,
+            create_before_destroy: directives.create_before_destroy,
+            prevent_destroy: directives.prevent_destroy,
+            depends_on: directives.depends_on.clone(),
+            ignore_changes: Vec::new(),
+            provider_instance: directives.provider_instance.clone(),
+        }
+    }
+}
+
+impl From<PersistedDirectives> for Directives {
+    fn from(directives: PersistedDirectives) -> Self {
+        Self::from(&directives)
+    }
+}
+
+impl PartialEq<Directives> for PersistedDirectives {
+    fn eq(&self, other: &Directives) -> bool {
+        self == &Self::from(other)
+    }
+}
+
+impl PartialEq<PersistedDirectives> for Directives {
+    fn eq(&self, other: &PersistedDirectives) -> bool {
+        other == self
+    }
 }
 
 /// The full expansion scope of a module-owned resource.
@@ -6220,6 +6448,11 @@ pub struct Resource<S = ModuleSource> {
     /// prevent-destroy).
     #[serde(default)]
     pub directives: Directives,
+    /// Schema-resolved host lifecycle metadata. Persisted resources carry only
+    /// the authored directive; every saved-plan load resolves it again after
+    /// checking the provider schema fingerprint.
+    #[serde(skip)]
+    pub(crate) resolved_ignore_changes: ResolvedIgnoreChanges,
     /// Attribute prefixes: maps attribute name -> prefix string
     /// e.g., {"bucket_name": "my-app-"} from `bucket_name_prefix = "my-app-"`
     #[serde(default)]
@@ -6292,6 +6525,7 @@ impl From<Resource> for SavedResource {
             id,
             attributes,
             directives,
+            resolved_ignore_changes,
             prefixes,
             binding,
             dependency_bindings,
@@ -6304,6 +6538,7 @@ impl From<Resource> for SavedResource {
             id,
             attributes,
             directives,
+            resolved_ignore_changes,
             prefixes,
             binding,
             dependency_bindings,
@@ -6321,6 +6556,7 @@ impl Resource {
             id,
             attributes: IndexMap::new(),
             directives: Directives::default(),
+            resolved_ignore_changes: ResolvedIgnoreChanges::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
@@ -6391,12 +6627,36 @@ impl<S: Clone> Resource<S> {
 }
 
 impl<S> Resource<S> {
+    /// Whether any value-bearing field contains a saved-plan secret marker.
+    ///
+    /// The exhaustive destructure keeps this security boundary compiler-checked
+    /// when `Resource` gains another field.
+    pub fn contains_redacted_secret_placeholders(&self) -> bool {
+        let Resource {
+            id: _id,
+            attributes,
+            directives: _directives,
+            resolved_ignore_changes: _resolved_ignore_changes,
+            prefixes: _prefixes,
+            binding: _binding,
+            dependency_bindings: _dependency_bindings,
+            module_source: _module_source,
+            default_tag_keys: _default_tag_keys,
+            loop_provenance: _loop_provenance,
+            quoted_string_attrs: _quoted_string_attrs,
+        } = self;
+        attributes
+            .values()
+            .any(crate::value::contains_redacted_secret)
+    }
+
     /// Remove module provenance while crossing into provider-owned code.
     pub(crate) fn into_provider_resource(self) -> ProviderResource {
         let Resource {
             id,
             attributes,
             directives,
+            resolved_ignore_changes,
             prefixes,
             binding,
             dependency_bindings,
@@ -6409,6 +6669,7 @@ impl<S> Resource<S> {
             id,
             attributes,
             directives,
+            resolved_ignore_changes,
             prefixes,
             binding,
             dependency_bindings,
@@ -6428,6 +6689,7 @@ impl<S> Resource<S> {
             id,
             attributes,
             directives,
+            resolved_ignore_changes,
             prefixes,
             binding,
             dependency_bindings,
@@ -6440,6 +6702,7 @@ impl<S> Resource<S> {
             id,
             attributes,
             directives,
+            resolved_ignore_changes,
             prefixes,
             binding,
             dependency_bindings,

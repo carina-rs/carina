@@ -218,7 +218,7 @@ async fn create_checked_bootstrap_resource(
     let request = carina_core::executor::prepare_create_request(resource, &preparation)
         .await
         .map_err(AppError::from_state_bucket_preparation)?;
-    let resolved = ResolvedResource::new(request.resource().as_resource().clone());
+    let resolved = request.resource().as_inner().clone();
     let accepted_request = AcceptedRequest::from_create_request(&request);
     match carina_core::executor::dispatch_create(provider, &id, request).await {
         Ok(outcome) => {
@@ -1143,7 +1143,7 @@ impl DriftCheckResult {
 
 /// Detect infrastructure drift and retain the single historical-secret
 /// verification pass for the saved-plan gate.
-pub(crate) async fn detect_drift<S>(
+pub(crate) async fn detect_drift<S: Clone>(
     sorted_resources: &[carina_core::resource::Resource<S>],
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     historical_addresses: &HistoricalResourceAddresses,
@@ -1166,6 +1166,7 @@ pub(crate) async fn detect_drift<S>(
         .collect();
 
     for resource in sorted_resources {
+        let resolved_resource = ResolvedResource::resolve_with_schemas(resource.clone(), schemas)?;
         // carina#3181: `sorted_resources` is managed-only — drift
         // detection only operates over provider-backed managed
         // resources.
@@ -1236,7 +1237,13 @@ pub(crate) async fn detect_drift<S>(
                             saved_plan_secret_rehydration_error(error, apply_target)
                         })?;
                 let secret_drift = verification.drifted_attributes();
-                let verified_planned = verification.state();
+                let mut verified_planned = verification.state().clone();
+                resolved_resource
+                    .ignore_changes()
+                    .mask_observed_readable_leaves(
+                        &mut verified_planned.attributes,
+                        &actual_state.attributes,
+                    );
                 verified_planned_states.insert(resource.id.clone(), verified_planned.clone());
                 // Compare attributes for existing resources
                 let mut attr_diffs: Vec<String> = Vec::new();
@@ -3273,8 +3280,10 @@ async fn run_apply_from_plan_locked_owned(
 
             let plan = rehydrated_plan_file.plan();
             let sorted_resources = rehydrated_plan_file.sorted_resources();
-            let resolved_sorted_resources =
-                ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?;
+            let resolved_sorted_resources = ResolvedResource::collect_resolved_with_schemas(
+                sorted_resources.iter().cloned(),
+                wiring.schemas(),
+            )?;
             let plan_compositions = rehydrated_plan_file.compositions();
             let plan_data_sources = rehydrated_plan_file.data_sources();
             let plan_data_source_origins: &[SavedDataSource] =

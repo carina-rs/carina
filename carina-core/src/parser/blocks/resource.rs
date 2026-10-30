@@ -15,7 +15,7 @@ use crate::parser::util::expression_is_plain_string_literal;
 use crate::parser::{parse_expression, parse_expression_eval, parse_expression_in_sink};
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, Directives, LoopElementOrigin, LoopProvenance,
-    Resource, ResourceId, ResourceIdentity, Value,
+    ParsedIgnorePath, ParsedIgnorePathSegment, Resource, ResourceId, ResourceIdentity, Value,
 };
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -116,6 +116,7 @@ pub(crate) fn parse_resource_for_target(
         id,
         attributes: attributes.into_iter().collect(),
         directives,
+        resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding,
         dependency_bindings: BTreeSet::new(),
@@ -445,6 +446,30 @@ fn parse_directives(
         let line = value_pair.line_col().0;
 
         match key.as_str() {
+            "ignore_changes" => {
+                let primary =
+                    crate::parser::util::unwrap_to_primary(value_pair).ok_or_else(|| {
+                        ParseError::InvalidExpression {
+                            line,
+                            message:
+                                "directives.ignore_changes: must be a list of bare attribute paths"
+                                    .to_string(),
+                        }
+                    })?;
+                let list = first_inner(primary, "list", "directives.ignore_changes")?;
+                if list.as_rule() != Rule::list {
+                    return Err(ParseError::InvalidExpression {
+                        line,
+                        message:
+                            "directives.ignore_changes: must be a list of bare attribute paths"
+                                .to_string(),
+                    });
+                }
+                directives.ignore_changes = list
+                    .into_inner()
+                    .map(|element| parse_ignore_change_path(element, ctx))
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
             "depends_on" => {
                 let primary =
                     crate::parser::util::unwrap_to_primary(value_pair).ok_or_else(|| {
@@ -507,6 +532,77 @@ fn parse_directives(
     }
 
     Ok(directives)
+}
+
+fn parse_ignore_change_path(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<ParsedIgnorePath, ParseError> {
+    let line = pair.line_col().0;
+    let authored = pair.as_str().to_string();
+    let primary = crate::parser::util::unwrap_to_primary(pair)
+        .ok_or_else(|| invalid_ignore_change_path(line, &authored))?;
+    let path = first_inner(primary, "attribute path", "directives.ignore_changes")?;
+    let mut segments = Vec::new();
+
+    match path.as_rule() {
+        Rule::namespaced_id => push_ignore_path_head(path.as_str(), &mut segments),
+        Rule::variable_ref | Rule::subscripted_id => {
+            let mut parts = path.into_inner();
+            let head = next_pair(
+                &mut parts,
+                "attribute path head",
+                "directives.ignore_changes",
+            )?;
+            push_ignore_path_head(head.as_str(), &mut segments);
+            for access in parts {
+                match access.as_rule() {
+                    Rule::field_access => {
+                        let field =
+                            first_inner(access, "field name", "directives.ignore_changes path")?;
+                        segments.push(ParsedIgnorePathSegment::Attribute(
+                            field.as_str().to_string(),
+                        ));
+                    }
+                    Rule::index_access => {
+                        let index =
+                            first_inner(access, "subscript", "directives.ignore_changes path")?;
+                        match parse_expression(index, ctx)? {
+                            Value::Concrete(ConcreteValue::String(key)) => segments.push(
+                                ParsedIgnorePathSegment::MapKey(key.expose_plaintext().to_string()),
+                            ),
+                            Value::Concrete(ConcreteValue::Int(index)) if index >= 0 => {
+                                let index = usize::try_from(index)
+                                    .map_err(|_| invalid_ignore_change_path(line, &authored))?;
+                                segments.push(ParsedIgnorePathSegment::ListIndex(index));
+                            }
+                            _ => return Err(invalid_ignore_change_path(line, &authored)),
+                        }
+                    }
+                    _ => return Err(invalid_ignore_change_path(line, &authored)),
+                }
+            }
+        }
+        _ => return Err(invalid_ignore_change_path(line, &authored)),
+    }
+
+    Ok(ParsedIgnorePath::new(segments))
+}
+
+fn push_ignore_path_head(head: &str, segments: &mut Vec<ParsedIgnorePathSegment>) {
+    segments.extend(
+        head.split('.')
+            .map(|name| ParsedIgnorePathSegment::Attribute(name.to_string())),
+    );
+}
+
+fn invalid_ignore_change_path(line: usize, authored: &str) -> ParseError {
+    ParseError::InvalidExpression {
+        line,
+        message: format!(
+            "directives.ignore_changes: `{authored}` must be a bare attribute path, not a string literal or computed expression"
+        ),
+    }
 }
 
 #[derive(Clone, Copy)]

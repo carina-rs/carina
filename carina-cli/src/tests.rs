@@ -6,17 +6,23 @@ use indexmap::IndexMap;
 
 use serde_json::json;
 
-use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
+use carina_core::data_source_value::{
+    DataSourceValue, DataSourceValues, ExecutableDataSourceValues,
+};
 use carina_core::effect::Effect;
-use carina_core::executor::{AcceptedRequest, Applied};
+use carina_core::executor::{
+    AcceptedRequest, Applied, ExecutionCheckpointSink, ExecutionEvent, ExecutionObserver,
+    ExecutionOutcome, LiveExecutionInput, ProviderCheckInputs,
+};
 use carina_core::parser::{LoadedProviderContext, ParsedFile, ProviderConfig, ProviderContext};
 use carina_core::plan::Plan;
 use carina_core::provider::{
-    AppliedIdentifier, BoxFuture, ProviderError, ProviderResult, ReadOutcome,
+    AppliedIdentifier, AppliedState, BoxFuture, NoopNormalizer, ProviderError, ProviderResult,
+    ReadOutcome, UpdateOutcome,
 };
 use carina_core::resource::{
-    ConcreteValue, Current, DataSource, DeferredValue, Directives, ResolvedDataSource,
-    ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
+    ConcreteValue, Current, DataSource, DeferredValue, Directives, ParsedIgnorePath,
+    ResolvedDataSource, ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
 };
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedValue;
@@ -245,6 +251,7 @@ fn saved_provider_configs(
 
 struct TestProvider {
     read_results: HashMap<(String, String), Result<State, String>>,
+    update_result: Option<AppliedState>,
 }
 
 impl TestProvider {
@@ -259,7 +266,17 @@ impl TestProvider {
     fn with_read_result(id: &ResourceId, identifier: &str, result: Result<State, String>) -> Self {
         let mut read_results = HashMap::new();
         read_results.insert((id.to_string(), identifier.to_string()), result);
-        Self { read_results }
+        Self {
+            read_results,
+            update_result: None,
+        }
+    }
+
+    fn with_update_state(state: AppliedState) -> Self {
+        Self {
+            read_results: HashMap::new(),
+            update_result: Some(state),
+        }
     }
 }
 
@@ -324,7 +341,11 @@ impl Provider for TestProvider {
         _identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
-        Box::pin(async { Err(ProviderError::internal("unexpected update")) })
+        let state = self
+            .update_result
+            .clone()
+            .expect("missing update state for test provider");
+        Box::pin(async move { Ok(UpdateOutcome::Success { state }) })
     }
 
     fn delete(
@@ -343,6 +364,165 @@ impl Provider for TestProvider {
     ) -> ProviderResult<Vec<String>> {
         Ok(Vec::new())
     }
+}
+
+struct NoopExecutionObserver;
+
+impl ExecutionObserver for NoopExecutionObserver {
+    fn on_event(&self, _event: &ExecutionEvent<'_>) {}
+}
+
+#[tokio::test]
+async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps_create_record() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("password", AttributeType::string())
+                    .write_only()
+                    .build(),
+            )
+            .validate()
+            .expect("write-only fixture schema is valid"),
+    );
+
+    let ignored_password: ParsedIgnorePath = serde_json::from_value(serde_json::json!({
+        "segments": [{ "kind": "attribute", "value": "password" }]
+    }))
+    .expect("valid ignored password path");
+    let resource = |comment: &str| {
+        let mut resource = Resource::with_provider("mock", "test.resource", "ignored", None)
+            .with_attribute(
+                "comment",
+                Value::Concrete(ConcreteValue::String(comment.into())),
+            )
+            .with_attribute(
+                "password",
+                Value::Concrete(ConcreteValue::String("create-time".into())),
+            );
+        resource.directives.ignore_changes = vec![ignored_password.clone()];
+        resource
+    };
+
+    let created = ResolvedResource::resolve_with_schemas(resource("before"), &schemas)
+        .expect("create resource resolves ignore_changes");
+    let updated = ResolvedResource::resolve_with_schemas(resource("after"), &schemas)
+        .expect("update resource resolves ignore_changes");
+    let id = updated.id.clone();
+    let schema = schemas
+        .get_for(updated.as_resource())
+        .expect("fixture schema is registered")
+        .schema()
+        .as_schema();
+
+    let create_request = AcceptedRequest::create_for_test();
+    let create_state = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "comment".to_string(),
+            Value::Concrete(ConcreteValue::String("before".into())),
+        )]),
+    )
+    .with_identifier("provider-id");
+    let created_row = ResourceState::from_provider_state_for_resource_and_schema(
+        &created,
+        &create_state,
+        None,
+        Some(schema),
+        RowBasis::Applied(&create_request),
+        None,
+    )
+    .expect("create-time row records the unobserved write-only value");
+    let mut existing = StateFile::new();
+    existing
+        .upsert_resource(created_row)
+        .expect("create-time row is valid");
+
+    let from = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "comment".to_string(),
+            Value::Concrete(ConcreteValue::String("before".into())),
+        )]),
+    )
+    .with_identifier("provider-id");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(from),
+        identifier: AppliedIdentifier::new("provider-id").expect("non-empty identifier"),
+        to: updated.clone(),
+        changed_attributes: vec!["comment".to_string()],
+    });
+    let provider = TestProvider::with_update_state(
+        AppliedState::new(
+            id.clone(),
+            "provider-id",
+            HashMap::from([(
+                "comment".to_string(),
+                Value::Concrete(ConcreteValue::String("after".into())),
+            )]),
+        )
+        .expect("non-empty applied identifier"),
+    );
+    let outcome = carina_core::executor::execute_live_plan(
+        &provider,
+        LiveExecutionInput {
+            plan: &plan,
+            provider_check_inputs: ProviderCheckInputs::Authored,
+            compositions: &[],
+            bindings: Default::default(),
+            managed_current: HashMap::new(),
+            data_source_values: ExecutableDataSourceValues::empty(),
+            normalizer: &NoopNormalizer,
+            provider_configs: &[],
+            factories: &[],
+            schemas: &schemas,
+            parallelism: std::num::NonZeroUsize::new(1).expect("one is non-zero"),
+            precompleted_success_count: 0,
+            checkpoint_sink: ExecutionCheckpointSink::noop(),
+        },
+        &NoopExecutionObserver,
+        carina_core::shutdown::ShutdownToken::running(),
+    )
+    .await;
+    let ExecutionOutcome::Completed(execution) = outcome else {
+        panic!("uncancelled update must complete");
+    };
+    let Some(Applied::Complete { request, .. }) = execution.applied_states.get(&id) else {
+        panic!("successful update must retain accepted-request evidence");
+    };
+    assert!(request.sent_attributes().contains("comment"));
+    assert!(
+        !request.sent_attributes().contains("password"),
+        "an ignored write-only attribute omitted from the patch is not sent"
+    );
+
+    let saved = build_state_after_apply(
+        ApplyStateSave {
+            state_file: existing,
+            sorted_resources: std::slice::from_ref(&updated),
+            runtime_synthesized_resources: &[],
+            managed_current: &HashMap::new(),
+            applied_states: &execution.applied_states,
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        },
+        None,
+    )
+    .expect("accepted update writes state");
+    let password = saved
+        .find_resource_for_id(&id)
+        .and_then(ResourceState::persisted_attributes)
+        .and_then(|attributes| attributes.get("password"));
+    assert_eq!(
+        password,
+        Some(Value::Concrete(ConcreteValue::String("create-time".into()))),
+        "writeback must retain the last accepted create-time write-only value"
+    );
 }
 
 #[tokio::test]
@@ -708,7 +888,9 @@ fn plan_file_serde_round_trip() {
         }),
         "a decoded plan must keep module metadata attached to its saved resource",
     );
-    let Effect::Create(resource) = &deserialized.plan.effects()[0] else {
+    let carina_core::effect::UnresolvedSavedEffect::Create(resource) =
+        &deserialized.plan.effects()[0]
+    else {
         panic!("fixture effect must remain a create");
     };
     assert_eq!(

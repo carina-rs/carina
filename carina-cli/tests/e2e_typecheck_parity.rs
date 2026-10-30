@@ -1368,6 +1368,91 @@ attributes { loaded: Bool = true }
 }
 
 #[test]
+fn ignore_changes_validation_has_cli_lsp_parity_for_every_v1_error() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "backend.crn",
+            "backend local { path = \"carina.state.json\" }\n",
+        ),
+        (
+            "main.crn",
+            r#"let missing = mock.test.resource {
+  name = "missing"
+  directives { ignore_changes = [does_not_exist] }
+}
+let read_only = mock.test.resource {
+  name = "read-only"
+  directives { ignore_changes = [identifier] }
+}
+let indexed = mock.test.resource {
+  name = "indexed"
+  rule { action = "allow" }
+  directives { ignore_changes = [rule[0].action] }
+}
+let through_list = mock.test.resource {
+  name = "through-list"
+  rule { action = "allow" }
+  directives { ignore_changes = [rule.action] }
+}
+let union_path = mock.test.resource {
+  name = "union"
+  choice = { value = "selected" }
+  directives { ignore_changes = [choice.value] }
+}
+let unwritten = mock.test.resource {
+  name = "unwritten"
+  directives { ignore_changes = [comment] }
+}
+let duplicate = mock.test.resource {
+  name = "duplicate"
+  comment = "recorded"
+  directives { ignore_changes = [comment, comment] }
+}
+"#,
+        ),
+    ]);
+    let schemas = carina_provider_mock::builtin_schemas().into_iter().fold(
+        SchemaRegistry::new(),
+        |mut registry, schema| {
+            registry.insert("mock", schema);
+            registry
+        },
+    );
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    let extract = |message: &str| {
+        message
+            .find("ignore_changes path")
+            .map(|start| message[start..].to_string())
+    };
+    let mut cli_messages = cli
+        .iter()
+        .filter_map(|message| extract(message))
+        .collect::<Vec<_>>();
+    let mut lsp_messages = lsp
+        .iter()
+        .filter_map(|diagnostic| extract(&diagnostic.message))
+        .collect::<Vec<_>>();
+    cli_messages.sort();
+    lsp_messages.sort();
+
+    assert_eq!(cli_messages, lsp_messages, "CLI={cli:#?}; LSP={lsp:#?}");
+    assert_eq!(
+        cli_messages,
+        [
+            "ignore_changes path `choice.value` passes through a union",
+            "ignore_changes path `comment` is listed more than once",
+            "ignore_changes path `comment` is not written in this resource block",
+            "ignore_changes path `does_not_exist` does not exist in the resource schema",
+            "ignore_changes path `identifier` reaches a read-only or provider-populated node",
+            "ignore_changes path `rule.action` passes through a list, which is not supported",
+            "ignore_changes path `rule[0].action` contains a list index, which is not supported",
+        ]
+    );
+}
+
+#[test]
 fn postfix_wrong_shape_access_has_cli_lsp_parity_for_local_and_wait_bindings() {
     let fixture = write_fixture(&[
         ("providers.crn", "provider mock {}\n"),

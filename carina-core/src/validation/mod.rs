@@ -2704,6 +2704,20 @@ pub fn validate_resources<E>(
                         all_errors.push(format!("{}: {}", id, error));
                     }
                 }
+                if matches!(kind, ValidatableKind::Resource) {
+                    let resource = match rref {
+                        ResourceRef::Resource(resource)
+                        | ResourceRef::Deferred { resource, .. } => resource,
+                        ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => {
+                            unreachable!("managed validation kind must carry a resource")
+                        }
+                    };
+                    if let Err(errors) = crate::resource::resolve_ignore_changes(resource, &schema)
+                    {
+                        all_errors
+                            .extend(errors.into_iter().map(|error| format!("{}: {}", id, error)));
+                    }
+                }
             }
             None => {
                 let provider = id.provider.as_str();
