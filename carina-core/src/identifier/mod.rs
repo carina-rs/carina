@@ -1132,7 +1132,7 @@ fn deterministic_value_string(value: &Value) -> String {
     }
 }
 
-pub fn canonical_create_only_value_string(value: &Value) -> Option<String> {
+fn canonical_create_only_value_string(value: &Value) -> Option<String> {
     match value {
         Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext().to_owned()),
         Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => Some(raw.as_str().to_string()),
@@ -2096,7 +2096,8 @@ impl AnonymousIdStateInfo {
         &self.create_only_values
     }
 
-    fn move_to(&self, to: ResolvedResourceId) -> ResolvedMove {
+    /// Build a detected move from this validated persisted/projected state row.
+    pub fn move_to(&self, to: ResolvedResourceId) -> ResolvedMove {
         ResolvedMove::from_detected_rename(self.origin_id.clone(), self.projected_id.clone(), to)
     }
 }
@@ -2146,7 +2147,11 @@ struct DesiredIdentityValues {
 }
 
 impl DesiredIdentityValues {
-    fn for_legacy_loop_match(resource: &Resource, schema: &ResourceSchema) -> Self {
+    fn from_resource(
+        resource: &Resource,
+        schema: &ResourceSchema,
+        find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+    ) -> Self {
         let create_only = schema
             .create_only_attributes()
             .into_iter()
@@ -2159,7 +2164,7 @@ impl DesiredIdentityValues {
                 .identity_attributes()
                 .into_iter()
                 .filter(|attribute| !create_only.contains(*attribute)),
-            &|_binding| Vec::new(),
+            find_state_by_binding,
             true,
         );
         Self { values }
@@ -2178,12 +2183,14 @@ fn legacy_row_stable_identity_matches(
     candidate: &LegacyLoopMoveCandidate<'_>,
     state_entry: &AnonymousIdStateInfo,
     registry: &SchemaRegistry,
+    find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
 ) -> Option<bool> {
     let schema = registry.get_for(candidate.resource)?;
     let schema = schema.as_schema();
     let desired_create_only =
-        DesiredCreateOnlyValues::for_legacy_loop_match(candidate.resource, schema);
-    let desired_identity = DesiredIdentityValues::for_legacy_loop_match(candidate.resource, schema);
+        DesiredCreateOnlyValues::from_resource(candidate.resource, schema, find_state_by_binding);
+    let desired_identity =
+        DesiredIdentityValues::from_resource(candidate.resource, schema, find_state_by_binding);
     if state_entry.create_only_values.is_empty() && state_entry.identity_values.values.is_empty() {
         return None;
     }
@@ -2222,6 +2229,7 @@ pub fn detect_legacy_loop_address_moves(
     resources: &[Resource],
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
+    find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     claims: &StateBlockClaims,
     reserved_moves: &[ResolvedMove],
 ) -> Vec<ResolvedMove> {
@@ -2314,7 +2322,12 @@ pub fn detect_legacy_loop_address_moves(
             })
             .collect();
         let selected = match eligible.as_slice() {
-            [only] => match legacy_row_stable_identity_matches(only, state_entry, registry) {
+            [only] => match legacy_row_stable_identity_matches(
+                only,
+                state_entry,
+                registry,
+                find_state_by_binding,
+            ) {
                 Some(true) | None => Some(*only),
                 Some(false) => None,
             },
@@ -2324,8 +2337,12 @@ pub fn detect_legacy_loop_address_moves(
                     .iter()
                     .copied()
                     .filter(|candidate| {
-                        legacy_row_stable_identity_matches(candidate, state_entry, registry)
-                            == Some(true)
+                        legacy_row_stable_identity_matches(
+                            candidate,
+                            state_entry,
+                            registry,
+                            find_state_by_binding,
+                        ) == Some(true)
                     })
                     .collect();
                 match stable_matches.as_slice() {
@@ -2556,17 +2573,6 @@ impl DesiredCreateOnlyValues {
             schema,
             schema.create_only_attributes(),
             find_state_by_binding,
-            false,
-        );
-        Self { values }
-    }
-
-    fn for_legacy_loop_match<S>(resource: &Resource<S>, schema: &ResourceSchema) -> Self {
-        let values = desired_comparable_values(
-            resource,
-            schema,
-            schema.create_only_attributes(),
-            &|_binding| Vec::new(),
             true,
         );
         Self { values }

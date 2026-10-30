@@ -4982,7 +4982,12 @@ fn detected_move_identity_pairs(moves: &[ResolvedMove]) -> Vec<(String, String)>
 }
 
 fn test_detected_bucket_move(origin: &str, projected_from: &str, to: &str) -> ResolvedMove {
-    ResolvedMove::from_detected_rename(bucket_id(origin), bucket_id(projected_from), bucket_id(to))
+    AnonymousIdStateInfo::try_without_comparable_attributes(
+        bucket_id(origin),
+        Some(bucket_id(projected_from)),
+    )
+    .expect("test move source and projection have the same provider and resource type")
+    .move_to(bucket_id(to))
 }
 
 #[test]
@@ -5592,6 +5597,9 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
                             .create_only()
                             .build(),
                     ),
+                ResourceSchema::new("ec2.RouteTable").attribute(
+                    AttributeSchema::provider_populated("id", AttributeType::string()).build(),
+                ),
                 ResourceSchema::new("ec2.Route")
                     .attribute(
                         AttributeSchema::optional("route_table_id", AttributeType::string())
@@ -5684,6 +5692,482 @@ fn desired_route(name: &str, route_table_binding: &str) -> Resource {
             path: AccessPath::new(route_table_binding, "id"),
         }),
     )
+}
+
+#[test]
+fn legacy_loop_detector_resolves_ref_only_ambiguity_through_state_view() {
+    use carina_core::config_loader::load_configuration_with_config;
+    use carina_state::state::{ResourceState, StateFile};
+
+    let project = tempfile::tempdir().expect("create temporary project");
+    std::fs::write(project.path().join("providers.crn"), "provider awscc {}\n")
+        .expect("write provider fixture");
+    std::fs::write(
+        project.path().join("inputs.crn"),
+        "let xs = ['only']\n\
+         let private_rtb = awscc.ec2.RouteTable {}\n\
+         let public_rtb = awscc.ec2.RouteTable {}\n",
+    )
+    .expect("write input fixture");
+    std::fs::write(
+        project.path().join("loop_private.crn"),
+        "for _ in xs {\n\
+           awscc.ec2.Route { route_table_id = private_rtb.id }\n\
+         }\n",
+    )
+    .expect("write private loop fixture");
+    std::fs::write(
+        project.path().join("loop_public.crn"),
+        "for _ in xs {\n\
+           awscc.ec2.Route { route_table_id = public_rtb.id }\n\
+         }\n",
+    )
+    .expect("write public loop fixture");
+
+    let mut parsed = load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load multi-file fixture")
+    .parsed;
+    let providers = resolved_provider_configs(&parsed);
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let canonical = canonicalize_resources_with_schemas(&mut parsed.resources, ctx.schemas())
+        .expect("fixture resources canonicalize");
+    let errors =
+        compute_anonymous_identifiers_with_ctx(&ctx, canonical, providers.as_provider_configs());
+    assert!(errors.is_empty(), "fixture identities resolve: {errors:?}");
+    let public_destination = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.id.resource_type == "ec2.Route"
+                && matches!(
+                    resource.get_attr("route_table_id"),
+                    Some(Value::Deferred(DeferredValue::ResourceRef { path }))
+                        if path.binding() == "public_rtb"
+                )
+        })
+        .and_then(|resource| resource.id.identity_str())
+        .expect("public route has a resolved anonymous identity")
+        .to_string();
+
+    let mut state_file = StateFile::new();
+    for (binding, route_table_id) in [("private_rtb", "rtb-private"), ("public_rtb", "rtb-public")]
+    {
+        let mut row = ResourceState::try_applied(
+            "ec2.RouteTable",
+            test_identity(binding),
+            "awscc",
+            route_table_id,
+        )
+        .expect("route-table provider id is non-empty")
+        .with_attribute("id", serde_json::json!(route_table_id));
+        row.binding = Some(binding.to_string());
+        state_file
+            .upsert_resource(row)
+            .expect("route-table state row is unique");
+    }
+    state_file
+        .upsert_resource(
+            ResourceState::try_applied(
+                "ec2.Route",
+                test_identity("_xs[0]"),
+                "awscc",
+                "legacy-route-id",
+            )
+            .expect("legacy route provider id is non-empty")
+            .with_attribute("route_table_id", serde_json::json!("rtb-public")),
+        )
+        .expect("legacy route state row is unique");
+    let claims = StateBlockClaims::empty();
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+
+    let moves =
+        detect_legacy_loop_moves_with_ctx(&ctx, &parsed.resources, &state_view, &claims, &[]);
+
+    assert_eq!(
+        detected_move_identity_pairs(&moves),
+        vec![("_xs[0]".to_string(), public_destination)],
+        "the concrete dependency state must select the one ref-valued owner",
+    );
+}
+
+#[tokio::test]
+async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
+    use carina_core::config_loader::load_configuration_with_config;
+    use carina_state::state::{ResourceState, StateFile};
+
+    let project = tempfile::tempdir().expect("create temporary project");
+    std::fs::write(
+        project.path().join("backend.crn"),
+        "backend local { path = 'carina.state.json' }\n",
+    )
+    .expect("write backend fixture");
+    std::fs::write(project.path().join("providers.crn"), "provider awscc {}\n")
+        .expect("write provider fixture");
+    std::fs::write(
+        project.path().join("loop.crn"),
+        "for _ in ['route'] {\n\
+           awscc.ec2.Route { route_table_id = 'rtb-loop' }\n\
+         }\n",
+    )
+    .expect("write loop fixture");
+    std::fs::write(
+        project.path().join("named.crn"),
+        "let named = awscc.ec2.SubnetRouteTableAssociation {\n\
+           route_table_id = 'rtb-named'\n\
+           subnet_id = 'subnet-named'\n\
+         }\n",
+    )
+    .expect("write named fixture");
+
+    let loaded = load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load multi-file fixture");
+    let parsed = loaded.parsed;
+    let provider_configs = resolved_provider_configs(&parsed);
+    let wiring = ValidatedWiring::from_factories_for_test(
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        provider_configs.as_provider_configs(),
+    );
+
+    let mut resolved_resources = parsed.resources.clone(); // allow: direct — fixture test inspection
+    let canonical =
+        canonicalize_resources_with_schemas(&mut resolved_resources, wiring.context().schemas())
+            .expect("fixture resources canonicalize");
+    let identity_errors = compute_anonymous_identifiers_with_ctx(
+        wiring.context(),
+        canonical,
+        provider_configs.as_provider_configs(),
+    );
+    assert!(
+        identity_errors.is_empty(),
+        "fixture identities must resolve: {identity_errors:?}"
+    );
+    let loop_destination = resolved_resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "ec2.Route")
+        .and_then(|resource| resource.id.identity_str())
+        .expect("loop route has a resolved anonymous identity")
+        .to_string();
+
+    let mut persisted = StateFile::new();
+    persisted
+        .upsert_resource(
+            ResourceState::try_applied(
+                "ec2.Route",
+                test_identity("_for0[0]"),
+                "awscc",
+                "loop-route-id",
+            )
+            .expect("legacy route provider id is non-empty")
+            .with_attribute("route_table_id", serde_json::json!("rtb-loop")),
+        )
+        .expect("legacy route state row is unique");
+    let named_orphan = "awscc_ec2_subnet_route_table_association_11111111";
+    persisted
+        .upsert_resource(
+            ResourceState::try_applied(
+                "ec2.SubnetRouteTableAssociation",
+                test_identity(named_orphan),
+                "awscc",
+                "named-association-id",
+            )
+            .expect("association provider id is non-empty")
+            .with_attribute("route_table_id", serde_json::json!("rtb-named"))
+            .with_attribute("subnet_id", serde_json::json!("subnet-named")),
+        )
+        .expect("named orphan state row is unique");
+    let state_path = project.path().join("carina.state.json");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
+    )
+    .expect("write real state fixture");
+    let state_file = Some(
+        carina_state::state::check_and_migrate(
+            &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+        )
+        .expect("decode real state fixture")
+        .into_state(),
+    );
+
+    let canonical_resources = canonical_pair(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        wiring.context().schemas(),
+    );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+    let planned = create_plan_from_parsed_with_upstream_with_ctx(
+        validated,
+        &provider_configs,
+        &state_file,
+        false,
+        ProgressSink::Human,
+        &HashMap::new(),
+        &StateBlockClaims::default(),
+        &ResolvedStateBlockTargets::default(),
+    )
+    .await
+    .expect("build mixed automatic-move plan");
+    let plan = &planned.resources().plan;
+    let summary = plan.summary();
+    assert_eq!(
+        summary.create,
+        0,
+        "plan must not create: {:#?}",
+        plan.effects()
+    );
+    assert_eq!(
+        summary.delete,
+        0,
+        "plan must not delete: {:#?}",
+        plan.effects()
+    );
+    assert_eq!(
+        summary.update,
+        0,
+        "plan must not update: {:#?}",
+        plan.effects()
+    );
+    assert_eq!(
+        summary.replace,
+        0,
+        "plan must not replace: {:#?}",
+        plan.effects()
+    );
+    let mut moves = plan
+        .effects()
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Move { from, to, .. } => Some((
+                from.identity_str().to_string(),
+                to.identity_str().to_string(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    moves.sort();
+    let mut expected = vec![
+        ("_for0[0]".to_string(), loop_destination),
+        (named_orphan.to_string(), "named".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(moves, expected, "plan must contain exactly the two moves");
+    assert_eq!(summary.moved, 2);
+}
+
+#[tokio::test]
+async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
+    use carina_core::config_loader::load_configuration_with_config;
+    use carina_core::parser::DeferredForTarget;
+    use carina_state::state::{ResourceState, StateFile};
+
+    let project = tempfile::tempdir().expect("create temporary project");
+    std::fs::write(
+        project.path().join("backend.crn"),
+        "backend local { path = 'carina.state.json' }\n",
+    )
+    .expect("write backend fixture");
+    std::fs::write(project.path().join("providers.crn"), "provider awscc {}\n")
+        .expect("write provider fixture");
+    std::fs::write(
+        project.path().join("upstream.crn"),
+        "let upstream = upstream_state { source = '../upstream' }\n",
+    )
+    .expect("write upstream fixture");
+    std::fs::write(
+        project.path().join("loops.crn"),
+        "for _ in (upstream.routes) {\n\
+           awscc.ec2.Route { route_table_id = 'rtb-loop' }\n\
+         }\n\n\
+         let named = for _ in (upstream.named) {\n\
+           awscc.ec2.SubnetRouteTableAssociation {\n\
+             route_table_id = 'rtb-named'\n\
+             subnet_id = 'subnet-named'\n\
+           }\n\
+         }\n",
+    )
+    .expect("write deferred-loop fixture");
+
+    let loaded = load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load multi-file fixture");
+    let parsed = loaded.parsed;
+    assert_eq!(
+        parsed.deferred_for_expressions.len(),
+        2,
+        "both resources must materialize after prelude detection",
+    );
+    let remote_bindings = HashMap::from([(
+        "upstream".to_string(),
+        HashMap::from([
+            (
+                "routes".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("route".into()),
+                )])),
+            ),
+            (
+                "named".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("named".into()),
+                )])),
+            ),
+        ]),
+    )]);
+    let provider_configs = resolved_provider_configs_with_remote(&parsed, &remote_bindings);
+    let wiring = ValidatedWiring::from_factories_for_test(
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        provider_configs.as_provider_configs(),
+    );
+
+    let anonymous_loop = parsed
+        .deferred_for_expressions
+        .iter()
+        .find(|deferred| matches!(deferred.target, DeferredForTarget::Unbound { .. }))
+        .expect("fixture has one unbound deferred loop");
+    let mut loop_children = carina_core::parser::expand_deferred_children(
+        anonymous_loop,
+        &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("route".into()),
+        )])),
+        carina_core::resource::AccessMissPolicy::Error,
+    )
+    .expect("deferred route loop expands");
+    let canonical =
+        canonicalize_resources_with_schemas(&mut loop_children, wiring.context().schemas())
+            .expect("expanded route canonicalizes");
+    let identity_errors = compute_anonymous_identifiers_with_ctx(
+        wiring.context(),
+        canonical,
+        provider_configs.as_provider_configs(),
+    );
+    assert!(
+        identity_errors.is_empty(),
+        "expanded route identity resolves: {identity_errors:?}"
+    );
+    let loop_destination = loop_children[0]
+        .id
+        .identity_str()
+        .expect("expanded route has an anonymous identity")
+        .to_string();
+
+    let mut persisted = StateFile::new();
+    persisted
+        .upsert_resource(
+            ResourceState::try_applied(
+                "ec2.Route",
+                test_identity("_for0[0]"),
+                "awscc",
+                "loop-route-id",
+            )
+            .expect("legacy route provider id is non-empty")
+            .with_attribute("route_table_id", serde_json::json!("rtb-loop")),
+        )
+        .expect("legacy route state row is unique");
+    let named_orphan = "awscc_ec2_subnet_route_table_association_11111111";
+    persisted
+        .upsert_resource(
+            ResourceState::try_applied(
+                "ec2.SubnetRouteTableAssociation",
+                test_identity(named_orphan),
+                "awscc",
+                "named-association-id",
+            )
+            .expect("association provider id is non-empty")
+            .with_attribute("route_table_id", serde_json::json!("rtb-named"))
+            .with_attribute("subnet_id", serde_json::json!("subnet-named")),
+        )
+        .expect("named orphan state row is unique");
+    let state_path = project.path().join("carina.state.json");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
+    )
+    .expect("write real state fixture");
+    let state_file = Some(
+        carina_state::state::check_and_migrate(
+            &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+        )
+        .expect("decode real state fixture")
+        .into_state(),
+    );
+
+    let canonical_resources = canonical_pair(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        wiring.context().schemas(),
+    );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+    let planned = create_plan_from_parsed_with_upstream_with_ctx(
+        validated,
+        &provider_configs,
+        &state_file,
+        false,
+        ProgressSink::Human,
+        &remote_bindings,
+        &StateBlockClaims::default(),
+        &ResolvedStateBlockTargets::default(),
+    )
+    .await
+    .expect("build late mixed automatic-move plan");
+    let plan = &planned.resources().plan;
+    let summary = plan.summary();
+    assert_eq!(
+        summary.create,
+        0,
+        "plan must not create: {:#?}",
+        plan.effects()
+    );
+    assert_eq!(
+        summary.delete,
+        0,
+        "plan must not delete: {:#?}",
+        plan.effects()
+    );
+    assert_eq!(
+        summary.update,
+        0,
+        "plan must not update: {:#?}",
+        plan.effects()
+    );
+    assert_eq!(
+        summary.replace,
+        0,
+        "plan must not replace: {:#?}",
+        plan.effects()
+    );
+    let mut moves = plan
+        .effects()
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Move { from, to, .. } => Some((
+                from.identity_str().to_string(),
+                to.identity_str().to_string(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    moves.sort();
+    let mut expected = vec![
+        ("_for0[0]".to_string(), loop_destination),
+        (named_orphan.to_string(), "named[0]".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(
+        moves, expected,
+        "plan must contain exactly the two late moves"
+    );
+    assert_eq!(summary.moved, 2);
 }
 
 #[test]

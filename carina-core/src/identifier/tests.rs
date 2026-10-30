@@ -126,6 +126,22 @@ fn loop_identity_registry(stable: bool) -> SchemaRegistry {
     registry
 }
 
+fn loop_identity_only_registry() -> SchemaRegistry {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("ec2.Vpc")
+            .attribute(
+                AttributeSchema::optional("identity_input", AttributeType::string())
+                    .identity()
+                    .build(),
+            )
+            .validate()
+            .expect("identity-only schema fixture must be valid"),
+    );
+    registry
+}
+
 fn loop_state_entry(
     registry: &SchemaRegistry,
     name: &str,
@@ -171,6 +187,7 @@ fn detect_legacy_loop_moves_for_test(
         resources,
         registry,
         &find_state_by_type,
+        &|_binding| Vec::new(),
         claims,
         reserved_moves,
     )
@@ -7482,6 +7499,47 @@ fn legacy_loop_detector_breaks_ambiguous_owner_with_exact_stable_inputs() {
         resolved_move_identity_pairs(&moves),
         vec![("_xs[0]".into(), beta_destination)]
     );
+}
+
+#[test]
+fn legacy_loop_detector_disambiguates_with_identity_only_values() {
+    let source_a =
+        "let xs = ['alpha']\nfor value in xs {\n  mock.ec2.Vpc { identity_input = value }\n}";
+    let source_b =
+        "let xs = ['beta']\nfor value in xs {\n  mock.ec2.Vpc { identity_input = value }\n}";
+    let mut resources = parse_loop_fixture(source_a, "a.crn");
+    resources.extend(parse_loop_fixture(source_b, "b.crn"));
+    let registry = loop_identity_only_registry();
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("distinct identity-only inputs produce distinct destinations");
+    let beta_destination = resources[1]
+        .id
+        .identity_str()
+        .expect("resolved beta destination")
+        .to_string();
+    let claims = StateBlockClaims::empty();
+
+    for (persisted_value, expected) in [
+        (
+            Some("beta"),
+            vec![("_xs[0]".to_string(), beta_destination.clone())],
+        ),
+        (Some("different"), Vec::new()),
+        (None, Vec::new()),
+    ] {
+        let moves = detect_legacy_loop_moves_for_test(
+            &resources,
+            &registry,
+            &[loop_state_entry(&registry, "_xs[0]", None, persisted_value)],
+            &claims,
+            &[],
+        );
+        assert_eq!(
+            resolved_move_identity_pairs(&moves),
+            expected,
+            "identity-only state case {persisted_value:?}",
+        );
+    }
 }
 
 #[test]

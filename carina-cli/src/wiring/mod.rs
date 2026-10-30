@@ -2606,6 +2606,7 @@ fn detect_legacy_loop_moves_with_ctx(
         resources,
         ctx.schemas(),
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
+        &|binding| state_view.entries_by_binding(claims, binding),
         claims,
         reserved_moves,
     )

@@ -354,6 +354,7 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
                 crate::identifier::AnonymousIdStateInfo::name,
             )
         },
+        &|_binding| Vec::new(),
         &claims,
         &[],
     );

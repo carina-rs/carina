@@ -467,7 +467,7 @@ impl ResolvedMove {
 
     /// Build an automatically detected move while retaining its persisted
     /// origin and current in-memory projection as separate addresses.
-    pub fn from_detected_rename(
+    pub(crate) fn from_detected_rename(
         origin: ResolvedResourceId,
         projected_from: ResolvedResourceId,
         to: ResolvedResourceId,
