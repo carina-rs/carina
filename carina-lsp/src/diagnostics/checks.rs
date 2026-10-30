@@ -1983,13 +1983,13 @@ impl DiagnosticEngine {
         let known = collect_known_bindings(merged);
         let text = doc.text();
         let mut diagnostics = Vec::new();
-        // Iterating the deferred list directly (rather than the subset of
-        // errors `check_identifier_scope` produces for iterables) keeps a
-        // 1:1 mapping between deferred expressions and diagnostics; two
-        // sibling files with `for _ in <same>.attr` on the same line
-        // would otherwise collide on the error's `(name, line)` key.
+        // This typed parser-phase iterator excludes bare iterables already
+        // classified as `UndefinedDeferredIterable`. Module finalization owns
+        // that distinct diagnostic in the LSP pipeline; this source-local pass
+        // owns only ordinary reference roots, so the two producers cannot
+        // overlap.
         let deferred_sites = merged
-            .deferred_for_sites()
+            .deferred_for_scope_reference_sites()
             .map(|deferred| (deferred.file, deferred.line, deferred.root_bindings()));
         for (file, line, root_bindings) in deferred_sites {
             if !deferred_in_current_file(file, current_file_name) {

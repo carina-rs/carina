@@ -10165,7 +10165,10 @@ let mod_items = for x in items { child { item = x } }
     .expect("body classification must retain the undefined iterable");
 
     let errors = check_identifier_scope(&parsed);
-    assert!(errors.is_empty(), "finalization owns this diagnostic");
+    assert!(matches!(
+        errors.as_slice(),
+        [ParseError::UndefinedDeferredIterable { name, .. }] if name == "items"
+    ));
     let [deferred] = parsed.parsed_deferred_for_expressions() else {
         panic!("expected one deferred loop")
     };
@@ -10191,7 +10194,10 @@ fn deferred_for_read_body_with_bare_unbound_iterable_records_finalization_error(
     .expect("body classification must retain the undefined iterable");
 
     let errors = check_identifier_scope(&parsed);
-    assert!(errors.is_empty(), "finalization owns this diagnostic");
+    assert!(matches!(
+        errors.as_slice(),
+        [ParseError::UndefinedDeferredIterable { name, .. }] if name == "items"
+    ));
     let [deferred] = parsed.parsed_deferred_for_expressions() else {
         panic!("expected one deferred loop")
     };
@@ -11158,8 +11164,9 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
     // `iterable is string "org" (expected map)`, calling the identifier
     // a string and leaving the user with no did-you-mean.
     //
-    // The parser records these as an explicitly undefined iterable so the
-    // final module-resolution seam can report one file/span-owned diagnostic.
+    // The parser records these as an explicitly undefined iterable so both
+    // static scope validation and final module resolution read the same typed
+    // error source.
     let input = r#"
         let orgs = upstream_state { source = "../a" }
         for _, id in org {
@@ -11171,10 +11178,10 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
     let parsed = parse(input, &ProviderContext::default())
         .expect("single-file parse must not reject bare-iterable identifiers; the cross-file check runs later");
     let errs = check_identifier_scope(&parsed);
-    assert!(
-        errs.is_empty(),
-        "the root scope pass must not duplicate finalization: {errs:?}"
-    );
+    assert!(matches!(
+        errs.as_slice(),
+        [ParseError::UndefinedDeferredIterable { name, .. }] if name == "org"
+    ));
     let err =
         crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
             .expect_err("finalization must reject the bare undefined iterable");
@@ -11184,8 +11191,8 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
     let err = parse_error;
     let msg = err.to_string();
     assert!(
-        matches!(err, ParseError::UndefinedIdentifier { .. }),
-        "expected UndefinedIdentifier, got: {err:?}"
+        matches!(err, ParseError::UndefinedDeferredIterable { .. }),
+        "expected UndefinedDeferredIterable, got: {err:?}"
     );
     assert!(
         msg.contains("`org`"),

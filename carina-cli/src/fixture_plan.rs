@@ -503,13 +503,15 @@ where
         .iter()
         .filter_map(|resource| resource.binding.clone())
         .collect();
-    let mut non_managed_deferred_for = parsed.deferred_for_expressions().clone();
-    non_managed_deferred_for.retain(|deferred| {
-        !deferred
-            .root_bindings()
-            .iter()
-            .any(|binding| managed_bindings.contains(binding))
-    });
+    let (non_managed_deferred_for, _managed_deferred_for) = parsed
+        .deferred_for_expressions()
+        .clone()
+        .partition(|deferred| {
+            !deferred
+                .root_bindings()
+                .iter()
+                .any(|binding| managed_bindings.contains(binding))
+        });
     let reconciled_expansion = expansion_prelude
         .bind_projected_phase1_state(managed_current, orphans, HashSet::new())
         .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Print)

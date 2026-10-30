@@ -1205,6 +1205,116 @@ fn plan_style_config_pair_rejects_undefined_deferred_for_iterable() {
 }
 
 #[test]
+fn plan_style_config_pair_rejects_module_internal_undefined_deferred_for_iterable() {
+    let project = tempfile::tempdir().expect("module undefined iterable plan fixture");
+    let parent = project.path().join("parent");
+    std::fs::create_dir(&parent).expect("create parent module");
+    std::fs::write(
+        parent.join("main.crn"),
+        "let items = ['one']\n\
+         let resources = for item in itmes {\n\
+           mock.test.resource { name = item }\n\
+         }\n\
+         attributes { value = 'parent' }\n",
+    )
+    .expect("write parent module");
+    std::fs::write(
+        project.path().join("main.crn"),
+        "let parent = use { source = './parent' }\nparent {}\n",
+    )
+    .expect("write root configuration");
+
+    let loaded = carina_core::config_loader::load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load plan fixture");
+    let providers = ProviderLoad::for_test(Vec::new(), &loaded.parsed.providers);
+    let error = match providers.validate_config_pair(
+        loaded.parsed,
+        loaded.unresolved_parsed,
+        project.path(),
+        false,
+        &loaded.duplicate_declarations,
+    ) {
+        Ok(_) => panic!("plan-style validation must reject the module-internal typo"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+
+    assert!(
+        message.contains("Undefined identifier `itmes`"),
+        "{message}"
+    );
+    assert!(message.contains("parent/main.crn"), "{message}");
+    assert!(
+        message.contains("module call in main.crn at line 2"),
+        "{message}"
+    );
+}
+
+#[test]
+fn plan_style_config_pair_reports_every_undefined_deferred_for_iterable() {
+    let project = tempfile::tempdir().expect("multiple undefined iterable plan fixture");
+    let child = project.path().join("child");
+    let parent = project.path().join("parent");
+    std::fs::create_dir(&child).expect("create child module");
+    std::fs::create_dir(&parent).expect("create parent module");
+    std::fs::write(
+        child.join("main.crn"),
+        "let first_resources = for item in frist_items {\n\
+           mock.test.resource { name = item }\n\
+         }\n\
+         let second_resources = for item in secnd_items {\n\
+           mock.test.resource { name = item }\n\
+         }\n\
+         attributes { value = 'child' }\n",
+    )
+    .expect("write child module");
+    std::fs::write(
+        parent.join("main.crn"),
+        "let child = use { source = '../child' }\n\
+         child {}\n\
+         attributes { value = 'parent' }\n",
+    )
+    .expect("write parent module");
+    std::fs::write(
+        project.path().join("main.crn"),
+        "let parent = use { source = './parent' }\nparent {}\n",
+    )
+    .expect("write root configuration");
+
+    let loaded = carina_core::config_loader::load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load plan fixture");
+    let providers = ProviderLoad::for_test(Vec::new(), &loaded.parsed.providers);
+    let error = match providers.validate_config_pair(
+        loaded.parsed,
+        loaded.unresolved_parsed,
+        project.path(),
+        false,
+        &loaded.duplicate_declarations,
+    ) {
+        Ok(_) => panic!("plan-style validation must reject both undefined loop iterables"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+
+    assert!(
+        message.contains("Undefined identifier `frist_items`"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Undefined identifier `secnd_items`"),
+        "{message}"
+    );
+}
+
+#[test]
 fn hard_reporting_load_returns_schema_only_diagnostics() {
     let user_dirs = carina_core::TestUserDirs::new();
     let base = tempfile::tempdir().unwrap();

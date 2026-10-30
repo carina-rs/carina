@@ -6374,16 +6374,7 @@ mod tests {
     fn resolved_deferred_templates(
         expressions: impl IntoIterator<Item = crate::parser::DeferredForExpression>,
     ) -> crate::parser::ResolvedDeferredForExpressions {
-        let resolved = crate::module_resolver::resolve_modules_providerless(
-            crate::parser::ParsedFile::default(),
-            std::path::Path::new("."),
-        )
-        .expect("deferred-template fixture crosses module resolution");
-        let mut templates = resolved.into_deferred_for_expressions();
-        for expression in expressions {
-            templates.push(expression);
-        }
-        templates
+        crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test(expressions)
     }
 
     #[test]

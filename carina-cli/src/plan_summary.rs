@@ -8,16 +8,7 @@ use crate::commands::plan::{ExportChange, ReloadedPlanFile};
 pub(crate) fn resolved_deferred_for_for_test(
     expressions: impl IntoIterator<Item = DeferredForExpression>,
 ) -> ResolvedDeferredForExpressions {
-    let resolved = carina_core::module_resolver::resolve_modules_providerless(
-        carina_core::parser::ParsedFile::default(),
-        std::path::Path::new("."),
-    )
-    .expect("plan-summary fixture crosses module resolution");
-    let mut deferred = resolved.into_deferred_for_expressions();
-    for expression in expressions {
-        deferred.push(expression);
-    }
-    deferred
+    ResolvedDeferredForExpressions::from_expressions_for_test(expressions)
 }
 
 /// Effect categories shared by plan text and plan-image summaries.

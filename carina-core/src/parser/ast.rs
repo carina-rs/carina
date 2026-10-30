@@ -8,7 +8,7 @@
 use super::display_string_literal;
 use super::error::{
     DeferredForBodyKind, DeferredForBodyUnsupportedError, DeferredForIterableResolution,
-    ParseWarning, WarningKind,
+    ParseError, ParseWarning, WarningKind,
 };
 use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
@@ -171,12 +171,7 @@ pub(crate) enum ParsedDeferredForIterableState {
 
 #[derive(Debug)]
 pub(crate) enum DeferredForResourceExpressionError {
-    UndefinedIterable {
-        file: Option<String>,
-        name: String,
-        line: usize,
-        span: SourceSpan,
-    },
+    UndefinedIterable(ParseError),
     Unsupported {
         file: Option<String>,
         error: Box<DeferredForBodyUnsupportedError>,
@@ -221,9 +216,34 @@ impl ParsedDeferredForExpression {
         }
     }
 
+    /// The one typed construction point for a bare undefined deferred
+    /// iterable diagnostic. Static identifier validation and the final
+    /// module-resolution conversion both consume this value, so they cannot
+    /// drift in variant, suggestion, source path, or authored span.
+    pub(crate) fn undefined_iterable_error(&self, known_bindings: &[String]) -> Option<ParseError> {
+        let ParsedDeferredForIterableState::UndefinedIdentifier { name } = &self.iterable_state
+        else {
+            return None;
+        };
+        let error = ParseError::undefined_deferred_iterable(
+            name.clone(),
+            self.line,
+            known_bindings.to_vec(),
+            self.span,
+        );
+        Some(match &self.file {
+            Some(path) => error.in_file(path),
+            None => error,
+        })
+    }
+
     pub(crate) fn into_resource_expression(
         self,
+        known_bindings: &[String],
     ) -> Result<DeferredForExpression, DeferredForResourceExpressionError> {
+        if let Some(error) = self.undefined_iterable_error(known_bindings) {
+            return Err(DeferredForResourceExpressionError::UndefinedIterable(error));
+        }
         let Self {
             file,
             line,
@@ -235,14 +255,10 @@ impl ParsedDeferredForExpression {
             binding,
             body,
         } = self;
-        if let ParsedDeferredForIterableState::UndefinedIdentifier { name } = iterable_state {
-            return Err(DeferredForResourceExpressionError::UndefinedIterable {
-                file,
-                name,
-                line,
-                span,
-            });
-        }
+        debug_assert!(matches!(
+            iterable_state,
+            ParsedDeferredForIterableState::Deferred
+        ));
         let iterable_resolution = match &iterable {
             Value::Concrete(_) => {
                 DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution
@@ -2827,6 +2843,20 @@ pub struct ParsedDeferredForPhase {
 /// source, or invalid bodies. Module resolution creates it while finalizing a
 /// [`File`] into [`ResolvedDeferredForPhase`]; later phases may move, filter,
 /// or append already-finalized expressions.
+///
+/// Production callers outside `carina-core` cannot append an arbitrary loop
+/// and thereby bypass the finalization seam:
+///
+/// ```compile_fail,E0599
+/// use carina_core::parser::{DeferredForExpression, ResolvedDeferredForExpressions};
+///
+/// fn bypass_finalization(
+///     expressions: &mut ResolvedDeferredForExpressions,
+///     unchecked: DeferredForExpression,
+/// ) {
+///     expressions.push(unchecked);
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct ResolvedDeferredForExpressions(Vec<DeferredForExpression>);
 
@@ -2863,12 +2893,12 @@ impl ResolvedDeferredForExpressions {
         (Self(selected), Self(retained))
     }
 
-    pub fn retain(&mut self, mut predicate: impl FnMut(&DeferredForExpression) -> bool) {
-        self.0.retain(|item| predicate(item));
-    }
-
-    pub fn push(&mut self, expression: DeferredForExpression) {
-        self.0.push(expression);
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn from_expressions_for_test(
+        expressions: impl IntoIterator<Item = DeferredForExpression>,
+    ) -> Self {
+        Self(expressions.into_iter().collect())
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -2881,8 +2911,17 @@ impl ResolvedDeferredForExpressions {
         self.0.remove(index)
     }
 
-    pub fn extend(&mut self, other: Self) {
+    pub(crate) fn extend(&mut self, other: Self) {
         self.0.extend(other.0);
+    }
+
+    /// Move an already-finalized collection into this finalized collection.
+    ///
+    /// External crates cannot construct either collection or append an
+    /// individual expression, so this operation preserves the module-
+    /// resolution finalization proof carried by both values.
+    pub fn append_finalized(&mut self, other: Self) {
+        self.extend(other);
     }
 }
 
@@ -3149,6 +3188,24 @@ impl<E> File<E, ParsedDeferredForPhase> {
     /// resource consumers should use [`Self::iter_all_resources`].
     pub fn parsed_deferred_for_expressions(&self) -> &[ParsedDeferredForExpression] {
         &self.deferred_for_phase.expressions
+    }
+
+    /// Deferred iterable sites whose identifier roots still require ordinary
+    /// scope checking. Bare undefined iterables are excluded by their private
+    /// parser state; their distinct typed diagnostic is owned by
+    /// [`crate::parser::check_identifier_scope`] or finalization, depending on
+    /// the pipeline.
+    pub fn deferred_for_scope_reference_sites(&self) -> impl Iterator<Item = DeferredForSite<'_>> {
+        self.deferred_for_phase
+            .expressions
+            .iter()
+            .filter(|expression| {
+                matches!(
+                    expression.iterable_state,
+                    ParsedDeferredForIterableState::Deferred
+                )
+            })
+            .map(ParsedDeferredForExpression::site)
     }
 
     pub(crate) fn parsed_deferred_for_expressions_mut(

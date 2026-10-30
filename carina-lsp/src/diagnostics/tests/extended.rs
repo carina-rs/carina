@@ -10736,6 +10736,29 @@ provider awscc {
 }
 
 #[test]
+fn directory_bare_undefined_deferred_iterable_is_reported_exactly_once() {
+    let fixture = tempfile::tempdir().expect("undefined iterable LSP fixture");
+    let source = "let items = ['one']\n\
+                  let resources = for item in itmes {\n\
+                    mock.test.resource { name = item }\n\
+                  }\n";
+    let file = fixture.path().join("main.crn");
+    std::fs::write(&file, source).expect("write LSP fixture");
+
+    let diagnostics = analyze_with_buffer(&test_engine(), fixture.path(), "main.crn", source);
+    let undefined = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("Undefined identifier `itmes`"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        undefined.len(),
+        1,
+        "the typed undefined iterable must have one LSP owner: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn lsp_flags_non_map_default_tags() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();

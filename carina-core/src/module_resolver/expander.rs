@@ -76,9 +76,8 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 resolved_bindings,
             )
             .map_err(|error| error.with_failing_call(call.id().clone()))?;
-        if let Some(error) = super::resolver::deferred_for_body_errors(&expanded)
-            .into_iter()
-            .next()
+        if let Some(error) =
+            ModuleError::from_errors(super::resolver::deferred_for_body_errors(&expanded))
         {
             return Err(error.with_failing_call(call.id().clone()));
         }

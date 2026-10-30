@@ -131,6 +131,7 @@ impl ResidualModuleResolutionError {
 
     pub fn diagnostic(&self) -> Option<ResidualModuleResolutionDiagnostic<'_>> {
         match self.0.root_cause() {
+            ModuleError::Multiple(_errors) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::Constraint(diagnostic) => {
                 Some(ResidualModuleResolutionDiagnostic::Constraint {
                     origin: &diagnostic.origin,
@@ -226,6 +227,7 @@ impl ResidualModuleResolutionError {
     ) -> bool {
         let root_cause = self.0.root_cause();
         match root_cause {
+            ModuleError::Multiple(_errors) => false,
             ModuleError::MissingArgument { module, argument } => findings.iter().any(|finding| {
                 self.finding_owns_error(finding)
                     && finding.message().covers_missing_argument(module, argument)
@@ -330,6 +332,13 @@ impl ResidualModuleResolutionError {
                     suggestion: _,
                     in_scope: _,
                 }
+                | ParseError::UndefinedDeferredIterable {
+                    name: _,
+                    line: _,
+                    span: _,
+                    suggestion: _,
+                    in_scope: _,
+                }
                 | ParseError::ModuleNotFound(_)
                 | ParseError::InternalError {
                     expected: _,
@@ -383,6 +392,13 @@ fn without_covered_reference_type_members(
     findings: &[crate::validation::ModuleCallFinding],
 ) -> Option<ModuleError> {
     match error {
+        ModuleError::Multiple(errors) => ModuleError::from_errors(
+            errors
+                .into_vec()
+                .into_iter()
+                .filter_map(|error| without_covered_reference_type_members(error, findings))
+                .collect(),
+        ),
         ModuleError::OwnedByCalls { calls, error } => {
             without_covered_reference_type_members(*error, findings).map(|error| {
                 ModuleError::OwnedByCalls {
@@ -1440,7 +1456,7 @@ fn finalize_deferred_for_bodies<E>(
     parsed: crate::parser::File<E>,
 ) -> Result<ModuleResolvedFile<E>, ModuleError> {
     let (resolved, errors) = finalize_deferred_for_bodies_collecting(parsed);
-    match errors.into_iter().next() {
+    match ModuleError::from_errors(errors) {
         Some(error) => Err(error),
         None => Ok(resolved),
     }
@@ -1454,13 +1470,10 @@ fn finalize_deferred_for_bodies_collecting<E>(
         let mut resolved = Vec::with_capacity(pending.len());
         let mut errors = Vec::new();
         for expression in pending {
-            match expression.into_resource_expression() {
+            match expression.into_resource_expression(&known_bindings) {
                 Ok(expression) => resolved.push(expression),
                 Err(error) => {
-                    errors.push(deferred_for_resource_expression_error(
-                        error,
-                        &known_bindings,
-                    ));
+                    errors.push(deferred_for_resource_expression_error(error));
                 }
             }
         }
@@ -1470,28 +1483,10 @@ fn finalize_deferred_for_bodies_collecting<E>(
 
 fn deferred_for_resource_expression_error(
     error: crate::parser::DeferredForResourceExpressionError,
-    known_bindings: &[String],
 ) -> ModuleError {
     match error {
-        crate::parser::DeferredForResourceExpressionError::UndefinedIterable {
-            file,
-            name,
-            line,
-            span,
-        } => {
-            let error = ParseError::undefined_identifier_at(
-                name,
-                line,
-                known_bindings.to_vec(),
-                Some(span),
-            );
-            match file {
-                Some(path) => ModuleError::ParseInFile {
-                    path: std::path::PathBuf::from(path),
-                    error: Box::new(error),
-                },
-                None => ModuleError::Parse(error),
-            }
+        crate::parser::DeferredForResourceExpressionError::UndefinedIterable(error) => {
+            parse_error_to_module_error(error)
         }
         crate::parser::DeferredForResourceExpressionError::Unsupported { file, error } => {
             let error = ParseError::DeferredForBodyUnsupported(error);
@@ -1503,6 +1498,13 @@ fn deferred_for_resource_expression_error(
                 None => ModuleError::Parse(error),
             }
         }
+    }
+}
+
+fn parse_error_to_module_error(error: ParseError) -> ModuleError {
+    match error {
+        ParseError::Located { path, error } => ModuleError::ParseInFile { path, error },
+        error => ModuleError::Parse(error),
     }
 }
 
@@ -1523,15 +1525,12 @@ pub(super) fn deferred_for_body_errors<E>(parsed: &crate::parser::File<E>) -> Ve
     parsed
         .parsed_deferred_for_expressions()
         .iter()
-        .filter_map(
-            |expression| match expression.clone().into_resource_expression() {
+        .filter_map(|expression| {
+            match expression.clone().into_resource_expression(&known_bindings) {
                 Ok(_) => None,
-                Err(error) => Some(deferred_for_resource_expression_error(
-                    error,
-                    &known_bindings,
-                )),
-            },
-        )
+                Err(error) => Some(deferred_for_resource_expression_error(error)),
+            }
+        })
         .collect()
 }
 

@@ -895,7 +895,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
 /// because `accumulate_*` helpers below still take `&HashSet<&str>` as a
 /// borrowed view (changing that signature would force `undefined_identifier_error`
 /// to rebuild a borrowed view per call).
-pub fn collect_known_bindings_merged(parsed: &ParsedFile) -> std::collections::HashSet<&str> {
+pub fn collect_known_bindings_merged<E>(parsed: &File<E>) -> std::collections::HashSet<&str> {
     let mut known = parsed.structural_binding_names();
     known.extend(parsed.variables.keys().map(String::as_str));
     known
@@ -1143,19 +1143,14 @@ fn push_root(
 /// - Every `ResourceRef` whose root binding is not in scope (roots in
 ///   resource attributes, attribute-parameter values, module-call
 ///   arguments, and export-parameter values).
-/// - Every deferred for-expression reference root whose iterable was not
-///   already classified as a bare undefined identifier.
-///
-/// Bare undefined deferred `for` iterables are deliberately excluded. Their
-/// parser-side typestate retains the authored file and span until module
-/// finalization, which is the single reporting seam for both root and
-/// module-owned loops. Other iterable references remain part of this root
-/// scope check.
+/// - Every deferred for-expression reference root whose iterable is not in
+///   scope, including bare identifiers represented by the parser's distinct
+///   undefined-iterable state.
 ///
 /// **This is the canonical entry point for "is this identifier in
 /// scope?" checks.** Follow the #2104 rule: any new semantic check in
 /// that family gets added *here*, not as a new sibling function.
-pub fn check_identifier_scope(parsed: &ParsedFile) -> Vec<ParseError> {
+pub fn check_identifier_scope<E: ExportParamLike>(parsed: &File<E>) -> Vec<ParseError> {
     let known = collect_known_bindings_merged(parsed);
     let mut errors = Vec::new();
     accumulate_undefined_reference_errors(parsed, &known, &mut errors);
@@ -1259,7 +1254,7 @@ pub fn check_provider_instance_routing(parsed: &ParsedFile) -> Vec<ParseError> {
 }
 
 fn accumulate_undefined_reference_errors(
-    parsed: &ParsedFile,
+    parsed: &File<impl ExportParamLike>,
     known: &std::collections::HashSet<&str>,
     errors: &mut Vec<ParseError>,
 ) {
@@ -1295,7 +1290,7 @@ fn accumulate_undefined_reference_errors(
         }
     }
     for export in &parsed.export_params {
-        if let Some(value) = &export.value {
+        if let Some(value) = export.value() {
             check(value);
         }
     }
@@ -1310,15 +1305,18 @@ fn accumulate_undefined_reference_errors(
 }
 
 fn accumulate_deferred_iterable_errors(
-    parsed: &ParsedFile,
+    parsed: &File<impl ExportParamLike>,
     known: &std::collections::HashSet<&str>,
     errors: &mut Vec<ParseError>,
 ) {
+    let mut known_bindings = known
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    known_bindings.sort_unstable();
     for deferred in parsed.parsed_deferred_for_expressions() {
-        if matches!(
-            deferred.iterable_state,
-            super::ParsedDeferredForIterableState::UndefinedIdentifier { .. }
-        ) {
+        if let Some(error) = deferred.undefined_iterable_error(&known_bindings) {
+            errors.push(error);
             continue;
         }
         for root in deferred.root_bindings() {

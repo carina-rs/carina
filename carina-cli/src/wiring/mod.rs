@@ -710,17 +710,16 @@ impl TryFrom<Vec<AppError>> for NonEmptyValidationErrors {
 }
 
 impl NonEmptyValidationErrors {
-    fn one(error: AppError) -> Self {
-        Self(vec![error])
-    }
-
     pub(crate) fn as_slice(&self) -> &[AppError] {
         &self.0
     }
 
-    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn into_vec(self) -> Vec<AppError> {
         self.0
+    }
+
+    fn extend(&mut self, errors: impl IntoIterator<Item = AppError>) {
+        self.0.extend(errors);
     }
 }
 
@@ -792,13 +791,7 @@ fn validation_report_from<'a>(
         Ok(crate::commands::ResolvedConfig::Paired { .. }) => {
             unreachable!("evaluated-only validation returned pair")
         }
-        Err(errors) => Err(
-            NonEmptyValidationErrors::try_from(errors).unwrap_or_else(|_| {
-                NonEmptyValidationErrors::one(AppError::Config(
-                    "validation pipeline failed without a diagnostic".to_string(),
-                ))
-            }),
-        ),
+        Err(errors) => Err(errors),
     };
     ValidationReport {
         result,
@@ -824,7 +817,8 @@ fn resolve_config_pair_errors_with_context(
     base_dir: &Path,
     skip_resource_validation: bool,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
-) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, Vec<AppError>> {
+) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, NonEmptyValidationErrors>
+{
     match crate::commands::validate_and_resolve_errors_inner(
         &ValidationPipelineAccess::new(),
         parsed,
@@ -861,7 +855,7 @@ fn resolve_config_pair_with_context(
         skip_resource_validation,
         duplicate_declarations,
     )
-    .map_err(crate::commands::collapse_errors)
+    .map_err(|errors| crate::commands::collapse_errors(errors.into_vec()))
 }
 
 fn binding_use_report_error(report: carina_core::validation::BindingUseReport) -> AppError {
@@ -1004,7 +998,7 @@ impl ProviderLoad {
                 if skip_resource_validation {
                     errors.extend(sorted_provider_load_errors(&self.load_errors));
                 }
-                return Err(crate::commands::collapse_errors(errors));
+                return Err(crate::commands::collapse_errors(errors.into_vec()));
             }
         };
         // The resource-skipping pipeline omits provider-load diagnostics.
@@ -1060,7 +1054,7 @@ impl ProviderLoad {
                 if skip_resource_validation {
                     errors.extend(sorted_provider_load_errors(&self.load_errors));
                 }
-                return Err(crate::commands::collapse_errors(errors));
+                return Err(crate::commands::collapse_errors(errors.into_vec()));
             }
         };
         let (parsed, unresolved) =
@@ -5047,6 +5041,10 @@ pub struct DeferredForExpansion {
     /// parser view. Retained only by the raw-file test adapter.
     #[cfg(test)]
     residual_warnings: Vec<ParseWarning>,
+    /// Complete finalized loop collection after expansion, retained only by
+    /// the raw-file test adapter so it can move the collection as a unit.
+    #[cfg(test)]
+    post_expansion_deferred_for: carina_core::parser::ResolvedDeferredForExpressions,
     /// Loops whose iterable is deferred until apply and should become
     /// state-only `Effect::DeferredCreate` entries in the plan.
     pub deferred_create_targets: Vec<DeferredCreateTarget>,
@@ -5076,14 +5074,9 @@ impl DeferredForExpansion {
         mut parsed: carina_core::parser::ModuleResolvedFile<E>,
     ) -> carina_core::parser::ModuleResolvedFile<E> {
         parsed.resources = self.sorted_resources;
-        // Concrete loops now live in `resources` and must disappear from the
-        // parser view. Genuinely deferred loops still back DeferredCreate /
-        // DeferredReplace effects, so retain their fresh templates alongside
-        // any residual diagnostic-only loops.
-        parsed.replace_deferred_for_expressions(self.residual_deferred_for);
-        for target in self.deferred_create_targets {
-            parsed.deferred_for_expressions_mut().push(target.template);
-        }
+        // Move the complete post-expansion collection as one finalized value;
+        // external code never appends individual expressions.
+        parsed.replace_deferred_for_expressions(self.post_expansion_deferred_for);
         parsed.warnings = self.residual_warnings;
         parsed
     }
@@ -5914,7 +5907,7 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
             .inner
             .data
             .residual_deferred_for
-            .extend(non_managed);
+            .append_finalized(non_managed);
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -6052,6 +6045,8 @@ impl PreparedDeferredForExpansion {
             residual_deferred_for,
             #[cfg(test)]
                 residual_warnings: _,
+            #[cfg(test)]
+                post_expansion_deferred_for: _,
             deferred_create_targets,
             new_child_ids,
             refreshable_child_ids,
@@ -6239,7 +6234,8 @@ impl<E> DeferredExpansionTarget<E> for carina_core::parser::ModuleResolvedFile<E
         self.replace_deferred_for_expressions(selected);
         self.expand_deferred_for_expressions(bindings)?;
         let residual = self.deferred_for_expressions().clone();
-        self.deferred_for_expressions_mut().extend(retained);
+        self.deferred_for_expressions_mut()
+            .append_finalized(retained);
         Ok(residual)
     }
 }
@@ -6274,6 +6270,8 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             #[cfg(test)]
             residual_warnings: parsed.warnings.clone(),
+            #[cfg(test)]
+            post_expansion_deferred_for: parsed.deferred_for_expressions().clone(),
             deferred_create_targets: Vec::new(),
             new_child_ids: HashSet::new(),
             refreshable_child_ids: RefreshableChildIds::default(),
@@ -6342,6 +6340,8 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     #[cfg(test)]
     let residual_warnings = target.parsed().warnings.clone();
     let parsed = target.parsed();
+    #[cfg(test)]
+    let post_expansion_deferred_for = parsed.deferred_for_expressions().clone();
 
     let pre_ids: HashSet<ResourceId> = sorted_resources.iter().map(|r| r.id.clone()).collect();
 
@@ -6395,6 +6395,8 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
         residual_deferred_for,
         #[cfg(test)]
         residual_warnings,
+        #[cfg(test)]
+        post_expansion_deferred_for,
         deferred_create_targets,
         new_child_ids,
         refreshable_child_ids,
@@ -6798,6 +6800,8 @@ async fn finish_expanded_refresh_state<
         residual_deferred_for: _,
         #[cfg(test)]
             residual_warnings: _,
+        #[cfg(test)]
+            post_expansion_deferred_for: _,
         deferred_create_targets: _,
         new_child_ids,
         refreshable_child_ids,

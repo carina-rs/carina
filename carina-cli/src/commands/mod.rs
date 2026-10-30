@@ -41,7 +41,8 @@ use crate::module_walk::ModuleWalk;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::wiring::ProviderLoad;
 use crate::wiring::{
-    CanonicalResourcePair, WiringContext, compute_anonymous_identifiers_with_policy_with_ctx,
+    CanonicalResourcePair, NonEmptyValidationErrors, WiringContext,
+    compute_anonymous_identifiers_with_policy_with_ctx,
     compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx, resolve_file_names_with_ctx,
     validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
     validate_module_attribute_refs_after_expansion_failure, validate_module_internal_ref_types,
@@ -478,7 +479,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
-) -> Result<ResolvedConfig, Vec<AppError>> {
+) -> Result<ResolvedConfig, NonEmptyValidationErrors> {
     // Binding-use validation is a production-readiness invariant, not a
     // resource-validation preference. Keep the recursive module snapshots
     // available even on destroy/state recovery paths; the later optional
@@ -486,6 +487,13 @@ pub(crate) fn validate_and_resolve_errors_inner(
     let module_walk = ModuleWalk::load(&parsed, base_dir);
 
     let mut errors: Vec<AppError> = Vec::new();
+    if !skip_resource_validation {
+        errors.extend(
+            carina_core::parser::check_identifier_scope(&parsed)
+                .into_iter()
+                .map(|error| AppError::Config(error.to_string())),
+        );
+    }
 
     if !skip_resource_validation {
         errors.extend(duplicate_declaration_errors(
@@ -693,7 +701,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // merged below.
     if !errors.is_empty() {
         extend_module_call_errors(&mut errors, authored_module_call_findings);
-        return Err(errors);
+        return Err(non_empty_validation_failure(errors));
     }
 
     let module_resolution = module_resolver::resolve_modules_with_diagnostics(
@@ -707,7 +715,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
         module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
             extend_module_call_errors(&mut errors, authored_module_call_findings);
             if !errors.is_empty() {
-                return Err(errors);
+                return Err(non_empty_validation_failure(errors));
             }
             *graph
         }
@@ -729,7 +737,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
                 ));
             }
             extend_module_resolution_errors(&mut errors, &residuals, base_dir);
-            return Err(errors);
+            return Err(non_empty_validation_failure(errors));
         }
         module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors: residuals } => {
             let findings = authored_module_call_findings;
@@ -743,7 +751,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
                 ));
             }
             extend_module_resolution_errors(&mut errors, &residuals, base_dir);
-            return Err(errors);
+            return Err(non_empty_validation_failure(errors));
         }
     };
 
@@ -759,11 +767,11 @@ pub(crate) fn validate_and_resolve_errors_inner(
             "Provider attribute resolution error: {}",
             e
         )));
-        return Err(errors);
+        return Err(non_empty_validation_failure(errors));
     }
     if let Err(e) = carina_core::parser::finalize_provider_configs(&mut parsed) {
         errors.push(AppError::Config(format!("Finalize error: {}", e)));
-        return Err(errors);
+        return Err(non_empty_validation_failure(errors));
     }
 
     // Expansion carries module-internal side data in parallel with each
@@ -783,7 +791,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
     extend_binding_use_errors(&mut errors, &binding_use_report);
     extend_expanded_binding_use_errors(&mut errors, &binding_use_report, &parsed.compositions);
     if !binding_use_report.is_ready() {
-        return Err(errors);
+        return Err(non_empty_validation_failure(errors));
     }
 
     // Resolve names (let bindings -> resource names) — must succeed
@@ -794,7 +802,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
             let name_errors = resolve_file_names_with_ctx(ctx, &mut parsed);
             if !name_errors.is_empty() {
                 errors.extend(name_errors);
-                return Err(errors);
+                return Err(non_empty_validation_failure(errors));
             }
             ResolvedConfig::Evaluated {
                 parsed: Box::new(parsed),
@@ -807,7 +815,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
                 },
                 Err(name_errors) => {
                     errors.extend(name_errors);
-                    return Err(errors);
+                    return Err(non_empty_validation_failure(errors));
                 }
             }
         }
@@ -898,7 +906,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
             errors.extend(split_validation_message(&msg));
         }
         if !errors.is_empty() {
-            return Err(errors);
+            return Err(non_empty_validation_failure(errors));
         }
     }
 
@@ -927,7 +935,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // Downstream plan code assumes every resource has a stable id, so any
     // identity or move-target error must stop the pipeline here.
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(non_empty_validation_failure(errors));
     }
 
     // Reject references to `upstream_state` fields that the upstream's
@@ -988,11 +996,15 @@ pub(crate) fn validate_and_resolve_errors_inner(
         );
     }
 
-    if errors.is_empty() {
-        Ok(resolved_config)
-    } else {
-        Err(errors)
+    match NonEmptyValidationErrors::try_from(errors) {
+        Ok(errors) => Err(errors),
+        Err(_empty) => Ok(resolved_config),
     }
+}
+
+fn non_empty_validation_failure(errors: Vec<AppError>) -> NonEmptyValidationErrors {
+    NonEmptyValidationErrors::try_from(errors)
+        .expect("validation failure branch must retain at least one diagnostic")
 }
 
 /// Split the newline-joined error strings that `carina_core::validation::*`
@@ -1014,6 +1026,23 @@ mod tests {
     use carina_core::resource::{ConcreteValue, Value};
     use indexmap::IndexMap;
     use std::collections::HashMap;
+
+    type ValidateAndResolveErrors =
+        fn(
+            &crate::wiring::ValidationPipelineAccess,
+            carina_core::parser::InferredFile,
+            &Path,
+            &WiringContext,
+            &HashMap<String, String>,
+            bool,
+            &[DuplicateDeclaration],
+            ConfigNameResolution,
+        ) -> Result<ResolvedConfig, crate::wiring::NonEmptyValidationErrors>;
+
+    #[test]
+    fn validate_and_resolve_failure_type_is_non_empty() {
+        let _: ValidateAndResolveErrors = validate_and_resolve_errors_inner;
+    }
 
     fn s3_backend_config(bucket: &str, region: &str) -> BackendConfig {
         let mut attributes = HashMap::new();

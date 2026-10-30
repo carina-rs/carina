@@ -193,6 +193,19 @@ pub enum ParseError {
         in_scope: Vec<String>,
     },
 
+    /// A bare deferred-`for` iterable that remained unbound after the
+    /// directory binding namespace was known. This is distinct from an
+    /// ordinary spanned identifier error so module-call ownership is decided
+    /// by semantic origin rather than by the incidental presence of a span.
+    #[error("{}", format_undefined_identifier(name, suggestion.as_deref(), in_scope))]
+    UndefinedDeferredIterable {
+        name: String,
+        line: usize,
+        span: Box<SourceSpan>,
+        suggestion: Option<String>,
+        in_scope: Vec<String>,
+    },
+
     #[error("Module not found: {0}")]
     ModuleNotFound(String),
 
@@ -373,6 +386,25 @@ impl ParseError {
             name,
             line,
             span: span.map(Box::new),
+            suggestion,
+            in_scope,
+        }
+    }
+
+    pub(crate) fn undefined_deferred_iterable(
+        name: String,
+        line: usize,
+        known_bindings: Vec<String>,
+        span: SourceSpan,
+    ) -> ParseError {
+        let known_refs: Vec<&str> = known_bindings.iter().map(String::as_str).collect();
+        let suggestion = crate::schema::suggest_similar_name(&name, &known_refs);
+        let mut in_scope = known_bindings;
+        in_scope.sort();
+        ParseError::UndefinedDeferredIterable {
+            name,
+            line,
+            span: Box::new(span),
             suggestion,
             in_scope,
         }

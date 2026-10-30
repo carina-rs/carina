@@ -330,11 +330,10 @@ pub struct LoadedConfig {
     pub backend_file: Option<PathBuf>,
     /// Identifier-scope errors surfaced by [`parser::check_identifier_scope`]
     /// on the merged directory parse: ResourceRef roots in resources /
-    /// attribute / module / export values. Bare undefined deferred `for`
-    /// iterables are reported once at module finalization, which retains their
-    /// file and span; dotted reference roots remain in this list. The loader
-    /// does not short-circuit on these errors so later validators can also run
-    /// in a single pass.
+    /// attribute / module / export values, including the distinct typed error
+    /// for a bare undefined deferred-`for` iterable. The loader does not
+    /// short-circuit on these errors so later validators can also run in a
+    /// single pass.
     pub identifier_scope_errors: Vec<parser::ParseError>,
     /// Directory-wide declaration collisions. These are non-blocking at the
     /// load boundary so editor callers retain the parsed tree; validation
@@ -2392,15 +2391,14 @@ let orgs = upstream_state {
         assert!(
             matches!(
                 error.as_ref(),
-                crate::parser::ParseError::UndefinedIdentifier {
+                crate::parser::ParseError::UndefinedDeferredIterable {
                     name,
                     line: 3,
                     suggestion: Some(suggestion),
-                    span: Some(_),
                     ..
                 } if name == "itmes" && suggestion == "items"
             ),
-            "expected the normal undefined-identifier diagnostic, got {error:?}"
+            "expected the typed undefined-iterable diagnostic, got {error:?}"
         );
     }
 
@@ -2624,8 +2622,9 @@ awscc.ec2.SecurityGroup {
             other => panic!("unexpected error: {other}"),
         }
 
-        // Dotted references remain root identifier-scope diagnostics; only a
-        // bare undefined iterable is owned by module finalization.
+        // Dotted references remain ordinary root identifier-scope
+        // diagnostics; a bare undefined iterable uses its distinct typed
+        // variant through the same pass.
         let dir2 = create_temp_dir("undefined_for_iterable_cli");
         fs::write(
             dir2.join("main.crn"),

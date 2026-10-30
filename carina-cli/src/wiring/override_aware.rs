@@ -270,7 +270,9 @@ impl<E> CanonicalResourcePair<E> {
         self.parsed.replace_deferred_for_expressions(selected);
         self.parsed.expand_deferred_for_expressions(bindings)?;
         let residual = self.parsed.deferred_for_expressions().clone();
-        self.parsed.deferred_for_expressions_mut().extend(retained);
+        self.parsed
+            .deferred_for_expressions_mut()
+            .append_finalized(retained);
         Ok(residual)
     }
 

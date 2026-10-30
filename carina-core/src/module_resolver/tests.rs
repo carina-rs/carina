@@ -6763,11 +6763,11 @@ let resources = for item in itmes {
         &crate::schema::SchemaRegistry::new(),
     )
     .expect("undefined iterable remains deferred until finalization");
-    assert!(
-        loaded.identifier_scope_errors.is_empty(),
-        "the loader must leave deferred iterable ownership to finalization: {:?}",
-        loaded.identifier_scope_errors,
-    );
+    assert!(matches!(
+        loaded.identifier_scope_errors.as_slice(),
+        [crate::parser::ParseError::Located { error, .. }]
+            if matches!(error.as_ref(), crate::parser::ParseError::UndefinedDeferredIterable { name, .. } if name == "itmes")
+    ));
 
     let error = super::resolve_modules_with_providerless_config(
         loaded.parsed,
@@ -6782,14 +6782,42 @@ let resources = for item in itmes {
     assert_eq!(path, &source_file);
     assert!(matches!(
         error.as_ref(),
-        crate::parser::ParseError::UndefinedIdentifier {
+        crate::parser::ParseError::UndefinedDeferredIterable {
             name,
             line: 2,
-            span: Some(span),
+            span,
             ..
         } if name == "itmes" && span.start_line() == 2 && span.end_line() == 4
     ));
     assert!(error.to_string().contains("Did you mean `items`"));
+}
+
+#[test]
+fn finalize_reports_every_undefined_iterable_for_managed_resource_bodies() {
+    let parsed = crate::parser::parse(
+        r#"let first = for item in frist_items {
+  mock.test.resource { name = item }
+}
+let second = for item in secnd_items {
+  mock.test.resource { name = item }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("both undefined iterables remain deferred until finalization");
+
+    let error = super::resolve_modules_providerless(parsed, std::path::Path::new("."))
+        .expect_err("finalization must reject both undefined iterables");
+    let message = error.display_relative_to(std::path::Path::new("."));
+
+    assert!(
+        message.contains("Undefined identifier `frist_items`"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Undefined identifier `secnd_items`"),
+        "{message}"
+    );
 }
 
 #[test]

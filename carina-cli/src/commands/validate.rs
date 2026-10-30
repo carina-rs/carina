@@ -68,12 +68,6 @@ pub fn validate_with_factories(
 
     let mut error_reports: Vec<String> = Vec::new();
     error_reports.extend(
-        loaded
-            .identifier_scope_errors
-            .iter()
-            .map(ToString::to_string),
-    );
-    error_reports.extend(
         super::validate_and_resolve_errors(
             &parsed,
             base_dir,
@@ -274,12 +268,6 @@ pub fn run_validate(
     // them all in one pass instead of fixing one, re-running, and
     // finding the next. See #2102 / #2105.
     let mut error_reports: Vec<String> = Vec::new();
-    error_reports.extend(
-        loaded
-            .identifier_scope_errors
-            .iter()
-            .map(ToString::to_string),
-    );
     if let Err(AppError::Validation(msg)) =
         check_upstream_state_sources(base_dir, &parsed.upstream_states)
     {
@@ -539,6 +527,37 @@ backend s3 {
         assert_eq!(errors.len(), 1, "unexpected validation errors: {errors:#?}");
         assert!(errors[0].contains("Undefined identifier `itmes`"));
         assert!(!errors[0].contains("cannot use module call"));
+    }
+
+    #[test]
+    fn root_undefined_deferred_iterable_is_collected_with_pre_expansion_error() {
+        let fixture = tempfile::tempdir().expect("combined validation fixture");
+        let child = fixture.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(
+            child.join("main.crn"),
+            "arguments { item: String }\nattributes { value = item }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            "backend s3 { bucket = 'state' key = 'state.json' region = true }\n\
+             let child = use { source = './child' }\n\
+             let calls = for item in itmes { child { item = item } }\n",
+        )
+        .unwrap();
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let rendered = errors.join("\n");
+
+        assert!(
+            rendered.contains("Invalid attribute 'region' for backend type 's3'"),
+            "unrelated pre-expansion error is missing: {errors:#?}",
+        );
+        assert!(
+            rendered.contains("Undefined identifier `itmes`"),
+            "undefined deferred iterable was lost behind the early return: {errors:#?}",
+        );
     }
 
     #[test]
