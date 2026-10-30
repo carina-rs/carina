@@ -9,7 +9,7 @@ use serde_json::json;
 use carina_core::data_source_value::{
     DataSourceValue, DataSourceValues, ExecutableDataSourceValues,
 };
-use carina_core::effect::Effect;
+use carina_core::effect::{Effect, ReleasedListKey, ReleasedListKeys};
 use carina_core::executor::{
     AcceptedRequest, Applied, ExecutionCheckpointSink, ExecutionEvent, ExecutionObserver,
     ExecutionOutcome, LiveExecutionInput, ProviderCheckInputs,
@@ -24,7 +24,9 @@ use carina_core::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, Directives, ParsedIgnorePath,
     ResolvedDataSource, ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
 };
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+};
 use carina_core::value::PersistedValue;
 use carina_state::{
     BackendError, DeposedInstance, DeposedKey, LoadedState, LockInfo, ResourceState, RowBasis,
@@ -768,6 +770,44 @@ fn plan_file_serde_round_trip() {
         explicit_dependencies: std::collections::HashSet::new(),
         blocked_by_updates: HashSet::new(),
     });
+    let release_schema = ResourceSchema::new("test.SavedRelease")
+        .attribute(
+            AttributeSchema::optional(
+                "settings",
+                AttributeType::list(AttributeType::struct_(
+                    "Setting",
+                    vec![
+                        StructField::required("key", AttributeType::string()).build(),
+                        StructField::required("value", AttributeType::string()).build(),
+                    ],
+                )),
+            )
+            .keyed_partial_update("key")
+            .build(),
+        )
+        .validate()
+        .expect("saved release fixture schema is valid");
+    let key_field = release_schema
+        .effective_attribute("settings")
+        .and_then(|attribute| attribute.keyed_partial_update())
+        .expect("saved release fixture has keyed semantics")
+        .key_field()
+        .clone();
+    plan.add(Effect::ReleaseListKeys {
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+            "aws",
+            "s3.Bucket",
+            "my-bucket",
+            None,
+        )),
+        attribute: "settings".to_string(),
+        key_field,
+        keys: ReleasedListKeys::try_new(vec![ReleasedListKey::new(
+            "stickiness.enabled",
+            Value::Concrete(ConcreteValue::String("true".into())),
+        )])
+        .expect("saved release fixture has one key"),
+    });
 
     let sorted_resources = vec![
         Resource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
@@ -899,7 +939,7 @@ fn plan_file_serde_round_trip() {
         "aws"
     );
     assert!(deserialized.backend_config.is_some());
-    assert_eq!(deserialized.plan.effects().len(), 2);
+    assert_eq!(deserialized.plan.effects().len(), 3);
     assert_eq!(deserialized.sorted_resources.len(), 1);
     assert_eq!(deserialized.unresolved_resources.len(), 1);
     assert_eq!(
@@ -927,6 +967,18 @@ fn plan_file_serde_round_trip() {
         }),
         "a decoded plan effect must retain its saved module-source type",
     );
+    let carina_core::effect::UnresolvedSavedEffect::ReleaseListKeys {
+        attribute,
+        key_field,
+        keys,
+        ..
+    } = &deserialized.plan.effects()[2]
+    else {
+        panic!("fixture release effect did not survive plan-file round-trip");
+    };
+    assert_eq!(attribute, "settings");
+    assert_eq!(key_field.as_str(), "key");
+    assert_eq!(keys[0].key(), "stickiness.enabled");
     let reserialized = serde_json::to_value(&deserialized).unwrap();
     assert_eq!(
         reserialized["plan"]["effects"][0]["Create"]["module_source"],

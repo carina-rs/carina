@@ -225,6 +225,7 @@ fn encode_attribute_schema(encoder: &mut CanonicalEncoder, schema: &AttributeSch
         removable,
         block_name,
         write_only,
+        keyed_partial_update,
         identity,
         deferred_populate,
     } = schema;
@@ -238,6 +239,9 @@ fn encode_attribute_schema(encoder: &mut CanonicalEncoder, schema: &AttributeSch
     encoder.option(*removable, CanonicalEncoder::bool);
     encoder.option(block_name.as_deref(), CanonicalEncoder::string);
     encoder.bool(*write_only);
+    encoder.option(keyed_partial_update.as_ref(), |encoder, keyed| {
+        encoder.string(keyed.key_field().as_str());
+    });
     encoder.bool(*identity);
     encoder.bool(*deferred_populate);
 }

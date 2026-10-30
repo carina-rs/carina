@@ -74,6 +74,13 @@ pub(super) fn build_plan_title(summary: &PlanSummary) -> Line<'static> {
                 ));
                 spans.push(Span::raw(" to move"));
             }
+            PlanSummaryPart::Release { count } => {
+                spans.push(Span::styled(
+                    count.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+                spans.push(Span::raw(" to release"));
+            }
             PlanSummaryPart::Wait { count } => {
                 spans.push(Span::styled(
                     count.to_string(),

@@ -597,6 +597,8 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 33 adds the typed keyed-list release effect.
+    ///
     /// Plan format 32 records provider-instance reference-scope evidence and
     /// the create-outcome-unknown marker for provider protocol v13.
     ///
@@ -862,6 +864,8 @@ struct ProviderEvidence {
 /// inventory to match every referenced type exactly and the provider-artifact
 /// keys to match the providers implied by the saved provider configurations.
 ///
+/// Format 33 adds typed keyed-list release effects.
+///
 /// Format 32 records provider-instance reference-scope evidence and the
 /// create-outcome-unknown marker for provider protocol v13.
 ///
@@ -877,7 +881,7 @@ pub struct PlanFile {
     evidence: ProviderEvidence,
 }
 
-/// Private format-32 wire representation.
+/// Private format-33 wire representation.
 ///
 /// Field order is intentionally identical to the historical `PlanFile`
 /// serialization order. Evidence is mandatory and is never defaulted.
@@ -1540,6 +1544,9 @@ impl<S> PlanFileContents<S> {
                     insert(&mut references, from, SchemaKind::Resource);
                     insert(&mut references, to, SchemaKind::Resource);
                 }
+                Effect::ReleaseListKeys { id, .. } => {
+                    insert(&mut references, id, SchemaKind::Resource);
+                }
                 Effect::Wait {
                     identity: _identity,
                     target_id,
@@ -1615,9 +1622,10 @@ impl<S> PlanFileContents<S> {
                     insert(&mut instances, &from.id);
                     insert(&mut instances, &to.id);
                 }
-                Effect::Delete { id, .. } | Effect::Import { id, .. } | Effect::Remove { id } => {
-                    insert(&mut instances, id)
-                }
+                Effect::Delete { id, .. }
+                | Effect::Import { id, .. }
+                | Effect::Remove { id }
+                | Effect::ReleaseListKeys { id, .. } => insert(&mut instances, id),
                 Effect::DeferredCreate { id, template } => {
                     insert(&mut instances, id);
                     insert(&mut instances, &template.template_resource.id);
@@ -1712,7 +1720,8 @@ impl UnresolvedPlanFileContents {
                 }
                 UnresolvedSavedEffect::Delete { id, .. }
                 | UnresolvedSavedEffect::Import { id, .. }
-                | UnresolvedSavedEffect::Remove { id } => {
+                | UnresolvedSavedEffect::Remove { id }
+                | UnresolvedSavedEffect::ReleaseListKeys { id, .. } => {
                     insert(&mut references, id, SchemaKind::Resource);
                 }
                 UnresolvedSavedEffect::DeferredCreate { template, .. } => {
@@ -1792,7 +1801,8 @@ impl UnresolvedPlanFileContents {
                 }
                 UnresolvedSavedEffect::Delete { id, .. }
                 | UnresolvedSavedEffect::Import { id, .. }
-                | UnresolvedSavedEffect::Remove { id } => insert(&mut instances, id),
+                | UnresolvedSavedEffect::Remove { id }
+                | UnresolvedSavedEffect::ReleaseListKeys { id, .. } => insert(&mut instances, id),
                 UnresolvedSavedEffect::DeferredCreate { id, template } => {
                     insert(&mut instances, id);
                     insert(&mut instances, &template.template_resource.id);
@@ -1841,7 +1851,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 32;
+    pub const CURRENT_VERSION: u32 = 33;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -2254,7 +2264,10 @@ impl PlanFile {
                 }
                 UnresolvedSavedEffect::Delete { id, .. }
                 | UnresolvedSavedEffect::Import { id, .. }
-                | UnresolvedSavedEffect::Remove { id } => require_identity(id, &location)?,
+                | UnresolvedSavedEffect::Remove { id }
+                | UnresolvedSavedEffect::ReleaseListKeys { id, .. } => {
+                    require_identity(id, &location)?
+                }
                 UnresolvedSavedEffect::Wait {
                     identity,
                     target_id,
@@ -2352,7 +2365,17 @@ impl PlanFile {
                         replacement.delete_idx
                     ));
                 }
-                _ => {
+                UnresolvedSavedEffect::Read { .. }
+                | UnresolvedSavedEffect::Create(_)
+                | UnresolvedSavedEffect::ResumeCreate { .. }
+                | UnresolvedSavedEffect::Update { .. }
+                | UnresolvedSavedEffect::Import { .. }
+                | UnresolvedSavedEffect::Remove { .. }
+                | UnresolvedSavedEffect::Move { .. }
+                | UnresolvedSavedEffect::ReleaseListKeys { .. }
+                | UnresolvedSavedEffect::Wait { .. }
+                | UnresolvedSavedEffect::DeferredCreate { .. }
+                | UnresolvedSavedEffect::DeferredReplace(_) => {
                     return Err(format!(
                         "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].delete_idx {} points at {}, expected Delete",
                         replacement.delete_idx,
@@ -2772,7 +2795,17 @@ impl MovedOrigins {
                 Effect::Move { from, to, .. } => {
                     Some((to.as_inner().clone(), from.as_inner().clone()))
                 }
-                _ => None,
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Update { .. }
+                | Effect::Delete { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => None,
             })
             .collect();
         Self { by_destination }
@@ -2786,7 +2819,17 @@ impl MovedOrigins {
                 UnresolvedSavedEffect::Move { from, to, .. } => {
                     Some((to.as_inner().clone(), from.as_inner().clone()))
                 }
-                _ => None,
+                UnresolvedSavedEffect::Read { .. }
+                | UnresolvedSavedEffect::Create(_)
+                | UnresolvedSavedEffect::ResumeCreate { .. }
+                | UnresolvedSavedEffect::Update { .. }
+                | UnresolvedSavedEffect::Delete { .. }
+                | UnresolvedSavedEffect::Import { .. }
+                | UnresolvedSavedEffect::Remove { .. }
+                | UnresolvedSavedEffect::ReleaseListKeys { .. }
+                | UnresolvedSavedEffect::Wait { .. }
+                | UnresolvedSavedEffect::DeferredCreate { .. }
+                | UnresolvedSavedEffect::DeferredReplace(_) => None,
             })
             .collect();
         Self { by_destination }
@@ -4114,6 +4157,8 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
+        // carina#4118: bumped 32→33 — keyed partial-update releases add a
+        // serialized state-only Effect variant.
         // carina#4067: bumped 29→31 — saved plans retain authored
         // `ignore_changes` paths and re-resolve them only after schema
         // fingerprint verification. Version 30 was never emitted; provider

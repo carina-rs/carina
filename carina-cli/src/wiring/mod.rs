@@ -7787,7 +7787,16 @@ pub fn add_state_block_effects(
                 ..
             } => true,
             Effect::Create(resource) => !suppress_create.contains(&resource.id),
-            _ => true,
+            Effect::Read { .. }
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => true,
         });
     }
 
@@ -7886,7 +7895,21 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
                 generation: EffectGeneration::Current,
                 ..
             } => !deletes_to_absorb.contains(id),
-            _ => true,
+            Effect::Delete {
+                generation: EffectGeneration::Deposed(_),
+                ..
+            }
+            | Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => true,
         });
     }
 

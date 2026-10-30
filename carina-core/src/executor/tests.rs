@@ -16,7 +16,7 @@ use crate::effect::deps::{
 };
 use crate::effect::{
     DeferredReplaceDelete, DeferredReplacePayload, DeletedInstanceKey, EffectGeneration,
-    NonEmptyDeletes,
+    NonEmptyDeletes, ReleasedListKey, ReleasedListKeys,
 };
 use crate::plan::Plan;
 use crate::provider::{
@@ -6980,6 +6980,80 @@ async fn test_read_effect_is_no_op() {
     let observer = MockObserver::new();
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 0);
+    assert!(provider.calls().is_empty());
+}
+
+#[tokio::test]
+async fn release_list_keys_never_reaches_provider_executor() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let provider = MockProvider::new();
+    let schema = ResourceSchema::new("test.KeyedSettings")
+        .attribute(
+            AttributeSchema::optional(
+                "settings",
+                AttributeType::list(AttributeType::struct_(
+                    "Setting",
+                    vec![
+                        StructField::required("key", AttributeType::string()).build(),
+                        StructField::required("value", AttributeType::string()).build(),
+                    ],
+                )),
+            )
+            .keyed_partial_update("key")
+            .build(),
+        )
+        .validate()
+        .expect("release fixture schema is valid");
+    let key_field = schema
+        .effective_attribute("settings")
+        .and_then(|attribute| attribute.keyed_partial_update())
+        .expect("release fixture has keyed semantics")
+        .key_field()
+        .clone();
+    let mut plan = Plan::new();
+    plan.add(Effect::ReleaseListKeys {
+        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "test.KeyedSettings",
+            "settings",
+        )),
+        attribute: "settings".to_string(),
+        key_field,
+        keys: ReleasedListKeys::try_new(vec![ReleasedListKey::new(
+            "b",
+            Value::Concrete(ConcreteValue::String("2".into())),
+        )])
+        .expect("release fixture has one key"),
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::new(),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
 
     assert_eq!(result.success_count, 0);
     assert_eq!(result.failure_count, 0);

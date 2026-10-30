@@ -2896,6 +2896,45 @@ fn snapshot_server_added_list_elements_changed() {
     insta::assert_snapshot!(output);
 }
 
+/// carina#4118. Omitting an authored keyed partial-update element releases
+/// its authoring record instead of promising a provider-side deletion.
+#[test]
+fn snapshot_keyed_partial_update_release() {
+    let fp = build_plan_from_fixture_name("keyed_partial_update_release");
+    let historical = crate::commands::plan::collect_historical_display_attributes(
+        &fp.plan,
+        &fp.managed_current,
+        fp.state_file.as_ref(),
+    );
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &historical,
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &[],
+        &[],
+        Some(&fp.prev_explicit),
+        None,
+    ));
+
+    assert!(
+        output.contains(
+            "! target_group_attributes[\"b\"]: left as '2' (AWS does not revert omitted keys; write the default value to revert)"
+        ),
+        "key release row missing from plan output:\n{output}"
+    );
+    assert!(
+        output.contains("Plan: 0 to add, 0 to change, 0 to destroy, 1 to release."),
+        "release summary missing from plan output:\n{output}"
+    );
+    assert!(
+        !output.contains("stickiness.type") && !output.contains("load_balancing.algorithm.type"),
+        "server-added elements must stay hidden:\n{output}"
+    );
+    insta::assert_snapshot!(output);
+}
+
 /// carina#3307 + carina#3322 acceptance: when an `ExpansionTrace`
 /// records two leaf resources under a composition call site, the
 /// rendered plan groups them under a

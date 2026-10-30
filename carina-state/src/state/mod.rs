@@ -3,7 +3,7 @@
 use carina_core::binding_index::SecretPreservingAttributes;
 use carina_core::deps::get_resource_dependencies;
 use carina_core::differ::{ComparisonContext, Orphan};
-use carina_core::effect::MoveAuthority;
+use carina_core::effect::{MoveAuthority, ReleaseListKeysEffect};
 use carina_core::executor::{AcceptedRequest, AcceptedRequestKind};
 use carina_core::explicit::{self, ExplicitFields};
 use carina_core::name_override::NameOverrideSource;
@@ -25,7 +25,9 @@ use carina_core::resource::{
     ConcreteValue, Current, DataSource, Directives, PartialReadMarker, PendingReRead,
     PersistedDirectives, ResolvedResource, ResourceId, ResourceIdentity, State, Value,
 };
-use carina_core::schema::{ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys};
+use carina_core::schema::{
+    FieldName, ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys,
+};
 use carina_core::value::{
     PersistedExportValue, PersistedValue, SerializationError, contains_unredacted_secret,
     merge_secrets_into_observation_json, merge_secrets_into_provider_json,
@@ -1615,6 +1617,99 @@ impl StateFile {
 
         *self = next;
         Ok(Some(source))
+    }
+
+    /// Apply a keyed partial-update release to one persisted row.
+    ///
+    /// The effect capability can only be minted from
+    /// `Effect::ReleaseListKeys`, and `key_field` can only be obtained from a
+    /// validated schema declaration. This API mutates authoring metadata only;
+    /// it never changes the provider-observed attribute value.
+    pub fn release_list_keys(
+        &mut self,
+        release: ReleaseListKeysEffect<'_>,
+        key_field: &FieldName,
+    ) -> Result<(), BackendError> {
+        let id = release.id();
+        let Some(position) = self.resources.iter().position(|row| {
+            row.provider == id.provider
+                && row.resource_type == id.resource_type
+                && row.identity.as_str() == id.identity_str()
+                && row.directives.provider_instance == id.provider_instance
+        }) else {
+            return Err(BackendError::InvalidState(format!(
+                "cannot release keyed list entries for {id}: resource row is missing"
+            )));
+        };
+
+        let attribute = release.attribute();
+        let stored = self.resources[position]
+            .persisted_attributes()
+            .and_then(|attributes| attributes.get(attribute))
+            .ok_or_else(|| {
+                BackendError::InvalidState(format!(
+                    "cannot release keyed list entries for {id}.{attribute}: stored list is missing"
+                ))
+            })?;
+        let Value::Concrete(ConcreteValue::List(stored_elements)) = stored else {
+            return Err(BackendError::InvalidState(format!(
+                "cannot release keyed list entries for {id}.{attribute}: stored value is not a list"
+            )));
+        };
+
+        let ExplicitFields::Struct { children } = &mut self.resources[position].explicit else {
+            return Err(BackendError::InvalidState(format!(
+                "cannot release keyed list entries for {id}.{attribute}: root authoring record is not a struct"
+            )));
+        };
+        let authoring = children.get_mut(attribute).ok_or_else(|| {
+            BackendError::InvalidState(format!(
+                "cannot release keyed list entries for {id}.{attribute}: authoring record is missing"
+            ))
+        })?;
+
+        if !matches!(authoring, ExplicitFields::ListElements { .. }) {
+            let element_authoring = match authoring.clone() {
+                ExplicitFields::List { element } => *element,
+                ExplicitFields::Unrecorded => ExplicitFields::Unrecorded,
+                ExplicitFields::Leaf
+                | ExplicitFields::Struct { .. }
+                | ExplicitFields::WholeValue { .. } => authoring.clone(),
+                ExplicitFields::ListElements { .. } => unreachable!("matched above"),
+            };
+            *authoring = ExplicitFields::ListElements {
+                elements: vec![element_authoring; stored_elements.len()],
+            };
+        }
+        let ExplicitFields::ListElements { elements } = authoring else {
+            unreachable!("normalized to ListElements")
+        };
+        if elements.len() != stored_elements.len() {
+            return Err(BackendError::InvalidState(format!(
+                "cannot release keyed list entries for {id}.{attribute}: authoring record has {} elements but stored list has {}",
+                elements.len(),
+                stored_elements.len(),
+            )));
+        }
+
+        let released = release
+            .keys()
+            .iter()
+            .map(|key| key.key())
+            .collect::<HashSet<_>>();
+        for (stored, explicit) in stored_elements.iter().zip(elements.iter_mut()) {
+            let Value::Concrete(ConcreteValue::Map(fields)) = stored else {
+                continue;
+            };
+            let Some(Value::Concrete(ConcreteValue::String(key))) = fields.get(key_field.as_str())
+            else {
+                continue;
+            };
+            if released.contains(key.expose_plaintext()) {
+                *explicit = ExplicitFields::Unrecorded;
+            }
+        }
+        Ok(())
     }
 
     /// Clear only the current instance after a provider verdict says a

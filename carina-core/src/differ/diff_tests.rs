@@ -39,6 +39,42 @@ fn replacement_metadata<'a>(
 }
 
 #[test]
+fn keyed_partial_update_release_requires_the_element_key_to_be_authored() {
+    let mut fields = IndexMap::new();
+    fields.insert(
+        "key".to_string(),
+        Value::Concrete(ConcreteValue::String("b".into())),
+    );
+    fields.insert(
+        "value".to_string(),
+        Value::Concrete(ConcreteValue::String("2".into())),
+    );
+    let saved = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Map(fields),
+    )]));
+    let value_only = crate::explicit::ExplicitFields::ListElements {
+        elements: vec![crate::explicit::ExplicitFields::Struct {
+            children: HashMap::from([("value".to_string(), crate::explicit::ExplicitFields::Leaf)]),
+        }],
+    };
+
+    assert!(authored_saved_keys(&saved, &value_only, "key").is_empty());
+
+    let keyed = crate::explicit::ExplicitFields::ListElements {
+        elements: vec![crate::explicit::ExplicitFields::Struct {
+            children: HashMap::from([
+                ("key".to_string(), crate::explicit::ExplicitFields::Leaf),
+                ("value".to_string(), crate::explicit::ExplicitFields::Leaf),
+            ]),
+        }],
+    };
+    assert_eq!(
+        authored_saved_keys(&saved, &keyed, "key"),
+        std::collections::BTreeSet::from(["b".to_string()])
+    );
+}
+
+#[test]
 fn diff_create_when_not_exists() {
     let desired = Resource::new("bucket", "test");
     let current = State::not_found(ResourceId::with_identity("bucket", "test"));

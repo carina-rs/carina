@@ -51,6 +51,14 @@ pub enum DetailLevel {
 pub struct HistoricalDisplayAttributes {
     updates: HashMap<ResourceId, HistoricalUpdateAttributes>,
     deletes: HashMap<DeletedInstanceKey, HistoricalDeleteAttributes>,
+    releases: HashMap<ResourceId, Vec<HistoricalListKeyRelease>>,
+}
+
+#[derive(Debug, Clone)]
+struct HistoricalListKeyRelease {
+    attribute: String,
+    key_field: String,
+    keys: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,16 +82,48 @@ impl HistoricalDisplayAttributes {
         let mut display = Self {
             updates: HashMap::new(),
             deletes: HashMap::new(),
+            releases: HashMap::new(),
         };
 
         for effect in plan.effects() {
             match effect {
+                Effect::ReleaseListKeys {
+                    id,
+                    attribute,
+                    key_field,
+                    keys,
+                } => display
+                    .releases
+                    .entry(id.as_inner().clone())
+                    .or_default()
+                    .push(HistoricalListKeyRelease {
+                        attribute: attribute.clone(),
+                        key_field: key_field.as_str().to_string(),
+                        keys: keys.iter().map(|key| key.key().to_string()).collect(),
+                    }),
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Update { .. }
+                | Effect::Delete { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => {}
+            }
+        }
+
+        for effect in plan.effects() {
+            match effect {
                 Effect::Update { from, to, .. } => {
+                    let attributes = display.filter_released(&from.id, from.attributes.clone());
                     display.updates.insert(
                         from.id.clone(),
                         HistoricalUpdateAttributes {
                             attributes: mask_attributes_using_secret_shape(
-                                &from.attributes,
+                                &attributes,
                                 &to.attributes,
                             ),
                             stored_attributes: None,
@@ -109,7 +149,16 @@ impl HistoricalDisplayAttributes {
                         },
                     );
                 }
-                _ => {}
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => {}
             }
         }
 
@@ -146,6 +195,35 @@ impl HistoricalDisplayAttributes {
         display
     }
 
+    fn filter_released(
+        &self,
+        id: &ResourceId,
+        mut attributes: HashMap<String, Value>,
+    ) -> HashMap<String, Value> {
+        let Some(releases) = self.releases.get(id) else {
+            return attributes;
+        };
+        for release in releases {
+            let Some(Value::Concrete(ConcreteValue::List(elements))) =
+                attributes.get_mut(&release.attribute)
+            else {
+                continue;
+            };
+            elements.retain(|element| {
+                let Value::Concrete(ConcreteValue::Map(fields)) = element else {
+                    return true;
+                };
+                let Some(Value::Concrete(ConcreteValue::String(key))) =
+                    fields.get(&release.key_field)
+                else {
+                    return true;
+                };
+                !release.keys.contains(key.expose_plaintext())
+            });
+        }
+        attributes
+    }
+
     /// Refine an Update's old-side view using persisted secret shape without
     /// discarding the desired-secret mask established by [`Self::for_plan`].
     pub fn set_update_from_provider_and_persisted(
@@ -154,15 +232,21 @@ impl HistoricalDisplayAttributes {
         provider_attributes: &HashMap<String, Value>,
         persisted_attributes: Option<&PersistedAttributes>,
     ) {
+        let filtered_provider = self.filter_released(&id, provider_attributes.clone());
         let persisted_masked =
-            mask_attributes_using_persisted_shape(provider_attributes, persisted_attributes);
+            mask_attributes_using_persisted_shape(&filtered_provider, persisted_attributes);
         let desired_shape = self.updates.get(&id).map(|entry| &entry.attributes);
         let masked = combine_with_desired_secret_shape(persisted_masked, desired_shape);
+        // Keep the stored anchor unfiltered: its list indices must stay
+        // aligned with `prev_explicit::ListElements` so projection can still
+        // hide server-added defaults. Only the provider/current comparison
+        // view drops released keys.
+        let stored_attributes = persisted_attributes.map(PersistedAttributes::to_values);
         self.updates.insert(
             id,
             HistoricalUpdateAttributes {
                 attributes: masked,
-                stored_attributes: persisted_attributes.map(PersistedAttributes::to_values),
+                stored_attributes,
             },
         );
     }
@@ -285,6 +369,12 @@ fn combine_with_desired_secret_shape(
 pub enum DetailRow {
     /// A preformatted informational line.
     Text { text: String },
+    /// A provider-retained keyed list entry released from authored state.
+    ReleasedListKey {
+        attribute: String,
+        key: String,
+        retained_value: RenderedValue,
+    },
     /// A normal attribute value (for Create/Delete effects)
     Attribute {
         key: String,
@@ -631,6 +721,16 @@ pub fn build_detail_rows_by_instance<S>(
                 annotation: None,
             }]
         }
+        Effect::ReleaseListKeys {
+            attribute, keys, ..
+        } => keys
+            .iter()
+            .map(|key| DetailRow::ReleasedListKey {
+                attribute: attribute.clone(),
+                key: key.key().to_string(),
+                retained_value: render_value(key.retained_value()),
+            })
+            .collect(),
         Effect::Remove { .. }
         | Effect::Move { .. }
         | Effect::Wait { .. }

@@ -186,7 +186,17 @@ pub(super) fn is_runtime_noop<S: Clone>(
 ) -> bool {
     match effect {
         Effect::Read { .. } => !is_deferred_read(effect, data_source_values),
-        _ => effect.is_state_operation() && !effect.is_scheduler_meta(),
+        Effect::Import { .. }
+        | Effect::Remove { .. }
+        | Effect::Move { .. }
+        | Effect::ReleaseListKeys { .. } => true,
+        Effect::Create(_)
+        | Effect::ResumeCreate { .. }
+        | Effect::Update { .. }
+        | Effect::Delete { .. }
+        | Effect::Wait { .. }
+        | Effect::DeferredCreate { .. }
+        | Effect::DeferredReplace(_) => false,
     }
 }
 
@@ -646,7 +656,17 @@ pub(super) async fn execute_effects_sequential<
                         | crate::resource::Current::CreateOutcomeUnknown(_)
                         | crate::resource::Current::MissingIdentifier(_) => None,
                     }),
-                _ => None,
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::Update { .. }
+                | Effect::Delete { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => None,
             };
             let completed_ref = &completed;
             let effect_for_future = effect.clone();
@@ -778,9 +798,10 @@ pub(super) async fn execute_effects_sequential<
                             }
                         }
                         // State operations are handled separately during apply
-                        Effect::Import { .. } | Effect::Remove { .. } | Effect::Move { .. } => {
-                            SingleEffectResult::ReadNoOp
-                        }
+                        Effect::Import { .. }
+                        | Effect::Remove { .. }
+                        | Effect::Move { .. }
+                        | Effect::ReleaseListKeys { .. } => SingleEffectResult::ReadNoOp,
                         Effect::DeferredCreate { .. } => unreachable!(
                             "DeferredCreate is handled synchronously before provider dispatch"
                         ),

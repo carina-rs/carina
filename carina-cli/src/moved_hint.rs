@@ -231,16 +231,40 @@ pub fn detect_moved_block_hints<S>(
                     .filter(|attributes| !attributes.is_empty())
                     .map(|attributes| DestroyCandidate { id, attributes })
             }
-            _ => None,
+            Effect::Delete { .. }
+            | Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => None,
         })
         .collect::<Vec<_>>();
     let mut created = Vec::new();
     for (index, effect) in plan.effects().iter().enumerate() {
-        if let Effect::Create(resource) = effect
-            && !replacement_creates.contains(&index)
-            && let Some(candidate) = create_candidate(resource, schemas, comparison_provider)?
-        {
-            created.push(candidate);
+        match effect {
+            Effect::Create(resource) if !replacement_creates.contains(&index) => {
+                if let Some(candidate) = create_candidate(resource, schemas, comparison_provider)? {
+                    created.push(candidate);
+                }
+            }
+            Effect::Create(_)
+            | Effect::Read { .. }
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => {}
         }
     }
 

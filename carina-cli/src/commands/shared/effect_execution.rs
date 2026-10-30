@@ -160,12 +160,33 @@ fn format_state_only_effect_line<S>(effect: &Effect<S>) -> Option<String> {
         Effect::Move { from, to, .. } => {
             Some(format!("  {} Moving {} -> {}", "->".yellow(), from, to))
         }
-        Effect::DeferredReplace(_) => None,
-        _ => None,
+        Effect::ReleaseListKeys {
+            id,
+            attribute,
+            keys,
+            ..
+        } => Some(format!(
+            "  {} Released {} key{} from authored state for {}.{}",
+            "!".yellow(),
+            keys.len(),
+            if keys.len() == 1 { "" } else { "s" },
+            id,
+            attribute,
+        )),
+        Effect::Read { .. }
+        | Effect::Create(_)
+        | Effect::ResumeCreate { .. }
+        | Effect::Update { .. }
+        | Effect::Delete { .. }
+        | Effect::Import { .. }
+        | Effect::Wait { .. }
+        | Effect::DeferredCreate { .. }
+        | Effect::DeferredReplace(_) => None,
     }
 }
 
-/// Report state-only effects (remove, move) and return their success count.
+/// Report state-only effects (remove, move, keyed-list release) and return
+/// their success count.
 ///
 /// State writeback applies these effects to every checkpoint and to the final
 /// state; this function only emits their user-facing output.

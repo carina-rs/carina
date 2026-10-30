@@ -25,7 +25,18 @@ use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::resolve_wait_predicate;
 use crate::wait::{WaitTargetLookup, resolve_wait_target};
 
-use super::{PlanPriorStates, PresentDiff, diff_present};
+use super::{PlanPriorStates, PlannedListKeyRelease, PresentDiff, diff_present_with_releases};
+
+fn add_key_releases(plan: &mut Plan, id: &ResourceId, releases: Vec<PlannedListKeyRelease>) {
+    for release in releases {
+        plan.add(Effect::ReleaseListKeys {
+            id: ResolvedResourceId::new(id.clone()),
+            attribute: release.attribute,
+            key_field: release.key_field,
+            keys: release.keys,
+        });
+    }
+}
 
 pub(crate) struct PendingReplace {
     pub create: ResolvedResource,
@@ -510,16 +521,18 @@ fn create_plan_parts(
                     comparison_provider.comparison_for(registry, &resource.id)?;
                 let owner_schema = resolved_comparison.owner_schema();
                 let context = resolved_comparison.context();
-                let schema = owner_schema.schema().as_schema();
-                match diff_present(
+                let validated_schema = owner_schema.schema();
+                let schema = validated_schema.as_schema();
+                let result = diff_present_with_releases(
                     resource,
                     present,
                     saved,
                     saved_attrs.nested_write_only(&resource.id),
                     prev_explicit_for_resource,
-                    Some(schema),
+                    validated_schema,
                     context,
-                ) {
+                );
+                match result.diff {
                     PresentDiff::Update {
                         id,
                         from,
@@ -544,6 +557,7 @@ fn create_plan_parts(
                         );
 
                         if changed_attributes.is_empty() {
+                            add_key_releases(&mut plan, &resource.id, result.releases);
                             continue;
                         }
 
@@ -599,14 +613,18 @@ fn create_plan_parts(
                                 to: ResolvedResource::new(to),
                                 changed_attributes,
                             });
+                            add_key_releases(&mut plan, &resource.id, result.releases);
                         }
                     }
                     PresentDiff::NoChange {
                         ignored_readable_differences,
-                    } => plan.record_ignored_readable_differences(
-                        resource.id.clone(),
-                        ignored_readable_differences,
-                    ),
+                    } => {
+                        plan.record_ignored_readable_differences(
+                            resource.id.clone(),
+                            ignored_readable_differences,
+                        );
+                        add_key_releases(&mut plan, &resource.id, result.releases);
+                    }
                 }
             }
         }
@@ -887,7 +905,17 @@ pub fn block_deletes_on_prior_consumer_updates(
                 ),
                 get_resource_dependencies(to.as_resource()),
             )),
-            _ => None,
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => None,
         })
         .collect();
 
@@ -1333,12 +1361,13 @@ fn take_update_from_plan(
         .iter()
         .position(|effect| matches!(effect, Effect::Update { to, .. } if to.id == *resource_id))?;
     let effect = plan.effects_mut().remove(index);
-    match effect {
-        Effect::Update {
-            from, identifier, ..
-        } => Some((from, identifier)),
-        _ => None,
-    }
+    let Effect::Update {
+        from, identifier, ..
+    } = effect
+    else {
+        unreachable!("index selected by the Update variant")
+    };
+    Some((from, identifier))
 }
 
 fn ensure_consumer_update(

@@ -1539,7 +1539,17 @@ fn build_destroy_wait_aliases(
                     .unwrap_or_else(|| id.identity_str().to_string()),
                 dependencies.clone(),
             )),
-            _ => None,
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => None,
         })
         .collect();
     let destroy_targets: HashSet<&str> = delete_dependencies

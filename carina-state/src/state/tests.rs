@@ -1110,6 +1110,105 @@ fn resource_state_identity_is_typed_and_serializes_as_a_plain_string() {
 }
 
 #[test]
+fn release_list_keys_only_demotes_matching_authoring_entries() {
+    use carina_core::effect::{Effect, ReleasedListKey, ReleasedListKeys};
+    use carina_core::schema::{AttributeSchema, AttributeType, StructField};
+
+    let schema = ResourceSchema::new("test.KeyedSettings")
+        .attribute(
+            AttributeSchema::optional(
+                "settings",
+                AttributeType::list(AttributeType::struct_(
+                    "Setting",
+                    vec![
+                        StructField::required("key", AttributeType::string()).build(),
+                        StructField::required("value", AttributeType::string()).build(),
+                    ],
+                )),
+            )
+            .keyed_partial_update("key")
+            .build(),
+        )
+        .validate()
+        .expect("release fixture schema is valid");
+    let key_field = schema
+        .effective_attribute("settings")
+        .and_then(|attribute| attribute.keyed_partial_update())
+        .expect("release fixture has keyed semantics")
+        .key_field()
+        .clone();
+    let stored = serde_json::json!([
+        { "key": "a", "value": "1" },
+        { "key": "b", "value": "2" },
+        { "key": "service-default", "value": "on" }
+    ]);
+    let mut row =
+        ResourceState::try_applied("test.KeyedSettings", "settings", "mock", "provider-id")
+            .expect("fixture identifier is valid")
+            .with_attribute("settings", stored.clone());
+    let authored = || ExplicitFields::Struct {
+        children: HashMap::from([
+            ("key".to_string(), ExplicitFields::Leaf),
+            ("value".to_string(), ExplicitFields::Leaf),
+        ]),
+    };
+    row.explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "settings".to_string(),
+            ExplicitFields::ListElements {
+                elements: vec![authored(), authored(), ExplicitFields::Unrecorded],
+            },
+        )]),
+    };
+    let mut state = StateFile::new();
+    state.upsert_resource(row).expect("insert release fixture");
+    let effect: Effect = Effect::ReleaseListKeys {
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+            "mock",
+            "test.KeyedSettings",
+            "settings",
+            None,
+        )),
+        attribute: "settings".to_string(),
+        key_field: key_field.clone(),
+        keys: ReleasedListKeys::try_new(vec![ReleasedListKey::new(
+            "b",
+            Value::Concrete(ConcreteValue::String("2".into())),
+        )])
+        .expect("release fixture has one key"),
+    };
+
+    state
+        .release_list_keys(
+            effect.as_release_list_keys().expect("release capability"),
+            &key_field,
+        )
+        .expect("release authoring metadata");
+
+    let row = state
+        .find_resource("mock", "test.KeyedSettings", "settings")
+        .expect("released row remains in state");
+    assert_eq!(
+        persisted_json_attribute(
+            row.persisted_attributes()
+                .expect("released row keeps provider attributes"),
+            "settings",
+        ),
+        Some(stored),
+        "release must not change provider-observed list values",
+    );
+    let ExplicitFields::Struct { children } = &row.explicit else {
+        panic!("released row authoring root must remain a struct");
+    };
+    let ExplicitFields::ListElements { elements } = &children["settings"] else {
+        panic!("released list authoring must remain index-aligned");
+    };
+    assert!(matches!(elements[0], ExplicitFields::Struct { .. }));
+    assert!(matches!(elements[1], ExplicitFields::Unrecorded));
+    assert!(matches!(elements[2], ExplicitFields::Unrecorded));
+}
+
+#[test]
 fn test_state_file_upsert_resource() {
     let mut state = StateFile::new();
 

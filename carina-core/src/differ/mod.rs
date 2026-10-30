@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Index;
 
 use crate::binding_index::ManagedBindingStability;
-use crate::effect::MoveAuthority;
+use crate::effect::{MoveAuthority, ReleasedListKey, ReleasedListKeys};
 use crate::provider::{
     LiftedSavedAttrs, NestedWriteOnlyRecord, ProviderError, ProviderResult, ProviderRouter,
     StateTransformMap,
@@ -19,7 +19,7 @@ use crate::resource::{
     Current, Directives, PlanInputCurrent, PresentResourceState, ResolvedResource, Resource,
     ResourceId, State, UnidentifiedState, Value, into_plan_input_current_map,
 };
-use crate::schema::{ResourceSchema, SchemaRegistry};
+use crate::schema::{ResourceSchema, SchemaRegistry, ValidatedResourceSchema};
 
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
@@ -54,16 +54,18 @@ pub fn managed_binding_stability(
         let resolved_comparison = provider.comparison_for(registry, &resource.id)?;
         let owner_schema = resolved_comparison.owner_schema();
         let context = resolved_comparison.context();
-        let schema = owner_schema.schema().as_schema();
-        let changed_attributes = match diff_present(
+        let schema = owner_schema.schema();
+        let changed_attributes = match diff_present_with_releases(
             resource,
             present,
             saved_attrs.get(&resource.id),
             saved_attrs.nested_write_only(&resource.id),
             prev_explicit.get(&resource.id),
-            Some(schema),
+            schema,
             context,
-        ) {
+        )
+        .diff
+        {
             PresentDiff::NoChange { .. } => {
                 result.insert(
                     resource.id.clone(),
@@ -89,7 +91,7 @@ pub fn managed_binding_stability(
             );
             continue;
         }
-        let create_only = schema.create_only_attributes();
+        let create_only = schema.as_schema().create_only_attributes();
         if changed_attributes
             .iter()
             .any(|attribute| create_only.contains(&attribute.as_str()))
@@ -99,6 +101,7 @@ pub fn managed_binding_stability(
         }
         let changed_attributes = changed_attributes.into_iter().collect();
         let refreshable_attributes = schema
+            .as_schema()
             .read_only_attributes()
             .into_iter()
             .map(str::to_string)
@@ -901,6 +904,294 @@ enum PresentDiff {
     NoChange {
         ignored_readable_differences: usize,
     },
+}
+
+#[derive(Debug)]
+pub(super) struct PlannedListKeyRelease {
+    pub(super) attribute: String,
+    pub(super) key_field: crate::schema::FieldName,
+    pub(super) keys: ReleasedListKeys,
+}
+
+struct PresentDiffResult {
+    diff: PresentDiff,
+    releases: Vec<PlannedListKeyRelease>,
+}
+
+fn concrete_list(value: &Value) -> Option<&[Value]> {
+    let Value::Concrete(crate::resource::ConcreteValue::List(items)) = value else {
+        return None;
+    };
+    Some(items)
+}
+
+fn keyed_element_key<'a>(element: &'a Value, key_field: &str) -> Option<&'a str> {
+    let Value::Concrete(crate::resource::ConcreteValue::Map(fields)) = element else {
+        return None;
+    };
+    let Value::Concrete(crate::resource::ConcreteValue::String(key)) = fields.get(key_field)?
+    else {
+        return None;
+    };
+    Some(key.expose_plaintext())
+}
+
+fn retained_key_value(element: &Value, key_field: &str) -> Value {
+    let Value::Concrete(crate::resource::ConcreteValue::Map(fields)) = element else {
+        return element.clone();
+    };
+    let mut retained = fields.clone();
+    retained.shift_remove(key_field);
+    if retained.len() == 1 {
+        retained.into_values().next().expect("length checked")
+    } else {
+        Value::Concrete(crate::resource::ConcreteValue::Map(retained))
+    }
+}
+
+fn unique_elements_by_key<'a>(
+    value: &'a Value,
+    key_field: &str,
+) -> Option<std::collections::BTreeMap<&'a str, &'a Value>> {
+    let mut by_key = std::collections::BTreeMap::new();
+    for element in concrete_list(value)? {
+        let key = keyed_element_key(element, key_field)?;
+        if by_key.insert(key, element).is_some() {
+            return None;
+        }
+    }
+    Some(by_key)
+}
+
+fn authored_saved_keys(
+    saved_value: &Value,
+    authoring: &crate::explicit::ExplicitFields,
+    key_field: &str,
+) -> std::collections::BTreeSet<String> {
+    let Some(elements) = concrete_list(saved_value) else {
+        return std::collections::BTreeSet::new();
+    };
+    match authoring {
+        crate::explicit::ExplicitFields::Unrecorded => std::collections::BTreeSet::new(),
+        crate::explicit::ExplicitFields::ListElements { elements: records }
+            if records.len() != elements.len() =>
+        {
+            std::collections::BTreeSet::new()
+        }
+        crate::explicit::ExplicitFields::ListElements { elements: records } => records
+            .iter()
+            .zip(elements)
+            .filter(|(record, _)| key_field_was_authored(record, key_field))
+            .filter_map(|(_, element)| keyed_element_key(element, key_field).map(str::to_owned))
+            .collect(),
+        crate::explicit::ExplicitFields::List { element }
+            if !key_field_was_authored(element, key_field) =>
+        {
+            std::collections::BTreeSet::new()
+        }
+        crate::explicit::ExplicitFields::Struct { .. }
+            if !key_field_was_authored(authoring, key_field) =>
+        {
+            std::collections::BTreeSet::new()
+        }
+        crate::explicit::ExplicitFields::Leaf
+        | crate::explicit::ExplicitFields::Struct { .. }
+        | crate::explicit::ExplicitFields::List { .. }
+        | crate::explicit::ExplicitFields::WholeValue { .. } => elements
+            .iter()
+            .filter_map(|element| keyed_element_key(element, key_field).map(str::to_owned))
+            .collect(),
+    }
+}
+
+fn key_field_was_authored(record: &crate::explicit::ExplicitFields, key_field: &str) -> bool {
+    match record {
+        crate::explicit::ExplicitFields::Unrecorded => false,
+        crate::explicit::ExplicitFields::Struct { children } => children
+            .get(key_field)
+            .is_some_and(|field| !matches!(field, crate::explicit::ExplicitFields::Unrecorded)),
+        crate::explicit::ExplicitFields::List { element } => {
+            key_field_was_authored(element, key_field)
+        }
+        // Leaf is the legacy whole-value record. WholeValue deliberately
+        // retains whole-list authoring when identity could not be transferred.
+        crate::explicit::ExplicitFields::Leaf
+        | crate::explicit::ExplicitFields::WholeValue { .. } => true,
+        // A nested list cannot be the scalar string key proven by schema
+        // validation. Treat malformed legacy metadata as no evidence rather
+        // than releasing a key on a guess.
+        crate::explicit::ExplicitFields::ListElements { .. } => false,
+    }
+}
+
+fn find_keyed_partial_update_releases(
+    desired: &HashMap<String, Value>,
+    current: &HashMap<String, Value>,
+    saved: Option<&HashMap<String, Value>>,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: &ValidatedResourceSchema,
+) -> Vec<PlannedListKeyRelease> {
+    let (Some(saved), Some(crate::explicit::ExplicitFields::Struct { children })) =
+        (saved, prev_explicit)
+    else {
+        return Vec::new();
+    };
+
+    schema
+        .effective_attributes()
+        .filter_map(|attribute| {
+            let semantics = attribute.keyed_partial_update()?;
+            let key_field = semantics.key_field().as_str();
+            let name = attribute.name();
+            let saved_value = saved.get(name)?;
+            let authoring = children.get(name)?;
+            let authored = authored_saved_keys(saved_value, authoring, key_field);
+            if authored.is_empty() {
+                return None;
+            }
+
+            let desired_by_key = match desired.get(name) {
+                Some(value) => unique_elements_by_key(value, key_field)?,
+                None => std::collections::BTreeMap::new(),
+            };
+            let current_by_key = current
+                .get(name)
+                .and_then(|value| unique_elements_by_key(value, key_field))?;
+
+            let keys = authored
+                .into_iter()
+                .filter(|key| !desired_by_key.contains_key(key.as_str()))
+                .filter_map(|key| {
+                    current_by_key.get(key.as_str()).map(|element| {
+                        ReleasedListKey::new(key, retained_key_value(element, key_field))
+                    })
+                })
+                .collect::<Vec<_>>();
+            ReleasedListKeys::try_new(keys)
+                .ok()
+                .map(|keys| PlannedListKeyRelease {
+                    attribute: name.to_string(),
+                    key_field: semantics.key_field().clone(),
+                    keys,
+                })
+        })
+        .collect()
+}
+
+fn remove_keys_from_list(value: &mut Value, key_field: &str, released: &HashSet<&str>) {
+    let Value::Concrete(crate::resource::ConcreteValue::List(elements)) = value else {
+        return;
+    };
+    elements.retain(|element| {
+        keyed_element_key(element, key_field).is_none_or(|key| !released.contains(key))
+    });
+}
+
+fn filter_explicit_list_elements(
+    explicit: &mut crate::explicit::ExplicitFields,
+    saved_value: &Value,
+    key_field: &str,
+    released: &HashSet<&str>,
+) {
+    let crate::explicit::ExplicitFields::ListElements { elements: records } = explicit else {
+        return;
+    };
+    let Some(saved_elements) = concrete_list(saved_value) else {
+        return;
+    };
+    if records.len() != saved_elements.len() {
+        return;
+    }
+    let mut index = 0usize;
+    records.retain(|_| {
+        let keep = keyed_element_key(&saved_elements[index], key_field)
+            .is_none_or(|key| !released.contains(key));
+        index += 1;
+        keep
+    });
+}
+
+fn diff_present_with_releases(
+    desired: &ResolvedResource,
+    current: &PresentResourceState,
+    saved: Option<&HashMap<String, Value>>,
+    nested_write_only: &NestedWriteOnlyRecord,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: &ValidatedResourceSchema,
+    context: &ComparisonContext<'_>,
+) -> PresentDiffResult {
+    let releases = find_keyed_partial_update_releases(
+        &desired.resolved_attributes(),
+        &current.state().attributes,
+        saved,
+        prev_explicit,
+        schema,
+    );
+    if releases.is_empty() {
+        return PresentDiffResult {
+            diff: diff_present(
+                desired,
+                current,
+                saved,
+                nested_write_only,
+                prev_explicit,
+                Some(schema.as_schema()),
+                context,
+            ),
+            releases,
+        };
+    }
+
+    let mut filtered_current = current.state().clone();
+    let mut filtered_saved = saved.cloned();
+    let mut filtered_explicit = prev_explicit.cloned();
+    for release in &releases {
+        let attribute = schema
+            .effective_attribute(&release.attribute)
+            .and_then(|attribute| attribute.keyed_partial_update())
+            .expect("release detection only returns validated keyed attributes");
+        let key_field = attribute.key_field().as_str();
+        let released = release
+            .keys
+            .iter()
+            .map(ReleasedListKey::key)
+            .collect::<HashSet<_>>();
+        if let Some(value) = filtered_current.attributes.get_mut(&release.attribute) {
+            remove_keys_from_list(value, key_field, &released);
+        }
+        if let (Some(saved), Some(crate::explicit::ExplicitFields::Struct { children })) =
+            (filtered_saved.as_mut(), filtered_explicit.as_mut())
+            && let (Some(saved_value), Some(explicit)) = (
+                saved.get(&release.attribute),
+                children.get_mut(&release.attribute),
+            )
+        {
+            filter_explicit_list_elements(explicit, saved_value, key_field, &released);
+        }
+        if let Some(value) = filtered_saved
+            .as_mut()
+            .and_then(|saved| saved.get_mut(&release.attribute))
+        {
+            remove_keys_from_list(value, key_field, &released);
+        }
+    }
+
+    let mut diff = diff_existing_state(
+        desired,
+        &filtered_current,
+        filtered_saved.as_ref(),
+        nested_write_only,
+        filtered_explicit.as_ref(),
+        Some(schema.as_schema()),
+        context,
+    );
+    if let PresentDiff::Update { from, .. } = &mut diff {
+        // Filtering exists only to answer whether omission itself is a
+        // provider change. Provider requests still need the complete refreshed
+        // `from` state for read-modify-write implementations.
+        **from = current.state().clone();
+    }
+    PresentDiffResult { diff, releases }
 }
 
 fn diff_present(
