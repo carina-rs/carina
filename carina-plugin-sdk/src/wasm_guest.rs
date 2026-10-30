@@ -7,6 +7,19 @@
 use carina_provider_protocol::PERSISTED_SECRET_KEY;
 use carina_provider_protocol::types as proto;
 
+/// Decode the version-13 `desired-resource` record into the SDK's typed view.
+///
+/// This is public only because [`crate::export_provider!`] expands in the
+/// provider crate. Provider implementations receive [`crate::DesiredResource`]
+/// and never the raw deferred-name list.
+#[doc(hidden)]
+pub fn decode_desired_resource(
+    resource: proto::Resource,
+    deferred: Vec<String>,
+) -> Result<crate::DesiredResource, crate::DesiredResourceDecodeError> {
+    crate::DesiredResource::decode(resource, deferred)
+}
+
 /// Render one error chain for protocol-v13 metadata's string-only failure
 /// channel. Each source is appended at most once even when a legacy outer
 /// display already includes its immediate source text.
@@ -1586,6 +1599,23 @@ macro_rules! export_provider {
                 })
             }
 
+            fn desired_resource_decode_to_provider_error(
+                error: $crate::DesiredResourceDecodeError,
+            ) -> wit_types::ProviderError {
+                wit_types::ProviderError::Internal(wit_types::ErrorDetail {
+                    message: format!(
+                        "WASM boundary decode error in normalize_desired: {error}"
+                    ),
+                    resource_id: None,
+                    cause: None,
+                    provider_name: None,
+                    operation: Some("normalize_desired".to_string()),
+                    status: None,
+                    code: None,
+                    request_id: None,
+                })
+            }
+
             fn boundary_applied_identifier_decode_to_provider_error(
                 operation: &'static str,
                 error: proto::EmptyAppliedIdentifier,
@@ -2165,15 +2195,26 @@ macro_rules! export_provider {
                 }
 
                 fn normalize_desired(
-                    resources: Vec<wit_types::ResourceDef>,
+                    resources: Vec<exports::carina::provider::provider::DesiredResource>,
                 ) -> Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError> {
                     let proto_resources = resources
-                        .iter()
-                        .map(wit_to_proto_resource)
-                        .collect::<Result<_, _>>()
-                        .map_err(|error| {
-                            boundary_decode_to_provider_error("normalize_desired", None, error)
-                        })?;
+                        .into_iter()
+                        .map(|desired| {
+                            let exports::carina::provider::provider::DesiredResource {
+                                resource,
+                                deferred,
+                            } = desired;
+                            let resource = wit_to_proto_resource(&resource).map_err(|error| {
+                                boundary_decode_to_provider_error(
+                                    "normalize_desired",
+                                    None,
+                                    error,
+                                )
+                            })?;
+                            helpers::decode_desired_resource(resource, deferred)
+                                .map_err(desired_resource_decode_to_provider_error)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     // Keep the mutex guard's lexical scope limited to the
                     // provider call; bridge result and encoding work does not
                     // require access to the shared provider.

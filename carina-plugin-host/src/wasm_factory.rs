@@ -2242,16 +2242,36 @@ pub(crate) mod version_checked_bindings {
             desired: &secret_seal::SealedDesired,
         ) -> wasmtime::Result<Result<secret_seal::GuestDesired, wit_types::ProviderError>> {
             desired
-                .send(|resources| async move {
+                .send(|resources, deferred| async move {
                     match &self.raw {
                         RawWasmBindings::Basic(b) => {
+                            let desired = resources
+                                .iter()
+                                .zip(deferred)
+                                .map(|(resource, deferred)| {
+                                    basic::exports::carina::provider::provider::DesiredResource {
+                                        resource: resource.clone(),
+                                        deferred: deferred.clone(),
+                                    }
+                                })
+                                .collect::<Vec<_>>();
                             b.carina_provider_provider()
-                                .call_normalize_desired(store, resources)
+                                .call_normalize_desired(store, &desired)
                                 .await
                         }
                         RawWasmBindings::Http(b) => {
+                            let desired = resources
+                                .iter()
+                                .zip(deferred)
+                                .map(|(resource, deferred)| {
+                                    http::exports::carina::provider::provider::DesiredResource {
+                                        resource: resource.clone(),
+                                        deferred: deferred.clone(),
+                                    }
+                                })
+                                .collect::<Vec<_>>();
                             b.carina_provider_provider()
-                                .call_normalize_desired(store, resources)
+                                .call_normalize_desired(store, &desired)
                                 .await
                         }
                     }
@@ -2268,13 +2288,31 @@ pub(crate) mod version_checked_bindings {
         {
             match &self.raw {
                 RawWasmBindings::Basic(b) => {
+                    let desired = resources
+                        .iter()
+                        .map(|resource| {
+                            basic::exports::carina::provider::provider::DesiredResource {
+                                resource: resource.clone(),
+                                deferred: Vec::new(),
+                            }
+                        })
+                        .collect::<Vec<_>>();
                     b.carina_provider_provider()
-                        .call_normalize_desired(store, resources)
+                        .call_normalize_desired(store, &desired)
                         .await
                 }
                 RawWasmBindings::Http(b) => {
+                    let desired = resources
+                        .iter()
+                        .map(|resource| {
+                            http::exports::carina::provider::provider::DesiredResource {
+                                resource: resource.clone(),
+                                deferred: Vec::new(),
+                            }
+                        })
+                        .collect::<Vec<_>>();
                     b.carina_provider_provider()
-                        .call_normalize_desired(store, resources)
+                        .call_normalize_desired(store, &desired)
                         .await
                 }
             }
@@ -6356,6 +6394,17 @@ struct StrippedAttribute {
 /// Attributes removed from a resource slice, grouped by slice position.
 struct StrippedAttributes(Vec<Vec<StrippedAttribute>>);
 
+impl StrippedAttributes {
+    /// Exact top-level names withheld from each resource, preserving resource
+    /// position and the resource's original attribute order.
+    fn deferred_names(&self) -> Vec<Vec<String>> {
+        self.0
+            .iter()
+            .map(|entries| entries.iter().map(|entry| entry.key.clone()).collect())
+            .collect()
+    }
+}
+
 /// Strip every resource attribute that the WASM provider boundary refuses to
 /// serialize, retaining the original `IndexMap` positions for restoration.
 fn strip_provider_boundary_attributes<S>(resources: &mut [Resource<S>]) -> StrippedAttributes {
@@ -6402,18 +6451,22 @@ fn restore_stripped_attributes<S>(resources: &mut [Resource<S>], stripped: Strip
 /// Run one WASM desired-normalization boundary call with unsupported
 /// attributes temporarily removed.
 ///
-/// The higher-ranked callback keeps the stripped slice scoped to this one
-/// operation. Attributes are restored before returning on both success and
-/// error.
+/// The callback receives the names derived from the same stripping result that
+/// retains the values. Attributes are restored before returning on both
+/// success and error.
 async fn with_wasm_serializable_resources<S, F>(
     resources: &mut [Resource<S>],
     operation: F,
 ) -> ProviderResult<()>
 where
-    F: for<'a> FnOnce(&'a mut [Resource<S>]) -> BoxFuture<'a, ProviderResult<()>>,
+    F: for<'a> FnOnce(
+        &'a mut [Resource<S>],
+        &'a [Vec<String>],
+    ) -> BoxFuture<'a, ProviderResult<()>>,
 {
     let stripped = strip_provider_boundary_attributes(resources);
-    let result = operation(resources).await;
+    let deferred_names = stripped.deferred_names();
+    let result = operation(resources, &deferred_names).await;
     restore_stripped_attributes(resources, stripped);
     result
 }
@@ -6425,11 +6478,12 @@ impl ProviderNormalizer for WasmProviderNormalizer {
     ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         let instance = Arc::clone(&self.instance);
         Box::pin(async move {
-            with_wasm_serializable_resources(resources, move |resources| {
+            with_wasm_serializable_resources(resources, move |resources, deferred_names| {
                 Box::pin(async move {
-                    let (sealed, unsealer) = secret_seal::seal(resources).map_err(|error| {
-                        wasm_value_encode_provider_error("normalize_desired", error)
-                    })?;
+                    let (sealed, unsealer) =
+                        secret_seal::seal_with_deferred(resources, deferred_names).map_err(
+                            |error| wasm_value_encode_provider_error("normalize_desired", error),
+                        )?;
 
                     // Plain `.await`, not a nested `block_on`: the guarded store is
                     // acquired and dropped within this one polled future, so the
@@ -7736,6 +7790,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stripped_attributes_expose_exact_deferred_names_by_resource_position() {
+        let mut first = Resource::new("test.t", "first");
+        first.set_attr("known", test_string_value("known"));
+        first.set_attr(
+            "pending",
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
+        );
+        first.set_attr("peer", Value::resource_ref("peer", "identifier", vec![]));
+        let mut second = Resource::new("test.t", "second");
+        second.set_attr("known", test_string_value("known"));
+        let mut third = Resource::new("test.t", "third");
+        third.set_attr(
+            "nested",
+            Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
+                DeferredValue::Unknown(UnknownReason::ForValue),
+            )])),
+        );
+        let mut resources = vec![first, second, third];
+
+        let stripped = strip_provider_boundary_attributes(&mut resources);
+
+        assert_eq!(
+            stripped.deferred_names(),
+            vec![
+                vec!["pending".to_string(), "peer".to_string()],
+                Vec::new(),
+                vec!["nested".to_string()],
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn wasm_serializable_resources_restores_original_attribute_order() {
         let mut resource = Resource::new("test.t", "n");
@@ -7750,7 +7836,7 @@ mod tests {
         let mut resources = vec![resource];
         let original_attributes = resources[0].attributes.clone();
 
-        with_wasm_serializable_resources(&mut resources, |resources| {
+        with_wasm_serializable_resources(&mut resources, |resources, _deferred_names| {
             Box::pin(async move {
                 assert_eq!(
                     resources[0].attributes.keys().collect::<Vec<_>>(),
@@ -7801,7 +7887,7 @@ mod tests {
         assert_eq!(first.id, second.id, "the regression requires duplicate IDs");
         let mut resources = vec![first, second];
 
-        with_wasm_serializable_resources(&mut resources, |resources| {
+        with_wasm_serializable_resources(&mut resources, |resources, _deferred_names| {
             Box::pin(async move {
                 for resource in resources {
                     assert_eq!(
@@ -7898,7 +7984,7 @@ mod tests {
         let mut resources = vec![resource];
         let original_attributes = resources[0].attributes.clone();
 
-        with_wasm_serializable_resources(&mut resources, |resources| {
+        with_wasm_serializable_resources(&mut resources, |resources, _deferred_names| {
             Box::pin(async move {
                 assert_eq!(
                     resources[0].attributes.keys().collect::<Vec<_>>(),
@@ -7937,17 +8023,18 @@ mod tests {
         let mut resources = vec![resource];
         let before = resources[0].attributes.clone();
 
-        let error = with_wasm_serializable_resources(&mut resources, |resources| {
-            Box::pin(async move {
-                assert_eq!(
-                    resources[0].attributes.keys().collect::<Vec<_>>(),
-                    vec!["stable"]
-                );
-                Err(ProviderError::internal("boundary failed"))
+        let error =
+            with_wasm_serializable_resources(&mut resources, |resources, _deferred_names| {
+                Box::pin(async move {
+                    assert_eq!(
+                        resources[0].attributes.keys().collect::<Vec<_>>(),
+                        vec!["stable"]
+                    );
+                    Err(ProviderError::internal("boundary failed"))
+                })
             })
-        })
-        .await
-        .expect_err("the boundary error must propagate");
+            .await
+            .expect_err("the boundary error must propagate");
 
         assert_eq!(error.detail().context(), "boundary failed");
         assert_eq!(

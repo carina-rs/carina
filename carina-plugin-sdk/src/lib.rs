@@ -921,6 +921,120 @@ impl<'de> serde::Deserialize<'de> for Never {
     }
 }
 
+/// The state of one top-level desired resource attribute at normalization time.
+///
+/// The host holds unresolved attributes back from the WASM value boundary. A
+/// provider must therefore distinguish an attribute the user omitted from one
+/// whose value exists but cannot be observed until its dependency resolves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DesiredAttribute<T> {
+    Known(T),
+    Absent,
+    Deferred,
+}
+
+/// A desired resource decoded from the WASM normalization boundary.
+///
+/// Attribute storage and the host's deferred-name set stay private so callers
+/// cannot accidentally interpret a missing map entry as user-authored
+/// absence. Use [`DesiredResource::attribute`] or
+/// [`DesiredResource::attribute_mut`] for the required three-way query.
+#[derive(Debug)]
+pub struct DesiredResource {
+    resource: Resource,
+    deferred: std::collections::BTreeSet<String>,
+}
+
+/// Invalid `desired-resource` input received from the WASM host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesiredResourceDecodeError {
+    DuplicateDeferredAttribute { name: String },
+    DeferredAttributePresent { name: String },
+}
+
+impl std::fmt::Display for DesiredResourceDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateDeferredAttribute { name } => {
+                write!(
+                    formatter,
+                    "deferred attribute name '{name}' appears more than once"
+                )
+            }
+            Self::DeferredAttributePresent { name } => write!(
+                formatter,
+                "attribute '{name}' is both present in the resource and marked deferred"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DesiredResourceDecodeError {}
+
+impl DesiredResource {
+    #[cfg(any(target_arch = "wasm32", test))]
+    fn decode(
+        resource: Resource,
+        deferred: Vec<String>,
+    ) -> Result<Self, DesiredResourceDecodeError> {
+        let mut deferred_names = std::collections::BTreeSet::new();
+        for name in deferred {
+            if !deferred_names.insert(name.clone()) {
+                return Err(DesiredResourceDecodeError::DuplicateDeferredAttribute { name });
+            }
+        }
+        if let Some(name) = deferred_names
+            .iter()
+            .find(|name| resource.attributes.contains_key(name.as_str()))
+        {
+            return Err(DesiredResourceDecodeError::DeferredAttributePresent {
+                name: name.clone(),
+            });
+        }
+        Ok(Self {
+            resource,
+            deferred: deferred_names,
+        })
+    }
+
+    /// Resource identity used for provider dispatch and diagnostics.
+    pub fn id(&self) -> &ResourceId {
+        &self.resource.id
+    }
+
+    /// Query one top-level attribute without conflating absence and deferral.
+    pub fn attribute(&self, name: &str) -> DesiredAttribute<&Value> {
+        if self.deferred.contains(name) {
+            DesiredAttribute::Deferred
+        } else {
+            self.resource
+                .attributes
+                .get(name)
+                .map_or(DesiredAttribute::Absent, DesiredAttribute::Known)
+        }
+    }
+
+    /// Mutably query one known top-level attribute.
+    ///
+    /// Deferred and absent attributes cannot be synthesized through this
+    /// method; both remain explicit enum variants.
+    pub fn attribute_mut(&mut self, name: &str) -> DesiredAttribute<&mut Value> {
+        if self.deferred.contains(name) {
+            DesiredAttribute::Deferred
+        } else {
+            self.resource
+                .attributes
+                .get_mut(name)
+                .map_or(DesiredAttribute::Absent, DesiredAttribute::Known)
+        }
+    }
+
+    /// Consume the typed view and return the resource sent back to the host.
+    pub fn into_resource(self) -> Resource {
+        self.resource
+    }
+}
+
 /// Trait that provider authors implement.
 #[allow(clippy::result_large_err)]
 pub trait CarinaProvider {
@@ -1100,8 +1214,17 @@ pub trait CarinaProvider {
     }
 
     /// Normalize desired resources (optional).
-    fn normalize_desired(&self, resources: Vec<Resource>) -> Result<Vec<Resource>, ProviderError> {
-        Ok(resources)
+    ///
+    /// Every attribute lookup is a three-way query: known, absent, or deferred
+    /// because the host temporarily withholds unresolved values from WASM.
+    fn normalize_desired(
+        &self,
+        resources: Vec<DesiredResource>,
+    ) -> Result<Vec<Resource>, ProviderError> {
+        Ok(resources
+            .into_iter()
+            .map(DesiredResource::into_resource)
+            .collect())
     }
 
     /// Normalize read-back state (optional).
@@ -1410,6 +1533,94 @@ mod tests {
             serde_json::from_str::<Pending<Never>>(r#"{"token":null,"poll_after_secs":1}"#,)
                 .is_err()
         );
+    }
+
+    fn desired_resource(attributes: BTreeMap<String, Value>) -> Resource {
+        Resource {
+            id: ResourceId {
+                provider: "test".to_string(),
+                resource_type: "test.Widget".to_string(),
+                identity: "example".to_string(),
+            },
+            attributes,
+            directives: types::Directives::default(),
+        }
+    }
+
+    #[test]
+    fn desired_resource_exposes_known_absent_and_deferred_attributes() {
+        let mut desired = DesiredResource::decode(
+            desired_resource(BTreeMap::from([(
+                "known".to_string(),
+                Value::String("before".to_string()),
+            )])),
+            vec!["deferred".to_string()],
+        )
+        .expect("valid desired resource");
+
+        assert!(matches!(
+            desired.attribute("known"),
+            DesiredAttribute::Known(Value::String(value)) if value == "before"
+        ));
+        assert!(matches!(
+            desired.attribute("absent"),
+            DesiredAttribute::Absent
+        ));
+        assert!(matches!(
+            desired.attribute("deferred"),
+            DesiredAttribute::Deferred
+        ));
+
+        match desired.attribute_mut("known") {
+            DesiredAttribute::Known(value) => *value = Value::String("after".to_string()),
+            DesiredAttribute::Absent | DesiredAttribute::Deferred => {
+                panic!("known attribute must remain mutable")
+            }
+        }
+        assert!(matches!(
+            desired.attribute_mut("deferred"),
+            DesiredAttribute::Deferred
+        ));
+
+        let resource = desired.into_resource();
+        assert_eq!(
+            resource.attributes.get("known"),
+            Some(&Value::String("after".to_string()))
+        );
+        assert!(!resource.attributes.contains_key("deferred"));
+    }
+
+    #[test]
+    fn desired_resource_rejects_duplicate_deferred_names() {
+        let error = DesiredResource::decode(
+            desired_resource(BTreeMap::new()),
+            vec!["pending".to_string(), "pending".to_string()],
+        )
+        .expect_err("duplicate deferred names must be rejected");
+
+        assert!(matches!(
+            error,
+            DesiredResourceDecodeError::DuplicateDeferredAttribute { name }
+                if name == "pending"
+        ));
+    }
+
+    #[test]
+    fn desired_resource_rejects_present_deferred_attribute() {
+        let error = DesiredResource::decode(
+            desired_resource(BTreeMap::from([(
+                "pending".to_string(),
+                Value::String("guest-visible".to_string()),
+            )])),
+            vec!["pending".to_string()],
+        )
+        .expect_err("an attribute cannot be both present and deferred");
+
+        assert!(matches!(
+            error,
+            DesiredResourceDecodeError::DeferredAttributePresent { name }
+                if name == "pending"
+        ));
     }
 
     #[test]
