@@ -7,8 +7,8 @@ use carina_core::UserDirs;
 use tempfile::NamedTempFile;
 
 use crate::provider_resolver::{
-    LockEntry, LockFile, LockFileError, LockFileMigration, WasmArtifactPath, provider_lock_path,
-    resolve_lock_file_save_path, resolve_parent, sha256_file,
+    LockEntry, LockFile, LockFileError, LockFileMigration, RegistrySequenceNotice,
+    WasmArtifactPath, provider_lock_path, resolve_lock_file_save_path, resolve_parent, sha256_file,
 };
 use crate::verified_artifact::{VerifiedArtifact, VerifiedArtifactError, publish_cached};
 
@@ -28,6 +28,7 @@ pub struct GuardedLockFile<'lock> {
     install_lock: &'lock ProviderInstallLock,
     lock_file: LockFile,
     migration: Option<LockFileMigration>,
+    pending_registry_sequence_notices: Vec<RegistrySequenceNotice>,
 }
 
 impl<'lock> GuardedLockFile<'lock> {
@@ -56,14 +57,26 @@ impl<'lock> GuardedLockFile<'lock> {
             install_lock: self.install_lock,
             lock_file: self.lock_file.clone(),
             migration: None,
+            pending_registry_sequence_notices: self.pending_registry_sequence_notices.clone(),
         }
     }
 
-    pub fn save(&self) -> io::Result<()> {
+    pub fn save(&mut self) -> io::Result<()> {
         save_lock_file_to_path(
             &self.lock_file,
             &provider_lock_path(self.install_lock.project_dir()),
-        )
+        )?;
+        for notice in self.pending_registry_sequence_notices.drain(..) {
+            eprintln!("{notice}");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn queue_registry_sequence_notice(
+        &mut self,
+        notice: Option<RegistrySequenceNotice>,
+    ) {
+        self.pending_registry_sequence_notices.extend(notice);
     }
 
     #[cfg(test)]
@@ -153,6 +166,7 @@ impl ProviderInstallLock {
                     install_lock: self,
                     lock_file,
                     migration,
+                    pending_registry_sequence_notices: Vec::new(),
                 }
             })
         })
@@ -164,6 +178,7 @@ impl ProviderInstallLock {
                 install_lock: self,
                 lock_file: LockFile::default(),
                 migration: None,
+                pending_registry_sequence_notices: Vec::new(),
             })
         })
     }
@@ -174,6 +189,7 @@ impl ProviderInstallLock {
             install_lock: self,
             lock_file,
             migration: None,
+            pending_registry_sequence_notices: Vec::new(),
         }
     }
 

@@ -2382,6 +2382,7 @@ mod registry_lock_with_host {
     pub(super) struct RegistryLockWithHost {
         host: (CanonicalRegistryHostname, RegistryHostLock),
         registry: RegistryLock,
+        sequence_notice: Option<RegistrySequenceNotice>,
     }
 
     impl RegistryLock {
@@ -2389,6 +2390,7 @@ mod registry_lock_with_host {
             registry: ResolvedRegistry,
             ratchets: RegistryRatchets,
             validated_sequence: ValidatedRegistrySequence,
+            source_key: &RemoteSourceKey,
         ) -> RegistryLockWithHost {
             let ResolvedRegistry {
                 hostname,
@@ -2401,7 +2403,8 @@ mod registry_lock_with_host {
                 signature,
                 transparency_log_present,
             } = ratchets;
-            let sequence_anchor = validated_sequence.into_anchor();
+            let (sequence_anchor, sequence_notice) =
+                validated_sequence.into_anchor_and_notice(source_key);
             let hostname = CanonicalRegistryHostname::from(hostname);
             RegistryLockWithHost {
                 host: (hostname.clone(), RegistryHostLock::pinned(discovery_pin)),
@@ -2414,12 +2417,14 @@ mod registry_lock_with_host {
                     signature,
                     transparency_log_present,
                 },
+                sequence_notice,
             }
         }
     }
 
-    impl LockFile {
-        /// Insert a registry provider together with the host record it references.
+    impl GuardedLockFile<'_> {
+        /// Insert a registry provider together with its host record and the
+        /// notice released by the guarded lock's next successful save.
         pub(super) fn upsert_registry_with_host(
             &mut self,
             entry: LockEntry<NoRegistryLock>,
@@ -2428,12 +2433,14 @@ mod registry_lock_with_host {
             let RegistryLockWithHost {
                 host: (hostname, host),
                 registry,
+                sequence_notice,
             } = registry_with_host;
             self.registry_host.insert(hostname, host);
 
             let mut entry = entry.into_stored();
             entry.registry = Some(registry);
             self.upsert_entry(entry);
+            self.queue_registry_sequence_notice(sequence_notice);
         }
     }
 }
@@ -4489,7 +4496,7 @@ impl<'borrow, 'lock> PersistentLockFile<'borrow, 'lock> {
             .known_registry_ratchets_by_source_key(&source)
             .map_err(|error| error.to_string())?;
         let registry_with_host =
-            RegistryLock::from_resolved_registry(registry, ratchets, validated_sequence);
+            RegistryLock::from_resolved_registry(registry, ratchets, validated_sequence, &source);
         self.lock_file.upsert_registry_with_host(
             LockEntry {
                 name,
@@ -6130,23 +6137,85 @@ struct RegistryVersion {
 mod registry_listing_validation {
     use super::*;
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum RegistrySequenceTransition {
+        Unchanged,
+        Advanced { previous: u64, current: u64 },
+        Established(u64),
+        StillUnestablished,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RegistrySequenceNoticeKind {
+        Established(u64),
+        StillUnestablished,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct RegistrySequenceNotice {
+        source_key: String,
+        kind: RegistrySequenceNoticeKind,
+    }
+
+    impl fmt::Display for RegistrySequenceNotice {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self.kind {
+                RegistrySequenceNoticeKind::Established(sequence) => write!(
+                    formatter,
+                    "carina: established registry sequence anchor for {}: {sequence}",
+                    self.source_key
+                ),
+                RegistrySequenceNoticeKind::StillUnestablished => write!(
+                    formatter,
+                    "carina: registry listing for {} has no sequence; no reference point established",
+                    self.source_key
+                ),
+            }
+        }
+    }
+
+    impl RegistrySequenceTransition {
+        fn into_notice(self, source_key: &RemoteSourceKey) -> Option<RegistrySequenceNotice> {
+            let kind = match self {
+                Self::Unchanged | Self::Advanced { .. } => None,
+                Self::Established(sequence) => {
+                    Some(RegistrySequenceNoticeKind::Established(sequence))
+                }
+                Self::StillUnestablished => Some(RegistrySequenceNoticeKind::StillUnestablished),
+            }?;
+            Some(RegistrySequenceNotice {
+                source_key: source_key.to_string(),
+                kind,
+            })
+        }
+    }
+
     /// The sequence from a listing that passed every listing-level check.
     /// Only this proof can establish the anchor written by a successful pin.
-    pub(super) struct ValidatedRegistrySequence(RegistrySequence);
+    #[derive(Debug)]
+    pub(super) struct ValidatedRegistrySequence {
+        sequence: RegistrySequence,
+        transition: RegistrySequenceTransition,
+    }
 
     impl ValidatedRegistrySequence {
-        pub(super) fn into_anchor(self) -> RegistrySequenceAnchor {
-            match self.0 {
+        pub(super) fn into_anchor_and_notice(
+            self,
+            source_key: &RemoteSourceKey,
+        ) -> (RegistrySequenceAnchor, Option<RegistrySequenceNotice>) {
+            let anchor = match self.sequence {
                 RegistrySequence::Absent => RegistrySequenceAnchor::Unestablished,
                 RegistrySequence::Present(sequence) => {
                     RegistrySequenceAnchor::Established(sequence)
                 }
-            }
+            };
+            (anchor, self.transition.into_notice(source_key))
         }
     }
 
     /// Listing observations that can only be constructed after every listing
     /// check has accepted the response.
+    #[derive(Debug)]
     pub(super) struct ValidatedRegistryListing {
         observations: Option<RegistryRatchets>,
         sequence: ValidatedRegistrySequence,
@@ -6165,37 +6234,47 @@ mod registry_listing_validation {
             let valid_until_present = versions.valid_until.is_some();
             let mut refusals = None;
 
-            match sequence_anchor {
-                RegistrySequenceAnchor::Unestablished => {}
-                RegistrySequenceAnchor::Established(previous) => match versions.sequence {
-                    None => RegistryRefusals::insert(
-                        &mut refusals,
-                        RegistryRefusal::SequenceFieldDisappeared {
-                            target: target.clone(),
-                        },
-                    ),
-                    Some(sequence) if sequence < previous => RegistryRefusals::insert(
-                        &mut refusals,
-                        RegistryRefusal::SequenceRollback {
-                            previous,
-                            current: sequence,
-                            target: target.clone(),
-                        },
-                    ),
-                    Some(sequence)
-                        if sequence.saturating_sub(previous) > MAX_SEQUENCE_FAST_FORWARD =>
-                    {
-                        RegistryRefusals::insert(
-                            &mut refusals,
-                            RegistryRefusal::SequenceFastForward {
-                                anchor: previous,
-                                current: sequence,
-                                target: target.clone(),
-                            },
-                        );
-                    }
-                    Some(_) => {}
-                },
+            let sequence_transition = match (sequence_anchor, versions.sequence) {
+                (RegistrySequenceAnchor::Unestablished, None) => {
+                    Ok(RegistrySequenceTransition::StillUnestablished)
+                }
+                (RegistrySequenceAnchor::Unestablished, Some(current)) => {
+                    Ok(RegistrySequenceTransition::Established(current))
+                }
+                (RegistrySequenceAnchor::Established(_previous), None) => {
+                    Err(RegistryRefusal::SequenceFieldDisappeared {
+                        target: target.clone(),
+                    })
+                }
+                (RegistrySequenceAnchor::Established(previous), Some(current))
+                    if current < previous =>
+                {
+                    Err(RegistryRefusal::SequenceRollback {
+                        previous,
+                        current,
+                        target: target.clone(),
+                    })
+                }
+                (RegistrySequenceAnchor::Established(previous), Some(current))
+                    if current.saturating_sub(previous) > MAX_SEQUENCE_FAST_FORWARD =>
+                {
+                    Err(RegistryRefusal::SequenceFastForward {
+                        anchor: previous,
+                        current,
+                        target: target.clone(),
+                    })
+                }
+                (RegistrySequenceAnchor::Established(previous), Some(current))
+                    if current == previous =>
+                {
+                    Ok(RegistrySequenceTransition::Unchanged)
+                }
+                (RegistrySequenceAnchor::Established(previous), Some(current)) => {
+                    Ok(RegistrySequenceTransition::Advanced { previous, current })
+                }
+            };
+            if let Err(refusal) = &sequence_transition {
+                RegistryRefusals::insert(&mut refusals, refusal.clone());
             }
 
             let stripped_versions = locked.yanked_versions.stripped_from(&versions.versions);
@@ -6217,6 +6296,7 @@ mod registry_listing_validation {
             if let Some(refusals) = refusals {
                 return Err(refusals.to_string());
             }
+            let sequence_transition = sequence_transition.map_err(|refusal| refusal.to_string())?;
 
             let valid_until = versions
                 .valid_until
@@ -6251,7 +6331,10 @@ mod registry_listing_validation {
             });
             Ok(Self {
                 observations,
-                sequence: ValidatedRegistrySequence(sequence),
+                sequence: ValidatedRegistrySequence {
+                    sequence,
+                    transition: sequence_transition,
+                },
             })
         }
 
@@ -6259,8 +6342,110 @@ mod registry_listing_validation {
             (self.observations, self.sequence)
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn source() -> RegistrySource {
+            let ProviderSource::Remote(RemoteSource::Registry(source)) =
+                "carina-rs/aws".parse::<ProviderSource>().unwrap()
+            else {
+                panic!("expected registry source")
+            };
+            source
+        }
+
+        fn validate_sequence(
+            anchor: RegistrySequenceAnchor,
+            sequence: Option<u64>,
+        ) -> Result<ValidatedRegistryListing, String> {
+            ValidatedRegistryListing::validate(
+                &source(),
+                &RegistryVersions {
+                    sequence,
+                    valid_until: None,
+                    versions: Vec::new(),
+                },
+                &RegistryRatchets::default(),
+                anchor,
+                Path::new("."),
+            )
+        }
+
+        #[test]
+        fn registry_sequence_transition_is_established_from_first_contact() {
+            let validated =
+                validate_sequence(RegistrySequenceAnchor::Unestablished, Some(7)).unwrap();
+            let transition = validated.sequence.transition;
+            assert_eq!(transition, RegistrySequenceTransition::Established(7));
+            assert_eq!(
+                transition
+                    .into_notice(&source().source_key())
+                    .unwrap()
+                    .to_string(),
+                "carina: established registry sequence anchor for carina-rs/aws: 7"
+            );
+        }
+
+        #[test]
+        fn registry_sequence_transition_stays_unestablished_without_sequence() {
+            let validated = validate_sequence(RegistrySequenceAnchor::Unestablished, None).unwrap();
+            let transition = validated.sequence.transition;
+            assert_eq!(transition, RegistrySequenceTransition::StillUnestablished);
+            assert_eq!(
+                transition
+                    .into_notice(&source().source_key())
+                    .unwrap()
+                    .to_string(),
+                "carina: registry listing for carina-rs/aws has no sequence; no reference point established"
+            );
+        }
+
+        #[test]
+        fn registry_sequence_transition_is_unchanged_at_existing_anchor() {
+            let validated =
+                validate_sequence(RegistrySequenceAnchor::Established(7), Some(7)).unwrap();
+            let transition = validated.sequence.transition;
+            assert_eq!(transition, RegistrySequenceTransition::Unchanged);
+            assert!(transition.into_notice(&source().source_key()).is_none());
+        }
+
+        #[test]
+        fn registry_sequence_transition_advances_existing_anchor() {
+            let validated =
+                validate_sequence(RegistrySequenceAnchor::Established(5), Some(7)).unwrap();
+            let transition = validated.sequence.transition;
+            assert_eq!(
+                transition,
+                RegistrySequenceTransition::Advanced {
+                    previous: 5,
+                    current: 7,
+                }
+            );
+            assert!(transition.into_notice(&source().source_key()).is_none());
+        }
+
+        #[test]
+        fn registry_sequence_transition_still_refuses_rollback_and_disappearance() {
+            let rollback = validate_sequence(RegistrySequenceAnchor::Established(7), Some(6))
+                .expect_err("rollback must remain refused");
+            assert!(
+                rollback.contains("registry sequence rollback"),
+                "{rollback}"
+            );
+
+            let disappearance = validate_sequence(RegistrySequenceAnchor::Established(7), None)
+                .expect_err("disappearance must remain refused");
+            assert!(
+                disappearance.contains("registry sequence field disappeared"),
+                "{disappearance}"
+            );
+        }
+    }
 }
 
+pub(crate) use registry_listing_validation::RegistrySequenceNotice;
 use registry_listing_validation::{ValidatedRegistryListing, ValidatedRegistrySequence};
 
 mod registry_version_candidates {
@@ -12820,6 +13005,67 @@ sha256 = "abc"
     }
 
     #[test]
+    fn registry_sequence_anchor_notice_is_suppressed_when_save_fails() {
+        const CHILD_ENV: &str = "CARINA_TEST_SEQUENCE_ANCHOR_SAVE_FAILURE_NOTICE";
+        const TEST_NAME: &str = "provider_resolver::tests::registry_sequence_anchor_notice_is_suppressed_when_save_fails";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let project = tempfile::tempdir().unwrap();
+            let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+            let mut lock = install_lock.guard_lock_file_for_test(LockFile::default());
+            let source = registry_source("carina-rs/aws");
+            let source_key = source.source_key();
+            let listing = RegistryVersions {
+                sequence: Some(7),
+                valid_until: None,
+                versions: Vec::new(),
+            };
+            {
+                let mut persistent = PersistentLockFile::new(&mut lock);
+                let validated_sequence = persistent
+                    .validate_and_record_registry_listing(&source, &source_key, &listing)
+                    .unwrap();
+                persistent
+                    .upsert_registry_provider(RegistryProviderLockEntry {
+                        name: "aws".into(),
+                        source: source_key,
+                        kind: LockEntryKind::Version {
+                            version: "0.5.0".into(),
+                            constraint: None,
+                        },
+                        sha256: "fixture-sha256".into(),
+                        registry: resolved_registry(
+                            "registry.carina-rs.dev",
+                            "https://registry.carina-rs.dev/v1/providers/",
+                        ),
+                        validated_sequence,
+                    })
+                    .unwrap();
+            }
+
+            let save_error = with_lock_file_rename_hook(
+                |_, _| Err(io::Error::other("injected anchor save failure")),
+                || lock.save(),
+            )
+            .expect_err("the injected rename failure must make save fail");
+            assert_eq!(save_error.to_string(), "injected anchor save failure");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([TEST_NAME, "--exact", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "child test failed: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            !stderr.contains("carina: established registry sequence anchor"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
     fn lock_file_save_accepts_parentless_relative_path() {
         const CHILD_ENV: &str = "CARINA_TEST_PARENTLESS_LOCK_SAVE";
         const TEST_NAME: &str =
@@ -15472,10 +15718,8 @@ transparency_log_present = false
         )
         .expect("re-bootstrap must make a sequence-less listing first contact");
         let (_, validated_sequence) = validated.into_parts();
-        assert_eq!(
-            validated_sequence.into_anchor(),
-            RegistrySequenceAnchor::Unestablished
-        );
+        let (sequence_anchor, _) = validated_sequence.into_anchor_and_notice(&source.source_key());
+        assert_eq!(sequence_anchor, RegistrySequenceAnchor::Unestablished);
     }
 
     #[test]
@@ -17597,6 +17841,26 @@ transparency_log_present = true
 
     #[test]
     fn registry_security_failed_first_contact_sequence_is_not_an_anchor() {
+        const CHILD_ENV: &str = "CARINA_TEST_FAILED_FIRST_CONTACT_SEQUENCE_NOTICE";
+        const TEST_NAME: &str = "provider_resolver::tests::registry_security_failed_first_contact_sequence_is_not_an_anchor";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([TEST_NAME, "--exact", "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "child test failed: {output:?}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            let notice = "carina: established registry sequence anchor for carina-rs/aws: 42";
+            assert_eq!(
+                stderr.matches(notice).count(),
+                1,
+                "the failed resolution must not emit an additional notice: {stderr}"
+            );
+            return;
+        }
+
         let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"honest first-contact artifact";
         let dir = tempfile::tempdir().unwrap();
