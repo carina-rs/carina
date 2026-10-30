@@ -1,0 +1,7 @@
+let record_module = use {
+  source = './record-module'
+}
+
+let r = record_module {
+  domain_name = 'registry.example.com'
+}

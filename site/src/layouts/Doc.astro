@@ -1,5 +1,6 @@
 ---
 import BaseLayout from '../components/BaseLayout.astro';
+import Footer from '../components/Footer.astro';
 import Sidebar from '../components/Sidebar.astro';
 import TOC from '../components/TOC.astro';
 
@@ -11,9 +12,10 @@ interface Props {
 }
 
 const { title, description, headings = [] } = Astro.props;
+const hasToc = headings.some(heading => heading.depth >= 2 && heading.depth <= 3);
 ---
-<BaseLayout title={title} description={description} showSidebar={false}>
-  <div class="doc-grid">
+<BaseLayout title={title} description={description} showSidebar={false} showFooter={false}>
+  <div class:list={['doc-grid', { 'has-toc': hasToc }]}>
     <Sidebar />
     <article class="doc-main">
       <header class="doc-header">
@@ -23,23 +25,43 @@ const { title, description, headings = [] } = Astro.props;
       <div class="doc-body">
         <slot />
       </div>
+      <Footer />
     </article>
-    <TOC headings={headings} />
+    {hasToc && <TOC headings={headings} />}
   </div>
 </BaseLayout>
 
 <style>
   .doc-grid {
+    --nav-expanded-width: 16rem;
+    --nav-column-width: var(--nav-expanded-width);
+    --toc-column-width: 14rem;
+
     display: grid;
-    grid-template-columns: 16rem minmax(0, 1fr) 14rem;
+    grid-template-columns: var(--nav-column-width) minmax(0, 1fr);
+    align-items: start;
     gap: var(--space-8);
-    max-width: 80rem;
+    max-width: 96rem;
+    min-height: calc(100dvh - var(--topbar-height));
     margin: 0 auto;
-    padding: var(--space-8) var(--space-6);
+    padding: 0 var(--space-6);
+  }
+
+  .doc-grid.has-toc {
+    grid-template-columns: var(--nav-column-width) minmax(0, 1fr) var(--toc-column-width);
+  }
+
+  :global(html[data-nav-collapsed]) .doc-grid {
+    --nav-column-width: 2.5rem;
+  }
+
+  :global(html[data-toc-collapsed]) .doc-grid {
+    --toc-column-width: 2.5rem;
   }
 
   .doc-main {
     min-width: 0;
+    padding: var(--space-8) 0;
     overflow-wrap: break-word;
   }
 
@@ -70,7 +92,6 @@ const { title, description, headings = [] } = Astro.props;
     margin-top: 4rem;
     padding-top: 1.25rem;
     margin-bottom: var(--space-4);
-    scroll-margin-top: var(--space-8);
     font-size: 1.55rem;
     font-weight: 700;
   }
@@ -89,7 +110,6 @@ const { title, description, headings = [] } = Astro.props;
   .doc-body :global(h3) {
     margin-top: var(--space-6);
     margin-bottom: var(--space-3);
-    scroll-margin-top: var(--space-8);
   }
 
   .doc-body :global(p) { margin: 0 0 var(--space-4); }
@@ -149,15 +169,111 @@ const { title, description, headings = [] } = Astro.props;
     font-weight: 600;
   }
 
-  /* 1024px 以下: TOC 落とす */
   @media (max-width: 64rem) {
-    .doc-grid { grid-template-columns: 14rem minmax(0, 1fr); }
+    .doc-grid {
+      --nav-expanded-width: 14rem;
+    }
+
+    .doc-grid,
+    .doc-grid.has-toc {
+      grid-template-columns: var(--nav-column-width) minmax(0, 1fr);
+    }
+
     .doc-grid > :global(.toc) { display: none; }
   }
 
-  /* 768px 以下: サイドバーも落とす */
   @media (max-width: 48rem) {
-    .doc-grid { grid-template-columns: 1fr; }
-    .doc-grid > :global(.sidebar) { display: none; }
+    .doc-grid,
+    .doc-grid.has-toc {
+      grid-template-columns: minmax(0, 1fr);
+      row-gap: 0;
+    }
   }
 </style>
+
+<script>
+  const root = document.documentElement;
+  const navToggle = document.querySelector<HTMLButtonElement>('[data-nav-toggle]');
+  const tocToggle = document.querySelector<HTMLButtonElement>('[data-toc-toggle]');
+  const mobileNavToggle = document.querySelector<HTMLButtonElement>('[data-mobile-nav-toggle]');
+
+  const syncDesktopToggle = (
+    toggle: HTMLButtonElement | null,
+    collapsed: boolean,
+    showLabel: string,
+    hideLabel: string,
+  ) => {
+    if (!toggle) return;
+    toggle.setAttribute('aria-expanded', String(!collapsed));
+    toggle.setAttribute('aria-label', collapsed ? showLabel : hideLabel);
+  };
+
+  const storeCollapsedState = (key: string, collapsed: boolean) => {
+    try {
+      window.localStorage.setItem(key, String(collapsed));
+    } catch {}
+  };
+
+  const syncDesktopToggles = () => {
+    syncDesktopToggle(
+      navToggle,
+      root.hasAttribute('data-nav-collapsed'),
+      'Show navigation',
+      'Hide navigation',
+    );
+    syncDesktopToggle(
+      tocToggle,
+      root.hasAttribute('data-toc-collapsed'),
+      'Show on this page',
+      'Hide on this page',
+    );
+  };
+
+  navToggle?.addEventListener('click', () => {
+    const collapsed = !root.hasAttribute('data-nav-collapsed');
+    root.toggleAttribute('data-nav-collapsed', collapsed);
+    storeCollapsedState('carina-doc-nav-collapsed', collapsed);
+    syncDesktopToggles();
+  });
+
+  tocToggle?.addEventListener('click', () => {
+    const collapsed = !root.hasAttribute('data-toc-collapsed');
+    root.toggleAttribute('data-toc-collapsed', collapsed);
+    storeCollapsedState('carina-doc-toc-collapsed', collapsed);
+    syncDesktopToggles();
+  });
+
+  mobileNavToggle?.addEventListener('click', () => {
+    const expanded = !root.hasAttribute('data-mobile-nav-open');
+    root.toggleAttribute('data-mobile-nav-open', expanded);
+    mobileNavToggle.setAttribute('aria-expanded', String(expanded));
+    mobileNavToggle.setAttribute(
+      'aria-label',
+      expanded ? 'Hide navigation menu' : 'Show navigation menu',
+    );
+  });
+
+  syncDesktopToggles();
+
+  const scrollActiveSidebarLinkIntoView = () => {
+    if (
+      !window.matchMedia('(min-width: 48.001rem)').matches
+      || root.hasAttribute('data-nav-collapsed')
+    ) return;
+
+    const navigation = document.querySelector<HTMLElement>('#doc-navigation');
+    const activeLink = navigation?.querySelector<HTMLElement>('.sidebar-link[aria-current="page"]');
+    if (!navigation || !activeLink) return;
+
+    const linkTop = activeLink.offsetTop;
+    const linkBottom = linkTop + activeLink.offsetHeight;
+    const visibleTop = navigation.scrollTop;
+    const visibleBottom = visibleTop + navigation.clientHeight;
+
+    if (linkTop < visibleTop || linkBottom > visibleBottom) {
+      navigation.scrollTop = linkTop - (navigation.clientHeight - activeLink.offsetHeight) / 2;
+    }
+  };
+
+  scrollActiveSidebarLinkIntoView();
+</script>

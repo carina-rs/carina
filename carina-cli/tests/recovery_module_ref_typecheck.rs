@@ -198,13 +198,13 @@ fn destroy_and_state_refresh_reject_nested_forwarding_mismatch() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !output.status.success(),
-            "{args:?} must stop before expansion; stderr={stderr}"
+            "{args:?} must stop at the resolver boundary; stderr={stderr}"
         );
         assert!(
-            stderr.contains("Type mismatch: expected Int, got String (from a)")
-                && stderr.contains("outer/main.crn")
-                && stderr.contains("line 3"),
-            "{args:?} must report the shared BindingIndex mismatch; stderr={stderr}"
+            stderr.contains("Reference type validation failed")
+                && stderr.contains("module call 'inner'")
+                && stderr.contains("expected Int, got String (from a)"),
+            "{args:?} must report the mandatory resolver mismatch; stderr={stderr}"
         );
     }
 }

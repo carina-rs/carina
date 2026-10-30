@@ -863,10 +863,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
         // See the matching attribute-output guard above. Annotated exports
         // need their concrete values for boundary checking; unannotated
         // exports must retain the expression for return-type inference.
-        let has_static_type = !matches!(
-            export.static_type(),
-            crate::parser::ExportParamStaticTypeRef::Parsed(None)
-        );
+        let has_static_type = export.type_expr_opt().is_some();
         if has_static_type {
             let resolved = export
                 .value()

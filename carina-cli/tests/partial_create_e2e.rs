@@ -26,6 +26,17 @@ impl Scenario {
         self.write_config_with_name("r1");
     }
 
+    fn copy_fixture(&self, name: &str) {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        for entry in fs::read_dir(fixture).expect("read fixture directory") {
+            let entry = entry.expect("read fixture entry");
+            fs::copy(entry.path(), self.project.join(entry.file_name()))
+                .expect("copy fixture file");
+        }
+    }
+
     fn write_config_with_name(&self, name: &str) {
         fs::write(
             self.project.join("main.crn"),
@@ -52,13 +63,30 @@ let r1 = mock.test.resource {{
     }
 
     fn apply_partial(&self) -> Output {
+        self.apply_partial_missing("tags")
+    }
+
+    fn apply_partial_missing(&self, missing: &str) -> Output {
         carina(&self.project)
             .args(["apply", ".", "--auto-approve", "--lock=false"])
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
             .env("CARINA_MOCK_PARTIAL_CREATE_FOR", "*")
-            .env("CARINA_MOCK_PARTIAL_CREATE_MISSING", "tags")
+            .env("CARINA_MOCK_PARTIAL_CREATE_MISSING", missing)
             .output()
             .expect("failed to execute carina apply")
+    }
+
+    fn restore_mock_identifier(&self, identifier: &str) {
+        let mut state: Value =
+            serde_json::from_str(&fs::read_to_string(&self.mock_state).expect("read mock state"))
+                .expect("decode mock state");
+        state["states"]["test.resource.source"]["identifier"] =
+            Value::String(identifier.to_string());
+        fs::write(
+            &self.mock_state,
+            serde_json::to_string_pretty(&state).expect("encode mock state"),
+        )
+        .expect("write mock state");
     }
 
     fn plan(&self) -> Output {
@@ -157,9 +185,48 @@ fn partial_create_records_state_and_next_plan_surfaces_unknown_reason() {
         "next plan must show the partially-created resource as an update\nstdout/stderr:\n{plan_text}"
     );
     assert!(
-        plan_text
-            .contains("(known after next apply: post-create read failed — mock partial create)"),
+        plan_text.contains(
+            "(unknown until next refresh: read after apply was incomplete — mock partial create)"
+        ),
         "next plan must surface the partial-create unknown reason\nstdout/stderr:\n{plan_text}"
+    );
+}
+
+#[test]
+fn multifile_reference_to_partial_read_attribute_resolves_on_successful_refresh() {
+    let scenario = Scenario::new();
+    scenario.copy_fixture("partial_read_multifile");
+    scenario.init();
+
+    let apply = scenario.apply_partial_missing("identifier");
+    assert_eq!(
+        apply.status.code(),
+        Some(2),
+        "partial apply must exit 2\nstdout/stderr:\n{}",
+        output_text(&apply)
+    );
+
+    let pending = scenario.plan();
+    assert_success("carina plan with pending re-read", &pending);
+    let pending_text = output_text(&pending);
+    assert!(
+        pending_text.contains(
+            "(unknown until next refresh: read after apply was incomplete — mock partial create)"
+        ),
+        "the cross-file export must render the pending re-read reason\nstdout/stderr:\n{pending_text}"
+    );
+
+    scenario.restore_mock_identifier("partial-source-id");
+    let refreshed = scenario.plan();
+    assert_success("carina plan after successful refresh", &refreshed);
+    let refreshed_text = output_text(&refreshed);
+    assert!(
+        refreshed_text.contains("partial-source-id"),
+        "the cross-file export must render the refreshed value\nstdout/stderr:\n{refreshed_text}"
+    );
+    assert!(
+        !refreshed_text.contains("unknown until next refresh"),
+        "a successful refresh must clear the pending re-read rendering\nstdout/stderr:\n{refreshed_text}"
     );
 }
 
@@ -208,8 +275,9 @@ fn replace_partial_create_records_marker_for_next_plan() {
         "next plan must show the replace partial resource as an update\nstdout/stderr:\n{plan_text}"
     );
     assert!(
-        plan_text
-            .contains("(known after next apply: post-create read failed — mock partial create)"),
+        plan_text.contains(
+            "(unknown until next refresh: read after apply was incomplete — mock partial create)"
+        ),
         "next plan must surface the replace partial-create unknown reason\nstdout/stderr:\n{plan_text}"
     );
 }

@@ -1315,7 +1315,7 @@ mod tests {
         let declarations = vec![
             ArgumentParameter {
                 name: "x".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::Int),
+                static_type: TypeExpr::Int,
                 default: None,
                 description: None,
                 validations: vec![ValidationBlock::dummy(
@@ -1329,7 +1329,7 @@ mod tests {
             },
             ArgumentParameter {
                 name: "y".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::Int),
+                static_type: TypeExpr::Int,
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -1361,7 +1361,7 @@ mod tests {
 
         let declarations = vec![ArgumentParameter {
             name: "name".to_string(),
-            static_type: crate::static_type::StaticType::Known(TypeExpr::String),
+            static_type: TypeExpr::String,
             default: None,
             description: None,
             validations: vec![ValidationBlock::dummy(

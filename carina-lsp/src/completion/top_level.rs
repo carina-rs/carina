@@ -7,7 +7,6 @@ use tower_lsp::lsp_types::{
 };
 
 use carina_core::parser;
-use carina_core::static_type::consumer_static_type_label;
 
 use super::{CompletionProvider, DslSource};
 
@@ -377,8 +376,7 @@ impl CompletionProvider {
 
         if let Some(parsed) = self.load_called_module(module_name, text, base_path) {
             for input in &parsed.arguments {
-                let type_str =
-                    self.format_type_expr(consumer_static_type_label(&input.static_type));
+                let type_str = self.format_type_expr(&input.static_type);
                 let required_marker = if input.default.is_some() {
                     ""
                 } else {
@@ -438,9 +436,7 @@ impl CompletionProvider {
         let Some(arg) = parsed.arguments.iter().find(|a| a.name == arg_name) else {
             return Vec::new();
         };
-        let Some(arg_type) = arg.static_type.known() else {
-            return Vec::new();
-        };
+        let arg_type = &arg.static_type;
         // Literal-set fast path: candidates are syntactic.
         let literal_items = literal_completions_from_type_expr(arg_type);
         if !literal_items.is_empty() {

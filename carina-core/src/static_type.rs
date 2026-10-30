@@ -19,7 +19,7 @@ impl<R> StaticType<R> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum TypeResolutionError {
+pub enum StaticTypeResolutionError {
     #[error("unknown custom type '{name}'")]
     UnknownCustomType { name: String },
     #[error("unknown custom type '{name}'; suggestion: use '{suggestion}'")]
@@ -29,9 +29,11 @@ pub enum TypeResolutionError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnnameableInConsumer {
     pub original: TypeExpr,
-    pub resolution_error: TypeResolutionError,
+    pub resolution_error: StaticTypeResolutionError,
 }
 
+/// Parser/local declarations carry [`TypeExpr`] directly; only consumer
+/// resolution outputs can carry [`ConsumerStaticType`] and its unchecked state.
 pub type ConsumerStaticType = StaticType<UnnameableInConsumer>;
 
 /// User-facing label for a declared type. An unchecked consumer boundary is
@@ -93,7 +95,6 @@ impl From<InferenceError> for InferenceIssue {
 pub enum InferredUncheckedReason {
     InferenceFailed(InferenceError),
     NotInferable(NotInferableReason),
-    UnnameableInConsumer(UnnameableInConsumer),
 }
 
 impl From<InferenceIssue> for InferredUncheckedReason {
@@ -108,15 +109,33 @@ impl From<InferenceIssue> for InferredUncheckedReason {
 pub type InferredStaticType = StaticType<InferredUncheckedReason>;
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum ConsumerInferredUncheckedReason {
+    InferenceFailed(InferenceError),
+    NotInferable(NotInferableReason),
+    UnnameableInConsumer(UnnameableInConsumer),
+}
+
+impl From<InferredUncheckedReason> for ConsumerInferredUncheckedReason {
+    fn from(reason: InferredUncheckedReason) -> Self {
+        match reason {
+            InferredUncheckedReason::InferenceFailed(error) => Self::InferenceFailed(error),
+            InferredUncheckedReason::NotInferable(reason) => Self::NotInferable(reason),
+        }
+    }
+}
+
+pub type ConsumerInferredStaticType = StaticType<ConsumerInferredUncheckedReason>;
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ExportStaticType {
-    Declared(ConsumerStaticType),
+    Declared(TypeExpr),
     Inferred(InferredStaticType),
 }
 
 impl ExportStaticType {
     pub fn known(&self) -> Option<&TypeExpr> {
         match self {
-            Self::Declared(static_type) => static_type.known(),
+            Self::Declared(type_expr) => Some(type_expr),
             Self::Inferred(static_type) => static_type.known(),
         }
     }
@@ -126,8 +145,7 @@ impl ExportStaticType {
     /// boundary.
     pub fn declared_known(&self) -> Option<&TypeExpr> {
         match self {
-            Self::Declared(StaticType::Known(type_expr)) => Some(type_expr),
-            Self::Declared(StaticType::Unchecked(_reason)) => None,
+            Self::Declared(type_expr) => Some(type_expr),
             Self::Inferred(StaticType::Known(_type_expr)) => None,
             Self::Inferred(StaticType::Unchecked(InferredUncheckedReason::InferenceFailed(
                 _error,
@@ -135,8 +153,37 @@ impl ExportStaticType {
             Self::Inferred(StaticType::Unchecked(InferredUncheckedReason::NotInferable(
                 _reason,
             ))) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConsumerExportStaticType {
+    Declared(ConsumerStaticType),
+    Inferred(ConsumerInferredStaticType),
+}
+
+impl ConsumerExportStaticType {
+    pub fn known(&self) -> Option<&TypeExpr> {
+        match self {
+            Self::Declared(static_type) => static_type.known(),
+            Self::Inferred(static_type) => static_type.known(),
+        }
+    }
+
+    pub fn declared_known(&self) -> Option<&TypeExpr> {
+        match self {
+            Self::Declared(StaticType::Known(type_expr)) => Some(type_expr),
+            Self::Declared(StaticType::Unchecked(_reason)) => None,
+            Self::Inferred(StaticType::Known(_type_expr)) => None,
             Self::Inferred(StaticType::Unchecked(
-                InferredUncheckedReason::UnnameableInConsumer(_reason),
+                ConsumerInferredUncheckedReason::InferenceFailed(_error),
+            )) => None,
+            Self::Inferred(StaticType::Unchecked(
+                ConsumerInferredUncheckedReason::NotInferable(_reason),
+            )) => None,
+            Self::Inferred(StaticType::Unchecked(
+                ConsumerInferredUncheckedReason::UnnameableInConsumer(_reason),
             )) => None,
         }
     }

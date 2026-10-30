@@ -26,6 +26,300 @@ fn saved_plan_validation_ready_constructor_is_unit_typed() {
     assert!(matches!(origin, ValidationReadyOrigin::SavedPlanArtifact));
 }
 
+fn missing_identifier_plan_error(identity: &str) -> carina_core::plan::PlanError {
+    carina_core::plan::PlanError::new(
+        ResourceId::with_identity("test.thing", test_identity(identity)),
+        carina_core::plan::PlanErrorKind::MissingProviderIdentifier,
+    )
+}
+
+#[test]
+fn non_empty_plan_errors_reject_empty_and_preserve_order() {
+    assert!(NonEmptyPlanErrors::try_from(Vec::new()).is_err());
+
+    let first = missing_identifier_plan_error("first");
+    let second = missing_identifier_plan_error("second");
+    let errors = NonEmptyPlanErrors::try_from(vec![first.clone(), second.clone()])
+        .expect("two errors are non-empty");
+
+    assert_eq!(errors.as_slice(), &[first, second]);
+}
+
+#[tokio::test]
+async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
+    let context = WiringContext::new_for_test(Vec::new(), &[]);
+    let expanded_resources = ExpandedCanonicalResources {
+        resources: canonical_unresolved(Vec::new(), context.schemas()),
+    };
+    let expansion = PostExpansionPlanView {
+        data: PostExpansionPlanData {
+            expanded_resources,
+            sorted_resources: Vec::new(),
+            addressed: AddressedState {
+                managed_current: HashMap::new(),
+                orphans: Orphans::new(),
+                saved_attrs: crate::empty_lifted_saved_attrs(),
+                prev_explicit: HashMap::new(),
+                moved_pairs: Vec::new(),
+            },
+            data_source_values: DataSourceValues::empty(),
+            wait_aliases: Vec::new(),
+            residual_deferred_for: Vec::new(),
+            deferred_create_targets: Vec::new(),
+        },
+        children: AbsentChildrenSettled,
+    }
+    .into_plan_settled();
+    let provider = carina_core::provider::ProviderRouter::new();
+    let state_file = None;
+    let state_block_claims = StateBlockClaims::default();
+    let resolved_state_block_targets = ResolvedStateBlockTargets::default();
+    let expected = missing_identifier_plan_error("diagnostic");
+    let preparation_errors =
+        NonEmptyPlanErrors::try_from(vec![expected.clone()]).expect("one error is non-empty");
+
+    let outcome = build_post_expansion_plan::<PlanMode, _>(PostExpansionPlanInput {
+        context: &context,
+        expansion,
+        environment: PostExpansionPlanEnvironment {
+            data_sources: &[],
+            provider: &provider,
+            normalizer: &provider,
+            provider_configs: &[],
+            remote_bindings: &HashMap::new(),
+            state_file: &state_file,
+            state_block_claims: &state_block_claims,
+            resolved_state_block_targets: &resolved_state_block_targets,
+            preparation_errors: Some(preparation_errors),
+        },
+    })
+    .await
+    .expect("typed preparation diagnostics should produce an outcome");
+
+    let PostExpansionOutcome::Diagnostics(diagnostics) = outcome else {
+        panic!("non-empty preparation diagnostics must not produce a plan")
+    };
+    let errors = diagnostics.errors().clone();
+    let artifacts = diagnostics.into_artifacts();
+    assert_eq!(errors.as_slice(), &[expected]);
+    assert_eq!(artifacts.plan.errors(), errors.as_slice());
+}
+
+struct RawEnumStateFactory;
+
+impl ProviderFactory for RawEnumStateFactory {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    fn display_name(&self) -> &str {
+        "raw enum state test provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> ProviderResult<()> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { Ok(Box::new(RawEnumStateProvider) as Box<dyn Provider>) })
+    }
+
+    fn create_normalizer(
+        &self,
+        _binding: Option<&str>,
+        _config: &ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async {
+            Ok(Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>)
+        })
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let mode = AttributeType::enum_(
+            carina_core::schema::enum_identity("Mode", Some("test.thing")),
+            Some(vec!["Allow".to_string()]),
+            vec![("Allow".to_string(), "allow".to_string())],
+            None,
+            None,
+        );
+        vec![
+            ResourceSchema::new("thing")
+                .attribute(AttributeSchema::required("mode", mode).build())
+                .validate()
+                .expect("raw enum test schema is valid"),
+        ]
+    }
+}
+
+struct RawEnumStateProvider;
+
+impl Provider for RawEnumStateProvider {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        identifier: &AppliedIdentifier,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
+        let id = id.clone();
+        let identifier = identifier.clone();
+        Box::pin(async move {
+            Ok(ReadOutcome::found(
+                AppliedState::new(
+                    id,
+                    identifier.to_string(),
+                    HashMap::from([(
+                        "mode".to_string(),
+                        Value::Concrete(ConcreteValue::String("Allow".into())),
+                    )]),
+                )
+                .expect("raw enum test identifier is non-empty"),
+            ))
+        })
+    }
+
+    fn read_data_source(
+        &self,
+        _resource: &carina_core::provider::ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { panic!("raw enum test must not read a data source") })
+    }
+
+    fn create(
+        &self,
+        _id: &ResourceId,
+        _request: CreateRequest,
+        _attempt: carina_core::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<CreateOutcome, carina_core::provider::CreateFailure>> {
+        Box::pin(async { panic!("raw enum test must not create") })
+    }
+
+    fn resume_create(
+        &self,
+        _request: carina_core::provider::ResumeCreateRequest,
+    ) -> BoxFuture<
+        '_,
+        Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
+    > {
+        Box::pin(async { panic!("raw enum test must not resume create") })
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &AppliedIdentifier,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+        Box::pin(async { panic!("raw enum test must not update") })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &AppliedIdentifier,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { panic!("raw enum test must not delete") })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+
+fn raw_enum_state_file() -> StateFile {
+    let mut row =
+        carina_state::state::ResourceState::try_applied("thing", "item", "test", "provider-id")
+            .expect("raw enum test identifier is non-empty")
+            .with_attribute("mode", serde_json::json!("Allow"));
+    row.binding = Some("item".to_string());
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(row)
+        .expect("raw enum test state row is unique");
+    state
+}
+
+#[tokio::test]
+async fn plan_lifts_raw_api_enum_prior_state_on_live_and_cached_paths() {
+    let parsed = parse(
+        r#"
+provider test {}
+
+let item = test.thing {
+  mode = test.thing.Mode.allow
+}
+"#,
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("parse raw enum plan fixture");
+    let provider_configs = resolved_provider_configs(&parsed);
+
+    for refresh in [true, false] {
+        let wiring = ValidatedWiring::from_factories_for_test(
+            vec![Box::new(RawEnumStateFactory)],
+            provider_configs.as_provider_configs(),
+        );
+        let canonical_resources = canonical_pair(
+            &parsed,
+            parsed.resources.clone(), // allow: direct — plan-time reconciliation
+            wiring.context().schemas(),
+        );
+        let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+        let state_file = Some(raw_enum_state_file());
+        let planned = create_plan_from_parsed_with_upstream_with_ctx(
+            validated,
+            &provider_configs,
+            &state_file,
+            refresh,
+            ProgressSink::Human,
+            &HashMap::new(),
+            &StateBlockClaims::default(),
+            &ResolvedStateBlockTargets::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("refresh={refresh} plan failed: {error}"));
+        let planned = planned.resources();
+
+        assert!(
+            planned.plan.effects().is_empty(),
+            "refresh={refresh} produced a phantom enum diff: {:#?}",
+            planned.plan.effects(),
+        );
+        let id = ResourceId::with_provider_identity("test", "thing", "item", None);
+        let Current::Present(prior) = &planned.managed_current[&id] else {
+            panic!("refresh={refresh} prior state is not present")
+        };
+        assert!(
+            matches!(
+                prior.state().attributes.get("mode"),
+                Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+                    if value.api_value() == "Allow"
+            ),
+            "refresh={refresh} did not lift raw enum state: {:?}",
+            prior.state().attributes.get("mode"),
+        );
+    }
+}
+
 #[test]
 fn data_source_reads_select_only_the_owning_identical_anonymous_call() {
     let tmp = tempfile::tempdir().expect("temporary project");
@@ -215,9 +509,7 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         parsed.providers = provider_configs();
         parsed.arguments = vec![carina_core::parser::ArgumentParameter {
             name: "unrelated".to_string(),
-            static_type: carina_core::static_type::StaticType::Known(
-                carina_core::parser::TypeExpr::String,
-            ),
+            static_type: carina_core::parser::TypeExpr::String,
             default: None,
             description: None,
             validations: Vec::new(),
@@ -272,9 +564,7 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
     parsed.providers = vec![provider];
     parsed.arguments = vec![carina_core::parser::ArgumentParameter {
         name: "unrelated".to_string(),
-        static_type: carina_core::static_type::StaticType::Known(
-            carina_core::parser::TypeExpr::String,
-        ),
+        static_type: carina_core::parser::TypeExpr::String,
         default: None,
         description: None,
         validations: Vec::new(),
@@ -1540,10 +1830,11 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
 #[tokio::test]
 async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
     let id = ResourceId::with_provider_identity("mock", "test.resource", "orphan", None);
-    let marker = carina_core::resource::PartialReadMarker {
-        detail: "provider read omitted token".to_string(),
-        missing_attributes: BTreeSet::from(["token".to_string()]),
-    };
+    let marker = carina_core::resource::PartialReadMarker::new(
+        carina_core::resource::PendingReRead::incomplete("provider read omitted token"),
+        BTreeSet::from(["token".to_string()]),
+    )
+    .expect("fixture has a missing attribute");
     let mut row = carina_state::ResourceState::try_applied(
         &id.resource_type,
         id.identity().expect("resolved test id").clone(),
@@ -2501,10 +2792,11 @@ let shared = read test.shared.Type {}
         "managed_saved",
         serde_json::json!("managed-write-only-value"),
     );
-    let partial_read = carina_core::resource::PartialReadMarker {
-        detail: "managed read omitted an attribute".to_string(),
-        missing_attributes: BTreeSet::from(["managed_missing".to_string()]),
-    };
+    let partial_read = carina_core::resource::PartialReadMarker::new(
+        carina_core::resource::PendingReRead::incomplete("managed read omitted an attribute"),
+        BTreeSet::from(["managed_missing".to_string()]),
+    )
+    .expect("fixture has a missing attribute");
     prior_row = crate::fixture_resource_state_metadata(
         prior_row,
         Some(vec!["managed_saved".to_string()]),
@@ -6642,6 +6934,212 @@ fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
     ));
 }
 
+fn prefix_reconciliation_resource(attributes: &[&str]) -> Resource {
+    let mut resource = Resource::with_provider("mock", "test.resource", "example", None);
+    for attribute in attributes {
+        resource
+            .prefixes
+            .insert((*attribute).to_string(), format!("{attribute}-prefix-"));
+        resource.set_attr(
+            (*attribute).to_string(),
+            Value::Concrete(ConcreteValue::String(
+                format!("generated-{attribute}-fallback").into(),
+            )),
+        );
+    }
+    resource
+}
+
+fn prefix_reconciliation_state_file(
+    attributes: HashMap<String, Value>,
+    partial_read: Option<carina_core::resource::PartialReadMarker>,
+    prefixes: &[&str],
+) -> StateFile {
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "example", None);
+    let mut provider_state = State::existing(id, attributes).with_identifier("provider-id");
+    provider_state.partial_read = partial_read;
+    let mut row = carina_state::ResourceState::from_provider_state(
+        "test.resource",
+        "example",
+        "mock",
+        &provider_state,
+    )
+    .expect("prefix fixture state is persistable");
+    for attribute in prefixes {
+        row.prefixes
+            .insert((*attribute).to_string(), format!("{attribute}-prefix-"));
+    }
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(row)
+        .expect("prefix fixture row is unique");
+    state_file
+}
+
+fn reconcile_prefixes_from_refreshed_current(
+    resource: &mut Resource,
+    state_file: &StateFile,
+    current: Current,
+) {
+    let managed_current = HashMap::from([(resource.id.clone(), current)]);
+    let prefix_state_info = refreshed_prefix_state_info(
+        std::slice::from_ref(resource),
+        &Some(state_file.clone()),
+        &managed_current,
+    );
+    identifier::reconcile_prefixed_names(
+        std::slice::from_mut(resource),
+        &|provider, resource_type, identity| {
+            prefix_state_info
+                .get(&prefix_state_key(provider, resource_type, identity))
+                .cloned()
+        },
+    );
+}
+
+fn assert_plain_prefix_value(resource: &Resource, attribute: &str, expected: &str) {
+    assert!(
+        matches!(
+            resource.attributes.get(attribute),
+            Some(Value::Concrete(ConcreteValue::String(value)))
+                if value.expose_plaintext() == expected
+        ),
+        "expected {attribute:?} to be {expected:?}, got {:?}",
+        resource.attributes.get(attribute),
+    );
+}
+
+#[test]
+fn refreshed_prefix_reconciliation_keeps_stored_name_when_current_is_absent() {
+    let mut resource = prefix_reconciliation_resource(&["name"]);
+    let state_file = prefix_reconciliation_state_file(
+        HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("stored-name".into())),
+        )]),
+        None,
+        &["name"],
+    );
+
+    reconcile_prefixes_from_refreshed_current(
+        &mut resource,
+        &state_file,
+        Current::absent(ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "example",
+            None,
+        )),
+    );
+
+    assert_plain_prefix_value(&resource, "name", "stored-name");
+}
+
+#[test]
+fn refreshed_prefix_reconciliation_keeps_stored_name_when_current_omits_it() {
+    let mut resource = prefix_reconciliation_resource(&["name"]);
+    let state_file = prefix_reconciliation_state_file(
+        HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("stored-name".into())),
+        )]),
+        None,
+        &["name"],
+    );
+    let id = resource.id.clone();
+    let current =
+        Current::from_state(State::existing(id, HashMap::new()).with_identifier("provider-id"));
+
+    reconcile_prefixes_from_refreshed_current(&mut resource, &state_file, current);
+
+    assert_plain_prefix_value(&resource, "name", "stored-name");
+}
+
+#[test]
+fn refreshed_prefix_reconciliation_prefers_current_marker_then_current_value() {
+    let pending = carina_core::resource::PendingReRead::incomplete("provider omitted name");
+    let marker = carina_core::resource::PartialReadMarker::new(
+        pending.clone(),
+        BTreeSet::from(["name".to_string()]),
+    )
+    .expect("fixture marker covers one attribute");
+    let state_file = prefix_reconciliation_state_file(
+        HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("stored-name".into())),
+        )]),
+        None,
+        &["name"],
+    );
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "example", None);
+    let mut current_state =
+        State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+    current_state.partial_read = Some(marker);
+    let mut marked_resource = prefix_reconciliation_resource(&["name"]);
+
+    reconcile_prefixes_from_refreshed_current(
+        &mut marked_resource,
+        &state_file,
+        Current::from_state(current_state),
+    );
+
+    assert!(matches!(
+        marked_resource.attributes.get("name"),
+        Some(Value::Deferred(DeferredValue::Unknown(
+            carina_core::resource::UnknownReason::PendingReRead(actual)
+        ))) if actual == &pending
+    ));
+
+    let mut valued_resource = prefix_reconciliation_resource(&["name"]);
+    let current_with_value = Current::from_state(
+        State::existing(
+            id,
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("refreshed-name".into())),
+            )]),
+        )
+        .with_identifier("provider-id"),
+    );
+
+    reconcile_prefixes_from_refreshed_current(
+        &mut valued_resource,
+        &state_file,
+        current_with_value,
+    );
+
+    assert_plain_prefix_value(&valued_resource, "name", "refreshed-name");
+}
+
+#[test]
+fn pre_refresh_prefix_reconciliation_uses_persisted_value_and_marker() {
+    let pending = carina_core::resource::PendingReRead::read_failed("read failed");
+    let marker = carina_core::resource::PartialReadMarker::new(
+        pending.clone(),
+        BTreeSet::from(["alias".to_string()]),
+    )
+    .expect("fixture marker covers one attribute");
+    let state_file = prefix_reconciliation_state_file(
+        HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("stored-name".into())),
+        )]),
+        Some(marker),
+        &["name", "alias"],
+    );
+    let mut resources = vec![prefix_reconciliation_resource(&["name", "alias"])];
+
+    reconcile_prefixed_names(&mut resources, &Some(state_file));
+
+    assert_plain_prefix_value(&resources[0], "name", "stored-name");
+    assert!(matches!(
+        resources[0].attributes.get("alias"),
+        Some(Value::Deferred(DeferredValue::Unknown(
+            carina_core::resource::UnknownReason::PendingReRead(actual)
+        ))) if actual == &pending
+    ));
+}
+
 struct RegionIdentityFactory;
 
 impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
@@ -7068,11 +7566,10 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
     assert_eq!(state.identifier.as_deref(), Some("route-123"));
 }
 
-// Smoke test for the module/provider wrappers: empty input exercises
-// each wrapper and pins the `Vec<AppError>` return type. A regression
-// back to `Result` fails to compile here.
+// Smoke test for the provider/composition wrappers and the typed module-call
+// checker on empty input.
 #[test]
-fn module_and_provider_wrappers_return_vec_app_error() {
+fn module_checker_and_provider_wrappers_accept_empty_input() {
     let ctx = WiringContext::new_for_test(vec![], &[]);
     let parsed = ParsedFile::default();
     let provider_ctx = carina_core::parser::ProviderContext::default();
@@ -7090,13 +7587,25 @@ fn module_and_provider_wrappers_return_vec_app_error() {
             &module_signatures,
         ),
     );
-    let errors = validate_module_calls_with_imported(
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_module_signatures(
         &parsed,
+        ctx.schemas(),
         &module_signatures,
-        &provider_ctx,
-        &binding_use_report,
     );
-    assert!(errors.is_empty(), "module_calls: got {errors:?}");
+    let findings = carina_core::validation::check_module_calls(
+        carina_core::validation::ModuleCallCheckInput {
+            authored: &parsed,
+            semantic: Some(&parsed),
+            base_dir: Some(std::path::Path::new(".")),
+            imported_signatures: &module_signatures,
+            provider_context: &provider_ctx,
+            schemas: ctx.schemas(),
+            binding_use_report: &binding_use_report,
+            bindings: &bindings,
+            reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
+        },
+    );
+    assert!(findings.is_empty(), "module_calls: got {findings:?}");
 
     let errors = validate_composition_ref_types_with_ctx(&ctx, &parsed);
     assert!(errors.is_empty(), "composition_ref_types: got {errors:?}");
@@ -7848,21 +8357,14 @@ mod expand_same_config_deferred_for_tests {
         let mut parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
         let state_file = None;
         let schemas = SchemaRegistry::new();
-        let wiring = WiringContext::new_for_test(Vec::new(), &[]);
-        let claims = resolve_state_block_claims(
-            &parsed.state_blocks,
-            &state_file,
-            &parsed.resources,
-            &schemas,
-        );
         let prelude = DeferredForExpansionPrelude::new_for_test(&parsed, &state_file, &schemas)
-            .expect("build expansion prelude")
-            .detect_moves(&wiring, &parsed.data_sources, &[], &claims)
-            .expect("detect automatic moves");
+            .expect("build expansion prelude");
         let prepared = prelude
-            .bind_projected_phase1_state(HashMap::new(), Orphans::new(), HashSet::new())
-            .reconcile_addresses(&parsed, DeferredForWarningPolicy::Suppress)
-            .expect("prepare expansion")
+            .preserve_addresses(PreserveDeferredForExpansionInputs {
+                managed_current: HashMap::new(),
+                orphans: Orphans::new(),
+                already_refreshed: HashSet::new(),
+            })
             .seal(DataSourceValues::empty());
 
         let out = prepared
@@ -9754,7 +10256,7 @@ mod resolved_value_constraint_gate {
 
     fn into_plan_errors(error: PlanPreparationError) -> Vec<carina_core::plan::PlanError> {
         match error {
-            PlanPreparationError::Plan(errors) => errors,
+            PlanPreparationError::Plan(errors) => errors.into_vec(),
             PlanPreparationError::Provider(error) => {
                 panic!("test normalizer unexpectedly failed: {error}")
             }

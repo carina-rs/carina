@@ -1,0 +1,3 @@
+exports {
+  source_identifier: String = source.identifier
+}

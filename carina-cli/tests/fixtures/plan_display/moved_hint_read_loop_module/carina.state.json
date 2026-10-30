@@ -1,0 +1,80 @@
+{
+  "version": 19,
+  "exports_version": 1,
+  "serial": 1,
+  "lineage": "test-moved-hint-read-loop-module",
+  "carina_version": "0.7.1",
+  "resources": [
+    {
+      "resource_type": "acm.Certificate",
+      "identity": "r.cert",
+      "provider": "aws",
+      "current": {
+        "kind": "applied",
+        "identifier": "arn:aws:acm:us-east-1:123456789012:certificate/example",
+        "attributes": {
+          "domain_name": "registry.example.com",
+          "validation_method": "DNS",
+          "domain_validation_options": [
+            {
+              "domain_name": "registry.example.com",
+              "resource_record": {
+                "name": "_acme.registry.example.com",
+                "type": "CNAME",
+                "value": "_validation.example.com"
+              }
+            }
+          ]
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "domain_name": { "kind": "leaf" },
+          "validation_method": { "kind": "leaf" }
+        }
+      },
+      "binding": "r.cert",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "route53.RecordSet",
+      "identity": "r.validation_record",
+      "provider": "aws",
+      "current": {
+        "kind": "applied",
+        "identifier": "Z123:_acme.registry.example.com:CNAME",
+        "attributes": {
+          "hosted_zone_id": "Z123",
+          "name": "_acme.registry.example.com",
+          "type": "CNAME",
+          "ttl": 60,
+          "resource_records": ["_validation.example.com"]
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "hosted_zone_id": { "kind": "leaf" },
+          "name": { "kind": "leaf" },
+          "type": { "kind": "leaf" },
+          "ttl": { "kind": "leaf" },
+          "resource_records": { "kind": "leaf" }
+        }
+      },
+      "binding": "r.validation_record",
+      "dependency_bindings": ["r.cert"]
+    }
+  ],
+  "exports": {}
+}

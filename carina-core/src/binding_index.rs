@@ -60,7 +60,7 @@ pub enum BindingTarget<'a> {
     Schema(&'a ResourceSchema),
     LiveComposition(&'a LiveComposition),
     ModuleCall(&'a crate::module_resolver::ResolvedModuleSignature),
-    Argument(&'a crate::static_type::ConsumerStaticType),
+    Argument(&'a crate::parser::TypeExpr),
     UpstreamState(&'a crate::upstream_exports::UpstreamExportEntries),
 }
 
@@ -858,11 +858,7 @@ impl<'a> BindingIndex<'a> {
                         Err(error) => RefType::UnknownAttribute(error),
                     }
                 }
-                BindingTarget::Argument(crate::static_type::StaticType::Unchecked(_reason)) => {
-                    visiting.remove(&key);
-                    return RefType::Unchecked;
-                }
-                BindingTarget::Argument(crate::static_type::StaticType::Known(type_expr)) => {
+                BindingTarget::Argument(type_expr) => {
                     let invalid_access = check.invalid_access_policy(entry.target);
                     // A resource-handle argument is substituted with the
                     // caller's concrete resource binding during module
@@ -2795,7 +2791,7 @@ let vpc = aws.ec2.Vpc {
                             "unnameable.Type",
                         )),
                         resolution_error:
-                            crate::static_type::TypeResolutionError::UnknownCustomType {
+                            crate::static_type::StaticTypeResolutionError::UnknownCustomType {
                                 name: "some.unnameable.Type".to_string(),
                             },
                     },
@@ -2989,16 +2985,16 @@ let vpc = aws.ec2.Vpc {
         parsed.arguments.extend([
             ArgumentParameter {
                 name: "name".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::String),
+                static_type: TypeExpr::String,
                 default: None,
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "cfg".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::Struct {
+                static_type: TypeExpr::Struct {
                     fields: vec![("enabled".to_string(), TypeExpr::Bool)],
-                }),
+                },
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -3023,9 +3019,7 @@ let vpc = aws.ec2.Vpc {
         let mut parsed = parse("", &Default::default()).expect("parse");
         parsed.arguments.push(ArgumentParameter {
             name: "vpc".to_string(),
-            static_type: crate::static_type::StaticType::Known(TypeExpr::Ref(
-                ResourceTypePath::new("aws", "ec2.Vpc"),
-            )),
+            static_type: TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc")),
             default: None,
             description: None,
             validations: Vec::new(),
@@ -3101,7 +3095,7 @@ let vpc = aws.ec2.Vpc {
                 "vpc".to_string(),
                 crate::upstream_exports::UpstreamExportEntry {
                     static_type: crate::upstream_exports::UpstreamExportType::Static(
-                        crate::static_type::ExportStaticType::Declared(
+                        crate::static_type::ConsumerExportStaticType::Declared(
                             crate::static_type::StaticType::Known(TypeExpr::SchemaType {
                                 owned: crate::parser::OwnedTypeIdentity::provider(
                                     "aws",
@@ -3147,7 +3141,7 @@ let vpc = aws.ec2.Vpc {
                 "opaque".to_string(),
                 crate::upstream_exports::UpstreamExportEntry {
                     static_type: crate::upstream_exports::UpstreamExportType::Static(
-                        crate::static_type::ExportStaticType::Inferred(
+                        crate::static_type::ConsumerExportStaticType::Inferred(
                             crate::static_type::StaticType::Known(TypeExpr::String),
                         ),
                     ),
@@ -3222,8 +3216,8 @@ mod resolved_bindings_tests {
     use super::*;
     use crate::data_source_value::{DataSourceValue, DataSourceValues};
     use crate::resource::{
-        ConcreteValue, DataSource, DeferredValue, PartialReadMarker, Resource, ResourceId, State,
-        UnknownReason, Value,
+        ConcreteValue, DataSource, DeferredValue, PartialReadMarker, PendingReRead, Resource,
+        ResourceId, State, UnknownReason, Value,
     };
     use std::collections::BTreeSet;
 
@@ -3366,10 +3360,10 @@ mod resolved_bindings_tests {
         );
         let mut partial_a =
             State::existing(id_a.clone(), HashMap::new()).with_identifier("aws-id-A");
-        partial_a.partial_read = Some(PartialReadMarker {
-            detail: "read after create did not return dns_name".to_string(),
-            missing_attributes: ["dns_name".to_string()].into_iter().collect(),
-        });
+        partial_a.partial_read = PartialReadMarker::new(
+            PendingReRead::incomplete("read after create did not return dns_name"),
+            ["dns_name".to_string()].into_iter().collect(),
+        );
         let states: HashMap<ResourceId, State> = [
             (id_a, partial_a),
             (id_b.clone(), State::existing(id_b, HashMap::new())),
@@ -3397,12 +3391,11 @@ mod resolved_bindings_tests {
             .get("a")
             .and_then(|attrs| attrs.get("dns_name"))
             .expect("partial-read missing attribute must be materialized");
-        match a_dns_name {
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::PostCreateReadIncomplete {
-                detail,
-            })) => assert_eq!(detail, "read after create did not return dns_name"),
-            other => panic!("expected PostCreateReadIncomplete unknown, got {other:?}"),
-        }
+        assert!(matches!(
+            a_dns_name,
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(pending)))
+                if pending == &PendingReRead::incomplete("read after create did not return dns_name")
+        ));
 
         crate::resolver::resolve_refs_with_state_and_remote(&mut resources, &resolved)
             .expect("sibling ref should resolve through the binding view");
@@ -3410,14 +3403,11 @@ mod resolved_bindings_tests {
             .attributes
             .get("target")
             .expect("target attribute should remain present");
-        match target {
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::PostCreateReadIncomplete {
-                detail,
-            })) => assert_eq!(detail, "read after create did not return dns_name"),
-            other => {
-                panic!("expected sibling ref to resolve to partial-read unknown, got {other:?}")
-            }
-        }
+        assert!(matches!(
+            target,
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(pending)))
+                if pending == &PendingReRead::incomplete("read after create did not return dns_name")
+        ));
     }
 
     #[test]

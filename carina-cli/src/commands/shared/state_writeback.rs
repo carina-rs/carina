@@ -6531,7 +6531,7 @@ mod export_writeback_tests {
     use carina_core::parser::InferredExportParam;
     use carina_core::resource::{
         AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PartialReadMarker,
-        UnknownReason, Value,
+        PendingReRead, UnknownReason, Value,
     };
     use carina_state::{ResourceState, StateFile};
 
@@ -6591,10 +6591,12 @@ mod export_writeback_tests {
         row = crate::fixture_resource_state_metadata(
             row,
             None,
-            Some(Some(PartialReadMarker {
-                detail: "provider read after create did not return every attribute".to_string(),
-                missing_attributes: BTreeSet::from(["computed".to_string()]),
-            })),
+            Some(PartialReadMarker::new(
+                PendingReRead::incomplete(
+                    "provider read after create did not return every attribute",
+                ),
+                BTreeSet::from(["computed".to_string()]),
+            )),
         );
         row.dependency_bindings = BTreeSet::from(["upstream".to_string()]);
         let mut state = StateFile::new();
@@ -6626,7 +6628,7 @@ mod export_writeback_tests {
             Current::Present(present) => {
                 assert!(matches!(
                     &present.state().partial_read,
-                    Some(marker) if marker.missing_attributes.contains("computed")
+                    Some(marker) if marker.missing_attributes().contains("computed")
                 ));
                 assert_eq!(
                     present.state().dependency_bindings,
@@ -6655,8 +6657,10 @@ mod export_writeback_tests {
         assert!(matches!(
             &values.as_slice()[0].value,
             Some(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::PostCreateReadIncomplete { detail }
-            ))) if detail == "provider read after create did not return every attribute"
+                UnknownReason::PendingReRead(pending)
+            ))) if pending == &PendingReRead::incomplete(
+                "provider read after create did not return every attribute"
+            )
         ));
         let (_, skipped) = materialize_exports(&values)
             .expect("unresolved export must be skippable")
@@ -6664,7 +6668,7 @@ mod export_writeback_tests {
         assert_eq!(skipped.len(), 1);
         assert_eq!(
             skipped[0].reason,
-            "value not yet known (post-create read failed: provider read after create did not return every attribute)"
+            "value not yet known (read after apply was incomplete: provider read after create did not return every attribute)"
         );
     }
 

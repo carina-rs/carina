@@ -21,13 +21,13 @@ use crate::config_loader::{find_crn_files_in_dir, parse_directory};
 use crate::parser::{ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState};
 use crate::resource::{DeferredValue, Subscript, Value};
 use crate::schema::suggest_similar_name;
-use crate::static_type::ExportStaticType;
+use crate::static_type::ConsumerExportStaticType;
 #[cfg(test)]
 use crate::static_type::StaticType;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpstreamExportType {
-    Static(ExportStaticType),
+    Static(ConsumerExportStaticType),
     InferenceNotRun,
 }
 
@@ -230,7 +230,7 @@ pub fn resolve_upstream_exports_with_schemas(
                 // structural TypeExpr values it receives, so leaving one
                 // declaration as DottedUnresolved while an equivalent schema
                 // projection is already SchemaType creates a false mismatch.
-                crate::validation::resolve_file_static_types_for_consumer(&mut parsed, config);
+                crate::validation::resolve_file_type_exprs_best_effort(&mut parsed, config);
                 // Expand module calls before inference so that
                 // `attributes { ... }`-typed `Virtual` resources land in
                 // `parsed.resources` (#2493). Without this the inferer
@@ -264,11 +264,7 @@ pub fn resolve_upstream_exports_with_schemas(
                 // name, preserving that distinction from inference failure.
                 let entries: UpstreamExportEntries = match schemas {
                     Some(s) => {
-                        let mut inferred = crate::validation::inference::apply_inference(parsed, s);
-                        crate::validation::resolve_file_static_types_for_consumer(
-                            &mut inferred,
-                            config,
-                        );
+                        let inferred = crate::validation::inference::apply_inference(parsed, s);
                         inferred
                             .export_params
                             .into_iter()
@@ -276,7 +272,12 @@ pub fn resolve_upstream_exports_with_schemas(
                                 (
                                     e.name,
                                     UpstreamExportEntry {
-                                        static_type: UpstreamExportType::Static(e.static_type),
+                                        static_type: UpstreamExportType::Static(
+                                            crate::validation::resolve_export_static_type_for_consumer(
+                                                e.static_type,
+                                                config,
+                                            ),
+                                        ),
                                         value: e.value,
                                     },
                                 )
@@ -287,31 +288,30 @@ pub fn resolve_upstream_exports_with_schemas(
                     // the declared type unchanged. Note that without
                     // schemas there is no way to run inference, so
                     // unannotated exports are marked `InferenceNotRun`.
-                    None => {
-                        crate::validation::resolve_file_static_types_for_consumer(
-                            &mut parsed,
-                            config,
-                        );
-                        parsed
-                            .export_params
-                            .into_iter()
-                            .map(|e| {
-                                let static_type = match e.static_type {
-                                    Some(static_type) => UpstreamExportType::Static(
-                                        ExportStaticType::Declared(static_type),
-                                    ),
-                                    None => UpstreamExportType::InferenceNotRun,
-                                };
-                                (
-                                    e.name,
-                                    UpstreamExportEntry {
-                                        static_type,
-                                        value: e.value,
-                                    },
-                                )
-                            })
-                            .collect()
-                    }
+                    None => parsed
+                        .export_params
+                        .into_iter()
+                        .map(|e| {
+                            let static_type = match e.static_type {
+                                Some(static_type) => {
+                                    UpstreamExportType::Static(ConsumerExportStaticType::Declared(
+                                        crate::validation::resolve_consumer_static_type(
+                                            &static_type,
+                                            config,
+                                        ),
+                                    ))
+                                }
+                                None => UpstreamExportType::InferenceNotRun,
+                            };
+                            (
+                                e.name,
+                                UpstreamExportEntry {
+                                    static_type,
+                                    value: e.value,
+                                },
+                            )
+                        })
+                        .collect(),
                 };
                 out.insert(us.binding.clone(), entries);
             }
@@ -1153,6 +1153,7 @@ mod tests {
     use crate::parser::ParsedFile;
     use crate::resource::DeferredValue;
     use crate::schema::SchemaRegistry;
+    use crate::static_type::ConsumerExportStaticType as ExportStaticType;
     use std::fs;
     use std::path::PathBuf;
 
@@ -1212,7 +1213,7 @@ mod tests {
         assert!(matches!(
             &entry.static_type,
             UpstreamExportType::Static(ExportStaticType::Inferred(StaticType::Unchecked(
-                crate::static_type::InferredUncheckedReason::InferenceFailed(
+                crate::static_type::ConsumerInferredUncheckedReason::InferenceFailed(
                     crate::static_type::InferenceError::HeterogeneousCollection { .. }
                 )
             )))

@@ -10,7 +10,6 @@ use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
 use carina_core::resource::EnumValueResolver;
 use carina_core::schema::{AttributeType, Shape, TypeIdentity, TypeInSchema};
-use carina_core::static_type::StaticType;
 use carina_core::upstream_exports::UpstreamExportEntry;
 
 use super::{AttributeValueTarget, CompletionProvider, DslSource};
@@ -1589,8 +1588,7 @@ impl CompletionProvider {
                 continue;
             };
             for export in &parsed.export_params {
-                let Some(export_ty) = export.static_type.as_ref().and_then(StaticType::known)
-                else {
+                let Some(export_ty) = export.static_type.as_ref() else {
                     continue;
                 };
                 if !type_expr_source_is_assignable_to(export_ty, target, target_defs) {

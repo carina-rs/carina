@@ -4,7 +4,7 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::schema::{TypeIdentity, levenshtein_distance};
-use crate::static_type::TypeResolutionError;
+use crate::static_type::StaticTypeResolutionError;
 
 use super::ast::{ResourceTypePath, TypeExpr};
 use super::error::{ParseError, ParseWarning};
@@ -37,7 +37,7 @@ pub fn parse_type_expr_str(input: &str, config: &ProviderContext) -> Option<Type
         return None;
     }
     let mut warnings: Vec<ParseWarning> = Vec::new();
-    parse_type_expr(pair, config, &mut warnings).ok()
+    parse_type_expr(pair, config, &mut warnings, None).ok()
 }
 
 /// Parse type expression. Handles unions of atomic types
@@ -49,6 +49,7 @@ pub(super) fn parse_type_expr(
     pair: pest::iterators::Pair<Rule>,
     config: &ProviderContext,
     warnings: &mut Vec<ParseWarning>,
+    preprocessed_file: Option<&super::PreprocessedFile>,
 ) -> Result<TypeExpr, ParseError> {
     // Top-level `type_expr` is one or more `type_expr_atom`s separated
     // by `|`. Collect each atom; the `|` tokens are silent in pest, so
@@ -56,7 +57,12 @@ pub(super) fn parse_type_expr(
     let mut atoms: Vec<TypeExpr> = Vec::new();
     for child in pair.into_inner() {
         if child.as_rule() == Rule::type_expr_atom {
-            atoms.push(parse_type_expr_atom(child, config, warnings)?);
+            atoms.push(parse_type_expr_atom(
+                child,
+                config,
+                warnings,
+                preprocessed_file,
+            )?);
         }
     }
     match atoms.len() {
@@ -173,13 +179,13 @@ pub(crate) fn suggest_registered_dotted_custom_type(
 pub(crate) fn unknown_custom_type_error(
     input: &str,
     config: &ProviderContext,
-) -> TypeResolutionError {
+) -> StaticTypeResolutionError {
     match suggest_registered_dotted_custom_type(input, config) {
-        Some(suggestion) => TypeResolutionError::UnknownCustomTypeWithSuggestion {
+        Some(suggestion) => StaticTypeResolutionError::UnknownCustomTypeWithSuggestion {
             name: input.to_string(),
             suggestion,
         },
-        None => TypeResolutionError::UnknownCustomType {
+        None => StaticTypeResolutionError::UnknownCustomType {
             name: input.to_string(),
         },
     }
@@ -193,6 +199,7 @@ fn parse_type_expr_atom(
     pair: pest::iterators::Pair<Rule>,
     config: &ProviderContext,
     warnings: &mut Vec<ParseWarning>,
+    preprocessed_file: Option<&super::PreprocessedFile>,
 ) -> Result<TypeExpr, ParseError> {
     let _ = warnings;
     let inner = first_inner(pair, "type", "type expression")?;
@@ -202,7 +209,11 @@ fn parse_type_expr_atom(
             Ok(TypeExpr::StringLiteral(parse_string_literal(string)?))
         }
         Rule::type_simple => {
-            let line = inner.as_span().start_pos().line_col().0;
+            let type_span = preprocessed_file.map_or_else(
+                || super::SourceSpan::from_unmapped_pest(&inner),
+                |file| super::SourceSpan::from_pest(&inner, file),
+            );
+            let line = type_span.start_line();
             let text = inner.as_str();
             match text {
                 "String" => Ok(TypeExpr::String),
@@ -232,10 +243,11 @@ fn parse_type_expr_atom(
                     if config.custom_types_loaded() {
                         return match resolve_known_bare_custom_type(&snake, config) {
                             Some(resolved) => Ok(resolved),
-                            None => Err(ParseError::InvalidExpression {
-                                line,
-                                message: unknown_custom_type_message(other, config),
-                            }),
+                            None => Err(ParseError::unresolved_declaration_type(
+                                other,
+                                type_span,
+                                unknown_custom_type_message(other, config),
+                            )),
                         };
                     }
                     Ok(TypeExpr::Simple(snake))
@@ -264,6 +276,7 @@ fn parse_type_expr_atom(
                 next_pair(&mut generic_inner, "inner type", "generic type expression")?,
                 config,
                 warnings,
+                preprocessed_file,
             )?;
 
             if is_list {
@@ -302,6 +315,7 @@ fn parse_type_expr_atom(
                         next_pair(&mut field_inner, "field type", "struct field")?,
                         config,
                         warnings,
+                        preprocessed_file,
                     )?;
                     if fields.iter().any(|(existing, _)| existing == &name) {
                         return Err(ParseError::InvalidResourceType(format!(

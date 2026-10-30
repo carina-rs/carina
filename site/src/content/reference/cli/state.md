@@ -69,14 +69,100 @@ restores user map keys exactly as authored, including keys that start with
 |------|-------------|
 | `--state-url <URL>` | Read state directly from a URL, bypassing `.crn` / backend resolution. Mutually exclusive with PATH |
 | `--tui` | Display state in interactive TUI mode |
-| `--json` | Output the raw state-file JSON |
+| `--json` | Output the versioned public JSON document described below |
 
-`state show --json` is a state-file inspection command, so its output retains
-the persisted state-file encoding. Canonical enums use a `$enum` host payload,
-redacted secrets use a `$secret` host payload, and each user map key beginning
-with `$` has one additional leading `$` (for example, `$secret` is stored as
-`$$secret`). This differs intentionally from the decoded output of
-`state lookup --json`.
+#### JSON output schema v1
+
+`state show --json` returns a public inspection document that is independent
+of the on-disk state format:
+
+```json
+{
+  "schema_version": 1,
+  "state": "present",
+  "resources": [
+    {
+      "binding": "vpc",
+      "identity": "main-vpc",
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc",
+      "protected": false,
+      "current": {
+        "kind": "applied",
+        "identifier": "vpc-0123456789abcdef0",
+        "attributes": {
+          "cidr_block": "10.0.0.0/16"
+        }
+      },
+      "deposed": [
+        {
+          "identifier": "vpc-0fedcba9876543210"
+        }
+      ]
+    }
+  ]
+}
+```
+
+The top-level fields are:
+
+| Field | Meaning |
+|-------|---------|
+| `schema_version` | Version of this public JSON contract. Consumers must check it before reading other fields. A version bump indicates an incompatible contract change. |
+| `state` | `present` when a state file was loaded, or `absent` when the configured backend has no state file. |
+| `resources` | Resource rows in state order. This is empty when `state` is `absent` or when the present state contains no resources. |
+
+Each resource object has these fields:
+
+| Field | Meaning |
+|-------|---------|
+| `binding` | DSL binding for the resource, or `null` for an anonymous resource. |
+| `identity` | Stable Carina resource identity stored in state. |
+| `provider` | Provider name, such as `awscc`. |
+| `resource_type` | Provider resource type, such as `ec2.Vpc`. |
+| `protected` | Whether Carina protects the resource from deletion. |
+| `current` | Current-generation status, identifier, and attributes. |
+| `deposed` | One object per older replacement generation still pending deletion. Each object contains its provider-side `identifier`. |
+
+The `current` object has these fields:
+
+| Field | Meaning |
+|-------|---------|
+| `kind` | One of the closed set described below. |
+| `identifier` | Provider-side identifier when one is known, including during an in-flight create; otherwise `null`. |
+| `attributes` | Sorted attribute object containing ordinary JSON values. It is empty for kinds that do not carry current attributes. |
+
+The closed `current.kind` set in schema version 1 is:
+
+| Kind | Meaning |
+|------|---------|
+| `applied` | A completed current resource instance with a provider identifier. |
+| `none` | The row has no current instance, but may retain deposed generations. |
+| `create_in_flight` | The provider accepted a create that has not completed. |
+| `missing_identifier` | A legacy or malformed current instance has attributes but no provider identifier. |
+
+Strings, numbers, booleans, lists, and maps are emitted as ordinary JSON.
+Canonical enums use their provider API string. Persisted host encodings and
+secret digests are never emitted. A secret or accepted write-only value is
+always replaced by this marker:
+
+```json
+{"redacted": true}
+```
+
+User map keys are restored as authored, including keys beginning with `$`;
+those keys are ordinary user data, not persisted `$enum` or `$secret` host
+payloads.
+
+When the configured backend has no state file, `state show --json` exits 0 and
+prints:
+
+```json
+{"schema_version":1,"state":"absent","resources":[]}
+```
+
+Backend, read, migration, and parse failures remain errors and exit non-zero.
+Non-JSON `state show` output is unchanged.
 
 ### `lookup`
 
@@ -86,9 +172,10 @@ Look up resource attributes from the state file.
 carina state lookup [OPTIONS] <QUERY> [PATH]
 ```
 
-**QUERY** can be:
-- `<binding_or_name>` -- returns all attributes as a JSON object
-- `<binding_or_name>.<attribute>` -- returns a single attribute value
+**QUERY** can select:
+
+- `<binding_or_name>` -- a whole resource
+- `<binding_or_name>.<attribute>` -- one current attribute
 
 The query is matched against resource bindings and resource identities, picking the longest one that is a prefix of the query, so a module-prefixed binding such as `r.distribution` resolves `r.distribution.id`. On a tie, a binding wins over an identity.
 
@@ -100,13 +187,26 @@ carina state lookup my_bucket
 carina state lookup my_bucket.bucket
 ```
 
-Single attribute values are returned as raw values (no quotes for strings), suitable for shell usage. Use `--json` to always output JSON.
+Without `--json`, single attribute values are returned as raw values (no
+quotes for strings), suitable for shell usage. Human-readable lookup output is
+unchanged.
 
-Lookup output is decoded for use as ordinary JSON: canonical enums are their
-provider API strings, `$`-prefixed user keys are unescaped, and redacted
-secrets are the fixed string `(secret)`. It never emits the raw `$enum`,
-`$secret`, or `$$` state-file representation. Consequently, a real redacted
-secret remains distinguishable from a user map whose key is `$secret`.
+With `--json`, lookup uses the same schema version 1 conversion as
+`state show --json`:
+
+- A whole-resource lookup returns that resource object, beginning with
+  `binding` and ending with `deposed`. It does not wrap the object in the
+  top-level document.
+- An attribute lookup returns that value from `current.attributes`, including
+  the `{"redacted": true}` marker for a secret or accepted write-only value.
+- A whole-resource lookup of an in-flight create returns the resource object
+  with `current.kind` set to `create_in_flight`. Looking up one of its
+  attributes remains an error.
+
+Lookup requires an existing state and a matching resource, so an absent state
+remains an error. Canonical enums and user map keys use the same decoded forms
+as `state show --json`; persisted `$enum`, `$secret`, and `$$` encodings are
+never exposed.
 
 #### Flags
 
@@ -177,6 +277,7 @@ Since state format version 14, Carina reserves single-`$` object keys for host p
 Canonical enums are stored as `$enum` payloads and redacted secrets as
 `$secret` payloads, while user keys beginning with `$` are escaped by adding
 one leading `$`. Carina decodes that representation when values are shown
-through human output, `state lookup --json`, exports, or `upstream_state`;
-decoded display views render a redacted secret as `(secret)`. Only
-`state show --json` exposes the raw file encoding.
+through public output, exports, or `upstream_state`. Human-readable state
+output renders a redacted secret as `(secret)`; schema version 1 JSON uses
+`{"redacted": true}`. The persisted representation is an internal storage
+detail and is not the `state show --json` contract.

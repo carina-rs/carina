@@ -3,14 +3,16 @@ use std::path::Path;
 
 use indexmap::IndexMap;
 
-use crate::parser::{ArgumentParameter, File, ParsedFile, ProviderContext, RequireBlock};
+use crate::parser::{ConsumerArgumentParameter, File, ParsedFile, ProviderContext, RequireBlock};
 use crate::static_type::ConsumerStaticType;
+
+use super::resolver::{StrictTypeResolution, TypeResolutionPolicy};
 
 /// The statically declared boundary of one imported module after dotted type
 /// expressions have been resolved against the caller's provider context.
 #[derive(Debug, Clone)]
 pub struct ResolvedModuleSignature {
-    pub arguments: Vec<ArgumentParameter>,
+    pub arguments: Vec<ConsumerArgumentParameter>,
     pub attributes: IndexMap<String, Option<ConsumerStaticType>>,
     pub requires: Vec<RequireBlock>,
 }
@@ -27,25 +29,32 @@ pub(super) fn resolved_signature(
     parsed: &ParsedFile,
     config: &ProviderContext,
 ) -> ResolvedModuleSignature {
+    resolved_signature_with_policy::<StrictTypeResolution>(parsed, config)
+}
+
+pub(super) fn resolved_signature_with_policy<P: TypeResolutionPolicy>(
+    parsed: &ParsedFile,
+    config: &ProviderContext,
+) -> ResolvedModuleSignature {
     let arguments = parsed
         .arguments
         .iter()
-        .cloned()
-        .map(|mut argument| {
-            argument.static_type = crate::validation::resolve_consumer_static_type_for_signature(
-                &argument.static_type,
-                config,
-            );
-            argument
+        .map(|argument| ConsumerArgumentParameter {
+            name: argument.name.clone(),
+            static_type: P::resolve_static_type(&argument.static_type, config),
+            default: argument.default.clone(),
+            description: argument.description.clone(),
+            validations: argument.validations.clone(),
         })
         .collect();
     let attributes = parsed
         .attribute_params
         .iter()
         .map(|attribute| {
-            let resolved = attribute.static_type.as_ref().map(|static_type| {
-                crate::validation::resolve_consumer_static_type_for_signature(static_type, config)
-            });
+            let resolved = attribute
+                .static_type
+                .as_ref()
+                .map(|type_expr| P::resolve_static_type(type_expr, config));
             (attribute.name.clone(), resolved)
         })
         .collect();

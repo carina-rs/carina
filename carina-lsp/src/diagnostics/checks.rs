@@ -15,34 +15,25 @@ use carina_core::parser::{
 };
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::suggest_similar_name;
-use carina_core::static_type::StaticType;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
 use super::{DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic};
 
-/// Directory parse plus the module-expansion error, if expansion stopped.
-///
-/// Most diagnostics can still use the partially expanded parse after a
-/// resolver failure, but concrete module constraint failures must not be
-/// discarded: they are actionable editor diagnostics in their own right.
+/// Directory parse plus the typed module-resolution outcome.
 pub(super) struct MergedParseResult {
     pub(super) directory: DirectoryParseResult,
-    pub(super) module_error: Option<carina_core::module_resolver::ModuleError>,
-    pub(super) module_constraint_reports: carina_core::module_resolver::ModuleCallConstraintReports,
+    pub(super) module_resolution: MergedModuleResolution,
 }
 
-pub(super) fn resolve_attribute_static_types_for_consumer(
-    parameters: &mut [AttributeParameter],
-    provider_context: &carina_core::parser::ProviderContext,
-) {
-    for parameter in parameters {
-        if let Some(static_type) = &mut parameter.static_type {
-            *static_type = carina_core::validation::resolve_consumer_static_type_for_signature(
-                static_type,
-                provider_context,
-            );
-        }
-    }
+pub(super) enum MergedModuleResolution {
+    Expanded,
+    ConstraintFailed {
+        findings: Vec<carina_core::validation::ModuleCallFinding>,
+        errors: Vec<carina_core::module_resolver::ResidualModuleResolutionError>,
+    },
+    Unowned {
+        errors: Vec<carina_core::module_resolver::ResidualModuleResolutionError>,
+    },
 }
 
 fn source_span_position(span: SourceSpan) -> (u32, u32) {
@@ -196,41 +187,22 @@ impl<'a> SemanticView<'a> {
         }
     }
 
-    /// Select the owner whose parser-native references are safe to feed to a
-    /// BindingIndex-backed check. Unlike value-shape checking, a failed
-    /// directory merge may use the authored node: the core reference visitor
-    /// ignores ambiguous `EnumIdentifier` guesses and sees only explicit
-    /// `BindingRef` / `ResourceRef` forms.
-    fn reference_owner<'view, T>(&'view self, authored: &'view T) -> Option<&'view T>
-    where
-        T: SemanticLookup,
-    {
-        match self {
-            Self::Standalone(_) | Self::DirectoryUnavailable => Some(authored),
-            Self::Directory { merged } => authored.lookup_in(merged),
-        }
-    }
-
     /// Select the only value that may be fed to the shared type checker.
     /// Directory-backed analysis prefers the merged semantic value. If the
     /// directory is unavailable, the authored value is admitted only through
     /// `ContextFreeValue`, which proves it contains no name that a sibling file
     /// could reclassify.
-    fn value_for_typecheck<'view, T>(
-        &'view self,
-        authored: &'view T,
-        slot: TypecheckValueSlot<'_>,
-    ) -> Option<&'view Value>
+    fn value_for_typecheck<'view, T>(&'view self, authored: &'view T) -> Option<&'view Value>
     where
         T: SemanticLookup,
     {
         match self {
-            Self::Standalone(_) => authored.value_at(slot),
-            Self::Directory { merged } => authored
-                .lookup_in(merged)
-                .and_then(|semantic| semantic.value_at(slot)),
+            Self::Standalone(_parsed) => authored.value(),
+            Self::Directory { merged } => {
+                authored.lookup_in(merged).and_then(SemanticLookup::value)
+            }
             Self::DirectoryUnavailable => authored
-                .value_at(slot)
+                .value()
                 .and_then(ContextFreeValue::new)
                 .map(ContextFreeValue::get),
         }
@@ -243,12 +215,6 @@ impl<'a> SemanticView<'a> {
             Self::DirectoryUnavailable => None,
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum TypecheckValueSlot<'a> {
-    Parameter,
-    ModuleArgument(&'a str),
 }
 
 /// Proof that a buffer-only value cannot acquire different semantics from a
@@ -307,24 +273,7 @@ impl<'a> ContextFreeValue<'a> {
 trait SemanticLookup: Sized {
     fn lookup_in<'a>(&self, merged: &'a ParsedFile) -> Option<&'a Self>;
 
-    fn value_at(&self, slot: TypecheckValueSlot<'_>) -> Option<&Value>;
-}
-
-impl SemanticLookup for ModuleCall {
-    fn lookup_in<'a>(&self, merged: &'a ParsedFile) -> Option<&'a Self> {
-        merged
-            .module_calls
-            .iter()
-            .find(|candidate| candidate.id() == self.id())
-    }
-
-    fn value_at(&self, slot: TypecheckValueSlot<'_>) -> Option<&Value> {
-        let TypecheckValueSlot::ModuleArgument(argument) = slot else {
-            return None;
-        };
-        self.argument(argument)
-            .and_then(|argument| argument.value())
-    }
+    fn value(&self) -> Option<&Value>;
 }
 
 impl SemanticLookup for AttributeParameter {
@@ -336,10 +285,8 @@ impl SemanticLookup for AttributeParameter {
         })
     }
 
-    fn value_at(&self, slot: TypecheckValueSlot<'_>) -> Option<&Value> {
-        matches!(slot, TypecheckValueSlot::Parameter)
-            .then_some(self.value.as_ref())
-            .flatten()
+    fn value(&self) -> Option<&Value> {
+        self.value.as_ref()
     }
 }
 
@@ -352,10 +299,8 @@ impl SemanticLookup for ParsedExportParam {
         })
     }
 
-    fn value_at(&self, slot: TypecheckValueSlot<'_>) -> Option<&Value> {
-        matches!(slot, TypecheckValueSlot::Parameter)
-            .then_some(self.value.as_ref())
-            .flatten()
+    fn value(&self) -> Option<&Value> {
+        self.value.as_ref()
     }
 }
 
@@ -1179,6 +1124,41 @@ impl DiagnosticEngine {
         None
     }
 
+    /// Build the typed call findings that may claim resolver backstops.
+    fn module_call_findings_for_resolution(
+        &self,
+        parsed: &ParsedFile,
+        base_path: &std::path::Path,
+    ) -> Vec<carina_core::validation::ModuleCallFinding> {
+        let signatures = carina_core::module_resolver::load_resolved_module_signatures(
+            parsed,
+            base_path,
+            &self.provider_context,
+        );
+        let binding_use_report = carina_core::validation::check_bare_binding_uses(
+            parsed,
+            &carina_core::validation::ValidationTypeContext::new(
+                parsed,
+                &self.schemas,
+                &self.provider_context,
+                &signatures,
+            ),
+        );
+        let bindings =
+            BindingIndex::from_parsed_with_module_signatures(parsed, &self.schemas, &signatures);
+        carina_core::validation::check_module_calls(carina_core::validation::ModuleCallCheckInput {
+            authored: parsed,
+            semantic: Some(parsed),
+            base_dir: Some(base_path),
+            imported_signatures: &signatures,
+            provider_context: &self.provider_context,
+            schemas: &self.schemas,
+            binding_use_report: &binding_use_report,
+            bindings: &bindings,
+            reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
+        })
+    }
+
     /// Run a directory-scoped parse with the current editor buffer substituted
     /// for its on-disk copy, so diagnostics that need cross-file context
     /// (upstream-state exports, for-iterable bindings) update on keystrokes.
@@ -1206,17 +1186,30 @@ impl DiagnosticEngine {
                 &self.provider_context,
                 &overrides,
             )?;
+        let covered_findings = self.module_call_findings_for_resolution(&result.parsed, base_path);
         // Module expansion is a no-op for configs without `module_call`.
-        // Retain an error while continuing with the partially expanded parse:
-        // source-level checks still have useful work to do, and concrete
-        // value-constraint failures are surfaced at the owning call site.
+        // Failures retain the authored parse for source-level checks; only the
+        // successful outcome can replace it with the expanded graph.
         let module_resolution = carina_core::module_resolver::resolve_modules_with_diagnostics(
-            &mut result.parsed,
+            &result.parsed,
             base_path,
             &self.provider_context,
             &self.schemas,
+            &covered_findings,
         );
-        let module_error = module_resolution.error;
+        let module_resolution = match module_resolution {
+            carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
+                result.parsed = *graph;
+                MergedModuleResolution::Expanded
+            }
+            carina_core::module_resolver::ModuleResolutionDiagnosticResult::ConstraintFailed {
+                findings,
+                errors,
+            } => MergedModuleResolution::ConstraintFailed { findings, errors },
+            carina_core::module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors } => {
+                MergedModuleResolution::Unowned { errors }
+            }
+        };
         let _ = carina_core::parser::resolve_provider_unresolved_attributes(
             &mut result.parsed,
             &self.provider_context,
@@ -1224,8 +1217,7 @@ impl DiagnosticEngine {
         let _ = carina_core::parser::finalize_provider_configs(&mut result.parsed);
         Ok(MergedParseResult {
             directory: result,
-            module_error,
-            module_constraint_reports: module_resolution.constraint_reports,
+            module_resolution,
         })
     }
 
@@ -1236,98 +1228,43 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         parsed: &ParsedFile,
-        error: &carina_core::module_resolver::ModuleError,
+        residual: &carina_core::module_resolver::ResidualModuleResolutionError,
         base_path: &std::path::Path,
         current_source: Option<&std::path::Path>,
     ) -> Vec<Diagnostic> {
-        // Resolver identities are always file-backed. Without a current-file
-        // identity there is no safe way to distinguish coincidentally equal
-        // spans from different directory members.
         let Some(current_source) = current_source else {
             return Vec::new();
         };
-        let call_source = error.call_source();
-        let error = error.root_cause();
+        let call_source = residual.call_source();
 
-        if matches!(
-            error,
-            carina_core::module_resolver::ModuleError::BareStructuralHandleArgument { .. }
-        ) && match call_source {
-            carina_core::module_resolver::ModuleErrorCallSource::Failing(identity) => {
-                identity.source_file() == current_source
-            }
-            carina_core::module_resolver::ModuleErrorCallSource::Owners(_)
-            | carina_core::module_resolver::ModuleErrorCallSource::Unavailable => false,
-        } {
-            // `check_module_calls` runs the same shared handle-sink check and
-            // can underline the exact argument expression in this document.
+        let Some(residual_diagnostic) = residual.diagnostic() else {
             return Vec::new();
-        }
-
-        let relative_message = error.display_relative_to(base_path);
-        let (constraint_origin, direct_error_location, severity, message) = match error {
-            carina_core::module_resolver::ModuleError::Constraint(diagnostic) => (
-                Some(&diagnostic.origin),
+        };
+        let relative_message = residual.display_relative_to(base_path);
+        let (constraint_origin, direct_error_location, severity, message) =
+            match residual_diagnostic {
+            carina_core::module_resolver::ResidualModuleResolutionDiagnostic::Constraint {
+                origin,
+            } => (
+                Some(origin),
                 None,
                 DiagnosticSeverity::ERROR,
                 relative_message,
             ),
-            carina_core::module_resolver::ModuleError::ReferenceType(joined) => {
-                // Output/resource/function declaration failures belong to the
-                // imported module document. Only a nested call boundary has a
-                // meaningful root-call anchor in the current document.
-                let nested_calls = joined
-                    .lines()
-                    .filter(|line| line.starts_with("module call '"))
-                    .collect::<Vec<_>>();
-                if nested_calls.is_empty() {
-                    return Vec::new();
-                }
-                (
-                    None,
-                    None,
-                    DiagnosticSeverity::WARNING,
-                    format!(
-                        "Reference type validation failed: {}",
-                        nested_calls.join("\n")
-                    ),
-                )
-            }
-            carina_core::module_resolver::ModuleError::ArgumentValueAccess {
+            carina_core::module_resolver::ResidualModuleResolutionDiagnostic::ArgumentValueAccess {
                 source_path,
                 line,
-                ..
-            }
-            | carina_core::module_resolver::ModuleError::BareStructuralHandleArgument {
-                source_path,
-                line,
-                ..
             } => (
                 None,
-                Some((*line, source_path.as_str())),
+                Some((line, source_path)),
                 DiagnosticSeverity::ERROR,
                 relative_message,
             ),
-            carina_core::module_resolver::ModuleError::Parse(_)
-            | carina_core::module_resolver::ModuleError::ParseInFile { .. } => {
+            carina_core::module_resolver::ResidualModuleResolutionDiagnostic::ModuleCall => {
                 (None, None, DiagnosticSeverity::ERROR, relative_message)
             }
-            carina_core::module_resolver::ModuleError::OwnedByCalls { .. }
-            | carina_core::module_resolver::ModuleError::AtCall { .. }
-            | carina_core::module_resolver::ModuleError::NotFound(_)
-            | carina_core::module_resolver::ModuleError::CircularImport(_)
-            | carina_core::module_resolver::ModuleError::MissingArgument { .. }
-            | carina_core::module_resolver::ModuleError::InvalidArgumentType { .. }
-            | carina_core::module_resolver::ModuleError::Io(_)
-            | carina_core::module_resolver::ModuleError::UnknownArgument { .. }
-            | carina_core::module_resolver::ModuleError::UnknownModule(_)
-            | carina_core::module_resolver::ModuleError::ProviderInModule
-            | carina_core::module_resolver::ModuleError::StateBlockInModule
-            | carina_core::module_resolver::ModuleError::BackendInModule
-            | carina_core::module_resolver::ModuleError::UpstreamStateInModule
-            | carina_core::module_resolver::ModuleError::ExportsInModule
-            | carina_core::module_resolver::ModuleError::NotADirectory { .. } => {
-                return Vec::new();
+            carina_core::module_resolver::ResidualModuleResolutionDiagnostic::Parse => {
+                (None, None, DiagnosticSeverity::ERROR, relative_message)
             }
         };
 
@@ -1925,249 +1862,6 @@ impl DiagnosticEngine {
         diagnostics
     }
 
-    /// Check module calls against imported module definitions
-    pub(super) fn check_module_calls(
-        &self,
-        parsed: &ParsedFile,
-        semantic_view: &SemanticView<'_>,
-        imported_modules: &carina_core::module_resolver::ResolvedModuleSignatures,
-        inference_bindings: &carina_core::validation::inference::InferenceBindings,
-        binding_use_report: &carina_core::validation::BindingUseReport,
-    ) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
-
-        // Check each module call
-        for call in &parsed.module_calls {
-            if let Some(signature) = imported_modules.get(&call.module_name) {
-                let module_args = &signature.arguments;
-                // Check for unknown parameters
-                for authored in call.arguments_with_source_spans() {
-                    let arg_name = authored.name();
-                    let authored_argument = authored.argument();
-                    let key_span = authored.key_span();
-                    let (line, col) = source_span_position(key_span);
-                    let matching_arg = module_args.iter().find(|arg| arg.name == arg_name);
-
-                    if matching_arg.is_none() {
-                        // Find similar parameter names for suggestion
-                        let suggestion = module_args
-                            .iter()
-                            .find(|arg| {
-                                arg.name.contains(arg_name) || arg_name.contains(arg.name.as_str())
-                            })
-                            .map(|arg| format!(". Did you mean '{}'?", arg.name))
-                            .unwrap_or_default();
-
-                        diagnostics.push(carina_diagnostic(
-                            line,
-                            col,
-                            col + arg_name.len() as u32,
-                            DiagnosticSeverity::WARNING,
-                            format!(
-                                "Unknown parameter '{}' for module '{}'{}",
-                                arg_name, call.module_name, suggestion
-                            ),
-                        ));
-                        continue;
-                    }
-
-                    // Type validation for known parameters
-                    let arg = matching_arg.unwrap();
-                    let Some(argument_type) = arg.static_type.known() else {
-                        continue;
-                    };
-                    let Ok(Some(resolved_parameter)) =
-                        carina_core::validation::resolve_parameter_type_for_check(
-                            argument_type,
-                            &self.provider_context,
-                        )
-                    else {
-                        // Dotted type-resolution diagnostics are emitted by
-                        // the shared validation path. Never guess handle-ness
-                        // from the unresolved syntax here.
-                        continue;
-                    };
-                    let semantic_argument = semantic_view
-                        .lookup(call)
-                        .and_then(|semantic_call| semantic_call.argument(arg_name))
-                        .unwrap_or(authored_argument);
-                    if carina_core::validation::binding_use_authority_owns_module_argument(
-                        parsed,
-                        binding_use_report,
-                        call.id(),
-                        arg_name,
-                    ) {
-                        continue;
-                    }
-                    if let Some(result) = carina_core::validation::check_module_argument_handle_sink(
-                        semantic_argument,
-                        &resolved_parameter,
-                    ) {
-                        if let Err(error) = result {
-                            diagnostics.push(carina_diagnostic(
-                                line,
-                                col,
-                                col + arg_name.len() as u32,
-                                DiagnosticSeverity::ERROR,
-                                format!(
-                                    "module call '{}' argument '{}': {error}",
-                                    call.module_name, arg_name,
-                                ),
-                            ));
-                        }
-                        // Core has completely checked this typed handle. Its
-                        // value-shaped projection is walker-only and must not
-                        // enter the ordinary value type checker below.
-                        continue;
-                    }
-                    if let Some(semantic_value) = semantic_view
-                        .value_for_typecheck(call, TypecheckValueSlot::ModuleArgument(arg_name))
-                        && let Err(type_error) =
-                            carina_core::validation::typecheck::check_type_expr_value(
-                                &resolved_parameter.as_type_expr(),
-                                semantic_value,
-                                &self.provider_context,
-                                carina_core::validation::typecheck::TypecheckInference::Available {
-                                    bindings: inference_bindings,
-                                    schemas: &self.schemas,
-                                },
-                            )
-                    {
-                        diagnostics.push(carina_diagnostic(
-                            line,
-                            col,
-                            col + arg_name.len() as u32,
-                            DiagnosticSeverity::WARNING,
-                            type_error.to_string(),
-                        ));
-                    }
-                }
-
-                // Check for missing required parameters
-                for arg in module_args {
-                    let pending_slot =
-                        carina_core::validation::module_argument_has_pending_binding_use(
-                            parsed,
-                            call.id(),
-                            &arg.name,
-                        );
-                    if arg.default.is_none() && !call.contains_argument(&arg.name) && !pending_slot
-                    {
-                        let (line, col) = module_call_position(call);
-                        diagnostics.push(carina_diagnostic(
-                            line,
-                            col,
-                            col + call.module_name.len() as u32,
-                            DiagnosticSeverity::ERROR,
-                            format!(
-                                "Missing required parameter '{}' for module '{}'",
-                                arg.name, call.module_name
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-
-        diagnostics
-    }
-
-    /// Map resolver-owned constraint outcomes onto their parser-authored
-    /// source spans. This layer never rebuilds argument values or re-runs a
-    /// constraint expression.
-    pub(super) fn module_constraint_diagnostics(
-        &self,
-        current_file: &std::path::Path,
-        reports: &carina_core::module_resolver::ModuleCallConstraintReports,
-    ) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
-        for report in reports.values() {
-            if report.source.file() != current_file {
-                continue;
-            }
-            for outcome in &report.outcomes {
-                let carina_core::module_resolver::ResolvedModuleConstraintStatus::Failed {
-                    diagnostic,
-                    origin,
-                } = &outcome.status
-                else {
-                    continue;
-                };
-                let span = match origin {
-                    carina_core::module_resolver::ResolvedModuleConstraintOrigin::Argument(
-                        carina_core::parser::ArgumentOrigin::Authored { key_span, .. },
-                    ) => *key_span,
-                    carina_core::module_resolver::ResolvedModuleConstraintOrigin::Argument(
-                        carina_core::parser::ArgumentOrigin::Defaulted,
-                    )
-                    | carina_core::module_resolver::ResolvedModuleConstraintOrigin::Call => {
-                        report.source.call_span()
-                    }
-                };
-                let (line, col) = source_span_position(span);
-                let width = if span.start_line() == span.end_line() {
-                    span.end_column().saturating_sub(span.start_column()) as u32
-                } else {
-                    1
-                };
-                diagnostics.push(carina_diagnostic(
-                    line,
-                    col,
-                    col + width.max(1),
-                    DiagnosticSeverity::ERROR,
-                    diagnostic.to_string(),
-                ));
-            }
-        }
-        diagnostics
-    }
-
-    /// Type-check reference-valued module arguments when expanded composition
-    /// diagnostics are unavailable. A successful directory parse supplies the
-    /// classified semantic call; a broken directory safely falls back only to
-    /// parser-native references from the authored call.
-    pub(super) fn check_module_call_ref_types(
-        &self,
-        parsed: &ParsedFile,
-        semantic_view: &SemanticView<'_>,
-        imported_modules: &carina_core::module_resolver::ResolvedModuleSignatures,
-        binding_index: &BindingIndex<'_>,
-    ) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
-        for authored_call in &parsed.module_calls {
-            let Some(semantic_call) = semantic_view.reference_owner(authored_call) else {
-                continue;
-            };
-            for error in
-                carina_core::validation::validate_module_call_argument_ref_types_with_bindings(
-                    std::slice::from_ref(semantic_call),
-                    imported_modules,
-                    &HashSet::new(),
-                    binding_index,
-                )
-            {
-                if semantic_call
-                    .argument(&error.argument)
-                    .is_some_and(|argument| argument.bare_handle_error().is_some())
-                {
-                    // `check_module_calls` routes classified handles through
-                    // core's shared sink checker at error severity.
-                    continue;
-                }
-                let (line, col) = source_span_position(error.argument_span);
-                let width = error.argument.chars().count() as u32;
-                diagnostics.push(carina_diagnostic(
-                    line,
-                    col,
-                    col + width,
-                    DiagnosticSeverity::WARNING,
-                    error.to_string(),
-                ));
-            }
-        }
-        diagnostics
-    }
-
     /// Surface BindingIndex-backed user-function argument/return reference
     /// mismatches in the authored buffer. The core owns the type relation; the
     /// LSP only chooses a source range.
@@ -2213,77 +1907,6 @@ impl DiagnosticEngine {
                 )
             })
             .collect()
-    }
-
-    /// Validate all expanded module boundaries, including calls nested below
-    /// the directory currently open in the editor.
-    pub(super) fn check_composition_ref_types(
-        &self,
-        parsed: &ParsedFile,
-        semantic_view: &SemanticView<'_>,
-        compositions: &[carina_core::resource::LiveComposition],
-        binding_index: &BindingIndex<'_>,
-    ) -> Vec<Diagnostic> {
-        carina_core::validation::validate_composition_ref_types_with_bindings(
-            compositions,
-            binding_index,
-        )
-        .into_iter()
-        .filter_map(|error| {
-            let carina_core::validation::CompositionRefError::ModuleCall(expanded_error) = &error
-            else {
-                // Output declaration diagnostics are owned by the module file's
-                // source-local `check_attributes_blocks` pass. Reporting their
-                // expanded copies here would duplicate once per instance and
-                // has no declaration range in a calling document.
-                return None;
-            };
-
-            let immediate_id = &expanded_error.call_path.immediate().id;
-            let immediate_call = parsed.module_calls.iter().find(|call| {
-                semantic_view
-                    .lookup(*call)
-                    .is_some_and(|semantic| semantic.id() == immediate_id)
-            });
-            let (authored_call, anchor_argument) = match immediate_call {
-                Some(call) => (call, true),
-                None => {
-                    let root_id = &expanded_error.call_path.root().id;
-                    let call = parsed.module_calls.iter().find(|call| {
-                        semantic_view
-                            .lookup(*call)
-                            .is_some_and(|semantic| semantic.id() == root_id)
-                    })?;
-                    (call, false)
-                }
-            };
-
-            let argument_span = if anchor_argument {
-                match *expanded_error.origin {
-                    carina_core::parser::ArgumentOrigin::Authored { key_span, .. } => {
-                        Some(key_span)
-                    }
-                    carina_core::parser::ArgumentOrigin::Defaulted => None,
-                }
-            } else {
-                None
-            };
-            let (line, col, width) = if let Some(span) = argument_span {
-                let (line, col) = source_span_position(span);
-                (line, col, expanded_error.argument.chars().count() as u32)
-            } else {
-                let (line, col) = module_call_position(authored_call);
-                (line, col, authored_call.module_name.chars().count() as u32)
-            };
-            Some(carina_diagnostic(
-                line,
-                col,
-                col + width,
-                DiagnosticSeverity::WARNING,
-                error.to_string(),
-            ))
-        })
-        .collect()
     }
 
     /// Format a stream of unused-binding names into LSP diagnostics.
@@ -2447,34 +2070,28 @@ impl DiagnosticEngine {
                     ));
                 }
 
-                match &attr_param.static_type {
-                    Some(StaticType::Known(type_expr)) => {
-                        if let Some(semantic_value) = semantic_view
-                            .value_for_typecheck(attr_param, TypecheckValueSlot::Parameter)
-                            && let Err(type_error) =
-                                carina_core::validation::typecheck::check_type_expr_value(
-                                    type_expr,
-                                    semantic_value,
-                                    &self.provider_context,
-                                    carina_core::validation::typecheck::TypecheckInference::Available {
-                                        bindings: inference_bindings,
-                                        schemas: &self.schemas,
-                                    },
-                                )
-                            && let Some((line, col)) =
-                                self.find_attributes_param_position(doc, &attr_param.name)
-                        {
-                            diagnostics.push(carina_diagnostic(
-                                line,
-                                col,
-                                col + attr_param.name.len() as u32,
-                                DiagnosticSeverity::WARNING,
-                                type_error.to_string(),
-                            ));
-                        }
-                    }
-                    Some(StaticType::Unchecked(_unnameable)) => {}
-                    None => {}
+                if let Some(type_expr) = &attr_param.static_type
+                    && let Some(semantic_value) = semantic_view.value_for_typecheck(attr_param)
+                    && let Err(type_error) =
+                        carina_core::validation::typecheck::check_type_expr_value(
+                            type_expr,
+                            semantic_value,
+                            &self.provider_context,
+                            carina_core::validation::typecheck::TypecheckInference::Available {
+                                bindings: inference_bindings,
+                                schemas: &self.schemas,
+                            },
+                        )
+                    && let Some((line, col)) =
+                        self.find_attributes_param_position(doc, &attr_param.name)
+                {
+                    diagnostics.push(carina_diagnostic(
+                        line,
+                        col,
+                        col + attr_param.name.len() as u32,
+                        DiagnosticSeverity::WARNING,
+                        type_error.to_string(),
+                    ));
                 }
             }
         }
@@ -2485,17 +2102,18 @@ impl DiagnosticEngine {
         // directional check. Expanded compositions handle imported-module
         // boundaries; this source-local walk covers the open module's own
         // `attributes {}` declaration.
-        let mut resolved_attribute_params = semantic_params
+        let attribute_params = semantic_params
             .into_iter()
             .flatten()
             .cloned()
             .collect::<Vec<_>>();
-        resolve_attribute_static_types_for_consumer(
-            &mut resolved_attribute_params,
-            &self.provider_context,
-        );
+        let resolved_attribute_params =
+            carina_core::validation::resolve_attribute_static_types_for_consumer(
+                &attribute_params,
+                &self.provider_context,
+            );
         if let Err(ref_errors) =
-            carina_core::validation::validate_attribute_param_ref_types_with_bindings(
+            carina_core::validation::validate_consumer_attribute_param_ref_types_with_bindings(
                 &resolved_attribute_params,
                 binding_index,
             )
@@ -2610,9 +2228,7 @@ impl DiagnosticEngine {
             let semantic_param = match semantic_view.lookup(param) {
                 Some(semantic_param) => semantic_param,
                 None => {
-                    let Some(value) =
-                        semantic_view.value_for_typecheck(param, TypecheckValueSlot::Parameter)
-                    else {
+                    let Some(value) = semantic_view.value_for_typecheck(param) else {
                         continue;
                     };
                     fallback = param.clone();
@@ -2641,23 +2257,17 @@ impl DiagnosticEngine {
 
         // Check for unknown type names in type annotations
         for param in &parsed.export_params {
-            match &param.static_type {
-                Some(StaticType::Known(type_expr)) => {
-                    if let Some(error) = self.check_unknown_type_names(type_expr)
-                        && let Some((line, col)) =
-                            self.find_exports_param_position(doc, &param.name)
-                    {
-                        diagnostics.push(carina_diagnostic(
-                            line,
-                            col,
-                            col + param.name.len() as u32,
-                            DiagnosticSeverity::WARNING,
-                            error,
-                        ));
-                    }
-                }
-                Some(StaticType::Unchecked(_unnameable)) => {}
-                None => {}
+            if let Some(type_expr) = &param.static_type
+                && let Some(error) = self.check_unknown_type_names(type_expr)
+                && let Some((line, col)) = self.find_exports_param_position(doc, &param.name)
+            {
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    col,
+                    col + param.name.len() as u32,
+                    DiagnosticSeverity::WARNING,
+                    error,
+                ));
             }
         }
 

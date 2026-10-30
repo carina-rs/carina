@@ -888,12 +888,7 @@ impl ModuleSignature {
             .iter()
             .map(|input| TypedArgument {
                 name: input.name.clone(),
-                static_type: match &input.static_type {
-                    StaticType::Known(type_expr) => {
-                        StaticType::Known(Self::signature_type_expr(type_expr))
-                    }
-                    StaticType::Unchecked(reason) => StaticType::Unchecked(reason.clone()),
-                },
+                static_type: StaticType::Known(Self::signature_type_expr(&input.static_type)),
                 required: input.default.is_none(),
                 default: input.default.as_ref().map(format_value),
                 description: input.description.clone(),
@@ -904,11 +899,11 @@ impl ModuleSignature {
         let argument_types: HashMap<String, TypeExpr> = parsed
             .arguments
             .iter()
-            .filter_map(|argument| {
-                argument
-                    .static_type
-                    .known()
-                    .map(|type_expr| (argument.name.clone(), Self::signature_type_expr(type_expr)))
+            .map(|argument| {
+                (
+                    argument.name.clone(),
+                    Self::signature_type_expr(&argument.static_type),
+                )
             })
             .collect();
 
@@ -974,14 +969,10 @@ impl ModuleSignature {
 
                 TypedAttributeParam {
                     name: attr_param.name.clone(),
-                    static_type: attr_param.static_type.as_ref().map(
-                        |static_type| match static_type {
-                            StaticType::Known(type_expr) => {
-                                StaticType::Known(Self::signature_type_expr(type_expr))
-                            }
-                            StaticType::Unchecked(reason) => StaticType::Unchecked(reason.clone()),
-                        },
-                    ),
+                    static_type: attr_param
+                        .static_type
+                        .as_ref()
+                        .map(|type_expr| StaticType::Known(Self::signature_type_expr(type_expr))),
                     source_binding,
                 }
             })
@@ -1634,20 +1625,15 @@ mod tests {
     }
 
     #[test]
-    fn module_info_display_labels_unnameable_types_with_original_declaration() {
+    fn module_info_display_labels_unresolved_types_with_original_declaration() {
         use crate::parser::{ProviderContext, parse};
 
-        let mut parsed = parse(
+        let parsed = parse(
             "arguments {\n  input: missing.types.Identifier\n}\n\
              attributes {\n  output: missing.types.Identifier = input\n}\n",
             &ProviderContext::default(),
         )
         .expect("module fixture must parse");
-        crate::validation::resolve_file_static_types_for_consumer(
-            &mut parsed,
-            &ProviderContext::default(),
-        );
-
         let signature = ModuleSignature::from_directory_module(&parsed, "unnameable");
         let display = signature.display_with_color(false);
 

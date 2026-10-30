@@ -18,7 +18,7 @@ use crate::resource::{
     LiveComposition, ModuleSource, PathSegment, Resource, ResourceId, ResourceIdentity,
     SavedModuleSource, StructuralOperand, StructuralOperandRef, UnknownReason, Value,
 };
-use crate::static_type::{ConsumerStaticType, ExportStaticType, StaticType};
+use crate::static_type::{ConsumerStaticType, ExportStaticType};
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -511,15 +511,17 @@ mod type_expr_display_tests {
 
 /// Argument parameter definition (in `arguments { ... }` block)
 #[derive(Debug, Clone)]
-pub struct ArgumentParameter {
+pub struct ArgumentParameter<T = TypeExpr> {
     pub name: String,
-    pub static_type: ConsumerStaticType,
+    pub static_type: T,
     pub default: Option<Value>,
     /// Optional description (from block form)
     pub description: Option<String>,
     /// Optional validation blocks (from block form). Multiple blocks are allowed.
     pub validations: Vec<ValidationBlock>,
 }
+
+pub type ConsumerArgumentParameter = ArgumentParameter<ConsumerStaticType>;
 
 /// A validate block: `validation { condition = <expr> error_message = "..." }`
 #[derive(Debug, Clone)]
@@ -661,9 +663,9 @@ impl RequireBlock {
 
 /// Attribute parameter definition (in `attributes { ... }` block)
 #[derive(Debug, Clone)]
-pub struct AttributeParameter {
+pub struct AttributeParameter<T = TypeExpr> {
     pub name: String,
-    pub static_type: Option<ConsumerStaticType>,
+    pub static_type: Option<T>,
     pub value: Option<Value>,
     source: DeclarationSource,
 }
@@ -678,7 +680,7 @@ impl AttributeParameter {
     ) -> Self {
         Self {
             name,
-            static_type: type_expr.map(StaticType::Known),
+            static_type: type_expr,
             value,
             source: DeclarationSource::authored(source_span, source_file),
         }
@@ -704,6 +706,19 @@ impl AttributeParameter {
     }
 }
 
+impl<T> AttributeParameter<T> {
+    pub(crate) fn map_type_expr<U>(self, map: impl FnOnce(T) -> U) -> AttributeParameter<U> {
+        AttributeParameter {
+            name: self.name,
+            static_type: self.static_type.map(map),
+            value: self.value,
+            source: self.source,
+        }
+    }
+}
+
+pub type ConsumerAttributeParameter = AttributeParameter<ConsumerStaticType>;
+
 /// An export parameter in an `exports { }` block, as produced by the
 /// parser before any inference runs.
 ///
@@ -714,7 +729,7 @@ impl AttributeParameter {
 #[derive(Debug, Clone)]
 pub struct ParsedExportParam {
     pub name: String,
-    pub static_type: Option<ConsumerStaticType>,
+    pub static_type: Option<TypeExpr>,
     pub value: Option<Value>,
     source: DeclarationSource,
 }
@@ -729,7 +744,7 @@ impl ParsedExportParam {
     ) -> Self {
         Self {
             name,
-            static_type: type_expr.map(StaticType::Known),
+            static_type: type_expr,
             value,
             source: DeclarationSource::authored(source_span, source_file),
         }
@@ -792,28 +807,9 @@ pub trait ExportParamLike {
     /// export boundary can return the same parser/inference shape wrapped in
     /// a checked type instead of maintaining parallel representations.
     fn set_value(&mut self, value: Option<Value>);
-    fn static_type(&self) -> ExportParamStaticTypeRef<'_>;
-    fn static_type_mut(&mut self) -> ExportParamStaticTypeMut<'_>;
-}
-
-#[derive(Clone, Copy)]
-pub enum ExportParamStaticTypeRef<'a> {
-    Parsed(&'a Option<ConsumerStaticType>),
-    Inferred(&'a ExportStaticType),
-}
-
-impl<'a> ExportParamStaticTypeRef<'a> {
-    pub fn known(self) -> Option<&'a TypeExpr> {
-        match self {
-            Self::Parsed(static_type) => static_type.as_ref().and_then(StaticType::known),
-            Self::Inferred(static_type) => static_type.known(),
-        }
-    }
-}
-
-pub enum ExportParamStaticTypeMut<'a> {
-    Parsed(&'a mut Option<ConsumerStaticType>),
-    Inferred(&'a mut ExportStaticType),
+    fn type_expr_opt(&self) -> Option<&TypeExpr>;
+    fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr>;
+    fn inference_failed(&self) -> bool;
 }
 
 impl ExportParamLike for ParsedExportParam {
@@ -826,11 +822,14 @@ impl ExportParamLike for ParsedExportParam {
     fn set_value(&mut self, value: Option<Value>) {
         self.value = value;
     }
-    fn static_type(&self) -> ExportParamStaticTypeRef<'_> {
-        ExportParamStaticTypeRef::Parsed(&self.static_type)
+    fn type_expr_opt(&self) -> Option<&TypeExpr> {
+        self.static_type.as_ref()
     }
-    fn static_type_mut(&mut self) -> ExportParamStaticTypeMut<'_> {
-        ExportParamStaticTypeMut::Parsed(&mut self.static_type)
+    fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr> {
+        self.static_type.as_mut()
+    }
+    fn inference_failed(&self) -> bool {
+        false
     }
 }
 
@@ -1079,6 +1078,35 @@ pub enum StateBlock {
 pub struct UseStatement {
     pub path: String,
     pub alias: String,
+    source: DeclarationSource,
+}
+
+impl UseStatement {
+    pub(crate) fn new_in_source(
+        path: String,
+        alias: String,
+        source_span: SourceSpan,
+        source_file: PathBuf,
+    ) -> Self {
+        Self {
+            path,
+            alias,
+            source: DeclarationSource::authored(source_span, source_file),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dummy(path: String, alias: String) -> Self {
+        Self::new_in_source(path, alias, SourceSpan::dummy(), PathBuf::from("test.crn"))
+    }
+
+    pub fn source_span(&self) -> SourceSpan {
+        self.source.span
+    }
+
+    pub fn source_file(&self) -> &Path {
+        &self.source.file
+    }
 }
 
 /// Parameter for a user-defined function
@@ -1199,7 +1227,7 @@ impl From<Value> for ModuleArgument {
 pub struct SourceFileId(Arc<Path>);
 
 impl SourceFileId {
-    pub(in crate::parser) fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self(Arc::from(path.into_boxed_path()))
     }
 
@@ -1272,6 +1300,7 @@ pub enum BindingUseOwner {
     ModuleArgument {
         call: ModuleCallId,
         argument: String,
+        value_span: SourceSpan,
     },
 }
 
@@ -1544,6 +1573,10 @@ impl ModuleCallId {
         self.source_file.path()
     }
 
+    pub fn source_file_id(&self) -> &SourceFileId {
+        &self.source_file
+    }
+
     pub fn call_span(&self) -> SourceSpan {
         self.call_span
     }
@@ -1807,6 +1840,28 @@ impl SourceSpan {
         Self::from_preprocessed_range(start, end, file)
     }
 
+    /// Build a span for a standalone parser fragment that has no heredoc
+    /// preprocessing map. Production file parsing uses [`Self::from_pest`].
+    pub(in crate::parser) fn from_unmapped_pest(
+        pair: &pest::iterators::Pair<'_, crate::parser::Rule>,
+    ) -> Self {
+        let span = pair.as_span();
+        let (start_line, start_column) = span.start_pos().line_col();
+        let (end_line, end_column) = span.end_pos().line_col();
+        Self {
+            start_byte: span.start(),
+            end_byte: span.end(),
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+        }
+    }
+
+    pub(crate) fn contains(self, other: Self) -> bool {
+        self.start_byte <= other.start_byte && self.end_byte >= other.end_byte
+    }
+
     pub(in crate::parser) fn from_preprocessed_range(
         start_byte: usize,
         end_byte: usize,
@@ -1900,6 +1955,7 @@ pub struct ParserBindingMetadata {
     structural_aliases: IndexMap<String, StructuralHandle>,
     value_structural_handles: IndexMap<String, StructuralHandleMetadata>,
     resource_source_files: HashMap<ResourceId, PathBuf>,
+    argument_type_sources: IndexMap<String, (SourceFileId, SourceSpan)>,
     pending_function_type_checks: Vec<PendingFunctionTypeCheck>,
 }
 
@@ -1952,6 +2008,22 @@ impl ParserBindingMetadata {
         self.resource_source_files.get(id).map(PathBuf::as_path)
     }
 
+    pub(crate) fn insert_argument_type_source(
+        &mut self,
+        name: String,
+        source_file: PathBuf,
+        span: SourceSpan,
+    ) {
+        self.argument_type_sources
+            .insert(name, (SourceFileId::new(source_file), span));
+    }
+
+    pub(crate) fn argument_type_source(&self, name: &str) -> Option<(&SourceFileId, SourceSpan)> {
+        self.argument_type_sources
+            .get(name)
+            .map(|(source_file, span)| (source_file, *span))
+    }
+
     pub(crate) fn insert_pending_function_type_check(&mut self, check: PendingFunctionTypeCheck) {
         if !self.pending_function_type_checks.contains(&check) {
             self.pending_function_type_checks.push(check);
@@ -1985,6 +2057,8 @@ impl ParserBindingMetadata {
             .extend(other.value_structural_handles);
         self.resource_source_files
             .extend(other.resource_source_files);
+        self.argument_type_sources
+            .extend(other.argument_type_sources);
         for check in other.pending_function_type_checks {
             self.insert_pending_function_type_check(check);
         }
@@ -2244,11 +2318,25 @@ impl ExportParamLike for InferredExportParam {
     fn set_value(&mut self, value: Option<Value>) {
         self.value = value;
     }
-    fn static_type(&self) -> ExportParamStaticTypeRef<'_> {
-        ExportParamStaticTypeRef::Inferred(&self.static_type)
+    fn type_expr_opt(&self) -> Option<&TypeExpr> {
+        self.static_type.known()
     }
-    fn static_type_mut(&mut self) -> ExportParamStaticTypeMut<'_> {
-        ExportParamStaticTypeMut::Inferred(&mut self.static_type)
+    fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr> {
+        match &mut self.static_type {
+            ExportStaticType::Declared(type_expr) => Some(type_expr),
+            ExportStaticType::Inferred(crate::static_type::StaticType::Known(type_expr)) => {
+                Some(type_expr)
+            }
+            ExportStaticType::Inferred(crate::static_type::StaticType::Unchecked(_reason)) => None,
+        }
+    }
+    fn inference_failed(&self) -> bool {
+        matches!(
+            self.static_type,
+            ExportStaticType::Inferred(crate::static_type::StaticType::Unchecked(
+                crate::static_type::InferredUncheckedReason::InferenceFailed(_)
+            ))
+        )
     }
 }
 
@@ -2256,7 +2344,7 @@ impl ExportParamLike for InferredExportParam {
 ///
 /// Two phases share this struct via aliases (see [`ParsedFile`] and
 /// [`InferredFile`]): the parser produces `File<ParsedExportParam>`
-/// where `static_type` is optional; the loader runs `apply_inference` and
+/// where `static_type` is an optional [`TypeExpr`]; the loader runs `apply_inference` and
 /// yields `File<InferredExportParam>` where every export carries its origin
 /// and unchecked reason. Every other field is identical between
 /// phases. See `notes/specs/2026-05-03-typeexpr-stage2-design.md`.
@@ -2995,7 +3083,7 @@ fn substitute_placeholder_with_policy(
             UnknownReason::UpstreamExport { .. }
             | UnknownReason::UpstreamAllExports { .. }
             | UnknownReason::EmptyInterpolation
-            | UnknownReason::PostCreateReadIncomplete { .. } => {}
+            | UnknownReason::PendingReRead(_) => {}
             // Function placeholders are substituted by user-function evaluation, not for expansion.
             UnknownReason::FnParam { .. }
             | UnknownReason::FnLocal { .. }
@@ -3134,7 +3222,7 @@ fn substitute_placeholder_lazily(
             UnknownReason::UpstreamExport { .. }
             | UnknownReason::UpstreamAllExports { .. }
             | UnknownReason::EmptyInterpolation
-            | UnknownReason::PostCreateReadIncomplete { .. }
+            | UnknownReason::PendingReRead(_)
             | UnknownReason::FnParam { .. }
             | UnknownReason::FnLocal { .. }
             | UnknownReason::ModuleArgument { .. } => {}
@@ -3275,7 +3363,7 @@ mod substitute_placeholder_tests {
 
         parsed.arguments.push(ArgumentParameter {
             name: "argument_name".to_string(),
-            static_type: StaticType::Known(TypeExpr::String),
+            static_type: TypeExpr::String,
             default: None,
             description: None,
             validations: Vec::new(),
@@ -3301,10 +3389,10 @@ mod substitute_placeholder_tests {
             depends_on: Vec::new(),
             line: 1,
         });
-        parsed.uses.push(UseStatement {
-            path: "./module".to_string(),
-            alias: "use_alias".to_string(),
-        });
+        parsed.uses.push(UseStatement::dummy(
+            "./module".to_string(),
+            "use_alias".to_string(),
+        ));
         parsed.user_functions.insert(
             "function_name".to_string(),
             UserFunction {

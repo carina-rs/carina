@@ -32,4 +32,24 @@ const ogUrl = new URL(ogPath, Astro.site ?? Astro.url).toString();
   <meta name="twitter:image" content={ogUrl} />
 
   <link rel="icon" type="image/png" href="/favicon.png" />
+
+  <script is:inline>
+    (() => {
+      const root = document.documentElement;
+
+      try {
+        root.toggleAttribute(
+          'data-nav-collapsed',
+          window.localStorage.getItem('carina-doc-nav-collapsed') === 'true',
+        );
+      } catch {}
+
+      try {
+        root.toggleAttribute(
+          'data-toc-collapsed',
+          window.localStorage.getItem('carina-doc-toc-collapsed') === 'true',
+        );
+      } catch {}
+    })();
+  </script>
 </head>

@@ -75,7 +75,7 @@ pub enum InferenceBinding {
     /// caller value is substituted; retaining the declaration here lets
     /// postfix access be checked before expansion.
     Argument {
-        static_type: crate::static_type::ConsumerStaticType,
+        type_expr: TypeExpr,
     },
     /// A user-defined function whose call may remain deferred until provider
     /// schemas are available. Its annotation is still enough authority to
@@ -119,7 +119,7 @@ pub fn bindings_from_parsed<E>(parsed: &crate::parser::File<E>) -> InferenceBind
     for argument in &parsed.arguments {
         out.entry(argument.name.clone())
             .or_insert_with(|| InferenceBinding::Argument {
-                static_type: argument.static_type.clone(),
+                type_expr: argument.static_type.clone(),
             });
     }
     for function in parsed.user_functions.values() {
@@ -491,16 +491,7 @@ fn infer_type_from_value_with_visiting(
         Value::Deferred(DeferredValue::Unknown(
             crate::resource::UnknownReason::ModuleArgument { name, .. },
         )) => match bindings.get(name) {
-            Some(InferenceBinding::Argument {
-                static_type: StaticType::Known(type_expr),
-            }) => Ok(type_expr.clone()),
-            Some(InferenceBinding::Argument {
-                static_type: StaticType::Unchecked(_reason),
-            }) => Err(InferenceIssue::NotInferable(
-                NotInferableReason::NonInferableBinding {
-                    binding: name.clone(),
-                },
-            )),
+            Some(InferenceBinding::Argument { type_expr }) => Ok(type_expr.clone()),
             Some(InferenceBinding::Resource { .. })
             | Some(InferenceBinding::UpstreamState)
             | Some(InferenceBinding::Virtual { .. })
@@ -974,12 +965,7 @@ pub fn infer_export_params(
         .iter()
         .map(|parameter| {
             let static_type = match &parameter.static_type {
-                Some(StaticType::Known(type_expr)) => {
-                    ExportStaticType::Declared(StaticType::Known(type_expr.clone()))
-                }
-                Some(StaticType::Unchecked(reason)) => {
-                    ExportStaticType::Declared(StaticType::Unchecked(reason.clone()))
-                }
+                Some(type_expr) => ExportStaticType::Declared(type_expr.clone()),
                 None => match &parameter.value {
                     None => ExportStaticType::Inferred(StaticType::Unchecked(
                         InferredUncheckedReason::NotInferable(NotInferableReason::MissingValue),
@@ -1013,14 +999,10 @@ pub fn attached_inference_failures(
     parameters
         .iter()
         .filter_map(|parameter| match &parameter.static_type {
-            ExportStaticType::Declared(StaticType::Known(_type_expr)) => None,
-            ExportStaticType::Declared(StaticType::Unchecked(_reason)) => None,
+            ExportStaticType::Declared(_type_expr) => None,
             ExportStaticType::Inferred(StaticType::Known(_type_expr)) => None,
             ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::NotInferable(_reason),
-            )) => None,
-            ExportStaticType::Inferred(StaticType::Unchecked(
-                InferredUncheckedReason::UnnameableInConsumer(_reason),
             )) => None,
             ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::InferenceFailed(error),
@@ -1051,14 +1033,10 @@ pub fn retry_unchecked_export_inference(
                     | NotInferableReason::SchemaUnavailable { .. },
                 ),
             )) => true,
-            ExportStaticType::Declared(StaticType::Known(_type_expr)) => false,
-            ExportStaticType::Declared(StaticType::Unchecked(_reason)) => false,
+            ExportStaticType::Declared(_type_expr) => false,
             ExportStaticType::Inferred(StaticType::Known(_type_expr)) => false,
             ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::InferenceFailed(_error),
-            )) => false,
-            ExportStaticType::Inferred(StaticType::Unchecked(
-                InferredUncheckedReason::UnnameableInConsumer(_reason),
             )) => false,
         };
         if !retry {
@@ -1903,7 +1881,7 @@ mod tests {
 
         assert_eq!(
             inferred.export_params[0].static_type,
-            ExportStaticType::Declared(StaticType::Known(TypeExpr::String))
+            ExportStaticType::Declared(TypeExpr::String)
         );
         assert_eq!(
             inferred.export_params[1].static_type,
@@ -2077,7 +2055,7 @@ mod tests {
         let inferred = apply_inference(parsed, &SchemaRegistry::new());
         assert_eq!(
             inferred.export_params[0].static_type,
-            ExportStaticType::Declared(StaticType::Known(TypeExpr::Simple("vpc_id".to_string())))
+            ExportStaticType::Declared(TypeExpr::Simple("vpc_id".to_string()))
         );
     }
 

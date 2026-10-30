@@ -5,23 +5,19 @@ use crate::resource::{
     ConcreteValue, DeferredValue, InterpolationPart, Resource, UnknownReason, Value,
 };
 use crate::schema::TypeIdentity;
-use crate::static_type::{ConsumerStaticType, StaticType};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
-fn known(type_expr: TypeExpr) -> ConsumerStaticType {
-    StaticType::Known(type_expr)
+fn known(type_expr: TypeExpr) -> TypeExpr {
+    type_expr
 }
 
-fn known_opt(type_expr: TypeExpr) -> Option<ConsumerStaticType> {
+fn known_opt(type_expr: TypeExpr) -> Option<TypeExpr> {
     Some(known(type_expr))
 }
 
-fn expect_known(static_type: &ConsumerStaticType) -> &TypeExpr {
-    match static_type {
-        StaticType::Known(type_expr) => type_expr,
-        StaticType::Unchecked(reason) => panic!("expected known type, got {reason:?}"),
-    }
+fn expect_known(static_type: &TypeExpr) -> &TypeExpr {
+    static_type
 }
 
 #[test]
@@ -6234,7 +6230,7 @@ fn parse_four_segment_path_with_pascal_tail_is_dotted_unresolved() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert!(matches!(
         result.arguments[0].static_type,
-        StaticType::Known(TypeExpr::DottedUnresolved(_))
+        TypeExpr::DottedUnresolved(_)
     ));
 }
 
@@ -11372,9 +11368,7 @@ fn parsed_file_is_file_of_parsed_export_param() {
 fn inferred_file_holds_inferred_export_param() {
     let one = InferredExportParam {
         name: "vpc_id".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(
-            crate::static_type::StaticType::Known(TypeExpr::String),
-        ),
+        static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::String),
         value: None,
     };
     let f: InferredFile = InferredFile {
@@ -14511,7 +14505,11 @@ let child = child_module { values = [vpc] }"#,
         .expect("nested structural module-argument use");
     assert!(matches!(
         &use_site.owner,
-        BindingUseOwner::ModuleArgument { call: owner, argument }
+        BindingUseOwner::ModuleArgument {
+            call: owner,
+            argument,
+            value_span: _,
+        }
             if owner == call.id() && argument == "values"
     ));
     assert!(matches!(
@@ -14622,7 +14620,11 @@ for item in ["one", "two"] {
         assert!(
             uses.iter().any(|use_site| matches!(
                 &use_site.owner,
-                BindingUseOwner::ModuleArgument { call: owner, argument }
+                BindingUseOwner::ModuleArgument {
+                    call: owner,
+                    argument,
+                    value_span: _,
+                }
                     if owner == call.id() && argument == "param"
             )),
             "each expanded call must own its corresponding use: {:?}",

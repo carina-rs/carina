@@ -174,8 +174,9 @@ fn partial_update_records_state_and_next_plan_surfaces_unknown_reason() {
         "next plan must show the partially-updated resource as an update\nstdout/stderr:\n{plan_text}"
     );
     assert!(
-        plan_text
-            .contains("(known after next apply: post-create read failed — mock partial update)"),
+        plan_text.contains(
+            "(unknown until next refresh: read after apply was incomplete — mock partial update)"
+        ),
         "next plan must surface the partial-update unknown reason\nstdout/stderr:\n{plan_text}"
     );
 }
@@ -220,8 +221,9 @@ fn replace_partial_create_records_state_and_next_plan_surfaces_unknown_reason() 
         "next plan must show the replace partial resource as an update\nstdout/stderr:\n{plan_text}"
     );
     assert!(
-        plan_text
-            .contains("(known after next apply: post-create read failed — mock partial create)"),
+        plan_text.contains(
+            "(unknown until next refresh: read after apply was incomplete — mock partial create)"
+        ),
         "next plan must surface the replace partial reason\nstdout/stderr:\n{plan_text}"
     );
 }

@@ -31,7 +31,8 @@ use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 use crate::commands::shared::state_writeback::{ApplyStateSave, build_state_after_apply};
 use crate::fixture_read_outcome;
 use crate::wiring::{
-    CanonicalResourcePair, OverrideAwareResources, resolve_config_block_names_for_test,
+    CanonicalResourcePair, OverrideAwareBuildMode, OverrideAwareResources,
+    resolve_config_block_names_for_test,
 };
 
 fn validate_with_test_factories(
@@ -1627,9 +1628,9 @@ inner { x = a }
     .expect_err("apply bootstrap reload must retain the reference-type gate");
     let message = crate::error::format_error_with_source_chain(&error);
     assert!(
-        message.contains("Type mismatch: expected Int, got String (from a)")
-            && message.contains("outer/main.crn")
-            && message.contains("line 3"),
+        message.contains("Reference type validation failed")
+            && message.contains("module call 'inner'")
+            && message.contains("expected Int, got String (from a)"),
         "{message}"
     );
 }
@@ -1710,7 +1711,7 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
             unresolved,
         )
         .expect_err("apply bootstrap reload must reject module-output type mismatch");
-        let message = error.to_string();
+        let message = crate::error::format_error_with_source_chain(&error);
         assert!(message.contains("module call 'y'"), "{message}");
         assert!(message.contains("expected Int"), "{message}");
         assert!(message.contains("got String"), "{message}");
@@ -5918,10 +5919,13 @@ async fn declared_state_bucket_bootstrap_partial_success_seeds_partial_read_stat
     let partial = row
         .partial_read()
         .expect("normal create writeback must preserve the partial-read marker");
-    assert_eq!(partial.detail, "bootstrap read incomplete");
     assert_eq!(
-        partial.missing_attributes,
-        BTreeSet::from(["versioning".to_string()])
+        partial.pending(),
+        &carina_core::resource::PendingReRead::incomplete("bootstrap read incomplete")
+    );
+    assert_eq!(
+        partial.missing_attributes(),
+        &BTreeSet::from(["versioning".to_string()])
     );
 }
 
@@ -6419,10 +6423,10 @@ async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_
     assert!(attributes.is_empty());
     assert_eq!(
         partial_read,
-        &Some(carina_core::resource::PartialReadMarker {
-            detail: "provider read after create returned not found".to_string(),
-            missing_attributes: BTreeSet::from(["bucket".to_string()]),
-        })
+        &carina_core::resource::PartialReadMarker::new(
+            carina_core::resource::PendingReRead::not_found(),
+            BTreeSet::from(["bucket".to_string()]),
+        )
     );
 }
 

@@ -12,7 +12,6 @@ use carina_core::schema::EffectiveSchemaNode;
 #[cfg(test)]
 use carina_core::schema::ResourceSchema;
 use carina_core::schema::{CompletionValue, SchemaRegistry, ValidatedResourceSchema};
-use carina_core::static_type::consumer_static_type_label;
 
 /// Find the `source` path of a `let <alias> = use {...}` declaration
 /// for `alias`. Tries the buffer's own parse first, then walks sibling
@@ -299,10 +298,7 @@ impl HoverProvider {
                     .unwrap_or_default();
                 content.push_str(&format!(
                     "- `{}`: `{}`{}{}\n",
-                    arg.name,
-                    consumer_static_type_label(&arg.static_type),
-                    desc,
-                    required
+                    arg.name, arg.static_type, desc, required
                 ));
             }
         }
@@ -314,7 +310,7 @@ impl HoverProvider {
                 let type_str = attr
                     .static_type
                     .as_ref()
-                    .map(|static_type| format!("`{}`", consumer_static_type_label(static_type)))
+                    .map(|type_expr| format!("`{type_expr}`"))
                     .unwrap_or_default();
                 content.push_str(&format!("- `{}`: {}\n", attr.name, type_str));
             }
@@ -362,7 +358,7 @@ impl HoverProvider {
             content.push_str("\n\n");
         }
 
-        let type_expr = consumer_static_type_label(&arg.static_type);
+        let type_expr = &arg.static_type;
         content.push_str(&format!("- **Type**: {type_expr}\n"));
 
         if let Some(default) = &arg.default {
@@ -1993,8 +1989,8 @@ EOT
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let arg = ArgumentParameter {
             name: "vpc".to_string(),
-            static_type: carina_core::static_type::StaticType::Known(TypeExpr::Ref(
-                carina_core::parser::ResourceTypePath::new("awscc", "ec2.Vpc"),
+            static_type: TypeExpr::Ref(carina_core::parser::ResourceTypePath::new(
+                "awscc", "ec2.Vpc",
             )),
             default: None,
             description: Some("The VPC to deploy into".to_string()),
@@ -2039,7 +2035,7 @@ EOT
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let arg = ArgumentParameter {
             name: "port".to_string(),
-            static_type: carina_core::static_type::StaticType::Known(TypeExpr::Int),
+            static_type: TypeExpr::Int,
             default: Some(Value::Concrete(ConcreteValue::Int(8080))),
             description: Some("Web server port".to_string()),
             validations: vec![],
@@ -2073,7 +2069,7 @@ EOT
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let arg = ArgumentParameter {
             name: "env".to_string(),
-            static_type: carina_core::static_type::StaticType::Known(TypeExpr::String),
+            static_type: TypeExpr::String,
             default: None,
             description: None,
             validations: vec![],

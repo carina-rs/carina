@@ -16,10 +16,7 @@ use carina_core::binding_index::{
 };
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::data_source_value::{DataSourceValues, ExecutableDataSourceValues};
-use carina_core::differ::{
-    Orphans, PlanPriorStates, block_deletes_on_prior_consumer_updates, create_plan_with_cascades,
-    into_all_prior_states, provider_states_for,
-};
+use carina_core::differ::Orphans;
 use carina_core::executor::{
     ExecutionCheckpointSink, ExecutionObserver, ExecutionOutcome, ExecutionResult,
     LiveExecutionInput, ProviderCheckInputs, SavedExecutionInput, UnresolvedResource,
@@ -75,13 +72,10 @@ use crate::display::print_plan;
 use crate::error::{AppError, SavedPlanSecretVerificationError};
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
-    AddressedDataSourceReadInputs, LateAnonymousIdentityInputs, OverrideAwareBuildMode,
-    OverrideAwareResources, ProjectedPhase1RefreshInputs, ProviderLoad, RebuildBindingsInputs,
-    ValidatedConfig, create_normalizers_from_configs_with_ctx,
-    create_providers_from_configs_with_ctx, get_provider_with_ctx, module_constraint_plan_errors,
-    prepare_data_sources_for_plan, prepare_default_provider_ready_config,
-    read_managed_state_with_retry, reconcile_late_anonymous_identities,
-    refresh_loaded_orphan_with_retry,
+    AddressedDataSourceReadInputs, ProjectedPhase1RefreshInputs, ProviderLoad, ValidatedConfig,
+    create_normalizers_from_configs_with_ctx, create_providers_from_configs_with_ctx,
+    get_provider_with_ctx, module_constraint_plan_errors, prepare_default_provider_ready_config,
+    read_managed_state_with_retry, refresh_loaded_orphan_with_retry,
 };
 #[cfg(test)]
 use crate::wiring::{ValidatedWiring, WiringContext, read_with_retry};
@@ -1933,9 +1927,9 @@ async fn run_apply_locked_owned(
                 .await?;
             let refresh_module_constraint_errors = phase2
                 .module_constraint_error
-                .map(module_constraint_plan_errors);
+                .and_then(module_constraint_plan_errors);
             let data_source_values = phase2.values;
-            let mut prepared_expansion = reconciled_expansion.seal(data_source_values);
+            let prepared_expansion = reconciled_expansion.seal(data_source_values);
 
             // carina#3132: expand same-config deferred-for loops post-refresh
             // via the *same* `expand_same_config_deferred_for` the plan path
@@ -1949,274 +1943,73 @@ async fn run_apply_locked_owned(
             //
             // carina#3278: the expand → child-refresh → hydrate(2nd) → lift
             // quartet runs through
-            // `expand_canonical_refresh_and_lift_states` so the apply and
-            // refresh paths cannot diverge on these phases. The
-            // constructor is the only way to obtain an `ExpandedRefreshState`
-            // — leaving a phase out becomes a compile error.
-            let crate::wiring::ValidatedExpandedRefreshState {
-                validated: validated_expansion,
-                sorted_resources: resorted,
-                residual_deferred_for,
-                deferred_create_targets,
-            } = crate::wiring::expand_validated_canonical_refresh_and_lift_states(
-                validated_config,
-                crate::wiring::ValidatedExpandRefreshAndLiftInputs {
-                    provider: &provider,
-                    expansion: &mut prepared_expansion,
-                    warning_policy: crate::wiring::DeferredForWarningPolicy::Print,
-                    remote_bindings,
-                    state_file: &state_file,
-                    saved_dep_bindings: &HashMap::new(),
-                    refresh_phase: &refresh_phase,
-                },
-            )
-            .await?;
-            let (ctx, expanded_canonical_resources) = validated_expansion.context_and_resources();
-            let sorted_resources = resorted;
-            let crate::wiring::PreparedDeferredForExpansionParts {
-                mut addressed,
-                mut data_source_values,
-                wait_aliases,
-            } = prepared_expansion.into_parts();
-            let parsed = expanded_canonical_resources.parsed();
-            drop(refresh_phase);
-            // Keep passing the explicit residual list to `print_plan`, matching
-            // the plan path's `ctx.residual_deferred_for` (`commands/plan.rs`).
-
-            // Data-source lifting stays inline: it operates on
-            // `parsed.data_sources` (not `sorted_resources`), so it is
-            // independent of the deferred-for expansion sequence the helper
-            // above pins.
-            crate::wiring::lift_data_source_value_enum_leaves(
-                &mut data_source_values,
-                &data_sources,
-                ctx.schemas(),
-            );
-
-            // Snapshot each composition resource's *pre-resolve* attributes
-            // (still carrying `ResourceRef`s) before the head-of-pipeline
-            // resolver call below replaces them with pre-apply concrete
-            // values. `finalize_apply`'s export resolution needs this
-            // snapshot to re-resolve compositions against the post-apply state —
-            // see #3169 / #3177. Without it, every composition ref is frozen at
-            // the pre-apply value and `state.exports` captures stale data
-            // after any Replace on a referenced managed resource.
-            // carina#3181: composition resources live in `parsed.compositions`
-            // as their own typed slice.
-            let pre_resolve_compositions: Vec<carina_core::resource::LiveComposition> =
-                parsed.compositions.clone();
-
-            let pre_apply_current = carina_core::resource::into_plan_input_current_map(
-                addressed.managed_current().clone(),
-                ctx.schemas(),
-                &sorted_resources,
-            );
-            let managed_stability = crate::wiring::derive_managed_binding_stability(
-                parsed,
-                &sorted_resources,
-                addressed.managed_current(),
-                &data_source_values,
-                ctx.schemas(),
-                addressed.saved_attrs(),
-                addressed.prev_explicit(),
-                remote_bindings,
-                &wait_aliases,
-            )?;
-            let projected_state = addressed.projected_state(state_file.as_ref());
-            let (mut override_aware_resources, unresolved_override_aware_resources) =
-                OverrideAwareResources::build_pair_with_stability(
-                    expanded_canonical_resources.as_pair(),
-                    &projected_state,
-                    carina_core::binding_index::LivePreApplyInputs {
-                        managed: &[],
-                        compositions: &pre_resolve_compositions,
-                        managed_current: &pre_apply_current,
-                        data_source_values: &data_source_values,
+            // `expand_validated_canonical_refresh_and_lift_states` so the apply
+            // and refresh paths cannot diverge on these phases. The transition
+            // consumes the prepared addressed state into the post-expansion
+            // plan view, so leaving a phase out becomes a compile error.
+            let validated_expansion =
+                crate::wiring::expand_validated_canonical_refresh_and_lift_states(
+                    validated_config,
+                    crate::wiring::ValidatedCanonicalExpandRefreshAndLiftInputs {
+                        provider: &provider,
+                        expansion: prepared_expansion,
+                        warning_policy: crate::wiring::DeferredForWarningPolicy::Print,
                         remote_bindings,
-                        wait_aliases: &wait_aliases,
+                        state_file: &state_file,
+                        saved_dep_bindings: &HashMap::new(),
+                        refresh_phase: &refresh_phase,
                     },
-                    &managed_stability,
-                    OverrideAwareBuildMode::Apply,
-                )?;
-            crate::legacy_name_overrides::emit_legacy_override_warnings(
-                &override_aware_resources,
-                &projected_state,
-            );
-            // Resolve and canonicalize only refresh-time data sources. Deferred
-            // reads keep their original input refs so the plan/executor dependency
-            // graph still contains the upstream create edge.
-            let mut data_sources_for_plan = prepare_data_sources_for_plan(
-                &data_source_values,
-                override_aware_resources.bindings(),
-                None,
-            )?;
-            let constraint_origin_resources = override_aware_resources
-                .paired_unresolved_resources_with_binding_sources(
-                    &unresolved_override_aware_resources,
-                );
-            // Run the normalization pipeline (same as plan path in wiring.rs).
-            // `create_plan` resolves typed wait RHS values against target schemas.
-            let wait_bindings = parsed.wait_bindings.clone();
-            let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(
-                &pre_resolve_compositions,
-            );
-            let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
-            let (managed_current, orphans) = addressed.managed_current_and_orphans_mut();
-            let preparation = if let Some(errors) = refresh_module_constraint_errors {
-                Err(crate::wiring::PlanPreparationError::Plan(errors))
-            } else {
-                preprocessor
-                    .prepare(
-                        &mut override_aware_resources,
-                        &constraint_origin_resources,
-                        &module_gate,
-                        managed_current,
-                        &mut data_source_values,
-                        orphans,
-                        raw_provider_configs,
-                        &mut data_sources_for_plan,
-                        &data_sources,
-                    )
-                    .await
-            };
-            if let Err(error) = preparation {
-                let errors = match error {
-                    crate::wiring::PlanPreparationError::Plan(errors) => errors,
-                    crate::wiring::PlanPreparationError::Provider(error) => {
-                        return Err(AppError::Provider(error));
-                    }
-                };
-                let mut plan = Plan::new();
-                for error in errors {
-                    plan.add_error(error);
+                )
+                .await?;
+            drop(refresh_phase);
+            let post_expansion = validated_expansion
+                .finish_post_expansion_plan::<crate::wiring::ApplyMode>(
+                    crate::wiring::PostExpansionPlanEnvironment {
+                        data_sources: &data_sources,
+                        provider: &provider,
+                        normalizer: &provider,
+                        provider_configs: raw_provider_configs,
+                        remote_bindings,
+                        state_file: &state_file,
+                        state_block_claims: &state_block_claims,
+                        resolved_state_block_targets: &resolved_state_block_targets,
+                        preparation_errors: refresh_module_constraint_errors,
+                    },
+                )
+                .await?;
+            let crate::wiring::PostExpansionPlan {
+                artifacts,
+                resources,
+            } = match post_expansion {
+                crate::wiring::PostExpansionOutcome::Planned(planned) => planned,
+                crate::wiring::PostExpansionOutcome::Diagnostics(diagnostics) => {
+                    return Err(diagnostics.render_and_abort());
                 }
-                render_plan_errors_and_abort(&plan)?;
-                unreachable!("render_plan_errors_and_abort returns an error for an invalid plan");
-            }
-            let resolved_desired_ids = reconcile_late_anonymous_identities(
-                ctx,
-                LateAnonymousIdentityInputs {
-                    resources: &mut override_aware_resources,
-                    addressed: &mut addressed,
-                    data_sources: &data_sources_for_plan,
-                    state_file: state_file.as_ref(),
-                    state_block_claims: &state_block_claims,
-                    providers: raw_provider_configs,
-                },
-            )?;
-            crate::wiring::validate_plan_time_state_block_collisions(
-                &resolved_desired_ids,
-                addressed.moved_pairs(),
-                &resolved_state_block_targets,
-                &state_file,
-            )?;
-            let reconciled_provider_states = provider_states_for(
-                addressed.managed_current(),
-                addressed.orphans(),
-                override_aware_resources.resources(),
-            );
-            let reconciled_input_current = carina_core::resource::into_plan_input_current_map(
-                reconciled_provider_states,
-                ctx.schemas(),
-                override_aware_resources.resources(),
-            );
-            let stability_resources = ResolvedResource::collect_resolved(
-                override_aware_resources.resources().iter().cloned(),
-            )?;
-            let managed_stability = carina_core::differ::managed_binding_stability(
-                &stability_resources,
-                &reconciled_input_current,
-                ctx.schemas(),
-                addressed.saved_attrs(),
-                addressed.prev_explicit(),
-            );
-            override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
-                RebuildBindingsInputs {
-                    compositions: &pre_resolve_compositions,
-                    managed_current: &reconciled_input_current,
-                    data_source_values: &data_source_values,
-                    remote_bindings,
-                    wait_aliases: &wait_aliases,
-                },
-                &managed_stability,
-            );
-            let paired_unresolved_resources = override_aware_resources
-                .paired_unresolved_resources_with_binding_sources(
-                    &unresolved_override_aware_resources,
-                );
-            let resolved_resources = ResolvedResource::collect_resolved(
-                override_aware_resources.resources().iter().cloned(),
-            )?;
-            let resolved_unresolved_resources =
-                ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
-            let plan_input_current = carina_core::resource::into_plan_input_current_map(
-                addressed.managed_current().clone(),
-                ctx.schemas(),
-                override_aware_resources.resources(),
-            );
-            let directives_map = addressed
-                .projected_state(state_file.as_ref())
-                .build_directives();
-            let schemas = ctx.schemas();
-            let mut plan = create_plan_with_cascades(
-                &resolved_resources,
-                &resolved_unresolved_resources,
-                &data_sources_for_plan,
-                &provider,
-                PlanPriorStates::new(&plan_input_current, addressed.orphans()),
-                &directives_map,
-                schemas,
-                addressed.saved_attrs(),
-                addressed.prev_explicit(),
-                &wait_bindings,
-            )?;
-            crate::wiring::add_deposed_delete_effects(
-                &mut plan,
-                &state_file,
-                addressed.moved_pairs(),
-            );
-            block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
-            override_aware_resources.apply_plan_stability(&plan_input_current, &plan, schemas);
-            // Add state block effects (import/removed/moved) only after both
-            // identifier-error producers above. `removed` suppresses those
-            // errors; the missing-provider-identifier E2E pins this ordering
-            // for live apply as well as the ordinary plan path.
-            // carina#3329: resolve `import { id = "${…}|…" }` interpolations
-            // against the same binding view the resource-attribute resolver
-            // uses. The empty `unresolved_upstream_bindings` set here just
-            // skips the plan-time "stamp upstream refs as
-            // `(known after upstream apply: …)`" pass — apply does not need
-            // that display marker. The hard-fail on a still-deferred
-            // identifier is enforced one layer down in
-            // `execute_import_effects` via [`carina_core::effect::resolve_import_identifier`],
-            // which rejects any non-Concrete `Value` before it can reach the
-            // provider's `read()`.
-            let no_unresolved_upstreams: std::collections::HashSet<&str> =
-                std::collections::HashSet::new();
-            crate::wiring::add_state_block_effects(
-                &mut plan,
-                &parsed.state_blocks,
-                &state_file,
-                addressed.moved_pairs(),
-                override_aware_resources.resources(),
-                override_aware_resources.bindings(),
-                &no_unresolved_upstreams,
-            );
-            crate::wiring::add_deferred_create_effects(&mut plan, &deferred_create_targets);
-            let moved_origins: HashMap<ResourceId, ResourceId> = addressed
-                .moved_pairs()
-                .iter()
-                .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
-                .collect();
-            let crate::wiring::AddressedStateParts {
-                managed_current,
-                orphans,
+            };
+            let crate::wiring::PostExpansionArtifacts {
+                expanded_resources: validated_expansion,
+                residual_deferred_for,
+                plan,
+                compositions: pre_resolve_compositions,
+                data_sources: _,
+                mut managed_current,
+                mut data_source_values,
+                moved_origins,
                 prev_explicit,
-                ..
-            } = addressed.into_parts();
-            let mut managed_current = into_all_prior_states(orphans, managed_current);
-
+                wait_aliases,
+            } = artifacts;
             render_plan_errors_and_abort(&plan)?;
+            #[cfg(any(test, feature = "test-utils"))]
+            capture_live_apply_plan_for_test(&plan)?;
+            let crate::wiring::PostExpansionApplyResources {
+                resolved: resolved_resources,
+                paired_unresolved: paired_unresolved_resources,
+                unresolved_by_resolved_id,
+                bindings,
+            } = resources;
+            let mut bindings = bindings;
+            let (ctx, expanded_canonical_resources) = validated_expansion.context_and_resources();
+            let parsed = expanded_canonical_resources.parsed();
             let executable_data_source_values = data_source_values
                 .clone()
                 .into_executable()
@@ -2232,10 +2025,7 @@ async fn run_apply_locked_owned(
                 // mutation does) silently falls through into the
                 // resource-apply pipeline and the `Persisting N export
                 // change(s) to state.` banner never prints (carina#3270).
-                finalize_module_constraints(
-                    &pre_resolve_compositions,
-                    override_aware_resources.bindings(),
-                )?;
+                finalize_module_constraints(&pre_resolve_compositions, &bindings)?;
                 let checked_exports_pre_apply =
                     crate::commands::plan::check_exports_pre_apply(CheckExportsPreApplyInput {
                         export_params: &parsed.export_params,
@@ -2279,6 +2069,9 @@ async fn run_apply_locked_owned(
                     None,
                     None,
                 );
+                // This fast path has no managed-resource mutations, so it
+                // cannot contain the Delete + Create pair required for a
+                // moved-block hint.
 
                 let stdin = tokio::io::BufReader::new(tokio::io::stdin());
                 if confirm_apply(stdin, cancel.clone(), auto_approve).await?
@@ -2353,6 +2146,9 @@ async fn run_apply_locked_owned(
                 Some(&prev_explicit),
                 None,
             );
+            let moved_hints =
+                crate::moved_hint::detect_moved_block_hints(&plan, &managed_current, ctx.schemas());
+            moved_hints.eprint();
 
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
             if confirm_apply(stdin, cancel.clone(), auto_approve).await?
@@ -2365,12 +2161,10 @@ async fn run_apply_locked_owned(
             println!("{}", "Applying changes...".cyan().bold());
             println!();
 
-            // Build unresolved resource map for re-resolution at apply time
-            let unresolved_resources = override_aware_resources
-                .unresolved_by_resolved_id_with_binding_sources(
-                    &unresolved_override_aware_resources,
-                )?;
-            let mut bindings = override_aware_resources.bindings().clone();
+            // Preserve the old execution boundary for the fallible unresolved
+            // map while deriving it from the exact resource view used by the
+            // shared plan seam.
+            let unresolved_resources = unresolved_by_resolved_id?;
             // `provider` is a `ProviderRouter`, which impls both `Provider` and
             // `ProviderNormalizer`; the same object is passed in both positions
             // so apply re-normalizes with exactly the plan-time normalizer
@@ -2421,7 +2215,7 @@ async fn run_apply_locked_owned(
             let state_base = saver.stop(&cancel).await;
             let resources_finished = Instant::now();
 
-            Ok(SourceApplyAfterHeartbeat::Executed(Box::new(
+            Ok::<_, AppError>(SourceApplyAfterHeartbeat::Executed(Box::new(
                 SourceApplyExecuted {
                     result,
                     cancelled,
@@ -2545,6 +2339,17 @@ async fn run_apply_locked_owned(
         result: op_result,
         lock,
     }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn capture_live_apply_plan_for_test(plan: &Plan) -> Result<(), AppError> {
+    let Ok(path) = std::env::var("CARINA_TEST_CAPTURE_LIVE_APPLY_PLAN") else {
+        return Ok(());
+    };
+    let encoded = serde_json::to_vec_pretty(plan)
+        .map_err(|error| AppError::Config(format!("serialize live apply plan: {error}")))?;
+    std::fs::write(&path, encoded)
+        .map_err(|error| AppError::Config(format!("write live apply plan to {path}: {error}")))
 }
 
 #[cfg(test)]
@@ -3526,6 +3331,12 @@ async fn run_apply_from_plan_locked_owned(
                 None,
                 None,
             );
+            let moved_hints = crate::moved_hint::detect_moved_block_hints(
+                plan,
+                &managed_current,
+                wiring.schemas(),
+            );
+            moved_hints.eprint();
 
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
             if confirm_apply(stdin, cancel.clone(), auto_approve).await?

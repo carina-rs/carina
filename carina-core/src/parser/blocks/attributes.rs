@@ -16,7 +16,11 @@ use crate::parser::grammar::PreprocessedFile;
 use crate::parser::parse_expression;
 use crate::parser::types::parse_type_expr;
 use crate::resource::{ConcreteValue, DeferredValue, Value};
-use crate::static_type::StaticType;
+
+pub(in crate::parser) struct ParsedArgumentsBlock {
+    pub parameters: Vec<ArgumentParameter>,
+    pub type_sources: Vec<(String, SourceSpan)>,
+}
 
 /// Parse arguments block. See `register_argument_binding` for the
 /// incremental scoping discipline that lets a later argument's default
@@ -28,8 +32,9 @@ pub(in crate::parser) fn parse_arguments_block(
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
     warnings: &mut Vec<ParseWarning>,
-) -> Result<Vec<ArgumentParameter>, ParseError> {
+) -> Result<ParsedArgumentsBlock, ParseError> {
     let mut arguments = Vec::new();
+    let mut type_sources = Vec::new();
 
     for param in pair.into_inner() {
         if param.as_rule() == Rule::arguments_param {
@@ -37,11 +42,9 @@ pub(in crate::parser) fn parse_arguments_block(
             let name = next_pair(&mut param_inner, "parameter name", "arguments block")?
                 .as_str()
                 .to_string();
-            let type_expr = parse_type_expr(
-                next_pair(&mut param_inner, "type expression", "arguments parameter")?,
-                config,
-                warnings,
-            )?;
+            let type_pair = next_pair(&mut param_inner, "type expression", "arguments parameter")?;
+            let type_span = SourceSpan::from_pest(&type_pair, preprocessed_file);
+            let type_expr = parse_type_expr(type_pair, config, warnings, Some(preprocessed_file))?;
 
             let mut description = None;
             let mut default = None;
@@ -132,9 +135,10 @@ pub(in crate::parser) fn parse_arguments_block(
             }
 
             register_argument_binding(ctx, &name, &type_expr);
+            type_sources.push((name.clone(), type_span));
             arguments.push(ArgumentParameter {
                 name,
-                static_type: StaticType::Known(type_expr),
+                static_type: type_expr,
                 default,
                 description,
                 validations,
@@ -142,7 +146,10 @@ pub(in crate::parser) fn parse_arguments_block(
         }
     }
 
-    Ok(arguments)
+    Ok(ParsedArgumentsBlock {
+        parameters: arguments,
+        type_sources,
+    })
 }
 
 /// Register an argument name as a lexical binding so subsequent expressions
@@ -204,7 +211,12 @@ pub(in crate::parser) fn parse_attributes_block(
             )?;
             let (type_expr, value) = if next.as_rule() == Rule::type_expr {
                 // Has explicit type annotation: name: type = expr
-                let type_expr = Some(parse_type_expr(next, ctx.config, warnings)?);
+                let type_expr = Some(parse_type_expr(
+                    next,
+                    ctx.config,
+                    warnings,
+                    Some(preprocessed_file),
+                )?);
                 let expr = next_pair(&mut param_inner, "value expression", "attributes parameter")?;
                 let value = Some(parse_expression(expr, ctx)?);
                 (type_expr, value)
@@ -246,7 +258,12 @@ pub(in crate::parser) fn parse_exports_block(
 
             let next = next_pair(&mut param_inner, "type or expression", "exports parameter")?;
             let (type_expr, value) = if next.as_rule() == Rule::type_expr {
-                let type_expr = Some(parse_type_expr(next, ctx.config, warnings)?);
+                let type_expr = Some(parse_type_expr(
+                    next,
+                    ctx.config,
+                    warnings,
+                    Some(preprocessed_file),
+                )?);
                 let expr = next_pair(&mut param_inner, "value expression", "exports parameter")?;
                 let value = Some(parse_expression(expr, ctx)?);
                 (type_expr, value)

@@ -1264,13 +1264,15 @@ mod process_basic_result_tests {
         };
         assert_eq!(applied.identifier, state.identifier);
         assert_eq!(applied.attributes, state.attributes);
+        let marker = applied
+            .partial_read
+            .as_ref()
+            .expect("partial result records a marker");
         assert_eq!(
-            applied.partial_read.as_ref().map(|marker| (
-                marker.detail.as_str(),
-                marker.missing_attributes.contains("computed")
-            )),
-            Some(("mock partial create", true))
+            marker.pending(),
+            &crate::resource::PendingReRead::incomplete("mock partial create")
         );
+        assert!(marker.missing_attributes().contains("computed"));
     }
 }
 
