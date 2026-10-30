@@ -1166,7 +1166,8 @@ impl ProviderFactory for AliasFactory {
         &self,
         _binding: Option<&str>,
         _config: &crate::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<crate::provider::InitializedProvider>> {
+        _initialize_outcome: crate::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
         unreachable!("test factory does not create providers")
     }
     fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {

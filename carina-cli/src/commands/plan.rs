@@ -431,7 +431,7 @@ mod provider_scope_evidence_tests {
         for (binding, scope) in scopes {
             router.add_provider_instance(
                 ProviderInstanceKey::new("test", Some(binding.to_string())),
-                InitializedProvider::new(
+                InitializedProvider::for_test(
                     Box::new(carina_provider_mock::MockProvider::new()),
                     scope,
                 ),
@@ -1564,10 +1564,9 @@ fn test_provider_router(instances: &BTreeSet<ProviderInstanceKey>) -> ProviderRo
     for instance in instances {
         provider.add_provider_instance(
             instance.clone(),
-            carina_core::provider::InitializedProvider::new(
-                Box::new(carina_provider_mock::MockProvider::new()),
-                ReferenceScope::Unavailable,
-            ),
+            carina_core::provider::InitializedProvider::unavailable(Box::new(
+                carina_provider_mock::MockProvider::new(),
+            )),
         );
     }
     provider

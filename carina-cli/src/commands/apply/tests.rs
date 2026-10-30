@@ -1131,12 +1131,11 @@ impl ProviderFactory for FailBCreateFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
-            Ok(carina_core::provider::InitializedProvider::new(
-                Box::new(FailBCreateProvider),
-                carina_core::provider::ReferenceScope::Unavailable,
-            ))
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(FailBCreateProvider)))
         })
     }
 
@@ -1875,13 +1874,12 @@ impl ProviderFactory for ApplyTimeReadFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         let shared = self.shared.clone();
         Box::pin(async move {
-            Ok(carina_core::provider::InitializedProvider::new(
-                Box::new(ApplyTimeReadProvider { shared }),
-                carina_core::provider::ReferenceScope::Unavailable,
-            ))
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(ApplyTimeReadProvider { shared })))
         })
     }
 
@@ -2073,13 +2071,12 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         let shared = self.shared.clone();
         Box::pin(async move {
-            Ok(carina_core::provider::InitializedProvider::new(
-                Box::new(ApplyCascadeProvider { shared }),
-                carina_core::provider::ReferenceScope::Unavailable,
-            ))
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(ApplyCascadeProvider { shared })))
         })
     }
 

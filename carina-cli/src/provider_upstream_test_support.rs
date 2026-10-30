@@ -41,13 +41,12 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
         &self,
         _binding: Option<&str>,
         config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         *self.received_role_arn.lock().unwrap() = config.attributes().get("role_arn").cloned();
         Box::pin(async {
-            Ok(carina_core::provider::InitializedProvider::new(
-                Box::new(carina_provider_mock::MockProvider::new()),
-                carina_core::provider::ReferenceScope::Unavailable,
-            ))
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(carina_provider_mock::MockProvider::new())))
         })
     }
 

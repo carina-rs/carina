@@ -68,12 +68,11 @@ impl ProviderFactory for AwsccTestFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
-            Ok(carina_core::provider::InitializedProvider::new(
-                Box::new(NoopProvider),
-                carina_core::provider::ReferenceScope::Unavailable,
-            ))
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(NoopProvider)))
         })
     }
     fn create_normalizer(

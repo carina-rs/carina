@@ -144,12 +144,11 @@ impl ProviderFactory for EvidenceTestFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
-            Ok(carina_core::provider::InitializedProvider::new(
-                Box::new(carina_provider_mock::MockProvider::new()),
-                carina_core::provider::ReferenceScope::Unavailable,
-            ))
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(carina_provider_mock::MockProvider::new())))
         })
     }
 
@@ -1659,7 +1658,9 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
     )
     .expect("valid provider schema witness");
     let mut schemas = SchemaRegistry::new();
-    schemas.insert_provider_witness("aws", &witness);
+    schemas
+        .insert_provider_witness("aws", &witness)
+        .expect("fixture owner has one validated witness");
 
     let resource = Resource::with_provider("aws", "lambda.Permission", "invoke", None);
     let id = resource.id.clone();
@@ -1685,7 +1686,7 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
     let mut provider = ProviderRouter::new();
     provider.add_provider(
         "aws".to_string(),
-        InitializedProvider::new(
+        InitializedProvider::for_test(
             Box::new(TestProvider::with_read_state(&id, identifier, actual)),
             ReferenceScope::Available {
                 partition: "aws".to_string(),

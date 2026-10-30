@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use carina_core::differ::{Diff, diff};
-use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
+use carina_core::provider::{InitializedProvider, ProviderRouter};
 use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry, StructField,
@@ -170,7 +170,7 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
     let mut providers = ProviderRouter::new();
     providers.add_provider(
         String::new(),
-        InitializedProvider::new(Box::new(ProviderRouter::new()), ReferenceScope::Unavailable),
+        InitializedProvider::unavailable(Box::new(ProviderRouter::new())),
     );
     let comparison = providers
         .comparison_context_for(
@@ -226,7 +226,7 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
     let mut providers = ProviderRouter::new();
     providers.add_provider(
         String::new(),
-        InitializedProvider::new(Box::new(ProviderRouter::new()), ReferenceScope::Unavailable),
+        InitializedProvider::unavailable(Box::new(ProviderRouter::new())),
     );
     let comparison = providers
         .comparison_context_for(

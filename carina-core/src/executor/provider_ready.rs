@@ -113,7 +113,7 @@ impl Deref for CanonicalProviderConfigAttributes {
 /// use indexmap::IndexMap;
 ///
 /// fn bypass(factory: &dyn ProviderFactory, attributes: &IndexMap<String, Value>) {
-///     let _ = factory.create_provider(None, attributes);
+///     let _ = factory.create_initialized_provider(None, attributes);
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq)]
@@ -986,7 +986,8 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<crate::provider::InitializedProvider>> {
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("config preparation tests do not create providers")
         }
 
@@ -1073,7 +1074,8 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<crate::provider::InitializedProvider>> {
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("routing tests do not create providers")
         }
 
@@ -1800,7 +1802,8 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<crate::provider::InitializedProvider>> {
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("config preparation tests do not create providers")
         }
 
@@ -1913,7 +1916,8 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<crate::provider::InitializedProvider>> {
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("config preparation tests do not create providers")
         }
 

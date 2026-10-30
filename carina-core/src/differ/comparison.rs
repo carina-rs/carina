@@ -377,25 +377,13 @@ fn reference_form_equal(
     let Some(form) = context.reference_form(identity) else {
         return false;
     };
-    let (partition, region, account) = match context.scope {
-        ReferenceScope::Available {
-            partition,
-            region,
-            account,
-        } => (partition, region, account),
-        ReferenceScope::Unavailable => return false,
-    };
     let expand = |name: &str| match form {
-        ReferenceForm::Template { long } => long
-            .as_str()
-            .replace("{partition}", partition)
-            .replace("{region}", region)
-            .replace("{account}", account)
-            .replace("{name}", name),
+        ReferenceForm::Template { long } => long.render(context.scope, name),
     };
     let is_name = |value: &str| !value.is_empty() && !value.contains(':') && !value.contains('/');
 
-    (is_name(a) && expand(a) == b) || (is_name(b) && expand(b) == a)
+    (is_name(a) && expand(a).is_some_and(|expanded| expanded == b))
+        || (is_name(b) && expand(b).is_some_and(|expanded| expanded == a))
 }
 
 /// List comparison with type-aware element comparison.

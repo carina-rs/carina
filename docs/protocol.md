@@ -24,6 +24,13 @@ identities are rejected while decoding. The registry retains one table per
 schema owner rather than one global identity table. Owner forms also contribute
 to semantic schema fingerprint encoding v5.
 
+Saved-plan format 30 records the `reference-scope` of every loaded provider
+instance next to its provider artifact evidence. Saved-plan apply initializes
+those same provider instances and refuses a missing or different scope before
+drift reads, secret evaluation, or provider effects. The evidence is keyed by
+provider instance, not provider kind, so named instances in different regions
+or accounts remain distinct.
+
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host
 validates and preserves that continuation through the same typestate path as
@@ -144,8 +151,11 @@ provider read. Recovery is explicit: import replaces it when the resource
 exists, while `carina state forget` removes only this row kind after the
 operator confirms the resource is absent.
 
-Saved-plan format 30 records an outcome-unknown marker and its `started_at`
-timestamp, never an identifier or continuation token. Apply reloads the marker
+Saved-plan format 30 records each loaded provider instance's `reference-scope`
+next to its artifact evidence. Apply initializes the same instance set and
+rejects a missing or different scope before drift reads or provider effects.
+The format also records an outcome-unknown marker and its `started_at`
+timestamp, never an identifier or continuation token. Apply reloads that marker
 under the state lock and rejects any lifecycle or timestamp change before
 provider effects run.
 

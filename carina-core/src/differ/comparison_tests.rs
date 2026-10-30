@@ -129,6 +129,25 @@ fn refined_string_reference_form_equates_bare_name_and_local_arn() {
 }
 
 #[test]
+fn refined_string_reference_form_does_not_expand_placeholder_text_inside_scope_values() {
+    let scope = ReferenceScope::Available {
+        partition: "aws{name}".to_string(),
+        region: "us-east-1".to_string(),
+        account: "123456789012".to_string(),
+    };
+    let (scope, forms, attr_type) = lambda_function_reference_fixture(scope);
+    let context = ComparisonContext::for_test(&scope, &forms);
+
+    assert!(super::type_aware_equal(
+        &string_value("processor"),
+        &string_value("arn:aws{name}:lambda:us-east-1:123456789012:function:processor"),
+        Some(&attr_type),
+        crate::schema::empty_defs_for_schema_walks(),
+        &context,
+    ));
+}
+
+#[test]
 fn refined_string_reference_form_rejects_cross_account_arn_for_local_name() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
     let context = ComparisonContext::for_test(&scope, &forms);

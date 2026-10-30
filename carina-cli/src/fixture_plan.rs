@@ -16,8 +16,8 @@ use carina_core::differ::{
 use carina_core::executor::UnresolvedResource;
 use carina_core::plan::Plan;
 use carina_core::provider::{
-    BoxFuture, InitializedProvider, ProviderFactory, ProviderInstanceKey, ProviderResult,
-    ProviderRouter, ReferenceScope,
+    BoxFuture, InitializedProvider, ProviderFactory, ProviderInitialization, ProviderInstanceKey,
+    ProviderResult, ProviderRouter,
 };
 use carina_core::resource::{Current, ResolvedResource, ResourceId, State, Value};
 use carina_core::schema::{
@@ -211,10 +211,7 @@ pub fn provider_router_for_plan<S>(plan: &Plan<S>) -> ProviderRouter {
     for instance in instances {
         provider.add_provider_instance(
             instance,
-            InitializedProvider::new(
-                Box::new(carina_provider_mock::MockProvider::new()),
-                ReferenceScope::Unavailable,
-            ),
+            InitializedProvider::unavailable(Box::new(carina_provider_mock::MockProvider::new())),
         );
     }
     provider
@@ -401,10 +398,9 @@ where
         );
         provider_router.add_provider(
             factory.name().to_string(),
-            carina_core::provider::InitializedProvider::new(
-                Box::new(carina_provider_mock::MockProvider::new()),
-                carina_core::provider::ReferenceScope::Unavailable,
-            ),
+            carina_core::provider::InitializedProvider::unavailable(Box::new(
+                carina_provider_mock::MockProvider::new(),
+            )),
         );
     }
     let expansion_prelude = expansion_prelude
@@ -945,7 +941,8 @@ impl ProviderFactory for FixtureProviderConfigFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1001,7 +998,8 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1066,7 +1064,8 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1148,7 +1147,8 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1223,7 +1223,8 @@ impl ProviderFactory for PlanImageFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1288,7 +1289,8 @@ impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1352,7 +1354,8 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1424,7 +1427,8 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1484,7 +1488,8 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 

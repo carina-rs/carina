@@ -4804,19 +4804,113 @@ pub fn merge_default_tags<S>(
     Ok(())
 }
 
-/// A provider implementation paired with the scope returned by that exact
+/// The opaque result of initializing one provider instance.
+///
+/// Native providers can state honestly that no reference scope is available.
+/// An available scope requires the one-shot mint that core passes into the
+/// factory initialization step.
+pub struct InitializeOutcome {
+    reference_scope: ReferenceScope,
+}
+
+/// Raw provider plus the opaque outcome of its initialization transition.
+pub struct ProviderInitialization {
+    provider: Box<dyn Provider>,
+    outcome: InitializeOutcome,
+}
+
+impl ProviderInitialization {
+    fn into_parts(self) -> (Box<dyn Provider>, InitializeOutcome) {
+        (self.provider, self.outcome)
+    }
+}
+
+impl InitializeOutcome {
+    pub fn unavailable() -> Self {
+        Self {
+            reference_scope: ReferenceScope::Unavailable,
+        }
+    }
+
+    pub fn with_provider(self, provider: Box<dyn Provider>) -> ProviderInitialization {
+        ProviderInitialization {
+            provider,
+            outcome: self,
+        }
+    }
+}
+
+/// One-shot capability supplied only while a provider factory initializes an
+/// instance. Its private field prevents callers from minting an available
+/// initialization outcome outside that transition.
+#[doc(hidden)]
+pub struct InitializeOutcomeMint {
+    _private: (),
+}
+
+impl InitializeOutcomeMint {
+    fn new() -> Self {
+        Self { _private: () }
+    }
+
+    pub fn available(
+        self,
+        partition: impl Into<String>,
+        region: impl Into<String>,
+        account: impl Into<String>,
+    ) -> InitializeOutcome {
+        InitializeOutcome {
+            reference_scope: ReferenceScope::Available {
+                partition: partition.into(),
+                region: region.into(),
+                account: account.into(),
+            },
+        }
+    }
+}
+
+/// A provider implementation paired with the outcome returned by that exact
 /// initialized instance.
 ///
 /// The fields are private so a routed provider cannot exist without an
 /// explicit scope. Comparison contexts borrow this witness rather than a raw
 /// provider, which makes scope selection part of the type-level call path.
+///
+/// Downstream code cannot pair an arbitrary provider with an available scope:
+///
+/// ```compile_fail
+/// use carina_core::provider::{
+///     InitializeOutcomeMint, InitializedProvider, Provider,
+/// };
+///
+/// fn forge(provider: Box<dyn Provider>) -> InitializedProvider {
+///     let mint = InitializeOutcomeMint { _private: () };
+///     let outcome = mint.available("aws", "us-east-1", "123456789012");
+///     InitializedProvider::new(provider, outcome)
+/// }
+/// ```
 pub struct InitializedProvider {
     provider: Box<dyn Provider>,
     reference_scope: ReferenceScope,
 }
 
 impl InitializedProvider {
-    pub fn new(provider: Box<dyn Provider>, reference_scope: ReferenceScope) -> Self {
+    pub(crate) fn new(provider: Box<dyn Provider>, outcome: InitializeOutcome) -> Self {
+        Self {
+            provider,
+            reference_scope: outcome.reference_scope,
+        }
+    }
+
+    /// Construct a native provider that cannot use reference-form
+    /// equivalence. Available scope is paired only by core after the factory
+    /// initialization transition.
+    pub fn unavailable(provider: Box<dyn Provider>) -> Self {
+        Self::new(provider, InitializeOutcome::unavailable())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(provider: Box<dyn Provider>, reference_scope: ReferenceScope) -> Self {
         Self {
             provider,
             reference_scope,
@@ -5669,7 +5763,22 @@ pub trait ProviderFactory: Send + Sync {
         &self,
         binding: Option<&str>,
         config: &ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>>;
+        initialize_outcome: InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>>;
+
+    /// Run the factory initialization transition and pair its raw provider
+    /// with the opaque outcome inside core.
+    fn create_initialized_provider(
+        &self,
+        binding: Option<&str>,
+        config: &ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+        let created = self.create_provider(binding, config, InitializeOutcomeMint::new());
+        Box::pin(async move {
+            let (provider, outcome) = created.await?.into_parts();
+            Ok(InitializedProvider::new(provider, outcome))
+        })
+    }
 
     /// Create a normalizer instance from configuration attributes.
     ///
@@ -5734,7 +5843,9 @@ pub fn collect_schemas(factories: &[Box<dyn ProviderFactory>]) -> SchemaRegistry
     let mut registry = SchemaRegistry::new();
     for factory in factories {
         let witness = factory.schema_witness();
-        registry.insert_provider_witness(factory.name(), &witness);
+        registry
+            .insert_provider_witness(factory.name(), &witness)
+            .expect("each schema owner must expose one consistent validated witness");
     }
     registry
 }
@@ -6314,7 +6425,9 @@ pub fn schema_registry_and_custom_types_from_factories(
     let mut index = BTreeMap::new();
     for (factory_index, factory) in factories.iter().enumerate() {
         let witness = factory.schema_witness();
-        registry.insert_provider_witness(factory.name(), &witness);
+        registry
+            .insert_provider_witness(factory.name(), &witness)
+            .expect("each schema owner must expose one consistent validated witness");
         let mut declarations = BTreeMap::<TypeIdentity, Vec<AttributeType>>::new();
         for (identity, declaration) in witness.identified_declarations() {
             declarations.entry(identity).or_default().push(declaration);
@@ -6540,7 +6653,7 @@ mod tests {
     use super::*;
 
     fn initialized(provider: impl Provider + 'static) -> InitializedProvider {
-        InitializedProvider::new(Box::new(provider), ReferenceScope::Unavailable)
+        InitializedProvider::unavailable(Box::new(provider))
     }
 
     #[test]
@@ -6928,7 +7041,8 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &crate::executor::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
             Box::pin(async { Err(ProviderError::internal("not used")) })
         }
     }
@@ -9813,7 +9927,9 @@ mod tests {
         )
         .expect("fixture provider schema must validate");
         let mut registry = crate::schema::SchemaRegistry::new();
-        registry.insert_provider_witness(owner, &witness);
+        registry
+            .insert_provider_witness(owner, &witness)
+            .expect("fixture owner has one validated witness");
         (registry, attr_type)
     }
 
@@ -9842,11 +9958,11 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_provider_instance(
             ProviderInstanceKey::new("mock", Some("east".to_string())),
-            InitializedProvider::new(Box::new(MockProvider), reference_scope("us-east-1")),
+            InitializedProvider::for_test(Box::new(MockProvider), reference_scope("us-east-1")),
         );
         router.add_provider_instance(
             ProviderInstanceKey::new("mock", Some("west".to_string())),
-            InitializedProvider::new(Box::new(MockProvider), reference_scope("us-west-2")),
+            InitializedProvider::for_test(Box::new(MockProvider), reference_scope("us-west-2")),
         );
         let id = ResourceId::with_provider_identity(
             "mock",
@@ -9956,7 +10072,8 @@ mod tests {
                 &self,
                 _binding: Option<&str>,
                 _config: &ProviderReadyConfig,
-            ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+                _initialize_outcome: crate::provider::InitializeOutcomeMint,
+            ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
                 Box::pin(async {
                     Err(ProviderError::invalid_input(
                         "AWS account ID '019115212452' is not in the provider's \
@@ -9986,7 +10103,7 @@ mod tests {
         let config =
             crate::executor::prepare_provider_ready_config(&factory, resolved_config.as_ref())
                 .unwrap();
-        let result = factory.create_provider(None, &config).await;
+        let result = factory.create_initialized_provider(None, &config).await;
         let err = match result {
             Ok(_) => panic!("create_provider must surface the init error"),
             Err(e) => e,
@@ -10050,16 +10167,15 @@ mod tests {
                 &self,
                 binding: Option<&str>,
                 _config: &ProviderReadyConfig,
-            ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+                _initialize_outcome: crate::provider::InitializeOutcomeMint,
+            ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
                 self.calls
                     .lock()
                     .unwrap()
                     .push(binding.map(|s| s.to_string()));
                 Box::pin(async {
-                    Ok(InitializedProvider::new(
-                        Box::new(MockProvider),
-                        ReferenceScope::Unavailable,
-                    ))
+                    Ok(InitializeOutcome::unavailable()
+                        .with_provider(Box::new(MockProvider) as Box<dyn Provider>))
                 })
             }
             fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
@@ -10083,10 +10199,16 @@ mod tests {
         let config =
             crate::executor::prepare_provider_ready_config(&factory, resolved_config.as_ref())
                 .unwrap();
-        let _ = factory.create_provider(None, &config).await.unwrap();
-        let _ = factory.create_provider(Some("us"), &config).await.unwrap();
         let _ = factory
-            .create_provider(Some("tokyo"), &config)
+            .create_initialized_provider(None, &config)
+            .await
+            .unwrap();
+        let _ = factory
+            .create_initialized_provider(Some("us"), &config)
+            .await
+            .unwrap();
+        let _ = factory
+            .create_initialized_provider(Some("tokyo"), &config)
             .await
             .unwrap();
 

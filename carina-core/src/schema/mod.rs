@@ -8220,6 +8220,11 @@ impl ValidatedConfigSchema {
 /// Provider-wide reference-form declarations keyed by semantic type identity.
 pub type ReferenceForms = BTreeMap<TypeIdentity, ReferenceForm>;
 
+fn empty_reference_forms() -> &'static ReferenceForms {
+    static EMPTY: OnceLock<ReferenceForms> = OnceLock::new();
+    EMPTY.get_or_init(ReferenceForms::new)
+}
+
 /// The declaration shape attached to an identified provider type.
 ///
 /// This is distinct from [`RefinedScalarKind`]: an enum with a String base is
@@ -11912,6 +11917,33 @@ pub struct SchemaRegistry {
     reference_forms: BTreeMap<String, ReferenceForms>,
 }
 
+/// Failure to combine owner-bound schema registry declarations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaRegistryError {
+    ConflictingReferenceForms {
+        owner: String,
+        existing: ReferenceForms,
+        incoming: ReferenceForms,
+    },
+}
+
+impl fmt::Display for SchemaRegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConflictingReferenceForms {
+                owner,
+                existing: _existing,
+                incoming: _incoming,
+            } => write!(
+                formatter,
+                "schema owner `{owner}` has conflicting witness-backed reference-form tables"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SchemaRegistryError {}
+
 impl SchemaRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -11929,7 +11961,6 @@ impl SchemaRegistry {
     /// ```
     pub fn insert(&mut self, provider: impl Into<String>, schema: ValidatedResourceSchema) {
         let provider = provider.into();
-        self.reference_forms.entry(provider.clone()).or_default();
         let key = (provider, schema.as_schema().resource_type.clone());
         match schema.as_schema().kind {
             SchemaKind::Resource => {
@@ -11947,10 +11978,21 @@ impl SchemaRegistry {
         &mut self,
         provider: impl Into<String>,
         witness: &ValidatedProviderSchemaWitness,
-    ) {
+    ) -> Result<(), SchemaRegistryError> {
         let provider = provider.into();
+        let incoming = witness.reference_forms();
+        if let Some(existing) = self.reference_forms.get(&provider)
+            && existing != incoming
+        {
+            return Err(SchemaRegistryError::ConflictingReferenceForms {
+                owner: provider,
+                existing: existing.clone(),
+                incoming: incoming.clone(),
+            });
+        }
         self.reference_forms
-            .insert(provider.clone(), witness.reference_forms().clone());
+            .entry(provider.clone())
+            .or_insert_with(|| incoming.clone());
         for schema in witness.resources() {
             let key = (provider.clone(), schema.as_schema().resource_type.clone());
             match schema.as_schema().kind {
@@ -11962,19 +12004,34 @@ impl SchemaRegistry {
                 }
             }
         }
+        Ok(())
     }
 
-    /// Merge another registry, with the incoming registry winning on duplicate
-    /// resource keys and owner form tables.
-    pub fn extend(&mut self, other: SchemaRegistry) {
+    /// Merge another registry. Incoming resource schemas win on duplicate
+    /// resource keys. Witness-backed owner form tables must be identical.
+    pub fn extend(&mut self, other: SchemaRegistry) -> Result<(), SchemaRegistryError> {
         let SchemaRegistry {
             managed,
             data_sources,
             reference_forms,
         } = other;
+        for (owner, incoming) in &reference_forms {
+            if let Some(existing) = self.reference_forms.get(owner)
+                && existing != incoming
+            {
+                return Err(SchemaRegistryError::ConflictingReferenceForms {
+                    owner: owner.clone(),
+                    existing: existing.clone(),
+                    incoming: incoming.clone(),
+                });
+            }
+        }
         self.managed.extend(managed);
         self.data_sources.extend(data_sources);
-        self.reference_forms.extend(reference_forms);
+        for (owner, forms) in reference_forms {
+            self.reference_forms.entry(owner).or_insert(forms);
+        }
+        Ok(())
     }
 
     /// Look up a schema by explicit `(provider, resource_type, kind)`.
@@ -11994,7 +12051,7 @@ impl SchemaRegistry {
                 let reference_forms = self
                     .reference_forms
                     .get(owner)
-                    .expect("every registered owner carries a reference-form table");
+                    .unwrap_or_else(|| empty_reference_forms());
                 OwnerBoundResourceSchema::new(owner, schema, reference_forms)
             })
     }

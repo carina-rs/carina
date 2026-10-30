@@ -49,7 +49,8 @@ impl ProviderFactory for SchemaFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         unimplemented!("schema fixture factories are never instantiated")
     }
 

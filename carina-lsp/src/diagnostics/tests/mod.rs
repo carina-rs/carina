@@ -73,11 +73,12 @@ impl ProviderFactory for RegionConfigFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
                     Output = carina_core::provider::ProviderResult<
-                        carina_core::provider::InitializedProvider,
+                        carina_core::provider::ProviderInitialization,
                     >,
                 > + Send
                 + '_,
@@ -212,11 +213,12 @@ impl ProviderFactory for SuspendedValidationFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
                     Output = carina_core::provider::ProviderResult<
-                        carina_core::provider::InitializedProvider,
+                        carina_core::provider::ProviderInitialization,
                     >,
                 > + Send
                 + '_,
@@ -317,11 +319,12 @@ impl ProviderFactory for EnumDeclaredCustomTypeFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
                     Output = carina_core::provider::ProviderResult<
-                        carina_core::provider::InitializedProvider,
+                        carina_core::provider::ProviderInitialization,
                     >,
                 > + Send
                 + '_,
@@ -432,9 +435,10 @@ impl ProviderFactory for SharedRoleArnFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<carina_core::provider::InitializedProvider>,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
         unimplemented!("diagnostics tests do not construct providers")
     }
@@ -537,9 +541,10 @@ impl ProviderFactory for BareTypeFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<carina_core::provider::InitializedProvider>,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
         unimplemented!("diagnostics tests do not construct providers")
     }
@@ -916,9 +921,10 @@ impl ProviderFactory for SchemaFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<carina_core::provider::InitializedProvider>,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
         unimplemented!("schema fixture factories do not construct providers")
     }

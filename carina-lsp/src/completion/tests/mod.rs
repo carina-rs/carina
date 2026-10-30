@@ -443,11 +443,12 @@ impl ProviderFactory for EnumShadowFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
                     Output = carina_core::provider::ProviderResult<
-                        carina_core::provider::InitializedProvider,
+                        carina_core::provider::ProviderInitialization,
                     >,
                 > + Send
                 + '_,

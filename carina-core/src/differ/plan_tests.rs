@@ -428,7 +428,9 @@ fn provider_scoped_reference_form_suppresses_create_only_replacement_in_plan() {
         ValidatedProviderSchemaWitness::new(vec![schema], ValidatedConfigSchema::default(), forms)
             .expect("fixture provider schema must validate");
     let mut registry = SchemaRegistry::new();
-    registry.insert_provider_witness("aws", &witness);
+    registry
+        .insert_provider_witness("aws", &witness)
+        .expect("fixture owner has one validated witness");
 
     let desired = Resource::with_provider("aws", "lambda.Permission", "invoke", None)
         .with_attribute(
@@ -456,7 +458,7 @@ fn provider_scoped_reference_form_suppresses_create_only_replacement_in_plan() {
     let mut provider = ProviderRouter::new();
     provider.add_provider(
         "aws".to_string(),
-        InitializedProvider::new(
+        InitializedProvider::for_test(
             Box::new(HintProvider { hints: Vec::new() }),
             ReferenceScope::Available {
                 partition: "aws".to_string(),

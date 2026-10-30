@@ -789,7 +789,8 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             unreachable!("plan canonicalization test does not create providers")
         }
 
@@ -1671,12 +1672,11 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
-                Ok(carina_core::provider::InitializedProvider::new(
-                    Box::new(MockProvider::new()),
-                    carina_core::provider::ReferenceScope::Unavailable,
-                ))
+                Ok(carina_core::provider::InitializeOutcome::unavailable()
+                    .with_provider(Box::new(MockProvider::new())))
             })
         }
 
@@ -1792,13 +1792,12 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async move {
                 if self.lines.is_empty() {
-                    Ok(carina_core::provider::InitializedProvider::new(
-                        Box::new(MockProvider::new()),
-                        carina_core::provider::ReferenceScope::Unavailable,
-                    ))
+                    Ok(carina_core::provider::InitializeOutcome::unavailable()
+                        .with_provider(Box::new(MockProvider::new())))
                 } else {
                     Err(ProviderError::internal(
                         "provider progress was emitted before initialization",
@@ -1880,7 +1879,8 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
                 Err(
                     carina_plugin_host::wasm_factory::decode_initialize_string_error_for_test(
@@ -1982,13 +1982,12 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         self.creates.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {
-            Ok(carina_core::provider::InitializedProvider::new(
-                Box::new(MockProvider::new()),
-                carina_core::provider::ReferenceScope::Unavailable,
-            ))
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(MockProvider::new())))
         })
     }
 
@@ -2173,12 +2172,11 @@ impl ProviderFactory for CascadeAwsccFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
-            Ok(carina_core::provider::InitializedProvider::new(
-                Box::new(CascadeCreateProvider::default()),
-                carina_core::provider::ReferenceScope::Unavailable,
-            ))
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(CascadeCreateProvider::default())))
         })
     }
 
@@ -2516,12 +2514,11 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
-            Ok(carina_core::provider::InitializedProvider::new(
-                Box::new(ReadWithRetryProvider::new(ReadBehavior::Success)),
-                carina_core::provider::ReferenceScope::Unavailable,
-            ))
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(ReadWithRetryProvider::new(ReadBehavior::Success))))
         })
     }
 
@@ -2894,7 +2891,8 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async { unreachable!("state normalization does not create providers") })
         }
 
@@ -3015,7 +3013,8 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             unreachable!("config selection test does not construct a provider")
         }
 
@@ -4965,15 +4964,14 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<carina_core::provider::InitializedProvider>,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
         Box::pin(async {
-            Ok(carina_core::provider::InitializedProvider::new(
-                Box::new(MockProvider::new()),
-                carina_core::provider::ReferenceScope::Unavailable,
-            ))
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(MockProvider::new())))
         })
     }
 
@@ -7169,15 +7167,14 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<carina_core::provider::InitializedProvider>,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
         Box::pin(async {
-            Ok(carina_core::provider::InitializedProvider::new(
-                Box::new(MockProvider::new()),
-                carina_core::provider::ReferenceScope::Unavailable,
-            ))
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(MockProvider::new())))
         })
     }
 
@@ -10024,12 +10021,11 @@ mod resolved_value_constraint_gate {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
-                Ok(carina_core::provider::InitializedProvider::new(
-                    Box::new(MockProvider::new()),
-                    carina_core::provider::ReferenceScope::Unavailable,
-                ))
+                Ok(carina_core::provider::InitializeOutcome::unavailable()
+                    .with_provider(Box::new(MockProvider::new())))
             })
         }
 
@@ -10139,13 +10135,12 @@ mod resolved_value_constraint_gate {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             let reads = self.reads.clone();
             Box::pin(async move {
-                Ok(carina_core::provider::InitializedProvider::new(
-                    Box::new(RecordingDataSourceProvider { reads }),
-                    carina_core::provider::ReferenceScope::Unavailable,
-                ))
+                Ok(carina_core::provider::InitializeOutcome::unavailable()
+                    .with_provider(Box::new(RecordingDataSourceProvider { reads })))
             })
         }
 

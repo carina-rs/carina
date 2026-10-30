@@ -32,9 +32,9 @@ use carina_core::effect::PlanOp;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CallEgressRecorder, CanonicalCustomTypeValue,
     CanonicalProviderConfigAttributes, CreateAttempt, CreateFailure, CreateOutcome, CreateRequest,
-    DecodedGuestCreateCall, DeleteRequest, FinishedGuestCreateCall, InitializedProvider,
-    Observation, PendingCreate as CorePendingCreate, Poll as CorePoll, Provider, ProviderError,
-    ProviderFactory, ProviderNormalizer, ProviderReadyConfig, ProviderResult, ReadOutcome,
+    DecodedGuestCreateCall, DeleteRequest, FinishedGuestCreateCall, InitializeOutcome, Observation,
+    PendingCreate as CorePendingCreate, Poll as CorePoll, Provider, ProviderError, ProviderFactory,
+    ProviderInitialization, ProviderNormalizer, ProviderReadyConfig, ProviderResult, ReadOutcome,
     ReadRequest, ResentPendingCreate, ResentPoll as CoreResentPoll, Resume as CoreResume,
     ResumeCreateRequest, ResumeFailure, ResumeOutcome, SavedAttrs, Sent, StartedGuestCreateCall,
     UpdateOutcome, UpdateRequest,
@@ -4391,7 +4391,8 @@ impl ProviderFactory for WasmProviderFactory {
         &self,
         binding: Option<&str>,
         config: &ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
+        initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         let attrs = config.attributes().clone();
         let binding = binding.map(|s| s.to_string());
         Box::pin(async move {
@@ -4404,15 +4405,20 @@ impl ProviderFactory for WasmProviderFactory {
                 .map_err(|error| {
                     error.into_provider_error_with(&self.instantiation_error_mapper)
                 })?;
-            let reference_scope = instance.reference_scope().clone();
-            Ok(InitializedProvider::new(
-                Box::new(WasmProvider {
-                    instance,
-                    name: self.configured.label.name.clone(),
-                    schema_witness: Arc::clone(&self.schema_witness),
-                }),
-                reference_scope,
-            ))
+            let outcome = match instance.reference_scope().clone() {
+                proto::ReferenceScope::Available {
+                    partition,
+                    region,
+                    account,
+                } => initialize_outcome.available(partition, region, account),
+                proto::ReferenceScope::Unavailable => InitializeOutcome::unavailable(),
+            };
+            let provider: Box<dyn Provider> = Box::new(WasmProvider {
+                instance,
+                name: self.configured.label.name.clone(),
+                schema_witness: Arc::clone(&self.schema_witness),
+            });
+            Ok(outcome.with_provider(provider))
         })
     }
 
@@ -7406,6 +7412,56 @@ mod tests {
         assert_eq!(
             pending.identifier().map(AppliedIdentifier::as_str),
             Some("resent-learned-id")
+        );
+    }
+
+    #[tokio::test]
+    async fn resent_poll_in_flight_keeps_the_new_token_and_learned_identifier() {
+        let (id, wit_id, wit_request) = boundary_resource();
+        let resume = resume_witness(persisted_resume_without_identifier()).await;
+        let step: wasm_convert::DecodedResumeStep =
+            proto::ResumeStep::Resent(proto::CreateStep::Pending(proto::PendingCreate {
+                token: proto::PendingToken::new("resent-original-token"),
+                identifier: None,
+                sent: sent_name_only(),
+                poll_after_secs: 1,
+            }));
+        let ResumeProgress::Pending(pending) =
+            WasmProvider::resumed_create_step(id, wit_id, wit_request, resume, step)
+        else {
+            panic!("resent pending step must retain a pollable continuation")
+        };
+        let PendingResume::Resent(starting) = *pending else {
+            panic!("resent pending step changed into a resume continuation")
+        };
+        let verdict: wasm_convert::DecodedPollVerdict =
+            proto::PollVerdict::InFlight(proto::CreateInFlight {
+                pending: proto::PendingCreate {
+                    token: proto::PendingToken::new("resent-poll-next-token"),
+                    identifier: Some(
+                        AppliedIdentifier::new("resent-poll-learned-id").expect("valid identifier"),
+                    ),
+                    sent: sent_name_only(),
+                    poll_after_secs: 4,
+                },
+                error: ProviderError::timeout("resent poll interrupted"),
+            });
+
+        let ResumeProgress::Verdict(failure) =
+            WasmProvider::polled_resent_verdict(starting, verdict)
+        else {
+            panic!("resent poll in-flight verdict must preserve a continuation")
+        };
+        let ResumeFailureKind::InFlight { pending, error: _ } = failure.into_kind() else {
+            panic!("resent poll in-flight verdict changed failure classification")
+        };
+        assert_eq!(
+            pending.token().expose_for_provider_call(),
+            "resent-poll-next-token"
+        );
+        assert_eq!(
+            pending.identifier().map(AppliedIdentifier::as_str),
+            Some("resent-poll-learned-id")
         );
     }
 

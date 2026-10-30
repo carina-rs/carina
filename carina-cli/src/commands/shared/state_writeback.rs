@@ -217,10 +217,9 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
         for route in routes {
             provider.add_provider_instance(
                 route,
-                carina_core::provider::InitializedProvider::new(
-                    Box::new(carina_provider_mock::MockProvider::new()),
-                    carina_core::provider::ReferenceScope::Unavailable,
-                ),
+                carina_core::provider::InitializedProvider::unavailable(Box::new(
+                    carina_provider_mock::MockProvider::new(),
+                )),
             );
         }
         Self::new(
@@ -1484,10 +1483,9 @@ pub(crate) fn build_state_after_apply<S: Clone>(
     for route in routes {
         provider.add_provider_instance(
             route,
-            carina_core::provider::InitializedProvider::new(
-                Box::new(carina_provider_mock::MockProvider::new()),
-                carina_core::provider::ReferenceScope::Unavailable,
-            ),
+            carina_core::provider::InitializedProvider::unavailable(Box::new(
+                carina_provider_mock::MockProvider::new(),
+            )),
         );
     }
 

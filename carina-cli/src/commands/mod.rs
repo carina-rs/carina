@@ -1378,15 +1378,14 @@ exports {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> carina_core::provider::BoxFuture<
             '_,
-            carina_core::provider::ProviderResult<carina_core::provider::InitializedProvider>,
+            carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
         > {
             Box::pin(async {
-                Ok(carina_core::provider::InitializedProvider::new(
-                    Box::new(carina_provider_mock::MockProvider::new()),
-                    carina_core::provider::ReferenceScope::Unavailable,
-                ))
+                Ok(carina_core::provider::InitializeOutcome::unavailable()
+                    .with_provider(Box::new(carina_provider_mock::MockProvider::new())))
             })
         }
 

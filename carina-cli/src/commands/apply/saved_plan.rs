@@ -1207,12 +1207,11 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
-                Ok(carina_core::provider::InitializedProvider::new(
-                    Box::new(carina_provider_mock::MockProvider::new()),
-                    carina_core::provider::ReferenceScope::Unavailable,
-                ))
+                Ok(carina_core::provider::InitializeOutcome::unavailable()
+                    .with_provider(Box::new(carina_provider_mock::MockProvider::new())))
             })
         }
 
@@ -1346,7 +1345,7 @@ mod tests {
         for (binding, scope) in scopes {
             provider.add_provider_instance(
                 ProviderInstanceKey::new("test", Some(binding.to_string())),
-                InitializedProvider::new(
+                InitializedProvider::for_test(
                     Box::new(carina_provider_mock::MockProvider::new()),
                     scope,
                 ),

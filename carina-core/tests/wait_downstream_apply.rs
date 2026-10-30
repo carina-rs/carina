@@ -41,7 +41,7 @@ use carina_core::parser::ProviderContext;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
     InitializedProvider, NoopNormalizer, Provider, ProviderInstanceKey, ProviderResult,
-    ProviderRouter, ReadOutcome, ReadRequest, ReferenceScope, UpdateOutcome, UpdateRequest,
+    ProviderRouter, ReadOutcome, ReadRequest, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{
@@ -113,7 +113,7 @@ fn fixture_provider(resources: &[Resource]) -> ProviderRouter {
     for route in routes {
         provider.add_provider_instance(
             route,
-            InitializedProvider::new(Box::new(MockProvider), ReferenceScope::Unavailable),
+            InitializedProvider::unavailable(Box::new(MockProvider)),
         );
     }
     provider

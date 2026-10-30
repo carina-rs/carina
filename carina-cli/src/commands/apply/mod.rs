@@ -1761,7 +1761,7 @@ async fn create_state_bucket_bootstrap_provider<R>(
     let factory = provider_mod::find_factory(ctx.factories(), provider_name)
         .ok_or_else(|| format!("No provider factory found for '{provider_name}'"))?;
     let config = prepare_default_provider_ready_config(factory, provider_name, provider_configs)?;
-    let provider = factory.create_provider(None, &config).await?;
+    let provider = factory.create_initialized_provider(None, &config).await?;
     let normalizer = factory.create_normalizer(None, &config).await?;
     let mut router = ProviderRouter::new();
     router.add_provider(provider_name.to_string(), provider);

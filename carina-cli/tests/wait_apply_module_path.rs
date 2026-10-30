@@ -94,14 +94,16 @@ impl ProviderFactory for AwsStub {
         &self,
         _b: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
-            Ok(carina_core::provider::InitializedProvider::new(
-                Box::new(NoopProvider {
-                    cert_publishes_arn: true,
-                }),
-                carina_core::provider::ReferenceScope::Unavailable,
-            ))
+            Ok(
+                carina_core::provider::InitializeOutcome::unavailable().with_provider(Box::new(
+                    NoopProvider {
+                        cert_publishes_arn: true,
+                    },
+                )),
+            )
         })
     }
     fn create_normalizer(

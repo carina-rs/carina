@@ -1269,7 +1269,7 @@ async fn create_state_bucket_delete_provider<R>(
         .ok_or_else(|| format!("No provider factory found for '{provider_name}'"))?;
     let config = prepare_default_provider_ready_config(factory, provider_name, provider_configs)?;
     factory
-        .create_provider(None, &config)
+        .create_initialized_provider(None, &config)
         .await
         .map_err(AppError::Provider)
 }
@@ -2574,10 +2574,9 @@ fn diff_display_update_resource(
     let mut provider = ProviderRouter::new();
     provider.add_provider_instance(
         carina_core::provider::ProviderInstanceKey::from(id.as_inner()),
-        carina_core::provider::InitializedProvider::new(
-            Box::new(carina_provider_mock::MockProvider::new()),
-            carina_core::provider::ReferenceScope::Unavailable,
-        ),
+        carina_core::provider::InitializedProvider::unavailable(Box::new(
+            carina_provider_mock::MockProvider::new(),
+        )),
     );
     diff_display_update_resource_with_provider(
         id,
@@ -2680,7 +2679,9 @@ mod tests {
         )
         .expect("valid provider schema witness");
         let mut schemas = SchemaRegistry::new();
-        schemas.insert_provider_witness("aws", &witness);
+        schemas
+            .insert_provider_witness("aws", &witness)
+            .expect("fixture owner has one validated witness");
 
         let desired = resolved(
             Resource::with_provider("aws", "lambda.Permission", "invoke", None).with_attribute(
@@ -2712,7 +2713,7 @@ mod tests {
         let mut provider = ProviderRouter::new();
         provider.add_provider(
             "aws".to_string(),
-            InitializedProvider::new(
+            InitializedProvider::for_test(
                 Box::new(carina_provider_mock::MockProvider::new()),
                 ReferenceScope::Available {
                     partition: "aws".to_string(),
@@ -3193,13 +3194,12 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             let reads = self.reads.clone();
             Box::pin(async move {
-                Ok(carina_core::provider::InitializedProvider::new(
-                    Box::new(ModuleConstraintRefreshProvider { reads }),
-                    carina_core::provider::ReferenceScope::Unavailable,
-                ))
+                Ok(carina_core::provider::InitializeOutcome::unavailable()
+                    .with_provider(Box::new(ModuleConstraintRefreshProvider { reads })))
             })
         }
 
@@ -3329,14 +3329,16 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::InitializedProvider>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             let reads = self.reads.clone();
             let trigger = self.trigger.clone();
             Box::pin(async move {
-                Ok(carina_core::provider::InitializedProvider::new(
-                    Box::new(CancellingDataSourceRefreshProvider { reads, trigger }),
-                    carina_core::provider::ReferenceScope::Unavailable,
-                ))
+                Ok(
+                    carina_core::provider::InitializeOutcome::unavailable().with_provider(
+                        Box::new(CancellingDataSourceRefreshProvider { reads, trigger }),
+                    ),
+                )
             })
         }
 

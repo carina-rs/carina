@@ -125,7 +125,6 @@ use carina_core::provider::ProviderInstanceKey;
 use carina_core::provider::{
     self as provider_mod, AppliedIdentifier, InitializedProvider, LiftedSavedAttrs,
     NormalizerRouter, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderRouter,
-    ReferenceScope,
 };
 use carina_core::provider_source::ProviderSource;
 use carina_core::resource::{
@@ -1723,7 +1722,9 @@ impl WiringContext {
         for (provider, schema) in additional_schemas {
             schemas.insert(provider, schema);
         }
-        schemas.extend(factory_schemas);
+        schemas
+            .extend(factory_schemas)
+            .expect("plain additional schemas cannot conflict with factory witness forms");
         if uses_builtin_mock {
             for schema in carina_provider_mock::builtin_schemas() {
                 let parts = schema.parts();
@@ -3454,7 +3455,7 @@ pub(crate) async fn get_provider_with_ctx(
         progress_sink.line("Using mock provider".cyan());
         router.add_provider(
             String::new(),
-            InitializedProvider::new(Box::new(MockProvider::new()), ReferenceScope::Unavailable),
+            InitializedProvider::unavailable(Box::new(MockProvider::new())),
         );
     }
 
@@ -3536,7 +3537,7 @@ async fn instantiate_provider_into_router(
         let region = factory.extract_region(config.attributes());
         let displayed_source = provider_config.source().or(inherited_source);
         let provider = factory
-            .create_provider(binding, &config)
+            .create_initialized_provider(binding, &config)
             .await
             .map_err(|e| e.for_provider(provider_config.name().to_string()))?;
         progress_sink.line(
@@ -3554,7 +3555,7 @@ async fn instantiate_provider_into_router(
         progress_sink.line("Using mock provider".cyan());
         router.add_provider_config(
             provider_config.as_provider_config(),
-            InitializedProvider::new(Box::new(MockProvider::new()), ReferenceScope::Unavailable),
+            InitializedProvider::unavailable(Box::new(MockProvider::new())),
         );
     } else if let Some(message) = missing_provider_message(provider_config, inherited_source) {
         eprintln!("{}", message.red());
@@ -3674,7 +3675,7 @@ pub async fn create_providers_from_configs_with_ctx(
         ProgressSink::Human.line("Using mock provider".cyan());
         router.add_provider(
             String::new(),
-            InitializedProvider::new(Box::new(MockProvider::new()), ReferenceScope::Unavailable),
+            InitializedProvider::unavailable(Box::new(MockProvider::new())),
         );
     }
 
@@ -5425,10 +5426,7 @@ pub(crate) fn test_comparison_provider_router<S>(resources: &[Resource<S>]) -> P
     for route in routes {
         provider.add_provider_instance(
             route,
-            InitializedProvider::new(
-                Box::new(carina_provider_mock::MockProvider::new()),
-                ReferenceScope::Unavailable,
-            ),
+            InitializedProvider::unavailable(Box::new(carina_provider_mock::MockProvider::new())),
         );
     }
     provider

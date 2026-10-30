@@ -46,7 +46,7 @@ use std::collections::HashMap;
 
 use carina_core::differ::{Diff, diff};
 use carina_core::explicit::ExplicitFields;
-use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
+use carina_core::provider::{InitializedProvider, ProviderRouter};
 use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 
@@ -114,7 +114,7 @@ fn carina3122_live_distribution_readback_defaults_are_projected_away() {
     let mut providers = ProviderRouter::new();
     providers.add_provider(
         "awscc".to_string(),
-        InitializedProvider::new(Box::new(ProviderRouter::new()), ReferenceScope::Unavailable),
+        InitializedProvider::unavailable(Box::new(ProviderRouter::new())),
     );
     let comparison = providers
         .comparison_context_for(

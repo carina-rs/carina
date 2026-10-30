@@ -53,6 +53,32 @@ pub enum ReferenceTemplateError {
     StrayClosingBrace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceTemplatePlaceholder {
+    Partition,
+    Region,
+    Account,
+    Name,
+}
+
+fn reference_template_placeholder(
+    value: &str,
+) -> Result<ReferenceTemplatePlaceholder, ReferenceTemplateError> {
+    if value == "partition" {
+        Ok(ReferenceTemplatePlaceholder::Partition)
+    } else if value == "region" {
+        Ok(ReferenceTemplatePlaceholder::Region)
+    } else if value == "account" {
+        Ok(ReferenceTemplatePlaceholder::Account)
+    } else if value == "name" {
+        Ok(ReferenceTemplatePlaceholder::Name)
+    } else {
+        Err(ReferenceTemplateError::UnknownPlaceholder {
+            placeholder: value.to_string(),
+        })
+    }
+}
+
 impl std::fmt::Display for ReferenceTemplateError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -97,14 +123,11 @@ impl ReferenceTemplate {
                     return Err(ReferenceTemplateError::StrayOpeningBrace);
                 }
                 let placeholder = &value[start..end];
-                match placeholder {
-                    "partition" | "region" | "account" => {}
-                    "name" => name_count += 1,
-                    placeholder => {
-                        return Err(ReferenceTemplateError::UnknownPlaceholder {
-                            placeholder: placeholder.to_string(),
-                        });
-                    }
+                match reference_template_placeholder(placeholder)? {
+                    ReferenceTemplatePlaceholder::Partition
+                    | ReferenceTemplatePlaceholder::Region
+                    | ReferenceTemplatePlaceholder::Account => {}
+                    ReferenceTemplatePlaceholder::Name => name_count += 1,
                 }
                 index = end + 1;
             } else if bytes[index] == b'}' {
@@ -122,6 +145,41 @@ impl ReferenceTemplate {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Expand this validated template once using one initialized provider
+    /// scope. Inserted values are appended as literal text and are never
+    /// parsed again as template placeholders.
+    pub fn render(&self, scope: &ReferenceScope, name: &str) -> Option<String> {
+        let (partition, region, account) = match scope {
+            ReferenceScope::Available {
+                partition,
+                region,
+                account,
+            } => (partition, region, account),
+            ReferenceScope::Unavailable => return None,
+        };
+        let mut rendered = String::with_capacity(self.0.len() + name.len());
+        let mut rest = self.as_str();
+        while let Some(open) = rest.find('{') {
+            rendered.push_str(&rest[..open]);
+            let placeholder_and_rest = &rest[open + 1..];
+            let close = placeholder_and_rest
+                .find('}')
+                .expect("validated reference template closes every placeholder");
+            let placeholder = &placeholder_and_rest[..close];
+            match reference_template_placeholder(placeholder)
+                .expect("validated reference template contains only known placeholders")
+            {
+                ReferenceTemplatePlaceholder::Partition => rendered.push_str(partition),
+                ReferenceTemplatePlaceholder::Region => rendered.push_str(region),
+                ReferenceTemplatePlaceholder::Account => rendered.push_str(account),
+                ReferenceTemplatePlaceholder::Name => rendered.push_str(name),
+            }
+            rest = &placeholder_and_rest[close + 1..];
+        }
+        rendered.push_str(rest);
+        Some(rendered)
     }
 }
 
