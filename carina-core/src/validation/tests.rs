@@ -77,15 +77,15 @@ fn empty_parsed() -> ParsedFile {
 fn module_call_findings_for_test(
     parsed: &ParsedFile,
     signatures: &crate::module_resolver::ResolvedModuleSignatures,
-    provider_context: &ProviderContext,
+    provider_context: &LoadedProviderContext,
 ) -> Vec<ModuleCallFinding> {
     let schemas = SchemaRegistry::new();
     let binding_use_report = check_bare_binding_uses(
         parsed,
-        &ValidationTypeContext::new_providerless(parsed, &schemas, provider_context, signatures),
+        &ValidationTypeContext::new(parsed, &schemas, provider_context, signatures),
     );
     let bindings = BindingIndex::from_parsed_with_module_signatures(parsed, &schemas, signatures);
-    check_module_calls_providerless(ModuleCallCheckInput {
+    check_module_calls(ModuleCallCheckInput {
         authored: parsed,
         semantic: Some(parsed),
         base_dir: Some(std::path::Path::new(".")),
@@ -3569,8 +3569,11 @@ fn check_module_calls_rejects_literal_union_mismatch() {
         },
     )]);
 
-    let findings =
-        module_call_findings_for_test(&parsed, &imported_modules, &ProviderContext::default());
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &imported_modules,
+        &LoadedProviderContext::empty_for_test(),
+    );
 
     assert!(
         findings.iter().any(|finding| finding
@@ -3709,8 +3712,11 @@ let inst = m { n = 'abc' }
         },
     )]);
 
-    let findings =
-        module_call_findings_for_test(&parsed, &imported_modules, &ProviderContext::default());
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &imported_modules,
+        &LoadedProviderContext::empty_for_test(),
+    );
     let finding = findings
         .first()
         .expect("the string argument must be rejected");
@@ -3748,7 +3754,11 @@ child {}
         },
     )]);
 
-    let findings = module_call_findings_for_test(&parsed, &signatures, &ProviderContext::default());
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &signatures,
+        &LoadedProviderContext::empty_for_test(),
+    );
     let first_call = &parsed.module_calls[0];
     let second_call = &parsed.module_calls[1];
     let surprise_span = first_call
@@ -3817,7 +3827,11 @@ for item in ["first", "second"] {
         },
     )]);
 
-    let findings = module_call_findings_for_test(&parsed, &signatures, &ProviderContext::default());
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &signatures,
+        &LoadedProviderContext::empty_for_test(),
+    );
     let mismatches = findings
         .iter()
         .filter(|finding| finding.kind() == ModuleCallFindingKind::ValueType)
@@ -3860,7 +3874,11 @@ child { values = [vpc] }
         },
     )]);
 
-    let findings = module_call_findings_for_test(&parsed, &signatures, &ProviderContext::default());
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &signatures,
+        &LoadedProviderContext::empty_for_test(),
+    );
 
     assert_eq!(
         findings
@@ -4046,8 +4064,11 @@ fn check_module_calls_defers_compatible_binding_refs_to_binding_use_authority() 
         },
     )]);
 
-    let findings =
-        module_call_findings_for_test(&parsed, &imported_modules, &ProviderContext::default());
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &imported_modules,
+        &LoadedProviderContext::empty_for_test(),
+    );
     assert!(
         findings.is_empty(),
         "compatible binding-owned module arguments must not be rechecked: {findings:#?}"
