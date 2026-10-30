@@ -1527,7 +1527,9 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
         let resource = planned.resource;
         let existing = moved_origins.find_persisted_row(&state, id);
         let preferred_hashes = planned_secret_hashes.and_then(|hashes| hashes.get(id));
-        let resolved_comparison = comparisons.comparison_for(&resource.id);
+        let resolved_comparison = comparisons
+            .comparison_for(&resource.id)
+            .map_err(AppError::from)?;
         let owner_schema = resolved_comparison.owner_schema();
         let comparison = resolved_comparison.context();
         let schema = Some(owner_schema.schema().as_schema());
@@ -2019,7 +2021,10 @@ mod apply_state_save_tests {
 
         let inputs =
             ApplyStateSaveInputs::new_for_test(Vec::new(), plan, SchemaRegistry::new(), None);
-        let comparison = inputs.comparisons.comparison_for(&runtime_id);
+        let comparison = inputs
+            .comparisons
+            .comparison_for(&runtime_id)
+            .expect("the deferred template must pre-resolve its runtime comparison key");
 
         assert_eq!(comparison.owner_schema().owner(), "aws");
     }

@@ -205,7 +205,7 @@ fn main() -> ExitCode {
             Some(&fp.prev_explicit),
             &provider,
         ) {
-            eprintln!("TUI error: {}", e);
+            eprintln!("{}", carina_cli::error::format_error_with_source_chain(&e));
             return ExitCode::from(1);
         }
         fp.moved_hints.eprint();

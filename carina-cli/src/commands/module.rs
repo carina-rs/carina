@@ -76,8 +76,7 @@ fn run_module_info(path: &Path, tui: bool) -> Result<(), AppError> {
         carina_core::module::FileSignature::from_parsed_file_with_name(&parsed, &module_name);
 
     if tui {
-        carina_tui::run_module_info(&signature)
-            .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
+        carina_tui::run_module_info(&signature)?;
     } else {
         println!("{}", signature.display());
     }

@@ -95,6 +95,12 @@ impl<'a> ComparisonContext<'a> {
         self.reference_forms.get(identity)
     }
 
+    /// Canonicalize the protocol's unqualified reference form.
+    ///
+    /// `{name}` denotes exactly one bare segment: it contains neither `:` nor
+    /// `/`. Values containing either delimiter are already qualified or path
+    /// forms and compare exactly; they are never expanded and can never equal
+    /// a bare name through reference-form canonicalization.
     pub(crate) fn canonical_string<'b>(
         &self,
         value: &'b str,

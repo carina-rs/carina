@@ -18,9 +18,12 @@ use carina_core::schema::{
 use carina_state::{DeposedInstance, DeposedKey, NameOverride, ResourceState};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[path = "tests/cancellation_fixture.rs"]
 mod cancellation_fixture;
@@ -131,6 +134,379 @@ macro_rules! unexpected_resume_create {
             Box::pin(async { panic!("unexpected resume_create") })
         }
     };
+}
+
+fn mock_http_wasm_path() -> Option<PathBuf> {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    [
+        "carina_provider_mock_http.wasm",
+        "carina-provider-mock-http.wasm",
+    ]
+    .into_iter()
+    .map(|name| workspace_root.join("target/wasm32-wasip2/debug").join(name))
+    .find(|path| path.exists())
+}
+
+fn spawn_mock_http_server(
+    expected_requests: usize,
+) -> Option<(SocketAddr, std::thread::JoinHandle<Vec<usize>>)> {
+    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
+            return None;
+        }
+    };
+    let address = listener.local_addr().expect("loopback listener address");
+    listener
+        .set_nonblocking(true)
+        .expect("set loopback listener nonblocking");
+    let server = std::thread::spawn(move || {
+        let mut request_sizes = Vec::with_capacity(expected_requests);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while request_sizes.len() < expected_requests {
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "server accept timed out");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("server accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set server read timeout");
+            let mut request = vec![0_u8; 32 * 1024];
+            let bytes_read = stream.read(&mut request).expect("read dispatched request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write HTTP response");
+            request_sizes.push(bytes_read);
+        }
+        request_sizes
+    });
+    Some((address, server))
+}
+
+fn mock_http_resource(identity: &str, address: SocketAddr, behavior: &str) -> Resource {
+    Resource::with_provider(
+        "mock_http",
+        "test.send_phase",
+        ResourceIdentity::try_from(identity.to_string()).expect("non-empty fixture identity"),
+        None,
+    )
+    .with_attribute(
+        "url",
+        Value::Concrete(ConcreteValue::String(
+            format!("http://phase-test.invalid:{}/", address.port()).into(),
+        )),
+    )
+    .with_attribute(
+        "method",
+        Value::Concrete(ConcreteValue::String("POST".into())),
+    )
+    .with_attribute(
+        "body",
+        Value::Concrete(ConcreteValue::String("x".repeat(16 * 1024).into())),
+    )
+    .with_attribute(
+        "create_behavior",
+        Value::Concrete(ConcreteValue::String(behavior.to_string().into())),
+    )
+}
+
+fn mock_http_ready_config(
+    factory: &dyn ProviderFactory,
+) -> carina_core::provider::ProviderReadyConfig {
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.providers.push(carina_core::parser::ProviderConfig {
+        name: factory.name().to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    });
+    let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
+        &parsed,
+        &HashMap::new(),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("mock HTTP provider config must resolve");
+    carina_core::executor::prepare_provider_ready_config(
+        factory,
+        resolved.iter().next().expect("one provider config"),
+    )
+    .expect("mock HTTP provider config must validate")
+}
+
+fn mock_http_replacement_schema() -> carina_core::schema::ValidatedResourceSchema {
+    ResourceSchema::new("test.send_phase")
+        .attribute(AttributeSchema::required("url", AttributeType::string()).build())
+        .attribute(AttributeSchema::required("method", AttributeType::string()).build())
+        .attribute(AttributeSchema::required("body", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::provider_populated("send_phase", AttributeType::string()).build(),
+        )
+        .attribute(
+            AttributeSchema::optional("create_behavior", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .with_coexisting_replacement()
+        .validate()
+        .expect("mock HTTP replacement schema must validate")
+}
+
+struct OutcomeUnknownExecutionObserver;
+
+impl carina_core::executor::ExecutionObserver for OutcomeUnknownExecutionObserver {
+    fn on_event(&self, _event: &carina_core::executor::ExecutionEvent<'_>) {}
+}
+
+async fn execute_mock_http_plan(
+    provider: &ProviderRouter,
+    factories: &[Box<dyn ProviderFactory>],
+    schemas: &SchemaRegistry,
+    plan: &Plan,
+    managed_current: HashMap<ResourceId, carina_core::resource::Current>,
+) -> carina_core::executor::ExecutionResult {
+    let outcome = carina_core::executor::execute_live_plan(
+        provider,
+        carina_core::executor::LiveExecutionInput {
+            plan,
+            provider_check_inputs: carina_core::executor::ProviderCheckInputs::Authored,
+            compositions: &[],
+            bindings: Default::default(),
+            managed_current,
+            data_source_values: carina_core::data_source_value::ExecutableDataSourceValues::empty(),
+            normalizer: &NoopNormalizer,
+            provider_configs: &[],
+            factories,
+            schemas,
+            parallelism: std::num::NonZeroUsize::new(1).expect("one is non-zero"),
+            precompleted_success_count: 0,
+            checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::noop(),
+        },
+        &OutcomeUnknownExecutionObserver,
+        carina_core::shutdown::ShutdownToken::running(),
+    )
+    .await;
+    let carina_core::executor::ExecutionOutcome::Completed(result) = outcome else {
+        panic!("an uncancelled mock HTTP execution must complete");
+    };
+    result
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recovery_state() {
+    let Some(wasm_path) = mock_http_wasm_path() else {
+        eprintln!(
+            "SKIP: mock HTTP WASM binary not found; build carina-provider-mock-http for wasm32-wasip2"
+        );
+        return;
+    };
+    let Some((server_address, server)) = spawn_mock_http_server(2) else {
+        return;
+    };
+    let cache = tempfile::tempdir().expect("create WASM cache directory");
+    let wasm_bytes = std::fs::read(wasm_path).expect("read mock HTTP WASM provider");
+    let verified = carina_provider_resolver::VerifiedLoad::for_test(
+        &wasm_bytes,
+        carina_provider_resolver::ProviderLoadIdentity::for_test(
+            "mock_http",
+            carina_provider_resolver::ProviderTrustClass::Untrusted,
+        ),
+    );
+    let factory =
+        carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(verified, cache.path())
+            .await
+            .expect("load mock HTTP WASM provider")
+            .with_http_test_route("phase-test.invalid", server_address);
+    let ready = mock_http_ready_config(&factory);
+    let initialized = factory
+        .create_initialized_provider(None, &ready)
+        .await
+        .expect("initialize mock HTTP provider");
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(factory)];
+    let mut schemas = carina_core::provider::collect_schemas(&factories);
+    schemas.insert("mock_http", mock_http_replacement_schema());
+    let mut provider = ProviderRouter::new();
+    provider.add_provider("mock_http".to_string(), initialized);
+
+    let fresh_resource = mock_http_resource("fresh-trap", server_address, "trap_after_send");
+    let fresh_id = fresh_resource.id.clone();
+    let fresh_resources = vec![ResolvedResource::new(fresh_resource)];
+    let mut fresh_plan = Plan::new();
+    fresh_plan.add(Effect::Create(fresh_resources[0].clone()));
+    let fresh_result =
+        execute_mock_http_plan(&provider, &factories, &schemas, &fresh_plan, HashMap::new()).await;
+    assert!(matches!(
+        fresh_result.applied_states.get(&fresh_id),
+        Some(carina_core::executor::Applied::CreateOutcomeUnknown(unknown))
+            if unknown.id() == &fresh_id
+    ));
+    let fresh_state = build_state_after_apply(
+        ApplyStateSave {
+            state_file: StateFile::new(),
+            sorted_resources: &fresh_resources,
+            runtime_synthesized_resources: &fresh_result.runtime_synthesized_resources,
+            managed_current: &fresh_result.managed_current,
+            applied_states: &fresh_result.applied_states,
+            plan: &fresh_plan,
+            successfully_deleted: &fresh_result.successfully_deleted,
+            failed_refreshes: &fresh_result.failed_refreshes,
+            schemas: &schemas,
+        },
+        None,
+    )
+    .expect("fresh unknown outcome must be written to state");
+    assert!(matches!(
+        fresh_state
+            .find_resource_for_id(&fresh_id)
+            .expect("fresh state row")
+            .current(),
+        carina_state::CurrentInstance::CreateOutcomeUnknown { .. }
+    ));
+
+    let mut desired = mock_http_resource("replacement-trap", server_address, "trap_after_send");
+    desired.directives.create_before_destroy = true;
+    let replacement_id = desired.id.clone();
+    let old_resource = mock_http_resource("replacement-trap", server_address, "normal");
+    let old_state = State::existing(
+        replacement_id.clone(),
+        old_resource.attributes.into_iter().collect(),
+    )
+    .with_identifier("old-applied-id");
+    let current_states = HashMap::from([(replacement_id.clone(), old_state)]);
+    let replacement_resources = vec![ResolvedResource::new(desired)];
+    let replacement_raw_resources = replacement_resources
+        .iter()
+        .map(|resource| resource.as_resource().clone())
+        .collect::<Vec<_>>();
+    let plan_input_current = crate::plan_input_current_from_states(
+        current_states.clone(),
+        &schemas,
+        &replacement_raw_resources,
+    );
+    let replacement_plan = carina_core::differ::create_plan(
+        &replacement_resources,
+        &[],
+        &provider,
+        carina_core::differ::PlanPriorStates::new(
+            &plan_input_current,
+            &carina_core::differ::Orphans::new(),
+        ),
+        &HashMap::new(),
+        &schemas,
+        &crate::empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &[],
+    )
+    .expect("create-only behavior change must plan a replacement");
+    assert!(
+        replacement_plan
+            .replace_display_info()
+            .next()
+            .is_some_and(|replacement| replacement.create_before_destroy),
+        "fixture must be a create-before-destroy replacement: {:?}",
+        replacement_plan.effects()
+    );
+
+    let mut initial_state = StateFile::new();
+    let old_url = format!("http://phase-test.invalid:{}/", server_address.port());
+    let old_row = ResourceState::try_applied(
+        "test.send_phase",
+        "replacement-trap",
+        "mock_http",
+        "old-applied-id",
+    )
+    .expect("old identifier is valid")
+    .with_attribute("url", serde_json::json!(old_url))
+    .with_attribute("method", serde_json::json!("POST"))
+    .with_attribute("body", serde_json::json!("x".repeat(16 * 1024)))
+    .with_attribute("create_behavior", serde_json::json!("normal"));
+    initial_state
+        .upsert_resource(old_row)
+        .expect("insert old applied state");
+
+    let replacement_result = execute_mock_http_plan(
+        &provider,
+        &factories,
+        &schemas,
+        &replacement_plan,
+        crate::managed_current_from_states(current_states),
+    )
+    .await;
+    assert!(matches!(
+        replacement_result.applied_states.get(&replacement_id),
+        Some(carina_core::executor::Applied::CreateOutcomeUnknown(unknown))
+            if unknown.id() == &replacement_id
+    ));
+    let mut replacement_state = build_state_after_apply(
+        ApplyStateSave {
+            state_file: initial_state,
+            sorted_resources: &replacement_resources,
+            runtime_synthesized_resources: &replacement_result.runtime_synthesized_resources,
+            managed_current: &replacement_result.managed_current,
+            applied_states: &replacement_result.applied_states,
+            plan: &replacement_plan,
+            successfully_deleted: &replacement_result.successfully_deleted,
+            failed_refreshes: &replacement_result.failed_refreshes,
+            schemas: &schemas,
+        },
+        None,
+    )
+    .expect("replacement unknown outcome must be written to state");
+    let replacement_row = replacement_state
+        .find_resource_for_id(&replacement_id)
+        .expect("replacement state row");
+    assert!(matches!(
+        replacement_row.current(),
+        carina_state::CurrentInstance::CreateOutcomeUnknown { .. }
+    ));
+    assert!(
+        replacement_row
+            .deposed
+            .iter()
+            .any(|generation| generation.identifier == "old-applied-id"),
+        "the old applied identifier must remain as a deposed generation"
+    );
+
+    let address = carina_core::parser::StateBlockAddress::new(
+        "mock_http",
+        "test.send_phase",
+        "replacement-trap",
+    );
+    let forgotten = replacement_state
+        .find_outcome_unknown(&address)
+        .expect("replacement row must authorize outcome-unknown forget");
+    StateFile::forget(forgotten);
+    let shell = replacement_state
+        .find_resource_for_id(&replacement_id)
+        .expect("forget must retain the deposed shell");
+    assert!(matches!(
+        shell.current(),
+        carina_state::CurrentInstance::None
+    ));
+    assert!(
+        shell
+            .deposed
+            .iter()
+            .any(|generation| generation.identifier == "old-applied-id"),
+        "state forget must keep the old deposed generation"
+    );
+
+    let request_sizes = server.join().expect("loopback server must finish");
+    assert_eq!(request_sizes.len(), 2);
+    assert!(
+        request_sizes.iter().all(|size| *size > 0),
+        "both guest creates must dispatch HTTP bytes: {request_sizes:?}"
+    );
 }
 
 #[test]

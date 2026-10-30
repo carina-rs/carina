@@ -2856,6 +2856,7 @@ fn deposed_attributes_for_display(
 mod historical_display_tests {
     use super::*;
     use carina_core::resource::{DeferredValue, ResolvedResource};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 
     #[test]
     fn production_historical_display_combines_desired_and_persisted_secret_shapes() {
@@ -2885,21 +2886,24 @@ mod historical_display_tests {
             to,
             changed_attributes: vec!["comment".to_string()],
         });
-        let current_states = HashMap::from([(id, Current::from_state(from))]);
+        let current_states = HashMap::from([(id.clone(), Current::from_state(from))]);
 
         // Exercise the same collector and row builder used by CLI and TUI
         // production paths. There is deliberately no persisted state shape:
         // the desired Secret shape must still mask the provider plaintext.
         let historical = collect_historical_display_attributes(&plan, &current_states, None);
-        let provider = crate::fixture_plan::provider_router_for_plan(&plan);
-        let app = carina_tui::App::new(
-            &plan,
-            &carina_core::schema::SchemaRegistry::new(),
-            &historical,
-            None,
-            &provider,
-        )
-        .expect("detail-row fixture must have an initialized provider route");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            ResourceSchema::new("mock.test.resource")
+                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+                .validate()
+                .expect("display fixture schema must be valid"),
+        );
+        let (schemas, provider) =
+            carina_core::provider::comparison_fixture_for_test(&schemas, std::iter::once(&id));
+        let app = carina_tui::App::new(&plan, &schemas, &historical, None, &provider)
+            .expect("detail-row fixture must have an initialized provider route");
         let rendered = format!("{:?}", app.nodes[0].detail_rows);
 
         assert!(
@@ -4763,8 +4767,7 @@ pub async fn run_plan(
             &historical_display,
             Some(&ctx.prev_explicit),
             &ctx.provider,
-        )
-        .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
+        )?;
         moved_hints.eprint();
         if let Some(result) = iam_preflight_result.as_ref() {
             crate::commands::iam_preflight::emit_warnings(result);

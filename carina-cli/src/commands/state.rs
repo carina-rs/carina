@@ -1197,8 +1197,7 @@ async fn run_state_show(
             &historical_display,
             Some(&prev_explicit),
             &carina_core::provider::ProviderRouter::new(),
-        )
-        .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
+        )?;
     } else {
         let output = format_state_show(&state);
         print!("{}", output);

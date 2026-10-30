@@ -91,6 +91,12 @@ cannot be emitted by `schemas()` JSON. Providers return the table from the
 required `CarinaProvider::reference_forms` method rather than constructing
 that JSON themselves.
 
+`{name}` describes the unqualified form: one bare segment containing no `:` or
+`/`. During semantic comparison the host expands only that bare form through
+the `long` template. Strings containing `:` or `/` are qualified or path forms
+and compare exactly as written; a qualified value therefore never compares
+equal to a bare name.
+
 What the attributes declare:
 
 - `create_only` means the API cannot change the value in place, so a change replaces the resource.

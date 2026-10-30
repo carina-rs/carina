@@ -134,7 +134,13 @@ fn seed_unknown_state(project: &OutcomeUnknownProject, identity: &str) {
             "current": {
                 "kind": "create_outcome_unknown",
                 "started_at": "2026-10-30T03:00:00Z"
-            }
+            },
+            "deposed": [{
+                "key": "00000000-0000-4000-8000-000000000001",
+                "identifier": "previous-applied-id",
+                "attributes": {},
+                "dependency_bindings": []
+            }]
         }],
         "exports": {}
     }));
@@ -211,23 +217,28 @@ fn unknown_row_forget_allows_the_next_plan_to_propose_create() {
         ".",
     ]);
     assert_success("state forget", &forget);
+    let expected_message =
+        format!("Forgot create-outcome-unknown current instance: mock.test.resource '{identity}'");
     assert!(
-        output_text(&forget).contains("Forgot state row: mock.test.resource"),
-        "state forget must show the row it removed\n{}",
+        output_text(&forget).contains(&expected_message),
+        "state forget must show the current instance it removed\n{}",
         output_text(&forget)
     );
-    assert!(
-        project.read_state_json()["resources"]
-            .as_array()
-            .expect("state resources")
-            .is_empty()
+    let forgotten = project.read_state_json();
+    let resources = forgotten["resources"].as_array().expect("state resources");
+    assert_eq!(resources.len(), 1, "the deposed-only shell must remain");
+    assert_eq!(resources[0]["current"]["kind"], "none");
+    assert_eq!(resources[0]["deposed"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        resources[0]["deposed"][0]["identifier"],
+        "previous-applied-id"
     );
 
     let plan = project.run(&["plan", "."]);
     assert_success("post-forget plan", &plan);
     let text = output_text(&plan);
     assert!(
-        text.contains("Plan: 1 to add, 0 to change, 0 to destroy"),
-        "post-forget plan must propose the ordinary create\n{text}"
+        text.contains("Plan: 1 to add, 0 to change, 1 to destroy"),
+        "post-forget plan must propose the ordinary create and retain the deposed delete\n{text}"
     );
 }

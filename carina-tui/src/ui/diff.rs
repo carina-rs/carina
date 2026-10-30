@@ -318,7 +318,7 @@ mod tests {
     use super::*;
     use carina_core::detail_rows::{
         DetailLevel, DetailRow, HistoricalDisplayAttributes, NonEmptyListOfMapsBlock,
-        build_detail_rows_by_instance_for_test,
+        build_detail_rows_by_instance,
     };
     use carina_core::effect::Effect;
     use carina_core::plan::Plan;
@@ -354,8 +354,11 @@ mod tests {
         let effect = Effect::Update {
             identifier: crate::fixture_applied_identifier("example-id"),
             from: Box::new(
-                State::existing(id, [("value".to_string(), old)].into_iter().collect())
-                    .with_identifier("example-id"),
+                State::existing(
+                    id.clone(),
+                    [("value".to_string(), old)].into_iter().collect(),
+                )
+                .with_identifier("example-id"),
             ),
             to: ResolvedResource::new(
                 Resource::new("test.Widget", "example").with_attribute("value", new),
@@ -365,15 +368,20 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(effect);
         let historical = HistoricalDisplayAttributes::for_plan(&plan);
+        let (schemas, provider) = carina_core::provider::comparison_fixture_for_test(
+            &carina_core::schema::SchemaRegistry::new(),
+            std::iter::once(&id),
+        );
 
-        build_detail_rows_by_instance_for_test(
+        build_detail_rows_by_instance(
             &plan.effects()[0],
-            None,
+            Some(&schemas),
             DetailLevel::Explicit,
             &historical,
             None,
-            &carina_core::differ::exact_comparison_context_for_tests(),
+            &provider,
         )
+        .expect("diff display test must use the production comparison path")
     }
 
     #[test]

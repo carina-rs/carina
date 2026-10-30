@@ -6,10 +6,6 @@ use carina_core::detail_rows::{
     DetailLevel, DetailRow, HistoricalDisplayAttributes, build_detail_rows_by_instance,
     build_replace_detail_rows_from_display, delete_identifier_fallback_row,
 };
-#[cfg(test)]
-use carina_core::detail_rows::{
-    build_detail_rows_by_instance_for_test, build_replace_detail_rows_from_display_for_test,
-};
 use carina_core::effect::Effect;
 use carina_core::explicit::ExplicitFields;
 use carina_core::plan::{Plan, PlanSummary, ReplaceDisplayInfo};
@@ -107,7 +103,12 @@ impl App {
     #[cfg(test)]
     pub(crate) fn for_plan(plan: &Plan, schemas: &SchemaRegistry) -> Self {
         let historical_display = HistoricalDisplayAttributes::for_plan(plan);
-        Self::new_for_test(plan, schemas, &historical_display, None)
+        let (schemas, provider) = carina_core::provider::comparison_fixture_for_test(
+            schemas,
+            plan.effects().iter().map(Effect::resource_id),
+        );
+        Self::new(plan, &schemas, &historical_display, None, &provider)
+            .expect("test plan display must resolve every comparison")
     }
 
     pub fn new(
@@ -117,11 +118,6 @@ impl App {
         prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
         provider: &ProviderRouter,
     ) -> ProviderResult<Self> {
-        let schemas_opt = if schemas.is_empty() {
-            None
-        } else {
-            Some(schemas)
-        };
         let replacement_display: Vec<_> = plan.replace_display_info().collect();
         let replacement_create_info: HashMap<_, _> = replacement_display
             .iter()
@@ -135,7 +131,7 @@ impl App {
                 effect_to_node(
                     plan,
                     effect,
-                    schemas_opt,
+                    schemas,
                     historical_display,
                     replacement_create_info.get(&idx).copied(),
                     prev_explicit,
@@ -144,37 +140,6 @@ impl App {
             })
             .collect::<ProviderResult<Vec<_>>>()?;
         Ok(Self::from_nodes(plan, nodes, replacement_display))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_for_test(
-        plan: &Plan,
-        schemas: &SchemaRegistry,
-        historical_display: &HistoricalDisplayAttributes,
-        prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
-    ) -> Self {
-        let schemas_opt = (!schemas.is_empty()).then_some(schemas);
-        let replacement_display: Vec<_> = plan.replace_display_info().collect();
-        let replacement_create_info: HashMap<_, _> = replacement_display
-            .iter()
-            .map(|metadata| (metadata.create_idx, *metadata))
-            .collect();
-        let nodes = plan
-            .effects()
-            .iter()
-            .enumerate()
-            .map(|(idx, effect)| {
-                effect_to_node_for_test(
-                    plan,
-                    effect,
-                    schemas_opt,
-                    historical_display,
-                    replacement_create_info.get(&idx).copied(),
-                    prev_explicit,
-                )
-            })
-            .collect();
-        Self::from_nodes(plan, nodes, replacement_display)
     }
 
     fn from_nodes(
@@ -799,7 +764,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
 fn effect_to_node(
     plan: &Plan,
     effect: &Effect,
-    schemas: Option<&SchemaRegistry>,
+    schemas: &SchemaRegistry,
     historical_display: &HistoricalDisplayAttributes,
     replacement_info: Option<ReplaceDisplayInfo<'_>>,
     prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
@@ -812,7 +777,7 @@ fn effect_to_node(
                 resource,
                 replacement,
                 historical_display,
-                schemas,
+                Some(schemas),
                 DetailLevel::Full,
                 prev_explicit.and_then(|map| map.get(&resource.id)),
                 provider,
@@ -820,7 +785,7 @@ fn effect_to_node(
         } else {
             build_detail_rows_by_instance(
                 effect,
-                schemas,
+                Some(schemas),
                 DetailLevel::Full,
                 historical_display,
                 prev_explicit,
@@ -833,41 +798,6 @@ fn effect_to_node(
         replacement_info,
         detail_rows,
     ))
-}
-
-#[cfg(test)]
-fn effect_to_node_for_test(
-    plan: &Plan,
-    effect: &Effect,
-    schemas: Option<&SchemaRegistry>,
-    historical_display: &HistoricalDisplayAttributes,
-    replacement_info: Option<ReplaceDisplayInfo<'_>>,
-    prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
-) -> TreeNode {
-    let comparison = carina_core::differ::exact_comparison_context_for_tests();
-    let detail_rows =
-        if let (Effect::Create(resource), Some(replacement)) = (effect, replacement_info) {
-            build_replace_detail_rows_from_display_for_test(
-                plan,
-                resource,
-                replacement,
-                historical_display,
-                schemas,
-                DetailLevel::Full,
-                prev_explicit.and_then(|map| map.get(&resource.id)),
-                &comparison,
-            )
-        } else {
-            build_detail_rows_by_instance_for_test(
-                effect,
-                schemas,
-                DetailLevel::Full,
-                historical_display,
-                prev_explicit,
-                &comparison,
-            )
-        };
-    effect_to_node_with_rows(plan, effect, replacement_info, detail_rows)
 }
 
 fn effect_to_node_with_rows(

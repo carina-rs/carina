@@ -19,6 +19,12 @@ value must contain `{name}` exactly once and may otherwise contain only
 `{partition}`, `{region}`, and `{account}` placeholders. Stray braces and
 unknown placeholders fail typed validation.
 
+At comparison time, `{name}` is the unqualified reference form and denotes one
+bare segment containing neither `:` nor `/`. Only such a bare value is expanded
+through `long`. A value containing `:` or `/` is already a qualified or path
+form, so it compares exactly as written and never compares equal to a bare name
+through reference-form expansion.
+
 The host admits resources, provider config, and forms as one provider-wide
 witness. Every form identity must be declared by that provider as a refined
 String; duplicate records, dangling identities, Int identities, and Enum

@@ -4893,17 +4893,26 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
     let mut historical =
         carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&delete_plan);
     historical.set_delete_from_persisted(
-        carina_core::effect::DeletedInstanceKey::new(id, generation, "resource-old".to_string()),
+        carina_core::effect::DeletedInstanceKey::new(
+            id.clone(),
+            generation,
+            "resource-old".to_string(),
+        ),
         row.deposed[0].persisted_attributes(),
     );
-    let delete_rows = carina_core::detail_rows::build_detail_rows_by_instance_for_test(
+    let (schemas, provider) = carina_core::provider::comparison_fixture_for_test(
+        &carina_core::schema::SchemaRegistry::new(),
+        std::iter::once(&id),
+    );
+    let delete_rows = carina_core::detail_rows::build_detail_rows_by_instance(
         &delete,
-        None,
+        Some(&schemas),
         carina_core::detail_rows::DetailLevel::Full,
         &historical,
         None,
-        &exact_comparison_context(),
-    );
+        &provider,
+    )
+    .expect("delete display must use the production detail-row builder");
     assert_eq!(
         delete_rows,
         vec![carina_core::detail_rows::DetailRow::Attribute {

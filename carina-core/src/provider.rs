@@ -5245,6 +5245,7 @@ pub enum ComparisonResolutionError {
     MissingResourceSchema { id: ResourceId },
     UnknownProviderInstance { instance: ProviderInstanceKey },
     SchemaOwnerMismatch { id: ResourceId, owner: String },
+    ComparisonNotResolvedAtApplyStart { id: ResourceId },
 }
 
 impl std::fmt::Display for ComparisonResolutionError {
@@ -5269,6 +5270,10 @@ impl std::fmt::Display for ComparisonResolutionError {
                 formatter,
                 "resource `{id}` routes to provider `{}` but its schema is owned by `{owner}`",
                 id.provider,
+            ),
+            Self::ComparisonNotResolvedAtApplyStart { id } => write!(
+                formatter,
+                "comparison for `{id}` was not resolved before provider mutation began"
             ),
         }
     }
@@ -5334,24 +5339,26 @@ pub struct ResolvedComparisonTable {
 }
 
 impl ResolvedComparisonTable {
-    pub fn comparison_for(&self, id: &ResourceId) -> ResolvedComparison<'_> {
+    pub fn comparison_for(
+        &self,
+        id: &ResourceId,
+    ) -> Result<ResolvedComparison<'_>, ComparisonResolutionError> {
         let key = ResolvedComparisonKey::from(id);
-        let data = self
-            .entries
-            .get(&key)
-            .unwrap_or_else(|| panic!("comparison for `{id}` was not resolved at apply start"));
+        let data = self.entries.get(&key).ok_or_else(|| {
+            ComparisonResolutionError::ComparisonNotResolvedAtApplyStart { id: id.clone() }
+        })?;
         let owner_schema = crate::schema::OwnerBoundResourceSchema::new(
             &data.owner,
             &data.schema,
             &data.reference_forms,
         );
-        ResolvedComparison {
+        Ok(ResolvedComparison {
             owner_schema,
             context: crate::differ::ComparisonContext::from_scope_and_forms(
                 &data.scope,
                 &data.reference_forms,
             ),
-        }
+        })
     }
 }
 
@@ -10761,6 +10768,26 @@ mod tests {
         assert!(matches!(
             error,
             ComparisonResolutionError::MissingResourceSchema { id: actual } if actual == id
+        ));
+    }
+
+    #[test]
+    fn resolved_comparison_table_reports_an_unresolved_id_without_panicking() {
+        let router = ProviderRouter::new();
+        let registry = crate::schema::SchemaRegistry::new();
+        let table = router
+            .resolve_comparisons(&registry, std::iter::empty())
+            .expect("an empty apply-start comparison set is valid");
+        let id = ResourceId::with_provider_identity("mock", "test.Widget", "late", None);
+
+        let error = table
+            .comparison_for(&id)
+            .expect_err("a writeback-only id must return a typed pre-resolution error");
+
+        assert!(matches!(
+            error,
+            ComparisonResolutionError::ComparisonNotResolvedAtApplyStart { id: actual }
+                if actual == id
         ));
     }
 

@@ -1366,28 +1366,6 @@ pub struct ProjectedAttributes {
 }
 
 impl ProjectedAttributes {
-    pub(crate) fn legacy(attributes: HashMap<String, Value>, explicit: &ExplicitFields) -> Self {
-        let attributes = match explicit {
-            ExplicitFields::Struct { children } => attributes
-                .into_iter()
-                .filter_map(|(key, value)| {
-                    children
-                        .get(&key)
-                        .map(|child| (key, project_legacy_value(value, child)))
-                })
-                .collect(),
-            ExplicitFields::Leaf
-            | ExplicitFields::List { .. }
-            | ExplicitFields::ListElements { .. }
-            | ExplicitFields::WholeValue { .. }
-            | ExplicitFields::Unrecorded => attributes,
-        };
-        Self {
-            attributes,
-            authoring: ProjectedAuthoring::from_unprojected(explicit),
-        }
-    }
-
     pub(crate) fn unprojected(
         attributes: HashMap<String, Value>,
         explicit: Option<&ExplicitFields>,

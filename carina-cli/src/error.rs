@@ -783,6 +783,10 @@ pub enum AppError {
     #[error(transparent)]
     PlanImage(#[from] crate::plan_image::PlanImageError),
 
+    /// Interactive terminal setup, display preparation, or I/O failed.
+    #[error(transparent)]
+    Tui(#[from] carina_tui::TuiError),
+
     /// One schema-aware bare-binding failure at its authored source token.
     #[error(transparent)]
     BindingUse(Box<carina_core::validation::BindingUseFinding>),
@@ -1285,6 +1289,27 @@ mod tests {
         let app_error = AppError::from(plan_image_error);
 
         assert!(matches!(app_error, AppError::PlanImage(_)));
+    }
+
+    #[test]
+    fn tui_error_keeps_the_typed_provider_failure_in_the_app_error_chain() {
+        let app_error = AppError::from(carina_tui::TuiError::PlanDisplay(
+            ProviderError::internal_caused_by(
+                "comparison resolution failed",
+                std::io::Error::other("typed leaf"),
+            ),
+        ));
+
+        assert_eq!(app_error.to_string(), "Failed to prepare TUI plan details");
+        let provider_error = std::error::Error::source(&app_error)
+            .and_then(|source| source.downcast_ref::<ProviderError>())
+            .expect("transparent AppError must retain the typed TUI provider source");
+        assert!(
+            provider_error
+                .detail()
+                .cause()
+                .is_some_and(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+        );
     }
 
     #[test]
