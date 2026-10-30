@@ -13,6 +13,7 @@ use carina_core::plan_tree::{
     build_dependency_graph, build_single_parent_tree, deferred_for_detail_rows,
     deferred_for_display_name, deferred_for_verb, extract_compact_hint,
 };
+use carina_core::provider::{ProviderResult, ProviderRouter};
 use carina_core::resource::ResourceId;
 use carina_core::schema::SchemaRegistry;
 use ratatui::widgets::ListState;
@@ -102,7 +103,12 @@ impl App {
     #[cfg(test)]
     pub(crate) fn for_plan(plan: &Plan, schemas: &SchemaRegistry) -> Self {
         let historical_display = HistoricalDisplayAttributes::for_plan(plan);
-        Self::new(plan, schemas, &historical_display, None)
+        let (schemas, provider) = carina_core::provider::comparison_fixture_for_test(
+            schemas,
+            plan.effects().iter().map(Effect::resource_id),
+        );
+        Self::new(plan, &schemas, &historical_display, None, &provider)
+            .expect("test plan display must resolve every comparison")
     }
 
     pub fn new(
@@ -110,13 +116,37 @@ impl App {
         schemas: &SchemaRegistry,
         historical_display: &HistoricalDisplayAttributes,
         prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
-    ) -> Self {
-        let schemas_opt = if schemas.is_empty() {
-            None
-        } else {
-            Some(schemas)
-        };
+        provider: &ProviderRouter,
+    ) -> ProviderResult<Self> {
         let replacement_display: Vec<_> = plan.replace_display_info().collect();
+        let replacement_create_info: HashMap<_, _> = replacement_display
+            .iter()
+            .map(|metadata| (metadata.create_idx, *metadata))
+            .collect();
+        let nodes = plan
+            .effects()
+            .iter()
+            .enumerate()
+            .map(|(idx, effect)| {
+                effect_to_node(
+                    plan,
+                    effect,
+                    schemas,
+                    historical_display,
+                    replacement_create_info.get(&idx).copied(),
+                    prev_explicit,
+                    provider,
+                )
+            })
+            .collect::<ProviderResult<Vec<_>>>()?;
+        Ok(Self::from_nodes(plan, nodes, replacement_display))
+    }
+
+    fn from_nodes(
+        plan: &Plan,
+        mut nodes: Vec<TreeNode>,
+        replacement_display: Vec<ReplaceDisplayInfo<'_>>,
+    ) -> Self {
         let replacement_delete_indices: HashSet<_> = replacement_display
             .iter()
             .map(|metadata| metadata.delete_idx)
@@ -124,21 +154,6 @@ impl App {
         let replacement_create_info: HashMap<_, _> = replacement_display
             .iter()
             .map(|metadata| (metadata.create_idx, *metadata))
-            .collect();
-        let mut nodes: Vec<TreeNode> = plan
-            .effects()
-            .iter()
-            .enumerate()
-            .map(|(idx, e)| {
-                effect_to_node(
-                    plan,
-                    e,
-                    schemas_opt,
-                    historical_display,
-                    replacement_create_info.get(&idx).copied(),
-                    prev_explicit,
-                )
-            })
             .collect();
         let plan_summary = plan.summary();
         let summary = format!("{}", plan_summary);
@@ -162,8 +177,17 @@ impl App {
                 Effect::Create(r) if replacement_create_info.contains_key(&idx) => {
                     Some(r.id.clone())
                 }
-                Effect::DeferredReplace(_) => None,
-                _ => None,
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Delete { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => None,
             })
             .collect();
 
@@ -749,31 +773,48 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
 fn effect_to_node(
     plan: &Plan,
     effect: &Effect,
-    schemas: Option<&SchemaRegistry>,
+    schemas: &SchemaRegistry,
     historical_display: &HistoricalDisplayAttributes,
     replacement_info: Option<ReplaceDisplayInfo<'_>>,
     prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
-) -> TreeNode {
-    let mut detail_rows =
+    provider: &ProviderRouter,
+) -> ProviderResult<TreeNode> {
+    let detail_rows =
         if let (Effect::Create(resource), Some(replacement)) = (effect, replacement_info) {
             build_replace_detail_rows_from_display(
                 plan,
                 resource,
                 replacement,
                 historical_display,
-                schemas,
+                Some(schemas),
                 DetailLevel::Full,
                 prev_explicit.and_then(|map| map.get(&resource.id)),
+                provider,
             )
         } else {
             build_detail_rows_by_instance(
                 effect,
-                schemas,
+                Some(schemas),
                 DetailLevel::Full,
                 historical_display,
                 prev_explicit,
+                provider,
             )
-        };
+        }?;
+    Ok(effect_to_node_with_rows(
+        plan,
+        effect,
+        replacement_info,
+        detail_rows,
+    ))
+}
+
+fn effect_to_node_with_rows(
+    plan: &Plan,
+    effect: &Effect,
+    replacement_info: Option<ReplaceDisplayInfo<'_>>,
+    mut detail_rows: Vec<DetailRow>,
+) -> TreeNode {
     if let Effect::Remove { id } = effect {
         detail_rows.extend(
             plan.abandoned_deposed_generations()
@@ -911,6 +952,17 @@ fn effect_to_node(
             effect_label: format!("{} -> {}", from.human(), to.human()),
             resource_type: to.display_type(),
             name_part: to.identity_str().to_string(),
+            symbol: effect.display_glyph().to_string(),
+            kind: EffectKind::Update,
+            detail_rows,
+            children: Vec::new(),
+            depth: 0,
+            parent: None,
+        },
+        Effect::ReleaseListKeys { id, .. } => TreeNode {
+            effect_label: format!("{} (release keyed list entries)", id.human()),
+            resource_type: id.display_type(),
+            name_part: id.identity_str().to_string(),
             symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Update,
             detail_rows,

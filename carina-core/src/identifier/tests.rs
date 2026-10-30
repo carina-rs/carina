@@ -6,14 +6,24 @@ use crate::resource::{
     Subscript, UnknownReason, ValueString,
 };
 use crate::schema::{
-    AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry,
-    ValidatedConfigSchema, enum_identity,
+    AttributeSchema, AttributeType, DslTransform, ReferenceForm, ReferenceForms, ReferenceTemplate,
+    ResourceSchema, SchemaRegistry, TypeIdentity, ValidatedConfigSchema,
+    ValidatedProviderSchemaWitness, enum_identity,
 };
 use indexmap::IndexMap;
 use std::path::Path;
 
 fn concrete_string(value: impl Into<ValueString>) -> Value {
     Value::Concrete(ConcreteValue::String(value.into()))
+}
+
+fn canonical_create_only_value_string_for_test(value: &Value) -> Option<String> {
+    canonical_create_only_value_string(
+        value,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
+        &crate::differ::exact_comparison_context_for_tests(),
+    )
 }
 
 fn anonymous_state_entry<I, K>(
@@ -169,6 +179,10 @@ fn detect_legacy_loop_moves_for_test(
     claims: &StateBlockClaims,
     reserved_moves: &[ResolvedMove],
 ) -> Vec<ResolvedMove> {
+    let (_, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        registry,
+        resources.iter().map(|resource| &resource.id),
+    );
     let find_state_by_type = |provider: &str, resource_type: &str| {
         claims.screen_entries(
             provider,
@@ -186,11 +200,13 @@ fn detect_legacy_loop_moves_for_test(
     super::detect_legacy_loop_address_moves(
         resources,
         registry,
+        &comparison_provider,
         &find_state_by_type,
         &|_binding| Vec::new(),
         claims,
         reserved_moves,
     )
+    .expect("legacy-loop comparison fixture must resolve")
 }
 
 #[test]
@@ -272,6 +288,10 @@ fn reconcile_anonymous_identifiers(
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
 ) -> Vec<ResolvedMove> {
+    let (_, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        registry,
+        resources.iter().map(|resource| &resource.id),
+    );
     let claims = StateBlockClaims::empty();
     let find_screened_state_by_type = |provider: &str, resource_type: &str| {
         claims.screen_entries(
@@ -285,10 +305,12 @@ fn reconcile_anonymous_identifiers(
         resources,
         &[],
         registry,
+        &comparison_provider,
         &find_screened_state_by_type,
         find_state_by_binding,
         &claims,
     )
+    .expect("anonymous reconciliation comparison fixture must resolve")
 }
 
 fn resolved_move_identity_pairs(moves: &[ResolvedMove]) -> Vec<(String, String)> {
@@ -3034,11 +3056,16 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
         .collect(),
         HashSet::new(),
     );
+    let (_, simhash_comparison_provider) = crate::provider::comparison_fixture_for_test(
+        &simhash_schemas,
+        simhash_resources.iter().map(|resource| &resource.id),
+    );
 
     let simhash_renames = super::reconcile_anonymous_identifiers(
         &simhash_resources,
         &[],
         &simhash_schemas,
+        &simhash_comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(
                 provider,
@@ -3049,7 +3076,8 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
         },
         &|_| Vec::new(),
         &claims,
-    );
+    )
+    .expect("SimHash comparison fixture must resolve");
     assert!(
         simhash_renames.is_empty(),
         "claimed moved.from state row must be excluded from SimHash candidates"
@@ -3086,11 +3114,16 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
         .collect(),
         HashSet::new(),
     );
+    let (_, create_only_comparison_provider) = crate::provider::comparison_fixture_for_test(
+        &create_only_schemas,
+        create_only_resources.iter().map(|resource| &resource.id),
+    );
 
     let create_only_renames = super::reconcile_anonymous_identifiers(
         &create_only_resources,
         &[],
         &create_only_schemas,
+        &create_only_comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(
                 provider,
@@ -3107,7 +3140,8 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
                 .collect()
         },
         &claims,
-    );
+    )
+    .expect("create-only comparison fixture must resolve");
     assert!(create_only_renames.is_empty());
     assert_eq!(
         create_only_resources[0]
@@ -3146,11 +3180,16 @@ fn test_reconcile_skips_desired_name_claimed_by_moved_to() {
             .into_iter()
             .collect(),
     );
+    let (_, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        &schemas,
+        resources.iter().map(|resource| &resource.id),
+    );
 
     super::reconcile_anonymous_identifiers(
         &resources,
         &[],
         &schemas,
+        &comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(
                 provider,
@@ -3167,7 +3206,8 @@ fn test_reconcile_skips_desired_name_claimed_by_moved_to() {
                 .collect()
         },
         &claims,
-    );
+    )
+    .expect("create-only comparison fixture must resolve");
 
     assert_eq!(
         resources[0].id.identity_str().expect("resolved identity"),
@@ -3536,28 +3576,27 @@ fn reconcile_simhash_match_tracks_origin_and_projected_source_separately() {
 #[test]
 fn test_canonical_create_only_string_covers_concrete_scalars() {
     assert_eq!(
-        canonical_create_only_value_string(&Value::Concrete(ConcreteValue::Int(42))),
+        canonical_create_only_value_string_for_test(&Value::Concrete(ConcreteValue::Int(42))),
         Some("Int(42)".to_string())
     );
     assert_eq!(
-        canonical_create_only_value_string(&Value::Concrete(ConcreteValue::Float(3.5))),
+        canonical_create_only_value_string_for_test(&Value::Concrete(ConcreteValue::Float(3.5))),
         Some("Float(3.5)".to_string())
     );
     assert_eq!(
-        canonical_create_only_value_string(&Value::Concrete(ConcreteValue::Bool(true))),
+        canonical_create_only_value_string_for_test(&Value::Concrete(ConcreteValue::Bool(true))),
         Some("Bool(true)".to_string())
     );
     assert_eq!(
-        canonical_create_only_value_string(&Value::Concrete(ConcreteValue::Duration(
+        canonical_create_only_value_string_for_test(&Value::Concrete(ConcreteValue::Duration(
             std::time::Duration::from_secs(90)
         ))),
         Some("Int(90)".to_string())
     );
     assert_eq!(
-        canonical_create_only_value_string(&Value::Concrete(ConcreteValue::StringList(vec![
-            "alpha".into(),
-            "beta".into(),
-        ]))),
+        canonical_create_only_value_string_for_test(&Value::Concrete(ConcreteValue::StringList(
+            vec!["alpha".into(), "beta".into(),]
+        ))),
         Some("List([alpha, beta])".to_string())
     );
 }
@@ -3575,7 +3614,7 @@ fn canonical_enum_create_only_comparison_preserves_identity_hash_material() {
         "canonical create-only comparison changes must not alter anonymous-id hash input",
     );
     assert_eq!(
-        canonical_create_only_value_string(&value),
+        canonical_create_only_value_string_for_test(&value),
         Some(r#"EnumApiValue("vpc")"#.to_string()),
     );
 }
@@ -3637,8 +3676,8 @@ fn test_canonical_create_only_string_matches_state_round_trip() {
             .decode()
             .expect("persisted state value should decode");
         assert_eq!(
-            canonical_create_only_value_string(&value),
-            canonical_create_only_value_string(&persisted),
+            canonical_create_only_value_string_for_test(&value),
+            canonical_create_only_value_string_for_test(&persisted),
             "round-trip canonical mismatch for {value:?}",
         );
     }
@@ -5151,6 +5190,83 @@ fn make_sso_instance_registry() -> SchemaRegistry {
     r
 }
 
+fn lambda_permission_reference_registry() -> SchemaRegistry {
+    let identity = TypeIdentity::new(Some("mock"), ["lambda", "Function"], "Name");
+    let schema = ResourceSchema::new("lambda.Permission").attribute(
+        AttributeSchema::optional(
+            "function_name",
+            AttributeType::refined_string(Some(identity.clone()), None, None, None),
+        )
+        .create_only()
+        .build(),
+    );
+    let forms = ReferenceForms::from([(
+        identity,
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:lambda:{region}:{account}:function:{name}",
+            )
+            .expect("reference template must be valid"),
+        },
+    )]);
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![schema.validate().expect("schema fixture must be valid")],
+        ValidatedConfigSchema::default(),
+        forms,
+    )
+    .expect("provider schema witness must be valid");
+    let mut registry = SchemaRegistry::new();
+    registry
+        .insert_provider_witness("mock", &witness)
+        .expect("fixture provider witness must have one owner");
+    registry
+}
+
+fn detect_reference_form_rename(
+    resource: Resource,
+    registry: &SchemaRegistry,
+    state_entry: AnonymousIdStateInfo,
+) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
+    let resources = [resource];
+    let claims = StateBlockClaims::empty();
+    let candidates = resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect::<HashSet<_>>();
+    let claimed_origins = AnonymousToNamedClaimedOrigins::default();
+    let providers = CanonicalizedProviderConfigs::from_configs_for_test(Vec::new());
+    let scope = crate::provider::ReferenceScope::available("aws", "us-east-1", "123456789012")
+        .expect("reference scope must be valid");
+    let (_, comparison_provider) = crate::provider::comparison_fixture_with_scope_for_test(
+        registry,
+        resources.iter().map(|resource| &resource.id),
+        scope,
+    );
+    let detection = super::detect_anonymous_to_named_renames(
+        AnonymousToNamedCandidates::new(&resources, &candidates, &claimed_origins),
+        registry,
+        &comparison_provider,
+        AnonymousToNamedStateLookup::new(
+            &|provider, resource_type| {
+                claims.screen_entries(
+                    provider,
+                    resource_type,
+                    [state_entry.clone()],
+                    AnonymousIdStateInfo::name,
+                )
+            },
+            &|_binding| Vec::new(),
+        ),
+        &providers,
+        &|_provider| Vec::new(),
+        &claims,
+    )
+    .expect("reference-form comparison must resolve");
+    let (moves, contests) = detection.into_parts();
+    assert!(contests.is_empty());
+    moves.into_iter().map(ResolvedMove::into_parts).collect()
+}
+
 #[test]
 fn test_detect_rename_unique_match_by_create_only_attrs() {
     // Scenario: state has an anonymous sso.instance with name="carina-rs".
@@ -5188,6 +5304,66 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
     assert_eq!(renames.len(), 1);
     assert_eq!(renames[0].0.identity_str(), "sso_instance_0ac0620303071530");
     assert_eq!(renames[0].1.identity_str(), "sso");
+}
+
+#[test]
+fn test_detect_rename_reference_form_matches_bare_name_and_arn() {
+    let registry = lambda_permission_reference_registry();
+    let mut resource = Resource::with_provider("mock", "lambda.Permission", "invoke", None);
+    resource.binding = Some("invoke".to_string());
+    resource.set_attr("function_name", concrete_string("processor"));
+    let state_entry = anonymous_state_entry(
+        &registry,
+        "mock",
+        "lambda.Permission",
+        "mock_lambda_permission_01234567",
+        None,
+        None,
+        [(
+            "function_name",
+            concrete_string("arn:aws:lambda:us-east-1:123456789012:function:processor"),
+        )],
+    );
+
+    let renames = detect_reference_form_rename(resource, &registry, state_entry);
+
+    assert_eq!(renames.len(), 1);
+    assert_eq!(
+        renames[0].0.identity_str(),
+        "mock_lambda_permission_01234567"
+    );
+    assert_eq!(renames[0].1.identity_str(), "invoke");
+}
+
+#[test]
+fn test_detect_rename_reference_form_prefix_uses_canonical_candidate_key() {
+    let registry = lambda_permission_reference_registry();
+    let mut resource = Resource::with_provider("mock", "lambda.Permission", "invoke", None);
+    resource.binding = Some("invoke".to_string());
+    resource
+        .prefixes
+        .insert("function_name".to_string(), "processor-".to_string());
+    let state_entry = anonymous_state_entry(
+        &registry,
+        "mock",
+        "lambda.Permission",
+        "mock_lambda_permission_01234567",
+        None,
+        None,
+        [(
+            "function_name",
+            concrete_string("arn:aws:lambda:us-east-1:123456789012:function:processor-prod"),
+        )],
+    );
+
+    let renames = detect_reference_form_rename(resource, &registry, state_entry);
+
+    assert_eq!(renames.len(), 1);
+    assert_eq!(
+        renames[0].0.identity_str(),
+        "mock_lambda_permission_01234567"
+    );
+    assert_eq!(renames[0].1.identity_str(), "invoke");
 }
 
 #[test]
@@ -5876,11 +6052,16 @@ fn test_reconcile_skips_state_entry_claimed_by_removed_from() {
             .collect(),
         HashSet::new(),
     );
+    let (_, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        &schemas,
+        resources.iter().map(|resource| &resource.id),
+    );
 
     super::reconcile_anonymous_identifiers(
         &resources,
         &[],
         &schemas,
+        &comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(
                 provider,
@@ -5897,7 +6078,8 @@ fn test_reconcile_skips_state_entry_claimed_by_removed_from() {
                 .collect()
         },
         &claims,
-    );
+    )
+    .expect("create-only comparison fixture must resolve");
 
     assert_eq!(
         resources[0].id.identity_str().expect("resolved identity"),
@@ -5946,11 +6128,16 @@ fn test_reconcile_existing_removed_from_identity_does_not_repoint_to_orphan() {
         .collect(),
         HashSet::new(),
     );
+    let (_, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        &schemas,
+        resources.iter().map(|resource| &resource.id),
+    );
 
     let renames = super::reconcile_anonymous_identifiers(
         &resources,
         &[],
         &schemas,
+        &comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
                 entry.name()
@@ -5958,7 +6145,8 @@ fn test_reconcile_existing_removed_from_identity_does_not_repoint_to_orphan() {
         },
         &|_| Vec::new(),
         &claims,
-    );
+    )
+    .expect("create-only comparison fixture must resolve");
 
     assert!(renames.is_empty());
     assert_eq!(

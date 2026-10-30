@@ -19,7 +19,6 @@
 //! error surfaces via the regular parser diagnostic path.
 
 use crate::parser::{File, ResourceRef};
-use crate::plan::PlanErrorKind;
 use crate::schema::{SchemaKind, SchemaRegistry};
 use crate::wait::predicate::resolve_wait_predicate;
 
@@ -98,11 +97,10 @@ pub fn validate_wait_bindings<E, D>(
                 provider,
                 resource_type,
             } => Ok((provider, resource_type)),
-            WaitTarget::DataSource => Err(PlanErrorKind::WaitTargetIsDataSource {
-                wait_binding: wb.binding.to_string(),
-                target: wb.target.to_string(),
-            }
-            .to_string()),
+            WaitTarget::DataSource => Err(format!(
+                "wait `{}`: target binding `{}` is a data source; wait targets must be managed resources",
+                wb.binding, wb.target
+            )),
             WaitTarget::LiveComposition => Err(format!(
                 "wait `{}`: target binding `{}` is a composition; waiting on module-call outputs is not supported",
                 wb.binding, wb.target

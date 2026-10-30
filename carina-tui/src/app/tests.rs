@@ -3,6 +3,7 @@ use carina_core::parser::{DeferredForExpression, ForBinding};
 use carina_core::resource::{
     ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, State, Value,
 };
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 use carina_core::value::format_value;
 
 fn resolved(resource: Resource) -> ResolvedResource {
@@ -239,7 +240,7 @@ fn whole_value_list_uses_whole_value_detail_row() {
         changed_attributes: vec!["rules".to_string()],
     });
     let prev_explicit = HashMap::from([(
-        id,
+        id.clone(),
         carina_core::explicit::ExplicitFields::Struct {
             children: HashMap::from([(
                 "rules".to_string(),
@@ -253,9 +254,32 @@ fn whole_value_list_uses_whole_value_detail_row() {
         },
     )]);
 
-    let schemas = SchemaRegistry::new();
+    let rule_type = AttributeType::list(AttributeType::struct_(
+        "ListenerRule",
+        vec![
+            StructField::required("port", AttributeType::int()).build(),
+            StructField::optional("description", AttributeType::string()).build(),
+        ],
+    ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.Listener")
+            .attribute(AttributeSchema::optional("rules", rule_type).build())
+            .validate()
+            .expect("listener schema must be valid"),
+    );
+    let (schemas, provider) =
+        carina_core::provider::comparison_fixture_for_test(&schemas, std::iter::once(&id));
     let historical_display = HistoricalDisplayAttributes::for_plan(&plan);
-    let app = App::new(&plan, &schemas, &historical_display, Some(&prev_explicit));
+    let app = App::new(
+        &plan,
+        &schemas,
+        &historical_display,
+        Some(&prev_explicit),
+        &provider,
+    )
+    .expect("whole-value display must use the production app constructor");
     assert!(matches!(
         app.nodes[0].detail_rows.as_slice(),
         [DetailRow::Changed { key, .. }] if key == "rules"

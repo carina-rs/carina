@@ -96,6 +96,19 @@ fn render_detail_row_to_rows(rows: &mut Vec<Row<'_>>, row: &DetailRow, is_select
                 Row::new(Indent::new(2), vec![Span::raw(text.clone())]).highlighted(is_selected),
             );
         }
+        DetailRow::ReleasedListKey {
+            attribute,
+            key,
+            retained_value,
+        } => {
+            let mut spans = vec![Span::styled("! ", Style::default().fg(Color::Yellow))];
+            spans.push(Span::raw(format!("{attribute}[{key:?}]: left as ")));
+            spans.extend(value_spans(retained_value));
+            spans.push(Span::raw(
+                " (AWS does not revert omitted keys; write the default value to revert)",
+            ));
+            rows.push(Row::new(Indent::new(2), spans).highlighted(is_selected));
+        }
         DetailRow::Attribute {
             key,
             value,

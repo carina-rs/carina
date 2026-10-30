@@ -83,8 +83,7 @@ fn run_module_info(
     );
 
     if tui {
-        carina_tui::run_module_info(&signature)
-            .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
+        carina_tui::run_module_info(&signature)?;
     } else {
         println!("{}", signature.display());
     }

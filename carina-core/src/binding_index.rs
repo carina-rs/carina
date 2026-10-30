@@ -1725,6 +1725,7 @@ impl ResolvedBindings {
                         }
                     }
                     crate::resource::Current::CreateInFlight(_pending) => {}
+                    crate::resource::Current::CreateOutcomeUnknown(_unknown) => {}
                     crate::resource::Current::MissingIdentifier(unidentified) => {
                         for (k, v) in &unidentified.state().attributes {
                             merged.entry(k.clone()).or_insert_with(|| v.clone());
@@ -2306,6 +2307,7 @@ pub fn managed_binding_stability_from_plan<S>(
             | Effect::Import { .. }
             | Effect::Remove { .. }
             | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
             | Effect::DeferredCreate { .. }
             | Effect::DeferredReplace(_) => {}

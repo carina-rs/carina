@@ -385,9 +385,14 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
         )]),
     )
     .expect("state fixture has a valid resolved address");
+    let (_, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        &registry,
+        parsed.iter_all_resources().map(|resource| resource.id()),
+    );
     let moves = crate::identifier::detect_legacy_loop_address_moves(
         &parsed.resources,
         &registry,
+        &comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(
                 provider,
@@ -399,7 +404,8 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
         &|_binding| Vec::new(),
         &claims,
         &[],
-    );
+    )
+    .expect("legacy-loop comparison fixture must resolve");
     assert_eq!(
         moves.len(),
         1,

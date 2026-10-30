@@ -10,8 +10,9 @@ use carina_core::schema::{
 };
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
-    CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, FoundRead, Pending,
-    Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
+    CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, DesiredAttribute,
+    DesiredResource, FoundRead, NormalizedResource, Pending, Poll, PollVerdict, Resume, ResumeStep,
+    ResumeVerdict, Sent, UpdateOutcome,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -522,7 +523,21 @@ impl CarinaProvider for MockProcessProvider {
                 )
                 .validate()
                 .expect("timing probe schema must be valid"),
+            CoreResourceSchema::new("test.normalize_required_together")
+                .attribute(
+                    CoreAttributeSchema::optional("primary", CoreAttributeType::string()).build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::optional("companion", CoreAttributeType::string()).build(),
+                )
+                .with_description("Mock desired-normalization three-way attribute probe")
+                .validate()
+                .expect("normalization probe schema must be valid"),
         ]
+    }
+
+    fn reference_forms(&self) -> carina_core::schema::ReferenceForms {
+        BTreeMap::new()
     }
 
     fn provider_config_attribute_types(&self) -> CoreValidatedConfigSchema {
@@ -541,11 +556,17 @@ impl CarinaProvider for MockProcessProvider {
         Ok(())
     }
 
-    fn initialize(&mut self, attrs: &BTreeMap<String, Value>) -> Result<(), String> {
+    fn initialize(&mut self, attrs: &BTreeMap<String, Value>) -> Result<ReferenceScope, String> {
         if attrs.contains_key("__mock_initialize_error__") {
             return Err("intentional mock initialization failure".to_string());
         }
-        Ok(())
+        match attrs.get("__mock_reference_scope_region__") {
+            Some(Value::String(region)) => {
+                ReferenceScope::available("mock", region.clone(), "test-account")
+                    .map_err(|error| error.to_string())
+            }
+            Some(_) | None => Ok(ReferenceScope::Unavailable),
+        }
     }
 
     fn read(
@@ -606,7 +627,7 @@ impl CarinaProvider for MockProcessProvider {
         id: &ResourceId,
         request: CreateRequest,
         attempt: CreateAttempt,
-    ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict> {
+    ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict<Self::CreateToken>> {
         if id.identity == "__mock_create_trap__" {
             panic!("intentional mock create trap");
         }
@@ -786,7 +807,7 @@ impl CarinaProvider for MockProcessProvider {
         id: &ResourceId,
         request: CreateRequest,
         poll: Poll<Self::CreateToken>,
-    ) -> Result<CreateStep<Self::CreateToken>, PollVerdict> {
+    ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
         let unencodable_poll = matches!(
             request.resource.attributes.get("create_mode"),
             Some(Value::String(mode))
@@ -838,10 +859,11 @@ impl CarinaProvider for MockProcessProvider {
                     },
                     1,
                 )),
-                CreateMode::MalformedPending => {
-                    Err(attempt
-                        .undetermined(Self::create_mode_error(id, CreateMode::MalformedPending)))
-                }
+                CreateMode::MalformedPending => Err(attempt.preserve(
+                    token,
+                    1,
+                    Self::create_mode_error(id, CreateMode::MalformedPending),
+                )),
                 CreateMode::Untracked => {
                     Err(attempt.untracked(Self::create_mode_error(id, CreateMode::Untracked)))
                 }
@@ -927,7 +949,7 @@ impl CarinaProvider for MockProcessProvider {
         id: &ResourceId,
         request: CreateRequest,
         resume: Resume<Self::CreateToken>,
-    ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict> {
+    ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
         let unencodable_repending = matches!(
             request.resource.attributes.get("create_mode"),
             Some(Value::String(mode)) if mode == "unencodable_repending"
@@ -991,9 +1013,16 @@ impl CarinaProvider for MockProcessProvider {
                 CreateMode::Discarded | CreateMode::Untracked => {
                     Err(attempt.untracked(Self::create_mode_error(id, token.mode)))
                 }
-                CreateMode::Undetermined | CreateMode::MalformedPending => {
-                    Err(attempt.undetermined(Self::create_mode_error(id, token.mode)))
-                }
+                CreateMode::Undetermined => Err(attempt.preserve(
+                    token,
+                    1,
+                    Self::create_mode_error(id, CreateMode::Undetermined),
+                )),
+                CreateMode::MalformedPending => Err(attempt.preserve(
+                    token,
+                    1,
+                    Self::create_mode_error(id, CreateMode::MalformedPending),
+                )),
                 CreateMode::Resend => {
                     let attributes = self.create_done(id, request, Some(token.polls_served + 1));
                     let identifier = AppliedIdentifier::new("mock-id")
@@ -1195,14 +1224,36 @@ impl CarinaProvider for MockProcessProvider {
         Ok(Vec::new())
     }
 
-    fn normalize_desired(&self, resources: Vec<Resource>) -> Result<Vec<Resource>, ProviderError> {
+    fn normalize_desired(
+        &self,
+        resources: Vec<DesiredResource>,
+    ) -> Result<Vec<NormalizedResource>, ProviderError> {
         if let Some(resource) = resources
             .iter()
-            .find(|resource| resource.id.identity == "__mock_normalize_desired_error__")
+            .find(|resource| resource.id().identity == "__mock_normalize_desired_error__")
         {
-            return Err(Self::operation_error("normalize_desired", &resource.id));
+            return Err(Self::operation_error("normalize_desired", resource.id()));
         }
-        Ok(resources)
+        if let Some(resource) = resources.iter().find(|resource| {
+            resource.id().resource_type == "test.normalize_required_together"
+                && matches!(resource.attribute("primary"), DesiredAttribute::Known(_))
+                && matches!(resource.attribute("companion"), DesiredAttribute::Absent)
+        }) {
+            return Err(ProviderError {
+                kind: ProviderErrorKind::InvalidInput,
+                message:
+                    "test.normalize_required_together companion is required when primary is present"
+                        .to_string(),
+                resource_id: Some(resource.id().clone()),
+                cause: None,
+                provider_name: Some("mock".to_string()),
+                operation: None,
+                status: None,
+                code: None,
+                request_id: None,
+            });
+        }
+        Ok(resources.into_iter().map(DesiredResource::finish).collect())
     }
 
     fn normalize_state(

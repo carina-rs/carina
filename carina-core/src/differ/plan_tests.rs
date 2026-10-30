@@ -9,12 +9,56 @@ use crate::plan::{
 };
 use crate::resource::{ConcreteValue, ResolvedResourceId, Resource, ResourceIdentity};
 
+fn diff_test(
+    desired: &Resource,
+    current: &State,
+    saved: Option<&HashMap<String, Value>>,
+    prev_explicit: Option<&ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+) -> Diff {
+    super::diff_test(
+        desired,
+        current,
+        saved,
+        prev_explicit,
+        schema,
+        &super::exact_comparison_context_for_tests(),
+    )
+}
+
 fn existing_state(id: ResourceId, attributes: HashMap<String, Value>) -> State {
     let identifier = id
         .identity_str()
         .expect("fixture resource identity must be resolved")
         .to_string();
     State::existing(id, attributes).with_identifier(identifier)
+}
+
+fn string_wait_schemas(provider: &str) -> SchemaRegistry {
+    use crate::schema::{AttributeSchema, AttributeType};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        provider,
+        (ResourceSchema::new("acm.Certificate")
+            .attribute(AttributeSchema::optional("status", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("domain_name", AttributeType::string()).build()))
+        .validate()
+        .expect("wait fixture schema must be valid"),
+    );
+    schemas
+}
+
+fn unknown_create_outcome(id: ResourceId) -> crate::provider::UnknownCreateOutcome {
+    let failure = crate::provider::CreateAttempt::new(id).0.outcome_unknown(
+        crate::provider::EgressSent::for_test(),
+        crate::provider::ProviderError::api_error("guest trapped"),
+    );
+    let crate::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } = failure.into_kind()
+    else {
+        panic!("the egress witness must mint an unknown outcome")
+    };
+    unknown
 }
 
 fn ignore_path(parts: &[&str]) -> crate::resource::ParsedIgnorePath {
@@ -242,7 +286,7 @@ fn desired_in_flight_plans_resume_never_create() {
 
     let desired = Resource::new("test.resource", "managed");
     let id = desired.id.clone();
-    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).pending(
+    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).0.pending(
         PendingToken::new("secret-provider-token"),
         Sent::AllRequestAttributes,
         1,
@@ -286,7 +330,7 @@ fn saved_resume_contains_no_token() {
 
     let desired = Resource::new("test.resource", "managed");
     let id = desired.id.clone();
-    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).pending(
+    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).0.pending(
         PendingToken::new("must-not-enter-plan"),
         Sent::AllRequestAttributes,
         1,
@@ -318,7 +362,7 @@ fn in_flight_orphan_is_create_in_flight_orphan_error() {
     use crate::provider::{CreateAttempt, InFlightCreate, PendingToken, Sent};
 
     let id = ResourceId::with_identity("test.resource", "orphan");
-    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).pending(
+    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).0.pending(
         PendingToken::new("opaque"),
         Sent::AllRequestAttributes,
         1,
@@ -348,6 +392,120 @@ fn in_flight_orphan_is_create_in_flight_orphan_error() {
 }
 
 #[test]
+fn outcome_unknown_blocks_both_desired_create_and_orphan_cleanup() {
+    let desired = Resource::with_provider("mock", "test.Resource", "managed", None);
+    let desired_id = desired.id.clone();
+    let current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(
+            desired_id.clone(),
+            Current::create_outcome_unknown(unknown_create_outcome(desired_id.clone())),
+        )]),
+        &SchemaRegistry::new(),
+        std::slice::from_ref(&desired),
+    );
+    let desired_plan = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+    assert!(desired_plan.effects().is_empty());
+    assert_eq!(
+        desired_plan.errors()[0].kind,
+        PlanErrorKind::CreateOutcomeUnknown {
+            resource: desired_id.clone(),
+        }
+    );
+
+    let orphan_id = ResourceId::with_provider_identity("mock", "test.Resource", "orphan", None);
+    let orphans = Orphans::from([Orphan::create_outcome_unknown(
+        unknown_create_outcome(orphan_id.clone()),
+        Some("orphan".to_string()),
+        Directives::default(),
+    )]);
+    let orphan_plan = create_plan(
+        &[],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &HashMap::new(),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &orphans,
+        &[],
+    );
+    assert!(orphan_plan.effects().is_empty());
+    assert_eq!(
+        orphan_plan.errors()[0].kind,
+        PlanErrorKind::CreateOutcomeUnknown {
+            resource: orphan_id,
+        }
+    );
+}
+
+#[test]
+fn import_replacement_suppresses_only_the_matching_provider_instance() {
+    let imported = Resource::with_provider(
+        "mock",
+        "test.Resource",
+        "shared",
+        Some("imported".to_string()),
+    );
+    let other =
+        Resource::with_provider("mock", "test.Resource", "shared", Some("other".to_string()));
+    let imported_id = imported.id.clone();
+    let other_id = other.id.clone();
+    let current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(
+            imported_id.clone(),
+            Current::create_outcome_unknown(unknown_create_outcome(imported_id.clone())),
+        )]),
+        &SchemaRegistry::new(),
+        std::slice::from_ref(&imported),
+    );
+    let orphans = Orphans::from([Orphan::create_outcome_unknown(
+        unknown_create_outcome(other_id.clone()),
+        Some("shared".to_string()),
+        Directives::default(),
+    )]);
+    let managed = ResolvedResource::collect_resolved([imported]).unwrap();
+    let (_import_effect, replacement) = Effect::import_replacing_outcome_unknown(
+        ResolvedResourceId::new(imported_id.clone()),
+        Value::Concrete(ConcreteValue::String("provider-id".into())),
+    );
+
+    let plan = create_plan_with_cascades(
+        &managed,
+        &managed,
+        &[],
+        &ProviderRouter::new(),
+        PlanPriorStates::new(&current, &orphans),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &[],
+        &HashSet::from([replacement]),
+    )
+    .unwrap();
+
+    assert!(plan.effects().is_empty());
+    assert_eq!(plan.errors().len(), 1);
+    assert_eq!(plan.errors()[0].resource_id, other_id);
+    assert!(matches!(
+        plan.errors()[0].kind,
+        PlanErrorKind::CreateOutcomeUnknown { .. }
+    ));
+}
+
+#[test]
 fn changed_provider_instance_rejects_resume() {
     use crate::effect::Effect;
     use crate::provider::{CreateAttempt, InFlightCreate, PendingToken, Sent};
@@ -365,7 +523,7 @@ fn changed_provider_instance_rejects_resume() {
         "managed",
         Some("issuing-route".to_string()),
     );
-    let pending = InFlightCreate::from_pending(CreateAttempt::new(persisted_id.clone()).pending(
+    let pending = InFlightCreate::from_pending(CreateAttempt::new(persisted_id.clone()).0.pending(
         PendingToken::new("opaque"),
         Sent::AllRequestAttributes,
         1,
@@ -434,6 +592,93 @@ fn explicit_top_level(keys: &[&str]) -> ExplicitFields {
             .map(|k| ((*k).to_string(), ExplicitFields::Leaf))
             .collect(),
     }
+}
+
+#[test]
+fn provider_scoped_reference_form_suppresses_create_only_replacement_in_plan() {
+    use crate::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
+    use crate::schema::{
+        AttributeSchema, ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity,
+        ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+    };
+
+    let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
+    let schema = ResourceSchema::new("lambda.Permission")
+        .attribute(
+            AttributeSchema::optional(
+                "function_name",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .create_only()
+            .build(),
+        )
+        .validate()
+        .expect("fixture schema must validate");
+    let forms = ReferenceForms::from([(
+        identity,
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:lambda:{region}:{account}:function:{name}",
+            )
+            .expect("fixture reference template must validate"),
+        },
+    )]);
+    let witness =
+        ValidatedProviderSchemaWitness::new(vec![schema], ValidatedConfigSchema::default(), forms)
+            .expect("fixture provider schema must validate");
+    let mut registry = SchemaRegistry::new();
+    registry
+        .insert_provider_witness("aws", &witness)
+        .expect("fixture owner has one validated witness");
+
+    let desired = Resource::with_provider("aws", "lambda.Permission", "invoke", None)
+        .with_attribute(
+            "function_name",
+            Value::Concrete(ConcreteValue::String("processor".into())),
+        );
+    let current = Current::from_state(
+        State::existing(
+            desired.id.clone(),
+            HashMap::from([(
+                "function_name".to_string(),
+                Value::Concrete(ConcreteValue::String(
+                    "arn:aws:lambda:us-east-1:123456789012:function:processor".into(),
+                )),
+            )]),
+        )
+        .with_identifier("permission-id"),
+    );
+    let current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(desired.id.clone(), current)]),
+        &registry,
+        std::slice::from_ref(&desired),
+    );
+    let managed = ResolvedResource::collect_resolved(vec![desired]).expect("resolved fixture");
+    let mut provider = ProviderRouter::new();
+    provider.add_provider(
+        "aws".to_string(),
+        InitializedProvider::for_test(
+            Box::new(HintProvider { hints: Vec::new() }),
+            ReferenceScope::available("aws", "us-east-1", "123456789012")
+                .expect("fixture scope is valid"),
+        ),
+    );
+    let saved = crate::provider::RawSavedAttrs::default().lift(&registry);
+
+    let plan = plan::create_plan(
+        &managed,
+        &[],
+        &provider,
+        PlanPriorStates::new(&current, &Orphans::new()),
+        &HashMap::new(),
+        &registry,
+        &saved,
+        &HashMap::new(),
+        &[],
+    )
+    .expect("plan comparison succeeds");
+
+    assert!(plan.effects().is_empty(), "unexpected plan: {plan:?}");
 }
 
 struct HintProvider {
@@ -939,7 +1184,9 @@ fn create_before_destroy_without_unique_name_attribute_emits_plan_error() {
         })
     );
     assert_eq!(
-        plan.errors()[0].to_string(),
+        plan.errors()[0]
+            .display_with_project_dir(std::path::Path::new("."))
+            .to_string(),
         "ec2.Vpc.my-vpc: resource type 'ec2.Vpc' does not support create_before_destroy: the replacement cannot coexist with the original"
     );
 }
@@ -1522,6 +1769,7 @@ fn list_elements_authored_field_removal_produces_update_for_paired_element() {
         &children["rules"],
         None,
         crate::schema::empty_defs_for_schema_walks(),
+        &super::exact_comparison_context_for_tests(),
     );
     let Value::Concrete(ConcreteValue::List(effective_rules)) = effective_desired else {
         panic!("expected effective desired rules list");
@@ -1711,6 +1959,7 @@ fn unchanged_dsl_after_writeback_pairs_raw_saved_list_without_phantom_removal() 
         &saved_attributes,
         &sent_desired,
         None,
+        &super::exact_comparison_context_for_tests(),
     );
     let ExplicitFields::Struct { children } = &prior else {
         panic!("expected resource-root Struct");
@@ -2023,6 +2272,9 @@ fn orphan_collection_rekeys_index_and_provider_state_together() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("test fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     assert_eq!(moved.id, new_id);
@@ -2127,6 +2379,9 @@ async fn prior_state_transform_rebuilds_managed_current_after_provider_transform
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("test fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     assert_eq!(
@@ -2269,6 +2524,16 @@ fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
         ))
         .validate()
         .expect("schema fixture must be valid"),
+    );
+    schemas.insert(
+        "",
+        (ResourceSchema::new("example.Consumer").attribute(
+            AttributeSchema::optional("producer_id", AttributeType::string())
+                .removable()
+                .build(),
+        ))
+        .validate()
+        .expect("consumer schema fixture must be valid"),
     );
 
     let plan = create_plan(
@@ -2501,6 +2766,8 @@ fn diff_no_change_without_prev_desired_keys() {
 
 #[test]
 fn create_plan_detects_attribute_removal() {
+    use crate::schema::{AttributeSchema, AttributeType};
+
     // Resource in .crn has no "tags", but current state (from AWS) has tags.
     // prev_desired_keys indicates user previously had "region" and "tags".
     let resources = vec![Resource::new("s3.Bucket", "test").with_attribute(
@@ -2532,17 +2799,31 @@ fn create_plan_detects_attribute_removal() {
         explicit_top_level(&["region", "tags"]),
     );
 
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        (ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::optional("region", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .removable()
+                    .build(),
+            ))
+        .validate()
+        .expect("schema fixture must be valid"),
+    );
+
     let plan = create_plan(
         &resources,
         &[],
         &crate::provider::ProviderRouter::new(),
         &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
-            &crate::schema::SchemaRegistry::new(),
-            &[],
+            &schemas,
+            &resources,
         ),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &prev_explicit,
         &Orphans::new(),
@@ -3295,7 +3576,9 @@ fn unresolved_wait_enum_identifier_is_a_plan_error() {
     assert!(plan.effects().iter().all(|effect| !effect.is_wait()));
     assert_eq!(plan.errors().len(), 1);
     assert_eq!(
-        plan.errors()[0].to_string(),
+        plan.errors()[0]
+            .display_with_project_dir(std::path::Path::new("."))
+            .to_string(),
         "job.Job.job: wait `job_ready`: cannot resolve `ready` as an enum value of `job.state`; quote it to compare as a string"
     );
 }
@@ -3609,7 +3892,16 @@ let renewed = wait cert {
     );
 
     assert_eq!(plan.errors().len(), 1);
-    assert_eq!(plan.errors()[0].kind.to_string(), validation[0].message);
+    assert_eq!(
+        plan.errors()[0]
+            .display_with_project_dir(std::path::Path::new("."))
+            .to_string(),
+        format!(
+            "{}: {}",
+            plan.errors()[0].resource_id,
+            validation[0].message
+        )
+    );
     assert!(
         validation[0]
             .message
@@ -3761,6 +4053,7 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
     let provider = HintProvider {
         hints: vec![BindingPattern::Exact("validation_records".to_string())],
     };
+    let schemas = string_wait_schemas("aws");
 
     let plan = create_plan(
         &parsed.resources,
@@ -3768,7 +4061,7 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
         &provider,
         &HashMap::new(),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &Orphans::new(),
@@ -3820,6 +4113,7 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
     let provider = HintProvider {
         hints: vec![BindingPattern::Exact("something".to_string())],
     };
+    let schemas = string_wait_schemas("");
 
     let plan = create_plan(
         &resources,
@@ -3827,7 +4121,7 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
         &provider,
         &HashMap::new(),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &Orphans::new(),
@@ -3957,7 +4251,7 @@ fn wait_with_unknown_target_emits_plan_error() {
             &plan.errors()[0].kind,
             PlanErrorKind::WaitTargetMissing { target, .. } if target == "nonexistent"
         ),
-        "error message should mention the missing target, got: {}",
+        "error should retain the missing target, got: {:?}",
         plan.errors()[0]
     );
 }
@@ -4059,6 +4353,7 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
         depends_on: vec![],
         line: 1,
     };
+    let schemas = string_wait_schemas("");
 
     let plan = create_plan(
         &resources,
@@ -4066,7 +4361,7 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
         &HintProvider { hints: Vec::new() },
         &HashMap::new(),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &Orphans::new(),
@@ -4217,6 +4512,7 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
         depends_on: vec![],
         line: 1,
     };
+    let schemas = string_wait_schemas("");
 
     let plan = create_plan(
         &resources,
@@ -4224,7 +4520,7 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
         &HintProvider { hints: Vec::new() },
         &HashMap::new(),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &Orphans::new(),
@@ -4297,6 +4593,7 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
         depends_on: vec![],
         line: 1,
     };
+    let schemas = string_wait_schemas("");
 
     let plan = create_plan(
         &resources,
@@ -4304,11 +4601,11 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
         &HintProvider { hints: Vec::new() },
         &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
-            &crate::schema::SchemaRegistry::new(),
-            &[],
+            &schemas,
+            &resources,
         ),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &Orphans::new(),

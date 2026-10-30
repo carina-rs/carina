@@ -443,17 +443,27 @@ impl ProviderFactory for EnumShadowFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
                     Output = carina_core::provider::ProviderResult<
-                        Box<dyn carina_core::provider::Provider>,
+                        carina_core::provider::ProviderInitialization,
                     >,
                 > + Send
                 + '_,
         >,
     > {
         unimplemented!("completion tests do not instantiate providers")
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {

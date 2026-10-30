@@ -86,6 +86,172 @@ fn schema_registry_lookup_binds_owner_to_the_validated_schema() {
 }
 
 #[test]
+fn schema_registry_lookup_retains_the_owners_complete_reference_form_table() {
+    let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
+    let schema = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional(
+                "name",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let forms = ReferenceForms::from([(
+        identity.clone(),
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:service:{region}:{account}:widget/{name}",
+            )
+            .unwrap(),
+        },
+    )]);
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![schema],
+        ValidatedConfigSchema::default(),
+        forms.clone(),
+    )
+    .unwrap();
+    let mut registry = SchemaRegistry::new();
+    registry
+        .insert_provider_witness("actual-owner", &witness)
+        .expect("first witness table must be admitted");
+
+    let bound = registry
+        .get("actual-owner", "test.Widget", SchemaKind::Resource)
+        .expect("registered schema");
+    assert_eq!(bound.reference_forms(), &forms);
+    assert_eq!(bound.reference_forms().get(&identity), forms.get(&identity));
+}
+
+#[test]
+fn schema_registry_additional_schema_cannot_clear_witness_forms_when_registered_last() {
+    let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
+    let owned_schema = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional(
+                "name",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("owned schema must validate");
+    let forms = ReferenceForms::from([(
+        identity,
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:service:{region}:{account}:widget/{name}",
+            )
+            .expect("reference template must validate"),
+        },
+    )]);
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![owned_schema],
+        ValidatedConfigSchema::default(),
+        forms.clone(),
+    )
+    .expect("provider witness must validate");
+    let additional_schema = ResourceSchema::new("test.Additional")
+        .validate()
+        .expect("additional schema must validate");
+
+    let mut registry = SchemaRegistry::new();
+    registry
+        .insert_provider_witness("actual-owner", &witness)
+        .expect("witness table must be admitted");
+    let mut additional = SchemaRegistry::new();
+    additional.insert("actual-owner", additional_schema);
+    registry
+        .extend(additional)
+        .expect("plain resource insertion carries no competing forms");
+
+    let bound = registry
+        .get("actual-owner", "test.Widget", SchemaKind::Resource)
+        .expect("witness-backed schema must remain registered");
+    assert_eq!(bound.reference_forms(), &forms);
+}
+
+fn reference_form_witness(template: &str) -> (ValidatedProviderSchemaWitness, ReferenceForms) {
+    let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
+    let schema = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional(
+                "name",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("fixture schema must validate");
+    let forms = ReferenceForms::from([(
+        identity,
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(template).expect("fixture template must validate"),
+        },
+    )]);
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![schema],
+        ValidatedConfigSchema::default(),
+        forms.clone(),
+    )
+    .expect("fixture witness must validate");
+    (witness, forms)
+}
+
+#[test]
+fn schema_registry_extend_accepts_identical_witness_forms() {
+    let (witness, forms) =
+        reference_form_witness("arn:{partition}:service:{region}:{account}:widget/{name}");
+    let mut first = SchemaRegistry::new();
+    first
+        .insert_provider_witness("actual-owner", &witness)
+        .expect("first witness table must be admitted");
+    let mut second = SchemaRegistry::new();
+    second
+        .insert_provider_witness("actual-owner", &witness)
+        .expect("second witness table must be admitted");
+
+    first
+        .extend(second)
+        .expect("identical witness tables must merge");
+
+    let bound = first
+        .get("actual-owner", "test.Widget", SchemaKind::Resource)
+        .expect("merged schema must remain registered");
+    assert_eq!(bound.reference_forms(), &forms);
+}
+
+#[test]
+fn schema_registry_extend_rejects_conflicting_witness_forms() {
+    let (first_witness, first_forms) =
+        reference_form_witness("arn:{partition}:service:{region}:{account}:widget/{name}");
+    let (second_witness, second_forms) =
+        reference_form_witness("arn:{partition}:other:{region}:{account}:widget/{name}");
+    let mut first = SchemaRegistry::new();
+    first
+        .insert_provider_witness("actual-owner", &first_witness)
+        .expect("first witness table must be admitted");
+    let mut second = SchemaRegistry::new();
+    second
+        .insert_provider_witness("actual-owner", &second_witness)
+        .expect("second witness table must be admitted");
+
+    let error = first
+        .extend(second)
+        .expect_err("conflicting witness tables must not use last-writer-wins");
+    let SchemaRegistryError::ConflictingReferenceForms {
+        owner,
+        existing,
+        incoming,
+    } = error;
+    assert_eq!(owner, "actual-owner");
+    assert_eq!(existing, first_forms);
+    assert_eq!(incoming, second_forms);
+}
+
+#[test]
 fn rootless_lookup_collects_every_failure_without_a_fake_attribute() {
     let identity = TypeIdentity::new(Some("test"), Vec::<String>::new(), "Identifier");
     let root = RootlessType::new(AttributeType::list(AttributeType::refined_string(
@@ -968,7 +1134,7 @@ fn schema_admission_checks_identified_types_inside_referenced_definitions() {
 }
 
 #[test]
-fn schema_admission_rejects_closed_enum_transform_not_representable_in_v12() {
+fn schema_admission_rejects_closed_enum_transform_not_representable_in_v13() {
     let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
     let error = admission_error(
         ResourceSchema::new("test.Widget").attribute(
@@ -987,12 +1153,12 @@ fn schema_admission_rejects_closed_enum_transform_not_representable_in_v12() {
     );
 
     assert!(error.contains("test.widget.Mode"), "{error}");
-    assert!(error.contains("protocol v12"), "{error}");
+    assert!(error.contains("protocol v13"), "{error}");
     assert!(error.contains("transform"), "{error}");
 }
 
 #[test]
-fn config_schema_admission_enforces_scalar_and_v12_enum_invariants() {
+fn config_schema_admission_enforces_scalar_and_v13_enum_invariants() {
     let errors = ValidatedConfigSchema::validate(BTreeMap::from([
         (
             "non_scalar".to_string(),
@@ -1020,7 +1186,7 @@ fn config_schema_admission_enforces_scalar_and_v12_enum_invariants() {
 
     let rendered = errors.to_string();
     assert!(rendered.contains("scalar base"), "{rendered}");
-    assert!(rendered.contains("protocol v12"), "{rendered}");
+    assert!(rendered.contains("protocol v13"), "{rendered}");
 }
 
 #[test]
@@ -12570,4 +12736,137 @@ fn resource_schema_semantic_fingerprint_covers_planning_and_apply_fields() {
             "changing semantic field {field} must change the fingerprint",
         );
     }
+}
+
+#[test]
+fn resource_schema_semantic_fingerprint_covers_keyed_partial_update() {
+    let element = || {
+        AttributeType::list(AttributeType::struct_(
+            "Setting",
+            vec![
+                StructField::required("key", AttributeType::string()).build(),
+                StructField::required("value", AttributeType::string()).build(),
+            ],
+        ))
+    };
+    let ordinary = ResourceSchema::new("test.Settings")
+        .attribute(AttributeSchema::optional("settings", element()).build());
+    let keyed = ResourceSchema::new("test.Settings").attribute(
+        AttributeSchema::optional("settings", element())
+            .keyed_partial_update("key")
+            .build(),
+    );
+
+    assert_ne!(
+        ordinary.semantic_fingerprint(),
+        keyed.semantic_fingerprint(),
+        "keyed partial-update semantics affect saved-plan compatibility"
+    );
+}
+
+fn keyed_partial_update_schema(
+    attr_type: AttributeType,
+    key_field: &str,
+) -> Result<ValidatedResourceSchema, ResourceSchemaValidationError> {
+    ResourceSchema::new("test.KeyedPartialUpdate")
+        .attribute(
+            AttributeSchema::optional("settings", attr_type)
+                .keyed_partial_update(key_field)
+                .build(),
+        )
+        .validate()
+}
+
+#[test]
+fn keyed_partial_update_validation_accepts_a_string_key_field() {
+    let schema = keyed_partial_update_schema(
+        AttributeType::list(AttributeType::struct_(
+            "Setting",
+            vec![
+                StructField::required("key", AttributeType::string()).build(),
+                StructField::required("value", AttributeType::string()).build(),
+            ],
+        )),
+        "key",
+    )
+    .expect("a list-of-structs string key is valid");
+
+    let keyed = schema
+        .effective_attribute("settings")
+        .expect("settings attribute")
+        .keyed_partial_update()
+        .expect("validated keyed partial-update property");
+    assert_eq!(keyed.key_field().as_str(), "key");
+}
+
+#[test]
+fn keyed_partial_update_validation_rejects_an_unknown_key_field() {
+    let error = keyed_partial_update_schema(
+        AttributeType::list(AttributeType::struct_(
+            "Setting",
+            vec![StructField::required("value", AttributeType::string()).build()],
+        )),
+        "key",
+    )
+    .expect_err("the declared key must name a real element field");
+
+    let issues = error.located_issues().collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        vec![(
+            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            "keyed partial-update key `key` is not a field of list element struct `Setting`"
+        )]
+    );
+}
+
+#[test]
+fn keyed_partial_update_validation_rejects_a_non_struct_list_shape() {
+    let error = keyed_partial_update_schema(AttributeType::list(AttributeType::string()), "key")
+        .expect_err("the attribute must be a list of structs");
+
+    let issues = error.located_issues().collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        vec![(
+            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            "keyed partial-update attribute must be a list of structs"
+        )]
+    );
+}
+
+#[test]
+fn keyed_partial_update_validation_rejects_a_non_list_shape() {
+    let error = keyed_partial_update_schema(AttributeType::string(), "key")
+        .expect_err("the attribute must be a list of structs");
+
+    let issues = error.located_issues().collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        vec![(
+            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            "keyed partial-update attribute must be a list of structs"
+        )]
+    );
+}
+
+#[test]
+fn keyed_partial_update_validation_rejects_a_non_string_key_field() {
+    let error = keyed_partial_update_schema(
+        AttributeType::list(AttributeType::struct_(
+            "Setting",
+            vec![StructField::required("key", AttributeType::int()).build()],
+        )),
+        "key",
+    )
+    .expect_err("the key field must be a scalar string");
+
+    let issues = error.located_issues().collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        vec![(
+            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            "keyed partial-update key field `key` must be a scalar string"
+        )]
+    );
 }
