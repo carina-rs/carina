@@ -812,7 +812,7 @@ fn checked_exports(
     carina_core::validation::check_export_values_pre_apply(
         params,
         &carina_core::binding_index::ResolvedBindings::default(),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
     )
     .expect("test exports must pass the secret boundary")
 }
@@ -7882,7 +7882,7 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()
@@ -7991,7 +7991,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()
@@ -8119,7 +8119,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()
@@ -8316,7 +8316,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()
@@ -8433,7 +8433,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
         wait_aliases: &[],
-        provider_context: &carina_core::parser::ProviderContext::default(),
+        provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
     })
     .unwrap()
     .into_parts()

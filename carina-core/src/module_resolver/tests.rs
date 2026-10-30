@@ -14,8 +14,8 @@ use indexmap::IndexMap;
 use super::resolver::ModuleResolver;
 use super::*;
 use crate::parser::{
-    ArgumentOrigin, ArgumentParameter, AttributePathSegment, BindingUseOwner, ModuleArgument,
-    ModuleCall, ParsedFile, ProviderContext, TypeExpr,
+    ArgumentOrigin, ArgumentParameter, AttributePathSegment, BindingUseOwner,
+    LoadedProviderContext, ModuleArgument, ModuleCall, ParsedFile, ProviderContext, TypeExpr,
 };
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, RawEnumIdentifier, Resource,
@@ -24,7 +24,7 @@ use crate::resource::{
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
 
 fn resolve_modules(parsed: &mut ParsedFile, base_dir: &std::path::Path) -> Result<(), ModuleError> {
-    super::resolve_modules(parsed, base_dir)
+    super::resolve_modules_providerless(parsed, base_dir)
 }
 
 fn resolve_modules_with_config(
@@ -33,7 +33,7 @@ fn resolve_modules_with_config(
     config: &ProviderContext,
     schemas: &crate::schema::SchemaRegistry,
 ) -> Result<(), ModuleError> {
-    super::resolve_modules_with_config(parsed, base_dir, config, schemas)
+    super::resolve_modules_with_providerless_config(parsed, base_dir, config, schemas)
 }
 
 fn reconcile_anonymous_module_instances(
@@ -392,7 +392,7 @@ fn resolver_error_from_parsed_call_retains_call_identity() {
         "fixture must pin the authored call range",
     );
 
-    let error = super::resolve_modules_with_config(
+    let error = super::resolve_modules_with_providerless_config(
         &mut parsed,
         base.path(),
         &ProviderContext::default(),
@@ -4332,11 +4332,11 @@ fn test_argument_type_mismatch_string_for_bool() {
 
 #[test]
 fn test_argument_type_custom_validator() {
-    // Create a ProviderContext with a custom "arn" validator
+    // Create a loaded ProviderContext with a custom "arn" validator
     let identity = TypeIdentity::bare("Arn");
     let owned = crate::parser::OwnedTypeIdentity::provider("test", identity.clone());
     let validator_identity = identity.clone();
-    let config = ProviderContext {
+    let config = LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([owned.clone()]),
             Box::new(move |target, value| {
@@ -4361,7 +4361,7 @@ fn test_argument_type_custom_validator() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
@@ -4372,8 +4372,9 @@ fn test_argument_type_custom_validator() {
         validations: Vec::new(),
     }];
 
+    let schemas = crate::schema::SchemaRegistry::new();
     let resolver = {
-        let mut r = ModuleResolver::with_config(".", &config);
+        let mut r = ModuleResolver::with_config_and_schemas(".", &config, &schemas);
         r.imported_modules.insert("test_module".to_string(), module);
         r
     };
@@ -4418,7 +4419,7 @@ fn test_argument_type_list_of_custom_type() {
     let identity = TypeIdentity::bare("Arn");
     let owned = crate::parser::OwnedTypeIdentity::provider("test", identity.clone());
     let validator_identity = identity.clone();
-    let config = ProviderContext {
+    let config = LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([owned.clone()]),
             Box::new(move |target, value| {
@@ -4443,7 +4444,7 @@ fn test_argument_type_list_of_custom_type() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
@@ -4454,8 +4455,9 @@ fn test_argument_type_list_of_custom_type() {
         validations: Vec::new(),
     }];
 
+    let schemas = crate::schema::SchemaRegistry::new();
     let resolver = {
-        let mut r = ModuleResolver::with_config(".", &config);
+        let mut r = ModuleResolver::with_config_and_schemas(".", &config, &schemas);
         r.imported_modules.insert("test_module".to_string(), module);
         r
     };

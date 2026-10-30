@@ -5889,6 +5889,26 @@ pub fn provider_custom_types_from_factories(
     crate::parser::ProviderCustomTypes::from_source(resolver)
 }
 
+/// Build the loaded provider context shared by validation, planning, apply,
+/// state writeback, fixtures, and the LSP.
+///
+/// This is the single production constructor for
+/// [`crate::parser::LoadedProviderContext`]. The custom-type resolver and
+/// resource-kind registry therefore come from the same factory/schema
+/// snapshot retained by the caller.
+pub fn loaded_provider_context_from_factories(
+    schemas: &crate::schema::SchemaRegistry,
+    factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>>,
+) -> crate::parser::LoadedProviderContext {
+    crate::parser::LoadedProviderContext::new(crate::parser::ProviderContext {
+        decryptor: None,
+        custom_types: provider_custom_types_from_factories(factories),
+        resource_types: crate::parser::ProviderContext::resource_types_from_schema_registry(
+            schemas,
+        ),
+    })
+}
+
 fn validate_custom_type_annotation(
     factories: &[Box<dyn ProviderFactory>],
     index: &BTreeMap<String, OwnerCustomTypeIndex>,

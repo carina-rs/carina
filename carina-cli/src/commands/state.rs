@@ -1564,7 +1564,7 @@ pub(crate) async fn run_state_refresh_locked(
         let checked_exports = carina_core::validation::check_export_values_pre_apply(
             &parsed.export_params,
             &carina_core::binding_index::ResolvedBindings::for_validation(parsed),
-            provider_context,
+            ctx.provider_context(),
         )
         .map_err(AppError::Validation)?;
         let values = crate::commands::shared::state_writeback::resolve_export_values_post_apply(
@@ -1575,7 +1575,7 @@ pub(crate) async fn run_state_refresh_locked(
                 post_apply_states: &post_apply_states,
                 schemas: ctx.schemas(),
                 wait_aliases: &wait_aliases,
-                provider_context,
+                provider_context: ctx.provider_context(),
             },
         )?;
         let resolution = crate::commands::shared::state_writeback::materialize_exports(&values)?;

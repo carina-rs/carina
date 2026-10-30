@@ -293,15 +293,10 @@ fn module_call_parity_schemas() -> SchemaRegistry {
 }
 
 fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &SchemaRegistry) {
-    let context = carina_core::parser::ProviderContext {
-        decryptor: None,
-        custom_types: carina_core::provider::provider_custom_types_from_factories(Arc::new(
-            factories_for(schemas),
-        )),
-        resource_types: carina_core::parser::ProviderContext::resource_types_from_schema_registry(
-            schemas,
-        ),
-    };
+    let context = carina_core::provider::loaded_provider_context_from_factories(
+        schemas,
+        Arc::new(factories_for(schemas)),
+    );
     let directory = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
         base_dir,
         &context,
@@ -3422,7 +3417,7 @@ awscc.cloudfront.Distribution {
         &schemas,
     )
     .expect("load caller configuration");
-    carina_core::module_resolver::resolve_modules_with_config(
+    carina_core::module_resolver::resolve_modules_with_providerless_config(
         &mut loaded.parsed,
         fixture.path(),
         &config,
