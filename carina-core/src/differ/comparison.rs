@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use indexmap::IndexMap;
 
-use crate::explicit::{self, ExplicitFields};
+use crate::explicit::{ExplicitFields, ExplicitProjection};
 use crate::provider::NestedWriteOnlyRecord;
 use crate::resource::{
     ConcreteValue, DeferredValue, InterpolationPart, SavedValueViews, UnknownReason, Value,
@@ -828,14 +828,13 @@ pub(crate) fn secret_grafted_comparison_view<'a>(
 /// If `saved` is provided, each desired value is merged with the saved value
 /// before comparison, filling in unmanaged nested fields.
 /// If `prev_explicit` is provided, the actual-state side is **projected**
-/// through its tree before comparison so server-side default fields the
-/// user never wrote do not surface as diffs (refs awscc#206). The
-/// projection is applied per-attribute: each `current[key]` is folded
-/// against the matching `prev_explicit` child shape via
-/// `crate::explicit::project`. Top-level keys absent from
-/// `prev_explicit.children` are treated as the user never having
-/// authored them and excluded from the comparison entirely (so their
-/// presence in `current` does not surface a removal).
+/// through its authoring context before comparison so server-side defaults
+/// the user never wrote do not surface as diffs (refs awscc#206). `saved`
+/// values anchor per-element list authoring when available; otherwise lists
+/// use the legacy union projection. Top-level keys absent from
+/// `prev_explicit.children` are treated as unauthored and excluded. Stored
+/// list values also anchor the per-element records used to remove uniquely
+/// paired server-added list elements (refs carina-provider-awscc#511).
 /// `prev_explicit` also drives the explicit-removal detection at the
 /// end of this function: the same set of top-level keys is used to
 /// flag attributes the user *previously* wrote but no longer mentions.
@@ -860,20 +859,32 @@ pub(super) fn find_changed_attributes(
     // Project `current` through `prev_explicit` so server-side defaults
     // the user never authored disappear before any comparison runs.
     // The projection is idempotent and shape-preserving for keys the
-    // user did author. When `prev_explicit` is absent (e.g. first-plan,
-    // no saved state) we fall back to the unprojected map — there is
-    // no authoring information to consult yet.
+    // user did author. Saved values anchor per-element list records when they
+    // are available. Without an anchor, projection retains every list item
+    // and applies the legacy union restriction to each one.
     //
     // `saved` undergoes the same projection so the saved-merge fallback
     // doesn't smuggle server-only fields back into `effective_desired`
     // (refs awscc#206).
-    let projected_current = match prev_explicit {
-        Some(e) => explicit::project_attributes(current.clone(), e),
-        None => current.clone(),
-    };
     let raw_saved = saved;
-    let projected_saved = match (raw_saved, prev_explicit) {
-        (Some(s), Some(e)) => Some(explicit::project_attributes(s.clone(), e)),
+    let empty_stored = HashMap::new();
+    let projection = prev_explicit.map(|explicit| {
+        ExplicitProjection::new(raw_saved.unwrap_or(&empty_stored), explicit, schema)
+    });
+    let projected_current = projection.as_ref().map_or_else(
+        || current.clone(),
+        |projection| {
+            projection
+                .project_attributes(current.clone())
+                .into_attributes()
+        },
+    );
+    let projected_saved = match (projection.as_ref(), raw_saved) {
+        (Some(projection), Some(stored)) => Some(
+            projection
+                .project_attributes(stored.clone())
+                .into_attributes(),
+        ),
         _ => None,
     };
     let projected_saved = projected_saved.as_ref().or(raw_saved);

@@ -210,7 +210,7 @@ fn warning_after_bars_yields_single_blank_line_on_pty() {
         "backend local { path = \"carina.state.json\" }\n\
          provider mock {}\n\
          mock.test.resource { name = \"r1\" }\n\
-         for x in [\"a\", \"b\"] {\n\
+         let resources = for x in [\"a\", \"b\"] {\n\
          \u{20}\u{20}mock.test.resource { name = \"static\" }\n\
          }\n",
     );
@@ -233,5 +233,35 @@ fn warning_after_bars_yields_single_blank_line_on_pty() {
          Execution Plan header — two would mean the cumulative bar flag \
          double-counted a region the warning already closed (#3150 \
          Round-4).\n{out}"
+    );
+}
+
+#[test]
+fn warning_from_unbound_loop_after_bars_yields_single_blank_line_on_pty() {
+    let tmp = init_project(
+        "backend local { path = \"carina.state.json\" }\n\
+         provider mock {}\n\
+         mock.test.resource { name = \"r1\" }\n\
+         for (index, value) in [\"a\", \"b\"] {\n\
+         \u{20}\u{20}mock.test.resource { name = value }\n\
+         }\n",
+    );
+
+    let out = run_on_pty(&["plan", tmp.path().to_str().unwrap()], tmp.path());
+
+    assert!(
+        without_rendered_line_breaks(&out).contains("for-loop binding 'index' is unused"),
+        "expected the unused-for-binding warning from the unbound loop.\n{out}"
+    );
+    assert!(
+        out.contains("Execution Plan:"),
+        "expected Execution Plan section.\n{out}"
+    );
+    assert!(out.contains('✓'), "expected ✓ refresh lines.\n{out}");
+    assert_eq!(
+        blank_lines_above(&out, "Execution Plan:"),
+        1,
+        "expected exactly one blank line between the warning and the \
+         Execution Plan header for an unbound loop.\n{out}"
     );
 }

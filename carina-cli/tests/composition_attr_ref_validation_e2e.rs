@@ -231,6 +231,12 @@ fn factories() -> Vec<carina_cli::wiring::LoadedProviderFactory> {
     ])
 }
 
+fn canonical_message(diagnostic: &str) -> &str {
+    diagnostic
+        .split_once('\n')
+        .map_or(diagnostic, |(_location, message)| message)
+}
+
 struct Fixture {
     _temp: TempDir,
     caller: PathBuf,
@@ -411,7 +417,7 @@ let b = consumer_component {
         "the bad reference should be reported once at the call boundary: {diags:#?}",
     );
     assert_eq!(
-        call_diags[0].as_str(),
+        canonical_message(call_diags[0]),
         "module call 'b': unknown attribute 'target_group_ar' on 'instance' in reference instance.target_group_ar Did you mean 'target_group_arn'?",
     );
 }
@@ -469,7 +475,7 @@ let b = consumer_component {
         "the schema-backed typo should be reported once at the call boundary: {diags:#?}",
     );
     assert_eq!(
-        call_diags[0].as_str(),
+        canonical_message(call_diags[0]),
         "module call 'b': unknown attribute 'target_group_ar' on 'tg' in reference tg.target_group_ar Did you mean 'target_group_arn'?",
     );
 }

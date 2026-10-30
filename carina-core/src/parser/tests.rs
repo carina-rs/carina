@@ -2,7 +2,8 @@ use super::*;
 use crate::binding_index::{IterableBindings, LivePreDataSourceReadInputs, ResolvedBindings};
 use crate::resolver::resolve_refs_for_plan;
 use crate::resource::{
-    ConcreteValue, DeferredValue, InterpolationPart, Resource, UnknownReason, Value,
+    ConcreteValue, DeferredValue, ForLoopElement, InterpolationPart, LoopKind, LoopOriginKind,
+    Resource, UnknownReason, Value,
 };
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
@@ -4966,7 +4967,7 @@ fn parse_import_block() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.state_blocks.len(), 1);
     match &result.state_blocks[0] {
-        StateBlock::Import { to, id } => {
+        StateBlock::Import { to, to_span: _, id } => {
             assert_eq!(to.provider, "awscc");
             assert_eq!(to.resource_type, "ec2.Vpc");
             assert_eq!(to.name_str(), "main-vpc");
@@ -5839,6 +5840,211 @@ fn if_value_expr_preserves_pending_bare_use_in_a_typed_resource_sink() {
 }
 
 #[test]
+fn unbound_for_elements_are_pending_and_unbound() {
+    let parsed = parse(
+        r#"
+        for az in ["ap-northeast-1a", "ap-northeast-1c"] {
+            awscc.ec2.Subnet {
+                availability_zone = az
+            }
+        }
+    "#,
+        &ProviderContext::default(),
+    )
+    .unwrap();
+
+    let resources = parsed.iter_all_resources().collect::<Vec<_>>();
+    assert_eq!(resources.len(), 2);
+    for (index, resource) in resources.into_iter().enumerate() {
+        let ResourceRef::Resource(resource) = resource else {
+            panic!("unbound for fixture must emit managed resources")
+        };
+        assert!(resource.id.identity_str().is_none());
+        assert_eq!(resource.binding, None);
+        let origin = resource
+            .loop_provenance
+            .direct_origin()
+            .expect("unbound for element must carry direct provenance");
+        assert_eq!(
+            origin.kind(),
+            &LoopOriginKind::For {
+                element: ForLoopElement::Index(index),
+            }
+        );
+        assert_eq!(origin.file(), "test.crn");
+        assert_eq!(origin.line(), 2);
+    }
+}
+
+#[test]
+fn unbound_for_legacy_addresses_match_old_spelling() {
+    let parsed = parse(
+        r#"
+        let xs = {
+            safe         = "one"
+            'unsafe-key' = "two"
+            "can't"      = "three"
+        }
+        for key, value in xs {
+            mock.test.Resource {
+                name = value
+            }
+        }
+    "#,
+        &ProviderContext::default(),
+    )
+    .unwrap();
+
+    let legacy: Vec<_> = parsed
+        .resources
+        .iter()
+        .map(|resource| {
+            resource
+                .loop_provenance
+                .direct_origin()
+                .expect("unbound for element provenance")
+                .legacy_address()
+                .exact_state_name()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(legacy, ["_xs['can't']", "_xs.safe", "_xs['unsafe-key']"]);
+}
+
+#[test]
+fn unbound_if_is_pending_and_unbound() {
+    let parsed = parse(
+        r#"
+        if true {
+            awscc.ec2.Vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+        }
+    "#,
+        &ProviderContext::default(),
+    )
+    .unwrap();
+
+    let resources = parsed.iter_all_resources().collect::<Vec<_>>();
+    assert_eq!(resources.len(), 1);
+    let ResourceRef::Resource(resource) = resources[0] else {
+        panic!("unbound if fixture must emit a managed resource")
+    };
+    assert!(resource.id.identity_str().is_none());
+    assert_eq!(resource.binding, None);
+    let origin = resource
+        .loop_provenance
+        .direct_origin()
+        .expect("unbound if resource provenance");
+    assert_eq!(origin.kind(), &LoopOriginKind::If);
+    assert_eq!(origin.legacy_address().exact_state_name(), "_if0");
+}
+
+#[test]
+fn unbound_loop_module_call_is_anonymous() {
+    let parsed = parse(
+        r#"
+        let web = use { source = "modules/web" }
+        for cidr in ["10.0.0.0/16"] {
+            web { vpc_cidr = cidr }
+        }
+    "#,
+        &ProviderContext::default(),
+    )
+    .unwrap();
+
+    assert_eq!(parsed.module_calls.len(), 1);
+    let call = &parsed.module_calls[0];
+    assert_eq!(call.binding_name, None);
+    let origin = call
+        .loop_origin()
+        .expect("unbound loop module call provenance");
+    assert_eq!(
+        origin.kind(),
+        &LoopOriginKind::For {
+            element: ForLoopElement::Index(0),
+        }
+    );
+    assert_eq!(origin.legacy_address().exact_state_name(), "_for0[0]");
+}
+
+#[test]
+fn unbound_for_read_requires_let() {
+    let error = parse(
+        r#"
+        for name in ["example"] {
+            read mock.test.Resource { name = name }
+        }
+    "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("an unbound for cannot create an addressable read");
+
+    assert!(matches!(
+        error,
+        ParseError::UnboundLoopRead {
+            kind: LoopKind::For,
+            line: 2,
+            ..
+        }
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("bind the for expression with `let`")
+    );
+}
+
+#[test]
+fn unbound_if_read_requires_let() {
+    let error = parse(
+        r#"
+        if true {
+            read mock.test.Resource { name = "example" }
+        }
+    "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("an unbound if cannot create an addressable read");
+
+    assert!(matches!(
+        error,
+        ParseError::UnboundLoopRead {
+            kind: LoopKind::If,
+            line: 2,
+            ..
+        }
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("bind the if expression with `let`")
+    );
+}
+
+#[test]
+fn deferred_unbound_target_round_trips() {
+    let parsed = parse(
+        r#"
+        let orgs = upstream_state { source = "../orgs" }
+        for account_id in orgs.accounts {
+            awscc.sso.Assignment {
+                target_id = account_id
+            }
+        }
+    "#,
+        &ProviderContext::default(),
+    )
+    .unwrap();
+
+    let target = &parsed.deferred_for_expressions[0].target;
+    assert!(matches!(target, DeferredForTarget::Unbound { .. }));
+    let json = serde_json::to_string(target).unwrap();
+    let decoded: DeferredForTarget = serde_json::from_str(&json).unwrap();
+    assert_eq!(&decoded, target);
+}
+
+#[test]
 fn parse_top_level_for_expression() {
     let input = r#"
         for az in ["ap-northeast-1a", "ap-northeast-1c"] {
@@ -5903,11 +6109,25 @@ fn parse_top_level_multiple_for_no_collision() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.resources.len(), 4);
 
-    // First for gets _for0, second gets _for1 - no collisions
+    // Live identities are anonymous and pending. The migration-only legacy
+    // addresses still distinguish the first loop from the second.
+    assert!(
+        result
+            .resources
+            .iter()
+            .all(|resource| resource.id.identity_str().is_none() && resource.binding.is_none())
+    );
     let names: Vec<&str> = result
         .resources
         .iter()
-        .map(|r| r.id.identity_str().expect("resolved identity"))
+        .map(|resource| {
+            resource
+                .loop_provenance
+                .direct_origin()
+                .expect("unbound loop origin")
+                .legacy_address()
+                .exact_state_name()
+        })
         .collect();
     assert_eq!(names[0], "_for0[0]");
     assert_eq!(names[1], "_for0[1]");
@@ -5929,10 +6149,23 @@ fn parse_top_level_for_uses_iterable_name_as_binding() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.resources.len(), 2);
 
+    assert!(
+        result
+            .resources
+            .iter()
+            .all(|resource| resource.id.identity_str().is_none() && resource.binding.is_none())
+    );
     let names: Vec<&str> = result
         .resources
         .iter()
-        .map(|r| r.id.identity_str().expect("resolved identity"))
+        .map(|resource| {
+            resource
+                .loop_provenance
+                .direct_origin()
+                .expect("unbound loop origin")
+                .legacy_address()
+                .exact_state_name()
+        })
         .collect();
     assert_eq!(names[0], "_azs[0]");
     assert_eq!(names[1], "_azs[1]");
@@ -5953,8 +6186,11 @@ fn parse_top_level_for_uses_last_segment_of_dotted_iterable() {
 
     let result = parse(input, &ProviderContext::default()).unwrap();
     // Deferred (upstream_state not resolved), so no concrete resources
-    // but the deferred_for_expressions should use _accounts
-    assert_eq!(result.deferred_for_expressions[0].binding_name, "_accounts");
+    // but the deferred target should retain _accounts only as migration provenance.
+    let DeferredForTarget::Unbound { template } = &result.deferred_for_expressions[0].target else {
+        panic!("top-level deferred loop must remain unbound")
+    };
+    assert_eq!(template.legacy_base().exact_state_name(), "_accounts");
 }
 
 #[test]
@@ -5968,10 +6204,23 @@ fn parse_top_level_for_literal_list_uses_counter_fallback() {
     "#;
 
     let result = parse(input, &ProviderContext::default()).unwrap();
+    assert!(
+        result
+            .resources
+            .iter()
+            .all(|resource| resource.id.identity_str().is_none() && resource.binding.is_none())
+    );
     let names: Vec<&str> = result
         .resources
         .iter()
-        .map(|r| r.id.identity_str().expect("resolved identity"))
+        .map(|resource| {
+            resource
+                .loop_provenance
+                .direct_origin()
+                .expect("unbound loop origin")
+                .legacy_address()
+                .exact_state_name()
+        })
         .collect();
     assert_eq!(names[0], "_for0[0]");
     assert_eq!(names[1], "_for0[1]");
@@ -14481,7 +14730,11 @@ let child = child_module { values = [vpc] }"#,
         .expect("nested structural module-argument use");
     assert!(matches!(
         &use_site.owner,
-        BindingUseOwner::ModuleArgument { call: owner, argument }
+        BindingUseOwner::ModuleArgument {
+            call: owner,
+            argument,
+            value_span: _,
+        }
             if owner == call.id() && argument == "values"
     ));
     assert!(matches!(
@@ -14592,7 +14845,11 @@ for item in ["one", "two"] {
         assert!(
             uses.iter().any(|use_site| matches!(
                 &use_site.owner,
-                BindingUseOwner::ModuleArgument { call: owner, argument }
+                BindingUseOwner::ModuleArgument {
+                    call: owner,
+                    argument,
+                    value_span: _,
+                }
                     if owner == call.id() && argument == "param"
             )),
             "each expanded call must own its corresponding use: {:?}",

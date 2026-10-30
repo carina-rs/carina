@@ -36,7 +36,7 @@ pub fn parse_type_expr_str(input: &str, config: &ProviderContext) -> Option<Type
         return None;
     }
     let mut warnings: Vec<ParseWarning> = Vec::new();
-    parse_type_expr(pair, config, &mut warnings).ok()
+    parse_type_expr(pair, config, &mut warnings, None).ok()
 }
 
 /// Parse type expression. Handles unions of atomic types
@@ -48,6 +48,7 @@ pub(super) fn parse_type_expr(
     pair: pest::iterators::Pair<Rule>,
     config: &ProviderContext,
     warnings: &mut Vec<ParseWarning>,
+    preprocessed_file: Option<&super::PreprocessedFile>,
 ) -> Result<TypeExpr, ParseError> {
     // Top-level `type_expr` is one or more `type_expr_atom`s separated
     // by `|`. Collect each atom; the `|` tokens are silent in pest, so
@@ -55,7 +56,12 @@ pub(super) fn parse_type_expr(
     let mut atoms: Vec<TypeExpr> = Vec::new();
     for child in pair.into_inner() {
         if child.as_rule() == Rule::type_expr_atom {
-            atoms.push(parse_type_expr_atom(child, config, warnings)?);
+            atoms.push(parse_type_expr_atom(
+                child,
+                config,
+                warnings,
+                preprocessed_file,
+            )?);
         }
     }
     match atoms.len() {
@@ -184,6 +190,7 @@ fn parse_type_expr_atom(
     pair: pest::iterators::Pair<Rule>,
     config: &ProviderContext,
     warnings: &mut Vec<ParseWarning>,
+    preprocessed_file: Option<&super::PreprocessedFile>,
 ) -> Result<TypeExpr, ParseError> {
     let _ = warnings;
     let inner = first_inner(pair, "type", "type expression")?;
@@ -193,7 +200,11 @@ fn parse_type_expr_atom(
             Ok(TypeExpr::StringLiteral(parse_string_literal(string)?))
         }
         Rule::type_simple => {
-            let line = inner.as_span().start_pos().line_col().0;
+            let type_span = preprocessed_file.map_or_else(
+                || super::SourceSpan::from_unmapped_pest(&inner),
+                |file| super::SourceSpan::from_pest(&inner, file),
+            );
+            let line = type_span.start_line();
             let text = inner.as_str();
             match text {
                 "String" => Ok(TypeExpr::String),
@@ -223,10 +234,11 @@ fn parse_type_expr_atom(
                     if config.custom_types_loaded() {
                         return match resolve_known_bare_custom_type(&snake, config) {
                             Ok(Some(resolved)) => Ok(resolved),
-                            Ok(None) => Err(ParseError::InvalidExpression {
-                                line,
-                                message: unknown_custom_type_message(other, config),
-                            }),
+                            Ok(None) => Err(ParseError::unresolved_declaration_type(
+                                other,
+                                type_span,
+                                unknown_custom_type_message(other, config),
+                            )),
                             Err(message) => Err(ParseError::InvalidExpression { line, message }),
                         };
                     }
@@ -256,6 +268,7 @@ fn parse_type_expr_atom(
                 next_pair(&mut generic_inner, "inner type", "generic type expression")?,
                 config,
                 warnings,
+                preprocessed_file,
             )?;
 
             if is_list {
@@ -294,6 +307,7 @@ fn parse_type_expr_atom(
                         next_pair(&mut field_inner, "field type", "struct field")?,
                         config,
                         warnings,
+                        preprocessed_file,
                     )?;
                     if fields.iter().any(|(existing, _)| existing == &name) {
                         return Err(ParseError::InvalidResourceType(format!(

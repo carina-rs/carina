@@ -331,8 +331,8 @@ fn validate_rejects_renamed_legacy_custom_type_name() {
 /// Reproduces carina#3368: a dotted custom type that is not registered
 /// must be rejected instead of silently validating as an untyped string.
 /// This also pins the signature-loader boundary: its best-effort snapshot may
-/// retain the unresolved type, but the caller-side parameter classifier must
-/// resolve it before deciding whether the argument is a handle or a value.
+/// retain the unresolved type, but the module declaration pass must reject it
+/// before expansion can treat the argument as untyped.
 #[test]
 fn validate_rejects_fake_dotted_custom_type() {
     let fixture = write_fixture("list(aws.iam.TotallyFake.Arn)");
@@ -342,7 +342,7 @@ fn validate_rejects_fake_dotted_custom_type() {
 
     assert!(
         diags.iter().any(|d| {
-            d.contains("module inner argument 'bad_arg'")
+            d.contains("argument 'bad_arg'")
                 && d.contains("unknown custom type")
                 && (d.contains("aws.iam.TotallyFake.Arn") || d.contains("TotallyFake"))
         }),
@@ -570,9 +570,9 @@ fn validate_routes_registered_bare_identity_through_its_provider_owner() {
 
 /// `attributes` parameters are the module-callable equivalent of
 /// `arguments` for attribute-level lookups, and they share the same
-/// silent-accept bug if the post-parse walk is restricted to
+/// silent-accept bug if the post-parse resolver is restricted to
 /// `arguments` alone. This test pins coverage so a future regression
-/// in the walker's parameter set is caught.
+/// in the resolver's parameter set is caught.
 #[test]
 fn validate_rejects_fake_custom_type_in_attributes() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -646,9 +646,9 @@ exports {
 /// against the module directory directly, with no caller in sight.
 /// The root parse used the bootstrap `ProviderContext`
 /// (`ProviderCustomTypes::Unloaded`), so the strict parser gate did not fire;
-/// the post-parse `validate_argument_custom_types` walk in
+/// the post-parse `resolve_file_type_exprs` pass in
 /// `validate_and_resolve_errors` with a test `ProviderLoad` is what catches the
-/// unknown name here. Without that walk, the bug-headline shape
+/// unknown name here. Without that resolver pass, the bug-headline shape
 /// (`arguments { bad_arg: TotallyMadeUpType }` validated standalone)
 /// would slip through and the issue would only partially be fixed.
 #[test]

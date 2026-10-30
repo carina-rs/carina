@@ -14,7 +14,7 @@ use super::blocks::resource::{parse_read_resource_expr, parse_resource_expr};
 use super::blocks::use_stmt::parse_use_expr;
 use super::context::{ParseBindingRef, ParseContext, first_inner, next_pair};
 use super::error::ParseError;
-use super::expressions::for_expr::parse_for_expr;
+use super::expressions::for_expr::{LoopParseTarget, parse_for_expr};
 use super::expressions::if_expr::parse_if_expr;
 use super::expressions::pipe::{apply_pipe_step, parse_coalesce_expr};
 use super::expressions::primary::{apply_postfix_steps, parse_postfix_eval, parse_primary_eval};
@@ -130,6 +130,7 @@ pub(super) fn parse_let_binding_extended(
     ),
     ParseError,
 > {
+    let source_span = crate::parser::SourceSpan::from_pest(&pair, preprocessed_file);
     let mut inner = pair.into_inner();
     let name = next_pair(&mut inner, "binding name", "let binding")?
         .as_str()
@@ -140,7 +141,7 @@ pub(super) fn parse_let_binding_extended(
     // grammar permits it here and only here (see carina.pest); everywhere
     // else it is a parse error.
     if rhs_pair.as_rule() == Rule::use_expr {
-        let use_stmt = parse_use_expr(rhs_pair, &name, ctx)?;
+        let use_stmt = parse_use_expr(rhs_pair, &name, ctx, source_span, source_file)?;
         let value =
             EvalValue::structural_handle(StructuralHandle::new(StructuralHandleKind::Use, &name));
         return Ok((
@@ -483,8 +484,13 @@ fn parse_primary_with_resource_or_module(
             ))
         }
         Rule::for_expr => {
-            let (resources, data_sources, module_calls) =
-                parse_for_expr(inner, ctx, binding_name, preprocessed_file, source_file)?;
+            let (resources, data_sources, module_calls) = parse_for_expr(
+                inner,
+                ctx,
+                LoopParseTarget::bound(binding_name),
+                preprocessed_file,
+                source_file,
+            )?;
             Ok((
                 for_structural_handle(binding_name),
                 resources,
@@ -496,7 +502,13 @@ fn parse_primary_with_resource_or_module(
         }
         Rule::if_expr => {
             let (value, resources, data_sources, module_calls, import, binding_kind) =
-                parse_if_expr(inner, ctx, binding_name, preprocessed_file, source_file)?;
+                parse_if_expr(
+                    inner,
+                    ctx,
+                    LoopParseTarget::bound(binding_name),
+                    preprocessed_file,
+                    source_file,
+                )?;
             Ok((
                 value,
                 resources,

@@ -1,0 +1,9 @@
+mock.test.Thing {
+  name = 'plain'
+}
+
+for name in ['loop'] {
+  mock.test.Thing {
+    name = name
+  }
+}
