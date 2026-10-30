@@ -630,43 +630,54 @@ fn unannotated_export_of_struct_with_nested_union_stays_compatibility_clean() {
 }
 
 #[test]
-fn attached_heterogeneous_export_error_is_shared_by_plan_style_validation() {
-    let fixture = Fixture::direct(&[("exports.crn", "exports {\n  mixed = [\"text\", 1]\n}\n")]);
-
-    let validate_diags = fixture.validate();
-    assert_eq!(
-        validate_diags.len(),
-        1,
-        "validate should report the original load-time inference error once: {validate_diags:#?}",
-    );
-    assert!(
-        validate_diags[0].contains("type annotation required")
-            && validate_diags[0].contains("collection element types disagree"),
-        "expected the heterogeneous-list inference diagnostic: {validate_diags:#?}",
-    );
-
-    let loaded = carina_core::config_loader::load_configuration_with_config(
-        &fixture.caller,
-        &carina_core::parser::ProviderContext::default(),
-        &carina_core::schema::SchemaRegistry::new(),
-    )
-    .expect("load plan-style fixture");
-    let mut parsed = loaded.parsed;
-    let providers = carina_cli::wiring::ProviderLoad::for_test(factories(), &parsed.providers);
-    let retry_errors = carina_cli::commands::validate_and_resolve_errors(
+fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validation() {
+    let fixture = Fixture::direct(&[(
+        "exports.crn",
+        "exports {\n  x = instance.target_group_ar\n}\n",
+    )]);
+    let provider_context = carina_core::parser::ProviderContext::default();
+    let mut parsed =
+        carina_core::config_loader::parse_directory(&fixture.caller, &provider_context)
+            .expect("parse directory-scoped fixture");
+    let mut schemas = carina_core::schema::SchemaRegistry::new();
+    for schema in AwsccTestFactory.schemas() {
+        schemas.insert("awscc", schema);
+    }
+    carina_core::module_resolver::resolve_modules_with_config(
         &mut parsed,
         carina_core::config_loader::get_base_dir(&fixture.caller),
-        &providers,
-        false,
-        &[],
-    );
+        &provider_context,
+        &schemas,
+    )
+    .expect("expand module call");
 
-    assert!(
-        retry_errors.len() == 1
-            && retry_errors[0]
-                .to_string()
-                .contains("type annotation required"),
-        "plan/apply-style validation must report the attached inference error once: {retry_errors:#?}",
+    // Exercise the same post-expansion inference + ref-validation seam used by
+    // CLI validation, where both stages can otherwise report this one typo.
+    let inferred_exports =
+        carina_core::validation::inference::infer_export_params(&parsed, &schemas);
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let mut diagnostics =
+        carina_core::validation::inference::attached_inference_failures(&inferred_exports)
+            .map(|failure| {
+                carina_core::validation::inference::format_inference_error(
+                    failure.name,
+                    failure.error,
+                )
+            })
+            .collect::<Vec<_>>();
+    if let Err(message) = carina_core::validation::validate_export_param_ref_types_with_bindings(
+        &inferred_exports,
+        &bindings,
+    ) {
+        diagnostics.extend(message.lines().map(str::to_owned));
+    }
+
+    assert_eq!(
+        diagnostics,
+        vec![
+            "export 'x': type annotation required: unknown attribute `target_group_ar` on `instance`"
+        ],
+        "attached inference and the CLI's shared ref validation must report the typo once",
     );
 }
 

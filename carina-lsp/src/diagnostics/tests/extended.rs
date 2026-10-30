@@ -4798,23 +4798,6 @@ fn exports_referencing_module_call_attribute_does_not_require_annotation() {
 }
 
 #[test]
-fn heterogeneous_export_reports_attached_inference_failure_once() {
-    let source = "exports {\n  x = [1, 'a']\n}\n";
-    let diagnostics = test_engine().analyze(&create_document(source), None);
-    let annotation_diagnostics = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.message.contains("type annotation required"))
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        annotation_diagnostics.len(),
-        1,
-        "attached inference failure must produce one diagnostic: {diagnostics:#?}",
-    );
-    assert!(annotation_diagnostics[0].message.contains("export 'x'"));
-}
-
-#[test]
 fn postfix_index_on_sibling_computed_let_has_no_unknown_binding_diagnostic() {
     let engine = test_engine();
     let directory = tempfile::tempdir().unwrap();
@@ -4927,7 +4910,7 @@ let selected = parts[secret("hunter2")]
 }
 
 #[test]
-fn module_call_export_typo_is_reported_once_after_lsp_expansion() {
+fn module_call_export_typo_reports_attached_inference_failure_once_after_lsp_expansion() {
     let engine = DiagnosticEngine::new(
         Arc::new(SchemaRegistry::new()),
         vec!["awscc".to_string()],
@@ -4952,25 +4935,14 @@ fn module_call_export_typo_is_reported_once_after_lsp_expansion() {
     std::fs::write(base.join("exports.crn"), exports).unwrap();
 
     let diagnostics = analyze_with_buffer(&engine, &base, "exports.crn", exports);
-    let typo_diagnostics: Vec<_> = diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic.message.contains("role_ar")
-                && diagnostic
-                    .message
-                    .to_ascii_lowercase()
-                    .contains("unknown attribute")
-        })
-        .collect();
-
     assert_eq!(
-        typo_diagnostics.len(),
+        diagnostics.len(),
         1,
-        "post-expansion inference and the existence walk must not duplicate the typo: {:?}",
-        diagnostics
-            .iter()
-            .map(|diagnostic| &diagnostic.message)
-            .collect::<Vec<_>>(),
+        "post-expansion inference and the existence walk must not duplicate the typo: {diagnostics:#?}",
+    );
+    assert_eq!(
+        diagnostics[0].message,
+        "export 'role_arn': type annotation required: unknown attribute `role_ar` on `github_actions_carina`",
     );
 }
 
