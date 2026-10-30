@@ -2405,7 +2405,12 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             DiagnosticSeverity::ERROR,
             error.to_string(),
         ),
-        ParseError::DeferredForBodyTemplate { span, error: _, .. } => carina_diagnostic_range(
+        ParseError::DeferredForBodyTemplate {
+            line: _,
+            header: _,
+            span,
+            error: _,
+        } => carina_diagnostic_range(
             Range {
                 start: Position {
                     line: span.start_line().saturating_sub(1) as u32,
