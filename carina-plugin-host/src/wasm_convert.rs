@@ -4697,6 +4697,7 @@ mod tests {
                 "name": "group_name",
                 "attr_type": { "type": "String" },
                 "required": true,
+                "keyed_partial_update": null,
                 "description": "Group name",
                 "create_only": true,
                 "read_only": false,
@@ -4739,6 +4740,7 @@ mod tests {
                   "ordered": false
                 },
                 "required": false,
+                "keyed_partial_update": null,
                 "description": "Ingress rules",
                 "create_only": false,
                 "read_only": false,
@@ -4751,6 +4753,7 @@ mod tests {
                 "name": "description",
                 "attr_type": { "type": "String" },
                 "required": true,
+                "keyed_partial_update": null,
                 "description": "Group description",
                 "create_only": false,
                 "read_only": false,
@@ -4760,6 +4763,7 @@ mod tests {
                 "name": "enabled",
                 "attr_type": { "type": "Bool" },
                 "required": false,
+                "keyed_partial_update": null,
                 "description": null,
                 "create_only": false,
                 "read_only": false,
@@ -4769,6 +4773,7 @@ mod tests {
                 "name": "priority",
                 "attr_type": { "type": "Int" },
                 "required": false,
+                "keyed_partial_update": null,
                 "description": null,
                 "create_only": false,
                 "read_only": false,
@@ -5830,7 +5835,8 @@ mod tests {
                                 "base":{"type":"String"}
                             }
                         },
-                        "required":false
+                        "required":false,
+                        "keyed_partial_update":null
                     }
                 }
             }
