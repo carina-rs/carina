@@ -2628,13 +2628,14 @@ fn detect_anonymous_to_named_moves_with_ctx(
     providers: &[ProviderConfig],
     state_view: &AnonymousReconciliationStateView,
     claims: &StateBlockClaims,
-) -> Result<Vec<ResolvedMove>, AppError> {
+    claimed_origins: &identifier::AnonymousToNamedClaimedOrigins,
+) -> Result<identifier::AnonymousToNamedRenameDetection, AppError> {
     let canonical_providers = carina_core::value::canonicalize_provider_configs_with_schemas(
         providers,
         &|provider_name| provider_config_schema_for(ctx, provider_name),
     )?;
     Ok(identifier::detect_anonymous_to_named_renames(
-        identifier::AnonymousToNamedCandidates::new(resources, candidates),
+        identifier::AnonymousToNamedCandidates::new(resources, candidates, claimed_origins),
         ctx.schemas(),
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &|binding| state_view.entries_by_binding(claims, binding),
@@ -2652,40 +2653,63 @@ fn detect_anonymous_to_named_moves_to_fixed_point(
     initial_moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
     claims: &StateBlockClaims,
 ) -> Result<Vec<ResolvedMove>, AppError> {
-    let mut projected_pairs = initial_moved_pairs.to_vec();
-    let mut detected = Vec::new();
-    let mut unsatisfied = resources
-        .iter()
-        .filter(|resource| resource.binding.is_some())
-        .map(|resource| resource.id.clone())
-        .collect::<HashSet<_>>();
+    let mut contested_resources = HashSet::new();
 
-    while !unsatisfied.is_empty() {
-        let state_view = AnonymousReconciliationStateView::new(ctx, state_file, &projected_pairs);
-        let pass = detect_anonymous_to_named_moves_with_ctx(
-            ctx,
-            resources,
-            &unsatisfied,
-            providers,
-            &state_view,
-            claims,
-        )?;
-        if pass.is_empty() {
-            break;
-        }
-        let satisfied = pass
+    'recompute: loop {
+        let mut projected_pairs = initial_moved_pairs.to_vec();
+        let mut detected = Vec::new();
+        let mut unsatisfied = resources
             .iter()
-            .map(|resolved_move| resolved_move.to().as_inner())
+            .filter(|resource| resource.binding.is_some())
+            .map(|resource| resource.id.clone())
+            .filter(|resource_id| !contested_resources.contains(resource_id))
             .collect::<HashSet<_>>();
-        unsatisfied.retain(|resource_id| !satisfied.contains(resource_id));
-        projected_pairs.extend(
-            pass.iter()
-                .map(|resolved_move| (resolved_move.from().clone(), resolved_move.to().clone())),
-        );
-        detected.extend(pass);
-    }
 
-    Ok(detected)
+        while !unsatisfied.is_empty() {
+            let state_view =
+                AnonymousReconciliationStateView::new(ctx, state_file, &projected_pairs);
+            let claimed_origins = identifier::AnonymousToNamedClaimedOrigins::from_moves(&detected);
+            let detection = detect_anonymous_to_named_moves_with_ctx(
+                ctx,
+                resources,
+                &unsatisfied,
+                providers,
+                &state_view,
+                claims,
+                &claimed_origins,
+            )?;
+            let (pass, cross_pass_contests) = detection.into_parts();
+            if !cross_pass_contests.is_empty() {
+                for contest in cross_pass_contests {
+                    let (origin, incumbent, contender) = contest.into_parts();
+                    debug_assert!(
+                        detected
+                            .iter()
+                            .any(|resolved_move| resolved_move.from() == &origin)
+                    );
+                    contested_resources.insert(incumbent);
+                    contested_resources.insert(contender);
+                }
+                continue 'recompute;
+            }
+            if pass.is_empty() {
+                break;
+            }
+            let satisfied = pass
+                .iter()
+                .map(|resolved_move| resolved_move.to().as_inner())
+                .collect::<HashSet<_>>();
+            unsatisfied.retain(|resource_id| !satisfied.contains(resource_id));
+            projected_pairs.extend(
+                pass.iter().map(|resolved_move| {
+                    (resolved_move.from().clone(), resolved_move.to().clone())
+                }),
+            );
+            detected.extend(pass);
+        }
+
+        return Ok(detected);
+    }
 }
 
 pub(crate) struct LateAnonymousIdentityInputs<'a> {
@@ -4123,8 +4147,7 @@ fn conflicting_move<'a>(
 ) -> Option<&'a (ResolvedResourceId, ResolvedResourceId)> {
     moved_pairs.iter().find(|(existing_from, existing_to)| {
         let continues_forward = existing_to == resolved_move.projected_from()
-            && (existing_from == resolved_move.from()
-                || resolved_move.from() == resolved_move.projected_from())
+            && existing_from == resolved_move.from()
             && existing_from != resolved_move.to()
             && resolved_move.projected_from() != resolved_move.to();
         let overlaps = existing_from == resolved_move.from()
@@ -4182,13 +4205,10 @@ fn apply_detected_resource_moves(
             .remap_resource_id(authority.from(), authority.to().clone());
         let projected_from = resolved_move.projected_from().clone();
         let (from, to) = resolved_move.into_parts();
-        if let Some((_origin, prior_target)) =
-            addressed
-                .moved_pairs
-                .iter_mut()
-                .find(|(origin, prior_target)| {
-                    prior_target == &projected_from && (origin == &from || from == projected_from)
-                })
+        if let Some((_origin, prior_target)) = addressed
+            .moved_pairs
+            .iter_mut()
+            .find(|(origin, prior_target)| prior_target == &projected_from && origin == &from)
         {
             *prior_target = to;
         } else {

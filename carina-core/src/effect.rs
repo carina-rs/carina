@@ -465,7 +465,9 @@ impl ResolvedMove {
         })
     }
 
-    pub(crate) fn from_detected_rename(
+    /// Build an automatically detected move while retaining its persisted
+    /// origin and current in-memory projection as separate addresses.
+    pub fn from_detected_rename(
         origin: ResolvedResourceId,
         projected_from: ResolvedResourceId,
         to: ResolvedResourceId,
@@ -511,13 +513,6 @@ impl ResolvedMove {
     /// Consume the move as the persisted origin-to-final-destination pair.
     pub fn into_parts(self) -> (ResolvedResourceId, ResolvedResourceId) {
         (self.origin, self.to)
-    }
-
-    pub fn into_effect(self) -> Effect {
-        Effect::Move {
-            from: self.origin,
-            to: self.to,
-        }
     }
 }
 

@@ -1394,24 +1394,26 @@ impl DesiredCreateOnlyValues {
     }
 }
 
-/// Comparable create-only values selected from persisted state.
+/// Comparable create-only values selected from state-side observations.
 ///
-/// Construction always canonicalizes raw state through the validated resource
-/// schema. Unlike [`DesiredCreateOnlyValues`], this type cannot represent an
-/// unresolved configured value.
+/// Inputs may come from a persisted state row or from provider-refreshed
+/// [`crate::resource::Current`] attributes. Construction applies each schema attribute's
+/// `canonicalize_state` conversion before comparison. Unlike
+/// [`DesiredCreateOnlyValues`], this type cannot represent an unresolved
+/// configured value.
 #[derive(Clone)]
 pub struct StateCreateOnlyValues {
     values: HashMap<String, ResolvedCreateOnlyValue>,
 }
 
 impl StateCreateOnlyValues {
-    /// Canonicalize and select create-only values from raw persisted state.
-    /// Missing or non-comparable state attributes remain absent.
+    /// Canonicalize and select create-only values from observed state-side
+    /// attributes. Missing or non-comparable attributes remain absent.
     pub fn from_state_attributes(
         schema: &ValidatedResourceSchema,
-        attributes: &HashMap<String, Value>,
+        observed_attributes: &HashMap<String, Value>,
     ) -> Self {
-        let mut canonical = attributes.clone();
+        let mut canonical = observed_attributes.clone();
         crate::value::canonicalize_state_attribute_map_with_schema(&mut canonical, schema);
         let values = schema
             .as_schema()
@@ -1634,20 +1636,26 @@ pub fn reconcile_anonymous_identifiers(
     moves
 }
 
-/// Full desired-resource context plus the subset still eligible for an
-/// anonymous-to-named move in the current fixed-point pass.
+/// Full desired-resource context plus the subset still eligible and the
+/// origins already claimed by earlier anonymous-to-named fixed-point passes.
 pub struct AnonymousToNamedCandidates<'a> {
     resources: &'a [Resource],
     eligible_ids: &'a HashSet<ResourceId>,
+    claimed_origins: &'a AnonymousToNamedClaimedOrigins,
 }
 
 impl<'a> AnonymousToNamedCandidates<'a> {
     /// Keep all desired addresses visible for orphan screening while limiting
-    /// move detection to `eligible_ids`.
-    pub fn new(resources: &'a [Resource], eligible_ids: &'a HashSet<ResourceId>) -> Self {
+    /// move detection to `eligible_ids` and retaining earlier-pass claims.
+    pub fn new(
+        resources: &'a [Resource],
+        eligible_ids: &'a HashSet<ResourceId>,
+        claimed_origins: &'a AnonymousToNamedClaimedOrigins,
+    ) -> Self {
         Self {
             resources,
             eligible_ids,
+            claimed_origins,
         }
     }
 
@@ -1655,6 +1663,69 @@ impl<'a> AnonymousToNamedCandidates<'a> {
         self.resources
             .iter()
             .filter(|resource| self.eligible_ids.contains(&resource.id))
+    }
+}
+
+/// Persisted origins already assigned by earlier anonymous-to-named passes.
+///
+/// Keeping the incumbent desired address with each origin lets a later pass
+/// report both sides of a cross-pass contest without inferring ownership from
+/// the projected state name.
+#[derive(Default)]
+pub struct AnonymousToNamedClaimedOrigins {
+    claimant_by_origin: HashMap<ResourceId, ResourceId>,
+}
+
+impl AnonymousToNamedClaimedOrigins {
+    /// Index accepted detected moves by their persisted origins.
+    pub fn from_moves(moves: &[ResolvedMove]) -> Self {
+        let claimant_by_origin = moves
+            .iter()
+            .map(|resolved_move| {
+                (
+                    resolved_move.from().as_inner().clone(),
+                    resolved_move.to().as_inner().clone(),
+                )
+            })
+            .collect();
+        Self { claimant_by_origin }
+    }
+
+    fn claimant_for(&self, origin: &ResolvedResourceId) -> Option<&ResourceId> {
+        self.claimant_by_origin.get(origin.as_inner())
+    }
+
+    fn contains(&self, origin: &ResolvedResourceId) -> bool {
+        self.claimant_for(origin).is_some()
+    }
+}
+
+/// A desired resource whose full create-only match is an origin assigned in
+/// an earlier fixed-point pass.
+pub struct AnonymousToNamedCrossPassContest {
+    origin: ResolvedResourceId,
+    incumbent: ResourceId,
+    contender: ResourceId,
+}
+
+impl AnonymousToNamedCrossPassContest {
+    /// Return the contested origin, incumbent destination, and later
+    /// contender destination.
+    pub fn into_parts(self) -> (ResolvedResourceId, ResourceId, ResourceId) {
+        (self.origin, self.incumbent, self.contender)
+    }
+}
+
+/// Moves accepted in one detection pass plus contests against earlier passes.
+pub struct AnonymousToNamedRenameDetection {
+    moves: Vec<ResolvedMove>,
+    cross_pass_contests: Vec<AnonymousToNamedCrossPassContest>,
+}
+
+impl AnonymousToNamedRenameDetection {
+    /// Separate accepted moves from contests against earlier passes.
+    pub fn into_parts(self) -> (Vec<ResolvedMove>, Vec<AnonymousToNamedCrossPassContest>) {
+        (self.moves, self.cross_pass_contests)
     }
 }
 
@@ -1682,7 +1753,9 @@ impl<'a> AnonymousToNamedCandidates<'a> {
 ///    exactly one orphaned anonymous state entry whose values all match wins.
 ///    Ambiguous matches are skipped without a fallback. If otherwise-unique
 ///    matches from multiple desired resources select the same orphan in one
-///    pass, every claim on that orphan is also skipped.
+///    pass, every claim on that orphan is also skipped. A full match on an
+///    origin claimed in an earlier pass is reported as a cross-pass contest,
+///    also without a SimHash fallback.
 /// 4. For resources with no configured create-only attributes, or with a
 ///    fully resolved create-only set that matches zero state rows, fall back
 ///    to SimHash Hamming-distance matching among rows that do not explicitly
@@ -1701,7 +1774,7 @@ pub fn detect_anonymous_to_named_renames(
     providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
-) -> Vec<ResolvedMove> {
+) -> AnonymousToNamedRenameDetection {
     // Collect the set of resource names currently used in the DSL per
     // (provider, resource_type). Any state entry not in this set is an orphan.
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
@@ -1720,6 +1793,7 @@ pub fn detect_anonymous_to_named_renames(
     }
 
     let mut renames = Vec::new();
+    let mut cross_pass_contests = Vec::new();
 
     for resource in candidates.eligible() {
         // Only rename let-bound resources whose binding was previously anonymous.
@@ -1767,6 +1841,7 @@ pub fn detect_anonymous_to_named_renames(
             let candidates = state_entries
                 .candidates()
                 .filter(|entry| !used_in_dsl.contains(entry.name()))
+                .filter(|entry| !candidates.claimed_origins.contains(entry.origin_id()))
                 .filter(|entry| {
                     let (_matched, mismatched) =
                         resource_co_values.match_counts(entry.create_only_values(), schema);
@@ -1786,22 +1861,39 @@ pub fn detect_anonymous_to_named_renames(
         {
             // Create-only path: find orphaned entries whose create-only values all match.
             let mut matches: Vec<&AnonymousIdStateInfo> = Vec::new();
+            let mut prior_claimed_matches = Vec::new();
             for entry in state_entries.candidates() {
-                if used_in_dsl.contains(entry.name()) {
-                    continue;
-                }
-                if extract_hash_from_identifier(entry.name()).is_none() {
+                let prior_claimant = candidates.claimed_origins.claimant_for(entry.origin_id());
+                let anonymous_identity = prior_claimant
+                    .map_or_else(|| entry.name(), |_| entry.origin_id().identity_str());
+                if extract_hash_from_identifier(anonymous_identity).is_none() {
                     continue;
                 }
                 let all_match = resource_co_values.all_match(entry.create_only_values(), schema);
-                if all_match {
+                if !all_match {
+                    continue;
+                }
+                if let Some(incumbent) = prior_claimant {
+                    prior_claimed_matches.push((entry, incumbent));
+                } else if !used_in_dsl.contains(entry.name()) {
                     matches.push(entry);
                 }
             }
-            match matches.as_slice() {
-                [entry] => Some(*entry),
-                [] => simhash_match(),
-                _ => None,
+            if prior_claimed_matches.is_empty() {
+                match matches.as_slice() {
+                    [entry] => Some(*entry),
+                    [] => simhash_match(),
+                    _ => None,
+                }
+            } else {
+                cross_pass_contests.extend(prior_claimed_matches.into_iter().map(
+                    |(entry, incumbent)| AnonymousToNamedCrossPassContest {
+                        origin: entry.origin_id().clone(),
+                        incumbent: incumbent.clone(),
+                        contender: resource.id.clone(),
+                    },
+                ));
+                None
             }
         } else if resource_co_values.has_configured_values() {
             // At least one configured value is unresolved. Neither a subset
@@ -1831,7 +1923,10 @@ pub fn detect_anonymous_to_named_renames(
             .is_some_and(|count| *count == 1)
     });
 
-    renames
+    AnonymousToNamedRenameDetection {
+        moves: renames,
+        cross_pass_contests,
+    }
 }
 
 #[cfg(test)]
@@ -1849,8 +1944,9 @@ pub fn detect_anonymous_to_named_renames_for_test(
         .iter()
         .map(|resource| resource.id.clone())
         .collect();
-    detect_anonymous_to_named_renames(
-        AnonymousToNamedCandidates::new(resources, &candidates),
+    let claimed_origins = AnonymousToNamedClaimedOrigins::default();
+    let (moves, contests) = detect_anonymous_to_named_renames(
+        AnonymousToNamedCandidates::new(resources, &candidates, &claimed_origins),
         registry,
         find_state_by_type,
         find_state_by_binding,
@@ -1858,9 +1954,9 @@ pub fn detect_anonymous_to_named_renames_for_test(
         identity_attributes_fn,
         claims,
     )
-    .into_iter()
-    .map(ResolvedMove::into_parts)
-    .collect()
+    .into_parts();
+    debug_assert!(contests.is_empty());
+    moves.into_iter().map(ResolvedMove::into_parts).collect()
 }
 
 #[cfg(test)]
