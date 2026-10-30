@@ -380,8 +380,9 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     }
                 })
                 .collect();
-            let (identity, report) = ModuleCallConstraintReport::new(source, outcomes);
-            self.record_constraint_report(identity, report);
+            let report =
+                ModuleCallConstraintReport::new(source, instance_prefix.to_string(), outcomes);
+            self.record_constraint_report(report);
         }
 
         let mut pending_constraints = Vec::new();
@@ -391,6 +392,8 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 ConstraintEvaluation::Pending => {
                     pending_constraints.push(evaluated.into_constraint());
                 }
+                ConstraintEvaluation::Violated(_) | ConstraintEvaluation::EvalError(_)
+                    if self.records_constraint_reports() => {}
                 ConstraintEvaluation::Violated(_) | ConstraintEvaluation::EvalError(_) => {
                     return Err(evaluated
                         .module_error(
@@ -529,7 +532,12 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 resolved_bindings,
             )
             .map_err(contextualize_access_error)?;
-            settle_prefixed_composition_constraints(&mut expanded)?;
+            if let Some(report) = settle_prefixed_composition_constraints(
+                &mut expanded,
+                self.records_constraint_reports(),
+            )? {
+                self.record_constraint_report(report);
+            }
             compositions.push(expanded);
         }
 
@@ -1671,9 +1679,10 @@ fn prefix_module_composition(
 /// path as direct module calls.
 fn settle_prefixed_composition_constraints(
     composition: &mut LiveComposition,
-) -> Result<(), ModuleError> {
+    record_outcomes: bool,
+) -> Result<Option<ModuleCallConstraintReport>, ModuleError> {
     if composition.signature.pending_constraints.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let argument_values = composition
@@ -1686,24 +1695,63 @@ fn settle_prefixed_composition_constraints(
     let evaluated =
         evaluate_module_constraints(ModuleConstraints::pending(&constraints), &argument_values);
     let mut pending = Vec::new();
+    let mut outcomes = Vec::new();
     for evaluated in evaluated {
+        let id = evaluated.constraint().id().clone();
         match evaluated.evaluation() {
-            ConstraintEvaluation::Satisfied => {}
-            ConstraintEvaluation::Pending => pending.push(evaluated.into_constraint()),
+            ConstraintEvaluation::Satisfied => outcomes.push(ResolvedModuleConstraintOutcome {
+                id,
+                status: ResolvedModuleConstraintStatus::Satisfied,
+            }),
+            ConstraintEvaluation::Pending => {
+                outcomes.push(ResolvedModuleConstraintOutcome {
+                    id,
+                    status: ResolvedModuleConstraintStatus::Pending,
+                });
+                pending.push(evaluated.into_constraint());
+            }
             ConstraintEvaluation::Violated(_) | ConstraintEvaluation::EvalError(_) => {
-                return Err(evaluated
-                    .module_error(
-                        &composition.module_name,
-                        &composition.instance,
-                        composition.binding.as_deref(),
-                        Some(&composition.call_path.immediate().id),
-                    )
-                    .expect("concrete nested constraint outcome has a diagnostic"));
+                if record_outcomes {
+                    let diagnostic = evaluated
+                        .module_diagnostic(
+                            &composition.module_name,
+                            &composition.instance,
+                            composition.binding.as_deref(),
+                            Some(&composition.call_path.immediate().id),
+                        )
+                        .expect("concrete nested constraint outcome has a diagnostic");
+                    outcomes.push(ResolvedModuleConstraintOutcome {
+                        id,
+                        status: ResolvedModuleConstraintStatus::Failed {
+                            diagnostic: Box::new(diagnostic),
+                            origin: ResolvedModuleConstraintOrigin::Call,
+                        },
+                    });
+                } else {
+                    return Err(evaluated
+                        .module_error(
+                            &composition.module_name,
+                            &composition.instance,
+                            composition.binding.as_deref(),
+                            Some(&composition.call_path.immediate().id),
+                        )
+                        .expect("concrete nested constraint outcome has a diagnostic"));
+                }
             }
         }
     }
     composition.signature.pending_constraints = pending;
-    Ok(())
+    if record_outcomes {
+        Ok(Some(ModuleCallConstraintReport::new(
+            crate::parser::ModuleCallDiagnosticSource {
+                id: composition.call_path.immediate().id.clone(),
+            },
+            composition.instance.clone(),
+            outcomes,
+        )))
+    } else {
+        Ok(None)
+    }
 }
 
 fn check_composition_argument_type(

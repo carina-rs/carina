@@ -2,11 +2,35 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
-use super::Rule;
+use super::{Rule, SourceSpan};
 use crate::eval_value::EvalValueError;
 use std::path::{Path, PathBuf};
 
 pub const SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE: &str = "single-quoted string contains '${...}' which is not interpolated; use double quotes (\"...\") for interpolation, or keep single quotes if the literal text is intended";
+
+/// Typed identity and authored token span for an unresolved declaration type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnresolvedTypeToken {
+    name: String,
+    span: SourceSpan,
+}
+
+impl UnresolvedTypeToken {
+    pub(crate) fn new(name: impl Into<String>, span: SourceSpan) -> Self {
+        Self {
+            name: name.into(),
+            span,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn span(&self) -> SourceSpan {
+        self.span
+    }
+}
 
 /// Parse error
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +59,16 @@ pub enum ParseError {
         kind: crate::resource::LoopKind,
         line: usize,
         span: Option<super::SourceSpan>,
+    },
+
+    /// Provider-aware parsing could not resolve a type annotation. The
+    /// rendered message is deliberately separate from the typed token used by
+    /// diagnostic coverage and deduplication.
+    #[error("Invalid expression at line {line}: {message}")]
+    UnresolvedDeclarationType {
+        token: UnresolvedTypeToken,
+        line: usize,
+        message: String,
     },
 
     /// A call whose name is neither a declared user function nor a builtin.
@@ -224,6 +258,18 @@ impl ParseError {
         ParseError::InvalidExpression {
             line,
             message: error.to_string(),
+        }
+    }
+
+    pub(crate) fn unresolved_declaration_type(
+        name: impl Into<String>,
+        span: SourceSpan,
+        message: String,
+    ) -> Self {
+        Self::UnresolvedDeclarationType {
+            token: UnresolvedTypeToken::new(name, span),
+            line: span.start_line(),
+            message,
         }
     }
 

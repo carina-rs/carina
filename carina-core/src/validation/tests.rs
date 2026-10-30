@@ -74,6 +74,30 @@ fn empty_parsed() -> ParsedFile {
     }
 }
 
+fn module_call_findings_for_test(
+    parsed: &ParsedFile,
+    signatures: &crate::module_resolver::ResolvedModuleSignatures,
+    provider_context: &ProviderContext,
+) -> Vec<ModuleCallFinding> {
+    let schemas = SchemaRegistry::new();
+    let binding_use_report = check_bare_binding_uses(
+        parsed,
+        &ValidationTypeContext::new(parsed, &schemas, provider_context, signatures),
+    );
+    let bindings = BindingIndex::from_parsed_with_module_signatures(parsed, &schemas, signatures);
+    check_module_calls(ModuleCallCheckInput {
+        authored: parsed,
+        semantic: Some(parsed),
+        base_dir: Some(std::path::Path::new(".")),
+        imported_signatures: signatures,
+        provider_context,
+        schemas: &schemas,
+        binding_use_report: &binding_use_report,
+        bindings: &bindings,
+        reference_checks: ModuleCallReferenceChecks::Enabled,
+    })
+}
+
 fn authored_binding_view(source: &str) -> crate::config_loader::AuthoredBindingView {
     crate::config_loader::AuthoredBindingView::parse_source(source, &ProviderContext::default())
         .expect("fixture must parse")
@@ -3453,7 +3477,7 @@ fn lifted_simple_vpc_id_accepts_matching_custom_identity() {
 }
 
 #[test]
-fn validate_module_calls_rejects_custom_type() {
+fn check_module_calls_rejects_custom_type() {
     use crate::parser::ArgumentParameter;
 
     let config = context_with_iam_policy_arn_validator();
@@ -3466,7 +3490,8 @@ fn validate_module_calls_rejects_custom_type() {
         )])),
     );
 
-    let module_calls = vec![ModuleCall::test(
+    let mut parsed = empty_parsed();
+    parsed.module_calls = vec![ModuleCall::test(
         "github".to_string(),
         None,
         module_arguments(args),
@@ -3488,16 +3513,22 @@ fn validate_module_calls_rejects_custom_type() {
         },
     );
 
-    let result = validate_module_calls(&module_calls, &imported_modules, &config);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("invalid IAM policy ARN"));
+    let findings = module_call_findings_for_test(&parsed, &imported_modules, &config);
+    assert!(
+        findings.iter().any(|finding| finding
+            .message()
+            .to_string()
+            .contains("invalid IAM policy ARN")),
+        "unexpected findings: {findings:#?}"
+    );
 }
 
 #[test]
-fn validate_module_calls_rejects_literal_union_mismatch() {
+fn check_module_calls_rejects_literal_union_mismatch() {
     use crate::parser::ArgumentParameter;
 
-    let module_calls = vec![ModuleCall::test(
+    let mut parsed = empty_parsed();
+    parsed.module_calls = vec![ModuleCall::test(
         "web_tier".to_string(),
         None,
         module_arguments([(
@@ -3524,21 +3555,116 @@ fn validate_module_calls_rejects_literal_union_mismatch() {
         },
     )]);
 
-    let error = validate_module_calls(
-        &module_calls,
-        &imported_modules,
-        &ProviderContext::default(),
-    )
-    .expect_err("a string outside the literal union must be rejected");
+    let findings =
+        module_call_findings_for_test(&parsed, &imported_modules, &ProviderContext::default());
 
     assert!(
-        error.contains("expected 'dev' | 'stg' | 'prod', got string 'production'"),
-        "unexpected error: {error}"
+        findings.iter().any(|finding| finding
+            .message()
+            .to_string()
+            .contains("expected 'dev' | 'stg' | 'prod', got string 'production'")),
+        "unexpected findings: {findings:#?}"
     );
 }
 
 #[test]
-fn validate_module_calls_uses_original_line_after_heredoc() {
+fn check_module_calls_reports_parameter_type_resolution_errors() {
+    use crate::parser::ArgumentParameter;
+
+    let mut parsed = empty_parsed();
+    parsed.module_calls = vec![ModuleCall::test(
+        "child",
+        Some("instance".to_string()),
+        module_arguments([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("input".into())),
+        )]),
+    )];
+    let signatures = HashMap::from([(
+        "child".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "value".to_string(),
+                type_expr: TypeExpr::DottedUnresolved(crate::parser::ResourceTypePath::new(
+                    "aws",
+                    "missing.Type",
+                )),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+    let provider_context = context_with_known_custom_types(HashSet::new());
+
+    let findings = module_call_findings_for_test(&parsed, &signatures, &provider_context);
+
+    assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
+    assert!(
+        findings[0]
+            .message()
+            .to_string()
+            .contains("unknown custom type 'aws.missing.Type'"),
+        "type-resolution error must remain a module-call finding: {findings:#?}",
+    );
+}
+
+#[test]
+fn check_module_calls_reports_nested_file_type_resolution_errors() {
+    let fixture = tempfile::tempdir().expect("nested type-resolution fixture");
+    let child = fixture.path().join("child");
+    std::fs::create_dir_all(&child).expect("create child module");
+    std::fs::write(
+        child.join("main.crn"),
+        "attributes { bad: aws.missing.Type = \"value\" }\n",
+    )
+    .expect("write child module");
+    let root_path = fixture.path().join("main.crn");
+    let parsed = crate::parser::parse_file(
+        "let child = use { source = \"./child\" }\nchild {}\n",
+        &root_path,
+        &ProviderContext::default(),
+    )
+    .expect("root fixture must parse");
+    let provider_context = context_with_known_custom_types(HashSet::new());
+    let schemas = SchemaRegistry::new();
+    let signatures = crate::module_resolver::load_resolved_module_signatures(
+        &parsed,
+        fixture.path(),
+        &provider_context,
+    );
+    let binding_use_report = check_bare_binding_uses(
+        &parsed,
+        &ValidationTypeContext::new(&parsed, &schemas, &provider_context, &signatures),
+    );
+    let bindings = BindingIndex::from_parsed_with_module_signatures(&parsed, &schemas, &signatures);
+
+    let findings = check_module_calls(ModuleCallCheckInput {
+        authored: &parsed,
+        semantic: Some(&parsed),
+        base_dir: Some(fixture.path()),
+        imported_signatures: &signatures,
+        provider_context: &provider_context,
+        schemas: &schemas,
+        binding_use_report: &binding_use_report,
+        bindings: &bindings,
+        reference_checks: ModuleCallReferenceChecks::Enabled,
+    });
+
+    assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
+    assert!(
+        findings[0]
+            .message()
+            .to_string()
+            .contains("attribute 'bad': unknown custom type 'aws.missing.Type'"),
+        "nested declaration resolution errors must not be discarded: {findings:#?}",
+    );
+}
+
+#[test]
+fn check_module_calls_uses_original_line_after_heredoc() {
     use crate::parser::ArgumentParameter;
 
     let parsed = crate::parser::parse(
@@ -3569,31 +3695,318 @@ let inst = m { n = 'abc' }
         },
     )]);
 
-    let error = validate_module_calls(
-        &parsed.module_calls,
-        &imported_modules,
-        &ProviderContext::default(),
-    )
-    .expect_err("the string argument must be rejected");
+    let findings =
+        module_call_findings_for_test(&parsed, &imported_modules, &ProviderContext::default());
+    let finding = findings
+        .first()
+        .expect("the string argument must be rejected");
 
-    assert!(error.contains("at line 8"), "unexpected error: {error}");
-    assert!(!error.contains("at line 4"), "unexpected error: {error}");
+    assert_eq!(finding.anchor().span.start_line(), 8);
 }
 
 #[test]
-fn validate_module_calls_defers_binding_refs_to_the_binding_index() {
+fn check_module_calls_uses_argument_values_and_call_span_as_authored_anchors() {
     use crate::parser::ArgumentParameter;
 
-    let module_calls = vec![ModuleCall::test(
-        "inner".to_string(),
-        None,
-        module_arguments([(
-            "name".to_string(),
-            Value::Deferred(DeferredValue::BindingRef {
-                binding: "count".to_string(),
-            }),
-        )]),
-    )];
+    let parsed = crate::parser::parse(
+        r#"let child = use { source = './child' }
+child {
+  surprise = true
+  count = "bad"
+}
+child {}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    let signatures = HashMap::from([(
+        "child".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "count".to_string(),
+                type_expr: TypeExpr::Int,
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+
+    let findings = module_call_findings_for_test(&parsed, &signatures, &ProviderContext::default());
+    let first_call = &parsed.module_calls[0];
+    let second_call = &parsed.module_calls[1];
+    let surprise_span = first_call
+        .arguments_with_source_spans()
+        .find(|argument| argument.name() == "surprise")
+        .expect("surprise argument")
+        .key_span();
+    let count_span = first_call
+        .arguments_with_source_spans()
+        .find(|argument| argument.name() == "count")
+        .expect("count argument")
+        .value_span();
+
+    let anchor_for = |kind| {
+        findings
+            .iter()
+            .find(|finding| finding.kind() == kind)
+            .unwrap_or_else(|| panic!("missing {kind:?}: {findings:#?}"))
+            .anchor()
+    };
+    assert_eq!(
+        anchor_for(ModuleCallFindingKind::UnknownArgument).span,
+        surprise_span,
+    );
+    assert_eq!(
+        anchor_for(ModuleCallFindingKind::ValueType).span,
+        count_span,
+    );
+    assert_eq!(
+        anchor_for(ModuleCallFindingKind::MissingRequiredArgument).span,
+        second_call.source_span(),
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|finding| { finding.anchor().source_file.path() == first_call.source_file() })
+    );
+}
+
+#[test]
+fn check_module_calls_keeps_distinct_for_expansion_payloads() {
+    use crate::parser::ArgumentParameter;
+
+    let parsed = crate::parser::parse(
+        r#"let child = use { source = "./child" }
+for item in ["first", "second"] {
+  child { count = item }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    assert_eq!(parsed.module_calls.len(), 2);
+    let signatures = HashMap::from([(
+        "child".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "count".to_string(),
+                type_expr: TypeExpr::Int,
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+
+    let findings = module_call_findings_for_test(&parsed, &signatures, &ProviderContext::default());
+    let mismatches = findings
+        .iter()
+        .filter(|finding| finding.kind() == ModuleCallFindingKind::ValueType)
+        .collect::<Vec<_>>();
+
+    assert_eq!(mismatches.len(), 2, "distinct payloads: {findings:#?}");
+    assert_eq!(mismatches[0].anchor(), mismatches[1].anchor());
+    let messages = mismatches
+        .iter()
+        .map(|finding| finding.message().to_string())
+        .collect::<Vec<_>>();
+    assert!(messages.iter().any(|message| message.contains("'first'")));
+    assert!(messages.iter().any(|message| message.contains("'second'")));
+}
+
+#[test]
+fn check_module_calls_pending_binding_slot_owns_missing_argument_suppression() {
+    use crate::parser::ArgumentParameter;
+
+    let parsed = crate::parser::parse(
+        r#"let vpc = mock.test.Thing { name = "source" }
+let child = use { source = "./child" }
+child { values = [vpc] }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    let signatures = HashMap::from([(
+        "child".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "values".to_string(),
+                type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+
+    let findings = module_call_findings_for_test(&parsed, &signatures, &ProviderContext::default());
+
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|finding| finding.kind() == ModuleCallFindingKind::BindingUse)
+            .count(),
+        1,
+        "the pending handle must retain its authored binding finding: {findings:#?}",
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|finding| { finding.kind() != ModuleCallFindingKind::MissingRequiredArgument }),
+        "the pending slot must not also become a missing argument: {findings:#?}",
+    );
+}
+
+#[test]
+fn expanded_module_argument_binding_findings_block_recovery_pipeline() {
+    use crate::parser::ArgumentParameter;
+
+    let parsed = crate::parser::parse(
+        r#"let vpc = mock.test.Thing { name = "source" }
+let child = use { source = "./child" }
+child { values = [vpc] }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    let signatures = HashMap::from([(
+        "child".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "values".to_string(),
+                type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+    let schemas = SchemaRegistry::new();
+    let report = check_bare_binding_uses(
+        &parsed,
+        &ValidationTypeContext::new(&parsed, &schemas, &ProviderContext::default(), &signatures),
+    );
+    assert!(!report.is_ready(), "fixture must produce a binding finding");
+
+    let findings = check_expanded_module_calls(ExpandedModuleCallCheckInput::BindingUses {
+        binding_use_report: &report,
+        compositions: &[],
+    });
+
+    assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
+    assert_eq!(findings[0].kind(), ModuleCallFindingKind::BindingUse);
+}
+
+#[test]
+fn authored_and_expanded_binding_findings_merge_by_typed_identity() {
+    use crate::parser::ArgumentParameter;
+    use crate::schema::AttributeSchema;
+
+    let parsed = crate::parser::parse_file(
+        r#"let source = mock.counter { count = 7 }
+let forwarded = source.count
+let child_module = use { source = "./child" }
+let child = child_module { value = forwarded }
+"#,
+        std::path::Path::new("calls.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("binding-reference fixture must parse");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("counter")
+            .attribute(AttributeSchema::optional("count", AttributeType::int()).build())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let signatures = HashMap::from([(
+        "child_module".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "value".to_string(),
+                type_expr: TypeExpr::String,
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+    let report = check_bare_binding_uses(
+        &parsed,
+        &ValidationTypeContext::new(&parsed, &schemas, &ProviderContext::default(), &signatures),
+    );
+    assert_eq!(report.findings().len(), 1, "unexpected report: {report:#?}");
+    assert!(matches!(
+        report.findings()[0].error,
+        BindingResolutionError::ReferenceType(_)
+    ));
+    let bindings = BindingIndex::from_parsed_with_module_signatures(&parsed, &schemas, &signatures);
+    let authored = check_module_calls(ModuleCallCheckInput {
+        authored: &parsed,
+        semantic: Some(&parsed),
+        base_dir: None,
+        imported_signatures: &signatures,
+        provider_context: &ProviderContext::default(),
+        schemas: &schemas,
+        binding_use_report: &report,
+        bindings: &bindings,
+        reference_checks: ModuleCallReferenceChecks::Enabled,
+    });
+    let expanded = check_expanded_module_calls(ExpandedModuleCallCheckInput::BindingUses {
+        binding_use_report: &report,
+        compositions: &[],
+    });
+    assert_eq!(
+        authored.len(),
+        1,
+        "unexpected authored findings: {authored:#?}"
+    );
+    assert_eq!(
+        expanded.len(),
+        1,
+        "unexpected expanded findings: {expanded:#?}"
+    );
+    assert_ne!(
+        authored[0].message().to_string(),
+        expanded[0].message().to_string(),
+        "the fixture must exercise display-label-independent identity",
+    );
+
+    let expected_anchor = ModuleCallFindingAnchor {
+        source_file: report.findings()[0].use_site.source_file.clone(),
+        span: report.findings()[0].use_site.span,
+    };
+    assert_eq!(authored[0].anchor(), &expected_anchor);
+    assert_eq!(expanded[0].anchor(), &expected_anchor);
+    let merged = merge_module_call_findings([authored, expanded]);
+    assert_eq!(
+        merged.len(),
+        1,
+        "one call/argument/typed error must survive both passes only once: {merged:#?}",
+    );
+}
+
+#[test]
+fn check_module_calls_defers_compatible_binding_refs_to_binding_use_authority() {
+    use crate::parser::ArgumentParameter;
+
+    let parsed = crate::parser::parse(
+        "let name = 'compatible'\nlet inner = use { source = './inner' }\ninner { name = name }\n",
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
     let imported_modules = HashMap::from([(
         "inner".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -3609,12 +4022,12 @@ fn validate_module_calls_defers_binding_refs_to_the_binding_index() {
         },
     )]);
 
-    validate_module_calls(
-        &module_calls,
-        &imported_modules,
-        &ProviderContext::default(),
-    )
-    .expect("reference-valued module arguments are owned by BindingIndex");
+    let findings =
+        module_call_findings_for_test(&parsed, &imported_modules, &ProviderContext::default());
+    assert!(
+        findings.is_empty(),
+        "compatible binding-owned module arguments must not be rechecked: {findings:#?}"
+    );
 }
 
 #[test]
@@ -3661,7 +4074,8 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         ..ProviderContext::default()
     };
     let authored = || Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
-    let module_calls = [ModuleCall::test(
+    let mut module_parsed = empty_parsed();
+    module_parsed.module_calls = vec![ModuleCall::test(
         "child",
         None,
         HashMap::from([("mode".to_string(), ModuleArgument::new(authored()))]),
@@ -3680,8 +4094,10 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
             requires: Vec::new(),
         },
     )]);
-    validate_module_calls(&module_calls, &imported_modules, &config)
-        .expect("module argument must validate");
+    assert!(
+        module_call_findings_for_test(&module_parsed, &imported_modules, &config).is_empty(),
+        "module argument must validate"
+    );
 
     validate_attribute_params(
         &[AttributeParameter::dummy(
@@ -5763,7 +6179,7 @@ fn validate_export_param_ref_types_skips_reported_unknown_index() {
         validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::from([0]));
     assert!(
         result.is_ok(),
-        "the exact Unknown parameter already reported by inference must be skipped, got {:?}",
+        "the exact unknown argument already reported by inference must be skipped, got {:?}",
         result
     );
 }
@@ -6830,8 +7246,8 @@ fn value_contains_unresolved_ref_unwraps_secret() {
 }
 
 // ---------------------------------------------------------------------------
-// carina#3239: post-parse argument-side unknown-custom-type walker.
-// These cover the validator unit; the end-to-end CLI / LSP wiring is
+// carina#3239: live module-boundary type resolution.
+// These cover the core resolver; the end-to-end CLI / LSP wiring is
 // exercised by `carina-cli/tests/validate_unknown_custom_type_e2e.rs`.
 // ---------------------------------------------------------------------------
 
@@ -6840,7 +7256,7 @@ fn enriched_context_with_iam_policy_arn() -> ProviderContext {
 }
 
 #[test]
-fn validate_argument_custom_types_rejects_unknown_in_arguments() {
+fn resolve_file_type_exprs_rejects_unknown_in_arguments() {
     use crate::parser::{ArgumentParameter, TypeExpr};
 
     let mut parsed = empty_parsed();
@@ -6852,10 +7268,10 @@ fn validate_argument_custom_types_rejects_unknown_in_arguments() {
         validations: Vec::new(),
     });
 
-    let findings = validate_argument_custom_types(&parsed, &enriched_context_with_iam_policy_arn());
+    let findings = resolve_file_type_exprs(&mut parsed, &enriched_context_with_iam_policy_arn());
 
     assert_eq!(findings.len(), 1, "expected one finding, got {findings:?}");
-    let only = &findings[0];
+    let only = findings[0].to_string();
     assert!(
         only.contains("argument 'bad_arg'")
             && only.contains("unknown custom type")
@@ -6865,7 +7281,52 @@ fn validate_argument_custom_types_rejects_unknown_in_arguments() {
 }
 
 #[test]
-fn validate_argument_custom_types_accepts_registered_bare_identity() {
+fn file_type_resolution_parser_error_coverage_ignores_rendered_wording() {
+    let source_file = std::path::Path::new("arguments.crn");
+    let source = "arguments {\n  bad_arg: TotallyMadeUpType\n}\n";
+    let mut parsed = crate::parser::parse_file(source, source_file, &ProviderContext::default())
+        .expect("bootstrap parsing must retain the unresolved declaration");
+    let enriched_context = enriched_context_with_iam_policy_arn();
+    let strict_error = crate::parser::parse_file(source, source_file, &enriched_context)
+        .expect_err("enriched parsing must emit a typed unresolved declaration");
+    let crate::parser::ParseError::UnresolvedDeclarationType {
+        token,
+        line,
+        message: _message,
+    } = strict_error
+    else {
+        panic!("unexpected strict parser error: {strict_error:?}");
+    };
+    let parser_error = crate::parser::ParseError::UnresolvedDeclarationType {
+        token,
+        line,
+        message: "wording drift must not change typed coverage".to_string(),
+    };
+
+    let bootstrap_report = resolve_file_type_exprs_report(
+        &mut parsed,
+        &ProviderContext::default(),
+        Some(TypeResolutionParserError::new(source_file, &parser_error)),
+    );
+    assert!(bootstrap_report.diagnostics().is_empty());
+    assert!(!bootstrap_report.covered_parser_error());
+
+    let report = resolve_file_type_exprs_report(
+        &mut parsed,
+        &enriched_context,
+        Some(TypeResolutionParserError::new(source_file, &parser_error)),
+    );
+
+    assert_eq!(report.diagnostics().len(), 1);
+    assert!(report.covered_parser_error());
+    assert_eq!(
+        report.diagnostics()[0].to_string(),
+        "argument 'bad_arg': unknown custom type 'TotallyMadeUpType'",
+    );
+}
+
+#[test]
+fn resolve_file_type_exprs_accepts_registered_bare_identity() {
     use crate::parser::{ArgumentParameter, TypeExpr};
 
     let mut parsed = empty_parsed();
@@ -6873,7 +7334,7 @@ fn validate_argument_custom_types_accepts_registered_bare_identity() {
         name: "policy".to_string(),
         // The fixture registers `IamPolicyArn` as a bare-identity
         // validator; this is the round-trip "name a registered custom
-        // type and have it pass" path that proves the walker isn't
+        // type and have it pass" path that proves the resolver isn't
         // over-firing.
         type_expr: TypeExpr::Simple("iam_policy_arn".to_string()),
         default: None,
@@ -6881,15 +7342,19 @@ fn validate_argument_custom_types_accepts_registered_bare_identity() {
         validations: Vec::new(),
     });
 
-    let findings = validate_argument_custom_types(&parsed, &enriched_context_with_iam_policy_arn());
+    let findings = resolve_file_type_exprs(&mut parsed, &enriched_context_with_iam_policy_arn());
     assert!(
         findings.is_empty(),
-        "registered bare custom type must pass the walker; got: {findings:?}"
+        "registered bare custom type must pass the resolver; got: {findings:?}"
     );
+    assert!(matches!(
+        &parsed.arguments[0].type_expr,
+        TypeExpr::SchemaType { owned: _ }
+    ));
 }
 
 #[test]
-fn validate_argument_custom_types_walks_into_list_map_union_struct() {
+fn resolve_file_type_exprs_walks_into_list_map_union_struct() {
     use crate::parser::{ArgumentParameter, TypeExpr};
 
     let mut parsed = empty_parsed();
@@ -6941,19 +7406,23 @@ fn validate_argument_custom_types_walks_into_list_map_union_struct() {
         validations: Vec::new(),
     });
 
-    let findings = validate_argument_custom_types(&parsed, &enriched_context_with_iam_policy_arn());
+    let findings = resolve_file_type_exprs(&mut parsed, &enriched_context_with_iam_policy_arn());
 
-    let joined = findings.join("\n");
+    let joined = findings
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
     for expected in ["UnknownA", "UnknownB", "UnknownC", "UnknownD", "UnknownE"] {
         assert!(
             joined.contains(expected),
-            "walker must descend into List/Map/Union/Struct and surface {expected}; got: {joined}"
+            "resolver must descend into List/Map/Union/Struct and surface {expected}; got: {joined}"
         );
     }
 }
 
 #[test]
-fn validate_argument_custom_types_is_independent_of_custom_type_load_state() {
+fn resolve_file_type_exprs_defers_unknown_bare_types_until_the_catalog_is_loaded() {
     use crate::parser::{ArgumentParameter, TypeExpr};
 
     let mut parsed = empty_parsed();
@@ -6965,23 +7434,21 @@ fn validate_argument_custom_types_is_independent_of_custom_type_load_state() {
         validations: Vec::new(),
     });
 
-    // Bootstrap context — custom types default to `Unloaded`. The
-    // walker delegates to the owner-preserving bare-type resolver; on an
-    // empty identity set the only accepted names are the
-    // BUILTIN_BARE_CUSTOM_TYPES set, so an unknown name still produces a
-    // finding even with the parser gate inactive. This pins
-    // that the walker is *independent* of the load state — only the
-    // parser is gated; the post-parse walker always reports. Callers
-    // that need the bootstrap-context exemption (e.g. LSP orphaned-file
-    // diagnostics) must withhold the call themselves.
+    // Bootstrap parsing has no authoritative provider catalog, so the live
+    // resolver must retain the provisional simple type without diagnosing it.
     let ctx = ProviderContext::default();
     assert!(!ctx.custom_types_loaded());
     assert!(ctx.known_custom_types().is_empty());
-    let findings = validate_argument_custom_types(&parsed, &ctx);
+    let findings = resolve_file_type_exprs(&mut parsed, &ctx);
+    assert!(findings.is_empty());
+
+    // Once schemas have loaded, the same declaration becomes an actionable
+    // unknown custom type.
+    let findings = resolve_file_type_exprs(&mut parsed, &enriched_context_with_iam_policy_arn());
     assert_eq!(
         findings.len(),
         1,
-        "walker always reports unknowns; gating is the caller's choice"
+        "the enriched catalog must reject the deferred unknown type"
     );
 }
 
@@ -7105,5 +7572,154 @@ fn parameter_handle_classification_requires_a_resolved_type() {
     assert_eq!(
         resolve_parameter_type(&unresolved, &enriched).unwrap(),
         ResolvedParameterType::Handle(ResourceTypePath::new("aws", "ec2.Vpc")),
+    );
+}
+
+fn attribute_reference_message_fixture(module_directory: &str) -> CompositionAttributeRefError {
+    CompositionAttributeRefError {
+        error: AttributeParamRefError {
+            attribute: "bad".to_string(),
+            path: ReferencePath::Binding("source".to_string()),
+            kind: ModuleCallRefErrorKind::TypeMismatch {
+                expected: "String".to_string(),
+                actual: "Int".to_string(),
+                declared: None,
+            },
+        },
+        module_name: "shared".to_string(),
+        module_source: Some("../shared".to_string()),
+        module_directory: Some(std::path::PathBuf::from(module_directory)),
+        call_paths: Vec::new(),
+        reference_position: 0,
+    }
+}
+
+#[test]
+fn module_call_type_resolution_message_exposes_its_typed_source() {
+    let message = ModuleCallFindingMessage::type_resolution_for_test(
+        "module declaration".to_string(),
+        "unknown custom type 'Missing'".to_string(),
+    );
+
+    let source = std::error::Error::source(&message)
+        .expect("type-resolution findings must expose their typed source");
+    assert!(
+        source.downcast_ref::<TypeResolutionDiagnostic>().is_some(),
+        "type-resolution findings must retain TypeResolutionDiagnostic, not rendered text",
+    );
+}
+
+#[test]
+fn module_attribute_reference_message_exposes_its_typed_source() {
+    let message = ModuleCallFindingMessage::attribute_reference_for_test(
+        attribute_reference_message_fixture("/modules/one"),
+    );
+
+    let source = std::error::Error::source(&message)
+        .expect("attribute-reference findings must expose their typed source");
+    assert!(
+        source
+            .downcast_ref::<CompositionAttributeRefError>()
+            .is_some(),
+        "attribute-reference findings must retain CompositionAttributeRefError",
+    );
+}
+
+#[test]
+fn module_reference_coverage_uses_typed_call_identity_not_display_text() {
+    let source = "let child = use { source = './child' }\nchild { value = 1 }\n";
+    let first = crate::parser::parse_file(
+        source,
+        std::path::Path::new("first.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("first fixture parse");
+    let second = crate::parser::parse_file(
+        source,
+        std::path::Path::new("second.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("second fixture parse");
+    let kind = ModuleCallRefErrorKind::TypeMismatch {
+        expected: "String".to_string(),
+        actual: "Int".to_string(),
+        declared: None,
+    };
+    let path = ReferencePath::Binding("source".to_string());
+    let finding =
+        ModuleCallFindingMessage::ReferenceType(Box::new(ModuleCallReferenceDiagnostic {
+            call_label: "child".to_string(),
+            identity: ModuleCallReferenceIdentity {
+                call: first.module_calls[0].id().clone(),
+                argument: "value".to_string(),
+                path: path.clone(),
+                kind: kind.clone(),
+            },
+        }));
+    let resolver_error = ModuleCallRefError {
+        call_label: "child".to_string(),
+        identity: ModuleCallReferenceIdentity {
+            call: second.module_calls[0].id().clone(),
+            argument: "value".to_string(),
+            path,
+            kind,
+        },
+        argument_span: second.module_calls[0].source_span(),
+    };
+
+    assert_eq!(
+        finding.to_string(),
+        resolver_error.to_string(),
+        "the fixture must render identically despite distinct authored call identities",
+    );
+    assert!(
+        !finding.covers_reference_type(&resolver_error),
+        "coverage must compare ModuleCallId as part of the typed identity",
+    );
+}
+
+#[test]
+fn module_attribute_reference_dedup_uses_typed_identity_not_display_text() {
+    let first = ModuleCallFindingMessage::attribute_reference_for_test(
+        attribute_reference_message_fixture("/modules/one"),
+    );
+    let second = ModuleCallFindingMessage::attribute_reference_for_test(
+        attribute_reference_message_fixture("/modules/two"),
+    );
+
+    assert_eq!(
+        first.to_string(),
+        second.to_string(),
+        "the fixture must isolate identities that intentionally render alike",
+    );
+    assert_ne!(
+        first, second,
+        "deduplication must not merge distinct typed attribute-reference failures",
+    );
+}
+
+#[test]
+fn module_type_resolution_dedup_uses_typed_identity_not_display_text() {
+    let diagnostic = |source_file| {
+        ModuleCallFindingMessage::TypeResolution(Box::new(TypeResolutionDiagnostic::description(
+            "module declaration".to_string(),
+            "unknown custom type 'Missing'".into(),
+            Some(TypeResolutionSource::new(
+                SourceFileId::new(std::path::PathBuf::from(source_file)),
+                SourceSpan::dummy(),
+            )),
+        )))
+    };
+    let first = diagnostic("first.crn");
+    let second = diagnostic("second.crn");
+
+    assert_eq!(
+        first.to_string(),
+        second.to_string(),
+        "the fixture must isolate source identities that intentionally render alike",
+    );
+    assert_ne!(
+        first, second,
+        "deduplication must retain distinct typed type-resolution failures",
     );
 }

@@ -1117,6 +1117,10 @@ static AUGMENT_COMPARISON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
         .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
         .attribute(AttributeSchema::optional("size", AttributeType::float()).build())
         .attribute(
+            AttributeSchema::optional("items", AttributeType::list(AttributeType::string()))
+                .build(),
+        )
+        .attribute(
             AttributeSchema::optional(
                 "options",
                 AttributeType::struct_(
@@ -6045,6 +6049,12 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
         Value::Concrete(ConcreteValue::String("new".into())),
     );
     to_resource.set_attr("size", Value::Concrete(ConcreteValue::Float(1.0)));
+    to_resource.set_attr(
+        "items",
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("authored".into()),
+        )])),
+    );
     let mut desired_options = indexmap::IndexMap::new();
     desired_options.insert(
         "label".to_string(),
@@ -6065,6 +6075,13 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
         Value::Concrete(ConcreteValue::String("old".into())),
     );
     from_attrs.insert("size".to_string(), Value::Concrete(ConcreteValue::Int(1)));
+    from_attrs.insert(
+        "items".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("authored".into())),
+            Value::Concrete(ConcreteValue::String("provider-default".into())),
+        ])),
+    );
     let mut current_options = indexmap::IndexMap::new();
     current_options.insert(
         "label".to_string(),
@@ -6123,6 +6140,79 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
         .map(crate::provider::PatchOp::key)
         .collect();
     assert_eq!(patched_keys, vec!["description"]);
+}
+
+#[tokio::test]
+async fn test_apply_effective_changed_includes_resource_ref_changed_during_resolution() {
+    use crate::binding_index::BindingValueSource;
+
+    let provider = MockProvider::new();
+    let mut to_resource = Resource::with_provider("test", "a", "a", None);
+    to_resource.binding = Some("a".to_string());
+    let rid = to_resource.id.clone();
+    to_resource.set_attr(
+        "description",
+        Value::resource_ref("dependency", "description", vec![]),
+    );
+
+    let mut from_attrs = HashMap::new();
+    from_attrs.insert(
+        "description".to_string(),
+        Value::Concrete(ConcreteValue::String("old".into())),
+    );
+    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        identifier: crate::effect::fixture_applied_identifier("id-123"),
+        from: Box::new(from_state),
+        to: resolved(to_resource),
+        changed_attributes: vec![],
+    });
+    provider.push_update(Ok(ok_state(&rid)));
+
+    let mut bindings = ResolvedBindings::default();
+    bindings.set(
+        "dependency",
+        HashMap::from([(
+            "description".to_string(),
+            Value::Concrete(ConcreteValue::String("new".into())),
+        )]),
+        BindingValueSource::Local,
+    );
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings,
+        managed_current: HashMap::new(),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &AUGMENT_COMPARISON_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    assert_eq!(result.success_count, 1);
+
+    let reqs = provider.captured_update_requests();
+    assert_eq!(reqs.len(), 1);
+    let description_op = reqs[0]
+        .patch()
+        .ops
+        .iter()
+        .find(|op| op.key() == "description")
+        .expect("apply-time resolved ResourceRef must be added to the patch");
+    assert_eq!(
+        description_op.sent_value(),
+        Some(&Value::Concrete(ConcreteValue::String("new".into())))
+    );
 }
 
 #[tokio::test]
@@ -6194,10 +6284,10 @@ async fn test_apply_effective_changed_includes_updatable_and_skips_create_only_w
         .iter()
         .map(crate::provider::PatchOp::key)
         .collect();
-    assert_eq!(
-        patched_keys,
-        vec!["description", "_provider_only", "write_only_token"]
-    );
+    // Literal attributes omitted by the plan are final; only values changed
+    // by apply-time resolution are reconsidered. The ordinary write-only value
+    // is reasserted, while the create-only write-only value remains excluded.
+    assert_eq!(patched_keys, vec!["description", "write_only_token"]);
 }
 
 #[tokio::test]

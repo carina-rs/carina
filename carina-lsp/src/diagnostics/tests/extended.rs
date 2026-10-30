@@ -5412,10 +5412,10 @@ let b = consumer {
     );
     assert_eq!(
         typo_diagnostics[0].range.start.line, 7,
-        "the structured argument name should anchor the diagnostic on `arn`",
+        "the authored argument value should anchor the diagnostic",
     );
-    assert_eq!(typo_diagnostics[0].range.start.character, 2);
-    assert_eq!(typo_diagnostics[0].range.end.character, 5);
+    assert_eq!(typo_diagnostics[0].range.start.character, 8);
+    assert_eq!(typo_diagnostics[0].range.end.character, 26);
 }
 
 #[test]
@@ -5467,8 +5467,8 @@ let b = consumer {
             .collect::<Vec<_>>(),
     );
     assert_eq!(typo_diagnostics[0].range.start.line, 7);
-    assert_eq!(typo_diagnostics[0].range.start.character, 2);
-    assert_eq!(typo_diagnostics[0].range.end.character, 5);
+    assert_eq!(typo_diagnostics[0].range.start.character, 8);
+    assert_eq!(typo_diagnostics[0].range.end.character, 26);
 }
 
 fn module_boundary_identity_engine() -> DiagnosticEngine {
@@ -5571,6 +5571,97 @@ let sg = aws.ec2.SecurityGroup {
             .map(|diagnostic| &diagnostic.message)
             .collect::<Vec<_>>(),
     );
+}
+
+#[test]
+fn module_call_findings_render_parser_key_and_call_ranges() {
+    let fixture = tempfile::tempdir().expect("module-call range fixture");
+    let child = fixture.path().join("child");
+    std::fs::create_dir(&child).expect("child module directory");
+    std::fs::write(child.join("arguments.crn"), "arguments { count: Int }\n")
+        .expect("child signature");
+    let source = r#"let child = use { source = "./child" }
+child {
+  count = 1
+  surprise = true
+}
+child {}
+"#;
+    let path = fixture.path().join("calls.crn");
+    std::fs::write(&path, source).expect("root calls");
+    let doc = create_document_at(source, path.clone());
+    let parsed = doc.parsed().expect("fixture must parse");
+    let diagnostics = test_engine().analyze(&doc, Some(&path));
+
+    let unknown = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Unknown argument 'surprise'"))
+        .unwrap_or_else(|| panic!("missing unknown-argument diagnostic: {diagnostics:#?}"));
+    let unknown_span = parsed.module_calls[0]
+        .arguments_with_source_spans()
+        .find(|argument| argument.name() == "surprise")
+        .expect("surprise argument")
+        .key_span();
+    assert_eq!(
+        unknown.range,
+        parser_span_range(&doc, unknown_span).unwrap()
+    );
+    assert_eq!(unknown.severity, Some(DiagnosticSeverity::ERROR));
+
+    let missing = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Missing required argument 'count'")
+        })
+        .unwrap_or_else(|| panic!("missing required-argument diagnostic: {diagnostics:#?}"));
+    assert_eq!(
+        missing.range,
+        parser_span_range(&doc, parsed.module_calls[1].source_span()).unwrap(),
+    );
+    assert_eq!(missing.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn nested_module_call_finding_renders_on_the_root_call_range() {
+    let fixture = tempfile::tempdir().expect("nested module-call range fixture");
+    let outer = fixture.path().join("outer");
+    let inner = fixture.path().join("inner");
+    std::fs::create_dir(&outer).expect("outer module directory");
+    std::fs::create_dir(&inner).expect("inner module directory");
+    std::fs::write(outer.join("arguments.crn"), "arguments { value: String }\n")
+        .expect("outer signature");
+    std::fs::write(
+        outer.join("imports.crn"),
+        "let inner = use { source = \"../inner\" }\n",
+    )
+    .expect("inner import");
+    std::fs::write(outer.join("calls.crn"), "inner { value = value }\n").expect("nested call");
+    std::fs::write(inner.join("arguments.crn"), "arguments { value: Int }\n")
+        .expect("inner signature");
+    let source = r#"let outer = use { source = "./outer" }
+outer { value = "root" }
+"#;
+    let path = fixture.path().join("calls.crn");
+    std::fs::write(&path, source).expect("root call");
+    let doc = create_document_at(source, path.clone());
+    let parsed = doc.parsed().expect("fixture must parse");
+    let diagnostics = test_engine().analyze(&doc, Some(&path));
+
+    let nested = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("module call 'inner (anonymous call)'")
+        })
+        .unwrap_or_else(|| panic!("missing nested module-call diagnostic: {diagnostics:#?}"));
+    assert_eq!(
+        nested.range,
+        parser_span_range(&doc, parsed.module_calls[0].source_span()).unwrap(),
+    );
+    assert_eq!(nested.severity, Some(DiagnosticSeverity::ERROR));
 }
 
 #[test]
@@ -5690,15 +5781,13 @@ let first = unrelated { }
     );
     binding_input.compositions.extend([source, consumer]);
     let bindings = BindingIndex::from_parsed(&binding_input, &engine.schemas);
-    let semantic_view =
-        super::super::checks::SemanticView::for_analysis(parsed, Some(&binding_input), true);
-
-    let diagnostics = engine.check_composition_ref_types(
-        parsed,
-        &semantic_view,
-        &binding_input.compositions,
-        &bindings,
+    let findings = carina_core::validation::check_expanded_module_calls(
+        carina_core::validation::ExpandedModuleCallCheckInput::References {
+            compositions: &binding_input.compositions,
+            bindings: &bindings,
+        },
     );
+    let diagnostics = render_module_call_findings(&doc, doc.source_file(), &findings);
 
     assert!(
         diagnostics.is_empty(),
@@ -5908,7 +5997,8 @@ let broken = needs_vpc {
         .collect();
     assert_eq!(mismatches.len(), 1);
     assert_eq!(mismatches[0].range.start.line, 7);
-    assert_eq!(mismatches[0].range.start.character, 2);
+    assert_eq!(mismatches[0].range.start.character, 11);
+    assert_eq!(mismatches[0].range.end.character, 22);
 }
 
 #[test]
@@ -6001,7 +6091,8 @@ let instance = checked {
     );
     let diagnostic = matching[0];
     assert_eq!(diagnostic.range.start.line, 3);
-    assert_eq!(diagnostic.range.start.character, 2);
+    assert_eq!(diagnostic.range.start.character, 9);
+    assert_eq!(diagnostic.range.end.character, 11);
 }
 
 #[test]
@@ -6296,7 +6387,7 @@ let b = selector { items = ['x', 'y'] }\n";
 }
 
 #[test]
-fn heredoc_argument_type_diagnostic_anchors_the_argument_key() {
+fn heredoc_argument_type_diagnostic_anchors_the_argument_value() {
     let main = r#"let m = use { source = './m' }
 let inst = m {
   enabled = <<EOT
@@ -6320,8 +6411,8 @@ EOT
 
     assert_eq!(
         diagnostic.range,
-        Range::new(Position::new(2, 2), Position::new(2, 9)),
-        "type mismatches must underline the argument key"
+        Range::new(Position::new(2, 12), Position::new(4, 3)),
+        "type mismatches must underline the authored argument value"
     );
 }
 
@@ -6366,7 +6457,7 @@ fn nested_bare_handle_diagnostic_is_anchored_at_the_root_call() {
 
     assert_eq!(
         diagnostic.range,
-        Range::new(Position::new(1, 0), Position::new(1, 1)),
+        Range::new(Position::new(1, 0), Position::new(1, 4)),
         "the root call must own a failure raised inside its imported module"
     );
 }
@@ -6389,7 +6480,7 @@ fn resolver_diagnostic_uses_explicit_current_file_path() {
 
     assert_eq!(
         diagnostic.range,
-        Range::new(Position::new(1, 0), Position::new(1, 1))
+        Range::new(Position::new(1, 0), Position::new(1, 4))
     );
 }
 
@@ -6420,6 +6511,68 @@ fn explicit_current_file_does_not_anchor_sibling_with_identical_span() {
         "a sibling failure must not be anchored on a different current file: \
          {diagnostics:#?}"
     );
+}
+
+#[test]
+fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call() {
+    let engine = test_engine();
+    let fixture = tempfile::tempdir().expect("resolver ownership fixture");
+    let source = "let missing = use { source = './missing' }\nmissing {}\n";
+    std::fs::write(fixture.path().join("main.crn"), source).expect("root source");
+
+    let path = fixture.path().join("main.crn");
+    let document = create_document_at(source, path.clone());
+    let resolver_input = document.parsed().expect("root parse").clone();
+    let report = carina_core::module_resolver::resolve_modules_with_diagnostics(
+        &resolver_input,
+        fixture.path(),
+        &engine.provider_context,
+        &engine.schemas,
+        &[],
+    );
+    let residuals = match report {
+        carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
+            panic!(
+                "missing module unexpectedly expanded to {} compositions",
+                graph.compositions.len()
+            )
+        }
+        carina_core::module_resolver::ModuleResolutionDiagnosticResult::ConstraintFailed {
+            findings,
+            errors,
+        } => panic!(
+            "unexpected constraint outcome: {} findings and {} residuals",
+            findings.len(),
+            errors.len()
+        ),
+        carina_core::module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors } => {
+            errors
+        }
+    };
+    let residual = residuals
+        .first()
+        .expect("resolver fixture must retain the uncovered nested call error");
+    assert!(
+        matches!(
+            residual.diagnostic(),
+            Some(carina_core::module_resolver::ResidualModuleResolutionDiagnostic::ModuleCall)
+        ),
+        "unexpected residual: {}",
+        residual.display_relative_to(fixture.path()),
+    );
+    let diagnostics = engine.analyze(&document, Some(&path));
+    let fallback = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("IO error: No such file or directory")
+        })
+        .unwrap_or_else(|| panic!("missing resolver fallback: {diagnostics:#?}"));
+
+    assert_eq!(fallback.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(fallback.range.start.line, 1);
+    assert_eq!(fallback.range.start.character, 0);
 }
 
 #[test]
@@ -6545,8 +6698,8 @@ fn multifile_sibling_let_violating_module_constraint_has_one_lsp_diagnostic() {
     );
     assert_eq!(
         matching[0].range,
-        Range::new(Position::new(3, 2), Position::new(3, 6)),
-        "an authored argument constraint must underline its key"
+        Range::new(Position::new(3, 9), Position::new(3, 10)),
+        "an authored argument constraint must underline its value"
     );
 }
 
@@ -6897,7 +7050,8 @@ let web2 = issue {
         mismatch.range.start.line, 11,
         "the structured call label must anchor the second call, not the first",
     );
-    assert_eq!(mismatch.range.start.character, 2);
+    assert_eq!(mismatch.range.start.character, 11);
+    assert_eq!(mismatch.range.end.character, 32);
 }
 
 #[test]
@@ -6931,7 +7085,7 @@ checked {
         .filter(|diagnostic| {
             diagnostic
                 .message
-                .contains("module call 'checked': argument 'vpc_id'")
+                .contains("module call 'checked (anonymous call)': argument 'vpc_id'")
                 && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
                 && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
         })
@@ -6944,8 +7098,8 @@ checked {
             .map(|diagnostic| diagnostic.range)
             .collect::<Vec<_>>(),
         vec![
-            Range::new(Position::new(7, 2), Position::new(7, 8)),
-            Range::new(Position::new(11, 2), Position::new(11, 8)),
+            Range::new(Position::new(7, 11), Position::new(7, 22)),
+            Range::new(Position::new(11, 11), Position::new(11, 22)),
         ],
     );
 }
@@ -6991,7 +7145,7 @@ let instance = checked {
     assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
     assert_eq!(
         matching[0].range,
-        Range::new(Position::new(6, 15), Position::new(6, 22)),
+        Range::new(Position::new(6, 15), Position::new(8, 1)),
         "a defaulted argument has no authored key, so the call must own the diagnostic",
     );
 }
@@ -7068,7 +7222,8 @@ let b = needs_vpc {
             .collect::<Vec<_>>(),
     );
     assert_eq!(mismatches[0].range.start.line, 12);
-    assert_eq!(mismatches[0].range.start.character, 2);
+    assert_eq!(mismatches[0].range.start.character, 11);
+    assert_eq!(mismatches[0].range.end.character, 18);
 }
 
 struct NestedModuleCallLspFixture {
@@ -7209,7 +7364,7 @@ fn annotated_nested_module_call_is_reported_when_root_module_is_opened() {
 }
 
 #[test]
-fn annotated_nested_mismatches_anchor_each_anonymous_root_call_fallback() {
+fn annotated_nested_mismatches_keep_each_root_call_owner() {
     let engine = module_boundary_identity_engine();
     let fixture = nested_module_call_lsp_fixture(": aws.ec2.SecurityGroup.Id");
     let root_source = r#"let outer = use { source = '../outer' }
@@ -7245,8 +7400,8 @@ outer {
             .map(|diagnostic| diagnostic.range)
             .collect::<Vec<_>>(),
         vec![
-            Range::new(Position::new(6, 0), Position::new(6, 5)),
-            Range::new(Position::new(10, 0), Position::new(10, 5)),
+            Range::new(Position::new(6, 0), Position::new(8, 1)),
+            Range::new(Position::new(10, 0), Position::new(12, 1)),
         ],
     );
 }
@@ -11219,7 +11374,7 @@ exports {
 }
 
 #[test]
-fn one_line_module_call_type_mismatch_is_anchored_to_argument_key() {
+fn one_line_module_call_type_mismatch_is_anchored_to_argument_value() {
     let main = "let m = use { source = './m' }\n\
 let inst = m { n = 'abc' label = 'x' }\n";
     let temp = write_tag_key_fixture(&[
@@ -11241,7 +11396,7 @@ let inst = m { n = 'abc' label = 'x' }\n";
     assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
     assert_eq!(
         matching[0].range,
-        Range::new(Position::new(1, 15), Position::new(1, 16))
+        Range::new(Position::new(1, 19), Position::new(1, 24))
     );
 }
 
@@ -11258,7 +11413,7 @@ let inst = m { n = 1 label = 'x' nn = 2 }\n";
     let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
     let matching = diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .filter(|diagnostic| diagnostic.message.contains("Unknown argument 'nn'"))
         .collect::<Vec<_>>();
 
     assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
@@ -11285,14 +11440,14 @@ let second = m { n = 2 }\n";
         .filter(|diagnostic| {
             diagnostic
                 .message
-                .contains("Missing required parameter 'label'")
+                .contains("Missing required argument 'label'")
         })
         .collect::<Vec<_>>();
 
     assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
     assert_eq!(
         matching[0].range,
-        Range::new(Position::new(2, 13), Position::new(2, 14))
+        Range::new(Position::new(2, 13), Position::new(2, 24))
     );
 }
 
@@ -11320,19 +11475,19 @@ m { label = 'x' }\n";
         .filter(|diagnostic| {
             diagnostic
                 .message
-                .contains("Missing required parameter 'label'")
+                .contains("Missing required argument 'label'")
         })
         .collect::<Vec<_>>();
 
     assert_eq!(mismatch.len(), 1, "diagnostics: {diagnostics:#?}");
     assert_eq!(
         mismatch[0].range,
-        Range::new(Position::new(1, 4), Position::new(1, 5))
+        Range::new(Position::new(1, 8), Position::new(1, 13))
     );
     assert_eq!(missing_label.len(), 1, "diagnostics: {diagnostics:#?}");
     assert_eq!(
         missing_label[0].range,
-        Range::new(Position::new(1, 0), Position::new(1, 1))
+        Range::new(Position::new(1, 0), Position::new(1, 15))
     );
     assert_ne!(missing_label[0].range.start.line, 0);
 }
@@ -11357,7 +11512,7 @@ EOT
     let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "calls.crn", calls);
     let unknown = diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .filter(|diagnostic| diagnostic.message.contains("Unknown argument 'nn'"))
         .collect::<Vec<_>>();
 
     assert_eq!(unknown.len(), 1, "diagnostics: {diagnostics:#?}");
@@ -11381,14 +11536,14 @@ fn issue_3859_module_call_diagnostics_stay_in_the_owning_sibling_file() {
     assert!(
         main_diagnostics
             .iter()
-            .all(|diagnostic| !diagnostic.message.contains("Unknown parameter 'nn'")),
+            .all(|diagnostic| !diagnostic.message.contains("Unknown argument 'nn'")),
         "main.crn diagnostics: {main_diagnostics:#?}"
     );
 
     let call_diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "calls.crn", calls);
     let unknown = call_diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .filter(|diagnostic| diagnostic.message.contains("Unknown argument 'nn'"))
         .collect::<Vec<_>>();
     assert_eq!(unknown.len(), 1, "diagnostics: {call_diagnostics:#?}");
     assert_eq!(
@@ -11419,14 +11574,14 @@ let inst = m { nn = 1 }
     let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
     let unknown = diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .find(|diagnostic| diagnostic.message.contains("Unknown argument 'nn'"))
         .unwrap_or_else(|| panic!("missing unknown-parameter diagnostic: {diagnostics:#?}"));
     let missing = diagnostics
         .iter()
         .find(|diagnostic| {
             diagnostic
                 .message
-                .contains("Missing required parameter 'label'")
+                .contains("Missing required argument 'label'")
         })
         .unwrap_or_else(|| panic!("missing required-parameter diagnostic: {diagnostics:#?}"));
 
@@ -11436,7 +11591,7 @@ let inst = m { nn = 1 }
     );
     assert_eq!(
         missing.range,
-        Range::new(Position::new(9, 11), Position::new(9, 12))
+        Range::new(Position::new(9, 11), Position::new(9, 23))
     );
 }
 
@@ -11477,14 +11632,14 @@ for x in ['a', 'b', 'c'] {
     let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
     let unknown = diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.message.contains("Unknown parameter 'nn'"))
+        .filter(|diagnostic| diagnostic.message.contains("Unknown argument 'nn'"))
         .collect::<Vec<_>>();
     let missing = diagnostics
         .iter()
         .filter(|diagnostic| {
             diagnostic
                 .message
-                .contains("Missing required parameter 'label'")
+                .contains("Missing required argument 'label'")
         })
         .collect::<Vec<_>>();
 
@@ -11496,7 +11651,7 @@ for x in ['a', 'b', 'c'] {
     );
     assert_eq!(
         missing[0].range,
-        Range::new(Position::new(2, 2), Position::new(2, 3))
+        Range::new(Position::new(2, 2), Position::new(2, 14))
     );
 }
 
@@ -11814,7 +11969,9 @@ inner {
     let diagnostics = analyze_with_buffer(&engine, temp.path(), "main.crn", main);
     assert!(
         diagnostics.iter().any(|diagnostic| {
-            diagnostic.message.contains("module call 'inner'")
+            diagnostic
+                .message
+                .contains("module call 'inner (anonymous call)'")
                 && diagnostic.message.contains("expected Int")
                 && diagnostic.message.contains("got String")
         }),

@@ -1,0 +1,67 @@
+{
+  "version": 10,
+  "serial": 1,
+  "lineage": "server-added-list-elements",
+  "carina_version": "0.4.0",
+  "resources": [
+    {
+      "resource_type": "test.server_added_list",
+      "identity": "mock_test_server_added_list_e646b73c",
+      "provider": "mock",
+      "identifier": "mock-id",
+      "attributes": {
+        "name": "target",
+        "target_group_attributes": [
+          {
+            "key": "deregistration_delay.timeout_seconds",
+            "value": "60"
+          },
+          {
+            "key": "stickiness.type",
+            "value": "lb_cookie"
+          },
+          {
+            "key": "load_balancing.algorithm.type",
+            "value": "round_robin"
+          }
+        ]
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": null,
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          },
+          "target_group_attributes": {
+            "kind": "list-elements",
+            "elements": [
+              {
+                "kind": "struct",
+                "children": {
+                  "key": {
+                    "kind": "leaf"
+                  },
+                  "value": {
+                    "kind": "leaf"
+                  }
+                }
+              },
+              {
+                "kind": "unrecorded"
+              },
+              {
+                "kind": "unrecorded"
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

@@ -130,6 +130,7 @@ pub(super) fn parse_let_binding_extended(
     ),
     ParseError,
 > {
+    let source_span = crate::parser::SourceSpan::from_pest(&pair, preprocessed_file);
     let mut inner = pair.into_inner();
     let name = next_pair(&mut inner, "binding name", "let binding")?
         .as_str()
@@ -140,7 +141,7 @@ pub(super) fn parse_let_binding_extended(
     // grammar permits it here and only here (see carina.pest); everywhere
     // else it is a parse error.
     if rhs_pair.as_rule() == Rule::use_expr {
-        let use_stmt = parse_use_expr(rhs_pair, &name, ctx)?;
+        let use_stmt = parse_use_expr(rhs_pair, &name, ctx, source_span, source_file)?;
         let value =
             EvalValue::structural_handle(StructuralHandle::new(StructuralHandleKind::Use, &name));
         return Ok((

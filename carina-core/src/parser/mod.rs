@@ -57,7 +57,7 @@ pub(crate) use entry::{
 };
 pub use error::{
     ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
-    WarningKind,
+    UnresolvedTypeToken, WarningKind,
 };
 pub(crate) use expressions::string_literal::{
     display_double_quoted_literal_part, escape_double_quoted_character, unescape_string,

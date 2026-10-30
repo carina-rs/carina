@@ -798,13 +798,13 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     );
                 }
             };
-            match super::dispatch_create(provider, &resource.id, CreateRequest::checked(resolved))
-                .await
-            {
+            let request = CreateRequest::checked(resolved);
+            let accepted_request = AcceptedRequest::from_create_request(&request)
+                .with_resolved_desired_attributes(resolved_attrs.clone());
+            match super::dispatch_create(provider, &resource.id, request).await {
                 Ok(outcome) => {
                     let (state, request, diagnostic) =
-                        super::complete_create_for_writeback(outcome);
-                    let request = request.with_resolved_desired_attributes(resolved_attrs.clone());
+                        super::complete_create_for_writeback(outcome, accepted_request);
                     if let Some(diagnostic) = diagnostic {
                         BasicEffectResult::PartialSuccess {
                             completed: CompletedEffect {
@@ -893,8 +893,10 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     );
                 }
             };
-            let request = match ResumeCreateRequest::new(pending, CreateRequest::checked(resolved))
-            {
+            let create_request = CreateRequest::checked(resolved);
+            let accepted_request = AcceptedRequest::from_create_request(&create_request)
+                .with_resolved_desired_attributes(resolved_attrs.clone());
+            let request = match ResumeCreateRequest::new(pending, create_request) {
                 Ok(request) => request,
                 Err(error) => {
                     let error = error.to_string();
@@ -924,8 +926,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 }
                 Ok(ResumeOutcomeKind::Resent(outcome)) => {
                     let (state, request, diagnostic) =
-                        super::complete_create_for_writeback(*outcome);
-                    let request = request.with_resolved_desired_attributes(resolved_attrs.clone());
+                        super::complete_create_for_writeback(*outcome, accepted_request);
                     if let Some(diagnostic) = diagnostic {
                         BasicEffectResult::PartialSuccess {
                             completed: CompletedEffect {
@@ -1041,6 +1042,14 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             };
             for (key, new_value) in &resolved_resource.attributes {
                 if effective_changed.iter().any(|k| k == key) {
+                    continue;
+                }
+                // The plan already decided literal attributes. Reconsider a
+                // key only when resolution or provider normalization changed
+                // its desired value at apply time; otherwise raw provider
+                // defaults could turn an unrelated saved-plan update into a
+                // wider patch than the plan authorized.
+                if resolve_source.attributes.get(key) == Some(new_value) {
                     continue;
                 }
                 let type_info = schema.attributes.get(key).map(|attr| TypedAttr {
@@ -1230,7 +1239,8 @@ mod process_basic_result_tests {
 
     #[test]
     fn partial_success_records_state_and_diagnostic() {
-        let id = ResourceId::with_provider_identity("mock", "test.resource", "r1", None);
+        let resource = Resource::with_provider("mock", "test.resource", "r1", None);
+        let id = resource.id.clone();
         let state = State::existing(id.clone(), HashMap::new()).with_identifier("mock-id");
         let diagnostic = PartialReadDiagnostic::new(
             "mock partial create".to_string(),
@@ -1252,7 +1262,7 @@ mod process_basic_result_tests {
             BasicEffectResult::PartialSuccess {
                 completed: CompletedEffect {
                     state: Box::new(writeback_state),
-                    request: AcceptedRequest::create(),
+                    request: AcceptedRequest::create_for_test(),
                 },
                 resource_id: id.clone(),
                 diagnostic: diagnostic.clone(),

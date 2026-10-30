@@ -707,6 +707,14 @@ pub enum AppError {
     #[error(transparent)]
     BindingUseReport(Box<carina_core::validation::BindingUseReport>),
 
+    /// One core-owned module-call finding at its parser-authored location.
+    #[error(transparent)]
+    ModuleCall(Box<carina_core::validation::ModuleCallFinding>),
+
+    /// A type-resolution failure without parser location metadata.
+    #[error(transparent)]
+    TypeResolution(Box<carina_core::validation::TypeResolutionDiagnostic>),
+
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]
     Validation(String),

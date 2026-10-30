@@ -5732,12 +5732,9 @@ fn merge_lists(
     // cannot transfer a pending nested removal to a uniquely identified list
     // element. Merging individual saved elements here would fill the removed
     // child back in and hide the very diff the fallback represents.
-    let aligned_elements = match prior_explicit {
+    let stored_elements = match prior_explicit {
         ExplicitFields::WholeValue { .. } => return desired.to_vec(),
-        ExplicitFields::ListElements { elements }
-            if elements.len() == projected_saved.len()
-                && raw_saved.len() == projected_saved.len() =>
-        {
+        ExplicitFields::ListElements { elements } if elements.len() == raw_saved.len() => {
             Some(elements)
         }
         ExplicitFields::Leaf
@@ -5750,6 +5747,16 @@ fn merge_lists(
     let item_type = list_element_type(attr_type, defs);
     let projected_pairs = pair_list_elements(desired, projected_saved, item_type, defs);
     let raw_pairs = pair_list_elements(desired, raw_saved, item_type, defs);
+    let projected_origins = if projected_saved.len() == raw_saved.len() {
+        // Projection preserves order when it retains every stored element.
+        // Keeping the direct index mapping also preserves the established
+        // conservative behavior for indistinguishable duplicate peers.
+        (0..projected_saved.len())
+            .map(ListElementPairing::Unique)
+            .collect()
+    } else {
+        pair_list_elements_with_uniqueness(projected_saved, raw_saved, item_type, defs)
+    };
 
     projected_pairs
         .into_iter()
@@ -5759,15 +5766,28 @@ fn merge_lists(
             |(desired_index, (projected_index, raw_index))| match projected_index {
                 Some(projected_index) => {
                     // Writeback assigned `elements` using raw-list pairing, while the legacy value
-                    // merge pairs against the projected list. Only matching indices corroborate the
-                    // authored claim; disagreement is uncertainty and must stay conservative.
-                    let authoring = aligned_elements
-                        .filter(|_| raw_index == Some(projected_index))
-                        .map(|elements| &elements[projected_index])
+                    // merge pairs against a projection that may have removed server-added
+                    // elements. Resolve the projected element back to its stored index and require
+                    // the independent raw pairing to corroborate that identity. Ambiguity or
+                    // disagreement is uncertainty and must stay conservative.
+                    let stored_index = match projected_origins[projected_index] {
+                        ListElementPairing::Unique(stored_index)
+                            if raw_index == Some(stored_index) =>
+                        {
+                            Some(stored_index)
+                        }
+                        ListElementPairing::Unique(_)
+                        | ListElementPairing::Ambiguous
+                        | ListElementPairing::Unmatched => None,
+                    };
+                    let authoring = stored_index
+                        .and_then(|stored_index| {
+                            stored_elements.map(|elements| &elements[stored_index])
+                        })
                         .unwrap_or(&ExplicitFields::Unrecorded);
                     let projected_value = &projected_saved[projected_index];
-                    let saved_views = raw_saved
-                        .get(projected_index)
+                    let saved_views = stored_index
+                        .and_then(|stored_index| raw_saved.get(stored_index))
                         .map(|raw_value| SavedValueViews::new(projected_value, raw_value))
                         .unwrap_or_else(|| SavedValueViews::same(projected_value));
                     merge_with_saved(

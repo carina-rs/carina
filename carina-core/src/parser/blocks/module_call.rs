@@ -47,6 +47,7 @@ pub(crate) fn parse_module_call(
             let mode = ExpressionMode::module_argument(
                 call_id.clone(),
                 key.clone(),
+                value_source_span,
                 source_file,
                 preprocessed_file,
                 StructuralSinkMode::DirectHandle,
