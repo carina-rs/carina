@@ -3034,3 +3034,75 @@ fn find_changed_attributes_unrecorded_prev_explicit_still_detects_real_drift() {
         "real drift under `Unrecorded` must still be reported"
     );
 }
+
+#[test]
+fn find_changed_attributes_keeps_legacy_unrecorded_list_element_still_in_desired() {
+    let route_table_ids = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::String("rtb-1".into()),
+    )]));
+    let desired = HashMap::from([("route_table_ids".to_string(), route_table_ids.clone())]);
+    let current = desired.clone();
+    let saved = desired.clone();
+    let prev_explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "route_table_ids".to_string(),
+            ExplicitFields::ListElements {
+                elements: vec![ExplicitFields::Unrecorded],
+            },
+        )]),
+    };
+
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        Some(&saved),
+        &NestedWriteOnlyRecord::new(),
+        Some(&prev_explicit),
+        None,
+    );
+
+    assert!(
+        changed.is_empty(),
+        "a desired element is authored even when legacy state recorded it as Unrecorded: {changed:?}"
+    );
+}
+
+#[test]
+fn find_changed_attributes_keeps_nested_legacy_unrecorded_list_element_in_desired() {
+    let network = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "route_table_ids".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("rtb-1".into()),
+        )])),
+    )])));
+    let desired = HashMap::from([("network".to_string(), network)]);
+    let current = desired.clone();
+    let saved = desired.clone();
+    let prev_explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "network".to_string(),
+            ExplicitFields::Struct {
+                children: HashMap::from([(
+                    "route_table_ids".to_string(),
+                    ExplicitFields::ListElements {
+                        elements: vec![ExplicitFields::Unrecorded],
+                    },
+                )]),
+            },
+        )]),
+    };
+
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        Some(&saved),
+        &NestedWriteOnlyRecord::new(),
+        Some(&prev_explicit),
+        None,
+    );
+
+    assert!(
+        changed.is_empty(),
+        "desired matching must reach nested ListElements records recursively: {changed:?}"
+    );
+}
