@@ -869,7 +869,12 @@ pub(super) fn find_changed_attributes(
     let raw_saved = saved;
     let empty_stored = HashMap::new();
     let projection = prev_explicit.map(|explicit| {
-        ExplicitProjection::new(raw_saved.unwrap_or(&empty_stored), explicit, schema)
+        ExplicitProjection::for_desired(
+            raw_saved.unwrap_or(&empty_stored),
+            desired,
+            explicit,
+            schema,
+        )
     });
     let projected_current = projection.as_ref().map_or_else(
         || current.clone(),
