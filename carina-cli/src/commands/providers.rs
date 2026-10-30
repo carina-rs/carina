@@ -275,7 +275,7 @@ fn run_rebootstrap(provider: &str, force: bool, base_dir: &Path) -> Result<(), A
         .map_err(|error| AppError::Config(error.to_string()))?;
     save_lock(&mut lock)?;
     println!(
-        "Registry freshness reset. Run `{}` to establish a new first-contact anchor.",
+        "Registry freshness reset. Run `{}` to establish a new reference point (or record that the registry serves no sequence).",
         ProjectCommand::new("init", base_dir)
     );
     Ok(())

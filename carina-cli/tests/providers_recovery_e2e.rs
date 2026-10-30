@@ -1038,6 +1038,13 @@ fn rebootstrap_prints_and_clears_both_freshness_values_only() {
     assert!(stderr.contains("Discarding sequence anchor: 5"), "{stderr}");
     assert!(!stdout.contains("Discarding"), "{stdout}");
     assert!(!stdout.contains("Enter provider source"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Registry freshness reset. Run `{}` to establish a new reference point (or record that the registry serves no sequence).",
+            ProjectCommand::new("init", dir.path())
+        )),
+        "{stdout}"
+    );
 
     let lock_path = dir.path().join("carina-providers.lock");
     carina_provider_resolver::LockFile::load(dir.path())

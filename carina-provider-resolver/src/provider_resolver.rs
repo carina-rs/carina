@@ -1761,10 +1761,6 @@ fn sequence_anchor_to_wire(anchor: RegistrySequenceAnchor) -> (bool, bool, Optio
     }
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 fn validate_sequence_anchor(
     sequence: &RegistrySequence,
     anchor: RegistrySequenceAnchor,
@@ -1907,7 +1903,7 @@ struct RegistryLockSerde {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sequence: Option<u64>,
     sequence_anchor_established: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     sequence_anchor_reset_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sequence_anchor: Option<u64>,
@@ -2523,19 +2519,6 @@ struct UncheckedLockFile {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct UncheckedLockFileV4 {
-    #[serde(rename = "version")]
-    _version: u32,
-    #[serde(default)]
-    registry_host: BTreeMap<String, RegistryHostLock>,
-    #[serde(default)]
-    provider: Vec<LockEntry<RegistryLockV4>>,
-    #[serde(default)]
-    unpinned_registry_ratchets: UnpinnedRegistryRatchets,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct UncheckedLockFileV3 {
     #[serde(rename = "version")]
     _version: u32,
@@ -2617,39 +2600,6 @@ struct RegistryLockV3 {
     certificate_identity: Option<String>,
     #[serde(default)]
     certificate_oidc_issuer: Option<String>,
-    transparency_log_present: bool,
-}
-
-/// The pinned registry shape used by lock format v4. v5 adds the typed
-/// reset-pending anchor marker while preserving every v4 field unchanged.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RegistryLockV4 {
-    resolved_hostname: CanonicalRegistryHostname,
-    sequence_present: bool,
-    #[serde(default)]
-    sequence: Option<u64>,
-    sequence_anchor_established: bool,
-    #[serde(default)]
-    sequence_anchor: Option<u64>,
-    valid_until_present: bool,
-    #[serde(default)]
-    yanked_versions: BTreeSet<String>,
-    signature_state: RegistrySignatureStateSerde,
-    #[serde(default)]
-    legacy_certificate_identity: Option<String>,
-    #[serde(default)]
-    legacy_certificate_oidc_issuer: Option<String>,
-    #[serde(default)]
-    source_oidc_issuer: Option<String>,
-    #[serde(default)]
-    source_repository_owner_id: Option<String>,
-    #[serde(default)]
-    source_repository_id: Option<String>,
-    #[serde(default)]
-    stable_workflow: Option<String>,
-    #[serde(default)]
-    prerelease_workflow: Option<String>,
     transparency_log_present: bool,
 }
 
@@ -2851,33 +2801,6 @@ impl TryFrom<RegistryLockV3> for RegistryLock {
     }
 }
 
-impl TryFrom<RegistryLockV4> for RegistryLock {
-    type Error = RegistryLockError;
-
-    fn try_from(value: RegistryLockV4) -> Result<Self, Self::Error> {
-        RegistryLockSerde {
-            resolved_hostname: value.resolved_hostname,
-            sequence_present: value.sequence_present,
-            sequence: value.sequence,
-            sequence_anchor_established: value.sequence_anchor_established,
-            sequence_anchor_reset_pending: false,
-            sequence_anchor: value.sequence_anchor,
-            valid_until_present: value.valid_until_present,
-            yanked_versions: value.yanked_versions,
-            signature_state: value.signature_state,
-            legacy_certificate_identity: value.legacy_certificate_identity,
-            legacy_certificate_oidc_issuer: value.legacy_certificate_oidc_issuer,
-            source_oidc_issuer: value.source_oidc_issuer,
-            source_repository_owner_id: value.source_repository_owner_id,
-            source_repository_id: value.source_repository_id,
-            stable_workflow: value.stable_workflow,
-            prerelease_workflow: value.prerelease_workflow,
-            transparency_log_present: value.transparency_log_present,
-        }
-        .try_into()
-    }
-}
-
 impl TryFrom<RegistryRatchetsV3> for RegistryRatchets {
     type Error = RegistryLockError;
 
@@ -2898,23 +2821,6 @@ impl TryFrom<RegistryRatchetsV3> for RegistryRatchets {
 
 fn migrate_v3_provider_entries(
     entries: Vec<LockEntry<RegistryLockV3>>,
-) -> Result<Vec<LockEntry<RegistryLock>>, RegistryLockError> {
-    entries
-        .into_iter()
-        .map(|entry| {
-            Ok(LockEntry {
-                name: entry.name,
-                source: entry.source,
-                kind: entry.kind,
-                sha256: entry.sha256,
-                registry: entry.registry.map(TryInto::try_into).transpose()?,
-            })
-        })
-        .collect()
-}
-
-fn migrate_v4_provider_entries(
-    entries: Vec<LockEntry<RegistryLockV4>>,
 ) -> Result<Vec<LockEntry<RegistryLock>>, RegistryLockError> {
     entries
         .into_iter()
@@ -3092,6 +2998,11 @@ impl LockFileMigration {
                     f,
                     "Migration found no v{} discovery pins requiring operator authorization.",
                     self.from
+                )?;
+            } else if self.from == 4 && self.to == 5 {
+                writeln!(
+                    f,
+                    "Version 5 adds only the optional reset-pending sequence-anchor marker; existing v4 lock state is unchanged."
                 )?;
             } else if self.from < self.to {
                 writeln!(
@@ -3859,26 +3770,25 @@ impl LockFile {
                 }
             }
             4 => {
-                let legacy: UncheckedLockFileV4 = parse_lock_table(&table, path)?;
-                let registry_host = canonicalize_registry_host_keys(legacy.registry_host, path)?;
-                let provider = migrate_v4_provider_entries(legacy.provider).map_err(|error| {
-                    LockFileError::InvalidRegistryState {
+                let unchecked: UncheckedLockFile = parse_lock_table(&table, path)?;
+                if let Some(entry) = unchecked.provider.iter().find(|entry| {
+                    entry.registry.as_ref().is_some_and(|registry| {
+                        registry.sequence_anchor == RegistrySequenceAnchor::ResetPending
+                    })
+                }) {
+                    return Err(LockFileError::InvalidRegistryState {
                         path: path.to_path_buf(),
-                        detail: error.to_string(),
-                    }
-                })?;
+                        detail: format!(
+                            "lock format v4 cannot contain a reset-pending sequence anchor for provider {:?}",
+                            entry.source
+                        ),
+                    });
+                }
                 let legacy_sources = legacy_entries
                     .iter()
                     .map(|entry| entry.source.clone())
                     .collect();
-                let lock_file = Self::from_parts(
-                    registry_host,
-                    provider,
-                    legacy.unpinned_registry_ratchets,
-                    legacy_entries,
-                    path,
-                    project_dir,
-                )?;
+                let lock_file = Self::from_unchecked(unchecked, legacy_entries, path, project_dir)?;
                 Ok(LoadedLockFile::Migrated {
                     lock_file,
                     migration: LockFileMigration {
@@ -4370,10 +4280,9 @@ impl LockFile {
     }
 
     #[cfg(test)]
-    fn registry_sequence_anchor(&self, source: &str) -> RegistrySequenceAnchor {
+    fn registry_sequence_anchor(&self, source: &str) -> Option<RegistrySequenceAnchor> {
         self.find_registry_by_source(source)
             .map(|registry| registry.sequence_anchor)
-            .unwrap_or(RegistrySequenceAnchor::Unestablished)
     }
 
     fn attach_unpinned_registry_ratchets(
@@ -13656,6 +13565,17 @@ sha256 = "abc"
 
         assert_eq!(migration.from, 4);
         assert_eq!(migration.to, 5);
+        let report = migration.to_string();
+        assert!(
+            report.contains(
+                "Version 5 adds only the optional reset-pending sequence-anchor marker; existing v4 lock state is unchanged."
+            ),
+            "{report}"
+        );
+        assert!(
+            !report.contains("legacy signer pin remains gated until verified conversion"),
+            "{report}"
+        );
         let registry = lock_file.provider[0].registry.as_ref().unwrap();
         assert_eq!(registry.sequence, RegistrySequence::Present(7));
         assert_eq!(
@@ -13677,12 +13597,16 @@ sha256 = "abc"
         let error = LockFile::from_toml_str(&mislabeled, Path::new("carina-providers.lock"))
             .expect_err("the v5 reset marker must not be accepted under a v4 header");
 
-        assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
         assert!(
-            error.to_string().contains("sequence_anchor_reset_pending"),
+            matches!(error, LockFileError::InvalidRegistryState { .. }),
             "{error}"
         );
-        assert!(error.to_string().contains("unknown field"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("lock format v4 cannot contain a reset-pending sequence anchor"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -15864,7 +15788,7 @@ transparency_log_present = false
         );
         assert_eq!(
             lock.registry_sequence_anchor("carina-rs/aws"),
-            RegistrySequenceAnchor::Established(5)
+            Some(RegistrySequenceAnchor::Established(5))
         );
         let after_entry = lock.find_by_source("carina-rs/aws").unwrap();
         assert_eq!(after_entry.sha256, before_entry.sha256);
@@ -16259,7 +16183,7 @@ transparency_log_present = false
         assert!(ratchets.transparency_log_present);
         assert_eq!(
             lock.registry_sequence_anchor("carina-rs/aws"),
-            RegistrySequenceAnchor::ResetPending
+            Some(RegistrySequenceAnchor::ResetPending)
         );
         let after_entry = lock.find_by_source("carina-rs/aws").unwrap();
         assert_eq!(after_entry.sha256, before_entry.sha256);
@@ -16273,7 +16197,7 @@ transparency_log_present = false
         );
         assert_eq!(
             reloaded.registry_sequence_anchor("carina-rs/aws"),
-            RegistrySequenceAnchor::ResetPending
+            Some(RegistrySequenceAnchor::ResetPending)
         );
     }
 
@@ -16319,7 +16243,7 @@ transparency_log_present = false
         assert_eq!(after.sequence, RegistrySequence::Absent);
         assert_eq!(
             lock.registry_sequence_anchor("carina-rs/aws"),
-            RegistrySequenceAnchor::ResetPending
+            Some(RegistrySequenceAnchor::ResetPending)
         );
         let validated = ValidatedRegistryListing::validate(
             &source,
@@ -16561,7 +16485,7 @@ transparency_log_present = false
         );
         assert_eq!(
             lock.registry_sequence_anchor("carina-rs/aws"),
-            RegistrySequenceAnchor::ResetPending
+            Some(RegistrySequenceAnchor::ResetPending)
         );
 
         lock.save(&lock_path).unwrap();
@@ -16581,7 +16505,7 @@ transparency_log_present = false
         );
         assert_eq!(
             reloaded.registry_sequence_anchor("carina-rs/aws"),
-            RegistrySequenceAnchor::ResetPending
+            Some(RegistrySequenceAnchor::ResetPending)
         );
         assert_eq!(
             reloaded.registry_sequence_previous_state("carina-rs/aws"),
@@ -16619,10 +16543,7 @@ transparency_log_present = false
             lock.known_registry_ratchets(source).unwrap().sequence,
             RegistrySequence::Absent
         );
-        assert_eq!(
-            lock.registry_sequence_anchor(source),
-            RegistrySequenceAnchor::Unestablished
-        );
+        assert_eq!(lock.registry_sequence_anchor(source), None);
 
         lock.save(&lock_path).unwrap();
         let saved = fs::read_to_string(&lock_path).unwrap();
@@ -18339,7 +18260,7 @@ transparency_log_present = true
             .unwrap()
     }
 
-    fn saved_registry_sequence_anchor(base_dir: &Path) -> RegistrySequenceAnchor {
+    fn saved_registry_sequence_anchor(base_dir: &Path) -> Option<RegistrySequenceAnchor> {
         let lock_path = base_dir.join("carina-providers.lock");
         load_lock_file_for_test(&lock_path)
             .unwrap()
@@ -18447,7 +18368,7 @@ transparency_log_present = true
         assert_eq!(fs::read(path.as_path()).unwrap(), SIGNED_FIXTURE_ARTIFACT);
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
-            RegistrySequenceAnchor::Established(10_000_000)
+            Some(RegistrySequenceAnchor::Established(10_000_000))
         );
     }
 
@@ -18477,7 +18398,7 @@ transparency_log_present = true
             assert_eq!(fs::read(path.as_path()).unwrap(), ARTIFACT);
             assert_eq!(
                 saved_registry_sequence_anchor(dir.path()),
-                RegistrySequenceAnchor::Established(sequence)
+                Some(RegistrySequenceAnchor::Established(sequence))
             );
         }
     }
@@ -18497,7 +18418,7 @@ transparency_log_present = true
         resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
-            RegistrySequenceAnchor::Established(0)
+            Some(RegistrySequenceAnchor::Established(0))
         );
 
         let hostile_sequence = MAX_SEQUENCE_FAST_FORWARD + 1;
@@ -18515,7 +18436,7 @@ transparency_log_present = true
         );
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
-            RegistrySequenceAnchor::Established(0)
+            Some(RegistrySequenceAnchor::Established(0))
         );
     }
 
@@ -18565,7 +18486,7 @@ transparency_log_present = true
         );
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
-            RegistrySequenceAnchor::Unestablished,
+            None,
             "a failed first contact must not establish a rollback anchor"
         );
         assert!(error.contains("unexpected test URL"), "{error}");
@@ -18582,7 +18503,7 @@ transparency_log_present = true
         assert_eq!(fs::read(path.as_path()).unwrap(), ARTIFACT);
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
-            RegistrySequenceAnchor::Established(42)
+            Some(RegistrySequenceAnchor::Established(42))
         );
         assert_eq!(
             saved_registry_ratchets(dir.path()).sequence.value(),
@@ -18660,7 +18581,7 @@ transparency_log_present = true
         lock.save(&lock_path).unwrap();
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
-            RegistrySequenceAnchor::ResetPending
+            Some(RegistrySequenceAnchor::ResetPending)
         );
 
         let failed_http = FakeRegistryHttp::default()
@@ -18682,7 +18603,7 @@ transparency_log_present = true
         );
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
-            RegistrySequenceAnchor::ResetPending,
+            Some(RegistrySequenceAnchor::ResetPending),
             "a failed resolution must not consume the re-bootstrap marker"
         );
     }
@@ -18735,7 +18656,7 @@ transparency_log_present = true
             );
             assert_eq!(
                 saved_registry_sequence_anchor(dir.path()),
-                RegistrySequenceAnchor::Established(10),
+                Some(RegistrySequenceAnchor::Established(10)),
                 "attempt {attempt} moved the established anchor"
             );
         }
@@ -18771,7 +18692,7 @@ transparency_log_present = true
         );
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
-            RegistrySequenceAnchor::Established(10),
+            Some(RegistrySequenceAnchor::Established(10)),
             "a downstream failure must not advance the established anchor"
         );
 
@@ -18790,7 +18711,7 @@ transparency_log_present = true
         );
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
-            RegistrySequenceAnchor::Established(10)
+            Some(RegistrySequenceAnchor::Established(10))
         );
     }
 
@@ -18827,7 +18748,7 @@ transparency_log_present = true
         );
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
-            RegistrySequenceAnchor::Established(100),
+            Some(RegistrySequenceAnchor::Established(100)),
             "the failed resolve must not advance the established anchor"
         );
 
@@ -18871,7 +18792,7 @@ transparency_log_present = true
         );
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
-            RegistrySequenceAnchor::Established(100),
+            Some(RegistrySequenceAnchor::Established(100)),
             "the bundle failure must not advance the established anchor"
         );
 
@@ -19331,7 +19252,7 @@ transparency_log_present = true
         assert!(saved_lock_contents(dir.path()).contains("sequence = 100"));
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
-            RegistrySequenceAnchor::Unestablished,
+            None,
             "version selection alone must not establish an anti-rollback anchor"
         );
 
@@ -19359,10 +19280,7 @@ transparency_log_present = true
             Some(100),
             "the lower accepted observation must not erase the durable maximum"
         );
-        assert_eq!(
-            saved_registry_sequence_anchor(dir.path()),
-            RegistrySequenceAnchor::Unestablished
-        );
+        assert_eq!(saved_registry_sequence_anchor(dir.path()), None);
     }
 
     #[test]
