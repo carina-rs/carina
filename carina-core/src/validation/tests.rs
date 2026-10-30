@@ -6694,10 +6694,10 @@ fn validate_resources_checks_secret_literals_without_revealing_them() {
 }
 
 /// `validate_resources` must reject a resource whose schema declares an
-/// `exclusive_required` group that is not satisfied — mirrors
+/// `ExactlyOne` field group that is not satisfied — mirrors
 /// `awscc.ec2.Vpc {}` with no cidr_block / ipam pool.
 #[test]
-fn validate_resources_rejects_missing_exclusive_required() {
+fn validate_resources_rejects_missing_exactly_one_field_group() {
     let schema = make_schema(
         "ec2.Vpc",
         vec![
@@ -6705,7 +6705,9 @@ fn validate_resources_rejects_missing_exclusive_required() {
             ("ipv4_ipam_pool_id", AttributeType::string()),
         ],
     )
-    .exclusive_required(&["cidr_block", "ipv4_ipam_pool_id"]);
+    .field_group(
+        crate::schema::FieldGroup::exactly_one(["cidr_block", "ipv4_ipam_pool_id"]).unwrap(),
+    );
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -6723,8 +6725,8 @@ fn validate_resources_rejects_missing_exclusive_required() {
     let err =
         validate_resources(&parsed, &schemas, &known, &ProviderContext::default()).unwrap_err();
     assert!(
-        err.contains("Exactly one of [cidr_block, ipv4_ipam_pool_id] must be specified"),
-        "expected exclusive_required error, got: {err}"
+        err.contains("exactly one of [cidr_block, ipv4_ipam_pool_id] must be set"),
+        "expected field-group error, got: {err}"
     );
 }
 

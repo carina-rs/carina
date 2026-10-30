@@ -2374,7 +2374,7 @@ mod tests {
             unique_name: proto::UniqueNameSpec::Conflicting,
             operation_config: None,
             validators: vec![],
-            exclusive_required: vec![],
+            field_groups: vec![],
             defs: Default::default(),
         }
     }
@@ -2700,6 +2700,7 @@ mod tests {
             "Tag".to_string(),
             proto::AttributeType::Struct {
                 name: "Tag".to_string(),
+                field_groups: vec![],
                 fields: vec![proto::StructField {
                     name: "key".to_string(),
                     field_type: proto_string(),
@@ -2725,6 +2726,7 @@ mod tests {
             carina_core::schema::RawShape::Struct {
                 name: _name,
                 fields,
+                ..
             } => fields,
             shape => panic!("expected struct, got {shape:?}"),
         };
@@ -2741,6 +2743,7 @@ mod tests {
             "output",
             proto::AttributeType::Struct {
                 name: "Output".to_string(),
+                field_groups: vec![],
                 fields: vec![proto::StructField {
                     name: "secret".to_string(),
                     field_type: proto_string(),
@@ -2823,6 +2826,7 @@ mod tests {
             name: "destination".to_string(),
             field_type: proto::AttributeType::Struct {
                 name: "Destination".to_string(),
+                field_groups: vec![],
                 fields: vec![illegal_leaf],
             },
             required: false,
@@ -2837,6 +2841,7 @@ mod tests {
             "metadata_configuration",
             proto::AttributeType::Struct {
                 name: "MetadataConfiguration".to_string(),
+                field_groups: vec![],
                 fields: vec![destination],
             },
         );
@@ -2861,6 +2866,7 @@ mod tests {
             "config",
             proto::AttributeType::Struct {
                 name: "Config".to_string(),
+                field_groups: vec![],
                 fields: vec![proto::StructField {
                     name: "client_secret".to_string(),
                     field_type: proto_string(),
@@ -2903,6 +2909,7 @@ mod tests {
                 name,
                 proto::AttributeType::Struct {
                     name: "Config".to_string(),
+                    field_groups: vec![],
                     fields: vec![proto::StructField {
                         name: "client_secret".to_string(),
                         field_type: proto_string(),
@@ -2966,6 +2973,7 @@ mod tests {
                     proto_string(),
                     proto::AttributeType::Struct {
                         name: "OidcConfig".to_string(),
+                        field_groups: vec![],
                         fields: vec![proto::StructField {
                             name: "client_secret".to_string(),
                             field_type: proto_string(),
@@ -4580,6 +4588,49 @@ mod tests {
 
     #[test]
     fn released_protocol_v12_schema_fixtures_require_keyed_metadata_before_core_decode() {
+        fn upgrade_v12_fixture_in_memory(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        upgrade_v12_fixture_in_memory(value);
+                    }
+                }
+                serde_json::Value::Object(object) => {
+                    if object.contains_key("resource_type") {
+                        let field_groups = object
+                            .remove("exclusive_required")
+                            .and_then(|value| value.as_array().cloned())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|fields| {
+                                serde_json::json!({
+                                    "kind": "exactly_one",
+                                    "fields": fields,
+                                })
+                            })
+                            .collect();
+                        object.insert(
+                            "field_groups".to_string(),
+                            serde_json::Value::Array(field_groups),
+                        );
+                    }
+                    if object.contains_key("attr_type") {
+                        object.insert("keyed_partial_update".to_string(), serde_json::Value::Null);
+                    }
+                    if object.get("type").and_then(serde_json::Value::as_str) == Some("struct") {
+                        object.insert(
+                            "field_groups".to_string(),
+                            serde_json::Value::Array(Vec::new()),
+                        );
+                    }
+                    for child in object.values_mut() {
+                        upgrade_v12_fixture_in_memory(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let fixtures = [
             (
                 "acm.Certificate",
@@ -4601,38 +4652,23 @@ mod tests {
 
         for (expected_resource_type, json) in fixtures {
             let error = json_to_schemas(json)
-                .expect_err("released v12 bytes predate required keyed-list metadata");
+                .expect_err("released v12 bytes predate required protocol metadata");
+            let rendered = render_error_chain(&error);
             assert!(
-                render_error_chain(&error).contains("missing field `keyed_partial_update`"),
-                "released fixture {expected_resource_type} crossed the required-field gate: {}",
-                render_error_chain(&error),
+                rendered.contains("missing field `keyed_partial_update`")
+                    || rendered.contains("missing field `field_groups`"),
+                "released fixture {expected_resource_type} crossed the required-field gate: {rendered}",
             );
 
-            // #4118 is queued behind the protocol-v13 change. The protocol
-            // constant deliberately remains unchanged on this branch, while
-            // the new field is deliberately required. Add the v13 field only
-            // in-memory so these immutable v12 bytes still exercise every
-            // older conversion rule after the required-field gate is pinned.
-            let mut augmented: serde_json::Value =
+            // The protocol constant deliberately remains unchanged on this
+            // branch, while both new fields are deliberately required. Add
+            // them only in-memory so these immutable v12 bytes still exercise
+            // every older conversion rule after the required-field gate.
+            let mut upgraded: serde_json::Value =
                 serde_json::from_str(json).expect("released fixture is valid JSON");
-            for schema in augmented
-                .as_array_mut()
-                .expect("released schema fixture is an array")
-            {
-                for attribute in schema["attributes"]
-                    .as_object_mut()
-                    .expect("released resource attributes are an object")
-                    .values_mut()
-                {
-                    attribute
-                        .as_object_mut()
-                        .expect("released attribute schema is an object")
-                        .insert("keyed_partial_update".to_string(), serde_json::Value::Null);
-                }
-            }
-            let augmented =
-                serde_json::to_string(&augmented).expect("augmented fixture serializes");
-            let schemas = json_to_schemas(&augmented).unwrap_or_else(|error| {
+            upgrade_v12_fixture_in_memory(&mut upgraded);
+            let upgraded = serde_json::to_string(&upgraded).expect("upgraded fixture serializes");
+            let schemas = json_to_schemas(&upgraded).unwrap_or_else(|error| {
                 panic!(
                     "augmented released fixture {expected_resource_type} must load: {}",
                     render_error_chain(&error)
@@ -4688,6 +4724,7 @@ mod tests {
                             "element_type":{
                                 "type":"struct",
                                 "name":"DomainValidation",
+                                "field_groups":[],
                                 "fields":[{
                                     "name":"domain_name",
                                     "field_type":{"type":"String"},
@@ -4701,6 +4738,7 @@ mod tests {
                                     "field_type":{
                                         "type":"struct",
                                         "name":"HttpRedirect",
+                                        "field_groups":[],
                                         "fields":[{
                                             "name":"redirect_from",
                                             "field_type":{"type":"String"},
@@ -4729,6 +4767,7 @@ mod tests {
                                     "field_type":{
                                         "type":"struct",
                                         "name":"ResourceRecord",
+                                        "field_groups":[],
                                         "fields":[{
                                             "name":"name",
                                             "field_type":{"type":"String"},
@@ -4832,7 +4871,8 @@ mod tests {
                         "write_only":false,
                         "provider_name":"DomainValidationOptions"
                     }
-                }
+                },
+                "field_groups":[]
             }]"#,
         )
         .expect("the released ACM semantics must load with required v13 metadata");
@@ -4915,6 +4955,7 @@ mod tests {
                         "attr_type":{
                             "type":"struct",
                             "name":"Config",
+                            "field_groups":[],
                             "fields":[{
                                 "name":"client_secret",
                                 "field_type":{"type":"String"},
@@ -4924,7 +4965,8 @@ mod tests {
                         "required":true,
                         "keyed_partial_update":null
                     }
-                }
+                },
+                "field_groups":[]
             }]"#,
         )
         .expect_err("protocol v13 schema JSON must declare nested write_only");
@@ -4961,6 +5003,7 @@ mod tests {
             r#"[{
                 "resource_type":"s3.Bucket",
                 "attributes":{},
+                "field_groups":[],
                 "unique_name_attribute":{"type":"attribute"}
             }]"#,
         )
@@ -4984,6 +5027,7 @@ mod tests {
             "resource_type": "ec2.SecurityGroup",
             "description": "EC2 Security Group",
             "unique_name_attribute": "group_name",
+            "field_groups": [],
             "attributes": {
               "group_name": {
                 "name": "group_name",
@@ -5005,6 +5049,7 @@ mod tests {
                       {
                         "type": "struct",
                         "name": "IngressRule",
+                        "field_groups": [],
                         "fields": [
                           {
                             "name": "from_port",
@@ -5087,7 +5132,7 @@ mod tests {
             kind,
             unique_name,
             operation_config,
-            exclusive_required,
+            field_groups,
             default_wait_timeout,
             default_wait_interval,
             defs,
@@ -5102,7 +5147,7 @@ mod tests {
         let _ = (
             validation,
             operation_config,
-            exclusive_required,
+            field_groups,
             default_wait_timeout,
             default_wait_interval,
             defs,
@@ -5166,7 +5211,7 @@ mod tests {
 
                         // First member: struct with block_name and provider_name on fields
                         match members[0].raw_shape() {
-                            carina_core::schema::RawShape::Struct { name, fields } => {
+                            carina_core::schema::RawShape::Struct { name, fields, .. } => {
                                 assert_eq!(name, "IngressRule");
                                 assert_eq!(fields.len(), 2);
 
@@ -5332,15 +5377,18 @@ mod tests {
             "test.Widget",
             [("known".to_string(), proto_attr("known", proto_string()))],
         );
-        schema.exclusive_required = vec![vec!["missing".to_string()]];
+        schema.field_groups = vec![proto::FieldGroup {
+            kind: proto::FieldGroupKind::ExactlyOne,
+            fields: vec!["known".to_string(), "missing".to_string()],
+        }];
 
-        let error = proto_schema_to_core(&schema)
-            .expect_err("unknown exclusive-required member must be rejected");
+        let error =
+            proto_schema_to_core(&schema).expect_err("unknown field-group member must be rejected");
         let rendered = render_error_chain(&error);
 
-        assert!(rendered.contains("exclusive_required[0]"), "{rendered}");
+        assert!(rendered.contains("field_groups[0]"), "{rendered}");
         assert!(
-            !rendered.contains("attribute 'exclusive_required[0]'"),
+            !rendered.contains("attribute 'field_groups[0]'"),
             "{rendered}"
         );
     }
@@ -5352,6 +5400,7 @@ mod tests {
             "Tag".to_string(),
             proto::AttributeType::Struct {
                 name: "Tag".to_string(),
+                field_groups: vec![],
                 fields: vec![proto::StructField {
                     name: "key".to_string(),
                     field_type: proto::AttributeType::Ref {
@@ -5451,7 +5500,7 @@ mod tests {
             unique_name: proto::UniqueNameSpec::Conflicting,
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
-            exclusive_required: vec![],
+            field_groups: vec![],
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
@@ -5472,7 +5521,7 @@ mod tests {
             unique_name: proto::UniqueNameSpec::Conflicting,
             operation_config: None,
             validators: vec![],
-            exclusive_required: vec![],
+            field_groups: vec![],
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
@@ -5483,9 +5532,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exclusive_required_roundtrips_through_proto() {
-        // Declarative exclusive_required must survive the proto boundary so
-        // WASM providers can express `oneOf` constraints as data.
+    fn test_field_groups_roundtrip_through_proto() {
         let proto_schema = proto::ResourceSchema {
             resource_type: "awscc.ec2.Vpc".to_string(),
             attributes: [
@@ -5505,19 +5552,19 @@ mod tests {
             unique_name: proto::UniqueNameSpec::Conflicting,
             operation_config: None,
             validators: vec![],
-            exclusive_required: vec![vec![
-                "cidr_block".to_string(),
-                "ipv4_ipam_pool_id".to_string(),
-            ]],
+            field_groups: vec![proto::FieldGroup {
+                kind: proto::FieldGroupKind::ExactlyOne,
+                fields: vec!["cidr_block".to_string(), "ipv4_ipam_pool_id".to_string()],
+            }],
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
         assert_eq!(
-            core_schema.parts().exclusive_required,
-            &[vec![
-                "cidr_block".to_string(),
-                "ipv4_ipam_pool_id".to_string(),
-            ]]
+            core_schema.parts().field_groups,
+            &[
+                carina_core::schema::FieldGroup::exactly_one(["cidr_block", "ipv4_ipam_pool_id",])
+                    .unwrap()
+            ]
         );
 
         // And the resulting core schema rejects empty attributes.
@@ -5532,14 +5579,14 @@ mod tests {
         assert!(
             err.iter().any(|e| e
                 .to_string()
-                .contains("Exactly one of [cidr_block, ipv4_ipam_pool_id]")),
+                .contains("exactly one of [cidr_block, ipv4_ipam_pool_id]")),
             "expected missing-group error, got: {:?}",
             err
         );
     }
 
     #[test]
-    fn test_exclusive_required_survives_json_roundtrip() {
+    fn test_field_groups_survive_json_roundtrip() {
         // The plugin host receives schemas as JSON. Confirm the new field
         // is preserved through full JSON round-trip (guest -> host).
         let proto_schema = proto::ResourceSchema {
@@ -5555,15 +5602,18 @@ mod tests {
             unique_name: proto::UniqueNameSpec::Conflicting,
             operation_config: None,
             validators: vec![],
-            exclusive_required: vec![vec!["a".to_string(), "b".to_string()]],
+            field_groups: vec![proto::FieldGroup {
+                kind: proto::FieldGroupKind::AtLeastOne,
+                fields: vec!["a".to_string(), "b".to_string()],
+            }],
             defs: Default::default(),
         };
         let json = serde_json::to_string(&vec![proto_schema]).unwrap();
         let schemas = json_to_schemas(&json).unwrap();
         assert_eq!(schemas.len(), 1);
         assert_eq!(
-            schemas[0].parts().exclusive_required,
-            &[vec!["a".to_string(), "b".to_string()]]
+            schemas[0].parts().field_groups,
+            &[carina_core::schema::FieldGroup::at_least_one(["a", "b"]).unwrap()]
         );
     }
 
@@ -6115,6 +6165,7 @@ mod tests {
         let json = r#"[
             {
                 "resource_type":"aws.ec2.VpcCidrBlockAssociation",
+                "field_groups":[],
                 "attributes":{
                     "id":{
                         "name":"id",
@@ -6306,7 +6357,7 @@ mod tests {
             unique_name: proto::UniqueNameSpec::Conflicting,
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
-            exclusive_required: vec![],
+            field_groups: vec![],
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();

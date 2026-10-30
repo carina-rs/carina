@@ -213,6 +213,106 @@ use resolved_union_members::UnionMemberTypes;
 pub use resolved_union_members::{ResolvedUnionMember, UnionMembers};
 pub use type_identity::TypeIdentity;
 
+/// The cardinality rule applied to a group of sibling fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FieldGroupKind {
+    ExactlyOne,
+    AtLeastOne,
+    AtMostOne,
+}
+
+impl FieldGroupKind {
+    fn description(self) -> &'static str {
+        match self {
+            Self::ExactlyOne => "exactly one",
+            Self::AtLeastOne => "at least one",
+            Self::AtMostOne => "at most one",
+        }
+    }
+}
+
+/// Construction error for a declarative sibling-field group.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FieldGroupError {
+    #[error("field groups require at least two fields, got {actual}")]
+    TooFewFields { actual: usize },
+    #[error("field group contains duplicate field `{name}`")]
+    DuplicateField { name: String },
+}
+
+/// A validated group of sibling field names and its cardinality rule.
+///
+/// The fields are private and construction is fallible, so a public
+/// `FieldGroup` always contains at least two distinct names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FieldGroup {
+    kind: FieldGroupKind,
+    fields: Box<[String]>,
+}
+
+impl FieldGroup {
+    pub fn new<I, S>(kind: FieldGroupKind, fields: I) -> Result<Self, FieldGroupError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let fields = fields.into_iter().map(Into::into).collect::<Vec<_>>();
+        if fields.len() < 2 {
+            return Err(FieldGroupError::TooFewFields {
+                actual: fields.len(),
+            });
+        }
+        let mut seen = HashSet::with_capacity(fields.len());
+        if let Some(name) = fields.iter().find(|name| !seen.insert(name.as_str())) {
+            return Err(FieldGroupError::DuplicateField { name: name.clone() });
+        }
+        Ok(Self {
+            kind,
+            fields: fields.into_boxed_slice(),
+        })
+    }
+
+    pub fn exactly_one<I, S>(fields: I) -> Result<Self, FieldGroupError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new(FieldGroupKind::ExactlyOne, fields)
+    }
+
+    pub fn at_least_one<I, S>(fields: I) -> Result<Self, FieldGroupError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new(FieldGroupKind::AtLeastOne, fields)
+    }
+
+    pub fn at_most_one<I, S>(fields: I) -> Result<Self, FieldGroupError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new(FieldGroupKind::AtMostOne, fields)
+    }
+
+    pub fn kind(&self) -> FieldGroupKind {
+        self.kind
+    }
+
+    pub fn fields(&self) -> &[String] {
+        &self.fields
+    }
+
+    fn is_satisfied_by_count(&self, present: usize) -> bool {
+        match self.kind {
+            FieldGroupKind::ExactlyOne => present == 1,
+            FieldGroupKind::AtLeastOne => present >= 1,
+            FieldGroupKind::AtMostOne => present <= 1,
+        }
+    }
+}
+
 /// Error returned when a bare projection reaches a schema-bound
 /// [`AttrTypeKind::Ref`] without a defs map.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1144,6 +1244,7 @@ pub(crate) enum AttrTypeKind {
     Struct {
         name: String,
         fields: Vec<StructField>,
+        field_groups: Vec<FieldGroup>,
     },
     /// Union of multiple types (value is valid if it matches any member)
     Union(UnionMemberTypes),
@@ -1401,6 +1502,7 @@ pub enum RawShape<'a> {
     Struct {
         name: &'a str,
         fields: &'a [StructField],
+        field_groups: &'a [FieldGroup],
     },
     /// Union of types — see [`AttrTypeKind::Union`].
     Union(&'a [AttributeType]),
@@ -1474,10 +1576,15 @@ impl fmt::Debug for RawShape<'_> {
                 .field("key", key)
                 .field("value", value)
                 .finish(),
-            RawShape::Struct { name, fields } => f
+            RawShape::Struct {
+                name,
+                fields,
+                field_groups,
+            } => f
                 .debug_struct("RawShape::Struct")
                 .field("name", name)
                 .field("fields", fields)
+                .field("field_groups", field_groups)
                 .finish(),
             RawShape::Union(members) => f.debug_tuple("RawShape::Union").field(members).finish(),
             RawShape::Ref(name) => f.debug_tuple("RawShape::Ref").field(name).finish(),
@@ -1896,7 +2003,11 @@ impl Schema {
             return;
         };
         match &attr.kind {
-            AttrTypeKind::Struct { name, fields } => {
+            AttrTypeKind::Struct {
+                name,
+                fields,
+                field_groups,
+            } => {
                 // Mirror the pre-#3345 standalone-validator collect_struct
                 // behavior, but route field walks through
                 // collect_attr_into so Ref-typed fields are resolved
@@ -1940,6 +2051,16 @@ impl Schema {
                             },
                         ));
                     }
+                }
+
+                for group in violated_struct_field_groups(fields, field_groups, map, ancestry) {
+                    out.push((
+                        path.clone(),
+                        TypeError::FieldGroupViolation {
+                            path: path.clone(),
+                            group: group.clone(),
+                        },
+                    ));
                 }
 
                 for (k, v) in map {
@@ -2000,6 +2121,80 @@ impl Schema {
                 for (i, item) in items.iter().enumerate() {
                     let next_path = path.push_index(i);
                     Self::collect_attr_into(inner, defs, &next_path, item, ancestry, out);
+                }
+            }
+            AttrTypeKind::Map {
+                key,
+                value: value_type,
+            } => {
+                let Some(map) = (match concrete {
+                    ConcreteValueRef::Map(map) => Some(map),
+                    _ => None,
+                }) else {
+                    out.push((
+                        path.clone(),
+                        TypeError::TypeMismatch {
+                            expected: attr.type_name(),
+                            got: concrete.type_name().to_string(),
+                        },
+                    ));
+                    return;
+                };
+                let mut first_value_error = None;
+                for (map_key, map_value) in map {
+                    let next_path = path.push_field(map_key.clone());
+                    let lifted_key = lift_map_key(key, map_key, defs);
+                    if let Err(inner) =
+                        validate_attr_with_defs_and_ancestry(key, &lifted_key, defs, ancestry)
+                    {
+                        out.push((
+                            next_path.clone(),
+                            TypeError::MapKeyError {
+                                key: map_key.clone(),
+                                inner: Box::new(inner),
+                            },
+                        ));
+                    }
+
+                    // Preserve the collector's established coarse Map-value
+                    // diagnostic for ordinary type/writability failures while
+                    // retaining the concrete entry path needed by field-group
+                    // errors. A Map has no source range for an arbitrary value
+                    // schema failure, but a group violation belongs to the
+                    // entry's Struct and can be anchored there.
+                    let mut entry_errors = Vec::new();
+                    Self::collect_attr_into(
+                        value_type,
+                        defs,
+                        &next_path,
+                        map_value,
+                        ancestry,
+                        &mut entry_errors,
+                    );
+                    let collected_value_error = entry_errors
+                        .iter()
+                        .find(|(_, error)| !matches!(error, TypeError::FieldGroupViolation { .. }))
+                        .map(|(_, error)| error.clone());
+                    out.extend(entry_errors.into_iter().filter(|(_, error)| {
+                        matches!(error, TypeError::FieldGroupViolation { .. })
+                    }));
+
+                    if let Some(collected_error) = collected_value_error
+                        && first_value_error.is_none()
+                    {
+                        let inner = validate_attr_with_defs_and_ancestry(
+                            value_type, map_value, defs, ancestry,
+                        )
+                        .err()
+                        .unwrap_or(collected_error);
+                        first_value_error = Some(TypeError::MapValueError {
+                            key: map_key.clone(),
+                            inner: Box::new(inner),
+                        });
+                    }
+                }
+                if let Some(error) = first_value_error {
+                    out.push((path.clone(), error));
                 }
             }
             // Keep Union membership and best-scoring failure selection
@@ -2145,10 +2340,7 @@ fn validation_error_with_defs_on_path<'a>(
                     if let Err(inner_err) =
                         validate_attr_with_defs_and_ancestry(inner, item, defs, ancestry)
                     {
-                        return Err(TypeError::ListItemError {
-                            index: i,
-                            inner: Box::new(inner_err),
-                        });
+                        return Err(inner_err.at_list_index(i));
                     }
                 }
                 Ok(())
@@ -2159,10 +2351,7 @@ fn validation_error_with_defs_on_path<'a>(
                     if let Err(inner_err) =
                         validate_attr_with_defs_and_ancestry(inner, &item, defs, ancestry)
                     {
-                        return Err(TypeError::ListItemError {
-                            index: i,
-                            inner: Box::new(inner_err),
-                        });
+                        return Err(inner_err.at_list_index(i));
                     }
                 }
                 Ok(())
@@ -2190,10 +2379,7 @@ fn validation_error_with_defs_on_path<'a>(
                     if let Err(inner_err) =
                         validate_attr_with_defs_and_ancestry(val_ty, v, defs, ancestry)
                     {
-                        return Err(TypeError::MapValueError {
-                            key: k.clone(),
-                            inner: Box::new(inner_err),
-                        });
+                        return Err(inner_err.at_map_value(k));
                     }
                 }
                 Ok(())
@@ -2206,7 +2392,11 @@ fn validation_error_with_defs_on_path<'a>(
                 })
             }
         }
-        AttrTypeKind::Struct { name, fields } => {
+        AttrTypeKind::Struct {
+            name,
+            fields,
+            field_groups,
+        } => {
             if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
                 validate_struct_fields(
                     name,
@@ -2223,12 +2413,19 @@ fn validation_error_with_defs_on_path<'a>(
                             defs,
                             ancestry.descend(field),
                         )
-                        .map_err(|inner_err| TypeError::StructFieldError {
-                            field: input_name.to_string(),
-                            inner: Box::new(inner_err),
-                        })
+                        .map_err(|inner_err| inner_err.at_struct_field(input_name))
                     },
-                )
+                )?;
+                if let Some(group) =
+                    violated_struct_field_groups(fields, field_groups, map, ancestry).next()
+                {
+                    Err(TypeError::FieldGroupViolation {
+                        path: FieldPath::new(),
+                        group: group.clone(),
+                    })
+                } else {
+                    Ok(())
+                }
             } else if matches!(value.as_concrete(), Some(ConcreteValueRef::List(_))) {
                 Err(TypeError::BlockSyntaxNotAllowed {
                     attribute: name.clone(),
@@ -2348,10 +2545,15 @@ impl fmt::Debug for AttributeType {
                 .field("key", key)
                 .field("value", value)
                 .finish(),
-            AttrTypeKind::Struct { name, fields } => f
+            AttrTypeKind::Struct {
+                name,
+                fields,
+                field_groups,
+            } => f
                 .debug_struct("Struct")
                 .field("name", name)
                 .field("fields", fields)
+                .field("field_groups", field_groups)
                 .finish(),
             AttrTypeKind::Union(types) => f.debug_tuple("Union").field(types).finish(),
             AttrTypeKind::Ref(name) => f.debug_tuple("Ref").field(name).finish(),
@@ -2413,6 +2615,33 @@ impl FieldPath {
         let mut next = self.clone();
         next.steps.push(FieldPathStep::Index(index));
         next
+    }
+
+    fn prepend_field(&self, name: impl Into<String>) -> Self {
+        let mut steps = Vec::with_capacity(self.steps.len() + 1);
+        steps.push(FieldPathStep::Field(name.into()));
+        steps.extend(self.steps.iter().cloned());
+        Self { steps }
+    }
+
+    fn prepend_index(&self, index: usize) -> Self {
+        let mut steps = Vec::with_capacity(self.steps.len() + 1);
+        steps.push(FieldPathStep::Index(index));
+        steps.extend(self.steps.iter().cloned());
+        Self { steps }
+    }
+
+    fn masked_for_secret(self) -> Self {
+        Self {
+            steps: self
+                .steps
+                .into_iter()
+                .map(|step| match step {
+                    FieldPathStep::Field(_) => FieldPathStep::Field(SECRET_VALUE_MASK.to_string()),
+                    FieldPathStep::Index(index) => FieldPathStep::Index(index),
+                })
+                .collect(),
+        }
     }
 }
 
@@ -2680,7 +2909,7 @@ impl AttributeType {
                 key: key.as_ref(),
                 value: value.as_ref(),
             },
-            AttrTypeKind::Struct { name, fields: _ } => Shape::Struct {
+            AttrTypeKind::Struct { name, .. } => Shape::Struct {
                 name: name.as_str(),
             },
             AttrTypeKind::Union(_members) => Shape::Union,
@@ -2770,9 +2999,14 @@ impl AttributeType {
                 key: key.as_ref(),
                 value: value.as_ref(),
             },
-            AttrTypeKind::Struct { name, fields } => RawShape::Struct {
+            AttrTypeKind::Struct {
+                name,
+                fields,
+                field_groups,
+            } => RawShape::Struct {
                 name: name.as_str(),
                 fields: fields.as_slice(),
+                field_groups: field_groups.as_slice(),
             },
             AttrTypeKind::Union(members) => RawShape::Union(members.as_raw_slice()),
             AttrTypeKind::Ref(name) => RawShape::Ref(name.as_str()),
@@ -3050,10 +3284,20 @@ impl AttributeType {
 
     /// Create a `Struct` type.
     pub fn struct_(name: impl Into<String>, fields: Vec<StructField>) -> Self {
+        Self::struct_with_field_groups(name, fields, Vec::new())
+    }
+
+    /// Create a `Struct` type with declarative sibling-field constraints.
+    pub fn struct_with_field_groups(
+        name: impl Into<String>,
+        fields: Vec<StructField>,
+        field_groups: Vec<FieldGroup>,
+    ) -> Self {
         AttributeType {
             kind: AttrTypeKind::Struct {
                 name: name.into(),
                 fields,
+                field_groups,
             },
         }
     }
@@ -4515,13 +4759,27 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
             }
             Some(Fit::with_kind(exactness, attr, FitKind::Map(entry_fits)))
         }
-        (AT::Struct { fields, .. }, ConcreteValueRef::Map(map)) => {
+        (
+            AT::Struct {
+                fields,
+                field_groups,
+                ..
+            },
+            ConcreteValueRef::Map(map),
+        ) => {
             for field in fields {
                 if ancestry.effective_input_mode(field).is_required()
                     && !struct_field_is_present(fields, map, field, ancestry)
                 {
                     return None;
                 }
+            }
+            if purpose.validates_struct_assignments()
+                && violated_struct_field_groups(fields, field_groups, map, ancestry)
+                    .next()
+                    .is_some()
+            {
+                return None;
             }
 
             let mut exactness = FitExactness::EXACT;
@@ -4867,6 +5125,27 @@ impl BestUnionMemberFailures {
         failures.push(first);
         failures.extend(tied);
 
+        // A Struct arm that otherwise fits but fails its own field-group
+        // contract is more specific than the closed-Struct shape summary.
+        // In particular, the summary must not advertise an empty form for an
+        // arm whose group rejects `{}`. Preserve a sole group-only failure;
+        // if several arms fail this way, retain the ordinary multi-arm error
+        // instead of constructing an impossible-form suggestion.
+        let group_failure_indices = failures
+            .iter()
+            .enumerate()
+            .filter_map(|(index, failure)| {
+                matches!(failure.error, TypeError::FieldGroupViolation { .. }).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if let [index] = group_failure_indices.as_slice() {
+            return failures.swap_remove(*index).error;
+        }
+        if !group_failure_indices.is_empty() {
+            let first = failures.remove(0);
+            return TypeError::from_union_member_failures(first, failures);
+        }
+
         // One non-empty recognized-field identity is a unique relevant arm,
         // even though every Struct shares the same canonical rank. Preserve
         // that member's detailed error verbatim (`{ days = "x" }`). Empty
@@ -4932,7 +5211,7 @@ fn describe_struct_union_members(
         .iter()
         .map(|member| {
             let member = member?.as_attr();
-            let AttrTypeKind::Struct { name, fields } = &member.kind else {
+            let AttrTypeKind::Struct { name, fields, .. } = &member.kind else {
                 return None;
             };
             let mut accepted_fields = Vec::with_capacity(fields.len() * 2);
@@ -5097,6 +5376,27 @@ fn struct_field_is_present(
     map.keys().any(|key| {
         struct_field_for_key(fields, key, ancestry)
             .is_some_and(|found| std::ptr::eq(found, expected))
+    })
+}
+
+fn violated_struct_field_groups<'a>(
+    fields: &'a [StructField],
+    field_groups: &'a [FieldGroup],
+    map: &'a IndexMap<String, Value>,
+    ancestry: FieldAncestry,
+) -> impl Iterator<Item = &'a FieldGroup> {
+    field_groups.iter().filter(move |group| {
+        let present = group
+            .fields()
+            .iter()
+            .filter(|name| {
+                fields
+                    .iter()
+                    .find(|field| field.name == name.as_str())
+                    .is_some_and(|field| struct_field_is_present(fields, map, field, ancestry))
+            })
+            .count();
+        !group.is_satisfied_by_count(present)
     })
 }
 
@@ -6080,6 +6380,7 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
         | TypeError::CustomTypeValidation { .. }
         | TypeError::ResourceValidationFailed { .. }
         | TypeError::MissingRequired { .. }
+        | TypeError::FieldGroupViolation { .. }
         | TypeError::ReadOnlyAttribute { .. }
         | TypeError::UnknownAttribute { .. }
         | TypeError::UnknownStructField { .. }
@@ -6099,6 +6400,16 @@ pub struct BindingShadowsEnumMemberError {
     pub binding_kind: BindingKind,
     pub r#enum: TypeIdentity,
     pub qualified: ExpectedEnumVariant,
+}
+
+fn format_field_group_violation(path: &FieldPath, group: &FieldGroup) -> String {
+    let fields = group.fields().join(", ");
+    let message = format!("{} of [{fields}] must be set", group.kind().description());
+    if path.is_empty() {
+        message
+    } else {
+        format!("{path}: {message}")
+    }
 }
 
 /// Type error
@@ -6211,6 +6522,9 @@ pub enum TypeError {
     #[error("Required attribute '{name}' is missing")]
     MissingRequired { name: String },
 
+    #[error("{}", format_field_group_violation(path, group))]
+    FieldGroupViolation { path: FieldPath, group: FieldGroup },
+
     #[error("Attribute '{name}' is populated by the provider and cannot be set")]
     ReadOnlyAttribute { name: String },
 
@@ -6289,6 +6603,45 @@ impl TypeError {
         }
     }
 
+    fn at_list_index(self, index: usize) -> Self {
+        match self {
+            Self::FieldGroupViolation { path, group } => Self::FieldGroupViolation {
+                path: path.prepend_index(index),
+                group,
+            },
+            inner => Self::ListItemError {
+                index,
+                inner: Box::new(inner),
+            },
+        }
+    }
+
+    fn at_map_value(self, key: &str) -> Self {
+        match self {
+            Self::FieldGroupViolation { path, group } => Self::FieldGroupViolation {
+                path: path.prepend_field(key),
+                group,
+            },
+            inner => Self::MapValueError {
+                key: key.to_string(),
+                inner: Box::new(inner),
+            },
+        }
+    }
+
+    fn at_struct_field(self, field: &str) -> Self {
+        match self {
+            Self::FieldGroupViolation { path, group } => Self::FieldGroupViolation {
+                path: path.prepend_field(field),
+                group,
+            },
+            inner => Self::StructFieldError {
+                field: field.to_string(),
+                inner: Box::new(inner),
+            },
+        }
+    }
+
     /// Return the authored top-level attribute carried by this diagnostic.
     /// Container and union wrappers delegate to their leaf failures so
     /// consumers do not need variant-specific position recovery.
@@ -6302,6 +6655,10 @@ impl TypeError {
             TypeError::ReadOnlyAttribute { name }
             | TypeError::UnknownAttribute { name, .. }
             | TypeError::BlockSyntaxNotAllowed { attribute: name } => Some(name),
+            TypeError::FieldGroupViolation { path, .. } => match path.steps().first() {
+                Some(FieldPathStep::Field(name)) => Some(name),
+                Some(FieldPathStep::Index(_)) | None => None,
+            },
             TypeError::ListItemError { inner, .. }
             | TypeError::MapKeyError { inner, .. }
             | TypeError::MapValueError { inner, .. }
@@ -6449,6 +6806,10 @@ impl TypeError {
                 field: SECRET_VALUE_MASK.to_string(),
                 inner: Box::new(inner.masked_for_secret()),
             },
+            TypeError::FieldGroupViolation { path, group } => TypeError::FieldGroupViolation {
+                path: path.masked_for_secret(),
+                group,
+            },
             TypeError::TypeMismatch { .. }
             | TypeError::BindingShadowsEnumMember(_)
             | TypeError::MissingRequired { .. }
@@ -6470,6 +6831,10 @@ impl TypeError {
     pub fn with_attribute(self, attribute: impl Into<String>) -> Self {
         let attribute = attribute.into();
         match self {
+            TypeError::FieldGroupViolation { path, group } => TypeError::FieldGroupViolation {
+                path: path.prepend_field(attribute),
+                group,
+            },
             TypeError::UnionAlternativesMismatch { failures } => {
                 let (first, rest) = failures.into_parts();
                 TypeError::from_union_arm_errors(
@@ -6676,53 +7041,6 @@ impl ConcreteValueRef<'_> {
                 Value::Concrete(ConcreteValue::StringList(items.to_vec()))
             }
             ConcreteValueRef::Map(map) => Value::Concrete(ConcreteValue::Map(map.clone())),
-        }
-    }
-}
-
-/// Common validation patterns for resource schemas
-pub mod validators {
-    use super::*;
-
-    /// Helper function to validate that exactly one of the specified fields is present.
-    /// Returns `Ok(())` if exactly one field is present, `Err` otherwise.
-    ///
-    /// Use this in custom validator functions for mutually exclusive required fields.
-    ///
-    /// # Example
-    /// ```
-    /// use std::collections::HashMap;
-    /// use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-    /// use carina_core::schema::{validators, TypeError};
-    ///
-    /// fn my_validator(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-    ///     validators::validate_exclusive_required(attributes, &["option_a", "option_b"])
-    /// }
-    /// ```
-    pub fn validate_exclusive_required(
-        attributes: &HashMap<String, Value>,
-        fields: &[&str],
-    ) -> Result<(), Vec<TypeError>> {
-        let present_fields: Vec<&str> = fields
-            .iter()
-            .filter(|&&name| attributes.contains_key(name))
-            .copied()
-            .collect();
-
-        match present_fields.len() {
-            0 => Err(vec![TypeError::ResourceValidationFailed {
-                message: format!("Exactly one of [{}] must be specified", fields.join(", ")),
-                attribute: None,
-            }]),
-            1 => Ok(()),
-            _ => Err(vec![TypeError::ResourceValidationFailed {
-                message: format!(
-                    "Only one of [{}] can be specified, but found: {}",
-                    fields.join(", "),
-                    present_fields.join(", ")
-                ),
-                attribute: present_fields.first().map(|s| s.to_string()),
-            }]),
         }
     }
 }
@@ -7291,7 +7609,7 @@ pub enum UniqueNameSpec {
 ///     kind,
 ///     unique_name,
 ///     operation_config,
-///     exclusive_required,
+///     field_groups,
 ///     default_wait_timeout,
 ///     default_wait_interval,
 ///     defs,
@@ -7304,7 +7622,7 @@ pub enum UniqueNameSpec {
 ///     kind,
 ///     unique_name,
 ///     operation_config,
-///     exclusive_required,
+///     field_groups,
 ///     default_wait_timeout,
 ///     default_wait_interval,
 ///     defs,
@@ -7326,11 +7644,8 @@ pub struct ResourceSchema {
     /// Per-resource operational config (timeouts, retries).
     /// When None, provider defaults are used.
     pub(crate) operation_config: Option<OperationConfig>,
-    /// Declarative "exactly one of" groups. Each inner vec is a group of
-    /// attribute names where exactly one must be specified. Unlike an
-    /// in-process validator, this is plain data and survives the WASM plugin
-    /// boundary.
-    pub(crate) exclusive_required: Vec<Vec<String>>,
+    /// Declarative cardinality constraints over sibling attributes.
+    pub(crate) field_groups: Vec<FieldGroup>,
     /// Default total timeout for `wait <target> { ... }` polling against
     /// this resource type. `None` falls back to
     /// [`WAIT_DEFAULT_TIMEOUT`].
@@ -7365,7 +7680,7 @@ pub struct ResourceSchemaParts<'a> {
     pub kind: SchemaKind,
     pub unique_name: &'a UniqueNameSpec,
     pub operation_config: Option<&'a OperationConfig>,
-    pub exclusive_required: &'a [Vec<String>],
+    pub field_groups: &'a [FieldGroup],
     pub default_wait_timeout: Option<std::time::Duration>,
     pub default_wait_interval: Option<std::time::Duration>,
     pub defs: &'a std::collections::BTreeMap<String, AttributeType>,
@@ -7394,12 +7709,12 @@ impl ResourceValidation {
 ///
 /// Attribute paths are kept distinct from schema-level declarations so wire
 /// decoders and other adapters cannot accidentally present
-/// `exclusive_required[0]` or `defs.Tag.key` as a resource attribute.
+/// `field_groups[0]` or `defs.Tag.key` as a resource attribute.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SchemaValidationIssueLocation {
     Attribute(String),
     Definition(String),
-    ExclusiveRequired(usize),
+    FieldGroup(usize),
     UniqueName,
 }
 
@@ -7408,7 +7723,7 @@ impl SchemaValidationIssueLocation {
         match self {
             Self::Attribute(path) => Self::Attribute(format!("{path}{suffix}")),
             Self::Definition(path) => Self::Definition(format!("{path}{suffix}")),
-            Self::ExclusiveRequired(_) | Self::UniqueName => {
+            Self::FieldGroup(_) | Self::UniqueName => {
                 unreachable!("schema-level issue locations cannot have type-path descendants")
             }
         }
@@ -7417,7 +7732,7 @@ impl SchemaValidationIssueLocation {
     pub fn attribute_path(&self) -> Option<&str> {
         match self {
             Self::Attribute(path) => Some(path),
-            Self::Definition(_) | Self::ExclusiveRequired(_) | Self::UniqueName => None,
+            Self::Definition(_) | Self::FieldGroup(_) | Self::UniqueName => None,
         }
     }
 }
@@ -7427,7 +7742,7 @@ impl fmt::Display for SchemaValidationIssueLocation {
         match self {
             Self::Attribute(path) => f.write_str(path),
             Self::Definition(path) => write!(f, "defs.{path}"),
-            Self::ExclusiveRequired(index) => write!(f, "exclusive_required[{index}]"),
+            Self::FieldGroup(index) => write!(f, "field_groups[{index}]"),
             Self::UniqueName => f.write_str("unique_name"),
         }
     }
@@ -7796,6 +8111,17 @@ impl<'a> EffectiveType<'a> {
         })
     }
 
+    /// Return whether this type graph can reach a `Struct` value through
+    /// transparent containers, unions, or schema references.
+    pub fn contains_struct_with_budget(&self, budget: &mut ShapeWalkBudget) -> bool {
+        type_contains_struct(self.attr_type, self.defs, budget)
+    }
+
+    pub fn contains_struct(&self) -> bool {
+        let mut budget = ShapeWalkBudget::new(64);
+        self.contains_struct_with_budget(&mut budget)
+    }
+
     pub fn field_candidates_with_budget(
         &self,
         budget: &mut ShapeWalkBudget,
@@ -7835,6 +8161,37 @@ impl<'a> EffectiveType<'a> {
         self.field_candidates_with_budget(budget)
             .into_iter()
             .find(|field| field.name() == name)
+    }
+}
+
+fn type_contains_struct(
+    attr_type: &AttributeType,
+    defs: &BTreeMap<String, AttributeType>,
+    budget: &mut ShapeWalkBudget,
+) -> bool {
+    if !budget.take() {
+        return false;
+    }
+    let Ok(resolution) = resolve_refs_on_path(attr_type, defs, &mut Vec::new()) else {
+        return false;
+    };
+    match &resolution.attr.kind {
+        AttrTypeKind::Struct { .. } => true,
+        AttrTypeKind::List { element_type, .. } => type_contains_struct(element_type, defs, budget),
+        AttrTypeKind::Map { value, .. } => type_contains_struct(value, defs, budget),
+        AttrTypeKind::Union(members) => members
+            .as_raw_slice()
+            .iter()
+            .any(|member| type_contains_struct(member, defs, budget)),
+        AttrTypeKind::String { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Ref(_) => false,
     }
 }
 
@@ -8522,6 +8879,7 @@ fn identified_declaration_kind(
         RawShape::Struct {
             name: _name,
             fields: _fields,
+            field_groups: _field_groups,
         } => None,
         RawShape::Union(_members) => None,
         RawShape::Ref(_name) => None,
@@ -8585,6 +8943,7 @@ fn identified_declaration_scalar_kind(attribute_type: &AttributeType) -> Option<
         RawShape::Struct {
             name: _name,
             fields: _fields,
+            field_groups: _field_groups,
         } => None,
         RawShape::Union(_members) => None,
         RawShape::Ref(_name) => None,
@@ -8630,7 +8989,9 @@ fn visit_identified_declarations(
             visit_identified_declarations(key, visitor);
             visit_identified_declarations(value, visitor);
         }
-        RawShape::Struct { name: _, fields } => {
+        RawShape::Struct {
+            name: _, fields, ..
+        } => {
             for field in fields {
                 visit_identified_declarations(&field.field_type, visitor);
             }
@@ -9029,6 +9390,76 @@ fn validate_struct_field_mode(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FieldGroupMemberAdmission {
+    input_mode: InputMode,
+    has_default: bool,
+}
+
+/// Validate every declaration-level invariant for sibling-field groups.
+///
+/// Resource attributes and Struct fields adapt their metadata into the same
+/// small record so unknown/provider/required/default checks and duplicate
+/// canonicalization cannot drift between the two schema levels.
+fn validate_field_group_admission(
+    groups: &[FieldGroup],
+    member_kind: &str,
+    group_location: impl Fn(usize) -> SchemaValidationIssueLocation,
+    member: impl Fn(&str) -> Option<FieldGroupMemberAdmission>,
+    issues: &mut Vec<SchemaDefinitionIssue>,
+) {
+    let mut seen = HashMap::<(FieldGroupKind, Vec<String>), usize>::new();
+
+    for (group_index, group) in groups.iter().enumerate() {
+        let location = group_location(group_index);
+        let fields = group.fields().join(", ");
+        let group_name = format!("{} field group [{fields}]", group.kind().description());
+
+        let mut canonical_fields = group.fields().to_vec();
+        canonical_fields.sort_unstable();
+        let duplicate_key = (group.kind(), canonical_fields.clone());
+        if let Some(first_index) = seen.get(&duplicate_key) {
+            push_schema_issue(
+                issues,
+                &location,
+                format!(
+                    "duplicate {} field group [{}]; matches field group at index {first_index}",
+                    group.kind().description(),
+                    canonical_fields.join(", ")
+                ),
+            );
+        } else {
+            seen.insert(duplicate_key, group_index);
+        }
+
+        for name in group.fields() {
+            match member(name) {
+                None => push_schema_issue(
+                    issues,
+                    &location,
+                    format!("{group_name} names unknown {member_kind} `{name}`"),
+                ),
+                Some(member) if member.input_mode.is_provider_populated() => push_schema_issue(
+                    issues,
+                    &location,
+                    format!("{group_name} names provider-populated {member_kind} `{name}`"),
+                ),
+                Some(member) if member.input_mode.is_required() => push_schema_issue(
+                    issues,
+                    &location,
+                    format!("{group_name} names required {member_kind} `{name}`"),
+                ),
+                Some(member) if member.has_default => push_schema_issue(
+                    issues,
+                    &location,
+                    format!("{group_name} names defaulted {member_kind} `{name}`"),
+                ),
+                Some(_) => {}
+            }
+        }
+    }
+}
+
 fn validate_type_definition(
     attr_type: &AttributeType,
     defs: &BTreeMap<String, AttributeType>,
@@ -9086,7 +9517,11 @@ fn validate_type_definition(
                 issues,
             );
         }
-        AttrTypeKind::Struct { fields, .. } => {
+        AttrTypeKind::Struct {
+            fields,
+            field_groups,
+            ..
+        } => {
             let mut names = HashSet::new();
             for field in fields {
                 let field_location = location.with_suffix(format_args!(".{}", field.name));
@@ -9114,6 +9549,23 @@ fn validate_type_definition(
                     issues,
                 );
             }
+            validate_field_group_admission(
+                field_groups,
+                "field",
+                |group_index| location.with_suffix(format_args!(".field_groups[{group_index}]")),
+                |name| {
+                    fields.iter().find(|field| field.name == name).map(|field| {
+                        FieldGroupMemberAdmission {
+                            input_mode: field.declared_input_mode,
+                            // StructField has no default in the core or v13
+                            // protocol grammar. Keeping this explicit makes a
+                            // future addition inherit the shared rejection.
+                            has_default: false,
+                        }
+                    })
+                },
+                issues,
+            );
         }
         AttrTypeKind::Union(members) => {
             for (index, member) in members.as_raw_slice().iter().enumerate() {
@@ -9703,7 +10155,7 @@ impl ResourceSchema {
             kind: SchemaKind::Resource,
             unique_name: UniqueNameSpec::Conflicting,
             operation_config: None,
-            exclusive_required: Vec::new(),
+            field_groups: Vec::new(),
             default_wait_timeout: None,
             default_wait_interval: None,
             defs: std::collections::BTreeMap::new(),
@@ -9769,33 +10221,20 @@ impl ResourceSchema {
             );
         }
 
-        for (group_index, group) in self.exclusive_required.iter().enumerate() {
-            for name in group {
-                match self.attributes.get(name) {
-                    None => {
-                        let location =
-                            SchemaValidationIssueLocation::ExclusiveRequired(group_index);
-                        push_schema_issue(
-                            &mut issues,
-                            &location,
-                            format!("exclusive_required names unknown attribute `{name}`"),
-                        );
-                    }
-                    Some(attribute) if attribute.input_mode.is_provider_populated() => {
-                        let location =
-                            SchemaValidationIssueLocation::ExclusiveRequired(group_index);
-                        push_schema_issue(
-                            &mut issues,
-                            &location,
-                            format!(
-                                "exclusive_required names provider-populated attribute `{name}`"
-                            ),
-                        );
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
+        validate_field_group_admission(
+            &self.field_groups,
+            "attribute",
+            SchemaValidationIssueLocation::FieldGroup,
+            |name| {
+                self.attributes
+                    .get(name)
+                    .map(|attribute| FieldGroupMemberAdmission {
+                        input_mode: attribute.input_mode,
+                        has_default: attribute.default.is_some(),
+                    })
+            },
+            &mut issues,
+        );
 
         if let UniqueNameSpec::Attribute(name) = &self.unique_name
             && !self.attributes.contains_key(name)
@@ -9835,7 +10274,7 @@ impl ResourceSchema {
             kind: self.kind,
             unique_name: &self.unique_name,
             operation_config: self.operation_config.as_ref(),
-            exclusive_required: &self.exclusive_required,
+            field_groups: &self.field_groups,
             default_wait_timeout: self.default_wait_timeout,
             default_wait_interval: self.default_wait_interval,
             defs: &self.defs,
@@ -9870,8 +10309,8 @@ impl ResourceSchema {
         self.operation_config.as_ref()
     }
 
-    pub fn exclusive_required_groups(&self) -> &[Vec<String>] {
-        &self.exclusive_required
+    pub fn field_groups(&self) -> &[FieldGroup] {
+        &self.field_groups
     }
 
     pub fn default_wait_timeout(&self) -> Option<std::time::Duration> {
@@ -10104,17 +10543,9 @@ impl ResourceSchema {
         self.validation.validator()
     }
 
-    /// Declare that exactly one of the given attributes must be specified.
-    ///
-    /// Equivalent to a CloudFormation `oneOf` of required properties. Stored
-    /// as data (not a closure) so the constraint survives serialization —
-    /// in particular, crossing the WASM plugin boundary.
-    ///
-    /// Multiple calls append additional groups; each group is evaluated
-    /// independently by `validate()`.
-    pub fn exclusive_required(mut self, fields: &[&str]) -> Self {
-        self.exclusive_required
-            .push(fields.iter().map(|s| s.to_string()).collect());
+    /// Add a declarative cardinality constraint over top-level attributes.
+    pub fn field_group(mut self, group: FieldGroup) -> Self {
+        self.field_groups.push(group);
         self
     }
 
@@ -10284,8 +10715,8 @@ impl ResourceSchema {
     /// Unlike the full validation entry point, this method
     /// deliberately omits shape-of-resource checks that were already made
     /// when the source was expanded: required attributes, unknown
-    /// attributes, provider-populated attributes, and exclusive-required
-    /// groups. It is intended for a later resolution boundary, where a value
+    /// attributes, provider-populated attributes, and field groups. It is
+    /// intended for a later resolution boundary, where a value
     /// that was deferred during expansion may have become concrete.
     ///
     /// Deferred leaves are ignored while concrete siblings in the same
@@ -10378,11 +10809,17 @@ impl ResourceSchema {
             None,
         ));
 
-        // Evaluate declarative exclusive-required groups (WASM-safe).
-        for group in &self.exclusive_required {
-            let refs: Vec<&str> = group.iter().map(|s| s.as_str()).collect();
-            if let Err(mut e) = validators::validate_exclusive_required(attributes, &refs) {
-                errors.append(&mut e);
+        for group in &self.field_groups {
+            let present = group
+                .fields()
+                .iter()
+                .filter(|name| attributes.contains_key(name.as_str()))
+                .count();
+            if !group.is_satisfied_by_count(present) {
+                errors.push(TypeError::FieldGroupViolation {
+                    path: FieldPath::new(),
+                    group: group.clone(),
+                });
             }
         }
 
