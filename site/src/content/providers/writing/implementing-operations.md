@@ -58,6 +58,7 @@ pub trait Api {
 
 use std::collections::{BTreeMap, HashMap};
 
+use carina_plugin_sdk::core::schema::ReferenceForms;
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending, Poll,
@@ -79,6 +80,10 @@ impl<A: Api> CarinaProvider for WidgetProvider<A> {
     type UpdateToken = Never;
     type DeleteToken = Never;
 
+    fn reference_forms(&self) -> ReferenceForms {
+        ReferenceForms::new()
+    }
+
     fn initialize(
         &mut self,
         _attrs: &BTreeMap<String, Value>,
@@ -91,6 +96,14 @@ impl<A: Api> CarinaProvider for WidgetProvider<A> {
 ```
 
 `CreateToken` is defined below. Updates and deletes finish in one call, so their token types are `Never`.
+
+When an initialized instance knows its reference namespace, return
+`ReferenceScope::available(partition, region, account)` from `initialize`.
+It returns `ReferenceScopeError` when a value is empty or contains `{` or `}`;
+map that error to `String` for the trait method. Return
+`ReferenceScope::Unavailable` when the namespace is not known; under
+`Unavailable`, the provider's reference forms are inert and do not expand
+short names during comparison.
 
 The component exports one concrete type, for example `export_provider!(WidgetProvider<HttpApi>, http)` with your real client as `HttpApi`; the `http` form also needs `wasi = "0.14"` in the `wasm32` dependencies, as the Overview explains. `export_provider!` builds the provider with `Default`, so that type needs a `Default` implementation, written in the same crate as `WidgetProvider` (Rust's orphan rule rejects it in a separate binary crate), and the client should take its endpoint and credentials in `initialize`, from the `provider` block. Remember that the host only lets requests reach AWS hosts today; see the [Overview](/providers/writing/overview/#what-a-provider-is).
 
@@ -492,7 +505,7 @@ A schema with `kind: SchemaKind::DataSource` declares a data source. The host ca
 
 ## Other trait methods
 
-`required_permissions` feeds the IAM preflight check that `carina plan --check-iam` runs, which warns about missing AWS IAM actions before an apply. Return an empty list unless your provider manages AWS resources. `normalize_desired`, `normalize_state` and `hydrate_read_state` are optional hooks for providers whose API changes values on the way in or out. Their default implementations return the values unchanged, so implement them only when you need them.
+`reference_forms` is required; return `ReferenceForms::new()` when the provider declares no short-to-long reference forms. `required_permissions` feeds the IAM preflight check that `carina plan --check-iam` runs, which warns about missing AWS IAM actions before an apply. Return an empty list unless your provider manages AWS resources. `normalize_desired`, `normalize_state` and `hydrate_read_state` are optional hooks for providers whose API changes values on the way in or out. Their default implementations return the values unchanged, so implement them only when you need them.
 
 Desired normalization has a three-way attribute contract. `DesiredResource::attribute` and `attributes` distinguish a `Known` value from an `Absent` attribute and a `Deferred` value that the host withheld until its dependency resolves. A deferred attribute is not absent: mutate only `Known` values, use `insert_absent` when adding a default, and return the opaque result from `finish`. This prevents normalization from replacing a deferred value by treating its missing map entry as user-authored absence.
 

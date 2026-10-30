@@ -5,6 +5,13 @@
 Protocol v13 makes initialized reference scope, provider-declared reference
 forms, and recoverable create failures explicit transport data.
 
+The `normalize-desired` input is now
+`list<desired-resource { resource, deferred }>` rather than a plain resource
+list. `deferred` names the top-level attributes whose unresolved values the
+host withheld from `resource`. A returned resource must not contain an
+attribute named in its input's `deferred` list; the host rejects such a result
+and restores the original unresolved value (carina#4120).
+
 `initialize` now returns an `initialize-result` containing a closed
 `reference-scope`: either the provider instance's `partition`, `region`, and
 `account`, or `unavailable`. The scope belongs to the initialized instance, so

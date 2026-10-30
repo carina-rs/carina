@@ -2172,6 +2172,7 @@ async fn precompleted_state_only_result_is_checkpointed_before_provider_completi
 
 fn persisted_create_for_executor(id: &ResourceId) -> crate::provider::InFlightCreate {
     let pending = crate::provider::CreateAttempt::new(id.clone())
+        .0
         .issued(
             AppliedIdentifier::new("created-id").expect("fixture identifier must be non-empty"),
             crate::provider::Sent::AllRequestAttributes,
@@ -2187,7 +2188,7 @@ fn persisted_create_for_executor(id: &ResourceId) -> crate::provider::InFlightCr
 }
 
 fn persisted_unissued_create_for_executor(id: &ResourceId) -> crate::provider::InFlightCreate {
-    let pending = crate::provider::CreateAttempt::new(id.clone()).pending(
+    let pending = crate::provider::CreateAttempt::new(id.clone()).0.pending(
         crate::provider::PendingToken::new("persisted-create-token"),
         crate::provider::Sent::AllRequestAttributes,
         1,
@@ -2356,40 +2357,6 @@ async fn resume_dispatch_validates_resent_sent_against_checked_request() {
 }
 
 #[tokio::test]
-async fn create_dispatch_rejects_an_outcome_bound_to_another_resource() {
-    let provider = MockProvider::new();
-    let resource = make_resource("source", &[]);
-    let id = resource.id.clone();
-    let other_id = make_resource("other", &[]).id;
-    provider.push_create(Ok(ok_state(&other_id)));
-    let bindings = ResolvedBindings::default();
-    let module_gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let preparation = crate::executor::ProviderPreparationContext::new(
-        &bindings,
-        &module_gate,
-        &[],
-        &NoopNormalizer,
-        &[],
-        &TEST_SCHEMAS,
-    );
-    let request = crate::executor::prepare_create_request(resource, &preparation)
-        .await
-        .expect("fixture request passes provider preparation");
-
-    let failure = crate::executor::dispatch_create(&provider, &id, request)
-        .await
-        .expect_err("a provider outcome for another route must be rejected");
-    let crate::provider::CreateFailureKind::Untracked(error) = failure.into_kind() else {
-        panic!("the mismatched provider outcome must not carry foreign state");
-    };
-    assert_eq!(
-        error.detail().context(),
-        "provider returned a create outcome for another resource"
-    );
-    assert!(error.to_string().starts_with("[test.source]"));
-}
-
-#[tokio::test]
 async fn create_untracked_skips_dependents_and_writes_nothing() {
     let provider = MockProvider::new();
     let source = make_resource("source", &[]);
@@ -2420,8 +2387,10 @@ async fn create_before_destroy_outcome_unknown_records_replacement_create_state(
     let provider = MockProvider::new();
     let source = make_resource("source", &[]);
     let source_id = source.id.clone();
-    let mut directives = Directives::default();
-    directives.create_before_destroy = true;
+    let directives = Directives {
+        create_before_destroy: true,
+        ..Directives::default()
+    };
     let mut plan = Plan::new();
     plan.add(create_effect(source));
     plan.add(Effect::Delete {

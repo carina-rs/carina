@@ -50,7 +50,7 @@ fn string_wait_schemas(provider: &str) -> SchemaRegistry {
 }
 
 fn unknown_create_outcome(id: ResourceId) -> crate::provider::UnknownCreateOutcome {
-    let failure = crate::provider::CreateAttempt::new(id).outcome_unknown(
+    let failure = crate::provider::CreateAttempt::new(id).0.outcome_unknown(
         crate::provider::EgressSent::for_test(),
         crate::provider::ProviderError::api_error("guest trapped"),
     );
@@ -286,7 +286,7 @@ fn desired_in_flight_plans_resume_never_create() {
 
     let desired = Resource::new("test.resource", "managed");
     let id = desired.id.clone();
-    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).pending(
+    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).0.pending(
         PendingToken::new("secret-provider-token"),
         Sent::AllRequestAttributes,
         1,
@@ -330,7 +330,7 @@ fn saved_resume_contains_no_token() {
 
     let desired = Resource::new("test.resource", "managed");
     let id = desired.id.clone();
-    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).pending(
+    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).0.pending(
         PendingToken::new("must-not-enter-plan"),
         Sent::AllRequestAttributes,
         1,
@@ -362,7 +362,7 @@ fn in_flight_orphan_is_create_in_flight_orphan_error() {
     use crate::provider::{CreateAttempt, InFlightCreate, PendingToken, Sent};
 
     let id = ResourceId::with_identity("test.resource", "orphan");
-    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).pending(
+    let pending = InFlightCreate::from_pending(CreateAttempt::new(id.clone()).0.pending(
         PendingToken::new("opaque"),
         Sent::AllRequestAttributes,
         1,
@@ -523,7 +523,7 @@ fn changed_provider_instance_rejects_resume() {
         "managed",
         Some("issuing-route".to_string()),
     );
-    let pending = InFlightCreate::from_pending(CreateAttempt::new(persisted_id.clone()).pending(
+    let pending = InFlightCreate::from_pending(CreateAttempt::new(persisted_id.clone()).0.pending(
         PendingToken::new("opaque"),
         Sent::AllRequestAttributes,
         1,

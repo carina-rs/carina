@@ -1657,7 +1657,9 @@ mod tests {
         let request = carina_core::executor::prepare_create_request(resource, &preparation)
             .await
             .expect("mock test resource should pass create preparation");
-        carina_core::executor::dispatch_create(provider, &id, request).await
+        let (create, _cancellation) =
+            carina_core::executor::dispatch_create(provider, &id, request);
+        create.await
     }
 
     fn persist_pending_for_resume(pending: &InFlightCreate) -> InFlightCreate {

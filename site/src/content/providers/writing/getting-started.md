@@ -81,6 +81,10 @@ The SDK is not on crates.io; depend on it from git and pin `rev`. `serde`, `serd
 
 use std::collections::{BTreeMap, HashMap};
 
+use carina_plugin_sdk::core::schema::{
+    AttributeSchema, AttributeType, ReferenceForms, ResourceSchema, ValidatedConfigSchema,
+    ValidatedResourceSchema,
+};
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending, Poll,
@@ -91,34 +95,6 @@ use carina_plugin_sdk::{
 /// the greeting is derived from its name, so it keeps no state of its own.
 #[derive(Default)]
 struct HelloProvider;
-
-fn string_type() -> AttributeType {
-    AttributeType::String {
-        pattern: None,
-        length: None,
-        validate: None,
-        to_dsl: None,
-        identity: None,
-    }
-}
-
-fn attribute(name: &str, required: bool, create_only: bool, read_only: bool) -> AttributeSchema {
-    AttributeSchema {
-        name: name.to_string(),
-        attr_type: string_type(),
-        required,
-        default: None,
-        description: None,
-        create_only,
-        read_only,
-        write_only: false,
-        block_name: None,
-        provider_name: None,
-        removable: None,
-        identity: required,
-        deferred_populate: false,
-    }
-}
 
 fn error(kind: ProviderErrorKind, message: impl Into<String>) -> ProviderError {
     ProviderError {
@@ -157,28 +133,31 @@ impl CarinaProvider for HelloProvider {
         }
     }
 
-    fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![ResourceSchema {
-            resource_type: "greeting".to_string(),
-            attributes: HashMap::from([
-                ("name".to_string(), attribute("name", true, true, false)),
-                ("message".to_string(), attribute("message", false, false, true)),
-            ]),
-            description: Some("A greeting derived from a name".to_string()),
-            kind: SchemaKind::Managed,
-            unique_name: UniqueNameSpec::default(),
-            operation_config: None,
-            validators: vec![],
-            exclusive_required: vec![],
-            defs: Default::default(),
-        }]
+    fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+        vec![ResourceSchema::new("greeting")
+            .with_description("A greeting derived from a name")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated("message", AttributeType::string()).build(),
+            )
+            .validate()
+            .expect("the greeting schema is valid")]
     }
 
-    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-        HashMap::new()
+    fn reference_forms(&self) -> ReferenceForms {
+        ReferenceForms::new()
     }
 
-    fn validate_config(&self, _attrs: &HashMap<String, Value>) -> Result<(), String> {
+    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+        ValidatedConfigSchema::default()
+    }
+
+    fn validate_config(&self, _attrs: &BTreeMap<String, Value>) -> Result<(), String> {
         Ok(())
     }
 

@@ -143,7 +143,11 @@ where
         id: &'a ResourceId,
         request: CreateRequest,
     ) -> BoxFuture<'a, Result<CreateOutcome, CreateFailure>> {
-        Box::pin(carina_core::executor::dispatch_create(self, id, request))
+        let (create, cancellation) = carina_core::executor::dispatch_create(self, id, request);
+        Box::pin(async move {
+            let _cancellation = cancellation;
+            create.await
+        })
     }
 }
 

@@ -91,7 +91,7 @@ use saved_plan::{
 pub type ApplyResult = ExecutionResult;
 
 type ObserverFactory<'a, S = ModuleSource> =
-    dyn Fn(&carina_core::plan::Plan<S>) -> Box<dyn ExecutionObserver<S>> + 'a;
+    dyn Fn(&carina_core::plan::Plan<S>, &Path) -> Box<dyn ExecutionObserver<S>> + 'a;
 
 #[derive(serde::Deserialize)]
 struct PlanFileHeader {
@@ -183,8 +183,9 @@ fn saved_plan_secret_orphan_vanished_error(
 
 fn cli_observer_factory<S: Send + Sync + 'static>(
     plan: &carina_core::plan::Plan<S>,
+    project_dir: &Path,
 ) -> Box<dyn ExecutionObserver<S>> {
-    Box::new(CliObserver::new(plan))
+    Box::new(CliObserver::new(plan, project_dir))
 }
 
 fn format_total_apply_line(elapsed: Duration) -> String {
@@ -235,7 +236,13 @@ async fn create_checked_bootstrap_resource(
     let comparison = resolved_comparison.context();
     let schema = Some(owner_schema.schema().as_schema());
     let accepted_request = AcceptedRequest::from_create_request(&request);
-    match carina_core::executor::dispatch_create(operation_provider, &id, request).await {
+    let (create, create_cancellation) =
+        carina_core::executor::dispatch_create(operation_provider, &id, request);
+    let outcome = create.await;
+    // Bootstrap creates are not part of the parallel executor, but they still
+    // retain the reporter until the guest call has settled.
+    drop(create_cancellation);
+    match outcome {
         Ok(outcome) => {
             let identifier = outcome.identifier().as_str().to_string();
             let (state, accepted_request, diagnostic) =
@@ -2279,7 +2286,7 @@ async fn run_apply_locked_owned(
             // `ProviderNormalizer`; the same object is passed in both positions
             // so apply re-normalizes with exactly the plan-time normalizer
             // (carina#3060). They must stay the same object.
-            let observer = observer_factory(&plan);
+            let observer = observer_factory(&plan, project_dir);
             let provider = Arc::new(provider);
             let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
                 resolved_resources.clone(),
@@ -3575,7 +3582,7 @@ async fn run_apply_from_plan_locked_owned(
             // Same object in both positions: `ProviderRouter` is both the
             // `Provider` and the `ProviderNormalizer`, so apply re-normalizes
             // with the plan-time normalizer (carina#3060).
-            let observer = observer_factory(plan);
+            let observer = observer_factory(plan, project_dir);
             let provider = Arc::new(provider);
             let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
                 resolved_sorted_resources.clone(),

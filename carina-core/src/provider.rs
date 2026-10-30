@@ -3089,7 +3089,8 @@ pub(crate) enum CancelledCreateReport {
 /// Executor-owned receiver for a classified create failure emitted when a
 /// started guest call is dropped during cleanup.
 #[derive(Debug)]
-pub(crate) struct CreateCallCancellationReceiver {
+#[doc(hidden)]
+pub struct CreateCallCancellationReceiver {
     receiver: mpsc::Receiver<CancelledCreateReport>,
 }
 
@@ -3110,7 +3111,6 @@ pub struct StartedGuestCreateCall {
 struct GuestCreateCallInner {
     attempt: CreateAttempt,
     recorder: CallEgressRecorder,
-    cancellation: Option<CreateCallCancellationReporter>,
 }
 
 impl StartedGuestCreateCall {
@@ -3136,14 +3136,7 @@ impl Drop for StartedGuestCreateCall {
         let Some(inner) = self.inner.take() else {
             return;
         };
-        let Some(reporter) = inner.cancellation else {
-            return;
-        };
-        report_cancelled_guest_create(
-            inner.attempt,
-            inner.recorder.may_have_dispatched(),
-            reporter,
-        );
+        report_cancelled_guest_create(inner.attempt, inner.recorder.may_have_dispatched());
     }
 }
 
@@ -3166,7 +3159,6 @@ impl FinishedGuestCreateCall {
         let GuestCreateCallInner {
             attempt,
             recorder: _recorder,
-            cancellation,
         } = self
             .inner
             .take()
@@ -3176,7 +3168,6 @@ impl FinishedGuestCreateCall {
                 attempt,
                 egress,
                 error,
-                cancellation,
             }),
         }
     }
@@ -3210,14 +3201,7 @@ impl Drop for FinishedGuestCreateCall {
         let Some(inner) = self.inner.take() else {
             return;
         };
-        let Some(reporter) = inner.cancellation else {
-            return;
-        };
-        report_cancelled_guest_create(
-            inner.attempt,
-            inner.recorder.may_have_dispatched(),
-            reporter,
-        );
+        report_cancelled_guest_create(inner.attempt, inner.recorder.may_have_dispatched());
     }
 }
 
@@ -3247,7 +3231,6 @@ struct GuestCallFailureInner {
     attempt: CreateAttempt,
     egress: CallEgress,
     error: ProviderError,
-    cancellation: Option<CreateCallCancellationReporter>,
 }
 
 impl GuestCallFailure {
@@ -3256,7 +3239,6 @@ impl GuestCallFailure {
             attempt,
             egress,
             error,
-            cancellation: _cancellation,
         } = self
             .inner
             .take()
@@ -3268,20 +3250,18 @@ impl GuestCallFailure {
     }
 }
 
-fn report_cancelled_guest_create(
-    attempt: CreateAttempt,
-    may_have_dispatched: bool,
-    reporter: CreateCallCancellationReporter,
-) {
+fn report_cancelled_guest_create(attempt: CreateAttempt, may_have_dispatched: bool) {
+    let CreateAttempt {
+        id,
+        started_at,
+        cancellation,
+    } = attempt;
     let report = if may_have_dispatched {
-        CancelledCreateReport::OutcomeUnknown(UnknownCreateOutcome::new(
-            attempt.id,
-            attempt.started_at,
-        ))
+        CancelledCreateReport::OutcomeUnknown(UnknownCreateOutcome::new(id, started_at))
     } else {
         CancelledCreateReport::Untracked
     };
-    let _send_result = reporter.sender.send(report);
+    let _send_result = cancellation.sender.send(report);
 }
 
 /// Inspectable classification carried by an opaque [`CreateFailure`].
@@ -3628,34 +3608,24 @@ impl ResumeFailure {
 ///     error: ProviderError,
 /// ) -> CreateFailure {
 ///     let _issued = attempt.issued(identifier, Sent::AllRequestAttributes);
-///     CreateAttempt::new(ResourceId::new("p", "t", "n")).untracked(error)
+///     CreateAttempt::new(ResourceId::new("p", "t", "n")).0.untracked(error)
 /// }
 /// ```
 #[derive(Debug)]
 pub struct CreateAttempt {
     id: ResourceId,
     started_at: Timestamp,
-    cancellation: Option<CreateCallCancellationReporter>,
+    cancellation: CreateCallCancellationReporter,
 }
 
 impl CreateAttempt {
-    pub(crate) fn new(id: ResourceId) -> Self {
-        Self {
-            id,
-            started_at: Timestamp::now(),
-            cancellation: None,
-        }
-    }
-
-    pub(crate) fn with_cancellation_report(
-        id: ResourceId,
-    ) -> (Self, CreateCallCancellationReceiver) {
+    pub(crate) fn new(id: ResourceId) -> (Self, CreateCallCancellationReceiver) {
         let (sender, receiver) = mpsc::channel();
         (
             Self {
                 id,
                 started_at: Timestamp::now(),
-                cancellation: Some(CreateCallCancellationReporter { sender }),
+                cancellation: CreateCallCancellationReporter { sender },
             },
             CreateCallCancellationReceiver { receiver },
         )
@@ -3665,7 +3635,7 @@ impl CreateAttempt {
     #[cfg(feature = "test-utils")]
     #[doc(hidden)]
     pub fn for_test(id: ResourceId) -> Self {
-        Self::new(id)
+        Self::new(id).0
     }
 
     pub fn untracked(self, error: ProviderError) -> CreateFailure {
@@ -3679,13 +3649,11 @@ impl CreateAttempt {
         })
     }
 
-    pub fn start_guest_call(mut self) -> StartedGuestCreateCall {
-        let cancellation = self.cancellation.take();
+    pub fn start_guest_call(self) -> StartedGuestCreateCall {
         StartedGuestCreateCall {
             inner: Some(GuestCreateCallInner {
                 attempt: self,
                 recorder: CallEgressRecorder::new(),
-                cancellation,
             }),
         }
     }
@@ -4127,7 +4095,12 @@ impl ResentCreateAttempt {
     }
 
     pub fn issued(self, identifier: AppliedIdentifier, sent: Sent) -> ResentIssuedCreate {
-        ResentIssuedCreate(CreateAttempt::new(self.previous.id().clone()).issued(identifier, sent))
+        ResentIssuedCreate(IssuedCreate {
+            id: self.previous.id().clone(),
+            identifier,
+            sent,
+            started_at: Some(Timestamp::now()),
+        })
     }
 
     pub fn pending(
@@ -4136,10 +4109,13 @@ impl ResentCreateAttempt {
         sent: Sent,
         poll_after_secs: u32,
     ) -> ResentPendingCreate {
-        ResentPendingCreate(CreateAttempt::new(self.previous.id().clone()).pending(
+        ResentPendingCreate(PendingCreate::new(
+            self.previous.id().clone(),
             token,
+            None,
             sent,
             poll_after_secs,
+            Timestamp::now(),
         ))
     }
 }
@@ -7939,8 +7915,9 @@ mod tests {
         use std::error::Error as _;
 
         let id = ResourceId::with_provider_identity("test", "widget", "example", None);
-        let failure =
-            CreateAttempt::new(id).untracked(ProviderError::api_error("leaf create failure"));
+        let failure = CreateAttempt::new(id)
+            .0
+            .untracked(ProviderError::api_error("leaf create failure"));
 
         assert_eq!(
             failure.to_string(),
@@ -7955,7 +7932,7 @@ mod tests {
     #[tokio::test]
     async fn guest_create_failure_after_egress_is_outcome_unknown() {
         let id = ResourceId::with_provider_identity("test", "widget", "example", None);
-        let started = CreateAttempt::new(id.clone()).start_guest_call();
+        let started = CreateAttempt::new(id.clone()).0.start_guest_call();
         started.egress_recorder().begin_request().dispatched();
 
         let failure = started
@@ -7975,6 +7952,7 @@ mod tests {
     async fn guest_create_failure_without_egress_is_untracked() {
         let id = ResourceId::with_provider_identity("test", "widget", "example", None);
         let failure = CreateAttempt::new(id)
+            .0
             .start_guest_call()
             .finish()
             .failed(ProviderError::internal("guest trapped"))
@@ -7990,7 +7968,7 @@ mod tests {
     #[tokio::test]
     async fn guest_decode_failure_waits_for_pending_egress_decision() {
         let id = ResourceId::with_provider_identity("test", "widget", "example", None);
-        let started = CreateAttempt::new(id).start_guest_call();
+        let started = CreateAttempt::new(id).0.start_guest_call();
         let pending = started.egress_recorder().begin_request();
         let classification = tokio::spawn(async move {
             started
@@ -8019,7 +7997,7 @@ mod tests {
     #[test]
     fn outcome_unknown_requires_the_egress_sent_witness() {
         let id = ResourceId::with_provider_identity("test", "widget", "example", None);
-        let failure = CreateAttempt::new(id.clone()).outcome_unknown(
+        let failure = CreateAttempt::new(id.clone()).0.outcome_unknown(
             EgressSent::for_test(),
             ProviderError::internal("returned value could not be decoded"),
         );
@@ -8034,7 +8012,7 @@ mod tests {
     #[test]
     fn dropped_started_guest_create_reports_only_the_two_cancellation_states() {
         let sent_id = ResourceId::with_provider_identity("test", "widget", "sent", None);
-        let (attempt, receiver) = CreateAttempt::with_cancellation_report(sent_id.clone());
+        let (attempt, receiver) = CreateAttempt::new(sent_id.clone());
         let started = attempt.start_guest_call();
         started.egress_recorder().begin_request().dispatched();
         drop(started);
@@ -8045,7 +8023,7 @@ mod tests {
         assert_eq!(unknown.id(), &sent_id);
 
         let unsent_id = ResourceId::with_provider_identity("test", "widget", "unsent", None);
-        let (attempt, receiver) = CreateAttempt::with_cancellation_report(unsent_id);
+        let (attempt, receiver) = CreateAttempt::new(unsent_id);
         drop(attempt.start_guest_call());
         assert!(matches!(
             receiver.drain().as_slice(),
@@ -8053,7 +8031,7 @@ mod tests {
         ));
 
         let pending_id = ResourceId::with_provider_identity("test", "widget", "pending", None);
-        let (attempt, receiver) = CreateAttempt::with_cancellation_report(pending_id.clone());
+        let (attempt, receiver) = CreateAttempt::new(pending_id.clone());
         let started = attempt.start_guest_call();
         let pending = started.egress_recorder().begin_request();
         drop(started);
@@ -9403,14 +9381,12 @@ mod tests {
         let provider = MockProvider;
         let resource = Resource::new("test", "example");
         let id = resource.id.clone();
-        let state = crate::executor::dispatch_create(
+        let (create, _cancellation) = crate::executor::dispatch_create(
             &provider,
             &id,
             CreateRequest::checked(resolved_for_test(resource)),
-        )
-        .await
-        .unwrap()
-        .into_state_for_writeback();
+        );
+        let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
     }
@@ -9477,14 +9453,12 @@ mod tests {
 
         let resource = Resource::with_provider("mock", "test", "example", None);
         let id = resource.id.clone();
-        let state = crate::executor::dispatch_create(
+        let (create, _cancellation) = crate::executor::dispatch_create(
             &router,
             &id,
             CreateRequest::checked(resolved_for_test(resource)),
-        )
-        .await
-        .unwrap()
-        .into_state_for_writeback();
+        );
+        let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
     }

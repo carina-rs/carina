@@ -450,11 +450,21 @@ impl<S> StartedEffect<'_, S> {
             });
     }
 
-    pub(super) fn failed(mut self, error: &str, duration: Duration) {
+    pub(super) fn failed(self, error: &str, duration: Duration) {
+        self.failed_with_recovery(error, None, duration);
+    }
+
+    pub(super) fn failed_with_recovery(
+        mut self,
+        error: &str,
+        recovery: Option<&crate::plan::PlanError>,
+        duration: Duration,
+    ) {
         let progress = self.finish();
         self.observer.on_event(&ExecutionEvent::EffectFailed {
             effect: self.effect(),
             error,
+            recovery,
             duration,
             progress,
         });
@@ -1109,8 +1119,7 @@ mod tests {
             "unknown-after-fail-safe",
             None,
         );
-        let (attempt, receiver) =
-            crate::provider::CreateAttempt::with_cancellation_report(id.clone());
+        let (attempt, receiver) = crate::provider::CreateAttempt::new(id.clone());
         let guest_call = attempt.start_guest_call();
         guest_call.egress_recorder().begin_request().dispatched();
         drop(guest_call);

@@ -394,10 +394,8 @@ fn dispatch_fixture_create(
     let provider = FixtureCreateProvider {
         result: std::sync::Mutex::new(Some(result)),
     };
-    block_on_ready(carina_core::executor::dispatch_create(
-        &provider, id, request,
-    ))
-    .expect_err("fixture create returns a classified failure")
+    let (create, _cancellation) = carina_core::executor::dispatch_create(&provider, id, request);
+    block_on_ready(create).expect_err("fixture create returns a classified failure")
 }
 
 #[cfg(test)]

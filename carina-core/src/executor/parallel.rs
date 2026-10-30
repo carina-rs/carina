@@ -414,6 +414,7 @@ pub(super) async fn execute_effects_sequential<
         observer.on_event(&ExecutionEvent::EffectFailed {
             effect: &effects[idx],
             error: &message,
+            recovery: None,
             duration: std::time::Duration::ZERO,
             progress,
         });
@@ -608,6 +609,7 @@ pub(super) async fn execute_effects_sequential<
                             observer.on_event(&ExecutionEvent::EffectFailed {
                                 effect: &effects[failed_idx],
                                 error: &message,
+                                recovery: None,
                                 duration: std::time::Duration::ZERO,
                                 progress,
                             });

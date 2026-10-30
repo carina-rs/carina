@@ -64,6 +64,7 @@ pub(super) enum BasicEffectResult {
     },
     ClassifiedFailure {
         error: String,
+        recovery: Option<Box<crate::plan::PlanError>>,
         resource_id: ResourceId,
         applied: Applied,
     },
@@ -116,10 +117,12 @@ impl<'a, S> StartedBasicEffectResult<'a, S> {
                 diagnostic,
                 ..
             } => started.partially_succeeded(&completed.state, diagnostic, duration),
-            BasicEffectResult::Failure { error, .. }
-            | BasicEffectResult::ClassifiedFailure { error, .. } => {
+            BasicEffectResult::Failure { error, .. } => {
                 started.failed(error, duration);
             }
+            BasicEffectResult::ClassifiedFailure {
+                error, recovery, ..
+            } => started.failed_with_recovery(error, recovery.as_deref(), duration),
             BasicEffectResult::ResumeSuccess { completed, .. } => {
                 let state = completed.observed_state();
                 started.succeeded(Some(&state), duration);
@@ -673,6 +676,7 @@ fn process_basic_outcome<S: Clone>(
         }
         BasicEffectResult::ClassifiedFailure {
             error: _,
+            recovery: _,
             resource_id,
             applied,
         } => {
@@ -799,12 +803,9 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             let request = CreateRequest::checked(resolved);
             let accepted_request = AcceptedRequest::from_create_request(&request)
                 .with_resolved_desired_attributes(resolved_attrs.clone());
-            let (attempt, cancellation) =
-                crate::provider::CreateAttempt::with_cancellation_report(resource.id.clone());
+            let (create, cancellation) = super::dispatch_create(provider, &resource.id, request);
             started_effect.track_create_cancellation(cancellation);
-            match super::dispatch_create_with_attempt(provider, &resource.id, request, attempt)
-                .await
-            {
+            match create.await {
                 Ok(outcome) => {
                     let (state, request, diagnostic) =
                         super::complete_create_for_writeback(outcome, accepted_request);
@@ -840,11 +841,11 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         }
                     }
                     CreateFailureKind::OutcomeUnknown { unknown, error } => {
-                        let error_str = format!(
-                            "{error}\nthe create may have reached the cloud; import the resource if it exists, or forget the protected state row if it does not"
-                        );
                         BasicEffectResult::ClassifiedFailure {
-                            error: error_str,
+                            error: error.to_string(),
+                            recovery: Some(Box::new(
+                                crate::plan::PlanError::create_outcome_unknown(resource.id.clone()),
+                            )),
                             resource_id: resource.id.clone(),
                             applied: Applied::CreateOutcomeUnknown(unknown),
                         }
@@ -855,6 +856,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         let error_str = format!("{error}\n{}", created.post_error_note());
                         BasicEffectResult::ClassifiedFailure {
                             error: error_str,
+                            recovery: None,
                             resource_id: resource.id.clone(),
                             applied: Applied::Observed(created.into()),
                         }
@@ -864,6 +866,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             format!("{error}\ncreate still in progress; the next apply resumes it");
                         BasicEffectResult::ClassifiedFailure {
                             error: error_str,
+                            recovery: None,
                             resource_id: resource.id.clone(),
                             applied: Applied::CreateInFlight(pending),
                         }
@@ -968,6 +971,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         let error = error.to_string();
                         BasicEffectResult::ClassifiedFailure {
                             error,
+                            recovery: None,
                             resource_id: resource.id.clone(),
                             applied: Applied::CreateEnded,
                         }
@@ -978,6 +982,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         let error = format!("{error}\n{}", created.post_error_note());
                         BasicEffectResult::ClassifiedFailure {
                             error,
+                            recovery: None,
                             resource_id: resource.id.clone(),
                             applied: Applied::Observed(created.into()),
                         }
@@ -987,6 +992,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             format!("{error}\ncreate still in progress; the next apply resumes it");
                         BasicEffectResult::ClassifiedFailure {
                             error,
+                            recovery: None,
                             resource_id: resource.id.clone(),
                             applied: Applied::CreateInFlight(pending),
                         }

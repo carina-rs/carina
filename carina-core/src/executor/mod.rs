@@ -129,20 +129,24 @@ use parallel::execute_effects_sequential;
 
 pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 
-/// Dispatch an already checked create request while minting the unforgeable
-/// initial-attempt witness inside core.
-pub async fn dispatch_create<P: Provider + ?Sized>(
-    provider: &P,
-    id: &ResourceId,
+/// Prepare dispatch of an already checked create request while minting the
+/// unforgeable initial-attempt witness and its cancellation receiver inside
+/// core. The supervising caller must retain the receiver until the returned
+/// future settles. Executor-owned abandonment paths drain it before saving
+/// the cancellation classification.
+pub fn dispatch_create<'a, P: Provider + ?Sized>(
+    provider: &'a P,
+    id: &'a ResourceId,
     request: CreateRequest,
-) -> Result<CreateOutcome, CreateFailure> {
-    dispatch_create_with_attempt(
-        provider,
-        id,
-        request,
-        crate::provider::CreateAttempt::new(id.clone()),
+) -> (
+    impl std::future::Future<Output = Result<CreateOutcome, CreateFailure>> + 'a,
+    crate::provider::CreateCallCancellationReceiver,
+) {
+    let (attempt, cancellation) = crate::provider::CreateAttempt::new(id.clone());
+    (
+        dispatch_create_with_attempt(provider, id, request, attempt),
+        cancellation,
     )
-    .await
 }
 
 async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
@@ -159,25 +163,12 @@ async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
         .cloned()
         .collect();
     match provider.create(id, request, attempt).await {
-        Ok(outcome) if outcome.id() == id => Ok(outcome),
-        Ok(_outcome) => Err(CreateFailure::untracked_at_dispatch(
-            ProviderError::internal("provider returned a create outcome for another resource")
-                .for_resource(id.clone()),
-        )),
+        Ok(outcome) => Ok(outcome),
         Err(failure) => match failure.into_kind() {
             CreateFailureKind::OutcomeUnknown { unknown, error } => {
                 Err(CreateFailure::outcome_unknown_at_dispatch(unknown, error))
             }
             CreateFailureKind::Created { created, error } => {
-                if created.id() != id {
-                    return Err(CreateFailure::untracked_at_dispatch(
-                        ProviderError::internal_caused_by(
-                            "provider returned a created failure for another resource",
-                            error,
-                        )
-                        .for_resource(id.clone()),
-                    ));
-                }
                 let (created, valid) = created.validate_request_sent(&request_attributes);
                 let error = if valid {
                     error
@@ -191,15 +182,6 @@ async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
                 Err(CreateFailure::created(created, error))
             }
             CreateFailureKind::InFlight { pending, error } => {
-                if pending.id() != id {
-                    return Err(CreateFailure::untracked_at_dispatch(
-                        ProviderError::internal_caused_by(
-                            "provider returned an in-flight create for another resource",
-                            error,
-                        )
-                        .for_resource(id.clone()),
-                    ));
-                }
                 let (pending, valid) = pending.validate_fresh_sent(&request_attributes);
                 let error = if valid {
                     error
@@ -1149,6 +1131,7 @@ pub enum ExecutionEvent<'a, S = ModuleSource> {
     EffectFailed {
         effect: &'a Effect<S>,
         error: &'a str,
+        recovery: Option<&'a crate::plan::PlanError>,
         duration: Duration,
         progress: ProgressInfo,
     },

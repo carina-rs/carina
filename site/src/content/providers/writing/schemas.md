@@ -5,7 +5,7 @@ description: "How a Carina provider declares its resource types: the schema buil
 
 A provider describes every resource type it manages with a schema: the attributes, their types, which ones the configuration sets and which ones the provider fills in, and the rules a value must follow. The host uses the schema to check a configuration before anything reaches the provider, to compute plans, to drive the editor's completion and diagnostics, and to store state.
 
-This page shows how to write schemas with the builder API in `carina-plugin-sdk`. Every Rust example on it is compiled and run as a doctest of `carina-plugin-sdk`, so the examples always match the SDK on the carina `main` branch. Earlier pages pin an older revision; the builder API on this page replaced the struct literals that [Your First Provider](/providers/writing/getting-started/) uses.
+This page shows how to write schemas with the builder API in `carina-plugin-sdk`. Every Rust example on it is compiled and run as a doctest of `carina-plugin-sdk`, so the examples always match the SDK on the carina `main` branch. [Your First Provider](/providers/writing/getting-started/) uses the same builders for its complete example.
 
 The schema types live in `carina_core::schema`. The SDK re-exports `carina_core` as `carina_plugin_sdk::core`, so a provider depends only on `carina-plugin-sdk`.
 
@@ -90,6 +90,22 @@ resources, config, and forms together, so an undeclared, Int, or Enum identity
 cannot be emitted by `schemas()` JSON. Providers return the table from the
 required `CarinaProvider::reference_forms` method rather than constructing
 that JSON themselves.
+
+Reference forms become active only when `initialize` returns an available
+scope. Construct one with the validated API:
+
+```rust
+use carina_plugin_sdk::types::ReferenceScope;
+
+let scope = ReferenceScope::available("aws", "us-east-1", "123456789012")
+    .expect("the reference scope is valid");
+assert!(scope.available_values().is_some());
+```
+
+`ReferenceScope::available(partition, region, account)` returns
+`ReferenceScopeError` for an empty value or any value containing `{` or `}`.
+If `initialize` instead returns `ReferenceScope::Unavailable`, all declared
+reference forms are inert: the host does not expand short names through them.
 
 `{name}` describes the unqualified form: one bare segment containing no `:` or
 `/`. During semantic comparison the host expands only that bare form through

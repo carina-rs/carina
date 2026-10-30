@@ -7154,9 +7154,9 @@ mod tests {
         let request = carina_core::executor::prepare_create_request(resource, &preparation)
             .await
             .expect("fixture resource passes provider preparation");
-        let failure = carina_core::executor::dispatch_create(&PendingFixtureProvider, &id, request)
-            .await
-            .expect_err("fixture create remains pending");
+        let (create, _cancellation) =
+            carina_core::executor::dispatch_create(&PendingFixtureProvider, &id, request);
+        let failure = create.await.expect_err("fixture create remains pending");
         let pending = match failure.into_kind() {
             CreateFailureKind::InFlight {
                 pending,
