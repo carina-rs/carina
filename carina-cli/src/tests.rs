@@ -739,6 +739,8 @@ fn plan_file_serde_round_trip() {
         Some(SavedModuleSource::Module {
             name: "web_tier".to_string(),
             instance: "web".to_string(),
+            scope_key: None,
+            scope_description: None,
         }),
         "a decoded plan must keep module metadata attached to its saved resource",
     );
@@ -750,6 +752,8 @@ fn plan_file_serde_round_trip() {
         Some(SavedModuleSource::Module {
             name: "web_tier".to_string(),
             instance: "web".to_string(),
+            scope_key: None,
+            scope_description: None,
         }),
         "a decoded plan effect must retain its saved module-source type",
     );
@@ -3496,6 +3500,146 @@ fn plan_file_validation_rejects_missing_resource_identity() {
         .validate_resource_identities()
         .expect_err("a saved plan must reject a missing resource identity");
     assert!(error.contains("sorted_resources[0]"), "got: {error}");
+}
+
+#[test]
+fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
+    let parsed = carina_core::parser::parse_file(
+        "let upstream = upstream_state { source = '../upstream' }\n\
+         let children = for value in upstream.values {\n\
+           mock.test.resource { name = value }\n\
+         }\n",
+        std::path::Path::new("main.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("bound deferred loop parses");
+    let template = parsed.deferred_for_expressions[0].clone();
+    assert!(matches!(
+        template.target,
+        carina_core::parser::DeferredForTarget::Bound { .. }
+    ));
+    let mut plan = Plan::new();
+    plan.add(Effect::DeferredCreate {
+        id: carina_core::resource::ResolvedResourceId::with_provider_identity(
+            "mock",
+            "__deferred_for",
+            "children",
+            None,
+        ),
+        template: Box::new(template),
+    });
+    let plan_file = record_test_plan(
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-10-30T00:00:00Z".to_string(),
+            source_path: "main.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
+            backend_config: None,
+            plan,
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        },
+        &["mock"],
+    );
+    let mut json = serde_json::to_value(plan_file).expect("serialize valid bound template");
+    json["plan"]["effects"][0]["DeferredCreate"]["template"]["template_resource"]["id"]
+        .as_object_mut()
+        .expect("template resource id")
+        .remove("identity");
+
+    let decoded: PlanFile = serde_json::from_value(json)
+        .expect("field codec admits pending templates before semantic validation");
+    let error = decoded
+        .validate_resource_identities()
+        .expect_err("bound deferred templates require a resolved identity");
+
+    assert!(
+        error.contains("plan.effects[0].template_resource"),
+        "unexpected validation error: {error}",
+    );
+}
+
+#[test]
+fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
+    let parsed = carina_core::parser::parse_file(
+        "let upstream = upstream_state { source = '../upstream' }\n\
+         for value in upstream.values {\n\
+           mock.test.resource { name = value }\n\
+         }\n",
+        std::path::Path::new("main.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("unbound deferred loop parses");
+    let mut template = parsed.deferred_for_expressions[0].clone();
+    assert!(matches!(
+        template.target,
+        carina_core::parser::DeferredForTarget::Unbound { .. }
+    ));
+    template.template_resource.id = carina_core::resource::ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "incorrectly_resolved",
+        None,
+    );
+    let mut plan = Plan::new();
+    plan.add(Effect::DeferredCreate {
+        id: carina_core::resource::ResolvedResourceId::with_provider_identity(
+            "mock",
+            "__deferred_for",
+            "unbound_loop",
+            None,
+        ),
+        template: Box::new(template),
+    });
+    let plan_file = record_test_plan(
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-10-30T00:00:00Z".to_string(),
+            source_path: "main.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
+            backend_config: None,
+            plan,
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        },
+        &["mock"],
+    );
+
+    let error = plan_file
+        .validate_resource_identities()
+        .expect_err("unbound deferred templates require a pending identity");
+    assert!(
+        error.contains("plan.effects[0].template_resource")
+            && error.contains("unbound deferred target")
+            && error.contains("pending"),
+        "unexpected validation error: {error}",
+    );
 }
 
 fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {

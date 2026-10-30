@@ -885,7 +885,13 @@ fn build_update_rows<S>(
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
     let from_attributes = historical_attributes;
-    let projected = project_from_attrs(from_attributes, stored_attributes, explicit, schema);
+    let projected = project_from_attrs(
+        from_attributes,
+        stored_attributes,
+        &to.attributes,
+        explicit,
+        schema,
+    );
     let from_attrs_projected = projected.attributes();
 
     let attr_rows = build_attribute_diff_rows(
@@ -1136,6 +1142,7 @@ fn is_whole_value(explicit: Option<&ProjectedAuthoring>) -> bool {
 fn project_from_attrs(
     from_attributes: &HashMap<String, Value>,
     stored_attributes: Option<&HashMap<String, Value>>,
+    desired_attributes: &IndexMap<String, Value>,
     explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> crate::explicit::ProjectedAttributes {
@@ -1146,10 +1153,13 @@ fn project_from_attrs(
     // the legacy union fallback.
     let empty_stored = HashMap::new();
     match explicit {
-        Some(explicit) => {
-            ExplicitProjection::new(stored_attributes.unwrap_or(&empty_stored), explicit, schema)
-                .project_attributes(from_attributes.clone())
-        }
+        Some(explicit) => ExplicitProjection::for_desired(
+            stored_attributes.unwrap_or(&empty_stored),
+            desired_attributes,
+            explicit,
+            schema,
+        )
+        .project_attributes(from_attributes.clone()),
         None => crate::explicit::ProjectedAttributes::unprojected(from_attributes.clone(), None),
     }
 }
@@ -1157,12 +1167,19 @@ fn project_from_attrs(
 fn project_previous_attrs(
     previous_attributes: &HashMap<String, Value>,
     stored_attributes: Option<&HashMap<String, Value>>,
+    desired_attributes: &IndexMap<String, Value>,
     explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> crate::explicit::ProjectedAttributes {
     // Same projection as `project_from_attrs`, but sourced from
     // replacement-display metadata instead of a replace effect state.
-    project_from_attrs(previous_attributes, stored_attributes, explicit, schema)
+    project_from_attrs(
+        previous_attributes,
+        stored_attributes,
+        desired_attributes,
+        explicit,
+        schema,
+    )
 }
 
 fn build_attribute_diff_rows<S>(
@@ -1421,8 +1438,13 @@ fn build_replace_rows_from_attributes<S>(
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
-    let projected =
-        project_previous_attrs(previous_attributes, stored_attributes, explicit, schema);
+    let projected = project_previous_attrs(
+        previous_attributes,
+        stored_attributes,
+        &to.attributes,
+        explicit,
+        schema,
+    );
     let from_attrs_projected = projected.attributes();
     let force_keys: HashSet<&str> = changed_create_only.iter().map(|s| s.as_str()).collect();
 

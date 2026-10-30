@@ -227,6 +227,7 @@ impl Orphan {
                     dependency_bindings: Default::default(),
                     module_source: None,
                     default_tag_keys: Default::default(),
+                    loop_provenance: Default::default(),
                     quoted_string_attrs: Default::default(),
                 };
             }
@@ -247,6 +248,7 @@ impl Orphan {
             dependency_bindings: dependency_bindings.clone(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: Default::default(),
         }
     }
@@ -799,7 +801,13 @@ pub(crate) use comparison::{
 /// Returns true when `binding` is one direct child emitted by the deferred-for
 /// template. List children use a numeric index (`items[0]`); map children use
 /// the canonical address spelling (`items.key` or `items['key with space']`).
-pub fn binding_matches_deferred_template(binding: &str, template_binding_name: &str) -> bool {
+pub fn binding_matches_deferred_template(
+    binding: &str,
+    target: &crate::parser::DeferredForTarget,
+) -> bool {
+    let Some(template_binding_name) = target.bound_binding() else {
+        return target.matches_legacy_binding(binding);
+    };
     let Some(suffix) = binding.strip_prefix(template_binding_name) else {
         return false;
     };

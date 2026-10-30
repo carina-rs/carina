@@ -2,20 +2,22 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
-use crate::parser::ParseContext;
 use crate::parser::Rule;
 use crate::parser::ast::{MovedAddresses, StateBlock, StateBlockAddress};
 use crate::parser::context::first_inner;
 use crate::parser::error::ParseError;
 use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::util::parse_state_block_address;
+use crate::parser::{ParseContext, PreprocessedFile, SourceSpan};
 
 /// Parse an import state block
 pub(in crate::parser) fn parse_import_state_block(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
+    file: &PreprocessedFile,
 ) -> Result<StateBlock, ParseError> {
     let mut to: Option<StateBlockAddress> = None;
+    let mut to_span: Option<SourceSpan> = None;
     let mut id: Option<crate::resource::Value> = None;
 
     for attr in pair.into_inner() {
@@ -24,6 +26,7 @@ pub(in crate::parser) fn parse_import_state_block(
             match inner.as_rule() {
                 Rule::import_to_attr => {
                     let addr = first_inner(inner, "resource address", "import to")?;
+                    to_span = Some(SourceSpan::from_pest(&addr, file));
                     to = Some(parse_state_block_address(addr)?);
                 }
                 Rule::import_id_attr => {
@@ -46,7 +49,11 @@ pub(in crate::parser) fn parse_import_state_block(
         message: "import block requires 'id' attribute".to_string(),
     })?;
 
-    Ok(StateBlock::Import { to, id })
+    Ok(StateBlock::Import {
+        to,
+        to_span: Some(to_span.expect("parsed import.to address has a source span")),
+        id,
+    })
 }
 
 /// Parse a removed block
@@ -73,9 +80,11 @@ pub(in crate::parser) fn parse_removed_block(
 /// Parse a moved block
 pub(in crate::parser) fn parse_moved_block(
     pair: pest::iterators::Pair<Rule>,
+    file: &PreprocessedFile,
 ) -> Result<StateBlock, ParseError> {
     let mut from: Option<StateBlockAddress> = None;
     let mut to: Option<StateBlockAddress> = None;
+    let mut to_span: Option<SourceSpan> = None;
 
     for attr in pair.into_inner() {
         if attr.as_rule() == Rule::moved_attr {
@@ -87,6 +96,7 @@ pub(in crate::parser) fn parse_moved_block(
                 }
                 Rule::moved_to_attr => {
                     let addr = first_inner(inner, "resource address", "moved to")?;
+                    to_span = Some(SourceSpan::from_pest(&addr, file));
                     to = Some(parse_state_block_address(addr)?);
                 }
                 _ => {}
@@ -115,6 +125,7 @@ pub(in crate::parser) fn parse_moved_block(
     }
 
     Ok(StateBlock::Moved {
-        addresses: MovedAddresses::new(from.provider, from.resource_type, from.name, to.name),
+        addresses: MovedAddresses::new(from.provider, from.resource_type, from.name, to.name)
+            .with_to_span(to_span.expect("parsed moved.to address has a source span")),
     })
 }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -8,10 +9,18 @@ use crate::parser::{
     DeferredForExpansionError, DeferredForExpression, ShapeMismatch, expand_deferred_children,
 };
 use crate::resource::ResolvedResource;
+use crate::resource::ResourceId;
+
+#[derive(Clone, Copy)]
+pub(super) struct DeferredIdentityInputs<'a> {
+    pub(super) provider_configs: &'a [crate::parser::ProviderConfig],
+    pub(super) factories: &'a [Box<dyn crate::provider::ProviderFactory>],
+    pub(super) schemas: &'a crate::schema::SchemaRegistry,
+}
 
 /// Failure while expanding a deferred-for create half against apply-time
 /// upstream state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) enum DeferredCreateFailure {
     /// Every candidate was complete, but a direct iterable reference was
     /// absent and there was no coalesce fallback.
@@ -35,6 +44,91 @@ pub(super) enum DeferredCreateFailure {
     ValueAccess {
         error: DeferredForExpansionError,
     },
+    ProviderConfig {
+        error: crate::value::ProviderConfigCanonicalizationError,
+    },
+    EnumCanonicalization {
+        error: crate::value::EnumCanonicalizationError,
+    },
+    AnonymousIdentity {
+        error: crate::identifier::AnonymousIdentityError,
+    },
+    AnonymousIdentityCollision {
+        id: ResourceId,
+        occupied_by: AnonymousIdentityCollisionSource,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AnonymousIdentityCollisionSource {
+    DesiredPlan,
+    CurrentState,
+    DeferredChild,
+}
+
+/// Apply-run ownership domain for IDs minted by unbound deferred loops.
+pub(super) struct DeferredAnonymousIdentityGuard {
+    desired: HashSet<ResourceId>,
+    current: HashSet<ResourceId>,
+    absorbed_current: HashSet<ResourceId>,
+    materialized: HashSet<ResourceId>,
+}
+
+impl DeferredAnonymousIdentityGuard {
+    pub(super) fn new(
+        desired: HashSet<ResourceId>,
+        current: HashSet<ResourceId>,
+        absorbed_current: HashSet<ResourceId>,
+    ) -> Self {
+        Self {
+            desired,
+            current,
+            absorbed_current,
+            materialized: HashSet::new(),
+        }
+    }
+
+    pub(super) fn admit<S>(
+        &mut self,
+        template: &DeferredForExpression<S>,
+        children: &[Effect<S>],
+    ) -> Result<(), DeferredCreateFailure> {
+        if !matches!(
+            template.target,
+            crate::parser::DeferredForTarget::Unbound { .. }
+        ) {
+            return Ok(());
+        }
+
+        let mut batch = HashSet::new();
+        for child in children {
+            let Effect::Create(resource) = child else {
+                continue;
+            };
+            let id = &resource.id;
+            let occupied_by = if self.desired.contains(id) {
+                Some(AnonymousIdentityCollisionSource::DesiredPlan)
+            } else if self.current.contains(id) && !self.absorbed_current.contains(id) {
+                Some(AnonymousIdentityCollisionSource::CurrentState)
+            } else if self.materialized.contains(id) || !batch.insert(id.clone()) {
+                Some(AnonymousIdentityCollisionSource::DeferredChild)
+            } else {
+                None
+            };
+            if let Some(occupied_by) = occupied_by {
+                return Err(DeferredCreateFailure::AnonymousIdentityCollision {
+                    id: id.clone(),
+                    occupied_by,
+                });
+            }
+        }
+        self.materialized.extend(batch);
+        Ok(())
+    }
+
+    pub(super) fn release_completed_current_delete(&mut self, id: &ResourceId) {
+        self.current.remove(id);
+    }
 }
 
 impl DeferredCreateFailure {
@@ -69,15 +163,56 @@ impl DeferredCreateFailure {
                 candidates.join(", ")
             ),
             DeferredCreateFailure::ValueAccess { error } => error.to_string(),
+            DeferredCreateFailure::ProviderConfig { error } => error.to_string(),
+            DeferredCreateFailure::EnumCanonicalization { error } => error.to_string(),
+            DeferredCreateFailure::AnonymousIdentity { error } => error.to_string(),
+            DeferredCreateFailure::AnonymousIdentityCollision { id, occupied_by } => {
+                let owner = match occupied_by {
+                    AnonymousIdentityCollisionSource::DesiredPlan => "a desired plan resource",
+                    AnonymousIdentityCollisionSource::CurrentState => {
+                        "an unabsorbed current-state row"
+                    }
+                    AnonymousIdentityCollisionSource::DeferredChild => {
+                        "another apply-time deferred child"
+                    }
+                };
+                format!(
+                    "anonymous deferred-loop identity collided at `{id}`: the address is already owned by {owner}"
+                )
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for DeferredCreateFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for DeferredCreateFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ValueAccess { error } => Some(error),
+            Self::ProviderConfig { error } => Some(error),
+            Self::EnumCanonicalization { error } => Some(error),
+            Self::AnonymousIdentity { error } => Some(error),
+            Self::IterableAbsent { .. }
+            | Self::IterableUnknown { .. }
+            | Self::ShapeMismatch { .. }
+            | Self::AnonymousIdentityCollision { .. } => None,
         }
     }
 }
 
 /// Materialize `Effect::Create` children for a deferred-for template using the
 /// runtime values published under every binding referenced by the iterable.
-pub(super) fn materialize_deferred_create<S: Clone>(
+pub(super) fn materialize_deferred_create<
+    S: Clone + crate::resource::AnonymousIdentityModuleSource,
+>(
     template: &DeferredForExpression<S>,
     bindings: &ResolvedBindings,
+    identity_inputs: &DeferredIdentityInputs<'_>,
 ) -> Result<Vec<Effect<S>>, DeferredCreateFailure> {
     let expression = crate::value::format_value(&template.iterable);
     let candidates = template
@@ -108,8 +243,8 @@ pub(super) fn materialize_deferred_create<S: Clone>(
     };
     let miss_policy = bindings.access_miss_policy_for_value(&template.iterable);
 
-    Ok(expand_deferred_children(template, &iterable, miss_policy)
-        .map_err(|error| match error {
+    let mut resources = expand_deferred_children(template, &iterable, miss_policy).map_err(
+        |error| match error {
             DeferredForExpansionError::ShapeMismatch(mismatch) => {
                 DeferredCreateFailure::ShapeMismatch {
                     expression: crate::value::format_value(&template.iterable),
@@ -123,7 +258,35 @@ pub(super) fn materialize_deferred_create<S: Clone>(
             error @ DeferredForExpansionError::Resolution { .. } => {
                 DeferredCreateFailure::ValueAccess { error }
             }
-        })?
+        },
+    )?;
+    if matches!(
+        template.target,
+        crate::parser::DeferredForTarget::Unbound { .. }
+    ) {
+        let canonical_resources = crate::value::canonicalize_resources_with_schemas(
+            &mut resources,
+            identity_inputs.schemas,
+        )
+        .map_err(|error| DeferredCreateFailure::EnumCanonicalization { error })?;
+        crate::identifier::compute_anonymous_identifiers_with_factories(
+            canonical_resources,
+            identity_inputs.provider_configs,
+            identity_inputs.factories,
+            identity_inputs.schemas,
+            crate::identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+        )
+        .map_err(|error| match error {
+            crate::identifier::AnonymousIdentityComputationError::ProviderConfig(error) => {
+                DeferredCreateFailure::ProviderConfig { error }
+            }
+            crate::identifier::AnonymousIdentityComputationError::Identity(error) => {
+                DeferredCreateFailure::AnonymousIdentity { error }
+            }
+        })?;
+    }
+
+    Ok(resources
         .into_iter()
         .map(|resource| {
             debug_assert!(
@@ -152,30 +315,41 @@ pub(super) struct PureMetaCtx<'a, S> {
     pub(super) completed: &'a AtomicUsize,
     pub(super) total: usize,
     pub(super) observer: &'a dyn ExecutionObserver<S>,
+    pub(super) identity_inputs: DeferredIdentityInputs<'a>,
+}
+
+pub(super) fn report_deferred_create_failure<S>(
+    effect: &Effect<S>,
+    error: &DeferredCreateFailure,
+    ctx: &PureMetaCtx<'_, S>,
+) {
+    let message = error.message();
+    ctx.observer.on_event(&ExecutionEvent::EffectFailed {
+        effect,
+        error: &message,
+        duration: Duration::ZERO,
+        progress: ProgressInfo {
+            completed: ctx.completed.load(Ordering::Relaxed),
+            total: ctx.total,
+        },
+    });
 }
 
 /// Dispatch a DeferredCreate meta-effect by materializing its runtime
 /// `Effect::Create` children, or emitting the meta-effect failure event when
 /// upstream state is missing or has the wrong shape.
-pub(super) fn dispatch_deferred_create<S: Clone>(
+pub(super) fn dispatch_deferred_create<
+    S: Clone + crate::resource::AnonymousIdentityModuleSource,
+>(
     effect: &Effect<S>,
     template: &DeferredForExpression<S>,
     bindings: &ResolvedBindings,
     ctx: &PureMetaCtx<'_, S>,
 ) -> DeferredDispatchResult<S> {
-    match materialize_deferred_create(template, bindings) {
+    match materialize_deferred_create(template, bindings, &ctx.identity_inputs) {
         Ok(children) => DeferredDispatchResult::Materialized(children),
         Err(err) => {
-            let message = err.message();
-            ctx.observer.on_event(&ExecutionEvent::EffectFailed {
-                effect,
-                error: &message,
-                duration: Duration::ZERO,
-                progress: ProgressInfo {
-                    completed: ctx.completed.load(Ordering::Relaxed),
-                    total: ctx.total,
-                },
-            });
+            report_deferred_create_failure(effect, &err, ctx);
             DeferredDispatchResult::MaterializeFailed
         }
     }
@@ -207,7 +381,9 @@ mod tests {
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
-            binding_name: "children".to_string(),
+            target: crate::parser::DeferredForTarget::Bound {
+                binding: "children".to_string(),
+            },
             iterable: Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(Value::resource_ref("up", "accounts", vec![])),
                 default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
@@ -215,6 +391,22 @@ mod tests {
             binding: ForBinding::Simple("account".to_string()),
             template_resource,
         }
+    }
+
+    fn materialize_for_test(
+        template: &DeferredForExpression,
+        bindings: &ResolvedBindings,
+    ) -> Result<Vec<Effect>, DeferredCreateFailure> {
+        let schemas = crate::schema::SchemaRegistry::new();
+        materialize_deferred_create(
+            template,
+            bindings,
+            &DeferredIdentityInputs {
+                provider_configs: &[],
+                factories: &[],
+                schemas: &schemas,
+            },
+        )
     }
 
     #[test]
@@ -233,9 +425,203 @@ mod tests {
             BindingCompleteness::Complete,
         );
 
-        let children = materialize_deferred_create(&coalesced_template(), &bindings)
+        let children = materialize_for_test(&coalesced_template(), &bindings)
             .expect("present iterable should materialize");
         assert_eq!(children.len(), 2);
+    }
+
+    #[test]
+    fn apply_time_unbound_children_receive_anonymous_ids() {
+        let parsed = crate::parser::parse(
+            "let upstream = upstream_state { source = '../upstream' }\n\
+             for value in upstream.values {\n\
+               mock.test.Child { identity_input = value }\n\
+             }\n",
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("deferred unbound loop parses");
+        let template = &parsed.deferred_for_expressions[0];
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_with_completeness(
+            "upstream",
+            HashMap::from([(
+                "values".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("stable".into()),
+                )])),
+            )]),
+            BindingValueSource::Local,
+            BindingCompleteness::Complete,
+        );
+        let schema = crate::schema::ResourceSchema::new("test.Child").attribute(
+            crate::schema::AttributeSchema::optional(
+                "identity_input",
+                crate::schema::AttributeType::string(),
+            )
+            .create_only()
+            .build(),
+        );
+        let mut schemas = crate::schema::SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            schema.validate().expect("schema fixture must be valid"),
+        );
+        let identity_inputs = DeferredIdentityInputs {
+            provider_configs: &[],
+            factories: &[],
+            schemas: &schemas,
+        };
+
+        let children = materialize_deferred_create(template, &bindings, &identity_inputs)
+            .expect("apply-time anonymous child materializes");
+
+        let [Effect::Create(child)] = children.as_slice() else {
+            panic!("one concrete create child expected");
+        };
+        assert!(
+            child
+                .id
+                .identity_str()
+                .is_some_and(|identity| identity.starts_with("mock_test_child_"))
+        );
+        assert!(child.binding.is_none());
+        assert!(child.loop_provenance.direct_origin().is_some());
+    }
+
+    #[test]
+    fn apply_time_unbound_enum_identity_matches_plan_time_canonical_identity() {
+        let parsed = crate::parser::parse_file(
+            "let upstream = upstream_state { source = '../upstream' }\n\
+             for value in upstream.values {\n\
+               mock.test.Child { mode = value }\n\
+             }\n",
+            std::path::Path::new("main.crn"),
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("deferred unbound enum loop parses");
+        let template = &parsed.deferred_for_expressions[0];
+        let iterable = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::enum_identifier("foo"),
+        )]));
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_with_completeness(
+            "upstream",
+            HashMap::from([("values".to_string(), iterable.clone())]),
+            BindingValueSource::Local,
+            BindingCompleteness::Complete,
+        );
+        let mode_type = crate::schema::AttributeType::enum_(
+            crate::schema::enum_identity("Mode", Some("mock.test.Child")),
+            Some(vec!["API_A".to_string()]),
+            vec![("API_A".to_string(), "foo".to_string())],
+            None,
+            None,
+        );
+        let schema = crate::schema::ResourceSchema::new("test.Child").attribute(
+            crate::schema::AttributeSchema::optional("mode", mode_type)
+                .create_only()
+                .build(),
+        );
+        let mut schemas = crate::schema::SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            schema.validate().expect("schema fixture must be valid"),
+        );
+        let identity_inputs = DeferredIdentityInputs {
+            provider_configs: &[],
+            factories: &[],
+            schemas: &schemas,
+        };
+
+        let runtime_children = materialize_deferred_create(template, &bindings, &identity_inputs)
+            .expect("apply-time enum child materializes");
+        let [Effect::Create(runtime_child)] = runtime_children.as_slice() else {
+            panic!("one runtime child expected");
+        };
+
+        let mut plan_time_resources = crate::parser::expand_deferred_children(
+            template,
+            &iterable,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .expect("plan-time child expands");
+        let canonical =
+            crate::value::canonicalize_resources_with_schemas(&mut plan_time_resources, &schemas)
+                .expect("plan-time child canonicalizes");
+        crate::identifier::compute_anonymous_identifiers_with_factories(
+            canonical,
+            &[],
+            &[],
+            &schemas,
+            crate::identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+        )
+        .expect("plan-time anonymous identity computes");
+
+        assert!(matches!(
+            runtime_child.get_attr("mode"),
+            Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+                if value.api_value() == "API_A"
+        ));
+        assert_eq!(
+            runtime_child.id, plan_time_resources[0].id,
+            "apply-time hashing must consume the same canonical enum representation as planning"
+        );
+    }
+
+    #[test]
+    fn apply_time_anonymous_identity_failure_preserves_the_typed_source() {
+        let parsed = crate::parser::parse(
+            "let upstream = upstream_state { source = '../upstream' }\n\
+             for value in upstream.values {\n\
+               mock.test.Child { identity_input = value }\n\
+             }\n",
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("deferred unbound loop parses");
+        let template = &parsed.deferred_for_expressions[0];
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_with_completeness(
+            "upstream",
+            HashMap::from([(
+                "values".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Concrete(ConcreteValue::String("same".into())),
+                    Value::Concrete(ConcreteValue::String("same".into())),
+                ])),
+            )]),
+            BindingValueSource::Local,
+            BindingCompleteness::Complete,
+        );
+        let schema = crate::schema::ResourceSchema::new("test.Child").attribute(
+            crate::schema::AttributeSchema::optional(
+                "identity_input",
+                crate::schema::AttributeType::string(),
+            )
+            .create_only()
+            .build(),
+        );
+        let mut schemas = crate::schema::SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            schema.validate().expect("schema fixture must be valid"),
+        );
+        let identity_inputs = DeferredIdentityInputs {
+            provider_configs: &[],
+            factories: &[],
+            schemas: &schemas,
+        };
+
+        let error = materialize_deferred_create(template, &bindings, &identity_inputs)
+            .expect_err("identical apply-time children must fail identity assignment");
+        let source = std::error::Error::source(&error)
+            .expect("deferred failure must retain its typed identity source");
+
+        assert!(
+            source
+                .downcast_ref::<crate::identifier::AnonymousIdentityError>()
+                .is_some(),
+            "unexpected source type: {source:?}",
+        );
     }
 
     #[test]
@@ -248,7 +634,7 @@ mod tests {
             BindingCompleteness::Complete,
         );
 
-        let children = materialize_deferred_create(&coalesced_template(), &bindings)
+        let children = materialize_for_test(&coalesced_template(), &bindings)
             .expect("complete missing attribute should select []");
         assert!(children.is_empty());
     }
@@ -264,7 +650,7 @@ mod tests {
         );
 
         assert!(matches!(
-            materialize_deferred_create(&coalesced_template(), &bindings),
+            materialize_for_test(&coalesced_template(), &bindings),
             Err(DeferredCreateFailure::IterableUnknown { .. })
         ));
     }
@@ -277,7 +663,7 @@ mod tests {
             default: Box::new(Value::resource_ref("fallback", "items", vec![])),
         });
 
-        let error = materialize_deferred_create(&template, &ResolvedBindings::default())
+        let error = materialize_for_test(&template, &ResolvedBindings::default())
             .expect_err("both unresolved candidates keep the iterable unknown");
         let DeferredCreateFailure::IterableUnknown { candidates, .. } = &error else {
             panic!("expected unknown iterable, got {error:?}");

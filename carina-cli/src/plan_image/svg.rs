@@ -1511,4 +1511,37 @@ mod tests {
     fn snapshot_anonymous_svg() {
         insta::assert_snapshot!(fixture_svg("plan_image_anonymous"));
     }
+
+    #[test]
+    fn snapshot_anonymous_loop_origin_labels_in_plan_image() {
+        let fixture =
+            crate::fixture_plan::build_plan_from_fixture_name("anonymous_loop_insert_before");
+        let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
+        let model = build_model(PlanImageInput {
+            plan: &fixture.plan,
+            desired_resources: &fixture.desired_resources,
+            unresolved_resources: &fixture.unresolved_resources,
+            compositions: &fixture.compositions,
+            expansion_trace: Some(&fixture.expansion_trace),
+            state: fixture.state_file.as_ref().map(|state| StateMetadata {
+                lineage: &state.lineage,
+                serial: state.serial,
+            }),
+            summary: &summary,
+        });
+        let mut labels = model
+            .nodes
+            .iter()
+            .filter_map(|node| node.label.contains("(for [").then_some(node.label.clone()))
+            .collect::<Vec<_>>();
+        labels.sort();
+
+        insta::assert_debug_snapshot!(labels, @r###"
+        [
+            "Vpc  (for [0] at main.crn:5)",
+            "awscc_ec2_vpc_0bc2a2bb  (for [0] at main.crn:11)",
+            "awscc_ec2_vpc_23be212c  (for [1] at main.crn:11)",
+        ]
+        "###);
+    }
 }

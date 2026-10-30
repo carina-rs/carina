@@ -2530,9 +2530,11 @@ fn import_identifiers_from_current_config<S>(
             continue;
         };
         if let Some(value) = parsed.state_blocks.iter().find_map(|block| match block {
-            carina_core::parser::StateBlock::Import { to, id: value }
-                if crate::wiring::resolve_import_target(to, &parsed.resources) == *id =>
-            {
+            carina_core::parser::StateBlock::Import {
+                to,
+                to_span: _,
+                id: value,
+            } if crate::wiring::resolve_import_target(to, &parsed.resources) == *id => {
                 Some(carina_core::resolver::resolve_value_for_plan(
                     value,
                     &bindings,
@@ -2831,8 +2833,9 @@ async fn run_apply_from_plan_with_observer_factory(
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
     // Validate version compatibility before decoding the payload. Format 31
-    // adds the typed keyed-list release effect; 29 and 30 are reserved by
-    // parallel changes. Format 27
+    // adds the typed keyed-list release effect. Format 30 is reserved for
+    // protocol-v13 provider-scope evidence; format 29 persists anonymous-loop
+    // provenance, typed deferred-loop targets, and Move origins. Format 27
     // requires normalized composition call origins. Plan-file version 26
     // persists the exact provider artifacts used to compute the plan. Plan-file
     // version 25 persists every data-source outcome so apply never re-derives

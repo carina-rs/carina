@@ -157,7 +157,9 @@ pub(crate) async fn execute_import_effects<S: Clone>(
 fn format_state_only_effect_line<S>(effect: &Effect<S>) -> Option<String> {
     match effect {
         Effect::Remove { id } => Some(format!("  {} removed-from-state {}", "~".yellow(), id)),
-        Effect::Move { from, to } => Some(format!("  {} Moving {} -> {}", "->".yellow(), from, to)),
+        Effect::Move { from, to, .. } => {
+            Some(format!("  {} Moving {} -> {}", "->".yellow(), from, to))
+        }
         Effect::ReleaseListKeys {
             id,
             attribute,
@@ -481,6 +483,7 @@ mod tests {
             format_state_only_effect_line(&Effect::<carina_core::resource::ModuleSource>::Move {
                 from: carina_core::resource::ResolvedResourceId::new(from.clone()),
                 to: carina_core::resource::ResolvedResourceId::new(to.clone()),
+                origin: None,
             })
             .expect("Move must render a line");
         colored::control::unset_override();

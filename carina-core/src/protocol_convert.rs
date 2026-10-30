@@ -1871,6 +1871,7 @@ pub fn try_resource_to_protocol<S>(
         dependency_bindings: _dependency_bindings,
         module_source: _module_source,
         default_tag_keys: _default_tag_keys,
+        loop_provenance: _loop_provenance,
         quoted_string_attrs: _quoted_string_attrs,
     } = resource;
     let attributes = attributes

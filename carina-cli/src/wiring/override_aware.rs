@@ -85,8 +85,10 @@ pub enum DeferredForExpansionChoice {
 pub enum CanonicalResourceIdentityError {
     #[error(transparent)]
     EnumCanonicalization(#[from] carina_core::value::EnumCanonicalizationError),
-    #[error("{0}")]
-    Identity(String),
+    #[error(transparent)]
+    ProviderConfig(#[from] carina_core::value::ProviderConfigCanonicalizationError),
+    #[error(transparent)]
+    Identity(#[from] carina_core::identifier::AnonymousIdentityError),
 }
 
 impl<E> CanonicalResourcePair<E> {
@@ -152,20 +154,29 @@ impl<E> CanonicalResourcePair<E> {
     pub fn canonicalize_and_compute_anonymous_identifiers(
         &mut self,
         registry: &carina_core::schema::SchemaRegistry,
-        providers: &carina_core::value::CanonicalizedProviderConfigs,
-        identity_attributes: &dyn Fn(&str) -> Vec<String>,
+        providers: &[carina_core::parser::ProviderConfig],
+        factories: &[Box<dyn carina_core::provider::ProviderFactory>],
+        conflict_policy: carina_core::identifier::AnonymousIdentityConflictPolicy,
     ) -> Result<(), CanonicalResourceIdentityError> {
-        let mut resources = carina_core::value::canonicalize_resources_with_schemas(
+        let resources = carina_core::value::canonicalize_resources_with_schemas(
             &mut self.parsed.resources,
             registry,
         )?;
-        carina_core::identifier::compute_anonymous_identifiers_with_provider_configs(
-            resources.as_mut_slice(),
+        carina_core::identifier::compute_anonymous_identifiers_with_factories(
+            resources,
             providers,
+            factories,
             registry,
-            identity_attributes,
+            conflict_policy,
         )
-        .map_err(CanonicalResourceIdentityError::Identity)
+        .map_err(|error| match error {
+            carina_core::identifier::AnonymousIdentityComputationError::ProviderConfig(error) => {
+                CanonicalResourceIdentityError::ProviderConfig(error)
+            }
+            carina_core::identifier::AnonymousIdentityComputationError::Identity(error) => {
+                CanonicalResourceIdentityError::Identity(error)
+            }
+        })
     }
 
     /// Reconcile generated prefix values against state while retaining the
@@ -624,6 +635,7 @@ fn paired_unresolved_resource(resource: &Resource, unresolved: &Resource) -> Res
 
 fn can_pair_by_binding(resource: &Resource, source: &Resource) -> bool {
     resource.binding == source.binding
+        && (resource.binding.is_some() || resource.loop_provenance == source.loop_provenance)
         && resource.module_source == source.module_source
         && resource.id.provider == source.id.provider
         && resource.id.resource_type == source.id.resource_type
