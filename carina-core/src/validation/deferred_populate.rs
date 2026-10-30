@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn parser_side_deferred_resource_body_is_checked() {
         let mut parsed = parsed_with_unsynchronized_chained_ref();
-        let record = parsed.resources.pop().expect("record resource");
+        let record = parsed.resources.pop().expect("record resource"); // allow: direct — fixture test inspection
         parsed
             .parsed_deferred_for_expressions_mut()
             .push(ParsedDeferredForExpression {

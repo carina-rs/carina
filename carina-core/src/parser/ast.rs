@@ -172,7 +172,10 @@ pub(crate) enum ParsedDeferredForIterableState {
 #[derive(Debug)]
 pub(crate) enum DeferredForResourceExpressionError {
     UndefinedIterable {
+        file: Option<String>,
         name: String,
+        line: usize,
+        span: SourceSpan,
     },
     Unsupported {
         file: Option<String>,
@@ -233,7 +236,12 @@ impl ParsedDeferredForExpression {
             body,
         } = self;
         if let ParsedDeferredForIterableState::UndefinedIdentifier { name } = iterable_state {
-            return Err(DeferredForResourceExpressionError::UndefinedIterable { name });
+            return Err(DeferredForResourceExpressionError::UndefinedIterable {
+                file,
+                name,
+                line,
+                span,
+            });
         }
         let iterable_resolution = match &iterable {
             Value::Concrete(_) => {
@@ -2812,11 +2820,13 @@ pub struct ParsedDeferredForPhase {
     pub(crate) expressions: Vec<ParsedDeferredForExpression>,
 }
 
-/// Resource-only deferred loops proven to have crossed module resolution.
+/// Resource-only deferred loops carried by a finalized file.
 ///
-/// The inner vector is private and this type has no public constructor or
-/// `Default` implementation. Module resolution creates the first value;
-/// expansion and planning may only transform an existing witness.
+/// This collection can contain only [`DeferredForExpression`] values, so its
+/// public transformations cannot reintroduce parser-side module-call, data
+/// source, or invalid bodies. Module resolution creates it while finalizing a
+/// [`File`] into [`ResolvedDeferredForPhase`]; later phases may move, filter,
+/// or append already-finalized expressions.
 #[derive(Debug, Clone)]
 pub struct ResolvedDeferredForExpressions(Vec<DeferredForExpression>);
 
@@ -2861,11 +2871,13 @@ impl ResolvedDeferredForExpressions {
         self.0.push(expression);
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
     pub fn pop(&mut self) -> Option<DeferredForExpression> {
         self.0.pop()
     }
 
-    pub fn remove(&mut self, index: usize) -> DeferredForExpression {
+    pub(crate) fn remove(&mut self, index: usize) -> DeferredForExpression {
         self.0.remove(index)
     }
 
@@ -2908,12 +2920,13 @@ impl<'a> IntoIterator for &'a ResolvedDeferredForExpressions {
     }
 }
 
-/// Resource-only deferred loops after module resolution has finalized every
-/// parser-side body.
+/// Deferred-loop phase reached only by module-resolution finalization.
 ///
-/// The expressions are private and this phase has no public constructor or
-/// `Default` implementation. Only module resolution can turn a
-/// [`ParsedDeferredForPhase`] into this phase.
+/// A [`File`] can change from [`ParsedDeferredForPhase`] to
+/// `ResolvedDeferredForPhase` only through the finalization seam, which
+/// converts every supported resource body and rejects every unsupported or
+/// invalid body. The resulting collection remains mutable, but its element
+/// type permits only resource deferred loops.
 #[derive(Debug, Clone)]
 pub struct ResolvedDeferredForPhase {
     pub(crate) expressions: ResolvedDeferredForExpressions,

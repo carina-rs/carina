@@ -686,28 +686,84 @@ impl<R: fmt::Debug> fmt::Debug for ValidatedConfig<R> {
     }
 }
 
-/// Collected validation diagnostics plus the read-only schemas used by
-/// warning-only validation checks.
+/// One or more validation diagnostics.
+///
+/// The inner vector is private and every constructor establishes the
+/// non-empty invariant, so a failed validation report cannot carry an empty
+/// diagnostic list.
+#[derive(Debug)]
+pub(crate) struct NonEmptyValidationErrors(Vec<AppError>);
+
+#[derive(Debug)]
+pub(crate) struct EmptyValidationErrors;
+
+impl TryFrom<Vec<AppError>> for NonEmptyValidationErrors {
+    type Error = EmptyValidationErrors;
+
+    fn try_from(errors: Vec<AppError>) -> Result<Self, Self::Error> {
+        if errors.is_empty() {
+            Err(EmptyValidationErrors)
+        } else {
+            Ok(Self(errors))
+        }
+    }
+}
+
+impl NonEmptyValidationErrors {
+    fn one(error: AppError) -> Self {
+        Self(vec![error])
+    }
+
+    pub(crate) fn as_slice(&self) -> &[AppError] {
+        &self.0
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn into_vec(self) -> Vec<AppError> {
+        self.0
+    }
+}
+
+/// Validation outcome plus the read-only schemas used by warning-only checks.
 pub(crate) struct ValidationReport<'a> {
-    errors: Vec<AppError>,
-    resolved: Option<carina_core::parser::ModuleResolvedInferredFile>,
+    result: Result<carina_core::parser::ModuleResolvedInferredFile, NonEmptyValidationErrors>,
     schemas: &'a SchemaRegistry,
 }
 
-impl ValidationReport<'_> {
+impl<'a> ValidationReport<'a> {
+    #[cfg(test)]
     pub(crate) fn errors(&self) -> &[AppError] {
-        &self.errors
-    }
-
-    pub(crate) fn resolved(&self) -> Option<&carina_core::parser::ModuleResolvedInferredFile> {
-        self.resolved.as_ref()
+        match &self.result {
+            Ok(_) => &[],
+            Err(errors) => errors.as_slice(),
+        }
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn into_errors(self) -> Vec<AppError> {
-        self.errors
+        match self.result {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors.into_vec(),
+        }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn into_result(
+        self,
+    ) -> Result<carina_core::parser::ModuleResolvedInferredFile, NonEmptyValidationErrors> {
+        self.result
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Result<carina_core::parser::ModuleResolvedInferredFile, NonEmptyValidationErrors>,
+        &'a SchemaRegistry,
+    ) {
+        (self.result, self.schemas)
+    }
+
+    #[cfg(test)]
     pub(crate) fn schemas(&self) -> &SchemaRegistry {
         self.schemas
     }
@@ -717,12 +773,12 @@ impl ValidationReport<'_> {
 fn validation_report_from<'a>(
     context: &'a WiringContext,
     load_errors: &HashMap<String, String>,
-    parsed: &mut carina_core::parser::InferredFile,
+    parsed: &carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> ValidationReport<'a> {
-    let (errors, resolved) = match crate::commands::validate_and_resolve_errors_inner(
+    let result = match crate::commands::validate_and_resolve_errors_inner(
         &ValidationPipelineAccess::new(),
         parsed.clone(),
         base_dir,
@@ -732,15 +788,20 @@ fn validation_report_from<'a>(
         duplicate_declarations,
         crate::commands::ConfigNameResolution::EvaluatedOnly,
     ) {
-        Ok(crate::commands::ResolvedConfig::Evaluated { parsed }) => (Vec::new(), Some(*parsed)),
+        Ok(crate::commands::ResolvedConfig::Evaluated { parsed }) => Ok(*parsed),
         Ok(crate::commands::ResolvedConfig::Paired { .. }) => {
             unreachable!("evaluated-only validation returned pair")
         }
-        Err(errors) => (errors, None),
+        Err(errors) => Err(
+            NonEmptyValidationErrors::try_from(errors).unwrap_or_else(|_| {
+                NonEmptyValidationErrors::one(AppError::Config(
+                    "validation pipeline failed without a diagnostic".to_string(),
+                ))
+            }),
+        ),
     };
     ValidationReport {
-        errors,
-        resolved,
+        result,
         schemas: context.schemas(),
     }
 }
@@ -900,7 +961,7 @@ impl ProviderLoad {
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn validation_report<'a>(
         &'a self,
-        parsed: &mut carina_core::parser::InferredFile,
+        parsed: &carina_core::parser::InferredFile,
         base_dir: &Path,
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
@@ -1134,7 +1195,7 @@ impl CheckedSavedPlanInputs {
 impl ReportingProviderLoad {
     pub(crate) fn validation_report<'a>(
         &'a self,
-        parsed: &mut carina_core::parser::InferredFile,
+        parsed: &carina_core::parser::InferredFile,
         base_dir: &Path,
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],

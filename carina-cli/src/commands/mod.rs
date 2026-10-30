@@ -289,36 +289,32 @@ pub(crate) fn duplicate_declaration_errors(
 /// parsed file so this follows the production validation path.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn validate_and_resolve_with_config(
-    parsed: &mut carina_core::parser::InferredFile,
+    parsed: &carina_core::parser::InferredFile,
     base_dir: &Path,
     providers: &ProviderLoad,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
-) -> Result<(), AppError> {
-    let errors = providers
+) -> Result<carina_core::parser::ModuleResolvedInferredFile, AppError> {
+    providers
         .validation_report(
             parsed,
             base_dir,
             skip_resource_validation,
             duplicate_declarations,
         )
-        .into_errors();
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(collapse_errors(errors))
-    }
+        .into_result()
+        .map_err(|errors| collapse_errors(errors.into_vec()))
 }
 
 /// Test-support entry point that exercises the real command-scoped provider loader.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn validate_and_resolve_with_provider_load_for_test(
     user_dirs: &carina_core::UserDirs,
-    parsed: &mut carina_core::parser::InferredFile,
+    parsed: &carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
-) -> Result<(), AppError> {
+) -> Result<carina_core::parser::ModuleResolvedInferredFile, AppError> {
     let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
     validate_and_resolve_with_config(
         parsed,
@@ -339,7 +335,7 @@ pub fn validate_and_resolve_with_provider_load_for_test(
 /// [`ProviderLoad`] or the report-only loader instead.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn validate_and_resolve_errors(
-    parsed: &mut carina_core::parser::InferredFile,
+    parsed: &carina_core::parser::InferredFile,
     base_dir: &Path,
     providers: &ProviderLoad,
     skip_resource_validation: bool,
@@ -1208,7 +1204,7 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).unwrap();
 
-        let errors = validate_and_resolve_errors(&mut parsed, base.path(), &providers, false, &[]);
+        let errors = validate_and_resolve_errors(&parsed, base.path(), &providers, false, &[]);
 
         assert!(errors.iter().any(|error| {
             matches!(
@@ -1248,9 +1244,8 @@ mod tests {
         });
 
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).unwrap();
-        let error =
-            validate_and_resolve_with_config(&mut parsed, base.path(), &providers, false, &[])
-                .unwrap_err();
+        let error = validate_and_resolve_with_config(&parsed, base.path(), &providers, false, &[])
+            .unwrap_err();
         let message = error.to_string();
 
         assert!(
@@ -1285,8 +1280,7 @@ mod tests {
         });
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base_dir).unwrap();
-        let result =
-            validate_and_resolve_with_config(&mut parsed, base_dir, &providers, false, &[]);
+        let result = validate_and_resolve_with_config(&parsed, base_dir, &providers, false, &[]);
 
         let err = result.unwrap_err();
         let msg = err.to_string();
@@ -1333,12 +1327,12 @@ exports {
         )
         .expect("load");
         let duplicate_declarations = loaded.duplicate_declarations;
-        let mut parsed = loaded.parsed;
+        let parsed = loaded.parsed;
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base).unwrap();
 
         // With full validation, the typo is rejected.
         let err = validate_and_resolve_with_config(
-            &mut parsed.clone(),
+            &parsed,
             &base,
             &providers,
             false,
@@ -1350,7 +1344,7 @@ exports {
         // With skip_resource_validation=true, recovery commands pass
         // through despite the typo.
         let result = validate_and_resolve_with_config(
-            &mut parsed,
+            &parsed,
             &base,
             &providers,
             true,
@@ -1384,7 +1378,7 @@ exports {
             ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).expect("providers");
 
         let recovery_errors = validate_and_resolve_errors(
-            &mut parsed.clone(),
+            &parsed,
             base.path(),
             &providers,
             true,
@@ -1436,7 +1430,7 @@ attributes { loaded: Bool = true }
             ProviderLoad::load(&user_dirs, &loaded.parsed.providers, fixture.path()).unwrap();
 
         let full_errors = validate_and_resolve_errors(
-            &mut loaded.parsed.clone(),
+            &loaded.parsed,
             fixture.path(),
             &providers,
             false,
@@ -1450,7 +1444,7 @@ attributes { loaded: Bool = true }
         );
 
         let skip_errors = validate_and_resolve_errors(
-            &mut loaded.parsed.clone(),
+            &loaded.parsed,
             fixture.path(),
             &providers,
             true,
@@ -1541,11 +1535,11 @@ child { values = [source] }
         )
         .expect("load");
         let duplicate_declarations = loaded.duplicate_declarations;
-        let mut parsed = loaded.parsed;
+        let parsed = loaded.parsed;
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).unwrap();
 
         let err = validate_and_resolve_with_config(
-            &mut parsed.clone(),
+            &parsed,
             base.path(),
             &providers,
             false,
@@ -1555,7 +1549,7 @@ child { values = [source] }
         assert!(err.to_string().contains("duplicate export 'x'"));
 
         let result = validate_and_resolve_with_config(
-            &mut parsed,
+            &parsed,
             base.path(),
             &providers,
             true,
@@ -1676,8 +1670,8 @@ child { values = [source] }
     #[test]
     fn validate_and_resolve_canonicalizes_resource_create_only_enums_before_anonymous_hash() {
         let base_dir = tempfile::tempdir().unwrap();
-        let mut awscc = resource_create_only_enum_file("awscc.Region.ap_northeast_1");
-        let mut aws = resource_create_only_enum_file("aws.Region.ap_northeast_1");
+        let awscc = resource_create_only_enum_file("awscc.Region.ap_northeast_1");
+        let aws = resource_create_only_enum_file("aws.Region.ap_northeast_1");
 
         let providers = ProviderLoad::for_test(
             crate::wiring::LoadedProviderFactory::for_test(vec![Box::new(
@@ -1687,9 +1681,9 @@ child { values = [source] }
             )]),
             &awscc.providers,
         );
-        let errors =
-            validate_and_resolve_errors(&mut awscc, base_dir.path(), &providers, false, &[]);
-        assert!(errors.is_empty(), "awscc spelling errors: {errors:?}");
+        let awscc =
+            validate_and_resolve_with_config(&awscc, base_dir.path(), &providers, false, &[])
+                .expect("awscc spelling must validate");
 
         let providers = ProviderLoad::for_test(
             crate::wiring::LoadedProviderFactory::for_test(vec![Box::new(
@@ -1699,8 +1693,8 @@ child { values = [source] }
             )]),
             &aws.providers,
         );
-        let errors = validate_and_resolve_errors(&mut aws, base_dir.path(), &providers, false, &[]);
-        assert!(errors.is_empty(), "aws spelling errors: {errors:?}");
+        let aws = validate_and_resolve_with_config(&aws, base_dir.path(), &providers, false, &[])
+            .expect("aws spelling must validate");
 
         assert_eq!(
             awscc.resources[0]

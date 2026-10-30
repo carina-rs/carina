@@ -1143,14 +1143,14 @@ fn push_root(
 /// - Every `ResourceRef` whose root binding is not in scope (roots in
 ///   resource attributes, attribute-parameter values, module-call
 ///   arguments, and export-parameter values).
-/// - Every deferred for-expression iterable whose root is not in scope.
+/// - Every deferred for-expression reference root whose iterable was not
+///   already classified as a bare undefined identifier.
 ///
-/// Errors are returned in a deterministic order: ResourceRef findings
-/// first (in resource / attribute / module / export order), then
-/// deferred-iterable findings. The caller (CLI `load_configuration_with_config`,
-/// LSP analysis pipeline) just inspects the returned `Vec` — both
-/// checks share the same `collect_known_bindings_merged` pass, so there
-/// is no performance reason to split them at the callsite.
+/// Bare undefined deferred `for` iterables are deliberately excluded. Their
+/// parser-side typestate retains the authored file and span until module
+/// finalization, which is the single reporting seam for both root and
+/// module-owned loops. Other iterable references remain part of this root
+/// scope check.
 ///
 /// **This is the canonical entry point for "is this identifier in
 /// scope?" checks.** Follow the #2104 rule: any new semantic check in
@@ -1277,7 +1277,7 @@ fn accumulate_undefined_reference_errors(
 
     // carina#3181: walk the typed top-level slices (managed, composition,
     // data source) — `parsed.resources` is managed-only now. Deferred
-    // for-expression templates are handled by
+    // for-expression templates are handled separately by
     // `accumulate_deferred_iterable_errors`, so they are excluded here.
     for rref in parsed.iter_top_level_resources() {
         for value in rref.attributes().values() {
@@ -1314,7 +1314,13 @@ fn accumulate_deferred_iterable_errors(
     known: &std::collections::HashSet<&str>,
     errors: &mut Vec<ParseError>,
 ) {
-    for deferred in parsed.deferred_for_sites() {
+    for deferred in parsed.parsed_deferred_for_expressions() {
+        if matches!(
+            deferred.iterable_state,
+            super::ParsedDeferredForIterableState::UndefinedIdentifier { .. }
+        ) {
+            continue;
+        }
         for root in deferred.root_bindings() {
             if known.contains(root.as_str()) {
                 continue;

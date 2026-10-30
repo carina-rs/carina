@@ -372,15 +372,16 @@ impl ModuleError {
 
 fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
     match error {
-        ParseError::DeferredForBodyUnsupported(_) => true,
+        ParseError::DeferredForBodyUnsupported(_)
+        | ParseError::UndefinedIdentifier { span: Some(_), .. } => true,
+        ParseError::Located { path: _, error } => parse_error_is_deferred_for_body_rejection(error),
         ParseError::DeferredForBodyTemplate {
             line: _,
             header: _,
             span: _,
-            source: _,
-        } => false,
-        ParseError::Located { path: _, error } => parse_error_is_deferred_for_body_rejection(error),
-        ParseError::Syntax(_)
+            error: _,
+        }
+        | ParseError::Syntax(_)
         | ParseError::InvalidExpression { .. }
         | ParseError::UnboundLoopRead { .. }
         | ParseError::UnresolvedDeclarationType { .. }
@@ -393,7 +394,7 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
         | ParseError::InvalidResourceType(_)
         | ParseError::DuplicateModule(_)
         | ParseError::DuplicateBinding { .. }
-        | ParseError::UndefinedIdentifier { .. }
+        | ParseError::UndefinedIdentifier { span: None, .. }
         | ParseError::ModuleNotFound(_)
         | ParseError::InternalError { .. }
         | ParseError::RecursiveFunction(_)

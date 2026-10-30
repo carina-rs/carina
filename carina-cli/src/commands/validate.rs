@@ -62,7 +62,7 @@ pub fn validate_with_factories(
         Ok(l) => l,
         Err(e) => return vec![e.to_string()],
     };
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::for_test(factories, &parsed.providers);
 
@@ -75,7 +75,7 @@ pub fn validate_with_factories(
     );
     error_reports.extend(
         super::validate_and_resolve_errors(
-            &mut parsed,
+            &parsed,
             base_dir,
             &providers,
             false,
@@ -111,25 +111,19 @@ pub fn validated_resource_ids_with_factories(
         Ok(l) => l,
         Err(e) => panic!("fixture failed to load: {e}"),
     };
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::for_test(factories, &parsed.providers);
 
     // This adapter exercises only the resource-enumeration half of validate.
     // Keep the identical module/name-resolution seam, but do not reject a
     // fixture before enumeration for an unrelated provider-schema diagnostic.
-    let validation_report =
-        providers.validation_report(&mut parsed, base_dir, true, &loaded.duplicate_declarations);
-    assert!(
-        validation_report.errors().is_empty(),
-        "fixture failed validation: {:?}",
-        validation_report.errors()
-    );
-    let parsed = validation_report
-        .resolved()
-        .expect("successful validation must retain its resolved file");
+    let parsed = providers
+        .validation_report(&parsed, base_dir, true, &loaded.duplicate_declarations)
+        .into_result()
+        .unwrap_or_else(|errors| panic!("fixture failed validation: {:?}", errors.as_slice()));
 
-    validated_entries(parsed)
+    validated_entries(&parsed)
         .iter()
         .map(ToString::to_string)
         .collect()
@@ -272,7 +266,7 @@ pub fn run_validate(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
 
@@ -303,26 +297,32 @@ pub fn run_validate(
         ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
     error_reports.extend(provider_load_error.iter().map(ToString::to_string));
     let validation_report =
-        providers.validation_report(&mut parsed, base_dir, false, &loaded.duplicate_declarations);
-    parsed.print_warnings_from(printed_warning_count);
-    error_reports.extend(
-        validation_report
-            .errors()
-            .iter()
-            .map(|error| crate::error::format_error_with_source_chain(error)),
-    );
+        providers.validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations);
+    let (validation_result, schemas) = validation_report.into_parts();
+    let parsed = match validation_result {
+        Ok(parsed) => {
+            parsed.print_warnings_from(printed_warning_count);
+            parsed
+        }
+        Err(errors) => {
+            error_reports.extend(
+                errors
+                    .as_slice()
+                    .iter()
+                    .map(|error| crate::error::format_error_with_source_chain(error)),
+            );
+            return Err(AppError::Validation(error_reports.join("\n")));
+        }
+    };
 
     if !error_reports.is_empty() {
         return Err(AppError::Validation(error_reports.join("\n")));
     }
-    let parsed = validation_report
-        .resolved()
-        .expect("successful validation must retain its resolved file");
 
     // Check for unused let bindings (warnings, not errors)
     let unused_warnings = carina_core::validation::check_unused_bindings_with_identity_requirements(
         &loaded.authored_bindings,
-        validation_report.schemas(),
+        schemas,
     );
 
     // Check for duplicate attribute keys
@@ -366,7 +366,7 @@ pub fn run_validate(
                 file: Some(file_path.display().to_string()),
             });
         }
-        let entries = validated_entries(parsed);
+        let entries = validated_entries(&parsed);
         let output = ValidateOutput {
             status: "ok",
             resource_count: entries.len(),
@@ -381,7 +381,7 @@ pub fn run_validate(
         return Ok(());
     }
 
-    let entries = validated_entries(parsed);
+    let entries = validated_entries(&parsed);
     println!(
         "{}",
         format!("✓ {} resources validated successfully.", entries.len())
@@ -518,7 +518,7 @@ backend s3 {
     }
 
     #[test]
-    fn undefined_deferred_iterable_does_not_add_unsupported_body_error() {
+    fn root_undefined_deferred_iterable_is_reported_exactly_once() {
         let fixture = tempfile::tempdir().expect("undefined iterable fixture");
         let child = fixture.path().join("child");
         std::fs::create_dir(&child).unwrap();
@@ -539,6 +539,68 @@ backend s3 {
         assert_eq!(errors.len(), 1, "unexpected validation errors: {errors:#?}");
         assert!(errors[0].contains("Undefined identifier `itmes`"));
         assert!(!errors[0].contains("cannot use module call"));
+    }
+
+    #[test]
+    fn module_internal_undefined_iterable_in_module_call_body_is_rejected() {
+        let fixture = tempfile::tempdir().expect("module undefined iterable fixture");
+        let child = fixture.path().join("child");
+        let parent = fixture.path().join("parent");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(
+            child.join("main.crn"),
+            "arguments { item: String }\nattributes { value = item }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            parent.join("main.crn"),
+            "let child = use { source = '../child' }\n\
+             let items = ['one']\n\
+             let calls = for item in itmes { child { item = item } }\n\
+             attributes { value = 'parent' }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            "let parent = use { source = './parent' }\nparent {}\n",
+        )
+        .unwrap();
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+
+        assert_eq!(errors.len(), 1, "unexpected validation errors: {errors:#?}");
+        assert!(errors[0].contains("Undefined identifier `itmes`"));
+        assert!(errors[0].contains("parent/main.crn"));
+        assert!(errors[0].contains("module call in main.crn at line 2"));
+    }
+
+    #[test]
+    fn module_internal_undefined_iterable_in_managed_resource_body_is_rejected() {
+        let fixture = tempfile::tempdir().expect("managed body undefined iterable fixture");
+        let parent = fixture.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(
+            parent.join("main.crn"),
+            "let items = ['one']\n\
+             let resources = for item in itmes {\n\
+               mock.test.resource { name = item }\n\
+             }\n\
+             attributes { value = 'parent' }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            "let parent = use { source = './parent' }\nparent {}\n",
+        )
+        .unwrap();
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+
+        assert_eq!(errors.len(), 1, "unexpected validation errors: {errors:#?}");
+        assert!(errors[0].contains("Undefined identifier `itmes`"));
+        assert!(errors[0].contains("parent/main.crn"));
+        assert!(errors[0].contains("line 2"));
     }
 
     /// carina#3121 fix A: the `--json` output must enumerate a `for`

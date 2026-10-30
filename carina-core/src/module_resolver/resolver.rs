@@ -291,7 +291,7 @@ impl ResidualModuleResolutionError {
                     line: _,
                     header: _,
                     span: _,
-                    source: _,
+                    error: _,
                 }
                 | ParseError::UnresolvedDeclarationType {
                     token: _,
@@ -326,6 +326,7 @@ impl ResidualModuleResolutionError {
                 | ParseError::UndefinedIdentifier {
                     name: _,
                     line: _,
+                    span: _,
                     suggestion: _,
                     in_scope: _,
                 }
@@ -1448,6 +1449,7 @@ fn finalize_deferred_for_bodies<E>(
 fn finalize_deferred_for_bodies_collecting<E>(
     parsed: crate::parser::File<E>,
 ) -> (ModuleResolvedFile<E>, Vec<ModuleError>) {
+    let known_bindings = deferred_for_known_bindings(&parsed);
     parsed.map_deferred_for_phase(|pending| {
         let mut resolved = Vec::with_capacity(pending.len());
         let mut errors = Vec::new();
@@ -1455,9 +1457,10 @@ fn finalize_deferred_for_bodies_collecting<E>(
             match expression.into_resource_expression() {
                 Ok(expression) => resolved.push(expression),
                 Err(error) => {
-                    if let Some(error) = deferred_for_resource_expression_error(error) {
-                        errors.push(error);
-                    }
+                    errors.push(deferred_for_resource_expression_error(
+                        error,
+                        &known_bindings,
+                    ));
                 }
             }
         }
@@ -1467,37 +1470,66 @@ fn finalize_deferred_for_bodies_collecting<E>(
 
 fn deferred_for_resource_expression_error(
     error: crate::parser::DeferredForResourceExpressionError,
-) -> Option<ModuleError> {
+    known_bindings: &[String],
+) -> ModuleError {
     match error {
-        crate::parser::DeferredForResourceExpressionError::UndefinedIterable { name } => {
-            // The final parse pass records this bare binding use before the
-            // loop reaches module resolution. Identifier-scope validation
-            // therefore owns the guaranteed undefined-identifier diagnostic;
-            // suppress only the derivative unsupported-body error here.
-            debug_assert!(!name.is_empty());
-            None
-        }
-        crate::parser::DeferredForResourceExpressionError::Unsupported { file, error } => {
-            let error = ParseError::DeferredForBodyUnsupported(error);
-            Some(match file {
+        crate::parser::DeferredForResourceExpressionError::UndefinedIterable {
+            file,
+            name,
+            line,
+            span,
+        } => {
+            let error = ParseError::undefined_identifier_at(
+                name,
+                line,
+                known_bindings.to_vec(),
+                Some(span),
+            );
+            match file {
                 Some(path) => ModuleError::ParseInFile {
                     path: std::path::PathBuf::from(path),
                     error: Box::new(error),
                 },
                 None => ModuleError::Parse(error),
-            })
+            }
+        }
+        crate::parser::DeferredForResourceExpressionError::Unsupported { file, error } => {
+            let error = ParseError::DeferredForBodyUnsupported(error);
+            match file {
+                Some(path) => ModuleError::ParseInFile {
+                    path: std::path::PathBuf::from(path),
+                    error: Box::new(error),
+                },
+                None => ModuleError::Parse(error),
+            }
         }
     }
 }
 
+fn deferred_for_known_bindings<E>(parsed: &crate::parser::File<E>) -> Vec<String> {
+    let mut known = parsed
+        .structural_binding_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    known.extend(parsed.variables.keys().cloned());
+    known.sort_unstable();
+    known.dedup();
+    known
+}
+
 pub(super) fn deferred_for_body_errors<E>(parsed: &crate::parser::File<E>) -> Vec<ModuleError> {
+    let known_bindings = deferred_for_known_bindings(parsed);
     parsed
         .parsed_deferred_for_expressions()
         .iter()
         .filter_map(
             |expression| match expression.clone().into_resource_expression() {
                 Ok(_) => None,
-                Err(error) => deferred_for_resource_expression_error(error),
+                Err(error) => Some(deferred_for_resource_expression_error(
+                    error,
+                    &known_bindings,
+                )),
             },
         )
         .collect()

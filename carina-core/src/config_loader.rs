@@ -330,10 +330,11 @@ pub struct LoadedConfig {
     pub backend_file: Option<PathBuf>,
     /// Identifier-scope errors surfaced by [`parser::check_identifier_scope`]
     /// on the merged directory parse: ResourceRef roots in resources /
-    /// attribute / module / export values and unresolved for-expression
-    /// iterables. Empty when every reference resolves against the
-    /// directory-wide binding set. The loader does not short-circuit on
-    /// these so that later validators can also run in a single pass.
+    /// attribute / module / export values. Bare undefined deferred `for`
+    /// iterables are reported once at module finalization, which retains their
+    /// file and span; dotted reference roots remain in this list. The loader
+    /// does not short-circuit on these errors so later validators can also run
+    /// in a single pass.
     pub identifier_scope_errors: Vec<parser::ParseError>,
     /// Directory-wide declaration collisions. These are non-blocking at the
     /// load boundary so editor callers retain the parsed tree; validation
@@ -2335,7 +2336,7 @@ let orgs = upstream_state {
     }
 
     #[test]
-    fn deferred_for_body_template_error_retains_loop_site_and_source() {
+    fn deferred_for_body_template_error_retains_loop_site_and_error() {
         let fixture = tempfile::tempdir().expect("deferred body error fixture");
         let file = fixture.path().join("main.crn");
         let source = "let src = mock.test.resource { name = 'src' }\n\
@@ -2348,7 +2349,7 @@ let orgs = upstream_state {
         let parser::ParseError::DeferredForBodyTemplate {
             line,
             header,
-            source,
+            error: inner,
             ..
         } = &error
         else {
@@ -2357,7 +2358,7 @@ let orgs = upstream_state {
         assert_eq!(*line, 3);
         assert_eq!(header, "for name in src.list");
         assert!(matches!(
-            source.as_ref(),
+            inner.as_ref(),
             parser::ParseError::InvalidExpression { message, .. }
                 if message.contains("index access key must be an integer or string")
         ));
@@ -2367,14 +2368,6 @@ let orgs = upstream_state {
         assert!(
             message.contains("loop value is not known at plan time"),
             "{message}"
-        );
-        let source_error = std::error::Error::source(&error)
-            .expect("the body-local parser error must remain the typed source");
-        assert!(
-            source_error
-                .to_string()
-                .contains("index access key must be an integer or string"),
-            "{source_error}"
         );
     }
 
@@ -2386,16 +2379,28 @@ let orgs = upstream_state {
              let mods = for n in itmes { child { item = n } }\n",
         );
 
-        let loaded = load_configuration(fixture.path())
-            .expect("an undefined iterable is diagnosed after the directory merge");
+        let error = resolve_deferred_for_fixture(&fixture)
+            .expect_err("finalization must diagnose an undefined iterable");
+        let crate::module_resolver::ModuleError::ParseInFile { path, error } = error.root_cause()
+        else {
+            panic!("expected a file-owned typed parse error, got {error:?}");
+        };
         assert!(
-            loaded.identifier_scope_errors.iter().any(|error| matches!(
-                error,
-                crate::parser::ParseError::UndefinedIdentifier { name, line: 3, .. }
-                    if name == "itmes"
-            )),
-            "expected the normal undefined-identifier diagnostic, got {:?}",
-            loaded.identifier_scope_errors
+            path.ends_with("main.crn"),
+            "unexpected error owner: {path:?}"
+        );
+        assert!(
+            matches!(
+                error.as_ref(),
+                crate::parser::ParseError::UndefinedIdentifier {
+                    name,
+                    line: 3,
+                    suggestion: Some(suggestion),
+                    span: Some(_),
+                    ..
+                } if name == "itmes" && suggestion == "items"
+            ),
+            "expected the normal undefined-identifier diagnostic, got {error:?}"
         );
     }
 
@@ -2594,7 +2599,7 @@ awscc.ec2.SecurityGroup {
     }
 
     #[test]
-    fn parse_directory_leaves_undefined_iterable_for_caller_to_check() {
+    fn parse_directory_leaves_undefined_iterable_reference_for_scope_check() {
         let dir = create_temp_dir("undefined_for_iterable");
         fs::write(
             dir.join("main.crn"),
@@ -2619,10 +2624,8 @@ awscc.ec2.SecurityGroup {
             other => panic!("unexpected error: {other}"),
         }
 
-        // `load_configuration_with_config` surfaces the error via
-        // `LoadedConfig::identifier_scope_errors` rather than short-
-        // circuiting, so the CLI caller can collect it together with
-        // findings from later validators in a single pass (#2102).
+        // Dotted references remain root identifier-scope diagnostics; only a
+        // bare undefined iterable is owned by module finalization.
         let dir2 = create_temp_dir("undefined_for_iterable_cli");
         fs::write(
             dir2.join("main.crn"),

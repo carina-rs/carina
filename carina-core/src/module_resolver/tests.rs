@@ -6748,6 +6748,51 @@ let second = for item in source.second {
 }
 
 #[test]
+fn finalize_rejects_undefined_iterable_for_managed_resource_body() {
+    let fixture = tempfile::tempdir().expect("undefined managed iterable fixture");
+    let source_file = fixture.path().join("main.crn");
+    let source = r#"let items = ["one"]
+let resources = for item in itmes {
+  mock.test.resource { name = item }
+}
+"#;
+    fs::write(&source_file, source).expect("write undefined iterable fixture");
+    let loaded = crate::config_loader::load_configuration_with_config(
+        fixture.path(),
+        &ProviderContext::default(),
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("undefined iterable remains deferred until finalization");
+    assert!(
+        loaded.identifier_scope_errors.is_empty(),
+        "the loader must leave deferred iterable ownership to finalization: {:?}",
+        loaded.identifier_scope_errors,
+    );
+
+    let error = super::resolve_modules_with_providerless_config(
+        loaded.parsed,
+        fixture.path(),
+        &ProviderContext::default(),
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect_err("finalization must reject an undefined managed-resource iterable");
+    let ModuleError::ParseInFile { path, error } = error.root_cause() else {
+        panic!("expected a file-owned parse error, got {error:?}");
+    };
+    assert_eq!(path, &source_file);
+    assert!(matches!(
+        error.as_ref(),
+        crate::parser::ParseError::UndefinedIdentifier {
+            name,
+            line: 2,
+            span: Some(span),
+            ..
+        } if name == "itmes" && span.start_line() == 2 && span.end_line() == 4
+    ));
+    assert!(error.to_string().contains("Did you mean `items`"));
+}
+
+#[test]
 fn resolve_modules_with_config_populates_and_prefixes_directory_module_dependencies() {
     let tmp = tempfile::tempdir().expect("tempdir");
 

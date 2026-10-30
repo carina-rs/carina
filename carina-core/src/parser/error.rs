@@ -101,14 +101,13 @@ pub enum ParseError {
     DeferredForBodyUnsupported(Box<DeferredForBodyUnsupportedError>),
 
     #[error(
-        "Deferred `for` expression `{header}` at line {line} cannot build its body template because its loop value is not known at plan time: {source}"
+        "Deferred `for` expression `{header}` at line {line} cannot build its body template because its loop value is not known at plan time: {error}"
     )]
     DeferredForBodyTemplate {
         line: usize,
         header: String,
         span: SourceSpan,
-        #[source]
-        source: Box<ParseError>,
+        error: Box<ParseError>,
     },
 
     /// Provider-aware parsing could not resolve a type annotation. The
@@ -181,6 +180,9 @@ pub enum ParseError {
     UndefinedIdentifier {
         name: String,
         line: usize,
+        /// Exact authored expression span when the reporting seam retains it.
+        /// Older identifier checks that only know a line leave this as `None`.
+        span: Option<Box<SourceSpan>>,
         /// Edit-distance close match among in-scope bindings, if any.
         /// Filled by the check site when a `suggest_similar_name` result is
         /// available; None for hand-constructed errors.
@@ -354,6 +356,15 @@ impl ParseError {
         line: usize,
         known_bindings: Vec<String>,
     ) -> ParseError {
+        Self::undefined_identifier_at(name, line, known_bindings, None)
+    }
+
+    pub(crate) fn undefined_identifier_at(
+        name: String,
+        line: usize,
+        known_bindings: Vec<String>,
+        span: Option<SourceSpan>,
+    ) -> ParseError {
         let known_refs: Vec<&str> = known_bindings.iter().map(String::as_str).collect();
         let suggestion = crate::schema::suggest_similar_name(&name, &known_refs);
         let mut in_scope = known_bindings;
@@ -361,6 +372,7 @@ impl ParseError {
         ParseError::UndefinedIdentifier {
             name,
             line,
+            span: span.map(Box::new),
             suggestion,
             in_scope,
         }

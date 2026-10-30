@@ -10155,24 +10155,32 @@ let resources = for x in (
 }
 
 #[test]
-fn deferred_for_module_call_body_with_bare_unbound_iterable_reports_identifier_error() {
+fn deferred_for_module_call_body_with_bare_unbound_iterable_records_finalization_error() {
     let parsed = parse(
         r#"let child = use { source = "./child" }
 let mod_items = for x in items { child { item = x } }
 "#,
         &ProviderContext::default(),
     )
-    .expect("body classification must not mask directory-scope identifier checks");
+    .expect("body classification must retain the undefined iterable");
 
     let errors = check_identifier_scope(&parsed);
+    assert!(errors.is_empty(), "finalization owns this diagnostic");
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
+        panic!("expected one deferred loop")
+    };
     assert!(matches!(
-        errors.as_slice(),
-        [ParseError::UndefinedIdentifier { name, line: 2, .. }] if name == "items"
+        &deferred.iterable_state,
+        ParsedDeferredForIterableState::UndefinedIdentifier { name } if name == "items"
+    ));
+    assert!(matches!(
+        &deferred.body,
+        DeferredForBody::ModuleCall(call) if call.module_name == "child"
     ));
 }
 
 #[test]
-fn deferred_for_read_body_with_bare_unbound_iterable_reports_identifier_error() {
+fn deferred_for_read_body_with_bare_unbound_iterable_records_finalization_error() {
     let parsed = parse(
         r#"let read_items = for x in items {
   read mock.iam.Roles { name_regex = x }
@@ -10180,12 +10188,21 @@ fn deferred_for_read_body_with_bare_unbound_iterable_reports_identifier_error() 
 "#,
         &ProviderContext::default(),
     )
-    .expect("body classification must not mask directory-scope identifier checks");
+    .expect("body classification must retain the undefined iterable");
 
     let errors = check_identifier_scope(&parsed);
+    assert!(errors.is_empty(), "finalization owns this diagnostic");
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
+        panic!("expected one deferred loop")
+    };
     assert!(matches!(
-        errors.as_slice(),
-        [ParseError::UndefinedIdentifier { name, line: 1, .. }] if name == "items"
+        &deferred.iterable_state,
+        ParsedDeferredForIterableState::UndefinedIdentifier { name } if name == "items"
+    ));
+    assert!(matches!(
+        &deferred.body,
+        DeferredForBody::Read(data_source)
+            if data_source.id.resource_type == "iam.Roles"
     ));
 }
 
@@ -10207,7 +10224,7 @@ let items = for x in src.list {
     let ParseError::DeferredForBodyTemplate {
         line,
         header,
-        source,
+        error,
         ..
     } = error
     else {
@@ -10216,7 +10233,7 @@ let items = for x in src.list {
     assert_eq!(line, 2);
     assert_eq!(header, "for x in src.list");
     assert!(matches!(
-        source.as_ref(),
+        error.as_ref(),
         ParseError::ReservedResourceAttribute {
             attribute,
             line: 5,
@@ -11141,10 +11158,8 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
     // `iterable is string "org" (expected map)`, calling the identifier
     // a string and leaving the user with no did-you-mean.
     //
-    // The fix records these as `DeferredForExpression` so
-    // `check_identifier_scope` validates them against the merged
-    // directory-wide binding set (mirrors the dotted-form path). That
-    // gives us cross-file visibility for the did-you-mean candidates.
+    // The parser records these as an explicitly undefined iterable so the
+    // final module-resolution seam can report one file/span-owned diagnostic.
     let input = r#"
         let orgs = upstream_state { source = "../a" }
         for _, id in org {
@@ -11156,8 +11171,17 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
     let parsed = parse(input, &ProviderContext::default())
         .expect("single-file parse must not reject bare-iterable identifiers; the cross-file check runs later");
     let errs = check_identifier_scope(&parsed);
-    assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
-    let err = &errs[0];
+    assert!(
+        errs.is_empty(),
+        "the root scope pass must not duplicate finalization: {errs:?}"
+    );
+    let err =
+        crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+            .expect_err("finalization must reject the bare undefined iterable");
+    let crate::module_resolver::ModuleError::Parse(parse_error) = err.root_cause() else {
+        panic!("expected a typed parse error, got {err:?}");
+    };
+    let err = parse_error;
     let msg = err.to_string();
     assert!(
         matches!(err, ParseError::UndefinedIdentifier { .. }),

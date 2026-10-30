@@ -45,6 +45,23 @@ fn non_empty_plan_errors_reject_empty_and_preserve_order() {
     assert_eq!(errors.as_slice(), &[first, second]);
 }
 
+#[test]
+fn successful_validation_report_returns_the_resolved_file_as_a_result() {
+    let providers = ProviderLoad::for_test(Vec::new(), &[]);
+    let parsed = carina_core::parser::InferredFile::default();
+    let report = providers.validation_report(&parsed, Path::new("."), true, &[]);
+
+    let resolved = report
+        .into_result()
+        .unwrap_or_else(|errors| panic!("empty configuration must validate: {errors:?}"));
+    assert!(resolved.resources.is_empty());
+}
+
+#[test]
+fn validation_failure_type_rejects_an_empty_error_vector() {
+    assert!(NonEmptyValidationErrors::try_from(Vec::new()).is_err());
+}
+
 #[tokio::test]
 async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
     let context = WiringContext::new_for_test(Vec::new(), &[]);
@@ -1143,6 +1160,51 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
 }
 
 #[test]
+fn plan_style_config_pair_rejects_undefined_deferred_for_iterable() {
+    let project = tempfile::tempdir().expect("undefined iterable plan fixture");
+    let child = project.path().join("child");
+    std::fs::create_dir(&child).expect("create child module");
+    std::fs::write(
+        child.join("main.crn"),
+        "arguments { item: String }\nattributes { value = item }\n",
+    )
+    .expect("write child module");
+    std::fs::write(
+        project.path().join("main.crn"),
+        "let child = use { source = './child' }\n\
+         let items = ['one']\n\
+         let mods = for n in itmes { child { item = n } }\n",
+    )
+    .expect("write root configuration");
+
+    let loaded = carina_core::config_loader::load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load plan fixture");
+    let providers = ProviderLoad::for_test(Vec::new(), &loaded.parsed.providers);
+    let error = match providers.validate_config_pair(
+        loaded.parsed,
+        loaded.unresolved_parsed,
+        project.path(),
+        false,
+        &loaded.duplicate_declarations,
+    ) {
+        Ok(_) => panic!("plan-style validation must reject the undefined loop iterable"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+
+    assert!(
+        message.contains("Undefined identifier `itmes`"),
+        "{message}"
+    );
+    assert!(message.contains("Did you mean `items`"), "{message}");
+    assert!(message.contains("main.crn"), "{message}");
+}
+
+#[test]
 fn hard_reporting_load_returns_schema_only_diagnostics() {
     let user_dirs = carina_core::TestUserDirs::new();
     let base = tempfile::tempdir().unwrap();
@@ -1165,8 +1227,8 @@ fn hard_reporting_load_returns_schema_only_diagnostics() {
         "fixture must exercise the hard loader failure"
     );
 
-    let mut parsed = carina_core::parser::InferredFile::default();
-    let report = providers.validation_report(&mut parsed, base.path(), true, &[]);
+    let parsed = carina_core::parser::InferredFile::default();
+    let report = providers.validation_report(&parsed, base.path(), true, &[]);
 
     assert!(report.errors().is_empty());
     assert!(report.schemas().iter().next().is_none());

@@ -37,7 +37,7 @@ use crate::wiring::{
 };
 
 fn validate_with_test_factories(
-    parsed: &mut carina_core::parser::InferredFile,
+    parsed: &carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
     factories: Vec<Box<dyn ProviderFactory>>,
@@ -68,9 +68,15 @@ fn complete_create(state: carina_core::resource::State) -> carina_core::executor
 fn resolve_file_for_test<E: carina_core::parser::ExportParamLike>(
     parsed: carina_core::parser::File<E>,
 ) -> carina_core::parser::ModuleResolvedFile<E> {
+    let base_dir = parsed
+        .module_calls
+        .first()
+        .and_then(|call| call.source_file().parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
     carina_core::module_resolver::resolve_modules_with_providerless_config(
         parsed,
-        std::path::Path::new("."),
+        &base_dir,
         &carina_core::parser::ProviderContext::default(),
         &carina_core::schema::SchemaRegistry::new(),
     )
@@ -110,6 +116,24 @@ fn canonical_unresolved_for_test(
     })
 }
 
+fn canonical_resolved_unresolved_for_test(
+    ctx: &WiringContext,
+    parsed: &carina_core::parser::ModuleResolvedInferredFile,
+    unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
+) -> CanonicalResourcePair<carina_core::parser::InferredExportParam> {
+    resolve_config_block_names_for_test(parsed.clone(), unresolved.clone(), ctx.schemas())
+        .unwrap_or_else(|errors| {
+            panic!(
+                "test block-name resolution failed: {}",
+                errors
+                    .into_iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        })
+}
+
 fn canonical_resources_for_test(
     resources: Vec<Resource>,
     schemas: &SchemaRegistry,
@@ -131,6 +155,24 @@ fn validated_apply_config_for_test(
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> ValidatedConfig {
     let resources = canonical_unresolved_for_test(wiring.context(), parsed, unresolved);
+    ValidatedConfig::from_wiring_ref_for_test(wiring, resources)
+}
+
+fn validated_resolved_apply_config_for_test(
+    wiring: &ValidatedWiring,
+    parsed: &carina_core::parser::ModuleResolvedInferredFile,
+    unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
+) -> ValidatedConfig {
+    let resources = canonical_resolved_unresolved_for_test(wiring.context(), parsed, unresolved);
+    ValidatedConfig::from_wiring_ref_for_test(wiring, resources)
+}
+
+fn validated_reload_owner_for_test(wiring: &ValidatedWiring) -> ValidatedConfig {
+    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
+    let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
+        carina_core::parser::ParsedFile::default(),
+    );
+    let resources = canonical_resolved_unresolved_for_test(wiring.context(), &parsed, &unresolved);
     ValidatedConfig::from_wiring_ref_for_test(wiring, resources)
 }
 
@@ -295,8 +337,8 @@ fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
 }
 
-fn resolved_provider_configs<E>(
-    parsed: &carina_core::parser::File<E>,
+fn resolved_provider_configs<E, D>(
+    parsed: &carina_core::parser::File<E, D>,
 ) -> carina_core::parser::ResolvedProviderConfigs {
     carina_core::parser::resolve_provider_attributes_with_remote(
         parsed,
@@ -1825,8 +1867,10 @@ inner { x = a }
     let providers =
         ProviderLoad::load(&user_dirs, &loaded.parsed.providers, fixture.path()).unwrap();
     let wiring = ValidatedWiring::from_load_for_test(providers);
-    let validated_config =
-        validated_apply_config_for_test(&wiring, &loaded.parsed, &loaded.unresolved_parsed);
+    // The reload API consumes the previous validation owner only for its
+    // provider wiring. This fixture is intentionally invalid before reload,
+    // so it cannot mint a resolved-file witness for the authored graph.
+    let validated_config = validated_reload_owner_for_test(&wiring);
     let unresolved = loaded.unresolved_parsed;
 
     let error = reload_apply_configuration_after_bootstrap(
@@ -1911,8 +1955,10 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
         let providers =
             ProviderLoad::load(&user_dirs, &loaded.parsed.providers, fixture.path()).unwrap();
         let wiring = ValidatedWiring::from_load_for_test(providers);
-        let validated_config =
-            validated_apply_config_for_test(&wiring, &loaded.parsed, &loaded.unresolved_parsed);
+        // The reload API consumes the previous validation owner only for its
+        // provider wiring. This fixture is intentionally invalid before
+        // reload, so use an empty resolved payload owned by the same wiring.
+        let validated_config = validated_reload_owner_for_test(&wiring);
         let unresolved = loaded.unresolved_parsed;
         let error = reload_apply_configuration_after_bootstrap(
             fixture.path(),
@@ -2598,11 +2644,11 @@ async fn run_apply_cascade_fixture(
         &SchemaRegistry::new(),
     )
     .expect("fixture must load");
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let validation_errors = validate_with_test_factories(
-        &mut parsed,
+        &parsed,
         base_dir,
         false,
         vec![Box::new(ApplyCascadeAwsccFactory {
@@ -2931,7 +2977,7 @@ fn load_and_resolve_module_data_source_fixture(
     fixture: &ApplyCancellationFixture,
     shared: &ApplyTimeReadShared,
 ) -> (
-    carina_core::parser::InferredFile,
+    carina_core::parser::ModuleResolvedInferredFile,
     carina_core::config_loader::UnresolvedConfigSnapshot,
 ) {
     let loaded = load_configuration_with_config(
@@ -2940,22 +2986,28 @@ fn load_and_resolve_module_data_source_fixture(
         &SchemaRegistry::new(),
     )
     .expect("module data-source fixture must load");
-    let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
-    let validation_errors = validate_with_test_factories(
-        &mut parsed,
-        get_base_dir(fixture.config_path()),
-        false,
-        vec![Box::new(ApplyTimeReadFactory {
+    let providers = crate::wiring::ProviderLoad::for_test_with_load_errors(
+        crate::wiring::LoadedProviderFactory::for_test(vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
-        })],
+        })]),
+        &loaded.parsed.providers,
         HashMap::new(),
-        &loaded.duplicate_declarations,
     );
-    assert!(
-        validation_errors.is_empty(),
-        "module data-source fixture must validate, got: {validation_errors:?}"
-    );
+    let parsed = providers
+        .validation_report(
+            &loaded.parsed,
+            get_base_dir(fixture.config_path()),
+            false,
+            &loaded.duplicate_declarations,
+        )
+        .into_result()
+        .unwrap_or_else(|errors| {
+            panic!(
+                "module data-source fixture must validate, got: {:?}",
+                errors.as_slice()
+            )
+        });
 
     (parsed, unresolved_parsed)
 }
@@ -2982,7 +3034,8 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
     );
     let ctx = wiring.context();
     let provider_configs = resolved_provider_configs(&parsed);
-    let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
+    let canonical_resources =
+        canonical_resolved_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
     let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
@@ -3048,7 +3101,7 @@ async fn apply_reads_module_data_source_and_resolves_consumer_interpolation() {
     let observer_factory = fixture.observer_factory();
 
     run_apply_locked(
-        validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
+        validated_resolved_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -3105,7 +3158,7 @@ let lookup = read mock.iam.Roles {{
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let validation_errors = validate_with_test_factories(
-        &mut parsed,
+        &parsed,
         get_base_dir(fixture.config_path()),
         false,
         vec![Box::new(ApplyTimeReadFactory {
@@ -4390,11 +4443,11 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
         &SchemaRegistry::new(),
     )
     .expect("fixture must load");
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let validation_errors = validate_with_test_factories(
-        &mut parsed,
+        &parsed,
         base_dir,
         false,
         vec![Box::new(FailBCreateFactory)],
@@ -4463,12 +4516,12 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
         &SchemaRegistry::new(),
     )
     .expect("fixture must load");
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
     let validation_errors = validate_with_test_factories(
-        &mut parsed,
+        &parsed,
         base_dir,
         false,
         vec![Box::new(ApplyTimeReadFactory {
@@ -4558,11 +4611,11 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
         &SchemaRegistry::new(),
     )
     .expect("fixture must load");
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let validation_errors = validate_with_test_factories(
-        &mut parsed,
+        &parsed,
         base_dir,
         false,
         vec![Box::new(ApplyCascadeAwsccFactory {
@@ -4626,11 +4679,11 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
         &SchemaRegistry::new(),
     )
     .expect("fixture must load");
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let validation_errors = validate_with_test_factories(
-        &mut parsed,
+        &parsed,
         base_dir,
         false,
         vec![Box::new(ApplyCascadeAwsccFactory {
@@ -4850,11 +4903,11 @@ awscc.ec2.Subnet {{
         &SchemaRegistry::new(),
     )
     .expect("fixture must load");
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let validation_errors = validate_with_test_factories(
-        &mut parsed,
+        &parsed,
         base_dir,
         false,
         vec![Box::new(ApplyCascadeAwsccFactory {
@@ -4935,12 +4988,12 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         &SchemaRegistry::new(),
     )
     .expect("fixture must load");
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
     let validation_errors = validate_with_test_factories(
-        &mut parsed,
+        &parsed,
         base_dir,
         false,
         vec![Box::new(ApplyTimeReadFactory {
@@ -4989,10 +5042,10 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         &SchemaRegistry::new(),
     )
     .expect("fixture must reload");
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let validation_errors = validate_with_test_factories(
-        &mut parsed,
+        &parsed,
         base_dir,
         false,
         vec![Box::new(ApplyTimeReadFactory {
@@ -5090,9 +5143,9 @@ let nat = mock.ec2.NatGateway {{
             &SchemaRegistry::new(),
         )
         .expect("fixture must load");
-        let mut parsed = loaded.parsed;
+        let parsed = loaded.parsed;
         let validation_errors = validate_with_test_factories(
-            &mut parsed,
+            &parsed,
             base_dir,
             false,
             vec![Box::new(ApplyTimeReadFactory {
@@ -5263,9 +5316,9 @@ let igw = mock.ec2.InternetGateway {{{tags}
             &SchemaRegistry::new(),
         )
         .expect("fixture must load");
-        let mut parsed = loaded.parsed;
+        let parsed = loaded.parsed;
         let validation_errors = validate_with_test_factories(
-            &mut parsed,
+            &parsed,
             base_dir,
             false,
             vec![Box::new(ApplyTimeReadFactory {
@@ -5430,9 +5483,9 @@ async fn assert_failed_nested_pending_removal_is_replanned(
             &SchemaRegistry::new(),
         )
         .expect("fixture must load");
-        let mut parsed = loaded.parsed;
+        let parsed = loaded.parsed;
         let validation_errors = validate_with_test_factories(
-            &mut parsed,
+            &parsed,
             base_dir,
             false,
             vec![Box::new(ApplyTimeReadFactory {
@@ -5707,12 +5760,12 @@ let consumer = mock.iam.Role {{
         &SchemaRegistry::new(),
     )
     .expect("fixture must load");
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
     let validation_errors = validate_with_test_factories(
-        &mut parsed,
+        &parsed,
         base_dir,
         false,
         vec![Box::new(ApplyTimeReadFactory {

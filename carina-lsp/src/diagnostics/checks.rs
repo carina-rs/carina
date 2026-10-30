@@ -197,7 +197,12 @@ fn value_depends_on_module_output(
 /// proven independent of sibling names may fall back to the buffer parse.
 pub(super) enum SemanticView<'a> {
     Standalone(&'a ParsedFile),
-    Directory { merged: &'a ParsedFile },
+    DirectoryParsed {
+        merged: &'a ParsedFile,
+    },
+    DirectoryResolved {
+        merged: &'a carina_core::parser::ModuleResolvedParsedFile,
+    },
     DirectoryUnavailable,
 }
 
@@ -205,14 +210,16 @@ impl<'a> SemanticView<'a> {
     pub(super) fn for_analysis(
         authored: &'a ParsedFile,
         merged: Option<&'a ParsedFile>,
+        resolved: Option<&'a carina_core::parser::ModuleResolvedParsedFile>,
         directory_backed: bool,
     ) -> Self {
         if !directory_backed {
             return Self::Standalone(authored);
         }
-        match merged {
-            Some(merged) => Self::Directory { merged },
-            None => Self::DirectoryUnavailable,
+        match (resolved, merged) {
+            (Some(merged), _) => Self::DirectoryResolved { merged },
+            (None, Some(merged)) => Self::DirectoryParsed { merged },
+            (None, None) => Self::DirectoryUnavailable,
         }
     }
 
@@ -222,7 +229,8 @@ impl<'a> SemanticView<'a> {
     {
         match self {
             Self::Standalone(_) => Some(authored),
-            Self::Directory { merged } => authored.lookup_in(merged),
+            Self::DirectoryParsed { merged } => authored.lookup_in(merged),
+            Self::DirectoryResolved { merged } => authored.lookup_in(merged),
             Self::DirectoryUnavailable => None,
         }
     }
@@ -238,21 +246,16 @@ impl<'a> SemanticView<'a> {
     {
         match self {
             Self::Standalone(_parsed) => authored.value(),
-            Self::Directory { merged } => {
+            Self::DirectoryParsed { merged } => {
+                authored.lookup_in(merged).and_then(SemanticLookup::value)
+            }
+            Self::DirectoryResolved { merged } => {
                 authored.lookup_in(merged).and_then(SemanticLookup::value)
             }
             Self::DirectoryUnavailable => authored
                 .value()
                 .and_then(ContextFreeValue::new)
                 .map(ContextFreeValue::get),
-        }
-    }
-
-    fn parsed(&self) -> Option<&ParsedFile> {
-        match self {
-            Self::Standalone(parsed) => Some(parsed),
-            Self::Directory { merged } => Some(merged),
-            Self::DirectoryUnavailable => None,
         }
     }
 }
@@ -311,13 +314,19 @@ impl<'a> ContextFreeValue<'a> {
 }
 
 trait SemanticLookup: Sized {
-    fn lookup_in<'a>(&self, merged: &'a ParsedFile) -> Option<&'a Self>;
+    fn lookup_in<'a, D>(
+        &self,
+        merged: &'a carina_core::parser::File<ParsedExportParam, D>,
+    ) -> Option<&'a Self>;
 
     fn value(&self) -> Option<&Value>;
 }
 
 impl SemanticLookup for AttributeParameter {
-    fn lookup_in<'a>(&self, merged: &'a ParsedFile) -> Option<&'a Self> {
+    fn lookup_in<'a, D>(
+        &self,
+        merged: &'a carina_core::parser::File<ParsedExportParam, D>,
+    ) -> Option<&'a Self> {
         let authored_span = self.source_span();
         let authored_file = self.source_file();
         merged.attribute_params.iter().find(|candidate| {
@@ -331,7 +340,10 @@ impl SemanticLookup for AttributeParameter {
 }
 
 impl SemanticLookup for ParsedExportParam {
-    fn lookup_in<'a>(&self, merged: &'a ParsedFile) -> Option<&'a Self> {
+    fn lookup_in<'a, D>(
+        &self,
+        merged: &'a carina_core::parser::File<ParsedExportParam, D>,
+    ) -> Option<&'a Self> {
         let authored_span = self.source_span();
         let authored_file = self.source_file();
         merged.export_params.iter().find(|candidate| {
@@ -2526,9 +2538,27 @@ impl DiagnosticEngine {
         // whole `InferredFile`. Use the merged, module-expanded parse when
         // available so sibling-file bindings are visible and module calls
         // appear as inferable `Virtual` compositions (#2493).
-        let Some(inference_input) = semantic_view.parsed() else {
-            return diagnostics;
+        let inferred_diagnostics = match semantic_view {
+            SemanticView::Standalone(inference_input)
+            | SemanticView::DirectoryParsed {
+                merged: inference_input,
+            } => self.check_inferred_export_types(doc, inference_input),
+            SemanticView::DirectoryResolved {
+                merged: inference_input,
+            } => self.check_inferred_export_types(doc, inference_input),
+            SemanticView::DirectoryUnavailable => Vec::new(),
         };
+        diagnostics.extend(inferred_diagnostics);
+
+        diagnostics
+    }
+
+    fn check_inferred_export_types<D>(
+        &self,
+        doc: &Document,
+        inference_input: &carina_core::parser::File<ParsedExportParam, D>,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
         let inferred_export_params = if let Some(loaded_providers) = &self.loaded_providers {
             let provider_inferred = carina_core::validation::inference::
                 infer_export_params_with_loaded_provider_schemas(
@@ -2587,9 +2617,9 @@ impl DiagnosticEngine {
         diagnostics
     }
 
-    fn infer_export_params_without_loaded_provider_schemas(
+    fn infer_export_params_without_loaded_provider_schemas<D>(
         &self,
-        parsed: &ParsedFile,
+        parsed: &carina_core::parser::File<ParsedExportParam, D>,
     ) -> carina_core::validation::inference::SchemaCheckedExportParams {
         carina_core::validation::inference::infer_export_params(parsed, &self.schemas)
     }

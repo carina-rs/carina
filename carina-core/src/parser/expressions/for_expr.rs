@@ -184,12 +184,12 @@ fn record_deferred_for_expression(
         preprocessed_file,
         source_file,
     ) {
-        Err(source) => {
+        Err(error) => {
             return Err(ParseError::DeferredForBodyTemplate {
                 line,
                 header,
                 span,
-                source: Box::new(source),
+                error: Box::new(error),
             });
         }
         Ok(template) => match template {
@@ -357,6 +357,7 @@ pub(crate) fn parse_for_expr(
 
     // Parse the iterable expression
     let iterable_pair = next_pair(&mut inner, "iterable", "for expression")?;
+    let iterable_surface = iterable_pair.as_str().trim().to_string();
     let ParsedForIterable {
         value: iterable,
         bare_unbound_identifier,
@@ -544,8 +545,16 @@ pub(crate) fn parse_for_expr(
         // replayed at plan/apply time. In particular, `ref ?? default` must
         // not collapse to the default before the reference snapshot is known
         // to be complete.
-        (_, iterable @ Value::Deferred(_)) => {
-            let iterable_surface = crate::value::format_value(iterable);
+        (_, Value::Deferred(_)) => {
+            let iterable_surface =
+                if let Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
+                    ..
+                })) = &iterable
+                {
+                    iterable_surface.clone()
+                } else {
+                    crate::value::format_value(&iterable)
+                };
             let header = deferred_for_header(&binding, &iterable_surface);
             record_deferred_for_expression(
                 body_pair.clone(),
