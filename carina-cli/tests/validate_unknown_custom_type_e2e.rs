@@ -8,9 +8,9 @@
 //! instead of silently degrading into an untyped string.
 //!
 //! The check fires at parse time, gated by whether provider custom types are
-//! loaded. Production runs through `enrich_provider_context`, which installs
-//! `ProviderCustomTypes::Loaded` once schemas have
-//! been collected; this test exercises the same CLI surface
+//! loaded. Production retains a `LoadedProviderContext` minted from the same
+//! validated provider witnesses as the schema registry; this test exercises
+//! the same CLI surface
 //! (`validate_with_factories`) that `carina-cli/tests/nested_module_call_ref_e2e.rs`
 //! does, so the fixture covers the real validate path end-to-end —
 //! including the [[feedback_directory_scoped_features]] requirement

@@ -36,9 +36,9 @@ carina providers repin-identity <PROVIDER> [PATH] [--force]
 
 ## re-bootstrap
 
-Discards the `sequence` observation, its reference point, and the record that the registry serves `sequence` at all, returning the provider to the state it was in before first contact.
+Discards the `sequence` observation, its reference point, and the record that the registry serves `sequence` at all. For an already pinned provider, the pinned lock record stores a reset-pending anchor state until the next successful resolution, so a failed attempt cannot consume the operator-authorized reset. Observations recorded before any successful pin never carry an anchor; clearing one leaves the source at first contact.
 
-Use this when resolution fails because the registry's `sequence` went backwards, jumped further ahead than the client will accept, or stopped being served, and you have confirmed the registry is behaving legitimately. The next successful resolution establishes a new reference point from what it observes.
+Use this when resolution fails because the registry's `sequence` went backwards, jumped further ahead than the client will accept, or stopped being served, and you have confirmed the registry is behaving legitimately. The next successful resolution consumes the marker and establishes a new reference point from what it observes; if the listing has no `sequence`, it records that sequence-less first contact so later resolutions stay silent.
 
 The signer source and workflow pins, signature requirement, recorded yanked versions, and pinned checksum are all retained. In particular, a yanked version stays yanked — un-yanking is not an operation Carina offers, because a genuine un-yank cannot be distinguished from an attacker stripping the flag.
 

@@ -274,6 +274,9 @@ pub(crate) struct ExportResolutionInputs<'a> {
     /// entries before this reaches export resolution.
     pub data_source_values: &'a DataSourceValues,
     pub resources: &'a [Resource],
+    /// Loaded provider custom types used when post-apply bindings make a
+    /// previously deferred export expression concrete.
+    pub provider_context: &'a carina_core::parser::LoadedProviderContext,
 }
 
 /// Input parameters for `finalize_apply`.
@@ -295,9 +298,6 @@ pub(crate) struct FinalizeApplyInput<'a, S = ModuleSource> {
     pub export_resolution_inputs: Option<ExportResolutionInputs<'a>>,
     pub backend: &'a dyn StateBackend,
     pub lock: StateLockRef<'a>,
-    /// Provider-aware builtin context used when post-apply bindings make a
-    /// previously deferred export expression concrete.
-    pub provider_context: &'a carina_core::parser::ProviderContext,
     /// Wait-binding aliases (carina#3085). When export expressions
     /// reference a `wait` binding (`exports { x = cert_issued.arn }`),
     /// these make `<wait-binding>.<attr>` resolve to `<target>.<attr>`
@@ -525,7 +525,7 @@ pub(crate) struct ResolveExportValuesPostApplyInput<'a> {
     pub post_apply_states: &'a PostApplyStates,
     pub schemas: &'a SchemaRegistry,
     pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
-    pub provider_context: &'a carina_core::parser::ProviderContext,
+    pub provider_context: &'a carina_core::parser::LoadedProviderContext,
 }
 
 pub(crate) fn resolve_export_values_post_apply(
@@ -6840,7 +6840,7 @@ mod apply_state_save_tests {
 #[cfg(test)]
 mod export_writeback_tests {
     use super::*;
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::InferredExportParam;
     use carina_core::resource::{
         AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PartialReadMarker,
         PendingReRead, UnknownReason, Value,
@@ -6850,7 +6850,15 @@ mod export_writeback_tests {
     fn export_param(name: &str, value: Value) -> InferredExportParam {
         InferredExportParam {
             name: name.to_string(),
-            type_expr: TypeExpr::Unknown,
+            static_type: carina_core::static_type::ExportStaticType::Inferred(
+                carina_core::static_type::StaticType::Unchecked(
+                    carina_core::static_type::InferredUncheckedReason::NotInferable(
+                        carina_core::static_type::NotInferableReason::SchemaUnavailable {
+                            binding: "test fixture".to_string(),
+                        },
+                    ),
+                ),
+            ),
             value: Some(value),
         }
     }
@@ -6867,7 +6875,7 @@ mod export_writeback_tests {
         let checked = carina_core::validation::check_export_values_pre_apply(
             export_params,
             &carina_core::binding_index::ResolvedBindings::default(),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
         )
         .expect("test exports must pass the secret boundary");
         let values = resolve_export_values_post_apply(ResolveExportValuesPostApplyInput {
@@ -6877,7 +6885,7 @@ mod export_writeback_tests {
             post_apply_states: &post_apply_states,
             schemas: &carina_core::schema::SchemaRegistry::new(),
             wait_aliases: &[],
-            provider_context: &carina_core::parser::ProviderContext::default(),
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
         })
         .expect("post-apply export resolution should succeed");
         materialize_exports(&values)
@@ -6915,7 +6923,7 @@ mod export_writeback_tests {
         let checked = carina_core::validation::check_export_values_pre_apply(
             &export_params,
             &carina_core::binding_index::ResolvedBindings::default(),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
         )
         .expect("test export must pass the secret boundary");
         let post_apply_states = PostApplyStates::from_current_and_state(
@@ -6957,7 +6965,7 @@ mod export_writeback_tests {
             post_apply_states: &post_apply_states,
             schemas: &carina_core::schema::SchemaRegistry::new(),
             wait_aliases: &[],
-            provider_context: &carina_core::parser::ProviderContext::default(),
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
         })
         .expect("post-apply export resolution should succeed");
 

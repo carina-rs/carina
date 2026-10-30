@@ -23,7 +23,8 @@ Since v0.5.0, the first release that checks the version, every release has set t
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
-| Next release after v0.8.0 (unreleased) | 13 | 13 |
+| Next release after v0.9.0 (unreleased) | 13 | 13 |
+| v0.9.0 | 12 | 12 |
 | v0.8.0 | 12 | 12 |
 | v0.7.1 | 12 | 12 |
 | v0.7.0 | 12 | 12 |

@@ -55,7 +55,15 @@ fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
         .into_iter()
         .collect();
     let factories = factories_for(&schemas);
-    DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(factories))
+    if provider_names.is_empty() {
+        DiagnosticEngine::without_loaded_provider_schemas()
+    } else {
+        let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+            Arc::new(factories),
+            SchemaRegistry::new(),
+        );
+        DiagnosticEngine::new(Arc::new(loaded_providers), provider_names)
+    }
 }
 
 fn single_schema_map(schema: ResourceSchema) -> SchemaRegistry {
@@ -137,7 +145,6 @@ fn cli_validated_file(
     .expect("load CLI fixture");
     let carina_core::config_loader::LoadedConfig {
         parsed,
-        inference_errors,
         duplicate_declarations,
         ..
     } = loaded;
@@ -146,13 +153,7 @@ fn cli_validated_file(
         &parsed.providers,
     );
     let validated = providers
-        .validate_evaluated_config(
-            parsed,
-            fixture.path(),
-            false,
-            &inference_errors,
-            &duplicate_declarations,
-        )
+        .validate_evaluated_config(parsed, fixture.path(), false, &duplicate_declarations)
         .expect("CLI validation fixture must pass");
     validated.evaluated_resources_for_test().clone()
 }
@@ -293,32 +294,29 @@ fn module_call_parity_schemas() -> SchemaRegistry {
 }
 
 fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &SchemaRegistry) {
-    let context = carina_core::parser::ProviderContext {
-        decryptor: None,
-        custom_types: carina_core::provider::provider_custom_types_from_factories(Arc::new(
-            factories_for(schemas),
-        )),
-        resource_types: carina_core::parser::ProviderContext::resource_types_from_schema_registry(
-            schemas,
-        ),
-    };
+    let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(factories_for(schemas)),
+        SchemaRegistry::new(),
+    );
+    let context = loaded_providers.provider_context();
+    let schemas = loaded_providers.schema_registry();
     let directory = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
         base_dir,
-        &context,
+        context,
         &HashMap::new(),
     )
     .expect("the fixture directory must parse before module expansion");
     let signatures = carina_core::module_resolver::load_resolved_module_signatures(
         &directory.parsed,
         base_dir,
-        &context,
+        context,
     );
     let binding_use_report = carina_core::validation::check_bare_binding_uses(
         &directory.parsed,
         &carina_core::validation::ValidationTypeContext::new(
             &directory.parsed,
             schemas,
-            &context,
+            context,
             &signatures,
         ),
     );
@@ -333,7 +331,7 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
             semantic: Some(&directory.parsed),
             base_dir: Some(base_dir),
             imported_signatures: &signatures,
-            provider_context: &context,
+            provider_context: context,
             schemas,
             binding_use_report: &binding_use_report,
             bindings: &bindings,
@@ -343,7 +341,7 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
     match carina_core::module_resolver::resolve_modules_with_diagnostics(
         &directory.parsed,
         base_dir,
-        &context,
+        context,
         schemas,
         &covered_findings,
     ) {
@@ -3317,7 +3315,7 @@ awscc.cloudfront.Distribution {
             .parsed
             .arguments
             .first()
-            .map(|argument| &argument.type_expr),
+            .map(|argument| &argument.static_type),
         Some(carina_core::parser::TypeExpr::DottedUnresolved(_))
     ));
     let matching_lsp =
@@ -3438,7 +3436,7 @@ awscc.cloudfront.Distribution {
         &schemas,
     )
     .expect("load caller configuration");
-    carina_core::module_resolver::resolve_modules_with_config(
+    carina_core::module_resolver::resolve_modules_with_providerless_config(
         &mut loaded.parsed,
         fixture.path(),
         &config,
@@ -4360,23 +4358,6 @@ fn wasm_style_vpc_schema() -> ResourceSchema {
         .attribute(AttributeSchema::optional("vpc_id", vpc_id_type).build())
 }
 
-fn wasm_style_schemas() -> SchemaRegistry {
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "awsccmock",
-        (wasm_style_vpc_schema())
-            .validate()
-            .expect("schema fixture must be valid"),
-    );
-    schemas.insert(
-        "awsccmock",
-        wasm_style_flow_log_schema()
-            .validate()
-            .expect("numeric bridge schema fixture must be valid"),
-    );
-    schemas
-}
-
 fn wasm_style_factories() -> Vec<Box<dyn ProviderFactory>> {
     vec![Box::new(WasmStyleProviderFactory {
         name: "awsccmock".to_string(),
@@ -4392,10 +4373,13 @@ fn wasm_style_factories() -> Vec<Box<dyn ProviderFactory>> {
 }
 
 fn wasm_style_engine() -> DiagnosticEngine {
-    let schemas = wasm_style_schemas();
     let factories: Vec<Box<dyn ProviderFactory>> = wasm_style_factories();
     let provider_names = vec!["awsccmock".to_string()];
-    DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(factories))
+    let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(factories),
+        SchemaRegistry::new(),
+    );
+    DiagnosticEngine::new(Arc::new(loaded_providers), provider_names)
 }
 
 fn wasm_style_flow_log_schema() -> ResourceSchema {
@@ -4528,17 +4512,6 @@ fn wasm_style_subnet_schema() -> ResourceSchema {
         .attribute(AttributeSchema::optional("vpc_ids", AttributeType::list(vpc_id_type)).build())
 }
 
-fn wasm_style_subnet_schemas() -> SchemaRegistry {
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "awsccmock",
-        (wasm_style_subnet_schema())
-            .validate()
-            .expect("schema fixture must be valid"),
-    );
-    schemas
-}
-
 fn wasm_style_subnet_factories() -> Vec<Box<dyn ProviderFactory>> {
     vec![Box::new(WasmStyleProviderFactory {
         name: "awsccmock".to_string(),
@@ -4560,13 +4533,13 @@ awsccmock.ec2.subnet {
 }
 "#,
     )]);
-    let schemas = wasm_style_subnet_schemas();
     let provider_names = vec!["awsccmock".to_string()];
-    let engine = DiagnosticEngine::new(
-        Arc::new(schemas),
-        provider_names,
-        Arc::new(wasm_style_subnet_factories()),
+    let factories = wasm_style_subnet_factories();
+    let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(factories),
+        SchemaRegistry::new(),
     );
+    let engine = DiagnosticEngine::new(Arc::new(loaded_providers), provider_names);
 
     let lsp_diags = lsp_diagnostics(&engine, &fixture, "main.crn");
     let cli_diags = cli_diagnostics(wasm_style_subnet_factories(), &fixture);
@@ -4658,23 +4631,6 @@ fn security_group_schema_2358() -> ResourceSchema {
         .attribute(AttributeSchema::optional("vpc_id", vpc_id_custom_type_2358()).build())
 }
 
-fn schemas_2358() -> SchemaRegistry {
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "awscc2358",
-        (vpc_resource_schema_2358())
-            .validate()
-            .expect("schema fixture must be valid"),
-    );
-    schemas.insert(
-        "awscc2358",
-        (security_group_schema_2358())
-            .validate()
-            .expect("schema fixture must be valid"),
-    );
-    schemas
-}
-
 fn factories_2358() -> Vec<Box<dyn ProviderFactory>> {
     vec![Box::new(WasmStyleProviderFactory {
         name: "awscc2358".to_string(),
@@ -4690,11 +4646,12 @@ fn factories_2358() -> Vec<Box<dyn ProviderFactory>> {
 }
 
 fn engine_2358() -> DiagnosticEngine {
-    DiagnosticEngine::new(
-        Arc::new(schemas_2358()),
-        vec!["awscc2358".to_string()],
-        Arc::new(factories_2358()),
-    )
+    let factories = factories_2358();
+    let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(factories),
+        SchemaRegistry::new(),
+    );
+    DiagnosticEngine::new(Arc::new(loaded_providers), vec!["awscc2358".to_string()])
 }
 
 #[test]
@@ -5037,11 +4994,33 @@ exports {
     );
 }
 
-// Note: typo-binding detection is exercised at the unit-test layer
-// (`carina-core/src/validation/inference.rs::resource_ref_typo_binding_errors_loudly`).
-// At the CLI surface, `check_identifier_scope` runs upstream of the
-// inferer and is the original gate — the inferer's `UnknownBinding`
-// arm is the secondary gate that fires only if the upstream check is
-// ever weakened. The two must stay in agreement, but the CLI-side
-// e2e path is dominated by the upstream check and adds no extra
-// signal beyond the unit test's coverage of the inferer itself.
+#[test]
+fn declared_export_unknown_binding_reports_exactly_one_diagnostic_per_frontend() {
+    let fixture = write_fixture(&[(
+        "main.crn",
+        "exports {\n  x: String = typo_binding.attr\n}\n",
+    )]);
+    let schemas = SchemaRegistry::new();
+
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas.clone()), &fixture, "main.crn");
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+
+    assert_eq!(
+        lsp.len(),
+        1,
+        "LSP must report the identifier-scope error once: {lsp:#?}",
+    );
+    assert_eq!(
+        cli.len(),
+        1,
+        "CLI must report the identifier-scope error once: {cli:#?}",
+    );
+    assert!(
+        lsp[0].message.contains("Undefined") && lsp[0].message.contains("typo_binding"),
+        "unexpected LSP diagnostic: {lsp:#?}",
+    );
+    assert!(
+        cli[0].contains("Undefined") && cli[0].contains("typo_binding"),
+        "unexpected CLI diagnostic: {cli:#?}",
+    );
+}

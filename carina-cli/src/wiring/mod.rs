@@ -122,7 +122,8 @@ use carina_core::parser::{
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::provider::{
     self as provider_mod, AppliedIdentifier, InitializedProvider, LiftedSavedAttrs,
-    NormalizerRouter, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderRouter,
+    LoadedProviderSnapshot, NormalizerRouter, Provider, ProviderError, ProviderFactory,
+    ProviderLoadedSchemaRegistry, ProviderNormalizer, ProviderRouter,
 };
 use carina_core::provider_source::ProviderSource;
 use carina_core::resource::{
@@ -362,9 +363,7 @@ pub struct StateBlockResolution {
 /// extracts schemas from its private context and never exposes the context
 /// itself.
 pub struct WiringContext {
-    factories: Arc<Vec<Box<dyn ProviderFactory>>>,
-    custom_types: carina_core::parser::ProviderCustomTypes,
-    schemas: SchemaRegistry,
+    loaded_providers: Arc<LoadedProviderSnapshot>,
     known_providers: HashSet<String>,
     uses_builtin_mock: bool,
     provider_artifacts: BTreeMap<String, LoadedProviderArtifact>,
@@ -452,7 +451,8 @@ pub(crate) struct CheckedSavedPlanInputs {
         Box<ValidationReady<CanonicalResourcePair<carina_core::parser::InferredExportParam>>>,
 }
 
-/// Schema-only provider state used by collect-all validation and lint.
+/// Schema and custom-type provider state used by collect-all validation and
+/// lint.
 ///
 /// A hard loader failure may produce this value with an empty context. It has
 /// no transition into [`CompleteProviderLoad`] or [`ValidatedConfig`].
@@ -717,7 +717,6 @@ fn validation_report_from<'a>(
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
-    prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> ValidationReport<'a> {
     let errors = match crate::commands::validate_and_resolve_errors_inner(
@@ -727,7 +726,6 @@ fn validation_report_from<'a>(
         context,
         load_errors,
         skip_resource_validation,
-        prior_inference_errors,
         duplicate_declarations,
         crate::commands::ConfigNameResolution::EvaluatedOnly,
     ) {
@@ -760,7 +758,6 @@ fn resolve_config_pair_errors_with_context(
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     base_dir: &Path,
     skip_resource_validation: bool,
-    prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, Vec<AppError>> {
     match crate::commands::validate_and_resolve_errors_inner(
@@ -770,7 +767,6 @@ fn resolve_config_pair_errors_with_context(
         context,
         load_errors,
         skip_resource_validation,
-        prior_inference_errors,
         duplicate_declarations,
         crate::commands::ConfigNameResolution::Paired(Box::new(unresolved)),
     )? {
@@ -789,7 +785,6 @@ fn resolve_config_pair_with_context(
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     base_dir: &Path,
     skip_resource_validation: bool,
-    prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Result<CanonicalResourcePair<carina_core::parser::InferredExportParam>, AppError> {
     resolve_config_pair_errors_with_context(
@@ -799,7 +794,6 @@ fn resolve_config_pair_with_context(
         unresolved,
         base_dir,
         skip_resource_validation,
-        prior_inference_errors,
         duplicate_declarations,
     )
     .map_err(crate::commands::collapse_errors)
@@ -814,16 +808,13 @@ fn resolve_file_binding_uses<E>(
     base_dir: &Path,
     context: &WiringContext,
 ) -> Result<carina_core::validation::ResolvedFile<E>, AppError> {
-    let provider_context = crate::commands::enrich_provider_context(
-        context.schemas(),
-        context.provider_custom_types_snapshot(),
-    );
+    let provider_context = context.provider_context();
     let module_signatures =
-        module_resolver::load_resolved_module_signatures(&file, base_dir, &provider_context);
+        module_resolver::load_resolved_module_signatures(&file, base_dir, provider_context);
     carina_core::validation::resolve_bare_binding_uses(
         file,
         context.schemas(),
-        &provider_context,
+        provider_context,
         &module_signatures,
     )
     .map_err(binding_use_report_error)
@@ -908,7 +899,6 @@ impl ProviderLoad {
         parsed: &mut carina_core::parser::InferredFile,
         base_dir: &Path,
         skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> ValidationReport<'a> {
         validation_report_from(
@@ -917,7 +907,6 @@ impl ProviderLoad {
             parsed,
             base_dir,
             skip_resource_validation,
-            prior_inference_errors,
             duplicate_declarations,
         )
     }
@@ -929,7 +918,6 @@ impl ProviderLoad {
         mut parsed: carina_core::parser::InferredFile,
         base_dir: &Path,
         skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig<carina_core::parser::InferredFile>, AppError> {
         let ValidationReport {
@@ -941,7 +929,6 @@ impl ProviderLoad {
             &mut parsed,
             base_dir,
             skip_resource_validation,
-            prior_inference_errors,
             duplicate_declarations,
         );
         // The resource-skipping pipeline omits provider-load diagnostics.
@@ -971,7 +958,6 @@ impl ProviderLoad {
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
         base_dir: &Path,
         skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig, AppError> {
         let canonical_resources = match resolve_config_pair_errors_with_context(
@@ -981,7 +967,6 @@ impl ProviderLoad {
             unresolved,
             base_dir,
             skip_resource_validation,
-            prior_inference_errors,
             duplicate_declarations,
         ) {
             Ok(canonical_resources) => {
@@ -1063,7 +1048,6 @@ impl CompleteProviderLoad {
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
         base_dir: &Path,
         skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<CheckedSavedPlanInputs, AppError> {
         let canonical_resources = resolve_config_pair_with_context(
@@ -1073,7 +1057,6 @@ impl CompleteProviderLoad {
             unresolved,
             base_dir,
             skip_resource_validation,
-            prior_inference_errors,
             duplicate_declarations,
         )?;
         let (parsed, unresolved) =
@@ -1140,7 +1123,6 @@ impl ReportingProviderLoad {
         parsed: &mut carina_core::parser::InferredFile,
         base_dir: &Path,
         skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> ValidationReport<'a> {
         validation_report_from(
@@ -1149,13 +1131,22 @@ impl ReportingProviderLoad {
             parsed,
             base_dir,
             skip_resource_validation,
-            prior_inference_errors,
             duplicate_declarations,
         )
     }
 
     pub(crate) fn schemas(&self) -> &SchemaRegistry {
         self.context.schemas()
+    }
+
+    pub(crate) fn loaded_provider_context(
+        &self,
+    ) -> Option<&carina_core::parser::LoadedProviderContext> {
+        if self.load_errors.is_empty() {
+            Some(self.context.provider_context())
+        } else {
+            None
+        }
     }
 }
 
@@ -1282,16 +1273,11 @@ impl<R> ValidatedConfig<R> {
 
     #[cfg(test)]
     pub(crate) fn from_wiring_ref_for_test(wiring: &ValidatedWiring, resources: R) -> Self {
-        let factories = Arc::clone(&wiring.load.context.factories);
-        let custom_types =
-            carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
         Self {
             wiring: ValidatedWiring {
                 load: CompleteProviderLoad {
                     context: WiringContext {
-                        factories,
-                        custom_types,
-                        schemas: wiring.load.context.schemas.clone(),
+                        loaded_providers: Arc::clone(&wiring.load.context.loaded_providers),
                         known_providers: wiring.load.context.known_providers.clone(),
                         uses_builtin_mock: wiring.load.context.uses_builtin_mock,
                         provider_artifacts: wiring.load.context.provider_artifacts.clone(),
@@ -1354,7 +1340,6 @@ impl ValidatedConfig<CanonicalResourcePair<carina_core::parser::InferredExportPa
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
         base_dir: &Path,
         skip_resource_validation: bool,
-        prior_inference_errors: &[carina_core::validation::inference::ExportInferenceError],
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig, AppError> {
         let Self {
@@ -1368,7 +1353,6 @@ impl ValidatedConfig<CanonicalResourcePair<carina_core::parser::InferredExportPa
             unresolved,
             base_dir,
             skip_resource_validation,
-            prior_inference_errors,
             duplicate_declarations,
         )?;
         let (parsed, unresolved) =
@@ -1654,9 +1638,9 @@ impl FormattingProviderLoad {
     ) -> Result<Self, AppError> {
         let (factories, load_errors) =
             build_factories_from_providers_for_formatting(user_dirs, providers, base_dir)?;
-        let WiringContext { schemas, .. } = WiringContext::new(factories, providers);
+        let context = WiringContext::new(factories, providers);
         Ok(Self {
-            schemas,
+            schemas: context.schemas().clone(),
             load_errors,
         })
     }
@@ -1671,9 +1655,9 @@ impl FormattingProviderLoad {
         provider_configs: &[ProviderConfig],
         load_errors: HashMap<String, ProviderFactoryDiagnostic>,
     ) -> Self {
-        let WiringContext { schemas, .. } = WiringContext::new(factories, provider_configs);
+        let context = WiringContext::new(factories, provider_configs);
         Self {
-            schemas,
+            schemas: context.schemas().clone(),
             load_errors,
         }
     }
@@ -1735,14 +1719,6 @@ impl WiringContext {
             .into_iter()
             .map(LoadedProviderFactory::into_factory)
             .collect::<Vec<_>>();
-        let factories = Arc::new(factories);
-        let (factory_schemas, custom_types) =
-            carina_core::provider::schema_registry_and_custom_types_from_factories(Arc::clone(
-                &factories,
-            ));
-        schemas
-            .extend(factory_schemas)
-            .expect("plain additional schemas cannot conflict with factory witness forms");
         if uses_builtin_mock {
             let builtin = carina_provider_mock::builtin_schema_witness();
             let missing = builtin.resources().iter().filter(|schema| {
@@ -1771,10 +1747,13 @@ impl WiringContext {
         if uses_builtin_mock {
             known_providers.insert(BUILTIN_PROVIDER_NAME.to_string());
         }
-        Self {
-            factories,
-            custom_types,
+        let factories = Arc::new(factories);
+        let loaded_providers = Arc::new(provider_mod::loaded_provider_snapshot_from_factories(
+            Arc::clone(&factories),
             schemas,
+        ));
+        Self {
+            loaded_providers,
             known_providers,
             uses_builtin_mock,
             provider_artifacts,
@@ -1803,25 +1782,27 @@ impl WiringContext {
     }
 
     pub fn factories(&self) -> &[Box<dyn ProviderFactory>] {
-        &self.factories
+        self.loaded_providers.factories()
     }
 
     pub fn factories_arc(&self) -> Arc<Vec<Box<dyn ProviderFactory>>> {
-        Arc::clone(&self.factories)
+        self.loaded_providers.factories_arc()
     }
 
     pub fn custom_type_resolver(&self) -> &dyn carina_core::parser::CustomTypeResolver {
-        &self.custom_types
+        self.provider_context().custom_type_resolver()
     }
 
-    pub(crate) fn provider_custom_types_snapshot(
-        &self,
-    ) -> carina_core::parser::ProviderCustomTypes {
-        self.custom_types.clone()
+    pub fn provider_context(&self) -> &carina_core::parser::LoadedProviderContext {
+        self.loaded_providers.provider_context()
     }
 
     pub fn schemas(&self) -> &SchemaRegistry {
-        &self.schemas
+        self.loaded_providers.schema_registry()
+    }
+
+    pub(crate) fn loaded_provider_schemas(&self) -> &ProviderLoadedSchemaRegistry {
+        self.loaded_providers.schemas()
     }
 
     pub fn known_providers(&self) -> &HashSet<String> {
@@ -3520,7 +3501,7 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
 pub(crate) fn validate_module_internal_ref_types(
     ctx: &WiringContext,
     module_walk: &ModuleWalk,
-    config: &carina_core::parser::ProviderContext,
+    config: &carina_core::parser::LoadedProviderContext,
 ) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {

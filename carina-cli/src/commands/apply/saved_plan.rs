@@ -286,7 +286,6 @@ impl ProviderBoundPlanFile {
                     base_dir,
                     false,
                     &[],
-                    &[],
                 )?;
                 Ok(Self::needs_secret_verification(plan, providers))
             }

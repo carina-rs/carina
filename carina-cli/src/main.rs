@@ -812,7 +812,7 @@ mod error_format_tests {
         }
         let provider_context = carina_core::parser::ProviderContext::default();
         let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
-        let context = carina_core::validation::ValidationTypeContext::new(
+        let context = carina_core::validation::ValidationTypeContext::new_providerless(
             &parsed,
             &schemas,
             &provider_context,

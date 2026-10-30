@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
@@ -643,47 +644,56 @@ fn unannotated_export_of_struct_with_nested_union_stays_compatibility_clean() {
 }
 
 #[test]
-fn prior_heterogeneous_export_error_is_not_rederived_by_plan_style_validation() {
-    let fixture = Fixture::direct(&[("exports.crn", "exports {\n  mixed = [\"text\", 1]\n}\n")]);
-
-    let validate_diags = fixture.validate();
-    assert_eq!(
-        validate_diags.len(),
-        1,
-        "validate should report the original load-time inference error once: {validate_diags:#?}",
+fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validation() {
+    let fixture = Fixture::direct(&[(
+        "exports.crn",
+        "exports {\n  x = instance.target_group_ar\n}\n",
+    )]);
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AwsccTestFactory)];
+    let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(factories),
+        carina_core::schema::SchemaRegistry::new(),
     );
-    assert!(
-        validate_diags[0].contains("type annotation required")
-            && validate_diags[0].contains("collection element types disagree"),
-        "expected the heterogeneous-list inference diagnostic: {validate_diags:#?}",
-    );
-
-    let loaded = carina_core::config_loader::load_configuration_with_config(
-        &fixture.caller,
-        &carina_core::parser::ProviderContext::default(),
-        &carina_core::schema::SchemaRegistry::new(),
-    )
-    .expect("load plan-style fixture");
-    assert_eq!(
-        loaded.inference_errors.len(),
-        1,
-        "fixture must carry exactly the load-time inference error",
-    );
-    let inference_errors = loaded.inference_errors;
-    let mut parsed = loaded.parsed;
-    let providers = carina_cli::wiring::ProviderLoad::for_test(factories(), &parsed.providers);
-    let retry_errors = carina_cli::commands::validate_and_resolve_errors(
+    let provider_context = loaded_providers.provider_context();
+    let schemas = loaded_providers.schemas();
+    let mut parsed = carina_core::config_loader::parse_directory(&fixture.caller, provider_context)
+        .expect("parse directory-scoped fixture");
+    carina_core::module_resolver::resolve_modules_with_config(
         &mut parsed,
         carina_core::config_loader::get_base_dir(&fixture.caller),
-        &providers,
-        false,
-        &inference_errors,
-        &[],
-    );
+        provider_context,
+        schemas.schemas(),
+    )
+    .expect("expand module call");
 
-    assert!(
-        retry_errors.is_empty(),
-        "plan/apply-style validation must not re-report a prior load-time inference error: {retry_errors:#?}",
+    // Exercise the same post-expansion inference + ref-validation seam used by
+    // CLI validation, where both stages can otherwise report this one typo.
+    let inferred_exports =
+        carina_core::validation::inference::infer_export_params_with_loaded_provider_schemas(
+            &parsed, schemas,
+        );
+    let bindings =
+        carina_core::binding_index::BindingIndex::from_parsed(&parsed, schemas.schemas());
+    let mut diagnostics = carina_core::validation::inference::attached_inference_failures(
+        inferred_exports.checked_exports(),
+    )
+    .map(|failure| {
+        carina_core::validation::inference::format_inference_error(failure.name, failure.error)
+    })
+    .collect::<Vec<_>>();
+    if let Err(message) = carina_core::validation::validate_export_param_ref_types_with_bindings(
+        inferred_exports.parameters(),
+        &bindings,
+    ) {
+        diagnostics.extend(message.lines().map(str::to_owned));
+    }
+
+    assert_eq!(
+        diagnostics,
+        vec![
+            "export 'x': type annotation required: unknown attribute `target_group_ar` on `instance`"
+        ],
+        "attached inference and the CLI's shared ref validation must report the typo once",
     );
 }
 

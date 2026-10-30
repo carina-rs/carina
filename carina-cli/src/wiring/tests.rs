@@ -1011,7 +1011,7 @@ query {}
     let config = carina_core::parser::ProviderContext::default();
     let mut parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
         .expect("root fixture must parse");
-    carina_core::module_resolver::resolve_modules_with_config(
+    carina_core::module_resolver::resolve_modules_with_providerless_config(
         &mut parsed,
         &root_dir,
         &config,
@@ -1100,7 +1100,7 @@ outer {{}}
     let config = carina_core::parser::ProviderContext::default();
     let mut parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
         .expect("root fixture must parse");
-    carina_core::module_resolver::resolve_modules_with_config(
+    carina_core::module_resolver::resolve_modules_with_providerless_config(
         &mut parsed,
         &root_dir,
         &config,
@@ -1165,7 +1165,7 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         parsed.providers = provider_configs();
         parsed.arguments = vec![carina_core::parser::ArgumentParameter {
             name: "unrelated".to_string(),
-            type_expr: carina_core::parser::TypeExpr::String,
+            static_type: carina_core::parser::TypeExpr::String,
             default: None,
             description: None,
             validations: Vec::new(),
@@ -1178,7 +1178,6 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         Path::new("."),
         true,
         &[],
-        &[],
     ) {
         Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
         Err(error) => error,
@@ -1189,7 +1188,6 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         Path::new("."),
         true,
-        &[],
         &[],
     ) {
         Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
@@ -1222,7 +1220,7 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
     parsed.providers = vec![provider];
     parsed.arguments = vec![carina_core::parser::ArgumentParameter {
         name: "unrelated".to_string(),
-        type_expr: carina_core::parser::TypeExpr::String,
+        static_type: carina_core::parser::TypeExpr::String,
         default: None,
         description: None,
         validations: Vec::new(),
@@ -1231,11 +1229,11 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
     let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
     );
-    let error =
-        match providers.validate_config_pair(parsed, unresolved, Path::new("."), false, &[], &[]) {
-            Ok(_) => panic!("plan-style validation must reject both independent errors"),
-            Err(error) => error,
-        };
+    let error = match providers.validate_config_pair(parsed, unresolved, Path::new("."), false, &[])
+    {
+        Ok(_) => panic!("plan-style validation must reject both independent errors"),
+        Err(error) => error,
+    };
     let message = error.to_string();
 
     assert!(message.contains("broken provider failed"), "{message}");
@@ -1266,7 +1264,7 @@ fn hard_reporting_load_returns_schema_only_diagnostics() {
     );
 
     let mut parsed = carina_core::parser::InferredFile::default();
-    let report = providers.validation_report(&mut parsed, base.path(), true, &[], &[]);
+    let report = providers.validation_report(&mut parsed, base.path(), true, &[]);
 
     assert!(report.errors().is_empty());
     assert!(report.schemas().iter().next().is_none());
@@ -8658,8 +8656,8 @@ fn validate_resources_with_ctx_returns_each_error_as_app_error() {
     let mut parsed = ParsedFile::default();
     parsed.resources = vec![r1, r2];
 
-    let provider_ctx = carina_core::parser::ProviderContext::default();
-    let errors = validate_resources_with_ctx(&ctx, &parsed, &provider_ctx);
+    let provider_ctx = ctx.provider_context();
+    let errors = validate_resources_with_ctx(&ctx, &parsed, provider_ctx);
     assert_eq!(errors.len(), 2, "got {errors:?}");
     for err in &errors {
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -9824,7 +9822,7 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
 fn module_checker_and_provider_wrappers_accept_empty_input() {
     let ctx = WiringContext::new_for_test(vec![], &[]);
     let parsed = ParsedFile::default();
-    let provider_ctx = carina_core::parser::ProviderContext::default();
+    let provider_ctx = ctx.provider_context();
 
     let errors = validate_provider_region_with_ctx(&ctx, &parsed);
     assert!(errors.is_empty(), "provider_region: got {errors:?}");
@@ -9835,7 +9833,7 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
         &carina_core::validation::ValidationTypeContext::new(
             &parsed,
             ctx.schemas(),
-            &provider_ctx,
+            provider_ctx,
             &module_signatures,
         ),
     );
@@ -9850,7 +9848,7 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
             semantic: Some(&parsed),
             base_dir: Some(std::path::Path::new(".")),
             imported_signatures: &module_signatures,
-            provider_context: &provider_ctx,
+            provider_context: provider_ctx,
             schemas: ctx.schemas(),
             binding_use_report: &binding_use_report,
             bindings: &bindings,
@@ -12749,7 +12747,10 @@ mod resolved_value_constraint_gate {
                             name.to_string(),
                             carina_core::resource::LiveCompositionArgument::from_value(
                                 value,
-                                carina_core::parser::TypeExpr::String,
+                                carina_core::validation::resolve_consumer_static_type_for_signature(
+                                    &carina_core::parser::TypeExpr::String,
+                                    &carina_core::parser::ProviderContext::default(),
+                                ),
                                 carina_core::parser::ArgumentOrigin::Defaulted,
                             ),
                         )

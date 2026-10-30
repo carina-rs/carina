@@ -1219,7 +1219,6 @@ async fn run_state_bucket_delete(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
 
@@ -1245,13 +1244,8 @@ async fn run_state_bucket_delete(
     // resolved provider values needed for construction can wait until after
     // confirmation.
     let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
-    let validated_config = providers.validate_evaluated_config(
-        parsed,
-        base_dir,
-        true,
-        &inference_errors,
-        &duplicate_declarations,
-    )?;
+    let validated_config =
+        providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
     println!(
         "{}",
@@ -1380,19 +1374,13 @@ pub async fn run_state_refresh(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
-    let validated_config = providers.validate_evaluated_config(
-        parsed,
-        base_dir,
-        true,
-        &inference_errors,
-        &duplicate_declarations,
-    )?;
+    let validated_config =
+        providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
     let verified_backend = verify_for_mutation(
         path,
@@ -1841,7 +1829,7 @@ pub(crate) async fn run_state_refresh_locked(
         let checked_exports = carina_core::validation::check_export_values_pre_apply(
             &parsed.export_params,
             &carina_core::binding_index::ResolvedBindings::for_validation(parsed),
-            provider_context,
+            ctx.provider_context(),
         )
         .map_err(AppError::Validation)?;
         let values = crate::commands::shared::state_writeback::resolve_export_values_post_apply(
@@ -1852,7 +1840,7 @@ pub(crate) async fn run_state_refresh_locked(
                 post_apply_states: &post_apply_states,
                 schemas: ctx.schemas(),
                 wait_aliases: &wait_aliases,
-                provider_context,
+                provider_context: ctx.provider_context(),
             },
         )?;
         let resolution = crate::commands::shared::state_writeback::materialize_exports(&values)?;
@@ -2673,7 +2661,10 @@ mod tests {
     fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
         LiveCompositionArgument::from_value(
             value,
-            carina_core::parser::TypeExpr::String,
+            carina_core::validation::resolve_consumer_static_type_for_signature(
+                &carina_core::parser::TypeExpr::String,
+                &carina_core::parser::ProviderContext::default(),
+            ),
             carina_core::parser::ArgumentOrigin::Defaulted,
         )
     }
@@ -3001,7 +2992,7 @@ mod tests {
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &downstream).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &downstream, true, &[], &[])
+            .validate_evaluated_config(parsed, &downstream, true, &[])
             .unwrap();
 
         run_state_refresh_locked(
@@ -3023,7 +3014,7 @@ mod tests {
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &base_dir, true, &[], &[])
+            .validate_evaluated_config(parsed, &base_dir, true, &[])
             .unwrap();
 
         run_state_refresh_locked(
@@ -3045,7 +3036,7 @@ mod tests {
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &base_dir, true, &[], &[])
+            .validate_evaluated_config(parsed, &base_dir, true, &[])
             .unwrap();
 
         run_state_refresh_locked(

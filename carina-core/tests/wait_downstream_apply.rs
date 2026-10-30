@@ -36,7 +36,7 @@ use carina_core::executor::{
     ExecutionObserver, ExecutionOutcome, ExecutionResult, LiveExecutionInput, ProviderCheckInputs,
     UnresolvedResource, execute_live_plan,
 };
-use carina_core::module_resolver::resolve_modules;
+use carina_core::module_resolver::resolve_modules_providerless as resolve_modules;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,

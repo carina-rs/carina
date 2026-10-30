@@ -6469,8 +6469,6 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
             "lifted TypeExpr must be assignable to itself; offending pair: lift({name}) -> lift({name})",
         );
     }
-
-    assert!(crate::validation::lift_type_expr(&TypeExpr::Unknown).is_none());
 }
 
 fn contains_unrefined_primitive(attr: &AttributeType) -> bool {

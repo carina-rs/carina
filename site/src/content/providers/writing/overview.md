@@ -86,7 +86,7 @@ The same user trust record controls metadata access. Only a recorded artifact fr
 
 ## Protocol version
 
-The provider protocol is versioned. The current development version is 13, and the host also requires at least 13. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.8.0 and v0.7.1 both speak version 12; version 13 will ship in the next release after v0.8.0.
+The provider protocol is versioned. The current development version is 13, and the host also requires at least 13. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.9.0, v0.8.0 and v0.7.1 all speak version 12; version 13 will ship in the next release after v0.9.0.
 
 When the versions do not match, the host refuses to load the provider and tells you which side to update: rebuild the provider against the current SDK, or upgrade Carina. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) records what each version changed, and [Versioning and Compatibility](/providers/writing/versioning/) explains what to do when the version changes.
 

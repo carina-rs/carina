@@ -20,6 +20,8 @@ The blocks fall into two groups by role:
 - **Declaration side** (`arguments`): the type annotation is required and load-bearing; `= expr` is an optional fallback when the caller omits the argument.
 - **Definition side** (`attributes`, `exports`): the value expression is required and load-bearing; the type annotation is an optional extra.
 
+When an export has no annotation and Carina cannot infer its type from the value, such as for a list with mixed element types, `carina validate`, `carina plan`, and `carina apply` all fail with a `type annotation required` error. Add an annotation to the export in that case.
+
 Because `description` and `validation` are input-side concerns (documenting what callers should pass, and checking what they did pass), they are available on `arguments` entries through the block form but are deliberately absent from `attributes` and `exports`. Outputs are values produced internally from bindings the module already controls, so there is nothing to validate and no caller-facing documentation to attach beyond the type.
 
 `attributes` and `exports` share their body grammar but are intentionally kept separate because their consumers are different: `attributes` is the interface a module presents to its direct caller, while `exports` is the interface a directory presents to other projects through `upstream_state`.

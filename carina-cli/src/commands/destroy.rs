@@ -130,19 +130,13 @@ pub async fn run_destroy(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
-    let validated_config = providers.validate_evaluated_config(
-        parsed,
-        base_dir,
-        true,
-        &inference_errors,
-        &duplicate_declarations,
-    )?;
+    let validated_config =
+        providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
     let verified_backend = verify_for_mutation(
         path,
@@ -1337,21 +1331,20 @@ async fn run_destroy_locked(
             .await;
         }
     };
-    let validated_config =
-        match providers.validate_evaluated_config(parsed, base_dir, true, &[], &[]) {
-            Ok(validated_config) => validated_config,
-            Err(error) => {
-                return finish_lock_command(
-                    backend.as_ref(),
-                    LockCommandOutcome::Kept {
-                        result: Err(error),
-                        lock,
-                    },
-                    &cancel,
-                )
-                .await;
-            }
-        };
+    let validated_config = match providers.validate_evaluated_config(parsed, base_dir, true, &[]) {
+        Ok(validated_config) => validated_config,
+        Err(error) => {
+            return finish_lock_command(
+                backend.as_ref(),
+                LockCommandOutcome::Kept {
+                    result: Err(error),
+                    lock,
+                },
+                &cancel,
+            )
+            .await;
+        }
+    };
     let outcome = run_destroy_locked_owned(
         validated_config,
         auto_approve,
@@ -2527,13 +2520,7 @@ mod tests {
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base_dir)
             .expect("mock provider must load");
         let validated_config = providers
-            .validate_evaluated_config(
-                parsed,
-                base_dir,
-                true,
-                &loaded.inference_errors,
-                &loaded.duplicate_declarations,
-            )
+            .validate_evaluated_config(parsed, base_dir, true, &loaded.duplicate_declarations)
             .expect("fixture must validate");
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
         let backend = fixture.lock_loss_backend_handle();

@@ -34,7 +34,9 @@ use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
 
-use carina_core::parser::{ProviderConfig, ProviderContext, ResolvedProviderConfigs};
+use carina_core::parser::{
+    LoadedProviderContext, ProviderConfig, ProviderContext, ResolvedProviderConfigs,
+};
 
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
@@ -943,7 +945,7 @@ pub(crate) async fn finalize_apply<S: Clone>(
             post_apply_states: &post_apply_states,
             schemas: input.state_save_inputs.schemas(),
             wait_aliases: input.wait_aliases,
-            provider_context: input.provider_context,
+            provider_context: export_inputs.provider_context,
         })
         .and_then(|values| materialize_exports(&values))
         .map(|resolution| resolution.write_into(&mut state))
@@ -1127,7 +1129,7 @@ pub(crate) async fn persist_exports_only(
     schemas: &carina_core::schema::SchemaRegistry,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
     managed_current: &HashMap<ResourceId, Current>,
-    provider_context: &ProviderContext,
+    provider_context: &LoadedProviderContext,
 ) -> Result<(), AppError> {
     let mut state = state_file.unwrap_or_default();
     let post_apply_states =
@@ -1468,7 +1470,6 @@ async fn run_apply_with_observer_factory(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let bootstrap_unresolved = loaded.unresolved_parsed.clone();
     let parsed = loaded.parsed;
@@ -1481,7 +1482,6 @@ async fn run_apply_with_observer_factory(
         loaded.unresolved_parsed,
         base_dir,
         false,
-        &inference_errors,
         &duplicate_declarations,
     )?;
     // Wiring needs declaration metadata and schemas before a bootstrap
@@ -1726,14 +1726,12 @@ fn reload_apply_configuration_after_bootstrap(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = reloaded.inference_errors;
     let duplicate_declarations = reloaded.duplicate_declarations;
     validated_config.revalidate_config_pair(
         reloaded.parsed,
         unresolved,
         base_dir,
         true,
-        &inference_errors,
         &duplicate_declarations,
     )
 }
@@ -1808,6 +1806,7 @@ struct SourceApplyExecuted {
     checked_exports: CheckedApplyExports,
     wait_aliases: Vec<WaitAliasSpec>,
     pre_resolve_compositions: Vec<carina_core::resource::LiveComposition>,
+    provider_context: LoadedProviderContext,
     cancel: ShutdownToken,
 }
 
@@ -2142,7 +2141,7 @@ async fn run_apply_locked_owned(
                         plan: &plan,
                         schemas: ctx.schemas(),
                         wait_aliases: &wait_aliases,
-                        provider_context,
+                        provider_context: ctx.provider_context(),
                     })
                     .map_err(AppError::Validation)?;
                 let empty_exports = HashMap::new();
@@ -2230,7 +2229,7 @@ async fn run_apply_locked_owned(
                     plan: &plan,
                     schemas: ctx.schemas(),
                     wait_aliases: &wait_aliases,
-                    provider_context,
+                    provider_context: ctx.provider_context(),
                 })
                 .map_err(AppError::Validation)?;
             let current_exports = state_file
@@ -2347,6 +2346,7 @@ async fn run_apply_locked_owned(
                     checked_exports: checked_exports_pre_apply,
                     wait_aliases,
                     pre_resolve_compositions,
+                    provider_context: ctx.provider_context().clone(),
                     cancel,
                 },
             )))
@@ -2390,7 +2390,7 @@ async fn run_apply_locked_owned(
                     validated_config.context().schemas(),
                     &wait_aliases,
                     &managed_current,
-                    provider_context,
+                    validated_config.context().provider_context(),
                 )
                 .await?;
                 Ok(None)
@@ -2407,6 +2407,7 @@ async fn run_apply_locked_owned(
                     checked_exports,
                     wait_aliases,
                     pre_resolve_compositions,
+                    provider_context,
                     cancel,
                 } = *context;
                 let export_resources: Vec<Resource> = state_save_inputs
@@ -2430,10 +2431,10 @@ async fn run_apply_locked_owned(
                                     export_params: &checked_exports,
                                     data_source_values: &data_source_values,
                                     resources: &export_resources,
+                                    provider_context: &provider_context,
                                 }),
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),
-                                provider_context,
                                 wait_aliases: &wait_aliases,
                                 pre_resolve_compositions: &pre_resolve_compositions,
                             },
@@ -3115,7 +3116,6 @@ async fn run_apply_from_plan_with_observer_factory(
             let parsed_backend = Some(current_config.parsed.backend.clone());
             let parsed = current_config.parsed;
             let unresolved = current_config.unresolved_parsed;
-            let inference_errors = current_config.inference_errors;
             let duplicate_declarations = current_config.duplicate_declarations;
             let providers = providers
                 .check_saved_plan_config_pair(
@@ -3123,7 +3123,6 @@ async fn run_apply_from_plan_with_observer_factory(
                     unresolved,
                     base_dir,
                     false,
-                    &inference_errors,
                     &duplicate_declarations,
                 )
                 .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
@@ -3671,10 +3670,6 @@ async fn run_apply_from_plan_locked_owned(
                     wait_aliases,
                     cancel,
                 } = *context;
-                // Reuse the exact factory/schema context that prepared and executed the
-                // saved plan for write-only attribute persistence.
-                let provider_context = ProviderContext::default();
-
                 let skipped_exports = finalize_after_execute(
                     |persistence| {
                         finalize_apply(
@@ -3689,7 +3684,6 @@ async fn run_apply_from_plan_locked_owned(
                                 export_resolution_inputs: None,
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),
-                                provider_context: &provider_context,
                                 // No export resolution runs here, but pass the reconstructed
                                 // aliases so the value is correct if a future plan file persists
                                 // export parameters.

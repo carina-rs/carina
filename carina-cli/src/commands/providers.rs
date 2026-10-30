@@ -114,7 +114,7 @@ fn flush_preview() -> Result<(), AppError> {
         .map_err(|error| AppError::Config(format!("Failed to print recovery preview: {error}")))
 }
 
-fn save_lock(lock: &GuardedLockFile<'_>) -> Result<(), AppError> {
+fn save_lock(lock: &mut GuardedLockFile<'_>) -> Result<(), AppError> {
     let lock_path = provider_lock_path(lock.project_dir());
     lock.save().map_err(|error| {
         AppError::Config(format!(
@@ -167,7 +167,7 @@ fn run_repin_discovery(host: &str, force: bool, base_dir: &Path) -> Result<(), A
         return Ok(());
     }
     recovery.commit();
-    save_lock(&lock)?;
+    save_lock(&mut lock)?;
     println!(
         "Registry discovery pin cleared. Run `{}` to verify discovery and acquire the new host pin.",
         ProjectCommand::new("init", base_dir)
@@ -227,7 +227,7 @@ fn run_repin_identity(provider: &str, force: bool, base_dir: &Path) -> Result<()
     recovery
         .commit()
         .map_err(|error| AppError::Config(error.to_string()))?;
-    save_lock(&lock)?;
+    save_lock(&mut lock)?;
     println!(
         "Signer pins cleared. Run `{}` to verify a signed artifact and acquire new pins.",
         ProjectCommand::new("init", base_dir)
@@ -266,12 +266,16 @@ fn run_rebootstrap(provider: &str, force: bool, base_dir: &Path) -> Result<(), A
     if !confirm_recovery(provider, "provider source", force)? {
         return Ok(());
     }
+    // A pinned target persists a typed reset-pending anchor state so failed
+    // resolutions cannot consume the operator-authorized reset. A pre-pin
+    // observation has no anchor; clearing it leaves the source at first
+    // contact. The next successful resolution pins either case.
     recovery
         .commit()
         .map_err(|error| AppError::Config(error.to_string()))?;
-    save_lock(&lock)?;
+    save_lock(&mut lock)?;
     println!(
-        "Registry freshness reset. Run `{}` to establish a new first-contact anchor.",
+        "Registry freshness reset. Run `{}` to establish a new reference point (or record that the registry serves no sequence).",
         ProjectCommand::new("init", base_dir)
     );
     Ok(())

@@ -968,7 +968,11 @@ mod tests {
             &ProviderContext::default(),
         )
         .unwrap();
-        let sig = FileSignature::from_parsed_file_with_name(&parsed, "test_module");
+        let sig = FileSignature::from_parsed_file_with_name(
+            &parsed,
+            "test_module",
+            &ProviderContext::default(),
+        );
         ModuleInfoApp::new(&sig)
     }
 
