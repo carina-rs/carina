@@ -1,0 +1,5 @@
+{
+  "versions": [
+    { "version": "0.7.3", "protocols": ["1"] }
+  ]
+}

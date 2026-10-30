@@ -1,4 +1,6 @@
 ---
+import RailHeader from './RailHeader.astro';
+
 const sections = [
   {
     label: 'Getting Started',
@@ -53,6 +55,13 @@ const sections = [
           { label: 'completions',  href: '/reference/cli/completions/' },
         ],
       },
+      {
+        label: 'Registry',
+        items: [
+          { label: 'Protocol',               href: '/reference/registry/protocol/' },
+          { label: 'Static Registry Layout', href: '/reference/registry/static-registry/' },
+        ],
+      },
     ],
   },
   {
@@ -73,6 +82,7 @@ const sections = [
           { label: 'Versioning',              href: '/providers/writing/versioning/' },
           { label: 'Docs Bundle',             href: '/providers/writing/docs-bundle/' },
           { label: 'Publishing',              href: '/providers/writing/publishing/' },
+          { label: 'Registries',              href: '/providers/writing/registries/' },
         ],
       },
     ],
@@ -82,51 +92,110 @@ const sections = [
 const currentPath = Astro.url.pathname;
 ---
 <aside class="sidebar">
-  {sections.map(section => (
-    <div class="sidebar-section">
-      <h3 class="sidebar-section-title">{section.label}</h3>
-      {section.items && (
-        <ul class="sidebar-list">
-          {section.items.map(item => (
-            <li>
-              <a
-                href={item.href}
-                class:list={['sidebar-link', { active: currentPath === item.href, external: item.external }]}
-                aria-current={currentPath === item.href ? 'page' : undefined}
-              >
-                {item.label}{item.external && ' →'}
-              </a>
-            </li>
-          ))}
-        </ul>
-      )}
-      {section.subgroups && section.subgroups.map(sub => (
-        <div class="sidebar-subgroup">
-          <h4 class="sidebar-subgroup-title">{sub.label}</h4>
+  <RailHeader
+    label="Documentation"
+    side="start"
+    toggle={{
+      controls: 'doc-navigation',
+      label: 'Hide navigation',
+      dataAttr: 'data-nav-toggle',
+    }}
+  />
+
+  <button
+    type="button"
+    class="sidebar-toggle-mobile"
+    aria-expanded="false"
+    aria-controls="doc-navigation"
+    aria-label="Show navigation menu"
+    data-mobile-nav-toggle
+  >
+    <span>Menu</span>
+    <svg
+      class="sidebar-mobile-icon"
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <polyline points="6 9 12 15 18 9"></polyline>
+    </svg>
+  </button>
+
+  <nav id="doc-navigation" class="sidebar-content" aria-label="Documentation navigation">
+    {sections.map(section => (
+      <div class="sidebar-section">
+        <h3 class="sidebar-section-title">{section.label}</h3>
+        {section.items && (
           <ul class="sidebar-list">
-            {sub.items.map(item => (
+            {section.items.map(item => (
               <li>
                 <a
                   href={item.href}
-                  class:list={['sidebar-link', { active: currentPath === item.href }]}
+                  class:list={['sidebar-link', { active: currentPath === item.href, external: item.external }]}
                   aria-current={currentPath === item.href ? 'page' : undefined}
                 >
-                  {item.label}
+                  {item.label}{item.external && ' →'}
                 </a>
               </li>
             ))}
           </ul>
-        </div>
-      ))}
-    </div>
-  ))}
+        )}
+        {section.subgroups && section.subgroups.map(sub => (
+          <div class="sidebar-subgroup">
+            <h4 class="sidebar-subgroup-title">{sub.label}</h4>
+            <ul class="sidebar-list">
+              {sub.items.map(item => (
+                <li>
+                  <a
+                    href={item.href}
+                    class:list={['sidebar-link', { active: currentPath === item.href }]}
+                    aria-current={currentPath === item.href ? 'page' : undefined}
+                  >
+                    {item.label}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+    ))}
+  </nav>
 </aside>
 
 <style>
   .sidebar {
-    padding: var(--space-2) 0;
+    position: sticky;
+    top: var(--topbar-height);
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
+    max-height: calc(100dvh - var(--topbar-height));
+    padding: calc(var(--space-8) + var(--space-4)) 0 var(--space-4);
+    overflow: hidden;
     background: var(--sidebar-bg);
   }
+
+  .sidebar-toggle-mobile { display: none; }
+
+  .sidebar-content {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-gutter: stable;
+  }
+
+  :global(html[data-nav-collapsed]) .sidebar-content { display: none; }
 
   .sidebar-section + .sidebar-section { margin-top: var(--space-6); }
 
@@ -181,5 +250,71 @@ const currentPath = Astro.url.pathname;
     color: var(--sidebar-group-head-color);
     opacity: 0.75;
     margin: var(--space-3) 0 var(--space-2);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .sidebar-link { transition: none; }
+  }
+
+  @media (max-width: 48rem) {
+    .sidebar {
+      position: static;
+      top: auto;
+      display: block;
+      max-height: none;
+      padding: var(--space-8) 0 0;
+      overflow: visible;
+    }
+
+    .sidebar-toggle-mobile {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-sizing: border-box;
+      width: 100%;
+      height: auto;
+      min-height: 2.5rem;
+      padding: var(--space-2) var(--space-3);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      background: var(--sidebar-bg);
+      color: var(--sidebar-group-head-color);
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .sidebar-toggle-mobile:hover {
+      border-color: var(--sidebar-link-hover-color);
+      color: var(--sidebar-link-hover-color);
+    }
+
+    .sidebar-toggle-mobile:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .sidebar-mobile-icon {
+      display: block;
+      flex: 0 0 auto;
+      margin-right: 0.15rem;
+    }
+
+    .sidebar-content {
+      position: static;
+      display: none;
+      min-height: auto;
+      padding-top: var(--space-4);
+      overflow-y: visible;
+      overscroll-behavior: auto;
+      scrollbar-width: auto;
+      scrollbar-gutter: auto;
+    }
+
+    :global(html[data-mobile-nav-open]) .sidebar-content { display: block; }
+
+    :global(html[data-mobile-nav-open]) .sidebar-mobile-icon {
+      transform: rotate(180deg);
+    }
   }
 </style>

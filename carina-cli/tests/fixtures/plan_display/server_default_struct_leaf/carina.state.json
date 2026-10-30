@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "ec2.Vpc",
-      "identity": "ec2_vpc_fixture",
+      "identity": "awscc_ec2_vpc_0bc2a2bb",
       "provider": "awscc",
       "identifier": "vpc-0000000000000abcd",
       "attributes": {

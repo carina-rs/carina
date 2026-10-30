@@ -5,7 +5,7 @@ description: "The archive format a Carina provider uses to ship its documentatio
 
 A provider registry shows each provider version's documentation: an overview page, and one page per resource type and data source. The official providers' pages at [registry.carina-rs.dev](https://registry.carina-rs.dev/providers/index.html) are built this way. The provider supplies them as a **docs bundle**, one archive built by the same release that builds the `.wasm`.
 
-Publishing to the registry is not open to third-party providers yet (see [Publishing](/providers/writing/publishing/)), but the format is fixed, so you can write your docs and build the bundle now; the registry checks it only at publish (see below). The authoritative definition is the registry protocol's [Documentation source](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-source-the-docs-bundle) section; this page summarizes it.
+Publishing to the registry is not open to third-party providers yet (see [Publishing](/providers/writing/publishing/)), but the format is fixed, so you can write your docs and build the bundle now; the registry checks it only at publish (see below). The authoritative definition is the registry protocol's [Documentation source](/reference/registry/protocol/#documentation-source-the-docs-bundle) section; this page summarizes it.
 
 ## Layout
 
@@ -39,6 +39,10 @@ The tar format has a few more rules: a directory entry declares size 0, paths lo
 Two more limits apply to rendering. A long run of table cells costs far more to render than its size suggests, so a file is refused when (largest number of `|` characters on any line + 1) × number of lines exceeds 250,000. Each page's Markdown may render to at most 2 MiB of HTML, and everything rendered for one version, pages, navigation and page template included, at 64 MiB in total. Ordinary documentation is far below all of these.
 
 Docs are accepted only for stable versions. A pre-release publish that carries a docs bundle is refused as a whole, so send docs only when publishing a stable version; an archive left on a pre-release's GitHub release is harmless. A version's docs are fixed when it is first published: corrected docs ship with the next version.
+
+## Grouping pages by service
+
+The bundle does not control how the sidebar is organized. By default it lists every resource and data source in one flat list. The registry can group a provider's pages under collapsible service headings from navigation metadata it keeps for that provider. That metadata applies to every version, including ones already published, so a provider never needs a new release to change its grouping. See the protocol's [Provider Documentation](/reference/registry/protocol/#provider-documentation) section.
 
 ## How pages are rendered
 
@@ -108,11 +112,11 @@ with open(out, "wb") as f, gzip.GzipFile(fileobj=f, mode="wb", mtime=0, filename
 python3 build-docs-bundle.py docs carina-provider-hello-v0.1.0-docs.tar.gz
 ```
 
-Attach the archive to the same GitHub release as the `.wasm`. A `github.com/...` source ignores it; the registry fetches it from that URL when the version is published. Registry versions can be signed keylessly by the release workflow run that built them. When a version is signed, the same job of the same workflow run attempt must also sign the archive's digest, in the same way as the `.wasm`. The registry refuses docs signed by another run, unsigned docs on a signed version, and signed docs on an unsigned one. The registry protocol's [Documentation provenance](https://github.com/carina-rs/registry/blob/main/docs/protocol.md#documentation-provenance) section has the details.
+Attach the archive to the same GitHub release as the `.wasm`. A `github.com/...` source ignores it; the registry fetches it from that URL when the version is published. Registry versions can be signed keylessly by the release workflow run that built them. When a version is signed, the same job of the same workflow run attempt must also sign the archive's digest, in the same way as the `.wasm`. The registry refuses docs signed by another run, unsigned docs on a signed version, and signed docs on an unsigned one. The registry protocol's [Documentation provenance](/reference/registry/protocol/#documentation-provenance) section has the details.
 
 If you release with [provider-release](/providers/writing/publishing/#the-release-pipeline), its build workflow packs and checks the bundle with a `scripts/docs-bundle.py` copied from carina-provider-aws instead of this script. That script expects carina-provider-aws's own source layout (generated pages as `<service>/<name>.md` with a front-matter title, and an index built from a hand-written `docs/registry/index.md` plus generated page lists), so adapt it as the provider-release README describes. It allows files up to 1 MiB where the registry allows 256 KiB, and like this script it does not check the rendering limits, so keep each page under 256 KiB and within the nesting and rendering limits yourself.
 
-There is no standalone checker for these rules yet; the registry runs them at publish. Making the registry's own validator available to providers is tracked in [carina-rs/registry#139](https://github.com/carina-rs/registry/issues/139).
+There is no standalone checker for these rules yet; the registry runs them at publish.
 
 ## Next steps
 

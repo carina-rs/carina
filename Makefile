@@ -26,6 +26,12 @@ plan-image-anonymous:
 	$(PLAN_FIXTURE) plan_image_anonymous
 plan-replace-create-only:
 	$(PLAN_FIXTURE) replace_create_only
+plan-anonymous-create-only-rekey:
+	$(PLAN_FIXTURE) anonymous_create_only_rekey
+plan-anonymous-old-identity-name-override:
+	$(PLAN_FIXTURE) anonymous_old_identity_name_override
+plan-anonymous-old-identity-update:
+	$(PLAN_FIXTURE) anonymous_old_identity_update
 plan-replace-with-non-forcing-diffs:
 	$(PLAN_FIXTURE) replace_with_non_forcing_diffs
 plan-delete:
@@ -110,6 +116,26 @@ plan-moved-prev-keys:
 	$(PLAN_FIXTURE) moved_prev_keys
 plan-moved-pure:
 	$(PLAN_FIXTURE) moved_pure
+plan-moved-let-to-for-bound:
+	$(PLAN_FIXTURE) moved_let_to_for_bound
+plan-moved-let-to-for-unbound:
+	$(PLAN_FIXTURE) moved_let_to_for_unbound
+plan-moved-let-to-for-map:
+	$(PLAN_FIXTURE) moved_let_to_for_map
+plan-moved-let-to-for-unbound-reference:
+	$(PLAN_FIXTURE) moved_let_to_for_unbound_reference
+plan-moved-let-to-for-read-loop:
+	$(PLAN_FIXTURE) moved_let_to_for_read_loop
+plan-moved-let-to-for-read-loop-module:
+	$(PLAN_FIXTURE) moved_let_to_for_read_loop_module
+plan-moved-hint-let-to-for:
+	$(PLAN_FIXTURE) moved_hint_let_to_for
+plan-moved-hint-read-loop:
+	$(PLAN_FIXTURE) moved_hint_read_loop
+plan-moved-hint-read-loop-module:
+	$(PLAN_FIXTURE) moved_hint_read_loop_module
+plan-moved-hint-ambiguous:
+	$(PLAN_FIXTURE) moved_hint_ambiguous
 plan-moved-claims-precede-heuristics:
 	$(PLAN_FIXTURE) moved_claims_precede_heuristics
 plan-map-diff-tui:
@@ -226,6 +252,36 @@ plan-fixtures:
 	@echo ""
 	@echo "=== moved_pure ==="
 	@$(MAKE) plan-moved-pure
+	@echo ""
+	@echo "=== moved_let_to_for_bound ==="
+	@$(MAKE) plan-moved-let-to-for-bound
+	@echo ""
+	@echo "=== moved_let_to_for_unbound ==="
+	@$(MAKE) plan-moved-let-to-for-unbound
+	@echo ""
+	@echo "=== moved_let_to_for_map ==="
+	@$(MAKE) plan-moved-let-to-for-map
+	@echo ""
+	@echo "=== moved_let_to_for_unbound_reference ==="
+	@$(MAKE) plan-moved-let-to-for-unbound-reference
+	@echo ""
+	@echo "=== moved_let_to_for_read_loop ==="
+	@$(MAKE) plan-moved-let-to-for-read-loop
+	@echo ""
+	@echo "=== moved_let_to_for_read_loop_module ==="
+	@$(MAKE) plan-moved-let-to-for-read-loop-module
+	@echo ""
+	@echo "=== moved_hint_let_to_for ==="
+	@$(MAKE) plan-moved-hint-let-to-for
+	@echo ""
+	@echo "=== moved_hint_read_loop ==="
+	@$(MAKE) plan-moved-hint-read-loop
+	@echo ""
+	@echo "=== moved_hint_read_loop_module ==="
+	@$(MAKE) plan-moved-hint-read-loop-module
+	@echo ""
+	@echo "=== moved_hint_ambiguous ==="
+	@$(MAKE) plan-moved-hint-ambiguous
 	@echo ""
 	@echo "=== moved_claims_precede_heuristics ==="
 	@$(MAKE) plan-moved-claims-precede-heuristics
@@ -349,13 +405,21 @@ plan-multi-instance-create:
 plan-multi-instance-module:
 	$(PLAN_FIXTURE) multi_instance_module
 .PHONY: plan-image plan-all-create plan-no-changes plan-empty-explicit-children-no-changes plan-no-changes-enum plan-dynamic-enum-az-no-diff plan-route53-hosted-zone-name-strip-suffix-no-diff plan-mixed plan-image-module-cascade plan-image-reference-layout plan-image-anonymous plan-delete plan-deposed-delete plan-deposed-delete-update-dependency plan-delete-list-of-maps plan-compact plan-import-deferred-interpolation \
-        plan-map-diff plan-replace-create-only plan-replace-with-non-forcing-diffs \
+        plan-map-diff plan-replace-create-only plan-anonymous-create-only-rekey \
+        plan-anonymous-old-identity-name-override plan-anonymous-old-identity-update \
+        plan-replace-with-non-forcing-diffs \
         plan-list-diff-added-struct plan-list-diff-removed-struct \
         plan-list-diff-modified-with-unchanged \
         plan-list-diff-modified-with-unchanged-nested \
         plan-enum-display plan-string-dot-suffix plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags plan-default-tags-update-replace plan-postfix-access \
         plan-state-blocks plan-removed-missing-identifier plan-secret-values plan-nested-write-only plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
+        plan-moved-let-to-for-bound plan-moved-let-to-for-unbound \
+        plan-moved-let-to-for-map plan-moved-let-to-for-unbound-reference \
+        plan-moved-let-to-for-read-loop \
+        plan-moved-let-to-for-read-loop-module \
+        plan-moved-hint-let-to-for plan-moved-hint-read-loop plan-moved-hint-read-loop-module \
+        plan-moved-hint-ambiguous \
         plan-moved-claims-precede-heuristics \
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \
         plan-upstream-state-map-subscript plan-upstream-state-map-dot-notation \

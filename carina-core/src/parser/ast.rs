@@ -3109,7 +3109,7 @@ fn substitute_placeholder_with_policy(
             UnknownReason::UpstreamExport { .. }
             | UnknownReason::UpstreamAllExports { .. }
             | UnknownReason::EmptyInterpolation
-            | UnknownReason::PostCreateReadIncomplete { .. } => {}
+            | UnknownReason::PendingReRead(_) => {}
             // Function placeholders are substituted by user-function evaluation, not for expansion.
             UnknownReason::FnParam { .. }
             | UnknownReason::FnLocal { .. }
@@ -3248,7 +3248,7 @@ fn substitute_placeholder_lazily(
             UnknownReason::UpstreamExport { .. }
             | UnknownReason::UpstreamAllExports { .. }
             | UnknownReason::EmptyInterpolation
-            | UnknownReason::PostCreateReadIncomplete { .. }
+            | UnknownReason::PendingReRead(_)
             | UnknownReason::FnParam { .. }
             | UnknownReason::FnLocal { .. }
             | UnknownReason::ModuleArgument { .. } => {}

@@ -61,6 +61,29 @@ impl Scenario {
         )
         .expect("write state");
     }
+
+    fn rename_mock_resource_identity(&self, resource_type: &str, from: &str, to: &str) {
+        let mut state: Value =
+            serde_json::from_slice(&fs::read(&self.mock_state).expect("read mock provider state"))
+                .expect("parse mock provider state");
+        let states = state["states"]
+            .as_object_mut()
+            .expect("mock provider states object");
+        let from = format!("{resource_type}.{from}");
+        let to = format!("{resource_type}.{to}");
+        let resource = states
+            .remove(&from)
+            .unwrap_or_else(|| panic!("missing mock provider resource {from:?}"));
+        assert!(
+            states.insert(to.clone(), resource).is_none(),
+            "mock provider resource {to:?} already exists"
+        );
+        fs::write(
+            &self.mock_state,
+            serde_json::to_vec_pretty(&state).expect("encode mock provider state"),
+        )
+        .expect("write mock provider state");
+    }
 }
 
 fn assert_success(label: &str, output: &Output) {
@@ -549,6 +572,7 @@ mock.example.consumer {
         .expect("current anonymous identity includes the provider prefix")
         .to_string();
     state["resources"][0]["identity"] = Value::String(stored_identity.clone());
+    scenario.rename_mock_resource_identity("example.consumer", &old_identity, &stored_identity);
     state["resources"][0]["attributes"]["plain"] = Value::String(legacy_marker(
         &Value::String("ANONYMOUS_LEGACY_RECONCILE_PLAIN".to_string()),
         "mock.example.consumer",

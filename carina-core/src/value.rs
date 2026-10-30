@@ -235,8 +235,22 @@ impl std::fmt::Display for UnknownReason {
             UnknownReason::ModuleArgument { name, .. } => write!(f, "module argument {name}"),
             UnknownReason::FnLocal { name } => write!(f, "function local {name}"),
             UnknownReason::EmptyInterpolation => write!(f, "empty interpolation"),
-            UnknownReason::PostCreateReadIncomplete { detail } => {
-                write!(f, "post-create read failed: {detail}")
+            UnknownReason::PendingReRead(pending) => pending.fmt(f),
+        }
+    }
+}
+
+impl std::fmt::Display for crate::resource::PendingReRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason() {
+            crate::resource::ReReadReason::Incomplete { detail } => {
+                write!(f, "read after apply was incomplete: {detail}")
+            }
+            crate::resource::ReReadReason::ReadFailed { detail } => {
+                write!(f, "read after apply failed: {detail}")
+            }
+            crate::resource::ReReadReason::NotFound => {
+                f.write_str("resource was not found during read after apply")
             }
         }
     }
@@ -260,9 +274,18 @@ pub fn render_unknown(reason: &UnknownReason) -> String {
         }
         UnknownReason::FnLocal { name } => format!("(unresolved function local: {name})"),
         UnknownReason::EmptyInterpolation => "(empty interpolation)".to_string(),
-        UnknownReason::PostCreateReadIncomplete { detail } => {
-            format!("(known after next apply: post-create read failed — {detail})")
-        }
+        UnknownReason::PendingReRead(pending) => match pending.reason() {
+            crate::resource::ReReadReason::Incomplete { detail } => {
+                format!("(unknown until next refresh: read after apply was incomplete — {detail})")
+            }
+            crate::resource::ReReadReason::ReadFailed { detail } => {
+                format!("(unknown until next refresh: read after apply failed — {detail})")
+            }
+            crate::resource::ReReadReason::NotFound => {
+                "(unknown until next refresh: resource was not found during read after apply)"
+                    .to_string()
+            }
+        },
     }
 }
 
@@ -6621,14 +6644,32 @@ mod tests {
     }
 
     #[test]
-    fn render_unknown_post_create_read_incomplete() {
-        let r = UnknownReason::PostCreateReadIncomplete {
-            detail: "AccessDenied".to_string(),
-        };
-        assert_eq!(
-            render_unknown(&r),
-            "(known after next apply: post-create read failed — AccessDenied)"
-        );
+    fn render_unknown_pending_reread_reasons() {
+        use crate::resource::{PendingReRead, ReReadReason};
+
+        let cases = [
+            (
+                ReReadReason::Incomplete {
+                    detail: "response omitted attributes".to_string(),
+                },
+                "(unknown until next refresh: read after apply was incomplete — response omitted attributes)",
+            ),
+            (
+                ReReadReason::ReadFailed {
+                    detail: "AccessDenied".to_string(),
+                },
+                "(unknown until next refresh: read after apply failed — AccessDenied)",
+            ),
+            (
+                ReReadReason::NotFound,
+                "(unknown until next refresh: resource was not found during read after apply)",
+            ),
+        ];
+
+        for (reason, expected) in cases {
+            let unknown = UnknownReason::PendingReRead(PendingReRead::new(reason));
+            assert_eq!(render_unknown(&unknown), expected);
+        }
     }
 
     /// `UnknownReason::Display` flows into the user-facing error from
@@ -6655,14 +6696,15 @@ mod tests {
             format!("{}", UnknownReason::ForValue),
             "deferred for-binding value"
         );
+        use crate::resource::{PendingReRead, ReReadReason};
         assert_eq!(
             format!(
                 "{}",
-                UnknownReason::PostCreateReadIncomplete {
-                    detail: "AccessDenied".to_string()
-                }
+                UnknownReason::PendingReRead(PendingReRead::new(ReReadReason::ReadFailed {
+                    detail: "AccessDenied".to_string(),
+                }))
             ),
-            "post-create read failed: AccessDenied"
+            "read after apply failed: AccessDenied"
         );
     }
 
@@ -8865,22 +8907,20 @@ mod tests {
     }
 
     #[test]
-    fn post_create_read_incomplete_unknown_returns_err_in_value_to_json() {
-        let v = Value::Deferred(DeferredValue::Unknown(
-            UnknownReason::PostCreateReadIncomplete {
-                detail: "mock partial create".to_string(),
-            },
-        ));
+    fn pending_reread_unknown_returns_err_in_value_to_json() {
+        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(
+            crate::resource::PendingReRead::incomplete("mock partial create"),
+        )));
         let err = value_to_json(&v).unwrap_err();
         assert!(
             matches!(
                 err,
                 SerializationError::UnknownNotAllowed {
-                    reason: UnknownReason::PostCreateReadIncomplete { .. },
+                    reason: UnknownReason::PendingReRead(_),
                     context: SerializationContext::ValueToJson,
                 }
             ),
-            "expected UnknownNotAllowed/PostCreateReadIncomplete/ValueToJson, got: {err:?}"
+            "expected UnknownNotAllowed/PendingReRead/ValueToJson, got: {err:?}"
         );
     }
 

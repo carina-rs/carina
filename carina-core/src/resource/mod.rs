@@ -3937,13 +3937,62 @@ impl Value {
     }
 }
 
+/// A post-apply read that must be retried during the next refresh.
+///
+/// This value is stored once in [`PartialReadMarker`] and cloned unchanged
+/// into every materialized unknown. Keeping the reason typed prevents state
+/// persistence and display wording from classifying the same read differently.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingReRead {
+    reason: ReReadReason,
+}
+
+impl PendingReRead {
+    pub fn new(reason: ReReadReason) -> Self {
+        Self { reason }
+    }
+
+    pub fn incomplete(detail: impl Into<String>) -> Self {
+        Self::new(ReReadReason::Incomplete {
+            detail: detail.into(),
+        })
+    }
+
+    pub fn read_failed(detail: impl Into<String>) -> Self {
+        Self::new(ReReadReason::ReadFailed {
+            detail: detail.into(),
+        })
+    }
+
+    pub fn not_found() -> Self {
+        Self::new(ReReadReason::NotFound)
+    }
+
+    pub fn reason(&self) -> &ReReadReason {
+        &self.reason
+    }
+}
+
+/// Why a post-apply read needs another refresh.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReReadReason {
+    /// The provider returned only part of the resource state.
+    Incomplete { detail: String },
+    /// The provider read itself returned an error.
+    ReadFailed { detail: String },
+    /// The provider read reported that the newly applied resource was absent.
+    NotFound,
+}
+
 /// Why a `Value::Unknown` is unknown. Each variant carries only the
 /// information its own consumer needs — no shared "context" field invites
 /// drift across reasons. See RFC #2371.
 /// These reasons span parser-stage placeholders (`FnParam`, `FnLocal`,
 /// `ModuleArgument`, `EmptyInterpolation`, and the `ForKey`, `ForIndex`, and
 /// `ForValue` loop placeholders) and markers that survive into plan/apply
-/// (`UpstreamExport`, `UpstreamAllExports`, and `PostCreateReadIncomplete`);
+/// (`UpstreamExport`, `UpstreamAllExports`, and `PendingReRead`);
 /// #4094 tracks splitting them by stage.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UnknownReason {
@@ -4003,8 +4052,8 @@ pub enum UnknownReason {
     /// diagnostic at the `${}` span and for downstream resolvers to
     /// stay tolerant. See #2480.
     EmptyInterpolation,
-    /// A create completed, but the provider could not read all attributes.
-    PostCreateReadIncomplete { detail: String },
+    /// An apply completed, but its follow-up read did not resolve the value.
+    PendingReRead(PendingReRead),
 }
 
 /// A part of a string interpolation expression
@@ -4816,7 +4865,7 @@ impl Value {
                     | UnknownReason::ModuleArgument { name, .. } => {
                         name.hash(hasher);
                     }
-                    UnknownReason::PostCreateReadIncomplete { detail } => detail.hash(hasher),
+                    UnknownReason::PendingReRead(pending) => pending.hash(hasher),
                     // `For{Key,Index,Value}` and `EmptyInterpolation`
                     // carry no payload; the discriminant alone already
                     // distinguishes them.
@@ -7259,11 +7308,50 @@ pub(crate) fn assert_value_fully_resolved(
     }
 }
 
-/// Marker for a state produced by a partial-success create.
+/// Marker for state whose post-apply read left attributes unresolved.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "PartialReadMarkerWire")]
 pub struct PartialReadMarker {
-    pub detail: String,
-    pub missing_attributes: BTreeSet<String>,
+    pending: PendingReRead,
+    missing_attributes: BTreeSet<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialReadMarkerWire {
+    pending: PendingReRead,
+    missing_attributes: BTreeSet<String>,
+}
+
+impl TryFrom<PartialReadMarkerWire> for PartialReadMarker {
+    type Error = &'static str;
+
+    fn try_from(wire: PartialReadMarkerWire) -> Result<Self, Self::Error> {
+        Self::new(wire.pending, wire.missing_attributes)
+            .ok_or("partial-read marker must contain at least one missing attribute")
+    }
+}
+
+impl PartialReadMarker {
+    /// Build a marker only when at least one attribute is still unresolved.
+    pub fn new(pending: PendingReRead, missing_attributes: BTreeSet<String>) -> Option<Self> {
+        (!missing_attributes.is_empty()).then_some(Self {
+            pending,
+            missing_attributes,
+        })
+    }
+
+    pub fn pending(&self) -> &PendingReRead {
+        &self.pending
+    }
+
+    pub fn missing_attributes(&self) -> &BTreeSet<String> {
+        &self.missing_attributes
+    }
+
+    pub fn into_parts(self) -> (PendingReRead, BTreeSet<String>) {
+        (self.pending, self.missing_attributes)
+    }
 }
 
 /// A loaded managed resource that is known to exist and has a validated
@@ -7484,6 +7572,18 @@ impl Current {
         }
     }
 
+    pub(crate) fn restore_move_source(&mut self, authority: &MoveAuthority<'_>) {
+        let from = authority.from();
+        match self {
+            Self::Absent(state) => state.0.id = from.clone(),
+            Self::Present(present) => present.state.id = from.clone(),
+            Self::CreateInFlight(pending) => {
+                *pending = pending.clone().rebind_for_move(authority.source_address());
+            }
+            Self::MissingIdentifier(state) => state.0.id = from.clone(),
+        }
+    }
+
     pub fn set_dependency_bindings(&mut self, dependency_bindings: BTreeSet<String>) {
         match self {
             Self::Absent(state) => state.0.dependency_bindings = dependency_bindings,
@@ -7655,13 +7755,11 @@ impl State {
         let Some(marker) = &self.partial_read else {
             return;
         };
-        for attr in &marker.missing_attributes {
+        for attr in marker.missing_attributes() {
             self.attributes.entry(attr.clone()).or_insert_with(|| {
-                Value::Deferred(DeferredValue::Unknown(
-                    UnknownReason::PostCreateReadIncomplete {
-                        detail: marker.detail.clone(),
-                    },
-                ))
+                Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(
+                    marker.pending().clone(),
+                )))
             });
         }
     }

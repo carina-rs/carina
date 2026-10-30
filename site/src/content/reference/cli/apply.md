@@ -55,6 +55,10 @@ carina apply plan.json
 
 When applying a saved plan, Carina checks the state lineage and serial number against the current state to detect drift since the plan was created.
 
+A saved plan also records the providers it was computed with: for each provider, the SHA-256 of its WebAssembly component with its locked source and version (or `file` for a `file://` source), and a fingerprint of the schema of every resource type the plan touches. `carina apply <plan>` loads the providers named in the plan and compares both before it reads any resource or runs any effect. If a provider was re-installed or rebuilt since the plan was made (for example after `carina init --upgrade`, with a different lock file, or after rebuilding a `file://` component), or a resource type's schema changed, apply stops with `Provider artifact mismatch` or `Provider schema mismatch` and shows the `carina plan --out` command to re-run.
+
+Saved plans are tied to the plan-file format of the Carina version that wrote them. A plan written by another version is rejected with `Unsupported plan file version`; create it again with `carina plan --out`.
+
 When a saved plan contains secret placeholders, Carina also re-reads and
 evaluates the configuration from the source directory recorded in the plan.
 New saved secret hashes are PHC strings that embed their random salt and
@@ -95,19 +99,24 @@ When `--auto-approve` is not set, Carina follows this flow:
 3. If no changes are needed, prints "No changes needed." and exits
 4. Prompts: "Do you want to perform these actions?"
 5. Waits for the user to type `yes` to confirm (any other input cancels)
-6. Executes the effects concurrently (up to `--parallelism` at a time, default 8) with progress spinners, saving state to the backend as effects complete
+6. Executes the effects concurrently (up to `--parallelism` at a time, default 8) with progress output (see [Progress output](#progress-output)), saving state to the backend as effects complete
 7. Saves the final state to the backend
 8. Prints a summary of results
 
 When `carina apply` creates a plan directly from a configuration directory, data sources are always read. Likewise, `carina plan --refresh=false` skips only managed-resource refresh before writing a saved plan; it still reads every data source.
 
+## Progress Output
+
+When stderr is a terminal, Carina shows a spinner for each running effect. Otherwise (for example in CI), it prints plain lines without colors or cursor movement. In plain mode, an effect that is still running after 30 seconds without printing anything gets a line such as `… Still running: Create aws.acm.Certificate cert [1m 30s elapsed]`, repeated every 30 seconds, so a long create does not look stalled. An effect that reports its own wait progress gets this line only after 60 seconds of silence. The same applies to `carina destroy` and `carina state refresh`.
+
 ## Error Handling
 
 - If an effect fails, Carina refreshes the resource state from the provider to capture any partial changes
+- If a create fails after the provider reported the new resource's identifier, the identifier is still recorded in state. When Carina could read the resource back, the note says `resource created; recorded in state, the next apply completes it`. When it could not, the note says the provider reported the identifier but the resource could not be observed, with the reason; the next `carina plan` checks it again
 - State is written incrementally while effects run, so results of completed effects survive even if the process is killed before the final save
 - The state file is always saved after execution, even if some effects failed, to prevent state drift
-- Failed and skipped effects are reported in the summary (e.g., "3 succeeded, 1 failed, 1 skipped")
-- Exit code `1` indicates an error occurred
+- Failed, partial, skipped and interrupted effects are reported in the summary (e.g., "3 succeeded, 1 failed, 1 skipped, 1 outcome unknown"). An effect that was still running when apply stopped is shown as `? <effect> - interrupted (outcome unknown)`; run `carina plan` to see what it left behind
+- Exit codes: `0` on success; `1` on an error or when any effect failed, was skipped or was interrupted; `2` when the only problem is creates that completed partially; `130` when cancelled with Ctrl+C
 
 ### State Locking Errors
 

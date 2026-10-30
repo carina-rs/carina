@@ -14,6 +14,8 @@ use carina_core::parser::File;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, Value};
 use carina_core::schema::{BlockNameConflict, SchemaRegistry};
 
+use super::ProjectedStateRead;
+
 /// Evaluated and pre-value-resolution resources whose provider-schema block
 /// aliases have been folded into canonical attribute names together.
 ///
@@ -59,6 +61,11 @@ use carina_core::schema::{BlockNameConflict, SchemaRegistry};
 pub struct CanonicalResourcePair<E> {
     parsed: File<E>,
     unresolved: Vec<Resource>,
+    /// Generated prefix values captured before persisted state can replace
+    /// them with a pending re-read unknown. A post-refresh reconciliation
+    /// restores these fallbacks first, then overlays only the refreshed
+    /// current value or refreshed marker.
+    prefix_fallbacks: Vec<HashMap<String, Value>>,
 }
 
 /// Selects how a deferred-for expression owned by a
@@ -84,7 +91,11 @@ pub enum CanonicalResourceIdentityError {
 
 impl<E> CanonicalResourcePair<E> {
     fn new(parsed: File<E>, unresolved: Vec<Resource>) -> Self {
-        Self { parsed, unresolved }
+        Self {
+            parsed,
+            unresolved,
+            prefix_fallbacks: Vec::new(),
+        }
     }
 
     pub(super) fn from_resolved_file(
@@ -163,6 +174,45 @@ impl<E> CanonicalResourcePair<E> {
         &mut self,
         find_state: &dyn Fn(&str, &str, &str) -> Option<carina_core::identifier::PrefixStateInfo>,
     ) {
+        let resource_count = self.parsed.resources.len(); // allow: direct — plan-time reconciliation
+        if self.prefix_fallbacks.len() != resource_count {
+            self.prefix_fallbacks = self
+                .parsed
+                .resources
+                .iter()
+                .map(|resource| {
+                    resource
+                        .prefixes
+                        .keys()
+                        .filter_map(|attribute| {
+                            resource
+                                .attributes
+                                .get(attribute)
+                                .cloned()
+                                .map(|value| (attribute.clone(), value))
+                        })
+                        .collect()
+                })
+                .collect();
+        }
+        carina_core::identifier::reconcile_prefixed_names(&mut self.parsed.resources, find_state);
+    }
+
+    /// Rebuild prefix-owned desired values from the post-hydration current
+    /// snapshot. Restoring the generated fallback before overlaying current
+    /// or persisted state guarantees that clearing a marker cannot retain an
+    /// unknown that came from the earlier identity pass, while an omitted
+    /// readback still reuses the stored generated name.
+    pub fn reconcile_refreshed_prefixed_names(
+        &mut self,
+        find_state: &dyn Fn(&str, &str, &str) -> Option<carina_core::identifier::PrefixStateInfo>,
+    ) {
+        let resources = &mut self.parsed.resources; // allow: direct — plan-time reconciliation
+        for (resource, fallbacks) in resources.iter_mut().zip(&self.prefix_fallbacks) {
+            for (attribute, value) in fallbacks {
+                resource.set_attr(attribute.clone(), value.clone());
+            }
+        }
         carina_core::identifier::reconcile_prefixed_names(&mut self.parsed.resources, find_state);
     }
 
@@ -179,33 +229,6 @@ impl<E> CanonicalResourcePair<E> {
             find_state_names_by_type,
             claims,
         );
-    }
-
-    /// Reconcile anonymous resource identities against state without
-    /// releasing the canonical evaluated resource set.
-    pub fn reconcile_anonymous_identifiers(
-        &mut self,
-        registry: &carina_core::schema::SchemaRegistry,
-        find_state_by_type: &dyn Fn(
-            &str,
-            &str,
-        ) -> carina_core::identifier::ScreenedStateEntries<
-            carina_core::identifier::AnonymousIdStateInfo,
-        >,
-        find_state_by_binding: &dyn Fn(
-            &str,
-        )
-            -> Vec<carina_core::identifier::AnonymousIdBindingStateInfo>,
-        claims: &carina_core::identifier::StateBlockClaims,
-    ) -> Vec<(String, String)> {
-        carina_core::identifier::reconcile_anonymous_identifiers(
-            &mut self.parsed.resources,
-            &self.parsed.data_sources,
-            registry,
-            find_state_by_type,
-            find_state_by_binding,
-            claims,
-        )
     }
 
     /// Partition and materialize this pair's own deferred-for templates as one
@@ -290,16 +313,12 @@ pub enum OverrideAwareBuildMode<'a> {
 /// ```compile_fail,E0308
 /// # use std::collections::HashMap;
 /// # use carina_core::binding_index::LivePreApplyInputs;
-/// # use carina_core::name_override::NameOverride;
 /// # use carina_cli::wiring::{OverrideAwareBuildMode, OverrideAwareResources};
-/// # use carina_core::resource::{Resource, ResourceId};
+/// # use carina_core::resource::Resource;
 /// # fn bypass(raw: Vec<Resource>, inputs: LivePreApplyInputs<'_>) {
-/// let _ = OverrideAwareResources::build_pair_with_stability::<
-///     (),
-///     HashMap<ResourceId, HashMap<String, NameOverride>>,
-/// >(
+/// let _ = OverrideAwareResources::build_pair_with_stability(
 ///     &raw,
-///     None,
+///     todo!(),
 ///     inputs,
 ///     &HashMap::new(),
 ///     OverrideAwareBuildMode::Apply,
@@ -332,33 +351,38 @@ pub struct RebuildBindingsInputs<'a> {
 impl OverrideAwareResources {
     /// Build evaluated and authored views from the opaque pair returned by the
     /// schema block-name resolver.
-    pub fn build_pair_with_stability<E, S>(
+    pub(crate) fn build_pair_with_stability<E>(
         resources: &CanonicalResourcePair<E>,
-        state_file: Option<&S>,
+        state: &ProjectedStateRead<'_>,
         inputs: LivePreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
         mode: OverrideAwareBuildMode<'_>,
-    ) -> Result<(Self, Self), String>
-    where
-        S: NameOverrideSource + ?Sized,
-    {
+    ) -> Result<(Self, Self), String> {
         let (evaluated, unresolved) = resources.resources_for_build()?;
-        let evaluated = Self::build_inner(evaluated, state_file, &inputs, managed_stability, mode)?;
-        let unresolved =
-            Self::build_inner(unresolved, state_file, &inputs, managed_stability, mode)?;
+        let evaluated = Self::build_inner(evaluated, state, &inputs, managed_stability, mode)?;
+        let unresolved = Self::build_inner(unresolved, state, &inputs, managed_stability, mode)?;
         Ok((evaluated, unresolved))
     }
 
-    fn build_inner<S>(
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn build_pair_without_state_for_test<E>(
+        resources: &CanonicalResourcePair<E>,
+        inputs: LivePreApplyInputs<'_>,
+        managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
+        mode: OverrideAwareBuildMode<'_>,
+    ) -> Result<(Self, Self), String> {
+        let state = ProjectedStateRead::for_test_unmoved(None);
+        Self::build_pair_with_stability(resources, &state, inputs, managed_stability, mode)
+    }
+
+    fn build_inner(
         unresolved: Vec<Resource>,
-        state_file: Option<&S>,
+        state: &ProjectedStateRead<'_>,
         inputs: &LivePreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
         mode: OverrideAwareBuildMode<'_>,
-    ) -> Result<Self, String>
-    where
-        S: NameOverrideSource + ?Sized,
-    {
+    ) -> Result<Self, String> {
         let mut resources = unresolved.clone();
         let mut bindings = ResolvedBindings::pre_apply_live_with_stability(
             LivePreApplyInputs {
@@ -378,31 +402,29 @@ impl OverrideAwareResources {
         let mut legacy_overrides_applied = Vec::new();
         let mut skipped_overrides = Vec::new();
 
-        if let Some(state_file) = state_file {
-            for ((resource, snapshot_resource), unresolved_resource) in resources
-                .iter_mut()
-                .zip(snapshot.iter())
-                .zip(unresolved_resources.iter_mut())
-            {
-                let Some(name_overrides) = state_file.name_overrides_for(&resource.id) else {
-                    continue;
-                };
-                for (attribute, override_) in name_overrides {
-                    let snapshot_value = snapshot_resource
-                        .attributes
-                        .get(attribute)
-                        .and_then(concrete_string);
-                    match should_apply_override(snapshot_value, override_) {
-                        ApplyDecision::Apply | ApplyDecision::ApplyWithUnknownDsl => {
-                            apply_override(resource, unresolved_resource, attribute, override_);
-                        }
-                        ApplyDecision::ApplyLegacy => {
-                            apply_override(resource, unresolved_resource, attribute, override_);
-                            push_unique(&mut legacy_overrides_applied, resource.id.clone());
-                        }
-                        ApplyDecision::Skip => {
-                            push_unique(&mut skipped_overrides, resource.id.clone());
-                        }
+        for ((resource, snapshot_resource), unresolved_resource) in resources
+            .iter_mut()
+            .zip(snapshot.iter())
+            .zip(unresolved_resources.iter_mut())
+        {
+            let Some(name_overrides) = state.name_overrides_for(&resource.id) else {
+                continue;
+            };
+            for (attribute, override_) in name_overrides {
+                let snapshot_value = snapshot_resource
+                    .attributes
+                    .get(attribute)
+                    .and_then(concrete_string);
+                match should_apply_override(snapshot_value, override_) {
+                    ApplyDecision::Apply | ApplyDecision::ApplyWithUnknownDsl => {
+                        apply_override(resource, unresolved_resource, attribute, override_);
+                    }
+                    ApplyDecision::ApplyLegacy => {
+                        apply_override(resource, unresolved_resource, attribute, override_);
+                        push_unique(&mut legacy_overrides_applied, resource.id.clone());
+                    }
+                    ApplyDecision::Skip => {
+                        push_unique(&mut skipped_overrides, resource.id.clone());
                     }
                 }
             }
@@ -724,9 +746,10 @@ mod tests {
         let mut parsed = carina_core::parser::ParsedFile::default();
         parsed.resources = resources.clone();
         let canonical = CanonicalResourcePair::new(parsed, resources);
+        let state = ProjectedStateRead::for_test_name_overrides(overrides);
         OverrideAwareResources::build_pair_with_stability(
             &canonical,
-            Some(overrides),
+            &state,
             LivePreApplyInputs {
                 managed: &[],
                 compositions: &compositions,

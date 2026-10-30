@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
 use carina_core::provider::ProviderError;
-use carina_core::resource::ResourceId;
+use carina_core::resource::{ResolvedResourceId, ResourceId};
 use carina_state::BackendError;
 
 /// State encoding failure annotated with the resource row being written.
@@ -560,6 +560,26 @@ pub enum AppError {
     /// Persisted current state did not agree with the validated move source.
     #[error(transparent)]
     CurrentMoveRouting(#[from] carina_core::differ::CurrentMoveRoutingMismatch),
+
+    /// A state-row move could not find its source in the addressed
+    /// current/orphan bundle.
+    #[error("cannot apply resource move {from} -> {to}: source state is not loaded")]
+    MoveSourceNotLoaded {
+        from: Box<ResolvedResourceId>,
+        to: Box<ResolvedResourceId>,
+    },
+
+    /// A detected state-row move overlaps an already-applied move in a shape
+    /// that cannot be represented as one forward chain.
+    #[error(
+        "cannot apply detected resource move {from} -> {to}: it conflicts with existing move {existing_from} -> {existing_to}"
+    )]
+    DetectedMoveConflict {
+        from: Box<ResolvedResourceId>,
+        to: Box<ResolvedResourceId>,
+        existing_from: Box<ResolvedResourceId>,
+        existing_to: Box<ResolvedResourceId>,
+    },
 
     /// Routed ids did not agree with the operator-authored `moved` block.
     #[error(transparent)]

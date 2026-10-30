@@ -4,7 +4,7 @@ expression: output
 ---
 Execution Plan:
 
-  ~ awscc.ec2.Vpc ec2_vpc_fb75c929
+  ~ awscc.ec2.Vpc awscc_ec2_vpc_0bc2a2bb
       tags:
         ~ Environment: 'staging' → 'production'
         - OldTag: 'remove-me'

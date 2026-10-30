@@ -1,5 +1,5 @@
 use super::*;
-use carina_core::resource::DeferredValue;
+use carina_core::resource::{DeferredValue, PendingReRead, ReReadReason};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -156,6 +156,215 @@ fn v17_migrates_nested_write_only_records_to_empty() {
     assert_eq!(
         encoded["resources"][1]["current"]["nested_write_only"],
         serde_json::json!({})
+    );
+}
+
+#[test]
+fn v18_migrates_partial_read_detail_to_incomplete_reread_reason() {
+    let json = serde_json::json!({
+        "version": 18,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "v18-partial-read-lineage",
+        "carina_version": "legacy",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "example",
+            "provider": "mock",
+            "current": {
+                "kind": "applied",
+                "identifier": "cloud-id",
+                "attributes": { "name": "example" },
+                "nested_write_only": {},
+                "partial_read": {
+                    "detail": "legacy partial read",
+                    "missing_attributes": ["computed"]
+                }
+            }
+        }],
+        "exports": {}
+    });
+
+    let migrated = check_and_migrate(&json.to_string()).expect("v18 state must migrate");
+    assert_eq!(
+        migrated.migration(),
+        Some(MigrationInfo { from: 18, to: 19 })
+    );
+    let state = migrated.into_state();
+    let marker = state.resources()[0]
+        .partial_read()
+        .expect("legacy marker survives migration");
+    assert_eq!(
+        marker.pending(),
+        &PendingReRead::new(ReReadReason::Incomplete {
+            detail: "legacy partial read".to_string(),
+        })
+    );
+    assert_eq!(
+        marker.missing_attributes(),
+        &BTreeSet::from(["computed".to_string()])
+    );
+
+    let encoded = serde_json::to_value(&state).expect("migrated state serializes");
+    assert_eq!(
+        encoded["resources"][0]["current"]["partial_read"]["pending"]["reason"],
+        serde_json::json!({
+            "kind": "incomplete",
+            "detail": "legacy partial read"
+        })
+    );
+}
+
+#[test]
+fn v19_state_rejects_partial_read_marker_with_empty_missing_attributes() {
+    let json = serde_json::json!({
+        "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "v19-empty-partial-read-lineage",
+        "carina_version": "test",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "example",
+            "provider": "mock",
+            "current": {
+                "kind": "applied",
+                "identifier": "cloud-id",
+                "attributes": { "name": "example" },
+                "nested_write_only": {},
+                "partial_read": {
+                    "pending": {
+                        "reason": {
+                            "kind": "incomplete",
+                            "detail": "provider omitted every computed attribute"
+                        }
+                    },
+                    "missing_attributes": []
+                }
+            }
+        }],
+        "exports": {}
+    });
+
+    let message = invalid_state_message(check_and_migrate(&json.to_string()));
+
+    assert!(
+        message.contains("partial-read marker must contain at least one missing attribute"),
+        "unexpected state-load error: {message}",
+    );
+}
+
+#[test]
+fn v18_empty_partial_read_marker_migrates_to_no_marker() {
+    let json = serde_json::json!({
+        "version": 18,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "v18-empty-partial-read-lineage",
+        "carina_version": "legacy",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "example",
+            "provider": "mock",
+            "current": {
+                "kind": "applied",
+                "identifier": "cloud-id",
+                "attributes": { "name": "example" },
+                "nested_write_only": {},
+                "partial_read": {
+                    "detail": "legacy empty partial read",
+                    "missing_attributes": []
+                }
+            }
+        }],
+        "exports": {}
+    });
+
+    let migrated = check_and_migrate(&json.to_string())
+        .expect("a v18 empty partial-read marker must be dropped during migration");
+    assert_eq!(
+        migrated.migration(),
+        Some(MigrationInfo { from: 18, to: 19 })
+    );
+    let state = migrated.into_state();
+    assert!(
+        state.resources()[0].partial_read().is_none(),
+        "an empty legacy marker must not survive migration"
+    );
+
+    let encoded = serde_json::to_value(state).expect("migrated state serializes");
+    assert!(
+        encoded["resources"][0]["current"]
+            .get("partial_read")
+            .is_none(),
+        "the dropped marker must not be serialized"
+    );
+}
+
+#[test]
+fn restore_partial_read_markers_shrinks_and_clears_resolved_attributes() {
+    let shrinking_id =
+        ResourceId::with_provider_identity("mock", "test.Resource", "shrinking", None);
+    let clearing_id = ResourceId::with_provider_identity("mock", "test.Resource", "clearing", None);
+    let pending = PendingReRead::read_failed("temporary provider read failure");
+
+    let mut shrinking_row =
+        ResourceState::try_applied("test.Resource", "shrinking", "mock", "shrinking-id")
+            .expect("fixture identifier is non-empty");
+    shrinking_row.set_partial_read_for_test(PartialReadMarker::new(
+        pending.clone(),
+        BTreeSet::from(["resolved".to_string(), "still_missing".to_string()]),
+    ));
+    let mut clearing_row =
+        ResourceState::try_applied("test.Resource", "clearing", "mock", "clearing-id")
+            .expect("fixture identifier is non-empty");
+    clearing_row.set_partial_read_for_test(PartialReadMarker::new(
+        PendingReRead::not_found(),
+        BTreeSet::from(["resolved".to_string()]),
+    ));
+
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(shrinking_row)
+        .expect("shrinking fixture row is unique");
+    state_file
+        .upsert_resource(clearing_row)
+        .expect("clearing fixture row is unique");
+
+    let resolved_value = Value::Concrete(ConcreteValue::String("now-known".into()));
+    let mut refreshed = HashMap::from([
+        (
+            shrinking_id.clone(),
+            State::existing(
+                shrinking_id.clone(),
+                HashMap::from([("resolved".to_string(), resolved_value.clone())]),
+            )
+            .with_identifier("shrinking-id"),
+        ),
+        (
+            clearing_id.clone(),
+            State::existing(
+                clearing_id.clone(),
+                HashMap::from([("resolved".to_string(), resolved_value)]),
+            )
+            .with_identifier("clearing-id"),
+        ),
+    ]);
+
+    state_file.restore_partial_read_markers_in(refreshed.iter_mut());
+
+    let marker = refreshed[&shrinking_id]
+        .partial_read
+        .as_ref()
+        .expect("an unresolved attribute keeps the marker");
+    assert_eq!(marker.pending(), &pending);
+    assert_eq!(
+        marker.missing_attributes(),
+        &BTreeSet::from(["still_missing".to_string()])
+    );
+    assert!(
+        refreshed[&clearing_id].partial_read.is_none(),
+        "resolving every missing attribute must clear the marker"
     );
 }
 
@@ -458,7 +667,7 @@ fn whole_value(paths: &[&[&str]]) -> ExplicitFields {
 fn test_state_file_new() {
     let state = StateFile::new();
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
-    assert_eq!(StateFile::CURRENT_VERSION, 18);
+    assert_eq!(StateFile::CURRENT_VERSION, 19);
     assert_eq!(state.serial, 0);
     assert!(!state.lineage.is_empty());
     assert!(state.resources.is_empty());
@@ -468,7 +677,7 @@ fn test_state_file_new() {
 fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
     use carina_core::resource::{Resource, State as ProviderState};
 
-    assert_eq!(StateFile::CURRENT_VERSION, 18);
+    assert_eq!(StateFile::CURRENT_VERSION, 19);
     let marker = valid_legacy_marker_shaped_string("state-marker-collision");
     let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
@@ -602,51 +811,6 @@ fn upsert_resource_returns_error_for_duplicate_deposed_key() {
         matches!(error, BackendError::InvalidState(message) if message.contains("duplicate deposed generation key"))
     );
     assert!(state.resources().is_empty());
-}
-
-#[test]
-fn rename_resource_identities_returns_error_for_duplicate_destination() {
-    let mut state = StateFile::new();
-    state
-        .upsert_resource(ResourceState::new("ec2.Vpc", "old", "aws"))
-        .expect("fresh state accepts the old identity");
-    state
-        .upsert_resource(ResourceState::new("ec2.Vpc", "existing", "aws"))
-        .expect("fresh state accepts the destination identity");
-
-    let error = state
-        .rename_resource_identities(&[("old".to_string(), "existing".to_string())])
-        .expect_err("rename must reject a duplicate destination identity");
-
-    assert!(
-        matches!(error, BackendError::InvalidState(message) if message.contains("duplicate resource identity"))
-    );
-    assert!(state.find_resource("aws", "ec2.Vpc", "old").is_some());
-    assert!(state.find_resource("aws", "ec2.Vpc", "existing").is_some());
-}
-
-#[test]
-fn rename_resource_identities_preserves_invalid_identity_detail_once() {
-    let mut state = StateFile::new();
-    state
-        .upsert_resource(ResourceState::new("ec2.Vpc", "old", "aws"))
-        .expect("fresh state accepts the old identity");
-
-    let error = state
-        .rename_resource_identities(&[("old".to_string(), String::new())])
-        .expect_err("rename must reject an empty destination identity");
-
-    assert!(matches!(error, BackendError::InvalidStateIdentity { .. }));
-    let rendered = error.to_string();
-    assert_eq!(
-        rendered
-            .matches("resource identity cannot be empty")
-            .count(),
-        1,
-        "{rendered}"
-    );
-    assert!(std::error::Error::source(&error).is_none());
-    assert!(state.find_resource("aws", "ec2.Vpc", "old").is_some());
 }
 
 #[test]
@@ -888,10 +1052,10 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
     resource.binding = Some("vpc".to_string());
     resource.dependency_bindings.insert("internet".to_string());
     resource.set_write_only_attributes_for_test(vec!["token".to_string()]);
-    resource.set_partial_read_for_test(Some(PartialReadMarker {
-        detail: "partial".to_string(),
-        missing_attributes: BTreeSet::from(["token".to_string()]),
-    }));
+    resource.set_partial_read_for_test(PartialReadMarker::new(
+        PendingReRead::incomplete("partial"),
+        BTreeSet::from(["token".to_string()]),
+    ));
     resource.deposed.push(DeposedInstance {
         key: DeposedKey::new_unique(),
         identifier: "vpc-old".to_string(),
@@ -4500,7 +4664,7 @@ fn v8_state_migrates_to_current_with_empty_deposed() {
 fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
     use super::check_and_migrate;
 
-    assert_eq!(StateFile::CURRENT_VERSION, 18);
+    assert_eq!(StateFile::CURRENT_VERSION, 19);
     let json = format!(
         r#"{{
         "version": 11,
@@ -6418,10 +6582,11 @@ fn unobserved_not_found_create_records_identifier_and_partial_read() {
     );
     assert_eq!(
         row.partial_read(),
-        Some(&PartialReadMarker {
-            detail: "provider read after create returned not found".to_string(),
-            missing_attributes: BTreeSet::from(["log_group_name".to_string()]),
-        })
+        PartialReadMarker::new(
+            PendingReRead::new(ReReadReason::NotFound),
+            BTreeSet::from(["log_group_name".to_string()]),
+        )
+        .as_ref()
     );
 }
 
@@ -6462,8 +6627,10 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
         Some("application-logs")
     );
     assert_eq!(
-        row.partial_read().map(|partial| partial.detail.as_str()),
-        Some(read_error_display.as_str())
+        row.partial_read().map(PartialReadMarker::pending),
+        Some(&PendingReRead::new(ReReadReason::ReadFailed {
+            detail: read_error_display,
+        }))
     );
 }
 
@@ -7959,10 +8126,10 @@ fn partial_read_marker_round_trips_through_state_json() {
     let mut state = StateFile::new();
     let mut rs = ResourceState::try_applied("test.resource", "r1", "mock", "mock-id")
         .expect("fixture identifier is non-empty");
-    rs.set_partial_read_for_test(Some(PartialReadMarker {
-        detail: "mock partial create".to_string(),
-        missing_attributes: ["a".to_string(), "b".to_string()].into_iter().collect(),
-    }));
+    rs.set_partial_read_for_test(PartialReadMarker::new(
+        PendingReRead::incomplete("mock partial create"),
+        ["a".to_string(), "b".to_string()].into_iter().collect(),
+    ));
     state
         .upsert_resource(rs)
         .expect("test state setup must be valid");

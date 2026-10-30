@@ -30,7 +30,7 @@ Display the plan in an interactive TUI (terminal user interface) mode. Allows na
 
 ### `--out <FILE>`
 
-Save the plan to a JSON file for later use with `carina apply`. The saved plan includes the effects, resource definitions, provider configurations, and state metadata for drift detection.
+Save the plan to a JSON file for later use with `carina apply`. The saved plan includes the effects, resource definitions, provider configurations, state metadata for drift detection, and the identity (SHA-256, source and version) and schema fingerprints of the providers it was computed with. Re-run `carina plan --out` after re-installing or upgrading a provider: `carina apply` rejects a saved plan whose providers no longer match (see [Applying a Saved Plan](/reference/cli/apply/#applying-a-saved-plan)).
 
 Saved plans never contain secret plaintext. Carina stores each secret as a
 typed placeholder containing only an Argon2id hash, including secrets nested
@@ -219,6 +219,10 @@ carina plan --check-iam --strict-iam
 ## State Locking
 
 `plan` does not acquire the state lock, so it never blocks or is blocked by other runs. Because a concurrent `apply` or `destroy` can change state while the plan is computed, `plan` re-reads state just before display. If the state's serial or lineage changed (or the state was removed), it prints a warning to stderr that the plan may be stale and still shows the plan. `--out` still writes the plan file; applying a stale saved plan is caught by the lineage/serial check in `carina apply`.
+
+When a destroy and create have matching configured create-only values, `plan`
+also warns on stderr about a possible state move; see
+[Moving resources in state](/guides/state-management/#moving-resources-in-state).
 
 ## Examples
 

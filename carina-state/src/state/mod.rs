@@ -21,8 +21,8 @@ pub use carina_core::resource::DeposedKey;
 #[cfg(test)]
 use carina_core::resource::Resource;
 use carina_core::resource::{
-    ConcreteValue, Current, DataSource, Directives, PartialReadMarker, ResolvedResource,
-    ResourceId, ResourceIdentity, State, Value,
+    ConcreteValue, Current, DataSource, Directives, PartialReadMarker, PendingReRead,
+    ResolvedResource, ResourceId, ResourceIdentity, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys};
 use carina_core::value::{
@@ -775,7 +775,10 @@ impl StateFile {
     ///      [`Self::EXPORTS_VERSION_INTRODUCED`].
     /// v18: Added per-instance nested write-only leaf provenance. The v17
     ///      migration initializes the record to empty.
-    pub const CURRENT_VERSION: u32 = 18;
+    /// v19: Replaced the partial-read marker's untyped detail with a typed
+    ///      pending re-read reason. The v18 migration classifies legacy
+    ///      details as incomplete reads.
+    pub const CURRENT_VERSION: u32 = 19;
 
     /// State file version that introduced the independent exports version.
     /// This value is fixed forever.
@@ -1018,37 +1021,6 @@ impl StateFile {
         self.upsert_resource(row)
     }
 
-    /// Rekey resource identities while preserving the state-wide uniqueness
-    /// invariant.
-    pub fn rename_resource_identities(
-        &mut self,
-        renames: &[(String, String)],
-    ) -> Result<(), BackendError> {
-        self.validate_unique_identities()
-            .map_err(BackendError::InvalidState)?;
-        let by_old: HashMap<&str, &str> = renames
-            .iter()
-            .map(|(old, new)| (old.as_str(), new.as_str()))
-            .collect();
-        let mut renamed = self.resources.clone();
-        for resource in &mut renamed {
-            if let Some(new_identity) = by_old.get(resource.identity.as_str()) {
-                resource.identity = ResourceIdentity::try_from((*new_identity).to_owned())
-                    .map_err(|error| BackendError::InvalidStateIdentity {
-                        context: format!(
-                            "cannot rename resource identity {:?} to {:?}",
-                            resource.identity.as_str(),
-                            new_identity
-                        ),
-                        error,
-                    })?;
-            }
-        }
-        validate_resource_identities(&renamed).map_err(BackendError::InvalidState)?;
-        self.resources = renamed;
-        Ok(())
-    }
-
     /// Remove one deposed generation after that exact generation's Delete
     /// succeeded. If the row was an exact deposed-only shell and this removes
     /// its last generation, the now-empty shell is dropped. A malformed
@@ -1131,7 +1103,14 @@ impl StateFile {
 
     /// Restore partial-read markers from the state file onto refreshed states.
     pub fn restore_partial_read_markers(&self, states: &mut StateTransformMap) {
-        for (id, current) in states.iter_mut() {
+        self.restore_partial_read_markers_in(states.iter_mut());
+    }
+
+    fn restore_partial_read_markers_in<'a>(
+        &self,
+        states: impl Iterator<Item = (&'a ResourceId, &'a mut State)>,
+    ) {
+        for (id, current) in states {
             if !current.exists {
                 current.partial_read = None;
                 continue;
@@ -1141,15 +1120,10 @@ impl StateFile {
                 .and_then(|identity| self.find_resource(&id.provider, &id.resource_type, identity))
                 .and_then(ResourceState::partial_read)
                 .cloned();
-            if let Some(mut marker) = marker {
-                marker
-                    .missing_attributes
-                    .retain(|attr| !current.attributes.contains_key(attr));
-                if marker.missing_attributes.is_empty() {
-                    current.partial_read = None;
-                } else {
-                    current.partial_read = Some(marker);
-                }
+            if let Some(marker) = marker {
+                let (pending, mut missing_attributes) = marker.into_parts();
+                missing_attributes.retain(|attr| !current.attributes.contains_key(attr));
+                current.partial_read = PartialReadMarker::new(pending, missing_attributes);
             }
         }
     }
@@ -1831,9 +1805,17 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             } else {
                 None
             };
-            let migrated_content = migrated_v17
+            let pre_partial_read_migration = migrated_v17
                 .as_deref()
                 .unwrap_or(pre_nested_write_only_migration);
+            let migrated_v18 = if v <= 18 {
+                Some(migrate_v18_partial_read_reason(pre_partial_read_migration)?)
+            } else {
+                None
+            };
+            let migrated_content = migrated_v18
+                .as_deref()
+                .unwrap_or(pre_partial_read_migration);
             let mut state = StateFile::from_json_str(migrated_content)
                 .map_err(|error| map_state_file_decode_error(error, Some(v)))?;
             // v5 → v6: lift the flat `desired_keys: Vec<String>` field
@@ -2990,11 +2972,17 @@ impl ResourceState {
         let writeback_resource = applied_desired.as_ref().unwrap_or(resource);
         let previous = existing.and_then(ResourceState::persisted_attributes);
         let no_observed_values = HashMap::new();
-        let (observed_values, incomplete_detail) = match created.observation() {
+        let (observed_values, pending_reread) = match created.observation() {
             CreateObservation::Observed(state) => (state.attributes(), None),
-            CreateObservation::Unobserved(reason) => {
-                (&no_observed_values, Some(reason.to_string()))
+            CreateObservation::Unobserved(carina_core::provider::UnobservedReason::NotFound) => {
+                (&no_observed_values, Some(PendingReRead::not_found()))
             }
+            CreateObservation::Unobserved(carina_core::provider::UnobservedReason::ReadFailed(
+                error,
+            )) => (
+                &no_observed_values,
+                Some(PendingReRead::read_failed(error.to_string())),
+            ),
         };
         let mut selected = SelectedStateAttributes::try_from_provider_values(
             observed_values,
@@ -3033,7 +3021,7 @@ impl ResourceState {
             preferred_hashes,
         )?;
         let (attributes, write_only_attributes) = selected.finish()?;
-        let partial_read = incomplete_detail.and_then(|detail| {
+        let partial_read = pending_reread.and_then(|pending| {
             let missing_attributes = writeback_resource
                 .attributes
                 .keys()
@@ -3045,10 +3033,7 @@ impl ResourceState {
                 .filter(|key| !attributes.contains_key(key))
                 .cloned()
                 .collect::<BTreeSet<_>>();
-            (!missing_attributes.is_empty()).then_some(PartialReadMarker {
-                detail,
-                missing_attributes,
-            })
+            PartialReadMarker::new(pending, missing_attributes)
         });
         let stored_attributes = attributes.to_values();
         let mut nested_write_only = NestedWriteOnlyRecord::default();
@@ -3398,7 +3383,7 @@ struct ResourceStateV14CurrentDto {
     #[serde(default)]
     write_only_attributes: Vec<String>,
     #[serde(default)]
-    partial_read: Option<PartialReadMarker>,
+    partial_read: Option<serde_json::Value>,
 }
 
 fn migrate_v14_current_instance(content: &str) -> Result<String, BackendError> {
@@ -3510,6 +3495,77 @@ fn migrate_v17_nested_write_only(content: &str) -> Result<String, BackendError> 
         .or_insert_with(|| serde_json::json!(PublishedExports::CURRENT_VERSION));
     serde_json::to_string(&root).map_err(|error| {
         BackendError::InvalidState(format!("Failed to migrate state file from v17: {error}"))
+    })
+}
+
+/// v18 → v19: wrap the legacy marker detail in the typed incomplete-read
+/// reason used by current state and runtime unknowns.
+fn migrate_v18_partial_read_reason(content: &str) -> Result<String, BackendError> {
+    let mut root: serde_json::Value = serde_json::from_str(content).map_err(|error| {
+        BackendError::InvalidState(format!("Failed to migrate state file from v18: {error}"))
+    })?;
+    let resources = root
+        .get_mut("resources")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| {
+            BackendError::InvalidState(
+                "Failed to migrate state file from v18: resources must be an array".to_string(),
+            )
+        })?;
+    for resource in resources {
+        let Some(current) = resource
+            .get_mut("current")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        let empty_partial_read = current
+            .get("partial_read")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|marker| marker.get("missing_attributes"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty);
+        if empty_partial_read {
+            current.remove("partial_read");
+            continue;
+        }
+        let Some(partial_read) = current.get_mut("partial_read") else {
+            continue;
+        };
+        if partial_read.is_null() {
+            continue;
+        }
+        let marker = partial_read.as_object_mut().ok_or_else(|| {
+            BackendError::InvalidState(
+                "Failed to migrate state file from v18: partial_read must be an object".to_string(),
+            )
+        })?;
+        let detail = marker
+            .remove("detail")
+            .and_then(|detail| detail.as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                BackendError::InvalidState(
+                    "Failed to migrate state file from v18: partial_read.detail must be a string"
+                        .to_string(),
+                )
+            })?;
+        marker.insert(
+            "pending".to_string(),
+            serde_json::json!({
+                "reason": {
+                    "kind": "incomplete",
+                    "detail": detail,
+                }
+            }),
+        );
+    }
+    root["version"] = serde_json::json!(StateFile::CURRENT_VERSION);
+    root.as_object_mut()
+        .expect("a state file root validated as an object")
+        .entry("exports_version".to_string())
+        .or_insert_with(|| serde_json::json!(PublishedExports::CURRENT_VERSION));
+    serde_json::to_string(&root).map_err(|error| {
+        BackendError::InvalidState(format!("Failed to migrate state file from v18: {error}"))
     })
 }
 

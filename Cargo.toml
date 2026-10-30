@@ -13,6 +13,7 @@ members = [
     "carina-state",
     "carina-tui",
 ]
+exclude = ["vendor"]
 resolver = "2"
 
 [workspace.package]
@@ -20,6 +21,15 @@ version = "0.7.1"
 repository = "https://github.com/carina-rs/carina"
 homepage = "https://github.com/carina-rs/carina"
 publish = false
+
+# Keep these proc-macro crate hashes worktree-independent by avoiding a baked-in
+# absolute OUT_DIR. scripts/check-vendored-patches-used.sh fails CI if a patch
+# stops applying, for example after a Wasmtime or wit-bindgen version bump.
+[patch.crates-io]
+wasmtime-internal-component-macro = { path = "vendor/wasmtime-internal-component-macro-43.0.0" }
+wiggle-macro = { path = "vendor/wiggle-macro-43.0.0" }
+wit-bindgen-rust-macro = { path = "vendor/wit-bindgen-rust-macro-0.54.0" }
+wit-bindgen-rust-macro-051 = { package = "wit-bindgen-rust-macro", path = "vendor/wit-bindgen-rust-macro-0.51.0" }
 
 # The CI Test job's nextest test-run phase is link-heavy across the
 # workspace's many test binaries. Default `debug = 2` emits full DWARF;

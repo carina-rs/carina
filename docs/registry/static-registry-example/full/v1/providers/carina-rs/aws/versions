@@ -1,0 +1,8 @@
+{
+  "sequence": 1,
+  "generated_at": "2026-10-28T00:00:00Z",
+  "valid_until": "2026-11-04T00:00:00Z",
+  "versions": [
+    { "version": "0.7.3", "protocols": ["1"] }
+  ]
+}

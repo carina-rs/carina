@@ -5,7 +5,7 @@ description: "Publishing third-party providers to the Carina provider registry i
 
 Publishing to the provider registry (`registry.carina-rs.dev`) is not open to third-party providers yet. Only the official `carina-rs/aws` and `carina-rs/awscc` providers are published there.
 
-Opening it is tracked in [carina-rs/registry#16](https://github.com/carina-rs/registry/issues/16). This page will describe the process once that work is done.
+This page will describe the process once it opens. Until then you can run your own registry; see [Registries](/providers/writing/registries/).
 
 ## The release pipeline
 

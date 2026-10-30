@@ -552,21 +552,15 @@ pub(crate) enum LeafProvenance<'a> {
     DecidedByPlan { key_changed: bool },
 }
 
-fn contains_post_create_read_incomplete(value: &Value) -> bool {
+fn contains_pending_reread(value: &Value) -> bool {
     match value {
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::PostCreateReadIncomplete {
-            ..
-        })) => true,
-        Value::Concrete(ConcreteValue::List(items)) => {
-            items.iter().any(contains_post_create_read_incomplete)
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            map.values().any(contains_post_create_read_incomplete)
-        }
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(_))) => true,
+        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_pending_reread),
+        Value::Concrete(ConcreteValue::Map(map)) => map.values().any(contains_pending_reread),
         Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
             matches!(
                 part,
-                InterpolationPart::Expr(value) if contains_post_create_read_incomplete(value)
+                InterpolationPart::Expr(value) if contains_pending_reread(value)
             )
         }),
         Value::Deferred(
@@ -575,16 +569,11 @@ fn contains_post_create_read_incomplete(value: &Value) -> bool {
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => args
             .iter()
-            .any(|argument| contains_post_create_read_incomplete(argument.walker_value())),
-        Value::Deferred(DeferredValue::Access(access)) => {
-            contains_post_create_read_incomplete(access.base())
-        }
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            contains_post_create_read_incomplete(inner)
-        }
+            .any(|argument| contains_pending_reread(argument.walker_value())),
+        Value::Deferred(DeferredValue::Access(access)) => contains_pending_reread(access.base()),
+        Value::Deferred(DeferredValue::Secret(inner)) => contains_pending_reread(inner),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            contains_post_create_read_incomplete(value)
-                || contains_post_create_read_incomplete(default)
+            contains_pending_reread(value) || contains_pending_reread(default)
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -607,13 +596,13 @@ fn contains_post_create_read_incomplete(value: &Value) -> bool {
 
 /// Return whether a single attribute's values differ semantically.
 pub(crate) fn should_patch_attr(cmp: AttrComparison<'_>) -> bool {
-    // A post-create read failure can leave a generated desired value unknown.
+    // A post-apply read failure can leave a generated desired value unknown.
     // There is no concrete target value to send, so it cannot form a patch
     // (and, in particular, cannot force replacement for a create-only name).
     // Keep an unknown on the current side comparable in the normal way: once
     // the desired value is concrete, the existing partial-read contract is to
     // surface an Update that retries the missing attribute.
-    if contains_post_create_read_incomplete(cmp.to) {
+    if contains_pending_reread(cmp.to) {
         return false;
     }
     let Some(from_value) = cmp.from else {
@@ -664,7 +653,7 @@ fn nested_write_only_should_enter_patch(
     leaf_provenance: LeafProvenance<'_>,
     cmp: AttrComparison<'_>,
 ) -> bool {
-    if contains_post_create_read_incomplete(cmp.to) {
+    if contains_pending_reread(cmp.to) {
         return false;
     }
     let attr_type = &schema.attributes[key].attr_type;

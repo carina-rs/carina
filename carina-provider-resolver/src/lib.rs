@@ -18,8 +18,8 @@ pub use github_location::{ArtifactId, AssetId, CommitSha, ReleaseTag};
 pub use install_lock::{GuardedLockFile, ProviderInstallLock};
 pub use provider_resolver::*;
 pub use provider_trust::{
-    ProviderLoadIdentity, ProviderLoadIdentityError, ProviderTrust, ProviderTrustClass,
-    UnverifiedOfficialProviderError, UnverifiedOfficialProviderReason,
+    ProviderLoadIdentity, ProviderLoadIdentityError, ProviderLoadSource, ProviderTrust,
+    ProviderTrustClass, UnverifiedOfficialProviderError, UnverifiedOfficialProviderReason,
 };
 pub use trusted_local::{GrantParseError, TrustedLocalGrants};
 pub use user_trust::UserTrustRecord;

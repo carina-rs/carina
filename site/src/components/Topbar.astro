@@ -19,13 +19,17 @@
 
 <style>
   .topbar {
-    height: 64px;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    box-sizing: border-box;
+    height: var(--topbar-height);
     background: var(--topbar-bg);
   }
 
   .topbar-inner {
     height: 100%;
-    max-width: 1280px;
+    max-width: 96rem;
     margin: 0 auto;
     padding: 0 var(--space-6);
     display: flex;

@@ -1,0 +1,13 @@
+---
+import Doc from '../../../layouts/Doc.astro';
+import { Content, getHeadings, frontmatter } from '../../../content/reference/registry/protocol.md';
+
+const headings = getHeadings();
+---
+<Doc
+  title={frontmatter.title ?? 'Registry Protocol'}
+  description={frontmatter.description}
+  headings={headings}
+>
+  <Content />
+</Doc>

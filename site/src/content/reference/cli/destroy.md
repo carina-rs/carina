@@ -34,6 +34,10 @@ Destroy even resources that have `prevent_destroy = true` in their `directives` 
 
 Maximum number of provider operations run concurrently. Defaults to `8`.
 
+## Progress and Errors
+
+Every provider must load before destroy starts. Progress is shown the same way as for `carina apply`: spinners on a terminal, and plain lines with a periodic `… Still running` line otherwise (see [Progress output](/reference/cli/apply/#progress-output)).
+
 ## Backend Drift
 
 Before destroying resources, Carina checks the current project backend

@@ -1,0 +1,43 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "test-anonymous-old-identity-name-override",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "test.Widget",
+      "identity": "test_widget_11111111",
+      "provider": "test",
+      "identifier": "widget-live",
+      "attributes": {
+        "external_name": "stable-replacement",
+        "legacy_token": "shared"
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false
+      },
+      "prefixes": {},
+      "name_overrides": {
+        "external_name": {
+          "temp_value": "stable-replacement",
+          "original_value": "stable"
+        }
+      },
+      "binding": null,
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": {
+            "kind": "leaf"
+          },
+          "legacy_token": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}
