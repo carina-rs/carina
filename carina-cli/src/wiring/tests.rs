@@ -159,7 +159,16 @@ impl ProviderFactory for RawEnumStateFactory {
         );
         vec![
             ResourceSchema::new("thing")
-                .attribute(AttributeSchema::required("mode", mode).build())
+                .attribute(
+                    AttributeSchema::required("mode", mode)
+                        .create_only()
+                        .build(),
+                )
+                .attribute(
+                    AttributeSchema::optional("priority", AttributeType::int())
+                        .create_only()
+                        .build(),
+                )
                 .validate()
                 .expect("raw enum test schema is valid"),
         ]
@@ -318,6 +327,99 @@ let item = test.thing {
             prior.state().attributes.get("mode"),
         );
     }
+}
+
+#[tokio::test]
+async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() {
+    use carina_core::config_loader::load_configuration_with_config;
+
+    const ANONYMOUS_NAME: &str = "test_thing_22222222";
+
+    let project = tempfile::tempdir().expect("create temporary project");
+    std::fs::write(project.path().join("providers.crn"), "provider test {}\n")
+        .expect("write provider fixture");
+    std::fs::write(
+        project.path().join("main.crn"),
+        "backend local { path = \"carina.state.json\" }\n",
+    )
+    .expect("write backend fixture");
+    std::fs::write(
+        project.path().join("resource.crn"),
+        r#"let typed = test.thing {
+  mode = test.thing.Mode.allow
+  priority = 7
+}
+"#,
+    )
+    .expect("write typed resource fixture");
+
+    let loaded = load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load multi-file fixture");
+    let parsed = loaded.parsed;
+    let provider_configs = resolved_provider_configs(&parsed);
+    let wiring = ValidatedWiring::from_factories_for_test(
+        vec![Box::new(RawEnumStateFactory)],
+        provider_configs.as_provider_configs(),
+    );
+    let canonical_resources = canonical_pair(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        wiring.context().schemas(),
+    );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+
+    let mut row = carina_state::state::ResourceState::try_applied(
+        "thing",
+        ANONYMOUS_NAME,
+        "test",
+        "provider-id",
+    )
+    .expect("typed state identifier is non-empty")
+    .with_attribute("mode", serde_json::json!("Allow"))
+    .with_attribute("priority", serde_json::json!(7));
+    row.binding = None;
+    let mut persisted = StateFile::new();
+    persisted
+        .upsert_resource(row)
+        .expect("typed anonymous state row is unique");
+    let state_path = project.path().join("carina.state.json");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
+    )
+    .expect("write real state fixture");
+    let state_file = Some(
+        carina_state::state::check_and_migrate(
+            &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+        )
+        .expect("decode real state fixture")
+        .into_state(),
+    );
+
+    let planned = create_plan_from_parsed_with_upstream_with_ctx(
+        validated,
+        &provider_configs,
+        &state_file,
+        false,
+        ProgressSink::Human,
+        &HashMap::new(),
+        &StateBlockClaims::default(),
+        &ResolvedStateBlockTargets::default(),
+    )
+    .await
+    .expect("build enum/int rename plan");
+    let effects = planned.resources().plan.effects();
+
+    assert_eq!(effects.len(), 1, "expected a pure move plan: {effects:#?}");
+    let Effect::Move { from, to } = &effects[0] else {
+        panic!("expected enum/int anonymous rename to be a move: {effects:#?}")
+    };
+    assert_eq!(from.identity_str(), ANONYMOUS_NAME);
+    assert_eq!(to.identity_str(), "typed");
 }
 
 #[test]
@@ -5042,6 +5144,11 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
                             .create_only()
                             .build(),
                     ),
+                ResourceSchema::new("ec2.Route").attribute(
+                    AttributeSchema::optional("route_table_id", AttributeType::string())
+                        .create_only()
+                        .build(),
+                ),
             ]
         };
         schema_drafts
@@ -5084,6 +5191,16 @@ fn association_state(
     state
 }
 
+fn route_state(name: &str, route_table_id: &str) -> carina_state::state::ResourceState {
+    let mut state =
+        carina_state::state::ResourceState::new("ec2.Route", test_identity(name), "awscc");
+    state.set_persisted_attribute(
+        "route_table_id".to_string(),
+        serde_json::Value::String(route_table_id.to_string()),
+    );
+    state
+}
+
 fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -> Resource {
     use carina_core::resource::AccessPath;
 
@@ -5104,6 +5221,113 @@ fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -
         Value::Concrete(ConcreteValue::String(subnet_id.to_string().into())),
     );
     resource
+}
+
+fn desired_route(name: &str, route_table_binding: &str) -> Resource {
+    use carina_core::resource::AccessPath;
+
+    Resource::with_provider("awscc", "ec2.Route", test_identity(name), None).with_attribute(
+        "route_table_id",
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new(route_table_binding, "id"),
+        }),
+    )
+}
+
+#[test]
+fn projected_moved_binding_resolves_for_anonymous_to_named_detection() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let old_binding = "old_rtb";
+    let projected_binding = "private_rtb";
+    let anonymous_name = "awscc_ec2_route_11111111";
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(route_table_state(old_binding, "rtb-private"))
+        .expect("insert moved route-table state");
+    state_file
+        .upsert_resource(route_state(anonymous_name, "rtb-private"))
+        .expect("insert anonymous route state");
+
+    let source = ResolvedResourceId::with_provider_identity(
+        "awscc",
+        "ec2.RouteTable",
+        test_identity(old_binding),
+        None,
+    );
+    let target = ResolvedResourceId::with_provider_identity(
+        "awscc",
+        "ec2.RouteTable",
+        test_identity(projected_binding),
+        None,
+    );
+    let claims = StateBlockClaims::new(
+        [StateBlockAddress::new(
+            "awscc",
+            "ec2.RouteTable",
+            old_binding,
+        )]
+        .into_iter()
+        .collect(),
+        [StateBlockAddress::new(
+            "awscc",
+            "ec2.RouteTable",
+            projected_binding,
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let mut desired = desired_route("nat", projected_binding);
+    desired.binding = Some("nat".to_string());
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[(source, target)]);
+
+    let moves =
+        detect_anonymous_to_named_moves_with_ctx(&ctx, &[desired], &[], &state_view, &claims)
+            .expect("empty provider configuration is valid");
+
+    assert_eq!(
+        detected_move_identity_pairs(&moves),
+        vec![(anonymous_name.to_string(), "nat".to_string())],
+        "a moved dependency row must resolve under its projected binding",
+    );
+}
+
+#[test]
+fn claimed_dependency_binding_is_hidden_from_anonymous_reconciliation() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let binding = "old_rtb";
+    let anonymous_name = "awscc_ec2_route_11111111";
+    let desired_name = "awscc_ec2_route_aaaaaaaa";
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(route_table_state(binding, "rtb-private"))
+        .expect("insert claimed route-table state");
+    state_file
+        .upsert_resource(route_state(anonymous_name, "rtb-private"))
+        .expect("insert anonymous route state");
+    let claims = StateBlockClaims::new(
+        [StateBlockAddress::new("awscc", "ec2.RouteTable", binding)]
+            .into_iter()
+            .collect(),
+        HashSet::new(),
+    );
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+
+    let moves = reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        &[desired_route(desired_name, binding)],
+        &[],
+        &state_view,
+        &claims,
+    );
+
+    assert!(
+        moves.is_empty(),
+        "a claimed-from dependency row must not resolve under its persisted binding: {moves:#?}",
+    );
 }
 
 #[test]

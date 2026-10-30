@@ -5082,6 +5082,34 @@ fn canonicalize_desired_with_type_and_ancestry(
     Ok(canonical)
 }
 
+/// Canonicalize one authored desired attribute through its resource schema.
+///
+/// Identity and reconciliation seams use this before reducing a value to a
+/// comparison string, so parser-surface enum identifiers and already
+/// canonical enum values share the same API-value representation.
+pub(crate) fn canonicalize_desired_attribute_value_with_schema(
+    value: Value,
+    schema: &crate::schema::ResourceSchema,
+    attribute: &str,
+) -> Result<Value, crate::schema::TypeError> {
+    // Already-canonical enums may carry an equivalent historical provider
+    // namespace. Their API spelling is the comparison identity at this seam,
+    // so only parser-surface EnumIdentifier values need schema resolution.
+    if first_enum_identifier(&value).is_none() {
+        return Ok(value);
+    }
+    let Some(attribute_schema) = schema.attributes.get(attribute) else {
+        return Ok(value);
+    };
+    canonicalize_desired_with_type_and_ancestry(
+        value,
+        &attribute_schema.attr_type,
+        &schema.defs,
+        crate::schema::FieldAncestry::from_input_mode(attribute_schema.input_mode()),
+        DesiredValueSource::AuthoredDsl,
+    )
+}
+
 /// Canonicalize provider or persisted state. Unrecognized enum-positioned
 /// strings legitimately remain strings for validation and comparison.
 #[cfg(test)]

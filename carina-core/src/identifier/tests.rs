@@ -10,6 +10,14 @@ use crate::schema::{
 };
 use indexmap::IndexMap;
 
+impl FromIterator<(String, String)> for CreateOnlyValues {
+    fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
+        let attributes = iter.into_iter().collect::<HashMap<_, _>>();
+        let create_only_attributes = attributes.keys().cloned().collect::<Vec<_>>();
+        Self::from_canonical_state_attributes(&create_only_attributes, &attributes)
+    }
+}
+
 fn live_module_source(name: &str, instance: &str) -> ModuleSource {
     ModuleSource::expanded_module(
         name,
@@ -1065,7 +1073,7 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
         provider_instance: None,
         name: state_name.clone(),
         create_only_values: vec![
-            ("domain".to_string(), "EnumApiValue(\"vpc\")".to_string()),
+            ("domain".to_string(), "vpc".to_string()),
             ("public_ipv4_pool".to_string(), "pool-a".to_string()),
         ]
         .into_iter()
@@ -1182,10 +1190,7 @@ fn test_reconcile_anonymous_id_after_nested_enum_create_only_hash_migration() {
         provider_instance: None,
         name: state_name.clone(),
         create_only_values: vec![
-            (
-                "domains".to_string(),
-                r#"List([EnumApiValue("vpc")])"#.to_string(),
-            ),
+            ("domains".to_string(), "List([vpc])".to_string()),
             ("public_ipv4_pool".to_string(), "pool-a".to_string()),
         ]
         .into_iter()
@@ -1302,10 +1307,7 @@ fn test_reconcile_anonymous_id_after_nested_enum_no_edit_upgrade_full_match() {
         provider_instance: None,
         name: state_name.clone(),
         create_only_values: vec![
-            (
-                "domains".to_string(),
-                r#"List([EnumApiValue("vpc")])"#.to_string(),
-            ),
+            ("domains".to_string(), "List([vpc])".to_string()),
             ("public_ipv4_pool".to_string(), "pool-a".to_string()),
         ]
         .into_iter()
@@ -1380,11 +1382,8 @@ fn test_reconcile_anonymous_id_nested_enum_full_match_ambiguous_skips() {
         .to_string();
     let resources = vec![resource];
 
-    let create_only_values: HashMap<String, String> = vec![
-        (
-            "domains".to_string(),
-            r#"List([EnumApiValue("vpc")])"#.to_string(),
-        ),
+    let create_only_values: CreateOnlyValues = vec![
+        ("domains".to_string(), "List([vpc])".to_string()),
         ("public_ipv4_pool".to_string(), "pool-a".to_string()),
     ]
     .into_iter()
@@ -2572,6 +2571,17 @@ fn subnet_route_table_association_schema() -> ResourceSchema {
         )
 }
 
+fn subnet_route_table_association_registry() -> SchemaRegistry {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        subnet_route_table_association_schema()
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    schemas
+}
+
 fn subnet_route_table_association_resource(
     name: &'static str,
     route_table_binding: &str,
@@ -2611,6 +2621,17 @@ fn binding_state_entry(
                 .collect(),
         },
     )
+}
+
+fn binding_state_entries_for(
+    entries: &[(String, AnonymousIdBindingStateInfo)],
+    binding: &str,
+) -> Vec<AnonymousIdBindingStateInfo> {
+    entries
+        .iter()
+        .filter(|(entry_binding, _)| entry_binding == binding)
+        .map(|(_, entry)| entry.clone())
+        .collect()
 }
 
 fn association_state_entry(
@@ -2687,17 +2708,17 @@ fn test_reconcile_does_not_hamming_match_standard_hash_names() {
         AnonymousIdStateInfo {
             provider_instance: None,
             name: "awscc_ec2_subnet_route_table_association_aaaaaaab".to_string(),
-            create_only_values: HashMap::new(),
+            create_only_values: CreateOnlyValues::default(),
         },
         AnonymousIdStateInfo {
             provider_instance: None,
             name: "awscc_ec2_subnet_route_table_association_bbbbbbba".to_string(),
-            create_only_values: HashMap::new(),
+            create_only_values: CreateOnlyValues::default(),
         },
         AnonymousIdStateInfo {
             provider_instance: None,
             name: "awscc_ec2_subnet_route_table_association_cccccccd".to_string(),
-            create_only_values: HashMap::new(),
+            create_only_values: CreateOnlyValues::default(),
         },
     ];
 
@@ -2812,7 +2833,7 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
     let simhash_state = vec![AnonymousIdStateInfo {
         provider_instance: None,
         name: "awscc_ec2_eip_0000000000000003".to_string(),
-        create_only_values: HashMap::new(),
+        create_only_values: CreateOnlyValues::default(),
     }];
     let claims = StateBlockClaims::new(
         [StateBlockAddress::new(
@@ -3204,12 +3225,12 @@ fn test_reconcile_simhash_tie_refused() {
         AnonymousIdStateInfo {
             provider_instance: None,
             name: "awscc_ec2_eip_0000000000000001".to_string(),
-            create_only_values: HashMap::new(),
+            create_only_values: CreateOnlyValues::default(),
         },
         AnonymousIdStateInfo {
             provider_instance: None,
             name: "awscc_ec2_eip_0000000000000002".to_string(),
-            create_only_values: HashMap::new(),
+            create_only_values: CreateOnlyValues::default(),
         },
     ];
 
@@ -3403,7 +3424,7 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
     let state_entries = vec![AnonymousIdStateInfo {
         provider_instance: None,
         name: old_id.clone(),
-        create_only_values: HashMap::new(),
+        create_only_values: CreateOnlyValues::default(),
     }];
     let renames = reconcile_anonymous_identifiers(
         &resources2,
@@ -3460,7 +3481,7 @@ fn test_reconcile_anonymous_id_simhash_does_not_steal_live_entry() {
     let state_entries = vec![AnonymousIdStateInfo {
         provider_instance: None,
         name: live_name.clone(),
-        create_only_values: HashMap::new(),
+        create_only_values: CreateOnlyValues::default(),
     }];
     let renames = reconcile_anonymous_identifiers(
         &resources,
@@ -3538,7 +3559,7 @@ fn test_reconcile_anonymous_id_simhash_claims_state_entry_once() {
     let state_entries = vec![AnonymousIdStateInfo {
         provider_instance: None,
         name: old_name.clone(),
-        create_only_values: HashMap::new(),
+        create_only_values: CreateOnlyValues::default(),
     }];
     let renames = reconcile_anonymous_identifiers(
         &nearby_resources,
@@ -3585,7 +3606,7 @@ fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
     let state_entries = vec![AnonymousIdStateInfo {
         provider_instance: None,
         name: "ec2_eip_5544332266778899".to_string(),
-        create_only_values: HashMap::new(),
+        create_only_values: CreateOnlyValues::default(),
     }];
     reconcile_anonymous_identifiers(
         &resources,
@@ -3665,7 +3686,7 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
     let state_entries = vec![AnonymousIdStateInfo {
         provider_instance: None,
         name: state_id,
-        create_only_values: HashMap::new(),
+        create_only_values: CreateOnlyValues::default(),
     }];
     reconcile_anonymous_identifiers(
         &resources,
@@ -3904,12 +3925,12 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
         AnonymousIdStateInfo {
             provider_instance: None,
             name: orig_id.clone(),
-            create_only_values: HashMap::new(),
+            create_only_values: CreateOnlyValues::default(),
         },
         AnonymousIdStateInfo {
             provider_instance: None,
             name: distant_id.clone(),
-            create_only_values: HashMap::new(),
+            create_only_values: CreateOnlyValues::default(),
         },
     ];
 
@@ -4002,7 +4023,7 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
     let state_entries = vec![AnonymousIdStateInfo {
         provider_instance: None,
         name: id.clone(),
-        create_only_values: HashMap::new(),
+        create_only_values: CreateOnlyValues::default(),
     }];
     reconcile_anonymous_identifiers(
         &resources,
@@ -4675,7 +4696,7 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
     let state_entries = vec![AnonymousIdStateInfo {
         provider_instance: None,
         name: step1_id.clone(),
-        create_only_values: HashMap::new(), // No create-only values in state either
+        create_only_values: CreateOnlyValues::default(), // No create-only values in state either
     }];
     let renames = reconcile_anonymous_identifiers(
         &resources2,
@@ -4862,13 +4883,7 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
 
 #[test]
 fn test_detect_rename_resolves_deferred_create_only_attrs_from_state_bindings() {
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "awscc",
-        subnet_route_table_association_schema()
-            .validate()
-            .expect("schema fixture must be valid"),
-    );
+    let schemas = subnet_route_table_association_registry();
 
     let mut resource =
         subnet_route_table_association_resource("nat_gw", "private_rtb", "private_subnet");
@@ -4892,13 +4907,7 @@ fn test_detect_rename_resolves_deferred_create_only_attrs_from_state_bindings() 
         &resources,
         &schemas,
         &|_provider, _resource_type| state_entries.clone(),
-        &|binding| {
-            binding_entries
-                .iter()
-                .filter(|(entry_binding, _)| entry_binding == binding)
-                .map(|(_, entry)| entry.clone())
-                .collect()
-        },
+        &|binding| binding_state_entries_for(&binding_entries, binding),
         &[],
         &|_provider| Vec::new(),
     );
@@ -4935,10 +4944,12 @@ fn test_detect_rename_matches_map_create_only_attr() {
     let state_entries = vec![AnonymousIdStateInfo {
         provider_instance: None,
         name: "awscc_test_map_identity_11111111".to_string(),
-        create_only_values: HashMap::from([(
+        create_only_values: [(
             "settings".to_string(),
             canonical_create_only_value_string(&settings).expect("concrete map is canonical"),
-        )]),
+        )]
+        .into_iter()
+        .collect(),
     }];
 
     let renames = detect_anonymous_to_named_renames_for_test(
@@ -4985,7 +4996,7 @@ fn test_detect_rename_matches_enum_and_int_create_only_attrs() {
     let state_entries = vec![AnonymousIdStateInfo {
         provider_instance: None,
         name: "awscc_test_typed_identity_11111111".to_string(),
-        create_only_values: HashMap::from([
+        create_only_values: [
             (
                 "domain".to_string(),
                 canonical_create_only_value_string(&domain).expect("canonical enum is canonical"),
@@ -4994,7 +5005,9 @@ fn test_detect_rename_matches_enum_and_int_create_only_attrs() {
                 "priority".to_string(),
                 canonical_create_only_value_string(&priority).expect("integer is canonical"),
             ),
-        ]),
+        ]
+        .into_iter()
+        .collect(),
     }];
 
     let renames = detect_anonymous_to_named_renames_for_test(
@@ -5011,13 +5024,7 @@ fn test_detect_rename_matches_enum_and_int_create_only_attrs() {
 
 #[test]
 fn test_detect_rename_skips_ambiguous_resolved_create_only_matches() {
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "awscc",
-        subnet_route_table_association_schema()
-            .validate()
-            .expect("schema fixture must be valid"),
-    );
+    let schemas = subnet_route_table_association_registry();
     let mut resource =
         subnet_route_table_association_resource("nat_gw", "private_rtb", "private_subnet");
     resource.binding = Some("nat_gw".to_string());
@@ -5047,18 +5054,114 @@ fn test_detect_rename_skips_ambiguous_resolved_create_only_matches() {
         &resources,
         &schemas,
         &|_provider, _resource_type| state_entries.clone(),
-        &|binding| {
-            binding_entries
-                .iter()
-                .filter(|(entry_binding, _)| entry_binding == binding)
-                .map(|(_, entry)| entry.clone())
-                .collect()
-        },
+        &|binding| binding_state_entries_for(&binding_entries, binding),
         &[],
         &|_provider| Vec::new(),
     );
 
     assert!(renames.is_empty());
+}
+
+#[test]
+fn test_detect_rename_falls_back_to_simhash_when_state_lacks_create_only_attr() {
+    let providers: Vec<ProviderConfig> = Vec::new();
+    let identity_fn = |_provider: &str| Vec::new();
+    let mut legacy_schemas = SchemaRegistry::new();
+    legacy_schemas.insert(
+        "awscc",
+        ResourceSchema::new("ec2.SubnetRouteTableAssociation")
+            .attribute(AttributeSchema::optional("route_table_id", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("subnet_id", AttributeType::string()).build())
+            .validate()
+            .expect("legacy schema fixture must be valid"),
+    );
+
+    let mut anonymous =
+        subnet_route_table_association_resource("placeholder", "private_rtb", "private_subnet");
+    anonymous.id =
+        ResourceId::pending_with_provider("awscc", "ec2.SubnetRouteTableAssociation", None);
+    let mut anonymous_resources = vec![anonymous];
+    compute_anonymous_identifiers_for_test(
+        &mut anonymous_resources,
+        &providers,
+        &legacy_schemas,
+        &identity_fn,
+    )
+    .expect("legacy anonymous SimHash must compute");
+    let anonymous_name = anonymous_resources[0]
+        .id
+        .identity_str()
+        .expect("legacy anonymous identity must resolve")
+        .to_string();
+    assert!(matches!(
+        extract_hash_from_identifier(&anonymous_name),
+        Some(AnonymousHashSuffix::SimHash(_))
+    ));
+
+    let mut named = anonymous_resources.remove(0);
+    named.id = ResourceId::with_provider_identity(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        "nat_gw",
+        None,
+    );
+    named.binding = Some("nat_gw".to_string());
+    let state_entries = vec![AnonymousIdStateInfo {
+        provider_instance: None,
+        name: anonymous_name.clone(),
+        create_only_values: [("route_table_id".to_string(), "rtb-private".to_string())]
+            .into_iter()
+            .collect(),
+    }];
+    let binding_entries = [
+        binding_state_entry("private_rtb", "private_rtb", &[("id", "rtb-private")]),
+        binding_state_entry(
+            "private_subnet",
+            "private_subnet",
+            &[("id", "subnet-private")],
+        ),
+    ];
+
+    let renames = detect_anonymous_to_named_renames_with_bindings_for_test(
+        &[named],
+        &subnet_route_table_association_registry(),
+        &|_provider, _resource_type| state_entries.clone(),
+        &|binding| binding_state_entries_for(&binding_entries, binding),
+        &providers,
+        &identity_fn,
+    );
+
+    assert_eq!(
+        renames.len(),
+        1,
+        "zero create-only matches must use SimHash"
+    );
+    assert_eq!(renames[0].0.identity_str(), anonymous_name);
+    assert_eq!(renames[0].1.identity_str(), "nat_gw");
+
+    let ambiguous_state_entries = vec![
+        association_state_entry(&anonymous_name, "rtb-private", "subnet-private"),
+        association_state_entry(
+            "awscc_ec2_subnet_route_table_association_0000000000000000",
+            "rtb-private",
+            "subnet-private",
+        ),
+    ];
+    let mut ambiguous_resource =
+        subnet_route_table_association_resource("nat_gw", "private_rtb", "private_subnet");
+    ambiguous_resource.binding = Some("nat_gw".to_string());
+    let ambiguous = detect_anonymous_to_named_renames_with_bindings_for_test(
+        &[ambiguous_resource],
+        &subnet_route_table_association_registry(),
+        &|_provider, _resource_type| ambiguous_state_entries.clone(),
+        &|binding| binding_state_entries_for(&binding_entries, binding),
+        &providers,
+        &identity_fn,
+    );
+    assert!(
+        ambiguous.is_empty(),
+        "ambiguous create-only matches must never fall back to the exact SimHash row",
+    );
 }
 
 #[test]
@@ -5340,12 +5443,16 @@ fn test_detect_rename_existing_removed_from_binding_does_not_use_orphan() {
         AnonymousIdStateInfo {
             provider_instance: None,
             name: binding_name.to_string(),
-            create_only_values: HashMap::from([("name".to_string(), "carina-rs".to_string())]),
+            create_only_values: [("name".to_string(), "carina-rs".to_string())]
+                .into_iter()
+                .collect(),
         },
         AnonymousIdStateInfo {
             provider_instance: None,
             name: orphan_name.to_string(),
-            create_only_values: HashMap::from([("name".to_string(), "carina-rs".to_string())]),
+            create_only_values: [("name".to_string(), "carina-rs".to_string())]
+                .into_iter()
+                .collect(),
         },
     ];
     let claims = StateBlockClaims::new(
@@ -5539,7 +5646,7 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
     let state_entries = vec![AnonymousIdStateInfo {
         provider_instance: None,
         name: anonymous_name.clone(),
-        create_only_values: HashMap::new(),
+        create_only_values: CreateOnlyValues::default(),
     }];
 
     // Step 4: detect_anonymous_to_named_renames should match via SimHash.
@@ -5623,7 +5730,7 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
     let state_entries = vec![AnonymousIdStateInfo {
         provider_instance: None,
         name: anonymous_name,
-        create_only_values: HashMap::new(),
+        create_only_values: CreateOnlyValues::default(),
     }];
 
     let renames = detect_anonymous_to_named_renames_for_test(
@@ -5679,12 +5786,12 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
         AnonymousIdStateInfo {
             provider_instance: None,
             name: nearby_name.clone(),
-            create_only_values: HashMap::new(),
+            create_only_values: CreateOnlyValues::default(),
         },
         AnonymousIdStateInfo {
             provider_instance: None,
             name: exact_name.clone(),
-            create_only_values: HashMap::new(),
+            create_only_values: CreateOnlyValues::default(),
         },
     ];
 
@@ -5733,7 +5840,7 @@ fn test_detect_rename_no_create_only_skips_8_char_hash_entries() {
     let state_entries = vec![AnonymousIdStateInfo {
         provider_instance: None,
         name: "sso_instance_a3f2b1c8".to_string(),
-        create_only_values: HashMap::new(),
+        create_only_values: CreateOnlyValues::default(),
     }];
 
     let renames = detect_anonymous_to_named_renames_for_test(
@@ -5778,12 +5885,12 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
         AnonymousIdStateInfo {
             provider_instance: None,
             name: anonymous_name.clone(),
-            create_only_values: HashMap::new(),
+            create_only_values: CreateOnlyValues::default(),
         },
         AnonymousIdStateInfo {
             provider_instance: None,
             name: anonymous_name,
-            create_only_values: HashMap::new(),
+            create_only_values: CreateOnlyValues::default(),
         },
     ];
 
@@ -5938,7 +6045,7 @@ fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_move() {
     let state_entries = vec![AnonymousIdStateInfo {
         provider_instance: None,
         name: old_name.clone(),
-        create_only_values: HashMap::new(),
+        create_only_values: CreateOnlyValues::default(),
     }];
 
     let renames = reconcile_anonymous_identifiers(

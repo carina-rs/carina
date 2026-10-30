@@ -4,7 +4,8 @@
 //! even when every create-only identity input is a cross-file resource ref.
 
 use std::fs;
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, ExitStatus};
 
 use carina_core::resource::ResourceIdentity;
 use carina_state::{ResourceState, StateFile};
@@ -30,6 +31,45 @@ fn applied_row(
         row = row.with_attribute(*name, value.clone());
     }
     row
+}
+fn init_project(project: &Path) {
+    let init = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .current_dir(project)
+        .env("NO_COLOR", "1")
+        .env_remove("CLICOLOR_FORCE")
+        .args(["init", "."])
+        .output()
+        .expect("run carina init");
+    assert!(
+        init.status.success(),
+        "carina init failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr),
+    );
+}
+
+fn write_state(project: &Path, state: &StateFile) {
+    fs::write(
+        project.join("carina.state.json"),
+        serde_json::to_vec_pretty(state).expect("serialize state fixture"),
+    )
+    .expect("write state fixture");
+}
+
+fn run_plan(project: &Path) -> (ExitStatus, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .current_dir(project)
+        .env("NO_COLOR", "1")
+        .env_remove("CLICOLOR_FORCE")
+        .args(["plan", "--refresh=false", "."])
+        .output()
+        .expect("run carina plan");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    (output.status, rendered)
 }
 
 #[test]
@@ -61,19 +101,7 @@ let subnet = mock.test.resource {
     )
     .expect("write referenced sibling bindings");
 
-    let init = Command::new(env!("CARGO_BIN_EXE_carina"))
-        .current_dir(project.path())
-        .env("NO_COLOR", "1")
-        .env_remove("CLICOLOR_FORCE")
-        .args(["init", "."])
-        .output()
-        .expect("run carina init");
-    assert!(
-        init.status.success(),
-        "carina init failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&init.stdout),
-        String::from_utf8_lossy(&init.stderr),
-    );
+    init_project(project.path());
 
     let mut state = StateFile::new();
     state
@@ -113,27 +141,12 @@ let subnet = mock.test.resource {
             ],
         ))
         .expect("insert anonymous target state");
-    fs::write(
-        project.path().join("carina.state.json"),
-        serde_json::to_vec_pretty(&state).expect("serialize state fixture"),
-    )
-    .expect("write state fixture");
+    write_state(project.path(), &state);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
-        .current_dir(project.path())
-        .env("NO_COLOR", "1")
-        .env_remove("CLICOLOR_FORCE")
-        .args(["plan", "--refresh=false", "."])
-        .output()
-        .expect("run carina plan");
-    let rendered = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    let (status, rendered) = run_plan(project.path());
 
     assert!(
-        output.status.success(),
+        status.success(),
         "multifile reference rename plan failed\n{rendered}"
     );
     assert!(
@@ -150,5 +163,71 @@ let subnet = mock.test.resource {
         !rendered.contains("+ mock.compute.Instance nat_gw")
             && !rendered.contains(&format!("- mock.compute.Instance {ANONYMOUS_IDENTITY}")),
         "plan must not contain either half of a delete/create pair\n{rendered}"
+    );
+}
+
+#[test]
+fn multifile_plan_does_not_match_only_the_resolvable_create_only_subset() {
+    let project = tempfile::tempdir().expect("create temporary project");
+    fs::write(project.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write provider configuration");
+    fs::write(
+        project.path().join("main.crn"),
+        r#"backend local { path = "carina.state.json" }
+
+let nat_gw = mock.compute.Instance {
+  name = allocation.identifier
+  cluster_name = new_subnet.identifier
+}
+"#,
+    )
+    .expect("write named resource configuration");
+    fs::write(
+        project.path().join("network.crn"),
+        r#"let allocation = mock.test.resource {
+  name = "eip-source"
+}
+
+let new_subnet = mock.test.resource {
+  name = "new-subnet-source"
+}
+"#,
+    )
+    .expect("write referenced sibling bindings");
+    init_project(project.path());
+
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(applied_row(
+            "test.resource",
+            "allocation",
+            Some("allocation"),
+            "eip-123",
+            &[
+                ("name", serde_json::json!("eip-source")),
+                ("identifier", serde_json::json!("eip-123")),
+            ],
+        ))
+        .expect("insert allocation state");
+    state
+        .upsert_resource(applied_row(
+            "compute.Instance",
+            ANONYMOUS_IDENTITY,
+            None,
+            "nat-123",
+            &[
+                ("name", serde_json::json!("eip-123")),
+                ("cluster_name", serde_json::json!("old-subnet-123")),
+                ("arn", serde_json::json!("arn:mock:nat-123")),
+            ],
+        ))
+        .expect("insert anonymous target state");
+    write_state(project.path(), &state);
+
+    let (status, rendered) = run_plan(project.path());
+    assert!(status.success(), "plan failed\n{rendered}");
+    assert!(
+        !rendered.contains(&format!("moved from: {ANONYMOUS_IDENTITY}")),
+        "an unresolved create-only ref must prevent subset-based rename matching\n{rendered}"
     );
 }
