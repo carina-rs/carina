@@ -1385,7 +1385,6 @@ async fn run_apply_with_observer_factory(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let bootstrap_unresolved = loaded.unresolved_parsed.clone();
     let parsed = loaded.parsed;
@@ -1398,7 +1397,6 @@ async fn run_apply_with_observer_factory(
         loaded.unresolved_parsed,
         base_dir,
         false,
-        &inference_errors,
         &duplicate_declarations,
     )?;
     // Wiring needs declaration metadata and schemas before a bootstrap
@@ -1642,14 +1640,12 @@ fn reload_apply_configuration_after_bootstrap(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = reloaded.inference_errors;
     let duplicate_declarations = reloaded.duplicate_declarations;
     validated_config.revalidate_config_pair(
         reloaded.parsed,
         unresolved,
         base_dir,
         true,
-        &inference_errors,
         &duplicate_declarations,
     )
 }
@@ -3000,7 +2996,6 @@ async fn run_apply_from_plan_with_observer_factory(
             let parsed_backend = Some(current_config.parsed.backend.clone());
             let parsed = current_config.parsed;
             let unresolved = current_config.unresolved_parsed;
-            let inference_errors = current_config.inference_errors;
             let duplicate_declarations = current_config.duplicate_declarations;
             let providers = providers
                 .check_saved_plan_config_pair(
@@ -3008,7 +3003,6 @@ async fn run_apply_from_plan_with_observer_factory(
                     unresolved,
                     base_dir,
                     false,
-                    &inference_errors,
                     &duplicate_declarations,
                 )
                 .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;

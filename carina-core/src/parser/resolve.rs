@@ -838,7 +838,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
         // classified the function's return type. In particular, eagerly
         // reducing an `Any` builtin such as `lookup()` would incorrectly make
         // an otherwise-uninferrable output look like a concrete String.
-        if attribute.type_expr.is_some()
+        if attribute.static_type.is_some()
             && let Some(value) = &mut attribute.value
         {
             *value = resolve_function_calls_only(
@@ -854,7 +854,8 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
         // See the matching attribute-output guard above. Annotated exports
         // need their concrete values for boundary checking; unannotated
         // exports must retain the expression for return-type inference.
-        if export.type_expr_opt().is_some() {
+        let has_static_type = export.type_expr_opt().is_some();
+        if has_static_type {
             let resolved = export
                 .value()
                 .map(|value| {

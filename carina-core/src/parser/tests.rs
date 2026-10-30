@@ -14,6 +14,18 @@ fn cross_deferred_for_resolution_seam(parsed: ParsedFile) -> ModuleResolvedParse
         .expect("deferred fixture crosses the module-resolution seam")
 }
 
+fn known(type_expr: TypeExpr) -> TypeExpr {
+    type_expr
+}
+
+fn known_opt(type_expr: TypeExpr) -> Option<TypeExpr> {
+    Some(known(type_expr))
+}
+
+fn expect_known(static_type: &TypeExpr) -> &TypeExpr {
+    static_type
+}
+
 #[test]
 fn parse_and_resolve_returns_value_only_no_closure() {
     // Issue #2230 acceptance criterion 3: `parse_and_resolve` must
@@ -943,11 +955,11 @@ fn parse_directory_module() {
     // Check arguments
     assert_eq!(result.arguments.len(), 2);
     assert_eq!(result.arguments[0].name, "vpc_id");
-    assert_eq!(result.arguments[0].type_expr, TypeExpr::String);
+    assert_eq!(result.arguments[0].static_type, known(TypeExpr::String));
     assert!(result.arguments[0].default.is_none());
 
     assert_eq!(result.arguments[1].name, "enable_https");
-    assert_eq!(result.arguments[1].type_expr, TypeExpr::Bool);
+    assert_eq!(result.arguments[1].static_type, known(TypeExpr::Bool));
     assert_eq!(
         result.arguments[1].default,
         Some(Value::Concrete(ConcreteValue::Bool(true)))
@@ -956,7 +968,10 @@ fn parse_directory_module() {
     // Check attribute params
     assert_eq!(result.attribute_params.len(), 1);
     assert_eq!(result.attribute_params[0].name, "sg_id");
-    assert_eq!(result.attribute_params[0].type_expr, Some(TypeExpr::String));
+    assert_eq!(
+        result.attribute_params[0].static_type,
+        known_opt(TypeExpr::String)
+    );
 
     // Check resource has argument reference (lexically scoped)
     assert_eq!(result.resources.len(), 1);
@@ -1098,20 +1113,20 @@ fn parse_generic_type_expressions() {
     let result = parse(input, &ProviderContext::default()).unwrap();
 
     assert_eq!(
-        result.arguments[0].type_expr,
-        TypeExpr::List(Box::new(TypeExpr::Int))
+        result.arguments[0].static_type,
+        known(TypeExpr::List(Box::new(TypeExpr::Int)))
     );
     assert_eq!(
-        result.arguments[1].type_expr,
-        TypeExpr::Map(Box::new(TypeExpr::String))
+        result.arguments[1].static_type,
+        known(TypeExpr::Map(Box::new(TypeExpr::String)))
     );
     assert_eq!(
-        result.arguments[2].type_expr,
-        TypeExpr::List(Box::new(TypeExpr::String))
+        result.arguments[2].static_type,
+        known(TypeExpr::List(Box::new(TypeExpr::String)))
     );
     assert_eq!(
-        result.attribute_params[0].type_expr,
-        Some(TypeExpr::List(Box::new(TypeExpr::String)))
+        result.attribute_params[0].static_type,
+        known_opt(TypeExpr::List(Box::new(TypeExpr::String)))
     );
     assert!(result.attribute_params[0].value.is_some());
 }
@@ -1139,16 +1154,18 @@ fn parse_ref_type_expression() {
     // Check ref type argument
     assert_eq!(result.arguments[0].name, "vpc");
     assert_eq!(
-        result.arguments[0].type_expr,
-        TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "vpc"))
+        result.arguments[0].static_type,
+        known(TypeExpr::DottedUnresolved(ResourceTypePath::new(
+            "aws", "vpc"
+        )))
     );
     assert!(result.arguments[0].default.is_none());
 
     // Check ref type attribute param
     assert_eq!(result.attribute_params[0].name, "security_group_id");
     assert_eq!(
-        result.attribute_params[0].type_expr,
-        Some(TypeExpr::DottedUnresolved(ResourceTypePath::new(
+        result.attribute_params[0].static_type,
+        known_opt(TypeExpr::DottedUnresolved(ResourceTypePath::new(
             "aws",
             "security_group"
         )))
@@ -1172,14 +1189,20 @@ fn parse_ref_type_with_nested_resource_type() {
 
     // Single-level resource type
     assert_eq!(
-        result.arguments[0].type_expr,
-        TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "security_group"))
+        result.arguments[0].static_type,
+        known(TypeExpr::DottedUnresolved(ResourceTypePath::new(
+            "aws",
+            "security_group"
+        )))
     );
 
     // Nested resource type (security_group.ingress_rule)
     assert_eq!(
-        result.arguments[1].type_expr,
-        TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "security_group.ingress_rule"))
+        result.arguments[1].static_type,
+        known(TypeExpr::DottedUnresolved(ResourceTypePath::new(
+            "aws",
+            "security_group.ingress_rule"
+        )))
     );
 }
 
@@ -1213,7 +1236,7 @@ fn parse_struct_type_expression() {
             ),
         ],
     };
-    assert_eq!(ep.type_expr, Some(expected));
+    assert_eq!(ep.static_type, known_opt(expected));
 }
 
 #[test]
@@ -1227,22 +1250,22 @@ fn parse_struct_type_nested_in_list_and_map() {
 
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
-        result.arguments[0].type_expr,
-        TypeExpr::List(Box::new(TypeExpr::Struct {
+        result.arguments[0].static_type,
+        known(TypeExpr::List(Box::new(TypeExpr::Struct {
             fields: vec![
                 ("name".to_string(), TypeExpr::String),
                 ("value".to_string(), TypeExpr::Int),
             ],
-        }))
+        })))
     );
     assert_eq!(
-        result.arguments[1].type_expr,
-        TypeExpr::Map(Box::new(TypeExpr::Struct {
+        result.arguments[1].static_type,
+        known(TypeExpr::Map(Box::new(TypeExpr::Struct {
             fields: vec![
                 ("arn".to_string(), TypeExpr::String),
                 ("id".to_string(), TypeExpr::String),
             ],
-        }))
+        })))
     );
 }
 
@@ -1304,7 +1327,7 @@ fn parse_attributes_without_type_annotation() {
 
     assert_eq!(result.attribute_params.len(), 1);
     assert_eq!(result.attribute_params[0].name, "security_group");
-    assert_eq!(result.attribute_params[0].type_expr, None);
+    assert_eq!(result.attribute_params[0].static_type, None);
     assert!(result.attribute_params[0].value.is_some());
 }
 
@@ -1336,19 +1359,19 @@ fn parse_attributes_mixed_typed_and_untyped() {
 
     // Explicit type
     assert_eq!(result.attribute_params[0].name, "vpc_id");
-    assert!(result.attribute_params[0].type_expr.is_some());
+    assert!(result.attribute_params[0].static_type.is_some());
     assert!(result.attribute_params[0].value.is_some());
 
     // No type annotation
     assert_eq!(result.attribute_params[1].name, "security_group");
-    assert_eq!(result.attribute_params[1].type_expr, None);
+    assert_eq!(result.attribute_params[1].static_type, None);
     assert!(result.attribute_params[1].value.is_some());
 
     // Explicit type
     assert_eq!(result.attribute_params[2].name, "subnet_ids");
     assert_eq!(
-        result.attribute_params[2].type_expr,
-        Some(TypeExpr::List(Box::new(TypeExpr::String)))
+        result.attribute_params[2].static_type,
+        known_opt(TypeExpr::List(Box::new(TypeExpr::String)))
     );
     assert!(result.attribute_params[2].value.is_some());
 }
@@ -6265,8 +6288,10 @@ fn parse_arguments_block_form_description_only() {
     assert_eq!(result.arguments.len(), 1);
     assert_eq!(result.arguments[0].name, "vpc");
     assert_eq!(
-        result.arguments[0].type_expr,
-        TypeExpr::DottedUnresolved(ResourceTypePath::new("awscc", "ec2.Vpc"))
+        result.arguments[0].static_type,
+        known(TypeExpr::DottedUnresolved(ResourceTypePath::new(
+            "awscc", "ec2.Vpc"
+        )))
     );
     assert!(result.arguments[0].default.is_none());
     assert_eq!(
@@ -6289,7 +6314,7 @@ fn parse_arguments_block_form_description_and_default() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.arguments.len(), 1);
     assert_eq!(result.arguments[0].name, "port");
-    assert_eq!(result.arguments[0].type_expr, TypeExpr::Int);
+    assert_eq!(result.arguments[0].static_type, known(TypeExpr::Int));
     assert_eq!(
         result.arguments[0].default,
         Some(Value::Concrete(ConcreteValue::Int(8080)))
@@ -6322,7 +6347,7 @@ fn parse_arguments_mixed_simple_and_block_form() {
 
     // Simple form (unchanged)
     assert_eq!(result.arguments[0].name, "enable_https");
-    assert_eq!(result.arguments[0].type_expr, TypeExpr::Bool);
+    assert_eq!(result.arguments[0].static_type, known(TypeExpr::Bool));
     assert_eq!(
         result.arguments[0].default,
         Some(Value::Concrete(ConcreteValue::Bool(true)))
@@ -6332,8 +6357,10 @@ fn parse_arguments_mixed_simple_and_block_form() {
     // Block form with description only
     assert_eq!(result.arguments[1].name, "vpc");
     assert_eq!(
-        result.arguments[1].type_expr,
-        TypeExpr::DottedUnresolved(ResourceTypePath::new("awscc", "ec2.Vpc"))
+        result.arguments[1].static_type,
+        known(TypeExpr::DottedUnresolved(ResourceTypePath::new(
+            "awscc", "ec2.Vpc"
+        )))
     );
     assert!(result.arguments[1].default.is_none());
     assert_eq!(
@@ -6343,7 +6370,7 @@ fn parse_arguments_mixed_simple_and_block_form() {
 
     // Block form with description and default
     assert_eq!(result.arguments[2].name, "port");
-    assert_eq!(result.arguments[2].type_expr, TypeExpr::Int);
+    assert_eq!(result.arguments[2].static_type, known(TypeExpr::Int));
     assert_eq!(
         result.arguments[2].default,
         Some(Value::Concrete(ConcreteValue::Int(8080)))
@@ -6380,10 +6407,10 @@ fn parse_accepts_pascal_case_primitives() {
         }
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(result.arguments[0].type_expr, TypeExpr::String);
-    assert_eq!(result.arguments[1].type_expr, TypeExpr::Int);
-    assert_eq!(result.arguments[2].type_expr, TypeExpr::Bool);
-    assert_eq!(result.arguments[3].type_expr, TypeExpr::Float);
+    assert_eq!(result.arguments[0].static_type, known(TypeExpr::String));
+    assert_eq!(result.arguments[1].static_type, known(TypeExpr::Int));
+    assert_eq!(result.arguments[2].static_type, known(TypeExpr::Bool));
+    assert_eq!(result.arguments[3].static_type, known(TypeExpr::Float));
 }
 
 #[test]
@@ -6397,10 +6424,10 @@ fn parse_still_accepts_lowercase_primitives_during_transition() {
         }
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(result.arguments[0].type_expr, TypeExpr::String);
-    assert_eq!(result.arguments[1].type_expr, TypeExpr::Int);
-    assert_eq!(result.arguments[2].type_expr, TypeExpr::Bool);
-    assert_eq!(result.arguments[3].type_expr, TypeExpr::Float);
+    assert_eq!(result.arguments[0].static_type, known(TypeExpr::String));
+    assert_eq!(result.arguments[1].static_type, known(TypeExpr::Int));
+    assert_eq!(result.arguments[2].static_type, known(TypeExpr::Bool));
+    assert_eq!(result.arguments[3].static_type, known(TypeExpr::Float));
 }
 
 #[test]
@@ -6414,16 +6441,16 @@ fn parse_accepts_pascal_case_custom_types() {
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
-        result.arguments[0].type_expr,
-        TypeExpr::Simple("aws_account_id".to_string())
+        result.arguments[0].static_type,
+        known(TypeExpr::Simple("aws_account_id".to_string()))
     );
     assert_eq!(
-        result.arguments[1].type_expr,
-        TypeExpr::Simple("ipv4_cidr".to_string())
+        result.arguments[1].static_type,
+        known(TypeExpr::Simple("ipv4_cidr".to_string()))
     );
     assert_eq!(
-        result.arguments[2].type_expr,
-        TypeExpr::Simple("arn".to_string())
+        result.arguments[2].static_type,
+        known(TypeExpr::Simple("arn".to_string()))
     );
 }
 
@@ -6436,14 +6463,14 @@ fn parse_three_segment_resource_path_is_ref() {
         }
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
-    match &result.arguments[0].type_expr {
+    match expect_known(&result.arguments[0].static_type) {
         TypeExpr::DottedUnresolved(path) => {
             assert_eq!(path.provider, "aws");
             assert_eq!(path.resource_type, "ec2.Vpc");
         }
         other => panic!("expected DottedUnresolved, got {other:?}"),
     }
-    match &result.arguments[1].type_expr {
+    match expect_known(&result.arguments[1].static_type) {
         TypeExpr::DottedUnresolved(path) => {
             assert_eq!(path.provider, "aws");
             assert_eq!(path.resource_type, "s3.Bucket");
@@ -6461,7 +6488,7 @@ fn parse_four_segment_path_with_pascal_tail_is_dotted_unresolved() {
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert!(matches!(
-        result.arguments[0].type_expr,
+        result.arguments[0].static_type,
         TypeExpr::DottedUnresolved(_)
     ));
 }
@@ -6474,8 +6501,10 @@ fn type_expr_ref_display_roundtrips_three_segment_path() {
     let input = format!(r#"arguments {{ v: {} }}"#, ty);
     let parsed = parse(&input, &ProviderContext::default()).unwrap();
     assert_eq!(
-        parsed.arguments[0].type_expr,
-        TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "ec2.Vpc"))
+        parsed.arguments[0].static_type,
+        known(TypeExpr::DottedUnresolved(ResourceTypePath::new(
+            "aws", "ec2.Vpc"
+        )))
     );
 }
 
@@ -6572,7 +6601,7 @@ fn parse_arguments_block_form_string_default_not_confused_with_description() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.arguments.len(), 1);
     assert_eq!(result.arguments[0].name, "name");
-    assert_eq!(result.arguments[0].type_expr, TypeExpr::String);
+    assert_eq!(result.arguments[0].static_type, known(TypeExpr::String));
     assert_eq!(
         result.arguments[0].description.as_deref(),
         Some("Name of the resource")
@@ -6602,7 +6631,7 @@ fn parse_arguments_block_form_validation_block() {
     assert_eq!(result.arguments.len(), 1);
     let arg = &result.arguments[0];
     assert_eq!(arg.name, "port");
-    assert_eq!(arg.type_expr, TypeExpr::Int);
+    assert_eq!(arg.static_type, known(TypeExpr::Int));
     assert_eq!(arg.default, Some(Value::Concrete(ConcreteValue::Int(8080))));
     assert_eq!(arg.description.as_deref(), Some("Web server port"));
     assert_eq!(arg.validations.len(), 1);
@@ -7723,13 +7752,13 @@ fn parse_custom_type_in_module_arguments() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.arguments[0].name, "vpc_cidr");
     assert_eq!(
-        result.arguments[0].type_expr,
-        TypeExpr::Simple("ipv4_cidr".to_string())
+        result.arguments[0].static_type,
+        known(TypeExpr::Simple("ipv4_cidr".to_string()))
     );
     assert_eq!(result.arguments[1].name, "server_ip");
     assert_eq!(
-        result.arguments[1].type_expr,
-        TypeExpr::Simple("ipv4_address".to_string())
+        result.arguments[1].static_type,
+        known(TypeExpr::Simple("ipv4_address".to_string()))
     );
 }
 
@@ -7747,8 +7776,8 @@ fn parse_custom_type_in_attributes() {
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
-        result.attribute_params[0].type_expr,
-        Some(TypeExpr::Simple("ipv4_cidr".to_string()))
+        result.attribute_params[0].static_type,
+        known_opt(TypeExpr::Simple("ipv4_cidr".to_string()))
     );
 }
 
@@ -8956,7 +8985,7 @@ arguments {
     assert_eq!(parsed.arguments.len(), 1);
     let arg = &parsed.arguments[0];
     assert_eq!(arg.name, "vpc_id");
-    match &arg.type_expr {
+    match expect_known(&arg.static_type) {
         TypeExpr::DottedUnresolved(path) => {
             assert_eq!(path.provider, "awscc");
             assert_eq!(path.resource_type, "ec2.VpcId");
@@ -9002,7 +9031,7 @@ arguments {
     let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.arguments.len(), 1);
     let arg = &parsed.arguments[0];
-    match &arg.type_expr {
+    match expect_known(&arg.static_type) {
         TypeExpr::List(inner) => match inner.as_ref() {
             TypeExpr::DottedUnresolved(path) => {
                 assert_eq!(path.provider, "awscc");
@@ -9862,7 +9891,7 @@ exports {
     let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.export_params.len(), 1);
     assert_eq!(parsed.export_params[0].name, "vpc_id");
-    assert!(parsed.export_params[0].type_expr.is_none());
+    assert!(parsed.export_params[0].static_type.is_none());
     assert!(parsed.export_params[0].value.is_some());
 }
 
@@ -9885,7 +9914,7 @@ exports {
     let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.export_params.len(), 2);
     assert_eq!(parsed.export_params[0].name, "vpc_id");
-    assert!(parsed.export_params[0].type_expr.is_some());
+    assert!(parsed.export_params[0].static_type.is_some());
     assert_eq!(parsed.export_params[1].name, "cidr");
 }
 
@@ -11727,23 +11756,9 @@ fn nested_block_value_map_preserves_insertion_order() {
 }
 
 #[test]
-fn type_expr_unknown_displays_as_unknown_marker() {
-    let u = TypeExpr::Unknown;
-    assert_eq!(format!("{}", u), "<unknown>");
-}
-
-#[test]
-fn type_expr_unknown_serde_round_trips() {
-    let u = TypeExpr::Unknown;
-    let json = serde_json::to_string(&u).unwrap();
-    let back: TypeExpr = serde_json::from_str(&json).unwrap();
-    assert_eq!(back, u);
-}
-
-#[test]
 fn parsed_export_param_keeps_optional_type_expr() {
     let p = ParsedExportParam::dummy("vpc_id".to_string(), None, None);
-    assert!(p.type_expr.is_none());
+    assert!(p.static_type.is_none());
 }
 
 #[test]
@@ -11760,14 +11775,17 @@ fn parsed_file_is_file_of_parsed_export_param() {
 fn inferred_file_holds_inferred_export_param() {
     let one = InferredExportParam {
         name: "vpc_id".to_string(),
-        type_expr: TypeExpr::String,
+        static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::String),
         value: None,
     };
     let f: InferredFile = InferredFile {
         export_params: vec![one],
         ..Default::default()
     };
-    assert_eq!(f.export_params[0].type_expr, TypeExpr::String);
+    assert_eq!(
+        f.export_params[0].static_type,
+        crate::static_type::ExportStaticType::Declared(known(TypeExpr::String))
+    );
 }
 
 #[test]
@@ -12912,7 +12930,10 @@ arguments {
     assert_eq!(parsed.arguments.len(), 1);
     let arg = &parsed.arguments[0];
     assert_eq!(arg.name, "env");
-    assert_eq!(arg.type_expr, TypeExpr::StringLiteral("dev".to_string()));
+    assert_eq!(
+        arg.static_type,
+        known(TypeExpr::StringLiteral("dev".to_string()))
+    );
 }
 
 #[test]
@@ -12926,11 +12947,11 @@ arguments {
     assert_eq!(parsed.arguments.len(), 1);
     let arg = &parsed.arguments[0];
     assert_eq!(
-        arg.type_expr,
-        TypeExpr::Union(vec![
+        arg.static_type,
+        known(TypeExpr::Union(vec![
             TypeExpr::StringLiteral("dev".to_string()),
             TypeExpr::StringLiteral("prod".to_string()),
-        ])
+        ]))
     );
 }
 
@@ -12966,7 +12987,10 @@ arguments {
 "#;
     let parsed = parse(src, &ProviderContext::default()).unwrap();
     let arg = &parsed.arguments[0];
-    assert_eq!(arg.type_expr.to_string(), "'tokyo' | 'osaka' | 'oregon'");
+    assert_eq!(
+        expect_known(&arg.static_type).to_string(),
+        "'tokyo' | 'osaka' | 'oregon'"
+    );
 }
 
 #[test]
@@ -12993,7 +13017,7 @@ arguments {
 "#;
     let parsed = parse(src, &ProviderContext::default()).unwrap();
     let arg = &parsed.arguments[0];
-    let inner = match &arg.type_expr {
+    let inner = match expect_known(&arg.static_type) {
         TypeExpr::List(inner) => inner.as_ref(),
         other => panic!("expected list type, got {:?}", other),
     };

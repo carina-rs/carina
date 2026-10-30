@@ -529,7 +529,10 @@ mod diagnostic_status_tests {
             crate::module_resolver::ResolvedModuleSignature {
                 arguments: vec![crate::parser::ArgumentParameter {
                     name: "required".to_string(),
-                    type_expr: crate::parser::TypeExpr::String,
+                    static_type: crate::validation::resolve_consumer_static_type_for_signature(
+                        &crate::parser::TypeExpr::String,
+                        &ProviderContext::default(),
+                    ),
                     default: None,
                     description: None,
                     validations: Vec::new(),
@@ -657,6 +660,11 @@ pub(crate) trait TypeResolutionPolicy {
         parsed: &mut crate::parser::File<E>,
         config: &ProviderContext,
     ) -> Result<(), ModuleError>;
+
+    fn resolve_static_type(
+        type_expr: &crate::parser::TypeExpr,
+        config: &ProviderContext,
+    ) -> crate::static_type::ConsumerStaticType;
 }
 
 /// Normal module resolution requires every declared type to resolve.
@@ -678,6 +686,13 @@ impl TypeResolutionPolicy for StrictTypeResolution {
         }
         Ok(())
     }
+
+    fn resolve_static_type(
+        type_expr: &crate::parser::TypeExpr,
+        config: &ProviderContext,
+    ) -> crate::static_type::ConsumerStaticType {
+        crate::validation::resolve_consumer_static_type_for_signature(type_expr, config)
+    }
 }
 
 /// Upstream projects are interpreted with the consumer's incomplete provider
@@ -689,8 +704,15 @@ impl TypeResolutionPolicy for DeferredUpstreamTypeResolution {
         parsed: &mut crate::parser::File<E>,
         config: &ProviderContext,
     ) -> Result<(), ModuleError> {
-        crate::validation::resolve_file_type_exprs_or_unknown(parsed, config);
+        crate::validation::resolve_file_type_exprs_best_effort(parsed, config);
         Ok(())
+    }
+
+    fn resolve_static_type(
+        type_expr: &crate::parser::TypeExpr,
+        config: &ProviderContext,
+    ) -> crate::static_type::ConsumerStaticType {
+        crate::validation::resolve_consumer_static_type(type_expr, config)
     }
 }
 
@@ -881,7 +903,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             .map(|(alias, module)| {
                 (
                     alias.clone(),
-                    super::signature::resolved_signature(module, self.config()),
+                    super::signature::resolved_signature_with_policy::<P>(module, self.config()),
                 )
             })
             .collect()

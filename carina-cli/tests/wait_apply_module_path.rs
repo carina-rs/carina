@@ -312,8 +312,6 @@ fn apply_path_propagates_module_wait_binding() {
         &carina_core::schema::SchemaRegistry::new(),
     )
     .expect("load_configuration_with_config should succeed");
-
-    let inference_errors = loaded.inference_errors;
     let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
     let providers = ProviderLoad::for_test(
@@ -338,7 +336,6 @@ fn apply_path_propagates_module_wait_binding() {
         // schema, only that the module's `wait` survives apply
         // expansion).
         true,
-        &inference_errors,
         &[],
     );
     assert!(
@@ -440,8 +437,6 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
         &carina_core::schema::SchemaRegistry::new(),
     )
     .expect("load_configuration_with_config should succeed");
-
-    let inference_errors = loaded.inference_errors;
     let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
     let providers = ProviderLoad::for_test(
@@ -450,14 +445,7 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
         ]),
         &parsed.providers,
     );
-    let errors = validate_and_resolve_errors(
-        &mut parsed,
-        base_dir,
-        &providers,
-        false,
-        &inference_errors,
-        &[],
-    );
+    let errors = validate_and_resolve_errors(&mut parsed, base_dir, &providers, false, &[]);
 
     assert!(
         errors.is_empty(),
@@ -517,7 +505,6 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         &carina_core::schema::SchemaRegistry::new(),
     )
     .expect("load should succeed");
-    let inference_errors = loaded.inference_errors;
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
 
@@ -528,7 +515,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         &parsed.providers,
     );
     let wiring = providers
-        .validate_evaluated_config(parsed, base_dir, true, &inference_errors, &[])
+        .validate_evaluated_config(parsed, base_dir, true, &[])
         .expect("expand stage must succeed");
 
     let ctx = wiring.context();

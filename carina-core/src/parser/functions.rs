@@ -610,7 +610,7 @@ fn check_fn_arg_type(
             Ok(None) => {
                 return Ok(FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded);
             }
-            Err(message) => return Err(ParseError::UserFunctionError(message)),
+            Err(error) => return Err(ParseError::UserFunctionError(error.to_string())),
         };
 
     if let Some(handle) = argument.handle() {

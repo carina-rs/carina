@@ -1067,7 +1067,7 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         parsed.providers = provider_configs();
         parsed.arguments = vec![carina_core::parser::ArgumentParameter {
             name: "unrelated".to_string(),
-            type_expr: carina_core::parser::TypeExpr::String,
+            static_type: carina_core::parser::TypeExpr::String,
             default: None,
             description: None,
             validations: Vec::new(),
@@ -1080,7 +1080,6 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         Path::new("."),
         true,
         &[],
-        &[],
     ) {
         Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
         Err(error) => error,
@@ -1091,7 +1090,6 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         Path::new("."),
         true,
-        &[],
         &[],
     ) {
         Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
@@ -1124,7 +1122,7 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
     parsed.providers = vec![provider];
     parsed.arguments = vec![carina_core::parser::ArgumentParameter {
         name: "unrelated".to_string(),
-        type_expr: carina_core::parser::TypeExpr::String,
+        static_type: carina_core::parser::TypeExpr::String,
         default: None,
         description: None,
         validations: Vec::new(),
@@ -1133,11 +1131,11 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
     let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
     );
-    let error =
-        match providers.validate_config_pair(parsed, unresolved, Path::new("."), false, &[], &[]) {
-            Ok(_) => panic!("plan-style validation must reject both independent errors"),
-            Err(error) => error,
-        };
+    let error = match providers.validate_config_pair(parsed, unresolved, Path::new("."), false, &[])
+    {
+        Ok(_) => panic!("plan-style validation must reject both independent errors"),
+        Err(error) => error,
+    };
     let message = error.to_string();
 
     assert!(message.contains("broken provider failed"), "{message}");
@@ -1168,7 +1166,7 @@ fn hard_reporting_load_returns_schema_only_diagnostics() {
     );
 
     let mut parsed = carina_core::parser::InferredFile::default();
-    let report = providers.validation_report(&mut parsed, base.path(), true, &[], &[]);
+    let report = providers.validation_report(&mut parsed, base.path(), true, &[]);
 
     assert!(report.errors().is_empty());
     assert!(report.schemas().iter().next().is_none());
@@ -12136,7 +12134,10 @@ mod resolved_value_constraint_gate {
                             name.to_string(),
                             carina_core::resource::LiveCompositionArgument::from_value(
                                 value,
-                                carina_core::parser::TypeExpr::String,
+                                carina_core::validation::resolve_consumer_static_type_for_signature(
+                                    &carina_core::parser::TypeExpr::String,
+                                    &carina_core::parser::ProviderContext::default(),
+                                ),
                                 carina_core::parser::ArgumentOrigin::Defaulted,
                             ),
                         )

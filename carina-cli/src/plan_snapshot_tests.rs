@@ -2285,7 +2285,6 @@ fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
         env!("CARGO_MANIFEST_DIR")
     ));
     let loaded = load_configuration(&fixture_path).unwrap();
-    let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let mut parsed = loaded.parsed;
     let providers =
@@ -2295,7 +2294,6 @@ fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
         &fixture_path,
         &providers,
         true,
-        &inference_errors,
         &duplicate_declarations,
     );
     let message = errors

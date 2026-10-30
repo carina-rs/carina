@@ -1095,8 +1095,8 @@ fn arguments_literal_union_type_does_not_surface_parser_error() {
     );
 }
 
-/// carina#3239 LSP parity: when a project has at least one provider
-/// registered (`provider_names` non-empty), an unknown bare custom-type
+/// carina#3239 LSP parity: when a project has loaded provider schemas,
+/// an unknown bare custom-type
 /// name in an `arguments { ... }` declaration must surface as an
 /// editor diagnostic — the same finding the CLI's `carina validate`
 /// produces. Without this coverage the bug-headline case
@@ -1170,12 +1170,11 @@ fn arguments_dotted_custom_type_suggests_nearest_identity_for_distance1_typo() {
     );
 }
 
-/// Companion to the test above: when no provider is registered
-/// (`provider_names` empty — the LSP's orphaned-file fallback), the
+/// Companion to the test above: when no provider schemas are loaded (the
+/// LSP's orphaned-file fallback), the
 /// strict check must *not* fire, otherwise every user-defined custom
-/// type in an orphaned file would redline. This pins the
-/// `has_loaded_providers = !provider_names.is_empty()` guard in
-/// `DiagnosticEngine::new`.
+/// type in an orphaned file would redline. This pins the separately named
+/// `DiagnosticEngine::without_loaded_provider_schemas` path.
 #[test]
 fn arguments_unknown_custom_type_silent_without_providers() {
     let engine = test_engine();

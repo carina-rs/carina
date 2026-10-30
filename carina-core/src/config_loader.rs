@@ -11,7 +11,6 @@ use crate::binding_index::BindingNameSet;
 use crate::parser::{self, File, InferredFile, ParsedFile, ProviderContext};
 use crate::resource::Value;
 use crate::schema::SchemaRegistry;
-use crate::validation::inference::ExportInferenceError;
 
 /// The syntactic kind of one named declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -313,10 +312,8 @@ impl UnresolvedConfigSnapshot {
 /// findings (#2102). Blocking errors (bad parse, missing modules) still
 /// come back as `Err` from the loader.
 pub struct LoadedConfig {
-    /// Post-inference file: every export carries a bare `TypeExpr`
-    /// (possibly the `TypeExpr::Unknown` sentinel for failed inference,
-    /// with a matching indexed entry in `inference_errors` when inference
-    /// produced a reportable failure).
+    /// Post-inference file: every export carries its origin and any typed
+    /// unchecked reason directly on the parameter.
     pub parsed: InferredFile,
     /// Values built from the directory parser's per-file output, after its
     /// static evaluation. That evaluation folds only fully static expressions
@@ -338,13 +335,6 @@ pub struct LoadedConfig {
     /// directory-wide binding set. The loader does not short-circuit on
     /// these so that later validators can also run in a single pass.
     pub identifier_scope_errors: Vec<parser::ParseError>,
-    /// Inference errors collected by `apply_inference` (#2360 stage 2):
-    /// one entry per `exports { ... }` declaration whose type could not
-    /// be statically resolved. The corresponding entry in `parsed.export_params`
-    /// carries `TypeExpr::Unknown` so downstream consumers can keep
-    /// looking the export up by name without spawning cascading
-    /// "missing export" diagnostics.
-    pub inference_errors: Vec<ExportInferenceError>,
     /// Directory-wide declaration collisions. These are non-blocking at the
     /// load boundary so editor callers retain the parsed tree; validation
     /// commands decide whether to treat them as hard errors.
@@ -623,9 +613,8 @@ pub fn load_configuration_with_config(
 
         // Phase transition: post-resolve, run rhs-driven inference over
         // every `exports { ... }` declaration so downstream consumers
-        // see a definitive `TypeExpr` per export (#2360 stage 2).
-        let (inferred, inference_errors) =
-            crate::validation::inference::apply_inference(merged, schemas);
+        // retain origin and unchecked provenance per export (#2360 stage 2).
+        let inferred = crate::validation::inference::apply_inference(merged, schemas);
 
         Ok(LoadedConfig {
             parsed: inferred,
@@ -633,7 +622,6 @@ pub fn load_configuration_with_config(
             unresolved_parsed: UnresolvedConfigSnapshot::from_parsed(unresolved_merged),
             backend_file,
             identifier_scope_errors,
-            inference_errors,
             duplicate_declarations,
         })
     } else {
@@ -1671,9 +1659,8 @@ mod tests {
 
     #[test]
     fn load_configuration_runs_inference_and_surfaces_errors() {
-        // Stage 2 (#2360): an unannotated dynamic-rhs export
-        // (`lookup` returns Any) becomes a sentinel + an inference
-        // error rather than slipping through unchecked.
+        // An unannotated dynamic-rhs export (`lookup` returns Any) carries
+        // its inference failure on the export parameter.
         let dir = create_temp_dir("load_inference_failure");
         fs::write(
             dir.join("main.crn"),
@@ -1689,11 +1676,18 @@ mod tests {
         .unwrap();
         cleanup(&dir);
         assert_eq!(loaded.parsed.export_params.len(), 1);
-        assert_eq!(
-            loaded.parsed.export_params[0].type_expr,
-            crate::parser::TypeExpr::Unknown,
-        );
-        assert_eq!(loaded.inference_errors.len(), 1);
+        assert!(matches!(
+            &loaded.parsed.export_params[0],
+            crate::parser::InferredExportParam {
+                name,
+                static_type: crate::static_type::ExportStaticType::Inferred(
+                    crate::static_type::StaticType::Unchecked(
+                        crate::static_type::InferredUncheckedReason::InferenceFailed(_)
+                    )
+                ),
+                ..
+            } if name == "zone_id"
+        ));
     }
 
     #[test]
@@ -1710,14 +1704,11 @@ mod tests {
         )
         .unwrap();
         cleanup(&dir);
-        assert!(
-            loaded.inference_errors.is_empty(),
-            "no inference errors expected, got {:?}",
-            loaded.inference_errors,
-        );
         assert_eq!(
-            loaded.parsed.export_params[0].type_expr,
-            crate::parser::TypeExpr::String,
+            loaded.parsed.export_params[0].static_type,
+            crate::static_type::ExportStaticType::Inferred(crate::static_type::StaticType::Known(
+                crate::parser::TypeExpr::String
+            )),
         );
     }
 

@@ -4,6 +4,7 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::schema::{TypeIdentity, levenshtein_distance};
+use crate::static_type::StaticTypeResolutionError;
 
 use super::ast::{ResourceTypePath, TypeExpr};
 use super::error::{ParseError, ParseWarning};
@@ -100,9 +101,9 @@ pub const BUILTIN_BARE_CUSTOM_TYPES: &[&str] = &[
 pub(crate) fn resolve_known_bare_custom_type(
     snake: &str,
     config: &ProviderContext,
-) -> Result<Option<TypeExpr>, String> {
+) -> Option<TypeExpr> {
     if BUILTIN_BARE_CUSTOM_TYPES.contains(&snake) {
-        return Ok(Some(TypeExpr::Simple(snake.to_string())));
+        return Some(TypeExpr::Simple(snake.to_string()));
     }
     let pascal = snake_to_pascal(snake);
     let matches = config
@@ -114,9 +115,7 @@ pub(crate) fn resolve_known_bare_custom_type(
                 && owned.identity().kind == pascal
         })
         .collect::<Vec<_>>();
-    let Some(first) = matches.first() else {
-        return Ok(None);
-    };
+    let first = matches.first()?;
     let owners = matches
         .iter()
         .skip(1)
@@ -124,7 +123,7 @@ pub(crate) fn resolve_known_bare_custom_type(
             owners.union(owned.owners())
         });
     let owned = crate::parser::OwnedTypeIdentity::with_owners(first.identity().clone(), owners);
-    Ok(Some(TypeExpr::SchemaType { owned }))
+    Some(TypeExpr::SchemaType { owned })
 }
 
 fn custom_type_suggestion_key(id: &TypeIdentity) -> String {
@@ -177,13 +176,23 @@ pub(crate) fn suggest_registered_dotted_custom_type(
         })
 }
 
-pub(crate) fn unknown_custom_type_message(input: &str, config: &ProviderContext) -> String {
+pub(crate) fn unknown_custom_type_error(
+    input: &str,
+    config: &ProviderContext,
+) -> StaticTypeResolutionError {
     match suggest_registered_dotted_custom_type(input, config) {
-        Some(suggestion) => {
-            format!("unknown custom type '{input}'; suggestion: use '{suggestion}'")
-        }
-        None => format!("unknown custom type '{input}'"),
+        Some(suggestion) => StaticTypeResolutionError::UnknownCustomTypeWithSuggestion {
+            name: input.to_string(),
+            suggestion,
+        },
+        None => StaticTypeResolutionError::UnknownCustomType {
+            name: input.to_string(),
+        },
     }
+}
+
+pub(crate) fn unknown_custom_type_message(input: &str, config: &ProviderContext) -> String {
+    unknown_custom_type_error(input, config).to_string()
 }
 
 fn parse_type_expr_atom(
@@ -233,13 +242,12 @@ fn parse_type_expr_atom(
                     // typos and renamed-then-removed types went unnoticed.
                     if config.custom_types_loaded() {
                         return match resolve_known_bare_custom_type(&snake, config) {
-                            Ok(Some(resolved)) => Ok(resolved),
-                            Ok(None) => Err(ParseError::unresolved_declaration_type(
+                            Some(resolved) => Ok(resolved),
+                            None => Err(ParseError::unresolved_declaration_type(
                                 other,
                                 type_span,
                                 unknown_custom_type_message(other, config),
                             )),
-                            Err(message) => Err(ParseError::InvalidExpression { line, message }),
                         };
                     }
                     Ok(TypeExpr::Simple(snake))
