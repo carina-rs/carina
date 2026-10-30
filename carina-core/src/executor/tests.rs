@@ -1269,6 +1269,7 @@ fn create_independent_create_plan<const N: usize>(names: [&str; N]) -> Plan {
 struct DelayedCountingProvider {
     default_delay: std::time::Duration,
     delays: HashMap<String, std::time::Duration>,
+    guest_egress: HashSet<String>,
     started: Arc<Mutex<Vec<String>>>,
 }
 
@@ -1277,12 +1278,18 @@ impl DelayedCountingProvider {
         Self {
             default_delay,
             delays: HashMap::new(),
+            guest_egress: HashSet::new(),
             started: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn with_delay(mut self, name: &str, delay: std::time::Duration) -> Self {
         self.delays.insert(name.to_string(), delay);
+        self
+    }
+
+    fn with_guest_egress(mut self, name: &str) -> Self {
+        self.guest_egress.insert(name.to_string());
         self
     }
 
@@ -1323,17 +1330,33 @@ impl Provider for DelayedCountingProvider {
         &self,
         id: &ResourceId,
         _request: CreateRequest,
-        _attempt: crate::provider::CreateAttempt,
+        attempt: crate::provider::CreateAttempt,
     ) -> BoxFuture<'_, Result<crate::provider::CreateOutcome, crate::provider::CreateFailure>> {
         let id = id.clone();
         let delay = self.delay_for(&id);
+        let guest_egress = self
+            .guest_egress
+            .contains(id.identity_str().expect("resolved identity"));
         let started = self.started.clone();
         Box::pin(async move {
             started
                 .lock()
                 .unwrap()
                 .push(id.identity_str().expect("resolved identity").to_string());
+            let guest_call = guest_egress.then(|| {
+                let call = attempt.start_guest_call();
+                call.egress_recorder().begin_request().dispatched();
+                call
+            });
             tokio::time::sleep(delay).await;
+            if let Some(call) = guest_call {
+                let decoded = call
+                    .finish()
+                    .decode((), |()| Ok(()))
+                    .await
+                    .expect("fixture guest return decodes");
+                let (_attempt, ()) = decoded.into_parts();
+            }
             Ok(crate::provider::CreateOutcome::fixture_success(
                 applied_state_for_test(ok_state(&id)),
             ))
@@ -5110,6 +5133,41 @@ async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_ef
         ["interrupted:test.r2:2/3", "interrupted:test.r3:3/3"],
         "started, abandoned effects must be interrupted in effect-index order"
     );
+}
+
+#[tokio::test]
+async fn cleanup_abandonment_checkpoints_unknown_outcome_after_guest_egress() {
+    let provider = DelayedCountingProvider::new(std::time::Duration::from_secs(60))
+        .with_guest_egress("unknown");
+    let observer = CancelsWhenStarted::with_cleanup_priority("unknown");
+    let shutdown = observer.token();
+    let plan = create_independent_create_plan(["unknown"]);
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::new(),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+    };
+
+    let result = match execute_plan(&provider, input, &observer, shutdown).await {
+        ExecutionOutcome::Cancelled(result) => result,
+        ExecutionOutcome::Completed(_) => panic!("cleanup-priority run returned Completed"),
+    };
+    let id = ResourceId::with_identity("test", "unknown");
+    assert!(matches!(
+        result.applied_states.get(&id),
+        Some(Applied::CreateOutcomeUnknown(unknown)) if unknown.id() == &id
+    ));
+    assert_eq!(result.interrupted_count, 1);
 }
 
 #[tokio::test]

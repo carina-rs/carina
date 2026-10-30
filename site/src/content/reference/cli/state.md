@@ -34,7 +34,7 @@ aws.ec2.Vpc main_vpc
 aws.ec2.Subnet public_subnet
 ```
 
-Rows whose state is not a plain applied resource carry a marker: `(no current instance)`, `(missing provider identifier)`, `(create in flight since <time>)`, or `(deposed <key> <identifier>)` for a pre-replacement instance pending delete.
+Rows whose state is not a plain applied resource carry a marker: `(no current instance)`, `(missing provider identifier)`, `(create in flight since <time>)`, `(create outcome unknown since <time>; the create may have reached the cloud)`, or `(deposed <key> <identifier>)` for a pre-replacement instance pending delete.
 
 Prints "No resources in state." if the state is empty.
 
@@ -132,6 +132,33 @@ carina state refresh [OPTIONS] [PATH]
 | Flag | Description |
 |------|-------------|
 | `--lock <BOOL>` | Enable/disable state locking (default: `true`) |
+
+### `forget`
+
+Forget a token-less create-outcome-unknown row after confirming that the
+resource does not exist in the provider. The command cannot remove applied,
+in-flight, missing-identifier, or absent rows; for ordinary state removal it
+points to a `removed { from = ... }` block instead.
+
+```bash
+carina state forget <RESOURCE_TYPE> <IDENTITY> [OPTIONS] [PATH]
+```
+
+For example:
+
+```bash
+carina state forget awscc.ec2.Vpc "main-vpc"
+```
+
+The command acquires the configured state lock, shows the row, and asks for
+confirmation before saving. After it succeeds, the next plan can propose the
+create normally.
+
+#### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--auto-approve` | Skip the confirmation prompt |
 
 ### `bucket-delete`
 

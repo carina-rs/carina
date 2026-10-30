@@ -1920,6 +1920,9 @@ mod tests {
             Current::Absent(state) => state.state(),
             Current::Present(present) => present.state(),
             Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
+            Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
+            }
             Current::MissingIdentifier(state) => state.state(),
         };
         let Value::Concrete(ConcreteValue::Map(pd)) =

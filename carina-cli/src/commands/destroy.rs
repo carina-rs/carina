@@ -540,6 +540,7 @@ async fn run_destroy_locked_owned(
                     Current::Absent(_state) => false,
                     Current::Present(_present) => true,
                     Current::CreateInFlight(_pending) => true,
+                    Current::CreateOutcomeUnknown(_unknown) => true,
                     Current::MissingIdentifier(_state) => true,
                 };
                 if exists
@@ -589,6 +590,7 @@ async fn run_destroy_locked_owned(
                     Current::Absent(_state) => false,
                     Current::Present(_present) => true,
                     Current::CreateInFlight(_pending) => true,
+                    Current::CreateOutcomeUnknown(_unknown) => true,
                     Current::MissingIdentifier(_state) => true,
                 });
             if !exists {
@@ -1612,6 +1614,10 @@ fn build_destroy_delete_effects(
                     resource.id.clone(),
                     carina_core::plan::PlanErrorKind::DestroyCreateInFlight,
                 ));
+                continue;
+            }
+            Some(Current::CreateOutcomeUnknown(unknown)) => {
+                errors.push(PlanError::create_outcome_unknown(unknown.id().clone()));
                 continue;
             }
             None => {
@@ -2983,6 +2989,40 @@ mod tests {
             assert!(message.contains(&expected_id.to_string()), "{message}");
             assert!(message.contains("run apply first"), "{message}");
         }
+    }
+
+    #[test]
+    fn destroy_rejects_create_outcome_unknown_with_resolution_hint() {
+        let resource = Resource::with_provider("mock", "test.Widget", "unknown", None);
+        let failure = carina_core::provider::CreateAttempt::for_test(resource.id.clone())
+            .outcome_unknown(
+                carina_core::provider::EgressSent::for_test(),
+                carina_core::provider::ProviderError::api_error("guest trapped"),
+            );
+        let carina_core::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } =
+            failure.into_kind()
+        else {
+            panic!("the egress witness must mint an unknown outcome")
+        };
+        let current_states = HashMap::from([(
+            resource.id.clone(),
+            Current::create_outcome_unknown(unknown),
+        )]);
+
+        let (effects, errors) =
+            build_destroy_delete_effects(&[&resource], &current_states, None, &HashSet::new());
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            errors.as_slice(),
+            [carina_core::plan::PlanError {
+                kind: carina_core::plan::PlanErrorKind::CreateOutcomeUnknown { .. },
+                ..
+            }]
+        ));
+        let message = errors[0].to_string();
+        assert!(message.contains("the create may have reached the cloud"));
+        assert!(message.contains("carina state forget mock.test.Widget \"unknown\""));
     }
 
     #[test]

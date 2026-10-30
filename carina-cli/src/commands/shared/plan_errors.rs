@@ -34,6 +34,7 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
             | PlanErrorKind::ResolvedValueConstraint { .. }
             | PlanErrorKind::CreateInFlightOrphan
             | PlanErrorKind::DestroyCreateInFlight
+            | PlanErrorKind::CreateOutcomeUnknown { .. }
             | PlanErrorKind::ResumeCreateRoutingMismatch { .. }
             | PlanErrorKind::ModuleConstraint(_) => other_count += 1,
         }

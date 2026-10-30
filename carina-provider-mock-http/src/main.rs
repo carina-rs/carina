@@ -17,6 +17,7 @@ const URL_ATTRIBUTE: &str = "url";
 const METHOD_ATTRIBUTE: &str = "method";
 const BODY_ATTRIBUTE: &str = "body";
 const SEND_PHASE_ATTRIBUTE: &str = "send_phase";
+const CREATE_BEHAVIOR_ATTRIBUTE: &str = "create_behavior";
 
 #[derive(Default)]
 struct MockHttpProvider;
@@ -161,6 +162,13 @@ impl CarinaProvider for MockHttpProvider {
                     )
                     .build(),
                 )
+                .attribute(
+                    CoreAttributeSchema::optional(
+                        CREATE_BEHAVIOR_ATTRIBUTE,
+                        CoreAttributeType::string(),
+                    )
+                    .build(),
+                )
                 .with_description("WASI HTTP send-phase probe")
                 .validate()
                 .expect("mock HTTP probe schema must be valid"),
@@ -227,7 +235,41 @@ impl CarinaProvider for MockHttpProvider {
                 "the HTTP probe requires a string body attribute",
             )));
         };
+        let behavior = request
+            .resource
+            .attributes
+            .get(CREATE_BEHAVIOR_ATTRIBUTE)
+            .and_then(|value| match value {
+                Value::String(value) => Some(value.clone()),
+                Value::Bool(_value) => None,
+                Value::Int(_value) => None,
+                Value::Float(_value) => None,
+                Value::StringList(_value) => None,
+                Value::List(_value) => None,
+                Value::Map(_value) => None,
+            });
+        if behavior.as_deref() == Some("trap_before_send") {
+            panic!("intentional mock HTTP trap before send");
+        }
         let phase = Self::wasi_http_send_phase(url, method, body);
+        match behavior.as_deref() {
+            Some("trap_after_send") => panic!("intentional mock HTTP trap after send"),
+            Some("untracked_after_send") => {
+                return Err(attempt.untracked(Self::error(
+                    id,
+                    ProviderErrorKind::ApiError,
+                    "provider declared untracked after send",
+                )));
+            }
+            None | Some("normal") => {}
+            Some(unsupported) => {
+                return Err(attempt.untracked(Self::error(
+                    id,
+                    ProviderErrorKind::InvalidInput,
+                    format!("unsupported create behavior {unsupported}"),
+                )));
+            }
+        }
         let mut attributes = request.resource.attributes;
         attributes.insert(SEND_PHASE_ATTRIBUTE.to_string(), Value::String(phase));
         let identifier =

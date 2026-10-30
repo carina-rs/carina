@@ -34,6 +34,18 @@ fn existing_state(id: ResourceId, attributes: HashMap<String, Value>) -> State {
     State::existing(id, attributes).with_identifier(identifier)
 }
 
+fn unknown_create_outcome(id: ResourceId) -> crate::provider::UnknownCreateOutcome {
+    let failure = crate::provider::CreateAttempt::new(id).outcome_unknown(
+        crate::provider::EgressSent::for_test(),
+        crate::provider::ProviderError::api_error("guest trapped"),
+    );
+    let crate::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } = failure.into_kind()
+    else {
+        panic!("the egress witness must mint an unknown outcome")
+    };
+    unknown
+}
+
 #[test]
 fn missing_identifier_current_produces_existing_plan_error() {
     let resource = Resource::new("test.resource", "managed");
@@ -233,6 +245,65 @@ fn in_flight_orphan_is_create_in_flight_orphan_error() {
     assert_eq!(plan.errors().len(), 1);
     assert_eq!(plan.errors()[0].resource_id, id);
     assert_eq!(plan.errors()[0].kind, PlanErrorKind::CreateInFlightOrphan);
+}
+
+#[test]
+fn outcome_unknown_blocks_both_desired_create_and_orphan_cleanup() {
+    let desired = Resource::with_provider("mock", "test.Resource", "managed", None);
+    let desired_id = desired.id.clone();
+    let current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(
+            desired_id.clone(),
+            Current::create_outcome_unknown(unknown_create_outcome(desired_id.clone())),
+        )]),
+        &SchemaRegistry::new(),
+        std::slice::from_ref(&desired),
+    );
+    let desired_plan = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+    assert!(desired_plan.effects().is_empty());
+    assert_eq!(
+        desired_plan.errors()[0].kind,
+        PlanErrorKind::CreateOutcomeUnknown {
+            resource: desired_id.clone(),
+        }
+    );
+
+    let orphan_id = ResourceId::with_provider_identity("mock", "test.Resource", "orphan", None);
+    let orphans = Orphans::from([Orphan::create_outcome_unknown(
+        unknown_create_outcome(orphan_id.clone()),
+        Some("orphan".to_string()),
+        Directives::default(),
+    )]);
+    let orphan_plan = create_plan(
+        &[],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &HashMap::new(),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &orphans,
+        &[],
+    );
+    assert!(orphan_plan.effects().is_empty());
+    assert_eq!(
+        orphan_plan.errors()[0].kind,
+        PlanErrorKind::CreateOutcomeUnknown {
+            resource: orphan_id,
+        }
+    );
 }
 
 #[test]
@@ -1978,6 +2049,9 @@ fn orphan_collection_rekeys_index_and_provider_state_together() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("test fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     assert_eq!(moved.id, new_id);
@@ -2082,6 +2156,9 @@ async fn prior_state_transform_rebuilds_managed_current_after_provider_transform
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("test fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     assert_eq!(

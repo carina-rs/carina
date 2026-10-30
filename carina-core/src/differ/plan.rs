@@ -480,6 +480,9 @@ fn create_plan_parts(
                     ));
                 }
             }
+            Current::CreateOutcomeUnknown(unknown) => {
+                plan.add_error(PlanError::create_outcome_unknown(unknown.id().clone()));
+            }
             Current::MissingIdentifier(_unidentified) => {
                 plan.add_error(PlanError::new(
                     resource.id.clone(),
@@ -597,6 +600,10 @@ fn create_plan_parts(
                     id.clone(),
                     PlanErrorKind::CreateInFlightOrphan,
                 ));
+                continue;
+            }
+            Current::CreateOutcomeUnknown(unknown) => {
+                plan.add_error(PlanError::create_outcome_unknown(unknown.id().clone()));
                 continue;
             }
             Current::MissingIdentifier(_state) => {
@@ -762,6 +769,7 @@ fn create_plan_parts(
                     Current::Absent(_absent) => None,
                     Current::Present(present) => Some(present.state()),
                     Current::CreateInFlight(_pending) => None,
+                    Current::CreateOutcomeUnknown(_unknown) => None,
                     Current::MissingIdentifier(unidentified) => Some(unidentified.state()),
                 });
         let wait_has_work = cached_state
@@ -1240,6 +1248,10 @@ fn promote_resource_to_pending_replace(
                 present.identifier().clone(),
             ),
             Current::CreateInFlight(_pending) => return None,
+            Current::CreateOutcomeUnknown(unknown) => {
+                plan.add_error(PlanError::create_outcome_unknown(unknown.id().clone()));
+                return None;
+            }
             Current::MissingIdentifier(_state) => {
                 plan.add_error(PlanError::new(
                     resource.id.clone(),
@@ -1327,6 +1339,10 @@ fn ensure_consumer_update(
         Current::Absent(_state) => return false,
         Current::Present(present) => (present.state().clone(), present.identifier().clone()),
         Current::CreateInFlight(_pending) => return false,
+        Current::CreateOutcomeUnknown(unknown) => {
+            plan.add_error(PlanError::create_outcome_unknown(unknown.id().clone()));
+            return false;
+        }
         Current::MissingIdentifier(_state) => {
             plan.add_error(PlanError::new(
                 resource.id.clone(),

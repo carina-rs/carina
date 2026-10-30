@@ -2418,6 +2418,7 @@ fn refreshed_prefix_state_info(
                     Current::Absent(state) => state.state(),
                     Current::Present(present) => present.state(),
                     Current::CreateInFlight(_pending) => return None,
+                    Current::CreateOutcomeUnknown(_unknown) => return None,
                     Current::MissingIdentifier(state) => state.state(),
                 };
                 let state_info = prefix_state_info(persisted, Some(current_state))?;
@@ -3186,6 +3187,7 @@ pub fn normalize_state_with_ctx(
                 Current::Absent(state) => Some(state.state()),
                 Current::Present(present) => Some(present.state()),
                 Current::CreateInFlight(_pending) => None,
+                Current::CreateOutcomeUnknown(_unknown) => None,
                 Current::MissingIdentifier(state) => Some(state.state()),
             };
             state.map(|state| (id.clone(), state.clone()))
@@ -5849,6 +5851,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
                         Current::Absent(_state) => false,
                         Current::Present(_present) => true,
                         Current::CreateInFlight(_pending) => true,
+                        Current::CreateOutcomeUnknown(_unknown) => true,
                         Current::MissingIdentifier(_state) => true,
                     })
                     .map(|(id, _loaded)| id.clone()),
@@ -6537,12 +6540,16 @@ pub fn resolve_state_blocks(
                 let Some(resolved_to) = resolve_import_target_in_desired(import_to, desired) else {
                     continue;
                 };
-                let already_in_state = state_file.as_ref().is_some_and(|sf| {
-                    sf.find_resource_by_state_block_address(&resolved_to)
-                        .is_some()
-                });
-                if !already_in_state {
-                    to.insert(resolved_to);
+                let disposition = state_file
+                    .as_ref()
+                    .map(|state| state.import_target_disposition(&resolved_to))
+                    .unwrap_or(carina_state::ImportTargetDisposition::Vacant);
+                match disposition {
+                    carina_state::ImportTargetDisposition::Vacant
+                    | carina_state::ImportTargetDisposition::ReplaceCreateOutcomeUnknown => {
+                        to.insert(resolved_to);
+                    }
+                    carina_state::ImportTargetDisposition::Occupied => {}
                 }
             }
         }
@@ -6718,6 +6725,8 @@ pub fn add_state_block_effects(
         std::collections::HashSet::new();
     let mut suppress_identifier_errors: std::collections::HashSet<StateBlockAddress> =
         std::collections::HashSet::new();
+    let mut suppress_outcome_unknown_errors: std::collections::HashSet<StateBlockAddress> =
+        std::collections::HashSet::new();
     let desired_ids: std::collections::HashSet<ResourceId> = desired_resources
         .iter()
         .map(|resource| resource.id.clone())
@@ -6730,11 +6739,19 @@ pub fn add_state_block_effects(
             StateBlock::Import { to, id } => {
                 let effective_to = resolve_import_target(to, desired_resources);
 
-                // Skip if resource already exists in state
-                let already_in_state = state_file
+                let disposition = state_file
                     .as_ref()
-                    .is_some_and(|sf| sf.find_resource_by_state_block_address(to).is_some());
-                if !already_in_state {
+                    .map(|state| state.import_target_disposition(to))
+                    .unwrap_or(carina_state::ImportTargetDisposition::Vacant);
+                let apply_import = match disposition {
+                    carina_state::ImportTargetDisposition::Vacant => true,
+                    carina_state::ImportTargetDisposition::ReplaceCreateOutcomeUnknown => {
+                        suppress_outcome_unknown_errors.insert(to.clone());
+                        true
+                    }
+                    carina_state::ImportTargetDisposition::Occupied => false,
+                };
+                if apply_import {
                     // carina#3329: resolve any `${binding.attr}` segments
                     // in `id` against the same binding view the resource
                     // attribute resolver uses. If the referenced binding
@@ -6869,6 +6886,35 @@ pub fn add_state_block_effects(
         });
     }
 
+    if !suppress_outcome_unknown_errors.is_empty() {
+        plan.retain_errors(|error| match &error.kind {
+            carina_core::plan::PlanErrorKind::CreateOutcomeUnknown { resource } => {
+                let Some(identity) = resource.identity() else {
+                    return true;
+                };
+                !suppress_outcome_unknown_errors.contains(&StateBlockAddress::new(
+                    resource.provider.clone(),
+                    resource.resource_type.clone(),
+                    identity.clone(),
+                ))
+            }
+            carina_core::plan::PlanErrorKind::PreventDestroy { .. }
+            | carina_core::plan::PlanErrorKind::SchemaNotRegistered(_)
+            | carina_core::plan::PlanErrorKind::ReplacementCannotCoexist(_)
+            | carina_core::plan::PlanErrorKind::MissingProviderIdentifier
+            | carina_core::plan::PlanErrorKind::CreateInFlightOrphan
+            | carina_core::plan::PlanErrorKind::DestroyCreateInFlight
+            | carina_core::plan::PlanErrorKind::ResumeCreateRoutingMismatch { .. }
+            | carina_core::plan::PlanErrorKind::InvalidImportProviderIdentifier
+            | carina_core::plan::PlanErrorKind::MissingDeposedProviderIdentifier { .. }
+            | carina_core::plan::PlanErrorKind::WaitTargetMissing { .. }
+            | carina_core::plan::PlanErrorKind::WaitTargetIsDataSource { .. }
+            | carina_core::plan::PlanErrorKind::WaitPredicateInvalid { .. }
+            | carina_core::plan::PlanErrorKind::ResolvedValueConstraint { .. }
+            | carina_core::plan::PlanErrorKind::ModuleConstraint(_) => true,
+        });
+    }
+
     // Add the new state block effects
     for effect in new_effects {
         plan.add(effect);
@@ -6988,6 +7034,7 @@ pub(crate) fn deposed_delete_effects_for_row(
             .unwrap_or_else(|| row.identity.clone())]),
         carina_state::CurrentInstance::None
         | carina_state::CurrentInstance::Applied { .. }
+        | carina_state::CurrentInstance::CreateOutcomeUnknown { .. }
         | carina_state::CurrentInstance::MissingIdentifier { .. } => HashSet::new(),
     };
     for deposed in &row.deposed {
@@ -7129,6 +7176,7 @@ pub async fn refresh_loaded_resource_with_retry(
         }
         Current::Absent(state) => Ok(Current::Absent(state)),
         Current::CreateInFlight(pending) => Ok(Current::CreateInFlight(pending)),
+        Current::CreateOutcomeUnknown(unknown) => Ok(Current::CreateOutcomeUnknown(unknown)),
         Current::MissingIdentifier(state) => Ok(Current::MissingIdentifier(state)),
     }
 }
@@ -7150,6 +7198,7 @@ pub async fn refresh_loaded_orphan_with_retry(
             Some((present.state().id.clone(), present.identifier().clone()))
         }
         Current::CreateInFlight(_pending) => None,
+        Current::CreateOutcomeUnknown(_unknown) => None,
         Current::MissingIdentifier(_state) => None,
     };
     match provider_read {
@@ -7176,6 +7225,7 @@ async fn refresh_loaded_orphans(
                 Current::Absent(state) => &state.state().id,
                 Current::Present(present) => &present.state().id,
                 Current::CreateInFlight(pending) => pending.id(),
+                Current::CreateOutcomeUnknown(unknown) => unknown.id(),
                 Current::MissingIdentifier(state) => &state.state().id,
             };
             let progress = refresh_phase.begin(id);
@@ -8050,6 +8100,7 @@ fn managed_resource_is_missing_from_state(
         Current::Absent(_state) => true,
         Current::Present(_present) => false,
         Current::CreateInFlight(_pending) => false,
+        Current::CreateOutcomeUnknown(_unknown) => false,
         Current::MissingIdentifier(_state) => false,
     }
 }

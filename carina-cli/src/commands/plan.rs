@@ -1618,11 +1618,35 @@ impl PlanFile {
                 } => None,
             })
             .collect();
+        let planned_unknown_origins: HashMap<_, _> = contents
+            .current_states
+            .iter()
+            .filter_map(|entry| match entry {
+                CurrentStateEntry::Managed { id, current } => current
+                    .planned_outcome_unknown_started_at()
+                    .map(|started_at| (moved_origins.origin_for(id).clone(), started_at.clone())),
+            })
+            .collect();
 
         if let Some(state_file) = state_file {
             for row in state_file.resources() {
                 let row_in_flight = match row.current() {
                     carina_state::CurrentInstance::CreateInFlight { pending: _pending } => true,
+                    carina_state::CurrentInstance::CreateOutcomeUnknown { unknown } => {
+                        let locked_id = ResourceId::with_provider_identity(
+                            row.provider.clone(),
+                            row.resource_type.clone(),
+                            row.identity.clone(),
+                            row.directives.provider_instance.clone(),
+                        );
+                        if planned_unknown_origins.get(&locked_id) != Some(unknown.started_at()) {
+                            return Err(carina_core::plan::PlanError::create_outcome_unknown(
+                                locked_id,
+                            )
+                            .to_string());
+                        }
+                        false
+                    }
                     carina_state::CurrentInstance::None => false,
                     carina_state::CurrentInstance::Applied {
                         identifier: _identifier,
@@ -1684,12 +1708,34 @@ impl PlanFile {
                             ));
                         }
                         (
+                            ReloadSavedManagedCurrent::CreateOutcomeUnknownMarker {
+                                started_at: planned_started_at,
+                            },
+                            Current::CreateOutcomeUnknown(unknown),
+                        ) if &planned_started_at == unknown.started_at() => {
+                            Box::new(Current::CreateOutcomeUnknown(unknown))
+                        }
+                        (ReloadSavedManagedCurrent::CreateOutcomeUnknownMarker { .. }, _locked) => {
+                            return Err(format!(
+                                "saved plan is stale for {id}: create-outcome-unknown status or timestamp changed; create a new plan before applying"
+                            ));
+                        }
+                        (
                             ReloadSavedManagedCurrent::Snapshot(_saved),
                             Current::CreateInFlight(_pending),
                         ) => {
                             return Err(format!(
                                 "saved plan is stale for {id}: create-in-flight status changed from false to true; create a new plan before applying"
                             ));
+                        }
+                        (
+                            ReloadSavedManagedCurrent::Snapshot(_saved),
+                            Current::CreateOutcomeUnknown(unknown),
+                        ) => {
+                            return Err(carina_core::plan::PlanError::create_outcome_unknown(
+                                unknown.id().clone(),
+                            )
+                            .to_string());
                         }
                         (ReloadSavedManagedCurrent::Snapshot(saved), _locked) => saved,
                     };
@@ -2373,6 +2419,7 @@ pub(crate) fn collect_historical_display_attributes<S>(
                             Current::Absent(state) => state.state(),
                             Current::Present(present) => present.state(),
                             Current::CreateInFlight(_pending) => continue,
+                            Current::CreateOutcomeUnknown(_unknown) => continue,
                             Current::MissingIdentifier(state) => state.state(),
                         };
                         let persisted_id = moved_origins.origin_for(key.id());
@@ -2820,11 +2867,17 @@ enum SavedManagedCurrentKind {
     Present(Box<State>),
     MissingIdentifier(Box<State>),
     CreateInFlightMarker,
+    CreateOutcomeUnknownMarker {
+        started_at: carina_core::provider::Timestamp,
+    },
 }
 
 enum ReloadSavedManagedCurrent {
     Snapshot(Box<Current>),
     CreateInFlightMarker,
+    CreateOutcomeUnknownMarker {
+        started_at: carina_core::provider::Timestamp,
+    },
 }
 
 impl SavedManagedCurrent {
@@ -2839,6 +2892,11 @@ impl SavedManagedCurrent {
                 SavedManagedCurrentKind::Present(Box::new(state))
             }
             Current::CreateInFlight(_pending) => SavedManagedCurrentKind::CreateInFlightMarker,
+            Current::CreateOutcomeUnknown(unknown) => {
+                SavedManagedCurrentKind::CreateOutcomeUnknownMarker {
+                    started_at: unknown.started_at().clone(),
+                }
+            }
             Current::MissingIdentifier(state) => {
                 SavedManagedCurrentKind::MissingIdentifier(Box::new(state.state().clone()))
             }
@@ -2848,6 +2906,16 @@ impl SavedManagedCurrent {
 
     fn planned_in_flight(&self) -> bool {
         matches!(self.0, SavedManagedCurrentKind::CreateInFlightMarker)
+    }
+
+    fn planned_outcome_unknown_started_at(&self) -> Option<&carina_core::provider::Timestamp> {
+        match &self.0 {
+            SavedManagedCurrentKind::CreateOutcomeUnknownMarker { started_at } => Some(started_at),
+            SavedManagedCurrentKind::Absent(_)
+            | SavedManagedCurrentKind::Present(_)
+            | SavedManagedCurrentKind::MissingIdentifier(_)
+            | SavedManagedCurrentKind::CreateInFlightMarker => None,
+        }
     }
 
     fn into_reload_kind(self) -> ReloadSavedManagedCurrent {
@@ -2860,6 +2928,9 @@ impl SavedManagedCurrent {
             SavedManagedCurrentKind::CreateInFlightMarker => {
                 ReloadSavedManagedCurrent::CreateInFlightMarker
             }
+            SavedManagedCurrentKind::CreateOutcomeUnknownMarker { started_at } => {
+                ReloadSavedManagedCurrent::CreateOutcomeUnknownMarker { started_at }
+            }
         }
     }
 
@@ -2869,6 +2940,7 @@ impl SavedManagedCurrent {
             | SavedManagedCurrentKind::Present(state)
             | SavedManagedCurrentKind::MissingIdentifier(state) => state_contains(state),
             SavedManagedCurrentKind::CreateInFlightMarker => false,
+            SavedManagedCurrentKind::CreateOutcomeUnknownMarker { .. } => false,
         }
     }
 
@@ -2878,6 +2950,7 @@ impl SavedManagedCurrent {
             | SavedManagedCurrentKind::Present(state)
             | SavedManagedCurrentKind::MissingIdentifier(state) => Some(&state.id),
             SavedManagedCurrentKind::CreateInFlightMarker => None,
+            SavedManagedCurrentKind::CreateOutcomeUnknownMarker { .. } => None,
         }
     }
 
@@ -2900,16 +2973,22 @@ mod managed_current_serde {
         status: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<State>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<carina_core::provider::Timestamp>,
     }
 
     pub fn serialize<S>(current: &SavedManagedCurrent, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let mut wire = serializer.serialize_struct("Current", 2)?;
+        let mut wire = serializer.serialize_struct("Current", 3)?;
         match &current.0 {
             SavedManagedCurrentKind::CreateInFlightMarker => {
                 wire.serialize_field("status", "create_in_flight")?;
+            }
+            SavedManagedCurrentKind::CreateOutcomeUnknownMarker { started_at } => {
+                wire.serialize_field("status", "create_outcome_unknown")?;
+                wire.serialize_field("started_at", started_at)?;
             }
             SavedManagedCurrentKind::Absent(state) => {
                 wire.serialize_field("status", "absent")?;
@@ -2931,16 +3010,40 @@ mod managed_current_serde {
     where
         D: Deserializer<'de>,
     {
-        let Wire { status, state } = Wire::deserialize(deserializer)?;
+        let Wire {
+            status,
+            state,
+            started_at,
+        } = Wire::deserialize(deserializer)?;
         if status == "create_in_flight" {
-            if state.is_some() {
+            if state.is_some() || started_at.is_some() {
                 return Err(D::Error::custom(
-                    "create-in-flight saved-plan markers must not contain state or a provider token",
+                    "create-in-flight saved-plan markers must not contain state, a timestamp, or a provider token",
                 ));
             }
             return Ok(SavedManagedCurrent(
                 SavedManagedCurrentKind::CreateInFlightMarker,
             ));
+        }
+        if status == "create_outcome_unknown" {
+            if state.is_some() {
+                return Err(D::Error::custom(
+                    "create-outcome-unknown saved-plan markers must not contain state or a provider token",
+                ));
+            }
+            let started_at = started_at.ok_or_else(|| {
+                D::Error::custom(
+                    "create-outcome-unknown saved-plan markers require a started_at timestamp",
+                )
+            })?;
+            return Ok(SavedManagedCurrent(
+                SavedManagedCurrentKind::CreateOutcomeUnknownMarker { started_at },
+            ));
+        }
+        if started_at.is_some() {
+            return Err(D::Error::custom(format!(
+                "managed current-state tag {status:?} must not contain started_at"
+            )));
         }
         let state = state.ok_or_else(|| {
             D::Error::custom(format!(
@@ -2954,6 +3057,11 @@ mod managed_current_serde {
             Current::CreateInFlight(_pending) => {
                 return Err(D::Error::custom(
                     "saved-plan state payload cannot construct an in-flight create",
+                ));
+            }
+            Current::CreateOutcomeUnknown(_unknown) => {
+                return Err(D::Error::custom(
+                    "saved-plan state payload cannot construct an outcome-unknown create",
                 ));
             }
             Current::MissingIdentifier(_state) => "missing_identifier",
@@ -2971,9 +3079,12 @@ mod managed_current_serde {
 mod managed_current_serde_tests {
     use super::{
         CurrentStateEntry, PlanFile, PlanFileContents, ReloadSavedManagedCurrent,
-        ReloadedCurrentStateEntry, SavedManagedCurrent,
+        ReloadedCurrentStateEntry, SavedManagedCurrent, SavedManagedCurrentKind,
     };
-    use carina_core::provider::{AppliedIdentifier, Sent};
+    use carina_core::provider::{
+        AppliedIdentifier, CreateAttempt, CreateFailureKind, EgressSent, ProviderError, Sent,
+        UnknownCreateOutcome,
+    };
     use carina_core::resource::{
         Current, ResolvedResource, Resource, ResourceId, State, fixture_present_current,
     };
@@ -3008,6 +3119,91 @@ mod managed_current_serde_tests {
             &[],
         ))
         .expect("test plan provider evidence must be valid")
+    }
+
+    fn unknown_outcome(id: ResourceId) -> UnknownCreateOutcome {
+        let failure = CreateAttempt::for_test(id).outcome_unknown(
+            EgressSent::for_test(),
+            ProviderError::api_error("guest trapped"),
+        );
+        let CreateFailureKind::OutcomeUnknown { unknown, .. } = failure.into_kind() else {
+            panic!("the egress witness must mint an unknown outcome")
+        };
+        unknown
+    }
+
+    #[test]
+    fn saved_plan_unknown_marker_round_trips_and_rejects_status_changes() {
+        let resource = ResolvedResource::new(Resource::with_provider(
+            "mock",
+            "test.Resource",
+            "unknown",
+            None,
+        ));
+        let id = resource.id.clone();
+        let unknown = unknown_outcome(id.clone());
+        let entry = CurrentStateEntry::Managed {
+            id: id.clone(),
+            current: SavedManagedCurrent::from_current(Current::create_outcome_unknown(
+                unknown.clone(),
+            )),
+        };
+        let encoded = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            encoded["current"]["status"],
+            serde_json::json!("create_outcome_unknown")
+        );
+        assert_eq!(
+            encoded["current"]["started_at"],
+            serde_json::json!(unknown.started_at().as_str())
+        );
+        assert!(encoded["current"].get("state").is_none());
+
+        let row = ResourceState::from_unknown_create_outcome(
+            &resource,
+            &unknown,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        );
+        let mut locked = StateFile::new();
+        locked.upsert_resource(row).unwrap();
+
+        let exact = plan_file_with_current(
+            id.clone(),
+            SavedManagedCurrent::from_current(Current::create_outcome_unknown(unknown.clone())),
+        )
+        .reload_in_flight_from_locked_state(Some(&locked))
+        .expect("an unchanged outcome-unknown marker must reload under the lock");
+        let ReloadedCurrentStateEntry::Managed {
+            id: exact_id,
+            current: exact_current,
+        } = exact
+            .current_states()
+            .first()
+            .expect("reloaded outcome-unknown current state");
+        assert_eq!(exact_id, &id);
+        assert!(matches!(
+            exact_current.as_ref(),
+            Current::CreateOutcomeUnknown(reloaded) if reloaded == &unknown
+        ));
+
+        let appeared = plan_file_with_current(
+            id.clone(),
+            SavedManagedCurrent::from_current(Current::absent(id.clone())),
+        )
+        .reload_in_flight_from_locked_state(Some(&locked))
+        .expect_err("an unknown row appearing after planning must invalidate the plan");
+        assert!(appeared.contains("the create may have reached the cloud"));
+        assert!(appeared.contains("carina state forget"));
+
+        let disappeared = plan_file_with_current(
+            id,
+            SavedManagedCurrent::from_current(Current::create_outcome_unknown(unknown)),
+        )
+        .reload_in_flight_from_locked_state(None)
+        .expect_err("an unknown row disappearing after planning must invalidate the plan");
+        assert!(disappeared.contains("status or timestamp changed"));
     }
 
     #[test]
@@ -3054,6 +3250,9 @@ mod managed_current_serde_tests {
                     }
                     Current::CreateInFlight(pending) => {
                         panic!("Present serialized as in flight: {pending:?}")
+                    }
+                    Current::CreateOutcomeUnknown(unknown) => {
+                        panic!("Present serialized as outcome unknown: {unknown:?}")
                     }
                     Current::MissingIdentifier(state) => {
                         panic!("Present serialized without an identifier: {state:?}")
@@ -3215,6 +3414,62 @@ mod managed_current_serde_tests {
             pending.token().expose_for_provider_call(),
             "state-owned-token"
         );
+    }
+
+    #[test]
+    fn saved_plan_reloads_moved_outcome_unknown_row_from_its_source_address() {
+        use carina_core::effect::Effect;
+        use carina_core::resource::ResolvedResourceId;
+
+        let source = ResourceId::with_provider_identity("mock", "test.Resource", "source", None);
+        let destination =
+            ResourceId::with_provider_identity("mock", "test.Resource", "destination", None);
+        let source_resource = ResolvedResource::new(Resource::from_id(source.clone()));
+        let unknown = unknown_outcome(source.clone());
+        let started_at = unknown.started_at().clone();
+        let row = ResourceState::from_unknown_create_outcome(
+            &source_resource,
+            &unknown,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        );
+        let mut locked = StateFile::new();
+        locked
+            .upsert_resource(row)
+            .expect("outcome-unknown state fixture must be valid");
+        let mut contents = plan_file_with_current(
+            destination.clone(),
+            SavedManagedCurrent(SavedManagedCurrentKind::CreateOutcomeUnknownMarker {
+                started_at: started_at.clone(),
+            }),
+        )
+        .into_contents();
+        contents.plan.add(Effect::Move {
+            from: ResolvedResourceId::new(source),
+            to: ResolvedResourceId::new(destination.clone()),
+        });
+        let plan = contents
+            .record_for_test(&crate::wiring::ValidatedConfig::from_factories_for_test(
+                (),
+                Vec::new(),
+                &[],
+            ))
+            .expect("test plan provider evidence must be valid");
+
+        let reloaded = plan
+            .reload_in_flight_from_locked_state(Some(&locked))
+            .expect("a moved outcome-unknown marker must reload from its source row");
+        let ReloadedCurrentStateEntry::Managed { id, current } = reloaded
+            .current_states()
+            .first()
+            .expect("moved outcome-unknown current state");
+        assert_eq!(id, &destination);
+        let Current::CreateOutcomeUnknown(unknown) = current.as_ref() else {
+            panic!("moved marker must reload the state-owned unknown outcome")
+        };
+        assert_eq!(unknown.id(), &destination);
+        assert_eq!(unknown.started_at(), &started_at);
     }
 }
 
@@ -3408,6 +3663,7 @@ fn build_plan_file_contents<E>(
                 Current::Absent(state) => Some(state.state()),
                 Current::Present(present) => Some(present.state()),
                 Current::CreateInFlight(_pending) => None,
+                Current::CreateOutcomeUnknown(_unknown) => None,
                 Current::MissingIdentifier(state) => Some(state.state()),
             };
             state.map(|state| redact_current_state(id, state).map(|state| (id.clone(), state)))

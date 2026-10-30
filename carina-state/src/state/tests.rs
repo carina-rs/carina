@@ -67,6 +67,229 @@ fn diff(
 }
 
 #[test]
+fn v19_migrates_to_v20_without_rewriting_resource_data() {
+    let json = serde_json::json!({
+        "version": 19,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 7,
+        "lineage": "v19-lineage",
+        "carina_version": "legacy",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "carried",
+            "provider": "mock",
+            "current": {
+                "kind": "applied",
+                "identifier": "provider-id",
+                "attributes": {"name": "carried"},
+                "nested_write_only": {}
+            },
+            "protected": true,
+            "binding": "carried_binding"
+        }],
+        "exports": {"answer": 42}
+    });
+
+    let migrated = check_and_migrate(&json.to_string()).expect("v19 state must migrate");
+    assert_eq!(
+        migrated.migration(),
+        Some(MigrationInfo { from: 19, to: 20 })
+    );
+    let state = migrated.into_state();
+    assert_eq!(state.version, 20);
+    assert_eq!(state.serial, 7);
+    assert_eq!(state.lineage, "v19-lineage");
+    assert_eq!(state.resources().len(), 1);
+    assert_eq!(state.resources()[0].identity.as_str(), "carried");
+    assert!(state.resources()[0].protected);
+    assert_eq!(
+        state.resources()[0].binding.as_deref(),
+        Some("carried_binding")
+    );
+    assert_eq!(
+        serde_json::to_value(&state).unwrap()["exports"]["answer"],
+        serde_json::json!(42)
+    );
+}
+
+#[test]
+fn create_outcome_unknown_row_round_trips_without_identifier_or_token() {
+    use carina_core::resource::Current;
+
+    let json = serde_json::json!({
+        "version": 20,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "unknown-create",
+        "carina_version": "test",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "unknown",
+            "provider": "mock",
+            "current": {
+                "kind": "create_outcome_unknown",
+                "started_at": "2026-10-23T08:00:00Z"
+            },
+            "directives": {"provider_instance": "issuing"},
+            "binding": "unknown_binding",
+            "deposed": [{
+                "key": "00000000-0000-4000-8000-000000000001",
+                "identifier": "old-id",
+                "provider_instance": "old-route",
+                "attributes": {},
+                "dependency_bindings": []
+            }]
+        }],
+        "exports": {}
+    });
+    let state = check_and_migrate(&json.to_string())
+        .expect("v20 outcome-unknown state must load")
+        .into_state();
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.Resource",
+        "unknown",
+        Some("issuing".into()),
+    );
+
+    let Current::CreateOutcomeUnknown(unknown) = state.build_state_for_resource(&id) else {
+        panic!("the token-less protected row must retain its typed lifecycle state")
+    };
+    assert_eq!(unknown.id(), &id);
+    assert_eq!(unknown.started_at().as_str(), "2026-10-23T08:00:00Z");
+    let row = state
+        .find_resource_for_id(&id)
+        .expect("outcome-unknown row remains addressable");
+    assert_eq!(row.identifier(), None);
+    assert!(row.refreshable().is_none());
+    assert_eq!(row.binding.as_deref(), Some("unknown_binding"));
+    assert_eq!(row.deposed.len(), 1);
+
+    let encoded = serde_json::to_value(&state).expect("v20 state must serialize");
+    assert_eq!(
+        encoded["resources"][0]["current"],
+        serde_json::json!({
+            "kind": "create_outcome_unknown",
+            "started_at": "2026-10-23T08:00:00Z"
+        })
+    );
+    let reloaded = check_and_migrate(&encoded.to_string())
+        .expect("serialized outcome-unknown row must reload")
+        .into_state();
+    assert_eq!(
+        serde_json::to_value(&state).unwrap(),
+        serde_json::to_value(&reloaded).unwrap()
+    );
+}
+
+#[test]
+fn create_outcome_unknown_row_rejects_identifier_and_token_fields() {
+    let base = serde_json::json!({
+        "version": 20,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "exclusive-unknown-create",
+        "carina_version": "test",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "unknown",
+            "provider": "mock",
+            "current": {
+                "kind": "create_outcome_unknown",
+                "started_at": "2026-10-23T08:00:00Z"
+            }
+        }],
+        "exports": {}
+    });
+    for forbidden in ["identifier", "token"] {
+        let mut malformed = base.clone();
+        malformed["resources"][0]["current"][forbidden] = serde_json::json!("forbidden");
+        assert!(
+            check_and_migrate(&malformed.to_string()).is_err(),
+            "outcome-unknown current must reject {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn outcome_unknown_lookup_mints_the_only_forget_handle() {
+    let json = serde_json::json!({
+        "version": 20,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "forget-unknown-create",
+        "carina_version": "test",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "unknown",
+            "provider": "mock",
+            "current": {
+                "kind": "create_outcome_unknown",
+                "started_at": "2026-10-23T08:00:00Z"
+            }
+        }],
+        "exports": {}
+    });
+    let mut state = check_and_migrate(&json.to_string()).unwrap().into_state();
+    let address = StateBlockAddress::new("mock", "test.Resource", "unknown");
+
+    assert_eq!(
+        state.import_target_disposition(&address),
+        ImportTargetDisposition::ReplaceCreateOutcomeUnknown
+    );
+    let handle = state
+        .find_outcome_unknown(&address)
+        .expect("the protected row must mint a typed forget handle");
+    let forgotten = StateFile::forget(handle);
+
+    assert_eq!(forgotten.identity.as_str(), "unknown");
+    assert!(
+        state
+            .find_resource_by_state_block_address(&address)
+            .is_none()
+    );
+    assert_eq!(
+        state.import_target_disposition(&address),
+        ImportTargetDisposition::Vacant
+    );
+}
+
+#[test]
+fn outcome_unknown_lookup_rejects_normal_and_missing_rows_with_removed_hint() {
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(
+            ResourceState::try_applied("test.Resource", "normal", "mock", "provider-id").unwrap(),
+        )
+        .unwrap();
+    let normal = StateBlockAddress::new("mock", "test.Resource", "normal");
+    let missing = StateBlockAddress::new("mock", "test.Resource", "missing");
+
+    assert_eq!(
+        state.import_target_disposition(&normal),
+        ImportTargetDisposition::Occupied
+    );
+    let normal_error = state.find_outcome_unknown(&normal).unwrap_err();
+    assert_eq!(
+        normal_error.kind(),
+        NotOutcomeUnknownKind::DifferentLifecycle
+    );
+    assert!(
+        normal_error
+            .to_string()
+            .contains("removed { from = mock.test.Resource 'normal' }")
+    );
+
+    let missing_error = state.find_outcome_unknown(&missing).unwrap_err();
+    assert_eq!(missing_error.kind(), NotOutcomeUnknownKind::Missing);
+    assert!(
+        missing_error
+            .to_string()
+            .contains("removed { from = mock.test.Resource 'missing' }")
+    );
+}
+
+#[test]
 fn v15_migrates_to_current_and_round_trips_all_current_instance_variants() {
     let json = serde_json::json!({
         "version": 15,
@@ -724,7 +947,7 @@ fn whole_value(paths: &[&[&str]]) -> ExplicitFields {
 fn test_state_file_new() {
     let state = StateFile::new();
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
-    assert_eq!(StateFile::CURRENT_VERSION, 19);
+    assert_eq!(StateFile::CURRENT_VERSION, 20);
     assert_eq!(state.serial, 0);
     assert!(!state.lineage.is_empty());
     assert!(state.resources.is_empty());
@@ -734,7 +957,7 @@ fn test_state_file_new() {
 fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
     use carina_core::resource::{Resource, State as ProviderState};
 
-    assert_eq!(StateFile::CURRENT_VERSION, 19);
+    assert_eq!(StateFile::CURRENT_VERSION, 20);
     let marker = valid_legacy_marker_shaped_string("state-marker-collision");
     let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
@@ -767,6 +990,9 @@ fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
         Current::Present(present) => present.state().clone(),
         Current::Absent(state) => panic!("expected present state, got {state:?}"),
         Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => {
             panic!("expected valid provider identifier, got {state:?}")
         }
@@ -3431,6 +3657,9 @@ fn test_build_state_for_resource_existing() {
         Current::Present(present) => present.state().clone(),
         Current::Absent(state) => panic!("expected present state, got {state:?}"),
         Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => {
             panic!("expected valid provider identifier, got {state:?}")
         }
@@ -3465,6 +3694,9 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
         Current::Present(present) => present.state().clone(),
         Current::Absent(state) => panic!("expected present state, got {state:?}"),
         Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => {
             panic!("expected valid provider identifier, got {state:?}")
         }
@@ -3580,6 +3812,9 @@ fn test_build_state_for_resource_not_found() {
             panic!("expected absent state, got {:?}", present.state())
         }
         Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => {
             panic!("expected absent state, got {state:?}")
         }
@@ -4010,6 +4245,9 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     assert!(orphan_state.exists);
@@ -4043,6 +4281,9 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     assert_eq!(refreshed.binding(), Some("my_subnet"));
@@ -4080,6 +4321,9 @@ fn refreshing_loaded_orphan_to_absent_cannot_retain_an_identifier() {
             present.identifier()
         ),
         Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => {
             panic!("an absent refreshed orphan remained existing: {state:?}")
         }
@@ -4122,6 +4366,9 @@ fn build_orphans_retains_row_without_identifier_as_typed_invalid_orphan() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     assert!(state.exists);
@@ -4270,6 +4517,9 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
         Current::Absent(state) => carina_core::resource::Current::Absent(state),
         Current::Present(present) => carina_core::resource::Current::Present(present),
         Current::CreateInFlight(pending) => carina_core::resource::Current::CreateInFlight(pending),
+        Current::CreateOutcomeUnknown(unknown) => {
+            carina_core::resource::Current::CreateOutcomeUnknown(unknown)
+        }
         Current::MissingIdentifier(state) => {
             carina_core::resource::Current::MissingIdentifier(state)
         }
@@ -4722,7 +4972,7 @@ fn v8_state_migrates_to_current_with_empty_deposed() {
 fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
     use super::check_and_migrate;
 
-    assert_eq!(StateFile::CURRENT_VERSION, 19);
+    assert_eq!(StateFile::CURRENT_VERSION, 20);
     let json = format!(
         r#"{{
         "version": 11,
@@ -6619,6 +6869,10 @@ fn unobserved_not_found_create_records_identifier_and_partial_read() {
         CreateFailureKind::Untracked(error) => {
             panic!("identifier-bearing failure became untracked: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "identifier-bearing failure became outcome unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::InFlight { pending, error } => {
             panic!("identifier-bearing failure remained in flight {pending:?}: {error}")
         }
@@ -6678,6 +6932,10 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
         CreateFailureKind::Untracked(error) => {
             panic!("identifier-bearing failure became untracked: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "identifier-bearing failure became outcome unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::InFlight { pending, error } => {
             panic!("identifier-bearing failure remained in flight {pending:?}: {error}")
         }
@@ -6829,6 +7087,10 @@ fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappe
                 CreateFailureKind::Untracked(error) => {
                     panic!("expected an observed create, got untracked failure: {error}")
                 }
+                CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+                    "expected an observed create, got unknown outcome for {}: {error}",
+                    unknown.id()
+                ),
                 CreateFailureKind::InFlight {
                     pending: _pending,
                     error,

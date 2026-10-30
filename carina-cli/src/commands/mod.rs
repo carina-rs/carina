@@ -56,6 +56,7 @@ pub enum DriftCommand {
     Apply,
     Destroy,
     RefreshState,
+    ForgetState,
 }
 
 impl DriftCommand {
@@ -64,6 +65,7 @@ impl DriftCommand {
             Self::Apply => "Cannot apply",
             Self::Destroy => "Cannot destroy",
             Self::RefreshState => "Cannot refresh state",
+            Self::ForgetState => "Cannot forget state",
         }
     }
 }

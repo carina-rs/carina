@@ -425,6 +425,9 @@ pub(crate) fn fixture_in_flight_create(
         carina_core::provider::CreateFailureKind::Untracked(error) => {
             panic!("pending fixture was classified untracked: {error}")
         }
+        carina_core::provider::CreateFailureKind::OutcomeUnknown { error, .. } => {
+            panic!("pending fixture was classified outcome unknown: {error}")
+        }
     }
 }
 
@@ -501,6 +504,9 @@ pub(crate) fn fixture_observed_create(
         } => panic!("observed fixture remained pending: {error}"),
         carina_core::provider::CreateFailureKind::Untracked(error) => {
             panic!("observed fixture was classified untracked: {error}")
+        }
+        carina_core::provider::CreateFailureKind::OutcomeUnknown { error, .. } => {
+            panic!("observed fixture was classified outcome unknown: {error}")
         }
     }
 }

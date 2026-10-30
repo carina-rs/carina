@@ -1,7 +1,7 @@
 //! Integration tests for the general mock and the isolated wasi:http probe guests.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -324,6 +324,14 @@ fn http_send_phase_resource(identity: &str, url: &str, method: &str, body: &str)
     resource
 }
 
+fn with_http_create_behavior(mut resource: Resource, behavior: &str) -> Resource {
+    resource.attributes.insert(
+        "create_behavior".to_string(),
+        Value::Concrete(ConcreteValue::String(behavior.to_string().into())),
+    );
+    resource
+}
+
 fn http_probe_body() -> String {
     // Exceed the two-chunk host body buffer so the closed-port case can close
     // the receiver while the guest is still writing, exercising the
@@ -340,12 +348,172 @@ fn http_probe_outcome(state: &State) -> &str {
     outcome.expose_plaintext()
 }
 
+fn spawn_http_ok_server() -> Option<(SocketAddr, std::thread::JoinHandle<usize>)> {
+    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
+            return None;
+        }
+    };
+    let address = listener
+        .local_addr()
+        .expect("bound loopback listener has an address");
+    listener
+        .set_nonblocking(true)
+        .expect("set loopback listener nonblocking");
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "server accept timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("server accept failed: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set server read timeout");
+        let mut request = vec![0_u8; 32 * 1024];
+        let bytes_read = stream
+            .read(&mut request)
+            .expect("read dispatched request bytes");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .expect("write successful HTTP response");
+        bytes_read
+    });
+    Some((address, server))
+}
+
 fn create_failure_error(failure: CreateFailure) -> ProviderError {
     match failure.into_kind() {
         CreateFailureKind::Untracked(error) => error,
+        CreateFailureKind::OutcomeUnknown { unknown: _, error } => error,
         CreateFailureKind::InFlight { pending: _, error } => error,
         CreateFailureKind::Created { created: _, error } => error,
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_create_trap_after_dispatched_egress_is_outcome_unknown() {
+    let path = skip_if_no_http_wasm!();
+    let Some((server_address, server)) = spawn_http_ok_server() else {
+        return;
+    };
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", server_address);
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should initialize");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "trap-after-egress",
+        None,
+    );
+    let resource = with_http_create_behavior(
+        http_send_phase_resource(
+            "trap-after-egress",
+            &format!("http://phase-test.invalid:{}/", server_address.port()),
+            "POST",
+            &http_probe_body(),
+        ),
+        "trap_after_send",
+    );
+
+    let failure = provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("the guest must trap after the request completes");
+    let bytes_read = server.join().expect("loopback server should finish");
+
+    assert!(bytes_read > 0, "the request must actually leave the guest");
+    let CreateFailureKind::OutcomeUnknown { unknown, error } = failure.into_kind() else {
+        panic!("a trap after dispatched egress must not be classified untracked")
+    };
+    assert_eq!(unknown.id(), &id);
+    assert!(error.to_string().contains("WASM guest trapped"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_create_trap_without_egress_is_untracked() {
+    let path = skip_if_no_http_wasm!();
+    let (factory, _cache) = load_http_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should initialize");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "trap-before-egress",
+        None,
+    );
+    let resource = with_http_create_behavior(
+        http_send_phase_resource(
+            "trap-before-egress",
+            "http://phase-test.invalid:1/",
+            "POST",
+            &http_probe_body(),
+        ),
+        "trap_before_send",
+    );
+
+    let failure = provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("the guest must trap before issuing the request");
+
+    let CreateFailureKind::Untracked(error) = failure.into_kind() else {
+        panic!("a trap with no dispatched egress must remain untracked")
+    };
+    assert!(error.to_string().contains("WASM guest trapped"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_declared_untracked_remains_untracked_after_egress() {
+    let path = skip_if_no_http_wasm!();
+    let Some((server_address, server)) = spawn_http_ok_server() else {
+        return;
+    };
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", server_address);
+    let provider = factory
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should initialize");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "declared-untracked-after-egress",
+        None,
+    );
+    let resource = with_http_create_behavior(
+        http_send_phase_resource(
+            "declared-untracked-after-egress",
+            &format!("http://phase-test.invalid:{}/", server_address.port()),
+            "POST",
+            &http_probe_body(),
+        ),
+        "untracked_after_send",
+    );
+
+    let failure = provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("the provider must return its declared verdict");
+    let bytes_read = server.join().expect("loopback server should finish");
+
+    assert!(bytes_read > 0, "the request must actually leave the guest");
+    let CreateFailureKind::Untracked(error) = failure.into_kind() else {
+        panic!("a decoded provider-declared untracked verdict must remain authoritative")
+    };
+    assert!(error.to_string().contains("provider declared untracked"));
 }
 
 fn persisted_create_for_resume(
@@ -389,6 +557,9 @@ fn persisted_create_for_resume(
         }
         carina_core::resource::Current::MissingIdentifier(state) => {
             panic!("resume fixture loaded without an identifier: {state:?}")
+        }
+        carina_core::resource::Current::CreateOutcomeUnknown(unknown) => {
+            panic!("resume fixture loaded as outcome unknown: {unknown:?}")
         }
     }
 }
@@ -545,12 +716,13 @@ async fn host_egress_denial_traps_instead_of_reaching_guest_send_phase_classific
         "denied",
     );
 
-    let error = create_failure_error(
-        provider
-            .create_for_test(&id, create_request_for_test(resource).await)
-            .await
-            .expect_err("the host egress policy must trap the guest"),
-    );
+    let failure = provider
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("the host egress policy must trap the guest");
+    let CreateFailureKind::Untracked(error) = failure.into_kind() else {
+        panic!("a policy-denied request must not count as dispatched egress")
+    };
     let rendered = error.to_string();
 
     assert!(
@@ -1172,6 +1344,10 @@ async fn test_wasm_pending_over_budget_times_out_without_poisoning_instance() {
         CreateFailureKind::Untracked(error) => {
             panic!("pending create was downgraded to untracked: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "pending create outcome became unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::Created { created, error } => panic!(
             "pending create was classified as created for {}: {error}",
             created.identifier()
@@ -1269,6 +1445,10 @@ async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() 
         CreateFailureKind::Untracked(error) => {
             panic!("undecodable token was downgraded to untracked: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "undecodable token became outcome unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::Created { created, error } => panic!(
             "undecodable token was classified as created for {}: {error}",
             created.identifier()
@@ -1306,6 +1486,10 @@ async fn initial_issued_encode_failure_is_created_never_untracked() {
         CreateFailureKind::Untracked(error) => {
             panic!("issued create was lost as untracked: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "issued create lost its identifier as outcome unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::InFlight { pending, error } => {
             panic!("finished create unexpectedly remained in flight {pending:?}: {error}")
         }
@@ -1345,6 +1529,10 @@ async fn initial_unissued_pending_token_encode_failure_is_untracked() {
         CreateFailureKind::Created { created, error } => panic!(
             "unissued create unexpectedly retained identifier {}: {error}",
             created.identifier()
+        ),
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "pre-dispatch token encoding failure became outcome unknown for {}: {error}",
+            unknown.id()
         ),
         CreateFailureKind::InFlight { pending, error } => {
             panic!("unencodable token entered in-flight state {pending:?}: {error}")
@@ -1402,6 +1590,10 @@ async fn initial_issued_pending_token_encode_failure_is_created() {
         CreateFailureKind::Untracked(error) => {
             panic!("issued create was lost as untracked: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "issued create lost its identifier as outcome unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::InFlight { pending, error } => {
             panic!("unencodable token entered in-flight state {pending:?}: {error}")
         }
@@ -1441,6 +1633,10 @@ async fn unissued_poll_token_encode_failure_keeps_previous_continuation() {
         CreateFailureKind::Untracked(error) => {
             panic!("poll token encoding failure lost the previous continuation: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "poll token encoding failure became outcome unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::Created { created, error } => panic!(
             "unissued poll unexpectedly retained identifier {}: {error}",
             created.identifier()
@@ -1489,6 +1685,10 @@ async fn issued_poll_token_encode_failure_keeps_previous_continuation() {
         CreateFailureKind::Untracked(error) => {
             panic!("issued poll was lost as untracked: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "issued poll became outcome unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::Created { created, error } => panic!(
             "issued poll ended the in-flight operation for {}: {error}",
             created.identifier()
@@ -1786,6 +1986,10 @@ async fn test_wasm_operation_budget_includes_initial_guest_call() {
         CreateFailureKind::Untracked(error) => {
             panic!("slow initial call was classified as untracked: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "slow initial call became outcome unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::Created { created, error } => panic!(
             "slow initial call was classified as created for {}: {error}",
             created.identifier()

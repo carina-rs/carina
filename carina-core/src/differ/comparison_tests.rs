@@ -2593,6 +2593,9 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("test fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     let result = diff_test(&resources[0], current, None, None, Some(&schema));
@@ -2686,6 +2689,9 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("test fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     let result = diff_test(
@@ -3045,6 +3051,9 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("test fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     let result = diff_test(
@@ -3183,6 +3192,9 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("test fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     let result = diff_test(

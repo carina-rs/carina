@@ -20,7 +20,8 @@ use crate::effect::Effect;
 use crate::executor::scheduler::FailureView;
 use crate::executor::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 use crate::provider::{
-    AppliedIdentifier, PartialReadDiagnostic, Provider, ProviderError, ReadRequest,
+    AppliedIdentifier, CancelledCreateReport, CreateCallCancellationReceiver,
+    PartialReadDiagnostic, Provider, ProviderError, ReadRequest,
 };
 #[cfg(test)]
 use crate::provider::{ReadOutcome, fixture_read_outcome_for_identifier};
@@ -111,6 +112,7 @@ pub(super) fn initial_wait_identifiers(
                 Current::Absent(_state) => None,
                 Current::Present(present) => Some(present.identifier().clone()),
                 Current::CreateInFlight(_pending) => None,
+                Current::CreateOutcomeUnknown(_unknown) => None,
                 Current::MissingIdentifier(_state) => None,
             };
             (id.clone(), identifier)
@@ -314,6 +316,7 @@ struct InterruptedEffect<S> {
 struct InterruptedRegistry<S> {
     abandoning: bool,
     effects: Vec<InterruptedEffect<S>>,
+    create_cancellations: HashMap<usize, CreateCallCancellationReceiver>,
     fail_safe_count: usize,
 }
 
@@ -322,6 +325,7 @@ impl<S> Default for InterruptedRegistry<S> {
         Self {
             abandoning: false,
             effects: Vec::new(),
+            create_cancellations: HashMap::new(),
             fail_safe_count: 0,
         }
     }
@@ -369,8 +373,26 @@ pub(super) struct StartedEffect<'a, S> {
 
 impl<S> StartedEffect<'_, S> {
     fn finish(&mut self) -> ProgressInfo {
+        self.interrupted
+            .lock()
+            .expect("interrupted effect registry poisoned")
+            .create_cancellations
+            .remove(&self.idx);
         self.terminal_emitted = true;
         self.progress
+    }
+
+    pub(super) fn track_create_cancellation(&mut self, receiver: CreateCallCancellationReceiver) {
+        let previous = self
+            .interrupted
+            .lock()
+            .expect("interrupted effect registry poisoned")
+            .create_cancellations
+            .insert(self.idx, receiver);
+        assert!(
+            previous.is_none(),
+            "one started effect may own only one guest-create cancellation reporter"
+        );
     }
 
     fn effect(&self) -> &Effect<S> {
@@ -449,6 +471,7 @@ impl<S> Drop for StartedEffect<'_, S> {
             return;
         }
         registry.fail_safe_count += 1;
+        registry.create_cancellations.remove(&self.idx);
         drop(registry);
 
         debug_assert!(
@@ -523,20 +546,21 @@ impl<'fut, R, S> WaitAwareInFlight<'fut, R, S> {
 
     /// Drop every unresolved future, emit its interruptions in effect-index
     /// order, and return those plus any fail-safe interruptions emitted earlier.
-    pub(super) fn abandon(self, observer: &dyn ExecutionObserver<S>) -> usize {
+    pub(super) fn abandon(self, observer: &dyn ExecutionObserver<S>) -> Abandonment {
         let interrupted_registry = Arc::clone(&self.interrupted);
         interrupted_registry
             .lock()
             .expect("interrupted effect registry poisoned")
             .abandoning = true;
         drop(self);
-        let (mut interrupted, fail_safe_count) = {
+        let (mut interrupted, fail_safe_count, cancellation_receivers) = {
             let mut registry = interrupted_registry
                 .lock()
                 .expect("interrupted effect registry poisoned");
             (
                 std::mem::take(&mut registry.effects),
                 std::mem::take(&mut registry.fail_safe_count),
+                std::mem::take(&mut registry.create_cancellations),
             )
         };
         interrupted.sort_by_key(|entry| entry.idx);
@@ -550,7 +574,14 @@ impl<'fut, R, S> WaitAwareInFlight<'fut, R, S> {
                 progress,
             });
         }
-        count
+        let create_reports = cancellation_receivers
+            .into_values()
+            .flat_map(|receiver| receiver.drain())
+            .collect();
+        Abandonment {
+            interrupted_count: count,
+            create_reports,
+        }
     }
 
     /// Begin the required terminal wait cancellation check before awaiting.
@@ -564,6 +595,11 @@ impl<'fut, R, S> WaitAwareInFlight<'fut, R, S> {
             undispatched_count,
         }
     }
+}
+
+pub(super) struct Abandonment {
+    pub(super) interrupted_count: usize,
+    pub(super) create_reports: Vec<CancelledCreateReport>,
 }
 
 /// Terminal-check typestate handle that blocks further pushes while alive.
@@ -1038,7 +1074,9 @@ mod tests {
             dropped.is_err(),
             "debug builds must catch the invariant violation"
         );
-        assert_eq!(in_flight.abandon(&observer), 1);
+        let abandonment = in_flight.abandon(&observer);
+        assert_eq!(abandonment.interrupted_count, 1);
+        assert!(abandonment.create_reports.is_empty());
     }
 
     #[test]

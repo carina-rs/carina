@@ -628,6 +628,11 @@ pub enum AppError {
     #[error(transparent)]
     Backend(#[from] BackendError),
 
+    /// `state forget` was asked to remove anything other than an
+    /// outcome-unknown create row.
+    #[error(transparent)]
+    StateForget(#[from] carina_state::NotOutcomeUnknown),
+
     /// A provider or desired value could not be encoded into one resource row.
     #[error(transparent)]
     ResourceStateEncoding(Box<LocatedResourceStateEncodingError>),

@@ -28,7 +28,7 @@ use crate::differ::ComparisonContext;
 use crate::effect::MoveAuthority;
 use crate::explicit::ExplicitFields;
 use crate::parser::display_string_literal;
-use crate::provider::{AppliedIdentifier, InFlightCreate};
+use crate::provider::{AppliedIdentifier, InFlightCreate, UnknownCreateOutcome};
 use crate::schema::{AttributeType, DslMap, ResourceSchema, Shape, ShapeWalkBudget, TypeIdentity};
 
 pub use enum_value::{
@@ -7498,6 +7498,7 @@ pub enum Current {
     Absent(AbsentState),
     Present(PresentResourceState),
     CreateInFlight(InFlightCreate),
+    CreateOutcomeUnknown(UnknownCreateOutcome),
     MissingIdentifier(UnidentifiedState),
 }
 
@@ -7549,11 +7550,16 @@ impl Current {
         Self::CreateInFlight(pending)
     }
 
+    pub fn create_outcome_unknown(unknown: UnknownCreateOutcome) -> Self {
+        Self::CreateOutcomeUnknown(unknown)
+    }
+
     pub fn id(&self) -> &ResourceId {
         match self {
             Self::Absent(state) => &state.0.id,
             Self::Present(present) => &present.state.id,
             Self::CreateInFlight(pending) => pending.id(),
+            Self::CreateOutcomeUnknown(unknown) => unknown.id(),
             Self::MissingIdentifier(state) => &state.0.id,
         }
     }
@@ -7576,6 +7582,7 @@ impl Current {
                 state: &mut present.state,
             }),
             Self::CreateInFlight(_pending) => None,
+            Self::CreateOutcomeUnknown(_unknown) => None,
             Self::MissingIdentifier(state) => Some(StateBearingCurrentMut {
                 state: &mut state.0,
             }),
@@ -7597,6 +7604,9 @@ impl Current {
                     .clone()
                     .rebind_for_move(authority.destination_address());
             }
+            Self::CreateOutcomeUnknown(unknown) => {
+                unknown.rebind_for_move(to.clone());
+            }
             Self::MissingIdentifier(state) => state.0.id = to.clone(),
         }
     }
@@ -7609,6 +7619,9 @@ impl Current {
             Self::CreateInFlight(pending) => {
                 *pending = pending.clone().rebind_for_move(authority.source_address());
             }
+            Self::CreateOutcomeUnknown(unknown) => {
+                unknown.rebind_for_move(from.clone());
+            }
             Self::MissingIdentifier(state) => state.0.id = from.clone(),
         }
     }
@@ -7620,6 +7633,7 @@ impl Current {
                 present.state.dependency_bindings = dependency_bindings;
             }
             Self::CreateInFlight(_pending) => {}
+            Self::CreateOutcomeUnknown(_unknown) => {}
             Self::MissingIdentifier(state) => {
                 state.0.dependency_bindings = dependency_bindings;
             }
@@ -7631,6 +7645,7 @@ impl Current {
             Self::Absent(state) => state.0.materialize_partial_read_unknowns(),
             Self::Present(present) => present.state.materialize_partial_read_unknowns(),
             Self::CreateInFlight(_pending) => {}
+            Self::CreateOutcomeUnknown(_unknown) => {}
             Self::MissingIdentifier(state) => state.0.materialize_partial_read_unknowns(),
         }
         PlanInputCurrent(self)

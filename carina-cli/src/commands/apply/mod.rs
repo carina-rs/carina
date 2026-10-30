@@ -310,6 +310,18 @@ async fn create_checked_bootstrap_resource(
         Err(error) => {
             let row = match error.kind() {
                 carina_core::provider::CreateFailureKind::Untracked(_error) => Ok(None),
+                carina_core::provider::CreateFailureKind::OutcomeUnknown {
+                    unknown,
+                    error: _provider_error,
+                } => Ok(Some(
+                    carina_state::ResourceState::from_unknown_create_outcome(
+                        &resolved,
+                        unknown,
+                        None,
+                        schema,
+                        &comparison,
+                    ),
+                )),
                 carina_core::provider::CreateFailureKind::Created {
                     created,
                     error: _provider_error,
@@ -1231,12 +1243,14 @@ pub(crate) async fn detect_drift<S>(
             Current::Absent(state) => Some(state.state()),
             Current::Present(present) => Some(present.state()),
             Current::CreateInFlight(_pending) => None,
+            Current::CreateOutcomeUnknown(_unknown) => None,
             Current::MissingIdentifier(state) => Some(state.state()),
         });
         let planned_exists = planned_current.and_then(|current| match current {
             Current::Absent(_absent) => Some(false),
             Current::Present(_present) => Some(true),
             Current::CreateInFlight(_pending) => None,
+            Current::CreateOutcomeUnknown(_unknown) => None,
             Current::MissingIdentifier(_unidentified) => Some(true),
         });
         let historical_id = planned_current
@@ -1260,6 +1274,9 @@ pub(crate) async fn detect_drift<S>(
                 )));
             }
             Some(Current::CreateInFlight(_pending)) => State::not_found(historical_id.clone()),
+            Some(Current::CreateOutcomeUnknown(_unknown)) => {
+                State::not_found(historical_id.clone())
+            }
             Some(Current::Absent(_state)) => State::not_found(historical_id.clone()),
             None => State::not_found(historical_id.clone()),
         };
@@ -1964,6 +1981,7 @@ async fn run_apply_locked_owned(
                         Current::Absent(_state) => false,
                         Current::Present(_present) => true,
                         Current::CreateInFlight(_pending) => true,
+                        Current::CreateOutcomeUnknown(_unknown) => true,
                         Current::MissingIdentifier(_state) => true,
                     };
                     if exists {

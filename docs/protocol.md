@@ -135,6 +135,20 @@ planned as token-free `ResumeCreate`; the token is joined from locked state
 immediately before dispatch. Only a terminal provider verdict may clear that
 row.
 
+State format 20 adds `create_outcome_unknown`, a token-less current instance
+containing only the create's UTC `started_at` timestamp. The host writes this
+row when an initial guest create fails after at least one host-approved request
+was dispatched and no identifier or continuation was returned. Plan, apply,
+and destroy block on the row. Refresh carries it forward unchanged without a
+provider read. Recovery is explicit: import replaces it when the resource
+exists, while `carina state forget` removes only this row kind after the
+operator confirms the resource is absent.
+
+Saved-plan format 30 records an outcome-unknown marker and its `started_at`
+timestamp, never an identifier or continuation token. Apply reloads the marker
+under the state lock and rejects any lifecycle or timestamp change before
+provider effects run.
+
 Saved-plan format 21 records the address and in-flight marker, never the
 provider token. Apply reloads the envelope from locked state and rejects the
 saved plan if any address changed in-flight status in either direction.

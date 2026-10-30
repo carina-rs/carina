@@ -10,6 +10,10 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use tokio::sync::Notify;
 
 use carina_provider_protocol::types as protocol_types;
 pub use carina_provider_protocol::types::{
@@ -2140,6 +2144,9 @@ enum EncodedStateRowCurrent {
         envelope: EncodedPendingEnvelope,
         started_at: Timestamp,
     },
+    CreateOutcomeUnknown {
+        started_at: Timestamp,
+    },
     #[serde(other)]
     Other,
 }
@@ -2420,6 +2427,35 @@ impl StateRowInFlightCreate {
     }
 }
 
+/// Loader-produced binding of an outcome-unknown timestamp to its containing
+/// state-row address.
+#[derive(Debug)]
+pub struct StateRowUnknownCreateOutcome(UnknownCreateOutcome);
+
+impl StateRowUnknownCreateOutcome {
+    pub fn into_inner(self) -> UnknownCreateOutcome {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for StateRowUnknownCreateOutcome {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let row = EncodedStateRowWithCurrent::deserialize(deserializer)?;
+        let EncodedStateRowCurrent::CreateOutcomeUnknown { started_at } = row.current else {
+            return Err(serde::de::Error::custom(
+                "state row does not contain an outcome-unknown create",
+            ));
+        };
+        let id = ResourceId::with_provider_identity(
+            row.provider,
+            row.resource_type,
+            row.identity,
+            row.directives.provider_instance,
+        );
+        Ok(Self(UnknownCreateOutcome::new(id, started_at)))
+    }
+}
+
 impl<'de> Deserialize<'de> for StateRowInFlightCreate {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let row = EncodedStateRowWithCurrent::deserialize(deserializer)?;
@@ -2629,10 +2665,406 @@ impl InFlightCreate {
     }
 }
 
+/// Proof that no outgoing request was dispatched during one guest call.
+///
+/// The field is private so only the host-owned call recorder can mint this
+/// witness.
+#[derive(Debug)]
+pub struct NoEgress(());
+
+/// Proof that at least one outgoing request was dispatched during one guest
+/// call.
+///
+/// The field is private so providers cannot upgrade an ordinary failure to an
+/// outcome-unknown failure without the host's observation.
+#[derive(Debug)]
+pub struct EgressSent(());
+
+impl EgressSent {
+    /// Construct an egress witness in cross-crate tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn for_test() -> Self {
+        Self(())
+    }
+}
+
+/// Host observation for exactly one guest call.
+#[derive(Debug)]
+pub enum CallEgress {
+    None(NoEgress),
+    Sent(EgressSent),
+}
+
+/// Cloneable handle installed by the host for one guest call.
+///
+/// Clones retain the identity of the call that minted them. A delayed request
+/// therefore cannot mark a later call's recorder.
+#[derive(Clone, Debug)]
+pub struct CallEgressRecorder {
+    state: Arc<CallEgressState>,
+}
+
+#[derive(Debug)]
+struct CallEgressState {
+    dispatched: AtomicBool,
+    pending: AtomicUsize,
+    settled: Notify,
+}
+
+/// One outgoing request whose host policy and dispatch decision is pending.
+///
+/// Dropping the guard records that the request was not dispatched. The host
+/// consumes it with [`PendingCallEgress::dispatched`] immediately before
+/// handing an approved request to the HTTP transport.
+#[derive(Debug)]
+#[must_use = "pending egress is settled when dispatched, rejected, or dropped"]
+pub struct PendingCallEgress {
+    recorder: CallEgressRecorder,
+    settled: bool,
+}
+
+impl CallEgressRecorder {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(CallEgressState {
+                dispatched: AtomicBool::new(false),
+                pending: AtomicUsize::new(0),
+                settled: Notify::new(),
+            }),
+        }
+    }
+
+    /// Start tracking a request before its asynchronous destination checks.
+    ///
+    /// The returned guard belongs to this call's recorder. Policy rejection,
+    /// DNS failure, and task cancellation leave it undispatched.
+    pub fn begin_request(&self) -> PendingCallEgress {
+        self.state.pending.fetch_add(1, Ordering::AcqRel);
+        PendingCallEgress {
+            recorder: self.clone(),
+            settled: false,
+        }
+    }
+
+    fn mark_dispatched(&self) {
+        self.state.dispatched.store(true, Ordering::Release);
+        self.state.settled.notify_one();
+    }
+
+    async fn settled_snapshot(&self) -> CallEgress {
+        loop {
+            let settled = self.state.settled.notified();
+            let pending = self.state.pending.load(Ordering::Acquire);
+            if self.state.dispatched.load(Ordering::Acquire) {
+                return CallEgress::Sent(EgressSent(()));
+            }
+            if pending == 0 {
+                return CallEgress::None(NoEgress(()));
+            }
+            settled.await;
+        }
+    }
+
+    fn cancellation_egress(&self) -> CancelledCallEgress {
+        if self.state.pending.load(Ordering::Acquire) > 0 {
+            CancelledCallEgress::PendingDispatch
+        } else if self.state.dispatched.load(Ordering::Acquire) {
+            CancelledCallEgress::Sent(EgressSent(()))
+        } else {
+            CancelledCallEgress::None(NoEgress(()))
+        }
+    }
+}
+
+impl PendingCallEgress {
+    /// Record that this host-approved request is being dispatched.
+    pub fn dispatched(mut self) {
+        self.recorder.mark_dispatched();
+        self.settle();
+    }
+
+    /// Record that this request did not leave the host.
+    pub fn not_dispatched(mut self) {
+        self.settle();
+    }
+
+    fn settle(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        let previous = self.recorder.state.pending.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous > 0, "a pending egress guard settles exactly once");
+        if previous == 1 {
+            self.recorder.state.settled.notify_one();
+        }
+    }
+}
+
+impl Drop for PendingCallEgress {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
+/// Address and start time retained when a create may have reached the cloud
+/// but returned no identifier or continuation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownCreateOutcome {
+    id: ResourceId,
+    started_at: Timestamp,
+}
+
+impl Serialize for UnknownCreateOutcome {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Encoded<'a> {
+            started_at: &'a Timestamp,
+        }
+
+        Encoded {
+            started_at: &self.started_at,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl UnknownCreateOutcome {
+    fn new(id: ResourceId, started_at: Timestamp) -> Self {
+        Self { id, started_at }
+    }
+
+    pub fn id(&self) -> &ResourceId {
+        &self.id
+    }
+
+    pub fn started_at(&self) -> &Timestamp {
+        &self.started_at
+    }
+
+    pub(crate) fn rebind_for_move(&mut self, id: ResourceId) {
+        self.id = id;
+    }
+}
+
+#[derive(Debug)]
+struct CreateCallCancellationReporter {
+    sender: mpsc::Sender<CancelledCreateReport>,
+}
+
+/// Egress knowledge available when a started guest create is dropped.
+#[derive(Debug)]
+enum CancelledCallEgress {
+    None(NoEgress),
+    Sent(EgressSent),
+    PendingDispatch,
+}
+
+/// The only two states a dropped started guest create can report.
+#[derive(Debug)]
+pub(crate) enum CancelledCreateReport {
+    Untracked,
+    OutcomeUnknown(UnknownCreateOutcome),
+}
+
+/// Executor-owned receiver for a classified create failure emitted when a
+/// started guest call is dropped during cleanup.
+#[derive(Debug)]
+pub(crate) struct CreateCallCancellationReceiver {
+    receiver: mpsc::Receiver<CancelledCreateReport>,
+}
+
+impl CreateCallCancellationReceiver {
+    pub(crate) fn drain(&self) -> Vec<CancelledCreateReport> {
+        let mut reports = Vec::new();
+        loop {
+            match self.receiver.try_recv() {
+                Ok(report) => reports.push(report),
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        reports
+    }
+}
+
+/// A guest create call that has started and therefore must be finished or
+/// reported as cancelled.
+#[derive(Debug)]
+pub struct StartedGuestCreateCall {
+    attempt: Option<CreateAttempt>,
+    recorder: CallEgressRecorder,
+    cancellation: Option<CreateCallCancellationReporter>,
+}
+
+impl StartedGuestCreateCall {
+    pub fn egress_recorder(&self) -> CallEgressRecorder {
+        self.recorder.clone()
+    }
+
+    pub fn finish(mut self) -> FinishedGuestCreateCall {
+        let attempt = self
+            .attempt
+            .take()
+            .expect("a started guest create call owns its attempt");
+        FinishedGuestCreateCall {
+            attempt: Some(attempt),
+            recorder: Some(self.recorder.clone()),
+            cancellation: self.cancellation.take(),
+        }
+    }
+}
+
+impl Drop for StartedGuestCreateCall {
+    fn drop(&mut self) {
+        let Some(attempt) = self.attempt.take() else {
+            return;
+        };
+        let Some(reporter) = self.cancellation.take() else {
+            return;
+        };
+        report_cancelled_guest_create(attempt, self.recorder.cancellation_egress(), reporter);
+    }
+}
+
+/// A completed guest call whose returned boundary value has not yet been
+/// decoded.
+#[derive(Debug)]
+pub struct FinishedGuestCreateCall {
+    attempt: Option<CreateAttempt>,
+    recorder: Option<CallEgressRecorder>,
+    cancellation: Option<CreateCallCancellationReporter>,
+}
+
+impl FinishedGuestCreateCall {
+    pub async fn failed(mut self, error: ProviderError) -> GuestCallFailure {
+        let egress = self
+            .recorder
+            .as_ref()
+            .expect("a finished guest create call owns its egress recorder")
+            .settled_snapshot()
+            .await;
+        GuestCallFailure {
+            attempt: self.attempt.take(),
+            egress: Some(egress),
+            error: Some(error),
+            cancellation: self.cancellation.take(),
+        }
+    }
+
+    /// Decode the complete guest result before releasing the provider-facing
+    /// attempt. A decode error is classified against this call's egress
+    /// record inside this method.
+    pub async fn decode<T, U>(
+        mut self,
+        value: T,
+        decode: impl FnOnce(T) -> Result<U, ProviderError>,
+    ) -> Result<DecodedGuestCreateCall<U>, CreateFailure> {
+        match decode(value) {
+            Ok(value) => {
+                let attempt = self
+                    .attempt
+                    .take()
+                    .expect("a finished guest create call owns its attempt");
+                let recorder = self
+                    .recorder
+                    .take()
+                    .expect("a finished guest create call owns its egress recorder");
+                drop(recorder);
+                drop(self.cancellation.take());
+                Ok(DecodedGuestCreateCall { attempt, value })
+            }
+            Err(error) => Err(self.failed(error).await.classify()),
+        }
+    }
+}
+
+impl Drop for FinishedGuestCreateCall {
+    fn drop(&mut self) {
+        let Some(attempt) = self.attempt.take() else {
+            return;
+        };
+        let Some(recorder) = self.recorder.take() else {
+            return;
+        };
+        let Some(reporter) = self.cancellation.take() else {
+            return;
+        };
+        report_cancelled_guest_create(attempt, recorder.cancellation_egress(), reporter);
+    }
+}
+
+/// Fully decoded guest result paired with the only attempt that may interpret
+/// the provider-declared step or verdict.
+#[derive(Debug)]
+pub struct DecodedGuestCreateCall<T> {
+    attempt: CreateAttempt,
+    value: T,
+}
+
+impl<T> DecodedGuestCreateCall<T> {
+    pub fn into_parts(self) -> (CreateAttempt, T) {
+        (self.attempt, self.value)
+    }
+}
+
+/// A guest-call failure that cannot expose its bare provider error. It must be
+/// consumed through [`GuestCallFailure::classify`].
+#[derive(Debug)]
+pub struct GuestCallFailure {
+    attempt: Option<CreateAttempt>,
+    egress: Option<CallEgress>,
+    error: Option<ProviderError>,
+    cancellation: Option<CreateCallCancellationReporter>,
+}
+
+impl GuestCallFailure {
+    pub fn classify(mut self) -> CreateFailure {
+        let attempt = self
+            .attempt
+            .take()
+            .expect("a guest call failure owns its attempt");
+        let egress = self
+            .egress
+            .take()
+            .expect("a guest call failure owns its egress record");
+        let error = self
+            .error
+            .take()
+            .expect("a guest call failure owns its provider error");
+        drop(self.cancellation.take());
+        match egress {
+            CallEgress::None(_no_egress) => attempt.untracked(error),
+            CallEgress::Sent(sent) => attempt.outcome_unknown(sent, error),
+        }
+    }
+}
+
+fn report_cancelled_guest_create(
+    attempt: CreateAttempt,
+    egress: CancelledCallEgress,
+    reporter: CreateCallCancellationReporter,
+) {
+    let report = match egress {
+        CancelledCallEgress::None(_no_egress) => CancelledCreateReport::Untracked,
+        CancelledCallEgress::Sent(_sent) => CancelledCreateReport::OutcomeUnknown(
+            UnknownCreateOutcome::new(attempt.id, attempt.started_at),
+        ),
+        CancelledCallEgress::PendingDispatch => CancelledCreateReport::OutcomeUnknown(
+            UnknownCreateOutcome::new(attempt.id, attempt.started_at),
+        ),
+    };
+    let _send_result = reporter.sender.send(report);
+}
+
 /// Inspectable classification carried by an opaque [`CreateFailure`].
 #[derive(Debug)]
 pub enum CreateFailureKind {
     Untracked(ProviderError),
+    OutcomeUnknown {
+        unknown: UnknownCreateOutcome,
+        error: ProviderError,
+    },
     Created {
         created: ObservedCreate,
         error: ProviderError,
@@ -2665,6 +3097,10 @@ impl std::fmt::Display for CreateFailure {
             CreateFailureKind::Untracked(_error) => {
                 f.write_str("create failed before it could be tracked")
             }
+            CreateFailureKind::OutcomeUnknown {
+                unknown: _unknown,
+                error: _error,
+            } => f.write_str("create outcome is unknown after a request left the provider"),
             CreateFailureKind::Created {
                 created: _created,
                 error: _error,
@@ -2681,6 +3117,10 @@ impl std::error::Error for CreateFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self.kind() {
             CreateFailureKind::Untracked(error) => Some(error),
+            CreateFailureKind::OutcomeUnknown {
+                unknown: _unknown,
+                error,
+            } => Some(error),
             CreateFailureKind::Created {
                 created: _created,
                 error,
@@ -2709,6 +3149,10 @@ impl CreateFailure {
     pub fn provider_error(&self) -> &ProviderError {
         match self.kind() {
             CreateFailureKind::Untracked(error) => error,
+            CreateFailureKind::OutcomeUnknown {
+                unknown: _unknown,
+                error,
+            } => error,
             CreateFailureKind::Created {
                 created: _created,
                 error,
@@ -2717,19 +3161,6 @@ impl CreateFailure {
                 pending: _pending,
                 error,
             } => error,
-        }
-    }
-
-    /// Convert a classified failure from a create begun by `resend` into the
-    /// corresponding resume failure. Only a real create typestate can produce
-    /// the `Untracked` input that becomes `Ended` here.
-    fn into_resent(self) -> ResumeFailure {
-        match self.into_kind() {
-            CreateFailureKind::Untracked(error) => ResumeFailure::ended_from_verdict(error),
-            CreateFailureKind::Created { created, error } => ResumeFailure::created(created, error),
-            CreateFailureKind::InFlight { pending, error } => {
-                ResumeFailure::in_flight(pending, error)
-            }
         }
     }
 
@@ -2743,6 +3174,13 @@ impl CreateFailure {
 
     pub(crate) fn untracked_at_dispatch(error: ProviderError) -> Self {
         Self::from_kind(CreateFailureKind::Untracked(error))
+    }
+
+    pub(crate) fn outcome_unknown_at_dispatch(
+        unknown: UnknownCreateOutcome,
+        error: ProviderError,
+    ) -> Self {
+        Self::from_kind(CreateFailureKind::OutcomeUnknown { unknown, error })
     }
 }
 
@@ -2969,11 +3407,31 @@ impl ResumeFailure {
 #[derive(Debug)]
 pub struct CreateAttempt {
     id: ResourceId,
+    started_at: Timestamp,
+    cancellation: Option<CreateCallCancellationReporter>,
 }
 
 impl CreateAttempt {
     pub(crate) fn new(id: ResourceId) -> Self {
-        Self { id }
+        Self {
+            id,
+            started_at: Timestamp::now(),
+            cancellation: None,
+        }
+    }
+
+    pub(crate) fn with_cancellation_report(
+        id: ResourceId,
+    ) -> (Self, CreateCallCancellationReceiver) {
+        let (sender, receiver) = mpsc::channel();
+        (
+            Self {
+                id,
+                started_at: Timestamp::now(),
+                cancellation: Some(CreateCallCancellationReporter { sender }),
+            },
+            CreateCallCancellationReceiver { receiver },
+        )
     }
 
     /// Construct an initial-create witness in cross-crate tests.
@@ -2987,24 +3445,33 @@ impl CreateAttempt {
         CreateFailure::from_kind(CreateFailureKind::Untracked(error))
     }
 
+    pub fn outcome_unknown(self, _sent: EgressSent, error: ProviderError) -> CreateFailure {
+        CreateFailure::from_kind(CreateFailureKind::OutcomeUnknown {
+            unknown: UnknownCreateOutcome::new(self.id, self.started_at),
+            error,
+        })
+    }
+
+    pub fn start_guest_call(mut self) -> StartedGuestCreateCall {
+        let cancellation = self.cancellation.take();
+        StartedGuestCreateCall {
+            attempt: Some(self),
+            recorder: CallEgressRecorder::new(),
+            cancellation,
+        }
+    }
+
     pub fn issued(self, identifier: AppliedIdentifier, sent: Sent) -> IssuedCreate {
         IssuedCreate {
             id: self.id,
             identifier,
             sent,
-            started_at: None,
+            started_at: Some(self.started_at),
         }
     }
 
     pub fn pending(self, token: PendingToken, sent: Sent, poll_after_secs: u32) -> PendingCreate {
-        PendingCreate::new(
-            self.id,
-            token,
-            None,
-            sent,
-            poll_after_secs,
-            Timestamp::now(),
-        )
+        PendingCreate::new(self.id, token, None, sent, poll_after_secs, self.started_at)
     }
 }
 
@@ -3477,7 +3944,16 @@ impl ResentIssuedCreate {
     }
 
     pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
-        self.0.failed(observation, error).into_resent()
+        let IssuedCreate {
+            id,
+            identifier,
+            sent,
+            started_at: _started_at,
+        } = self.0;
+        ResumeFailure::created(
+            ObservedCreate::new(id, identifier, observation, SentRecord::Request(sent)),
+            error,
+        )
     }
 
     pub fn discarded(self, error: ProviderError) -> ResumeFailure {
@@ -3502,7 +3978,15 @@ impl ResentFinishingCreate {
     }
 
     pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
-        self.0.failed(observation, error).into_resent()
+        let FinishingCreate {
+            id,
+            identifier,
+            sent,
+        } = self.0;
+        ResumeFailure::created(
+            ObservedCreate::new(id, identifier, observation, SentRecord::Request(sent)),
+            error,
+        )
     }
 
     pub fn discarded(self, error: ProviderError) -> ResumeFailure {
@@ -3546,7 +4030,11 @@ impl ResentPendingCreate {
     }
 
     pub fn untracked(self, error: ProviderError) -> ResumeFailure {
-        self.0.untracked(error).into_resent()
+        if self.0.identifier().is_some() {
+            InFlightCreate::from_pending(self.0).into_resume_failure(error)
+        } else {
+            ResumeFailure::ended_from_verdict(error)
+        }
     }
 }
 
@@ -6672,6 +7160,119 @@ mod tests {
             failure.source().map(ToString::to_string).as_deref(),
             Some("leaf create failure")
         );
+    }
+
+    #[tokio::test]
+    async fn guest_create_failure_after_egress_is_outcome_unknown() {
+        let id = ResourceId::with_provider_identity("test", "widget", "example", None);
+        let started = CreateAttempt::new(id.clone()).start_guest_call();
+        started.egress_recorder().begin_request().dispatched();
+
+        let failure = started
+            .finish()
+            .failed(ProviderError::internal("guest trapped"))
+            .await
+            .classify();
+
+        let CreateFailureKind::OutcomeUnknown { unknown, error } = failure.into_kind() else {
+            panic!("a sent guest call must not be classified as untracked")
+        };
+        assert_eq!(unknown.id(), &id);
+        assert_eq!(error.to_string(), "guest trapped");
+    }
+
+    #[tokio::test]
+    async fn guest_create_failure_without_egress_is_untracked() {
+        let id = ResourceId::with_provider_identity("test", "widget", "example", None);
+        let failure = CreateAttempt::new(id)
+            .start_guest_call()
+            .finish()
+            .failed(ProviderError::internal("guest trapped"))
+            .await
+            .classify();
+
+        let CreateFailureKind::Untracked(error) = failure.into_kind() else {
+            panic!("a guest call with no dispatched request must remain untracked")
+        };
+        assert_eq!(error.to_string(), "guest trapped");
+    }
+
+    #[tokio::test]
+    async fn guest_decode_failure_waits_for_pending_egress_decision() {
+        let id = ResourceId::with_provider_identity("test", "widget", "example", None);
+        let started = CreateAttempt::new(id).start_guest_call();
+        let pending = started.egress_recorder().begin_request();
+        let classification = tokio::spawn(async move {
+            started
+                .finish()
+                .decode((), |()| {
+                    Err::<(), _>(ProviderError::internal("malformed guest result"))
+                })
+                .await
+                .expect_err("the guest result must fail decoding")
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !classification.is_finished(),
+            "classification must wait for the host's dispatch decision"
+        );
+        pending.not_dispatched();
+
+        let failure = classification.await.expect("classification task");
+        let CreateFailureKind::Untracked(error) = failure.into_kind() else {
+            panic!("a host-denied pending request must not count as egress")
+        };
+        assert_eq!(error.to_string(), "malformed guest result");
+    }
+
+    #[test]
+    fn outcome_unknown_requires_the_egress_sent_witness() {
+        let id = ResourceId::with_provider_identity("test", "widget", "example", None);
+        let failure = CreateAttempt::new(id.clone()).outcome_unknown(
+            EgressSent::for_test(),
+            ProviderError::internal("returned value could not be decoded"),
+        );
+
+        let CreateFailureKind::OutcomeUnknown { unknown, error } = failure.into_kind() else {
+            panic!("the egress witness must mint an outcome-unknown failure")
+        };
+        assert_eq!(unknown.id(), &id);
+        assert_eq!(error.to_string(), "returned value could not be decoded");
+    }
+
+    #[test]
+    fn dropped_started_guest_create_reports_only_the_two_cancellation_states() {
+        let sent_id = ResourceId::with_provider_identity("test", "widget", "sent", None);
+        let (attempt, receiver) = CreateAttempt::with_cancellation_report(sent_id.clone());
+        let started = attempt.start_guest_call();
+        started.egress_recorder().begin_request().dispatched();
+        drop(started);
+        let reports = receiver.drain();
+        let [CancelledCreateReport::OutcomeUnknown(unknown)] = reports.as_slice() else {
+            panic!("a dropped call after dispatch must report one unknown outcome")
+        };
+        assert_eq!(unknown.id(), &sent_id);
+
+        let unsent_id = ResourceId::with_provider_identity("test", "widget", "unsent", None);
+        let (attempt, receiver) = CreateAttempt::with_cancellation_report(unsent_id);
+        drop(attempt.start_guest_call());
+        assert!(matches!(
+            receiver.drain().as_slice(),
+            [CancelledCreateReport::Untracked]
+        ));
+
+        let pending_id = ResourceId::with_provider_identity("test", "widget", "pending", None);
+        let (attempt, receiver) = CreateAttempt::with_cancellation_report(pending_id.clone());
+        let started = attempt.start_guest_call();
+        let pending = started.egress_recorder().begin_request();
+        drop(started);
+        let reports = receiver.drain();
+        let [CancelledCreateReport::OutcomeUnknown(unknown)] = reports.as_slice() else {
+            panic!("a dropped call with an unresolved dispatch must report one unknown outcome")
+        };
+        assert_eq!(unknown.id(), &pending_id);
+        pending.not_dispatched();
     }
 
     #[test]

@@ -756,7 +756,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
         total,
     };
     let effect = basic.as_effect();
-    let started_effect = in_flight_start.emit_started(observer, effect, progress);
+    let mut started_effect = in_flight_start.emit_started(observer, effect, progress);
 
     let outcome = match basic {
         BasicEffect::Create { resource, .. } => {
@@ -777,8 +777,16 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     );
                 }
             };
-            match super::dispatch_create(provider, &resource.id, CreateRequest::checked(resolved))
-                .await
+            let (attempt, cancellation) =
+                crate::provider::CreateAttempt::with_cancellation_report(resource.id.clone());
+            started_effect.track_create_cancellation(cancellation);
+            match super::dispatch_create_with_attempt(
+                provider,
+                &resource.id,
+                CreateRequest::checked(resolved),
+                attempt,
+            )
+            .await
             {
                 Ok(outcome) => {
                     let (state, request, diagnostic) =
@@ -813,6 +821,16 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         BasicEffectResult::Failure {
                             error: error_str,
                             refresh: None,
+                        }
+                    }
+                    CreateFailureKind::OutcomeUnknown { unknown, error } => {
+                        let error_str = format!(
+                            "{error}\nthe create may have reached the cloud; import the resource if it exists, or forget the protected state row if it does not"
+                        );
+                        BasicEffectResult::ClassifiedFailure {
+                            error: error_str,
+                            resource_id: resource.id.clone(),
+                            applied: Applied::CreateOutcomeUnknown(unknown),
                         }
                     }
                     CreateFailureKind::Created { created, error } => {
@@ -1275,6 +1293,9 @@ mod process_basic_result_tests {
             } => state,
             Applied::Observed(_created) => panic!("unexpected observed create"),
             Applied::CreateInFlight(_pending) => panic!("unexpected in-flight create"),
+            Applied::CreateOutcomeUnknown(_unknown) => {
+                panic!("unexpected unknown create outcome")
+            }
             Applied::CreateEnded => panic!("unexpected ended create"),
             Applied::Imported(_state) => panic!("unexpected import"),
             Applied::DataSource(_state) => panic!("unexpected data source"),

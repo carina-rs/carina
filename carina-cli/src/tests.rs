@@ -1423,6 +1423,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
         carina_core::resource::Current::Absent(_state) => None,
         carina_core::resource::Current::MissingIdentifier(_state) => None,
         carina_core::resource::Current::CreateInFlight(_pending) => None,
+        carina_core::resource::Current::CreateOutcomeUnknown(_unknown) => None,
     };
     assert_eq!(
         identifier,
@@ -1551,6 +1552,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
         carina_core::resource::Current::Absent(_state) => None,
         carina_core::resource::Current::MissingIdentifier(_state) => None,
         carina_core::resource::Current::CreateInFlight(_pending) => None,
+        carina_core::resource::Current::CreateOutcomeUnknown(_unknown) => None,
     };
     assert!(
         identifier.is_some(),
@@ -2848,6 +2850,9 @@ fn refresh_false_uses_cached_state_from_state_file() {
         Current::MissingIdentifier(state) => state.state(),
         Current::CreateInFlight(pending) => {
             panic!("fixture unexpectedly loaded an in-flight create: {pending:?}")
+        }
+        Current::CreateOutcomeUnknown(unknown) => {
+            panic!("fixture unexpectedly loaded an unknown create outcome: {unknown:?}")
         }
     };
     assert!(cached_state.exists, "State should exist from state file");

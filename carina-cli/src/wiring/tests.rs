@@ -1424,6 +1424,9 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         Current::CreateInFlight(pending) => {
             panic!("test orphan unexpectedly has an in-flight create: {pending:?}")
         }
+        Current::CreateOutcomeUnknown(unknown) => {
+            panic!("test orphan unexpectedly has an unknown create outcome: {unknown:?}")
+        }
     };
     let mut orphans = Orphans::from([carina_core::differ::Orphan::present(
         present,
@@ -1585,6 +1588,9 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
         Current::CreateInFlight(pending) => {
             panic!("orphan unexpectedly remained in flight: {pending:?}")
         }
+        Current::CreateOutcomeUnknown(unknown) => {
+            panic!("orphan unexpectedly became outcome unknown: {unknown:?}")
+        }
     };
     assert_eq!(state.partial_read, None);
 
@@ -1612,6 +1618,9 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
         Current::MissingIdentifier(state) => state.state(),
         Current::CreateInFlight(pending) => {
             panic!("orphan unexpectedly remained in flight: {pending:?}")
+        }
+        Current::CreateOutcomeUnknown(unknown) => {
+            panic!("orphan unexpectedly became outcome unknown: {unknown:?}")
         }
     };
     assert_eq!(state.partial_read, Some(marker));
@@ -2641,6 +2650,9 @@ let shared = read test.shared.Type {}
         Current::CreateInFlight(pending) => {
             panic!("managed orphan unexpectedly has an in-flight create: {pending:?}")
         }
+        Current::CreateOutcomeUnknown(unknown) => {
+            panic!("managed orphan unexpectedly has an unknown create outcome: {unknown:?}")
+        }
     };
     assert_eq!(
         orphan_state.attributes.get("managed_saved"),
@@ -2699,6 +2711,49 @@ async fn read_with_retry_does_not_retry_not_found() {
     assert_eq!(state.id, id);
     assert_eq!(state.identifier, None);
     assert_eq!(provider.read_calls(), 1);
+}
+
+#[tokio::test]
+async fn outcome_unknown_refresh_preserves_managed_and_orphan_rows_without_provider_read() {
+    let provider = ReadWithRetryProvider::new(ReadBehavior::Success);
+    let id = ResourceId::with_provider_identity("test", "test.Resource", "unknown", None);
+    let failure = carina_core::provider::CreateAttempt::for_test(id.clone()).outcome_unknown(
+        carina_core::provider::EgressSent::for_test(),
+        ProviderError::api_error("guest trapped"),
+    );
+    let carina_core::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } =
+        failure.into_kind()
+    else {
+        panic!("the egress witness must mint an unknown outcome")
+    };
+
+    let refreshed = refresh_loaded_resource_with_retry(
+        &provider,
+        Current::create_outcome_unknown(unknown.clone()),
+        None,
+        &SchemaRegistry::new(),
+    )
+    .await
+    .expect("an outcome-unknown managed row must be carried without a read");
+    let Current::CreateOutcomeUnknown(refreshed_unknown) = refreshed else {
+        panic!("managed refresh changed the outcome-unknown lifecycle")
+    };
+    assert_eq!(refreshed_unknown, unknown);
+
+    let orphan = Orphan::create_outcome_unknown(
+        unknown.clone(),
+        Some("unknown".to_string()),
+        Directives::default(),
+    );
+    let refreshed_orphan =
+        refresh_loaded_orphan_with_retry(&provider, orphan, None, &SchemaRegistry::new())
+            .await
+            .expect("an outcome-unknown orphan must be carried without a read");
+    assert!(matches!(
+        refreshed_orphan.current(),
+        Current::CreateOutcomeUnknown(refreshed_unknown) if refreshed_unknown == &unknown
+    ));
+    assert_eq!(provider.read_calls(), 0);
 }
 
 use carina_core::parser::ParsedFile;
@@ -3300,6 +3355,9 @@ fn same_type_moved_block_parses_and_materializes_state() {
         Current::MissingIdentifier(state) => state.state(),
         Current::CreateInFlight(pending) => {
             panic!("moved test state unexpectedly remained in flight: {pending:?}")
+        }
+        Current::CreateOutcomeUnknown(unknown) => {
+            panic!("moved test state unexpectedly became outcome unknown: {unknown:?}")
         }
     };
     assert_eq!(moved.id, to);
@@ -4011,6 +4069,88 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
         }
         other => panic!("expected Import effect, got {other:?}"),
     }
+}
+
+#[test]
+fn import_replaces_only_a_create_outcome_unknown_row() {
+    use carina_core::effect::Effect;
+    use carina_core::plan::{Plan, PlanError};
+
+    let resource = Resource::with_provider("mock", "test.Resource", "unknown", None);
+    let address = StateBlockAddress::new("mock", "test.Resource", "unknown");
+    let state = carina_state::check_and_migrate(
+        &serde_json::json!({
+            "version": 20,
+            "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+            "serial": 1,
+            "lineage": "import-unknown",
+            "carina_version": "test",
+            "resources": [{
+                "resource_type": "test.Resource",
+                "identity": "unknown",
+                "provider": "mock",
+                "current": {
+                    "kind": "create_outcome_unknown",
+                    "started_at": "2026-10-23T08:00:00Z"
+                }
+            }],
+            "exports": {}
+        })
+        .to_string(),
+    )
+    .unwrap()
+    .into_state();
+    let state_file = Some(state);
+    let state_blocks = vec![StateBlock::Import {
+        to: address.clone(),
+        id: Value::Concrete(ConcreteValue::String("provider-id".to_string().into())),
+    }];
+
+    let resolution = resolve_state_blocks(
+        &state_blocks,
+        &state_file,
+        std::slice::from_ref(&resource),
+        &SchemaRegistry::new(),
+    );
+    assert!(resolution.claims.claims_to(&resource.id));
+
+    let mut plan = Plan::new();
+    plan.add_error(PlanError::create_outcome_unknown(resource.id.clone()));
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    add_state_block_effects(
+        &mut plan,
+        &state_blocks,
+        &state_file,
+        &[],
+        std::slice::from_ref(&resource),
+        &bindings,
+        &no_upstreams,
+    );
+
+    assert!(matches!(plan.effects(), [Effect::Import { .. }]));
+    assert!(plan.errors().is_empty());
+
+    let removed_blocks = vec![StateBlock::Removed { from: address }];
+    let mut removed_plan = Plan::new();
+    removed_plan.add_error(PlanError::create_outcome_unknown(resource.id.clone()));
+    add_state_block_effects(
+        &mut removed_plan,
+        &removed_blocks,
+        &state_file,
+        &[],
+        std::slice::from_ref(&resource),
+        &bindings,
+        &no_upstreams,
+    );
+    assert!(matches!(removed_plan.effects(), [Effect::Remove { .. }]));
+    assert!(matches!(
+        removed_plan.errors(),
+        [PlanError {
+            kind: carina_core::plan::PlanErrorKind::CreateOutcomeUnknown { .. },
+            ..
+        }]
+    ));
 }
 
 #[test]
@@ -7423,6 +7563,9 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
         Current::CreateInFlight(pending) => {
             panic!("renamed test state unexpectedly remained in flight: {pending:?}")
         }
+        Current::CreateOutcomeUnknown(unknown) => {
+            panic!("renamed test state unexpectedly became outcome unknown: {unknown:?}")
+        }
     };
     assert_eq!(state.identifier.as_deref(), Some("route-123"));
 }
@@ -8306,6 +8449,9 @@ mod expand_same_config_deferred_for_tests {
             }
             Current::CreateInFlight(pending) => {
                 panic!("test orphan unexpectedly has an in-flight create: {pending:?}")
+            }
+            Current::CreateOutcomeUnknown(unknown) => {
+                panic!("test orphan unexpectedly has an unknown create outcome: {unknown:?}")
             }
         };
         let orphan_owned = Orphans::from([carina_core::differ::Orphan::present(

@@ -115,7 +115,7 @@ use crate::provider::{
     AppliedIdentifier, CreateFailure, CreateFailureKind, CreateOutcome, CreateRequest,
     InFlightCreate, ObservedCreate, PartialReadDiagnostic, PatchOp, Provider, ProviderError,
     ProviderNormalizer, ProviderReadyDataSource, ResumeCreateRequest, ResumeFailure,
-    ResumeFailureKind, ResumeOutcome, UpdateRequest,
+    ResumeFailureKind, ResumeOutcome, UnknownCreateOutcome, UpdateRequest,
 };
 use crate::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart, ModuleSource,
@@ -135,6 +135,21 @@ pub async fn dispatch_create<P: Provider + ?Sized>(
     id: &ResourceId,
     request: CreateRequest,
 ) -> Result<CreateOutcome, CreateFailure> {
+    dispatch_create_with_attempt(
+        provider,
+        id,
+        request,
+        crate::provider::CreateAttempt::new(id.clone()),
+    )
+    .await
+}
+
+async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
+    provider: &P,
+    id: &ResourceId,
+    request: CreateRequest,
+    attempt: crate::provider::CreateAttempt,
+) -> Result<CreateOutcome, CreateFailure> {
     let request_attributes: BTreeSet<_> = request
         .resource()
         .as_resource()
@@ -142,16 +157,16 @@ pub async fn dispatch_create<P: Provider + ?Sized>(
         .keys()
         .cloned()
         .collect();
-    match provider
-        .create(id, request, crate::provider::CreateAttempt::new(id.clone()))
-        .await
-    {
+    match provider.create(id, request, attempt).await {
         Ok(outcome) if outcome.id() == id => Ok(outcome),
         Ok(_outcome) => Err(CreateFailure::untracked_at_dispatch(
             ProviderError::internal("provider returned a create outcome for another resource")
                 .for_resource(id.clone()),
         )),
         Err(failure) => match failure.into_kind() {
+            CreateFailureKind::OutcomeUnknown { unknown, error } => {
+                Err(CreateFailure::outcome_unknown_at_dispatch(unknown, error))
+            }
             CreateFailureKind::Created { created, error } => {
                 if created.id() != id {
                     return Err(CreateFailure::untracked_at_dispatch(
@@ -388,6 +403,7 @@ pub enum Applied {
     },
     Observed(Arc<ObservedCreate>),
     CreateInFlight(InFlightCreate),
+    CreateOutcomeUnknown(UnknownCreateOutcome),
     CreateEnded,
     Imported(State),
     DataSource(State),
@@ -974,6 +990,7 @@ impl<S: Clone> ExecutionAccumulator<S> {
             }
             | Applied::Observed(_)
             | Applied::CreateInFlight(_)
+            | Applied::CreateOutcomeUnknown(_)
             | Applied::CreateEnded
             | Applied::Imported(_)
             | Applied::WaitSnapshot(_) => {

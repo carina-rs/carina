@@ -6239,6 +6239,7 @@ pub fn canonicalize_states_with_schemas(
             crate::resource::Current::Absent(state) => state.state(),
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => continue,
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => continue,
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         let kind = if state.id.resource_type.is_empty() {
@@ -12418,6 +12419,9 @@ mod tests {
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
             }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         assert_eq!(
@@ -12445,6 +12449,9 @@ mod tests {
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
+            }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
             }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
@@ -12475,6 +12482,9 @@ mod tests {
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
             }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         assert_eq!(
@@ -12498,6 +12508,9 @@ mod tests {
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
+            }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
             }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
@@ -12536,6 +12549,9 @@ mod tests {
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
+            }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
             }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
@@ -12597,6 +12613,9 @@ mod tests {
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
+            }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
             }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
@@ -12677,6 +12696,9 @@ mod tests {
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
+            }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
             }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };

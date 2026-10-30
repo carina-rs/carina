@@ -15,7 +15,7 @@ use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesF
 use carina_core::provider::SentRecord;
 use carina_core::provider::{
     AppliedIdentifier, InFlightCreate, InFlightPersistence, ObservedCreate, PersistedAttributes,
-    ProviderError, ProviderRouter,
+    ProviderError, ProviderRouter, UnknownCreateOutcome,
 };
 use carina_core::resource::{
     ConcreteValue, Current, DefaultTagKeys, ModuleSource, ResolvedResource, ResolvedResourceId,
@@ -709,6 +709,8 @@ enum UpsertSource<'a> {
     Imported(&'a State),
     CurrentPresent(&'a State),
     CurrentCreateInFlight(&'a InFlightCreate),
+    CreateOutcomeUnknown(&'a UnknownCreateOutcome),
+    CurrentCreateOutcomeUnknown(&'a UnknownCreateOutcome),
     CurrentMissingIdentifier(&'a State),
 }
 
@@ -720,6 +722,8 @@ impl<'a> UpsertSource<'a> {
             Self::CreateInFlight(pending) => pending.identifier().map(|value| value.as_str()),
             Self::CurrentPresent(_state) => None,
             Self::CurrentCreateInFlight(_pending) => None,
+            Self::CreateOutcomeUnknown(_unknown) => None,
+            Self::CurrentCreateOutcomeUnknown(_unknown) => None,
             Self::CurrentMissingIdentifier(_state) => None,
         }
     }
@@ -734,6 +738,8 @@ impl<'a> UpsertSource<'a> {
             Self::Imported(_state) => true,
             Self::CurrentPresent(_state) => false,
             Self::CurrentCreateInFlight(_pending) => false,
+            Self::CreateOutcomeUnknown(_unknown) => true,
+            Self::CurrentCreateOutcomeUnknown(_unknown) => false,
             Self::CurrentMissingIdentifier(_state) => false,
         }
     }
@@ -743,6 +749,8 @@ impl<'a> UpsertSource<'a> {
             Self::Observed(_created) => true,
             Self::CreateInFlight(_pending) => true,
             Self::CurrentCreateInFlight(_pending) => true,
+            Self::CreateOutcomeUnknown(_unknown) => true,
+            Self::CurrentCreateOutcomeUnknown(_unknown) => true,
             Self::Complete { .. } => false,
             Self::Imported(_state) => false,
             Self::CurrentPresent(_state) => false,
@@ -1033,6 +1041,7 @@ fn replacement_create_result<'upsert, 'resource, S>(
             Applied::Complete { .. }
             | Applied::Observed(_)
             | Applied::CreateInFlight(_)
+            | Applied::CreateOutcomeUnknown(_)
             | Applied::Imported(_)
             | Applied::DataSource(_)
             | Applied::WaitSnapshot(_),
@@ -1055,6 +1064,7 @@ fn planned_depose<S>(
         Current::Absent(state) => Some(state.state()),
         Current::Present(present) => Some(present.state()),
         Current::CreateInFlight(_pending) => None,
+        Current::CreateOutcomeUnknown(_unknown) => None,
         Current::MissingIdentifier(state) => Some(state.state()),
     });
     let existing_attributes = existing.and_then(ResourceState::persisted_attributes);
@@ -1205,6 +1215,7 @@ fn plan_displaced_identifier_deposes<S>(
                     Current::Absent(_state) => true,
                     Current::Present(_present) => false,
                     Current::CreateInFlight(_pending) => false,
+                    Current::CreateOutcomeUnknown(_unknown) => false,
                     Current::MissingIdentifier(_state) => false,
                 })
         {
@@ -1313,6 +1324,9 @@ fn decompose_with_moved_origins<'a, S>(
             Applied::CreateInFlight(pending) => {
                 wb.add_upsert(resource, UpsertSource::CreateInFlight(pending))
             }
+            Applied::CreateOutcomeUnknown(unknown) => {
+                wb.add_upsert(resource, UpsertSource::CreateOutcomeUnknown(unknown))
+            }
             Applied::CreateEnded => wb.add_clear_current(resource.resolved_id()),
             Applied::Imported(state) => wb.add_upsert(resource, UpsertSource::Imported(state)),
             Applied::DataSource(_state) | Applied::WaitSnapshot(_state) => Ok(()),
@@ -1334,6 +1348,9 @@ fn decompose_with_moved_origins<'a, S>(
                 }
                 Current::CreateInFlight(pending) => {
                     wb.add_upsert(resource, UpsertSource::CurrentCreateInFlight(pending))?
+                }
+                Current::CreateOutcomeUnknown(unknown) => {
+                    wb.add_upsert(resource, UpsertSource::CurrentCreateOutcomeUnknown(unknown))?
                 }
                 Current::MissingIdentifier(state) => wb.add_upsert(
                     resource,
@@ -1597,6 +1614,16 @@ pub(crate) fn build_state_after_apply_with_provider<S: Clone>(
                 &comparison,
             )
             .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?,
+            UpsertSource::CreateOutcomeUnknown(unknown)
+            | UpsertSource::CurrentCreateOutcomeUnknown(unknown) => {
+                ResourceState::from_unknown_create_outcome(
+                    resource,
+                    unknown,
+                    existing,
+                    schema,
+                    &comparison,
+                )
+            }
         };
         if planned.source.records_name_overrides()
             && let Some(overrides) = permanent_name_overrides.get(id)
@@ -1824,6 +1851,9 @@ mod post_apply_states_tests {
             Current::CreateInFlight(pending) => {
                 panic!("identifier row was classified in flight: {pending:?}")
             }
+            Current::CreateOutcomeUnknown(unknown) => {
+                panic!("identifier row was classified outcome unknown: {unknown:?}")
+            }
             Current::MissingIdentifier(state) => {
                 panic!("identifier row lost its identifier: {state:?}")
             }
@@ -1873,6 +1903,9 @@ mod post_apply_states_tests {
             Current::CreateInFlight(pending) => {
                 panic!("deposed-only row was classified in flight: {pending:?}")
             }
+            Current::CreateOutcomeUnknown(unknown) => {
+                panic!("deposed-only row was classified outcome unknown: {unknown:?}")
+            }
             Current::MissingIdentifier(state) => {
                 panic!("deposed-only row was treated as malformed current state: {state:?}")
             }
@@ -1908,6 +1941,9 @@ mod post_apply_states_tests {
             }
             Current::CreateInFlight(pending) => {
                 panic!("identifierless row was classified in flight: {pending:?}")
+            }
+            Current::CreateOutcomeUnknown(unknown) => {
+                panic!("identifierless row was classified outcome unknown: {unknown:?}")
             }
             Current::MissingIdentifier(state) => {
                 assert!(state.state().exists);
@@ -2008,6 +2044,50 @@ mod apply_state_save_tests {
         sent: carina_core::provider::Sent,
     ) -> carina_core::provider::ObservedCreate {
         crate::fixture_observed_create(id, attributes, sent)
+    }
+
+    #[test]
+    fn outcome_unknown_apply_result_writes_tokenless_protected_row() {
+        let resource = Resource::with_provider("mock", "test.Resource", "unknown", None);
+        let id = resource.id.clone();
+        let resolved_resource = resolved(resource);
+        let failure = carina_core::provider::CreateAttempt::for_test(id.clone()).outcome_unknown(
+            carina_core::provider::EgressSent::for_test(),
+            carina_core::provider::ProviderError::api_error("guest trapped"),
+        );
+        let carina_core::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } =
+            failure.into_kind()
+        else {
+            panic!("the witness-gated fixture must mint an unknown outcome")
+        };
+
+        let state = build_state_after_apply(
+            ApplyStateSave {
+                state_file: StateFile::new(),
+                sorted_resources: std::slice::from_ref(&resolved_resource),
+                runtime_synthesized_resources: &[],
+                managed_current: &HashMap::new(),
+                applied_states: &HashMap::from([(
+                    id.clone(),
+                    Applied::CreateOutcomeUnknown(unknown),
+                )]),
+                plan: &Plan::new(),
+                successfully_deleted: &HashSet::new(),
+                failed_refreshes: &HashSet::new(),
+                schemas: &SchemaRegistry::new(),
+            },
+            None,
+        )
+        .expect("outcome-unknown writeback");
+
+        let row = state.find_resource_for_id(&id).expect("protected row");
+        assert!(matches!(
+            row.current(),
+            CurrentInstance::CreateOutcomeUnknown { .. }
+        ));
+        let encoded = serde_json::to_value(row).unwrap();
+        assert!(encoded["current"].get("identifier").is_none());
+        assert!(encoded["current"].get("token").is_none());
     }
 
     #[derive(Clone, Copy)]
@@ -2182,6 +2262,9 @@ mod apply_state_save_tests {
                 pending,
                 pending.started_at().as_str()
             ),
+            CurrentInstance::CreateOutcomeUnknown { unknown } => {
+                panic!("expected applied current, got outcome unknown: {unknown:?}")
+            }
             CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes,
@@ -2214,6 +2297,9 @@ mod apply_state_save_tests {
                 "expected in-flight current, got applied {} ({attributes:?}, {write_only_attributes:?}, {nested_write_only:?}, {partial_read:?})",
                 identifier.as_str()
             ),
+            CurrentInstance::CreateOutcomeUnknown { unknown } => {
+                panic!("expected in-flight current, got outcome unknown: {unknown:?}")
+            }
             CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes,
@@ -2243,6 +2329,9 @@ mod apply_state_save_tests {
                 pending,
                 pending.started_at().as_str()
             ),
+            CurrentInstance::CreateOutcomeUnknown { unknown } => {
+                panic!("expected no current instance, got outcome unknown: {unknown:?}")
+            }
             CurrentInstance::MissingIdentifier {
                 attributes,
                 write_only_attributes,
@@ -5563,6 +5652,9 @@ mod apply_state_save_tests {
             carina_core::resource::Current::CreateInFlight(pending) => {
                 panic!("saved applied row unexpectedly remained in flight: {pending:?}")
             }
+            carina_core::resource::Current::CreateOutcomeUnknown(unknown) => {
+                panic!("saved applied row unexpectedly became outcome unknown: {unknown:?}")
+            }
         };
         let current_states = HashMap::from([(id.clone(), current_state)]);
         let second_plan = create_plan(
@@ -5714,6 +5806,9 @@ mod apply_state_save_tests {
             carina_core::resource::Current::MissingIdentifier(state) => state.into_state(),
             carina_core::resource::Current::CreateInFlight(pending) => {
                 panic!("saved applied row unexpectedly remained in flight: {pending:?}")
+            }
+            carina_core::resource::Current::CreateOutcomeUnknown(unknown) => {
+                panic!("saved applied row unexpectedly became outcome unknown: {unknown:?}")
             }
         };
         let current_states = HashMap::from([(id.clone(), current_state)]);
@@ -6794,6 +6889,9 @@ mod export_writeback_tests {
             }
             Current::CreateInFlight(pending) => {
                 panic!("partial-read row unexpectedly remained in flight: {pending:?}")
+            }
+            Current::CreateOutcomeUnknown(unknown) => {
+                panic!("partial-read row unexpectedly became outcome unknown: {unknown:?}")
             }
         }
 

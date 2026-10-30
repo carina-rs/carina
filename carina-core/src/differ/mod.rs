@@ -195,6 +195,18 @@ impl Orphan {
         }
     }
 
+    pub fn create_outcome_unknown(
+        unknown: crate::provider::UnknownCreateOutcome,
+        binding: Option<String>,
+        directives: Directives,
+    ) -> Self {
+        Self {
+            current: Current::CreateOutcomeUnknown(unknown),
+            binding,
+            directives,
+        }
+    }
+
     pub fn current(&self) -> &Current {
         &self.current
     }
@@ -226,6 +238,19 @@ impl Orphan {
                 &present.state().dependency_bindings,
             ),
             Current::CreateInFlight(_pending) => {
+                return Resource {
+                    id: self.current.id().clone(),
+                    attributes: Default::default(),
+                    directives: self.directives.clone(),
+                    prefixes: Default::default(),
+                    binding: self.binding.clone(),
+                    dependency_bindings: Default::default(),
+                    module_source: None,
+                    default_tag_keys: Default::default(),
+                    quoted_string_attrs: Default::default(),
+                };
+            }
+            Current::CreateOutcomeUnknown(_unknown) => {
                 return Resource {
                     id: self.current.id().clone(),
                     attributes: Default::default(),
@@ -276,6 +301,7 @@ impl Orphan {
             Current::Absent(state) => state.state(),
             Current::Present(present) => present.state(),
             Current::CreateInFlight(_pending) => return self,
+            Current::CreateOutcomeUnknown(_unknown) => return self,
             Current::MissingIdentifier(state) => state.state(),
         };
         fresh.id = prior.id.clone();
@@ -377,6 +403,7 @@ impl Orphans {
             Current::Absent(state) => state.state().id.clone(),
             Current::Present(present) => present.state().id.clone(),
             Current::CreateInFlight(pending) => pending.id().clone(),
+            Current::CreateOutcomeUnknown(unknown) => unknown.id().clone(),
             Current::MissingIdentifier(state) => state.state().id.clone(),
         };
         self.by_id.insert(id, orphan);
@@ -573,6 +600,7 @@ fn prior_managed_transform_states(
                 Current::Absent(state) => state.state(),
                 Current::Present(present) => present.state(),
                 Current::CreateInFlight(_pending) => return None,
+                Current::CreateOutcomeUnknown(_unknown) => return None,
                 Current::MissingIdentifier(state) => state.state(),
             };
             Some((id.clone(), state.clone()))
@@ -585,6 +613,7 @@ fn prior_managed_transform_states(
                 Current::Absent(state) => state.state(),
                 Current::Present(present) => present.state(),
                 Current::CreateInFlight(_pending) => return None,
+                Current::CreateOutcomeUnknown(_unknown) => return None,
                 Current::MissingIdentifier(state) => state.state(),
             };
             Some((id.clone(), state.clone()))

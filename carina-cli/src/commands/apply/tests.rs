@@ -268,6 +268,9 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
         carina_core::resource::Current::CreateInFlight(_) => {
             panic!("legacy fixture must not produce an in-flight create")
         }
+        carina_core::resource::Current::CreateOutcomeUnknown(_) => {
+            panic!("legacy fixture must not produce an unknown create outcome")
+        }
     };
     assert_eq!(
         planned_state.attributes.keys().collect::<Vec<_>>(),

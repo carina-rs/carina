@@ -30,13 +30,14 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use carina_core::UserDirs;
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
-    AppliedIdentifier, AppliedState, BoxFuture, CanonicalCustomTypeValue,
+    AppliedIdentifier, AppliedState, BoxFuture, CallEgressRecorder, CanonicalCustomTypeValue,
     CanonicalProviderConfigAttributes, CreateAttempt, CreateFailure, CreateOutcome, CreateRequest,
-    DeleteRequest, InitializedProvider, Observation, PendingCreate as CorePendingCreate,
-    Poll as CorePoll, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
-    ProviderReadyConfig, ProviderResult, ReadOutcome, ReadRequest, ResentPendingCreate,
-    ResentPoll as CoreResentPoll, Resume as CoreResume, ResumeCreateRequest, ResumeFailure,
-    ResumeOutcome, SavedAttrs, Sent, UpdateOutcome, UpdateRequest,
+    DecodedGuestCreateCall, DeleteRequest, FinishedGuestCreateCall, InitializedProvider,
+    Observation, PendingCreate as CorePendingCreate, Poll as CorePoll, Provider, ProviderError,
+    ProviderFactory, ProviderNormalizer, ProviderReadyConfig, ProviderResult, ReadOutcome,
+    ReadRequest, ResentPendingCreate, ResentPoll as CoreResentPoll, Resume as CoreResume,
+    ResumeCreateRequest, ResumeFailure, ResumeOutcome, SavedAttrs, Sent, StartedGuestCreateCall,
+    UpdateOutcome, UpdateRequest,
 };
 #[cfg(test)]
 use carina_core::provider::{
@@ -1306,6 +1307,7 @@ struct AllowListHttpHooks {
     kind: Option<ProviderKind>,
     resolver: Arc<dyn DestinationResolver>,
     test_route: Option<HttpTestRoute>,
+    call_egress: Option<CallEgressRecorder>,
 }
 
 impl AllowListHttpHooks {
@@ -1319,6 +1321,7 @@ impl AllowListHttpHooks {
             kind,
             resolver,
             test_route: None,
+            call_egress: None,
         }
     }
 
@@ -1378,6 +1381,10 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
         let label = Arc::clone(&self.label);
         let kind = self.kind;
         let resolver = Arc::clone(&self.resolver);
+        let mut pending_egress = self
+            .call_egress
+            .as_ref()
+            .map(CallEgressRecorder::begin_request);
         let trace_state = trace_http_enabled().then(|| {
             (
                 request.method().to_string(),
@@ -1429,6 +1436,9 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                                 EgressDenied::new(label, kind, destination, reason),
                             )),
                             Ok(vetted) => {
+                                if let Some(pending) = pending_egress.take() {
+                                    pending.dispatched();
+                                }
                                 let mut config = config;
                                 let cap = if vetted.is_metadata {
                                     METADATA_PROBE_TIMEOUT
@@ -3025,6 +3035,14 @@ impl<'a> LiveInstanceGuard<'a> {
         *slot = FailFastSlot::Poisoned { reason };
     }
 
+    fn release(mut self) {
+        drop(
+            self.slot
+                .take()
+                .expect("a released LiveInstanceGuard always owns its slot"),
+        );
+    }
+
     /// Run one guest call under the live store's wall-clock budget.
     async fn call<U, F>(mut self, operation: &'static str, f: F) -> ProviderResult<U>
     where
@@ -3048,17 +3066,64 @@ impl<'a> LiveInstanceGuard<'a> {
         };
         match call {
             Ok(value) => {
-                drop(
-                    self.slot
-                        .take()
-                        .expect("a successful guest call must still own its slot"),
-                );
+                self.release();
                 Ok(value)
             }
             Err(error) => {
                 let reason = PoisonReason::from_trap(operation, &error);
                 self.poison(reason);
                 Err(wasm_trap_provider_error(operation, error))
+            }
+        }
+    }
+
+    async fn call_create<U, F>(
+        self,
+        operation: &'static str,
+        id: ResourceId,
+        started: StartedGuestCreateCall,
+        f: F,
+    ) -> Result<ReturnedGuestCreateCall<U>, CreateFailure>
+    where
+        U: 'static,
+        F: AsyncFnOnce(&WasmBindings, &mut Store<HostState>) -> wasmtime::Result<U>,
+    {
+        let mut active = ActiveGuestCreateCall::new(self, id, started);
+        let call = {
+            let guard = active
+                .guard
+                .as_mut()
+                .expect("an active guest create call owns its instance guard");
+            let slot = guard
+                .slot
+                .as_mut()
+                .expect("an armed LiveInstanceGuard always owns its slot");
+            match &mut **slot {
+                FailFastSlot::Live(live) => {
+                    let (store, bindings) = (&mut live.store, &live.bindings);
+                    store.call(|store| f(bindings, store)).await
+                }
+                FailFastSlot::Poisoned { reason: _reason } => {
+                    unreachable!("LiveInstanceGuard can only hold a live slot")
+                }
+            }
+        };
+        let call = match call {
+            Ok(call) => call,
+            Err(error) => {
+                active.poison(PoisonReason::WallClockTimeout { operation });
+                let error = wall_budget_provider_error(operation, error);
+                return Err(active.classify_failure(error).await);
+            }
+        };
+        match call {
+            Ok(value) => Ok(active.finish(value)),
+            Err(error) => {
+                let reason = PoisonReason::from_trap(operation, &error);
+                active.poison(reason);
+                Err(active
+                    .classify_failure(wasm_trap_provider_error(operation, error))
+                    .await)
             }
         }
     }
@@ -3071,6 +3136,104 @@ impl Drop for LiveInstanceGuard<'_> {
                 reason: PoisonReason::Cancelled,
             };
         }
+    }
+}
+
+struct ActiveGuestCreateCall<'a> {
+    guard: Option<LiveInstanceGuard<'a>>,
+    id: ResourceId,
+    started: Option<StartedGuestCreateCall>,
+}
+
+impl<'a> ActiveGuestCreateCall<'a> {
+    fn new(
+        mut guard: LiveInstanceGuard<'a>,
+        id: ResourceId,
+        started: StartedGuestCreateCall,
+    ) -> Self {
+        let recorder = started.egress_recorder();
+        let slot = guard
+            .slot
+            .as_mut()
+            .expect("an armed LiveInstanceGuard always owns its slot");
+        match &mut **slot {
+            FailFastSlot::Live(live) => live.store.begin_create_call(recorder),
+            FailFastSlot::Poisoned { reason: _reason } => {
+                unreachable!("LiveInstanceGuard can only hold a live slot")
+            }
+        }
+        Self {
+            guard: Some(guard),
+            id,
+            started: Some(started),
+        }
+    }
+
+    fn poison(&mut self, reason: PoisonReason) {
+        self.guard
+            .take()
+            .expect("an active guest create call owns its instance guard")
+            .poison(reason);
+    }
+
+    async fn classify_failure(mut self, error: ProviderError) -> CreateFailure {
+        let id = self.id.clone();
+        self.started
+            .take()
+            .expect("an active guest create call owns its call witness")
+            .finish()
+            .failed(error.for_resource(id))
+            .await
+            .classify()
+    }
+
+    fn finish<U>(mut self, value: U) -> ReturnedGuestCreateCall<U> {
+        let mut guard = self
+            .guard
+            .take()
+            .expect("an active guest create call owns its instance guard");
+        let slot = guard
+            .slot
+            .as_mut()
+            .expect("an armed LiveInstanceGuard always owns its slot");
+        match &mut **slot {
+            FailFastSlot::Live(live) => live.store.finish_create_call(),
+            FailFastSlot::Poisoned { reason: _reason } => {
+                unreachable!("LiveInstanceGuard can only hold a live slot")
+            }
+        }
+        let call = self
+            .started
+            .take()
+            .expect("an active guest create call owns its call witness")
+            .finish();
+        guard.release();
+        ReturnedGuestCreateCall { call, value }
+    }
+}
+
+impl Drop for ActiveGuestCreateCall<'_> {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            drop(guard);
+        }
+        if let Some(started) = self.started.take() {
+            drop(started);
+        }
+    }
+}
+
+struct ReturnedGuestCreateCall<T> {
+    call: FinishedGuestCreateCall,
+    value: T,
+}
+
+impl<T> ReturnedGuestCreateCall<T> {
+    async fn decode<U>(
+        self,
+        decode: impl FnOnce(T) -> Result<U, ProviderError>,
+    ) -> Result<DecodedGuestCreateCall<U>, CreateFailure> {
+        self.call.decode(self.value, decode).await
     }
 }
 
@@ -5421,40 +5584,57 @@ impl WasmProvider {
             Ok(locked) => locked,
             Err(error) => return Err(attempt.untracked(error.for_resource(id))),
         };
-        let result = match locked
-            .call("create", async |bindings, store| {
+        let started = attempt.start_guest_call();
+        let returned = locked
+            .call_create("create", id.clone(), started, async |bindings, store| {
                 bindings.call_create(store, &call_id, &call_request).await
             })
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => return Err(attempt.untracked(error.for_resource(id))),
-        };
-        match result {
-            Ok(step) => match wasm_convert::wit_to_core_create_step(step, &id) {
-                Ok(wasm_convert::DecodedIssued::Decoded(step)) => Ok(Self::initial_create_step(
-                    id,
-                    wit_id,
-                    wit_request,
-                    attempt,
-                    step,
-                )),
-                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => Ok(
-                    Self::initial_created_read_decode_failure(id, &wit_request, attempt, failure),
-                ),
-                Err(error) => Err(attempt
-                    .untracked(wasm_value_decode_provider_error("create", error).for_resource(id))),
-            },
-            Err(verdict) => match wasm_convert::wit_to_core_create_verdict(verdict, &id) {
-                Ok(wasm_convert::DecodedIssued::Decoded(verdict)) => Ok(
-                    Self::initial_create_verdict(id, &wit_request, attempt, verdict),
-                ),
-                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => Ok(
-                    Self::initial_created_read_decode_failure(id, &wit_request, attempt, failure),
-                ),
-                Err(error) => Err(attempt
-                    .untracked(wasm_value_decode_provider_error("create", error).for_resource(id))),
-            },
+            .await?;
+        enum DecodedInitialCreateCall {
+            Step(wasm_convert::DecodedIssued<wasm_convert::DecodedCreateStep>),
+            Verdict(wasm_convert::DecodedIssued<wasm_convert::DecodedCreateVerdict>),
+        }
+        let decode_id = id.clone();
+        let decoded = returned
+            .decode(|result| match result {
+                Ok(step) => wasm_convert::wit_to_core_create_step(step, &decode_id)
+                    .map(DecodedInitialCreateCall::Step)
+                    .map_err(|error| {
+                        wasm_value_decode_provider_error("create", error)
+                            .for_resource(decode_id.clone())
+                    }),
+                Err(verdict) => wasm_convert::wit_to_core_create_verdict(verdict, &decode_id)
+                    .map(DecodedInitialCreateCall::Verdict)
+                    .map_err(|error| {
+                        wasm_value_decode_provider_error("create", error)
+                            .for_resource(decode_id.clone())
+                    }),
+            })
+            .await?;
+        let (attempt, decoded) = decoded.into_parts();
+        match decoded {
+            DecodedInitialCreateCall::Step(wasm_convert::DecodedIssued::Decoded(step)) => Ok(
+                Self::initial_create_step(id, wit_id, wit_request, attempt, step),
+            ),
+            DecodedInitialCreateCall::Step(wasm_convert::DecodedIssued::CreatedReadFailed(
+                failure,
+            )) => Ok(Self::initial_created_read_decode_failure(
+                id,
+                &wit_request,
+                attempt,
+                failure,
+            )),
+            DecodedInitialCreateCall::Verdict(wasm_convert::DecodedIssued::Decoded(verdict)) => Ok(
+                Self::initial_create_verdict(id, &wit_request, attempt, verdict),
+            ),
+            DecodedInitialCreateCall::Verdict(wasm_convert::DecodedIssued::CreatedReadFailed(
+                failure,
+            )) => Ok(Self::initial_created_read_decode_failure(
+                id,
+                &wit_request,
+                attempt,
+                failure,
+            )),
         }
     }
 
@@ -6673,6 +6853,12 @@ mod tests {
             CreateFailureKind::Untracked(error) => {
                 panic!("post-identifier decode failure became untracked: {error}")
             }
+            CreateFailureKind::OutcomeUnknown { unknown, error } => {
+                panic!(
+                    "post-identifier decode failure lost identifier as unknown for {}: {error}",
+                    unknown.id()
+                )
+            }
             CreateFailureKind::InFlight { error, .. } => {
                 panic!("post-identifier decode failure stayed in flight: {error}")
             }
@@ -6836,6 +7022,12 @@ mod tests {
             CreateFailureKind::Untracked(error) => {
                 panic!("fixture create was not pending: {error}")
             }
+            CreateFailureKind::OutcomeUnknown { unknown, error } => {
+                panic!(
+                    "fixture create outcome was unknown for {}: {error}",
+                    unknown.id()
+                )
+            }
         };
         PendingCreate {
             id,
@@ -6894,6 +7086,9 @@ mod tests {
             Current::Present(state) => panic!("resume fixture loaded as present: {state:?}"),
             Current::MissingIdentifier(state) => {
                 panic!("resume fixture loaded without an identifier: {state:?}")
+            }
+            Current::CreateOutcomeUnknown(unknown) => {
+                panic!("resume fixture loaded as outcome unknown: {unknown:?}")
             }
         }
     }
@@ -6977,6 +7172,12 @@ mod tests {
                 }
                 CreateFailureKind::Untracked(error) => {
                     panic!("issued create was downgraded to untracked: {error}")
+                }
+                CreateFailureKind::OutcomeUnknown { unknown, error } => {
+                    panic!(
+                        "issued create was downgraded to outcome unknown for {}: {error}",
+                        unknown.id()
+                    )
                 }
                 CreateFailureKind::Created { created, error } => {
                     panic!(

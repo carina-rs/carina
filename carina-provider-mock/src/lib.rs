@@ -1503,6 +1503,9 @@ mod tests {
             carina_core::resource::Current::MissingIdentifier(state) => {
                 panic!("resume fixture loaded without an identifier: {state:?}")
             }
+            carina_core::resource::Current::CreateOutcomeUnknown(unknown) => {
+                panic!("resume fixture loaded as outcome unknown: {unknown:?}")
+            }
         }
     }
 
@@ -1581,6 +1584,12 @@ mod tests {
                 (expected, Err(CreateFailureKind::InFlight { pending, error })) => {
                     panic!("expected {expected}, got in flight {pending:?}: {error}")
                 }
+                (expected, Err(CreateFailureKind::OutcomeUnknown { unknown, error })) => {
+                    panic!(
+                        "expected {expected}, got outcome unknown for {}: {error}",
+                        unknown.id()
+                    )
+                }
             }
             drop(mode_guard);
         }
@@ -1609,6 +1618,12 @@ mod tests {
             Err(CreateFailureKind::Untracked(error)) => panic!("expected pending, got {error}"),
             Err(CreateFailureKind::Created { created, error }) => {
                 panic!("expected pending, got {created:?}: {error}")
+            }
+            Err(CreateFailureKind::OutcomeUnknown { unknown, error }) => {
+                panic!(
+                    "expected pending, got outcome unknown for {}: {error}",
+                    unknown.id()
+                )
             }
         };
         drop(create_mode);

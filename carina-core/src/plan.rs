@@ -81,6 +81,11 @@ pub enum PlanErrorKind {
     CreateInFlightOrphan,
     /// Destroy cannot identify an unfinished create yet; apply must resume it.
     DestroyCreateInFlight,
+    /// The initial create may have reached the provider, but returned neither
+    /// an identifier nor a continuation that could classify its outcome.
+    CreateOutcomeUnknown {
+        resource: ResourceId,
+    },
     /// Desired provider routing no longer matches the route that issued the
     /// persisted create.
     ResumeCreateRoutingMismatch {
@@ -122,6 +127,36 @@ pub enum PlanErrorKind {
     ModuleConstraint(ModuleConstraintDiagnostic),
 }
 
+/// The sole resolution seam for a resource that is confirmed absent after an
+/// outcome-unknown create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateOutcomeUnknownAbsentResolution {
+    StateForget,
+}
+
+pub const fn create_outcome_unknown_absent_resolution() -> CreateOutcomeUnknownAbsentResolution {
+    CreateOutcomeUnknownAbsentResolution::StateForget
+}
+
+impl CreateOutcomeUnknownAbsentResolution {
+    fn hint(self, resource: &ResourceId) -> String {
+        match self {
+            Self::StateForget => {
+                format!(
+                    "carina state forget {}",
+                    create_outcome_unknown_address(resource)
+                )
+            }
+        }
+    }
+}
+
+fn create_outcome_unknown_address(resource: &ResourceId) -> String {
+    let identity =
+        crate::parser::display_double_quoted_literal_part(&resource.identity_display().to_string());
+    format!("{} \"{identity}\"", resource.display_type())
+}
+
 impl PlanError {
     pub fn new(resource_id: ResourceId, kind: PlanErrorKind) -> Self {
         Self { resource_id, kind }
@@ -129,6 +164,15 @@ impl PlanError {
 
     pub fn prevent_destroy(resource_id: ResourceId, action: PreventDestroyAction) -> Self {
         Self::new(resource_id, PlanErrorKind::PreventDestroy { action })
+    }
+
+    pub fn create_outcome_unknown(resource_id: ResourceId) -> Self {
+        Self::new(
+            resource_id.clone(),
+            PlanErrorKind::CreateOutcomeUnknown {
+                resource: resource_id,
+            },
+        )
     }
 
     /// Validate the provider identifier for one deposed generation.
@@ -196,6 +240,14 @@ impl std::fmt::Display for PlanErrorKind {
             Self::DestroyCreateInFlight => f.write_str(
                 "saved state contains a create still in progress; run apply first to resume it before destroying",
             ),
+            Self::CreateOutcomeUnknown { resource } => {
+                let address = create_outcome_unknown_address(resource);
+                let absent = create_outcome_unknown_absent_resolution().hint(resource);
+                write!(
+                    f,
+                    "the create may have reached the cloud, but its outcome is unknown; if it exists: import {{ to = {address} id = \"…\" }}; if it doesn't: {absent}"
+                )
+            }
             Self::ResumeCreateRoutingMismatch { persisted } => {
                 let route = persisted.provider_instance.as_deref().unwrap_or("default");
                 write!(
@@ -283,7 +335,22 @@ impl std::fmt::Display for PlanError {
             // The synthetic `_virtual` id is internal correlation metadata,
             // not a second user-facing resource identity.
             PlanErrorKind::ModuleConstraint(diagnostic) => write!(f, "{diagnostic}"),
-            kind => write!(f, "{}: {kind}", self.resource_id),
+            kind @ (PlanErrorKind::PreventDestroy { .. }
+            | PlanErrorKind::SchemaNotRegistered(_)
+            | PlanErrorKind::ReplacementCannotCoexist(_)
+            | PlanErrorKind::MissingProviderIdentifier
+            | PlanErrorKind::CreateInFlightOrphan
+            | PlanErrorKind::DestroyCreateInFlight
+            | PlanErrorKind::CreateOutcomeUnknown { .. }
+            | PlanErrorKind::ResumeCreateRoutingMismatch { .. }
+            | PlanErrorKind::InvalidImportProviderIdentifier
+            | PlanErrorKind::MissingDeposedProviderIdentifier { .. }
+            | PlanErrorKind::WaitTargetMissing { .. }
+            | PlanErrorKind::WaitTargetIsDataSource { .. }
+            | PlanErrorKind::WaitPredicateInvalid { .. }
+            | PlanErrorKind::ResolvedValueConstraint { .. }) => {
+                write!(f, "{}: {kind}", self.resource_id)
+            }
         }
     }
 }
@@ -1415,6 +1482,31 @@ mod tests {
             expected,
             "resource type 'ec2.Vpc' does not support create_before_destroy: the replacement cannot coexist with the original"
         );
+    }
+
+    #[test]
+    fn create_outcome_unknown_error_has_parseable_import_and_forget_hint() {
+        let resource = ResourceId::with_provider_identity(
+            "awscc",
+            "ec2.Vpc",
+            "main-vpc",
+            Some("management".to_string()),
+        );
+        let error = PlanError::create_outcome_unknown(resource);
+        let rendered = error.to_string();
+
+        assert_eq!(
+            rendered,
+            "awscc.ec2.Vpc.main-vpc: the create may have reached the cloud, but its outcome is unknown; if it exists: import { to = awscc.ec2.Vpc \"main-vpc\" id = \"…\" }; if it doesn't: carina state forget awscc.ec2.Vpc \"main-vpc\""
+        );
+        let import = rendered
+            .split_once("if it exists: ")
+            .and_then(|(_prefix, resolutions)| resolutions.split_once("; if it doesn't:"))
+            .map(|(import, _forget)| import)
+            .expect("the rendered hint must contain both resolution branches");
+
+        crate::parser::parse(import, &crate::parser::ProviderContext::default())
+            .expect("the rendered single-line import form must parse");
     }
 
     #[test]

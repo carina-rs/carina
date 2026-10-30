@@ -472,6 +472,9 @@ fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
         Current::CreateInFlight(pending) => {
             Orphan::create_in_flight(pending, row.binding.clone(), row.directives.clone())
         }
+        Current::CreateOutcomeUnknown(unknown) => {
+            Orphan::create_outcome_unknown(unknown, row.binding.clone(), row.directives.clone())
+        }
         Current::MissingIdentifier(state) => {
             Orphan::missing_identifier(state, row.binding.clone(), row.directives.clone())
         }
@@ -945,6 +948,7 @@ impl DesiredVerifiedPlanFile {
                     redacted_states.insert(id.clone(), present.state().clone());
                 }
                 carina_core::resource::Current::CreateInFlight(_pending) => {}
+                carina_core::resource::Current::CreateOutcomeUnknown(_unknown) => {}
                 carina_core::resource::Current::MissingIdentifier(state) => {
                     redacted_states.insert(id.clone(), state.state().clone());
                 }
@@ -975,6 +979,7 @@ impl DesiredVerifiedPlanFile {
                             .await?
                     }
                     carina_core::resource::Current::CreateInFlight(_pending) => None,
+                    carina_core::resource::Current::CreateOutcomeUnknown(_unknown) => None,
                     carina_core::resource::Current::MissingIdentifier(state) => {
                         verifier.verify(id, state.state(), None).await?
                     }

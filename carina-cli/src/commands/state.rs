@@ -13,11 +13,14 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{Orphan, Orphans, into_all_prior_states, lift_prior_state_enum_leaves};
 use carina_core::effect::Effect;
 use carina_core::executor::UnresolvedDataSourceInput;
-use carina_core::parser::ProviderContext;
+use carina_core::parser::{ProviderContext, ResourceTypePath, StateBlockAddress};
 use carina_core::plan::Plan;
+use carina_core::plan::{
+    CreateOutcomeUnknownAbsentResolution, create_outcome_unknown_absent_resolution,
+};
 use carina_core::provider::{
     self as provider_mod, AppliedIdentifier, InFlightCreate, PersistedAttributes, Provider,
-    ProviderError, ProviderNormalizer, ProviderRouter, RawSavedAttrs,
+    ProviderError, ProviderNormalizer, ProviderRouter, RawSavedAttrs, UnknownCreateOutcome,
 };
 use carina_core::resource::{
     Current, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
@@ -27,12 +30,10 @@ use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
 };
 use carina_core::value::format_value;
-#[cfg(test)]
-use carina_state::LockInfo;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, BackendSelection, DeposedInstance,
-    DeposedKey, LoadedOrphans, ResourceState, RowBasis, StateBackend, StateFile, StateUrl,
-    load_state_from_url,
+    DeposedKey, LoadedOrphans, LockInfo, ResourceState, RowBasis, StateBackend, StateFile,
+    StateUrl, load_state_from_url,
 };
 
 use super::{
@@ -45,8 +46,11 @@ use crate::commands::plan::{
 };
 use crate::commands::shared::finalize::release_lock_after_execute;
 use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
-use crate::commands::shared::progress::{ProgressBackend, ProgressSink, RefreshPhase};
+use crate::commands::shared::progress::{
+    ProgressBackend, ProgressSink, RefreshPhase, emit_newline_on_interrupt,
+};
 use crate::commands::shared::state_writeback::SkippedExports;
+use crate::cursor::CursorReveal;
 use crate::error::AppError;
 use crate::wiring::{
     AddressedDataSourceReadInputs, ProviderLoad, ValidatedConfig, get_provider_with_ctx,
@@ -214,6 +218,22 @@ pub enum StateCommands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         lock: bool,
     },
+    /// Forget a create-outcome-unknown row after confirming the resource is absent
+    Forget {
+        /// Namespaced resource type, for example awscc.ec2.Vpc
+        resource_type: String,
+
+        /// Resource identity
+        identity: String,
+
+        /// Skip confirmation prompt (auto-approve)
+        #[arg(long)]
+        auto_approve: bool,
+
+        /// Path to directory containing backend configuration
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// List all managed resources from the state file
     List {
         /// Path to directory containing .crn files (defaults to ".").
@@ -271,7 +291,9 @@ pub enum StateCommands {
 impl StateCommands {
     pub fn project_dir(&self) -> Option<&Path> {
         match self {
-            Self::BucketDelete { path, .. } | Self::Refresh { path, .. } => Some(path),
+            Self::BucketDelete { path, .. }
+            | Self::Refresh { path, .. }
+            | Self::Forget { path, .. } => Some(path),
             Self::List { path, state_url }
             | Self::Lookup {
                 path, state_url, ..
@@ -304,6 +326,22 @@ pub async fn run_state_command(
         } => run_state_bucket_delete(user_dirs, &bucket_name, force, &path, provider_context).await,
         StateCommands::Refresh { path, lock } => {
             run_state_refresh(user_dirs, &path, lock, provider_context, cancel).await
+        }
+        StateCommands::Forget {
+            resource_type,
+            identity,
+            auto_approve,
+            path,
+        } => {
+            run_state_forget(
+                &resource_type,
+                &identity,
+                auto_approve,
+                &path,
+                provider_context,
+                cancel,
+            )
+            .await
         }
         StateCommands::List { path, state_url } => {
             run_state_list(path.as_deref(), state_url.as_deref(), provider_context).await
@@ -339,6 +377,171 @@ pub async fn run_state_command(
             .await
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateForgetConfirmation {
+    Confirmed,
+    Cancelled,
+}
+
+fn state_forget_address(
+    namespaced_type: &str,
+    identity: &str,
+) -> Result<StateBlockAddress, AppError> {
+    let type_path = ResourceTypePath::parse(namespaced_type).ok_or_else(|| {
+        AppError::Config(format!(
+            "Invalid resource type '{namespaced_type}'; expected a namespaced type such as awscc.ec2.Vpc"
+        ))
+    })?;
+    let identity = ResourceIdentity::try_from(identity.to_owned())?;
+    Ok(StateBlockAddress::new(
+        type_path.provider,
+        type_path.resource_type,
+        identity,
+    ))
+}
+
+fn display_state_forget_address(address: &StateBlockAddress) -> String {
+    format!(
+        "{} {}",
+        address.display_type(),
+        carina_core::parser::display_string_literal(address.name_str())
+    )
+}
+
+async fn confirm_state_forget<R>(
+    reader: R,
+    cancel: ShutdownToken,
+    auto_approve: bool,
+) -> Result<StateForgetConfirmation, AppError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    if auto_approve {
+        return Ok(StateForgetConfirmation::Confirmed);
+    }
+
+    println!(
+        "{}",
+        "Forget this create-outcome-unknown state row?"
+            .yellow()
+            .bold()
+    );
+    println!(
+        "  {}",
+        "Only continue after confirming that the resource does not exist. Type 'yes' to confirm."
+            .yellow()
+    );
+    let input = {
+        let _reveal = CursorReveal::new();
+        print!("\n  Enter a value: ");
+        std::io::Write::flush(&mut std::io::stdout()).map_err(|error| error.to_string())?;
+        let result = crate::signal::read_line_until_cancelled(reader, cancel).await;
+        emit_newline_on_interrupt(&mut std::io::stdout(), &result);
+        result?
+    };
+
+    if input.trim() == "yes" {
+        println!();
+        Ok(StateForgetConfirmation::Confirmed)
+    } else {
+        println!();
+        println!("{}", "State forget cancelled.".yellow());
+        Ok(StateForgetConfirmation::Cancelled)
+    }
+}
+
+/// Remove the recovery row for a create whose outcome is unknown.
+pub async fn run_state_forget(
+    namespaced_type: &str,
+    identity: &str,
+    auto_approve: bool,
+    path: &Path,
+    provider_context: &ProviderContext,
+    cancel: ShutdownToken,
+) -> Result<(), AppError> {
+    let address = state_forget_address(namespaced_type, identity)?;
+    let parsed = load_configuration_with_config(
+        path,
+        provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    )?
+    .parsed;
+    let verified_backend =
+        verify_for_mutation(path, parsed.backend.as_ref(), DriftCommand::ForgetState)?;
+    let backend = verified_backend
+        .resolve()
+        .await
+        .map_err(AppError::Backend)?;
+
+    println!("{}", "Acquiring state lock...".cyan());
+    let lock = backend
+        .acquire_lock("state forget")
+        .await
+        .map_err(|error| map_lock_error(error, path))?;
+    println!("  {} Lock acquired", "✓".green());
+
+    let reader = tokio::io::BufReader::new(tokio::io::stdin());
+    let operation = run_state_forget_locked(
+        backend.as_ref(),
+        &lock,
+        &address,
+        auto_approve,
+        reader,
+        cancel.clone(),
+    )
+    .await;
+    let release =
+        release_lock_after_execute(backend.as_ref(), StateLockRef::Held(&lock), &cancel).await;
+    if release.is_ok() {
+        println!("  {} Lock released", "✓".green());
+    }
+    operation?;
+    release
+}
+
+async fn run_state_forget_locked<R>(
+    backend: &dyn StateBackend,
+    lock: &LockInfo,
+    address: &StateBlockAddress,
+    auto_approve: bool,
+    reader: R,
+    cancel: ShutdownToken,
+) -> Result<(), AppError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut state =
+        crate::commands::apply::load_state_persist_if_migrated(backend, StateLockRef::Held(lock))
+            .await?
+            .unwrap_or_default();
+    let row = state.find_outcome_unknown(address)?;
+
+    println!(
+        "Create-outcome-unknown row: {}",
+        display_state_forget_address(address).yellow()
+    );
+    println!("This row has no provider identifier and cannot be destroyed safely.");
+    if confirm_state_forget(reader, cancel, auto_approve).await?
+        == StateForgetConfirmation::Cancelled
+    {
+        drop(row);
+        return Ok(());
+    }
+
+    match create_outcome_unknown_absent_resolution() {
+        CreateOutcomeUnknownAbsentResolution::StateForget => {
+            StateFile::forget(row);
+        }
+    }
+    crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
+    println!(
+        "{} {}",
+        "Forgot state row:".green().bold(),
+        display_state_forget_address(address)
+    );
+    Ok(())
 }
 
 /// Run force-unlock command
@@ -457,6 +660,7 @@ enum StateCommandCurrent<'a> {
         kind: StateCommandStateKind,
     },
     CreateInFlight(&'a InFlightCreate),
+    CreateOutcomeUnknown(&'a UnknownCreateOutcome),
 }
 
 impl<'a> From<&'a Current> for StateCommandCurrent<'a> {
@@ -471,6 +675,7 @@ impl<'a> From<&'a Current> for StateCommandCurrent<'a> {
                 kind: StateCommandStateKind::Present,
             },
             Current::CreateInFlight(pending) => Self::CreateInFlight(pending),
+            Current::CreateOutcomeUnknown(unknown) => Self::CreateOutcomeUnknown(unknown),
             Current::MissingIdentifier(unidentified) => Self::State {
                 state: unidentified.state(),
                 kind: StateCommandStateKind::MissingIdentifier,
@@ -491,6 +696,13 @@ fn current_for_state_command(state: &StateFile, row: &ResourceState) -> Current 
 
 fn create_in_flight_status(pending: &InFlightCreate) -> String {
     format!("create in flight since {}", pending.started_at().as_str())
+}
+
+fn create_outcome_unknown_status(unknown: &UnknownCreateOutcome) -> String {
+    format!(
+        "create outcome unknown since {}; the create may have reached the cloud",
+        unknown.started_at().as_str()
+    )
 }
 
 /// Format state list output. Returns each line as a string.
@@ -517,6 +729,12 @@ fn format_state_list(state: &StateFile) -> Vec<String> {
                 lines.push(format!(
                     "{row_prefix}  ({})",
                     create_in_flight_status(pending)
+                ));
+            }
+            StateCommandCurrent::CreateOutcomeUnknown(unknown) => {
+                lines.push(format!(
+                    "{row_prefix}  ({})",
+                    create_outcome_unknown_status(unknown)
                 ));
             }
         }
@@ -695,6 +913,24 @@ fn format_resource_value(
                 }
             }
         },
+        StateCommandCurrent::CreateOutcomeUnknown(unknown) => match attribute {
+            Some(attr) => {
+                let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
+                Err(AppError::Config(format!(
+                    "Cannot look up attribute '{attr}' on resource '{display_name}': {}.",
+                    create_outcome_unknown_status(unknown)
+                )))
+            }
+            None => {
+                let status = create_outcome_unknown_status(unknown);
+                if json_output {
+                    Ok(serde_json::to_string_pretty(&status)
+                        .expect("outcome-unknown status is serializable"))
+                } else {
+                    Ok(status)
+                }
+            }
+        },
     }
 }
 
@@ -801,6 +1037,9 @@ fn format_state_show(state: &StateFile) -> String {
             ),
             StateCommandCurrent::CreateInFlight(pending) => {
                 output.push_str(&format!("  {}\n", create_in_flight_status(pending)));
+            }
+            StateCommandCurrent::CreateOutcomeUnknown(unknown) => {
+                output.push_str(&format!("  {}\n", create_outcome_unknown_status(unknown)));
             }
         }
         for deposed in &rs.deposed {
@@ -1195,6 +1434,10 @@ pub(crate) async fn run_state_refresh_locked(
                 Current::CreateInFlight(pending) => {
                     managed_current.insert(resource.id.clone(), Current::CreateInFlight(pending));
                 }
+                Current::CreateOutcomeUnknown(unknown) => {
+                    managed_current
+                        .insert(resource.id.clone(), Current::CreateOutcomeUnknown(unknown));
+                }
                 Current::Absent(_state) => {}
             }
         }
@@ -1232,6 +1475,7 @@ pub(crate) async fn run_state_refresh_locked(
             Current::Absent(_state) => {}
             Current::Present(_present) => {}
             Current::CreateInFlight(_pending) => {}
+            Current::CreateOutcomeUnknown(_unknown) => {}
             Current::MissingIdentifier(_state) => {
                 warn_missing_provider_identifier(id);
                 missing_provider_identifier_ids.insert(id.clone());
@@ -1724,6 +1968,7 @@ async fn refresh_orphans_until_cancelled(
                 Current::Absent(_state) => false,
                 Current::Present(_present) => true,
                 Current::CreateInFlight(_pending) => false,
+                Current::CreateOutcomeUnknown(_unknown) => false,
                 Current::MissingIdentifier(_state) => false,
             };
             in_flight.push(async move {
@@ -2120,6 +2365,18 @@ fn diff_display_update_resource_with_provider(
                 label_suffix,
             );
             println!("    {}", create_in_flight_status(pending));
+            println!();
+            return Ok(());
+        }
+        StateCommandCurrent::CreateOutcomeUnknown(unknown) => {
+            counts.unchanged += 1;
+            println!(
+                "  {} \"{}\"{}:",
+                id.display_type().cyan(),
+                identity,
+                label_suffix,
+            );
+            println!("    {}", create_outcome_unknown_status(unknown));
             println!();
             return Ok(());
         }
@@ -3411,6 +3668,144 @@ mod tests {
             "State is locked by another process (lock ID: lock-123, operation: apply)\n\
              If you believe this is stale, run: `carina force-unlock lock-123 infra/foo`"
         );
+    }
+
+    fn outcome_unknown_state_fixture() -> StateFile {
+        carina_state::check_and_migrate(
+            &serde_json::json!({
+                "version": StateFile::CURRENT_VERSION,
+                "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+                "serial": 4,
+                "lineage": "state-forget-test",
+                "carina_version": "test",
+                "resources": [{
+                    "resource_type": "test.Resource",
+                    "identity": "unknown",
+                    "provider": "mock",
+                    "current": {
+                        "kind": "create_outcome_unknown",
+                        "started_at": "2026-10-30T03:00:00Z"
+                    }
+                }],
+                "exports": {}
+            })
+            .to_string(),
+        )
+        .expect("outcome-unknown fixture must decode")
+        .into_state()
+    }
+
+    fn state_forget_fixture(state: &StateFile) -> CancellationFixtureBase {
+        let fixture = CancellationFixtureBase::new();
+        fixture.write_crn(format!(
+            "backend local {{ path = \"{}\" }}\n",
+            fixture.state_path().display()
+        ));
+        fixture.write_backend_lock();
+        fixture.write_state(state);
+        fixture
+    }
+
+    #[tokio::test]
+    async fn state_forget_removes_and_persists_only_outcome_unknown_row() {
+        let fixture = state_forget_fixture(&outcome_unknown_state_fixture());
+
+        run_state_forget(
+            "mock.test.Resource",
+            "unknown",
+            true,
+            fixture.config_path(),
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect("outcome-unknown row may be forgotten");
+
+        let persisted = fixture.read_state().await;
+        assert!(persisted.resources().is_empty());
+        assert_eq!(persisted.serial, 5);
+    }
+
+    #[tokio::test]
+    async fn state_forget_rejects_normal_row_with_typed_removed_guidance() {
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(
+                ResourceState::try_applied("test.Resource", "normal", "mock", "provider-id")
+                    .expect("fixture identifier is non-empty"),
+            )
+            .expect("normal fixture row is valid");
+        let fixture = state_forget_fixture(&state);
+
+        let error = run_state_forget(
+            "mock.test.Resource",
+            "normal",
+            true,
+            fixture.config_path(),
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect_err("ordinary rows cannot be forgotten");
+
+        assert!(matches!(&error, AppError::StateForget(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("removed { from = mock.test.Resource 'normal' }")
+        );
+        assert_eq!(fixture.read_state().await.resources().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn state_forget_reports_lock_contention_like_other_locked_commands() {
+        let fixture = state_forget_fixture(&outcome_unknown_state_fixture());
+        let backend = fixture.backend_handle();
+        let held = backend
+            .acquire_lock("apply")
+            .await
+            .expect("hold fixture lock");
+
+        let error = run_state_forget(
+            "mock.test.Resource",
+            "unknown",
+            true,
+            fixture.config_path(),
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect_err("held lock must reject state forget");
+
+        assert!(matches!(error, AppError::Config(_)));
+        assert!(error.to_string().contains("State is locked by"));
+        assert!(error.to_string().contains("operation: apply"));
+        assert_eq!(fixture.read_state().await.resources().len(), 1);
+        backend
+            .release_lock(&held)
+            .await
+            .expect("release fixture lock");
+    }
+
+    #[tokio::test]
+    async fn state_forget_confirmation_requires_yes_and_auto_approve_skips_input() {
+        let cancelled = confirm_state_forget(
+            tokio::io::BufReader::new("no\n".as_bytes()),
+            ShutdownToken::running(),
+            false,
+        )
+        .await
+        .expect("confirmation input is readable");
+        assert_eq!(cancelled, StateForgetConfirmation::Cancelled);
+
+        let confirmed = confirm_state_forget(
+            tokio::io::BufReader::new(tokio::io::empty()),
+            ShutdownToken::running(),
+            true,
+        )
+        .await
+        .expect("auto approve does not read input");
+        assert_eq!(confirmed, StateForgetConfirmation::Confirmed);
     }
 
     #[derive(Default)]

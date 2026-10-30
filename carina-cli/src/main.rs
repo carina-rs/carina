@@ -1359,6 +1359,36 @@ mod error_format_tests {
     }
 
     #[test]
+    fn state_forget_hint_shape_parses_with_auto_approve() {
+        let cli = Cli::try_parse_from([
+            "carina",
+            "state",
+            "forget",
+            "awscc.ec2.Vpc",
+            "main-vpc",
+            "--auto-approve",
+        ])
+        .expect("the plan hint's state-forget command must be copy-pasteable");
+
+        let Commands::State { command } = cli.command else {
+            panic!("expected state command");
+        };
+        let StateCommands::Forget {
+            resource_type,
+            identity,
+            auto_approve,
+            path,
+        } = command
+        else {
+            panic!("expected state forget command");
+        };
+        assert_eq!(resource_type, "awscc.ec2.Vpc");
+        assert_eq!(identity, "main-vpc");
+        assert!(auto_approve);
+        assert_eq!(path, PathBuf::from("."));
+    }
+
+    #[test]
     fn saved_plan_apply_accepts_legacy_override_flag_after_plan_path() {
         let cli = Cli::try_parse_from([
             "carina",
