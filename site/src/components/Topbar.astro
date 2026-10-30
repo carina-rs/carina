@@ -19,7 +19,11 @@
 
 <style>
   .topbar {
-    height: 64px;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    box-sizing: border-box;
+    height: var(--topbar-height);
     background: var(--topbar-bg);
   }
 

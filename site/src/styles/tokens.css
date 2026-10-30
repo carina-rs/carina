@@ -105,6 +105,10 @@
 }
 
 /* ---------- Semantic base styles ---------- */
+html {
+  scroll-padding-top: calc(var(--topbar-height) + var(--space-6));
+}
+
 html, body {
   background: var(--bg);
   color: var(--fg2);
@@ -237,6 +241,7 @@ a:hover { color: var(--accent-high); }
    ============================================================ */
 :root {
   /* ----- Topbar ----- */
+  --topbar-height:           64px;
   --topbar-bg:               var(--bg);
   --topbar-border:           var(--border);
   --topbar-brand-color:      var(--accent);
@@ -373,4 +378,36 @@ a:hover { color: var(--accent-high); }
   --feature-card-icon-bg:    var(--bg-panel);
   --feature-card-icon-color: var(--accent);
 
+}
+
+/* Shared ghost control for the documentation side rails. */
+.rail-toggle {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--topbar-icon-color);
+  cursor: pointer;
+  transition: color 0.15s, background-color 0.15s;
+}
+
+.rail-toggle:hover {
+  color: var(--topbar-icon-hover);
+  background: var(--bg-raise);
+}
+
+.rail-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rail-toggle { transition: none; }
 }

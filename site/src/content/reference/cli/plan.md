@@ -220,6 +220,10 @@ carina plan --check-iam --strict-iam
 
 `plan` does not acquire the state lock, so it never blocks or is blocked by other runs. Because a concurrent `apply` or `destroy` can change state while the plan is computed, `plan` re-reads state just before display. If the state's serial or lineage changed (or the state was removed), it prints a warning to stderr that the plan may be stale and still shows the plan. `--out` still writes the plan file; applying a stale saved plan is caught by the lineage/serial check in `carina apply`.
 
+When a destroy and create have matching configured create-only values, `plan`
+also warns on stderr about a possible state move; see
+[Moving resources in state](/guides/state-management/#moving-resources-in-state).
+
 ## Examples
 
 Plan from the current directory:

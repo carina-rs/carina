@@ -173,7 +173,7 @@ fn state_lookup_redacts_secrets_without_colliding_with_user_secret_keys() {
     assert_command_success(&json_secret);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&json_secret.stdout).unwrap(),
-        json!("(secret)")
+        json!({"redacted": true})
     );
 
     for args in [
@@ -229,7 +229,7 @@ fn state_list_file_url_lists_resources() {
 }
 
 #[test]
-fn state_show_json_file_url_emits_state_json() {
+fn state_show_json_file_url_emits_versioned_public_document() {
     let tmp = TempDir::new().unwrap();
     let state = write_minimal_state(tmp.path());
     let url = format!("file://{}", state.display());
@@ -245,7 +245,13 @@ fn state_show_json_file_url_emits_state_json() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("show --json must emit valid JSON");
-    assert_eq!(parsed["lineage"], "test-state-url-e2e");
+    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["state"], "present");
+    assert_eq!(
+        parsed["resources"][0]["current"]["identifier"],
+        "vpc-deadbeef"
+    );
+    assert!(parsed.get("lineage").is_none());
 }
 
 #[test]

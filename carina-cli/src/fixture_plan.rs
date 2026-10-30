@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
-use carina_core::differ::{
-    Orphans, PlanPriorStates, create_plan_with_cascades, into_all_prior_states, provider_states_for,
-};
+use carina_core::differ::Orphans;
 use carina_core::executor::UnresolvedResource;
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult, ProviderRouter};
@@ -24,12 +22,9 @@ use carina_core::schema::{
 use carina_state::{PublishedExports, StateFile, check_and_migrate};
 
 use crate::commands::plan::compute_export_diffs;
+use crate::moved_hint::{MovedBlockHints, detect_moved_block_hints};
 use crate::plan_summary::PlanChangeSummary;
-use crate::wiring::{
-    LoadedProviderFactory, OverrideAwareBuildMode, OverrideAwareResources, PlanPreparationError,
-    PlanPreprocessor, ProviderLoad, RebuildBindingsInputs, ValidatedConfig,
-    add_deferred_create_effects,
-};
+use crate::wiring::{LoadedProviderFactory, ProviderLoad, ValidatedConfig};
 
 /// Fixture root path relative to the `carina-cli` crate manifest.
 const FIXTURE_SUBPATH: &str = "tests/fixtures/plan_display";
@@ -49,7 +44,49 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
     let aws = |schema| ("aws".to_string(), schema);
     let awscc = |schema| ("awscc".to_string(), schema);
     let schemas = vec![
-        aws(ResourceSchema::new("acm.Certificate").attribute(create_only_string("domain_name"))),
+        aws(ResourceSchema::new("acm.Certificate")
+            .attribute(create_only_string("domain_name"))
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "domain_validation_options",
+                    AttributeType::list(AttributeType::struct_(
+                        "DomainValidation",
+                        vec![
+                            StructField::provider_populated("domain_name", AttributeType::string())
+                                .build(),
+                            StructField::provider_populated(
+                                "resource_record",
+                                AttributeType::struct_(
+                                    "ResourceRecord",
+                                    vec![
+                                        StructField::provider_populated(
+                                            "name",
+                                            AttributeType::string(),
+                                        )
+                                        .build(),
+                                        // The real provider uses a string enum here. The
+                                        // provider-less fixture catalog keeps the nested
+                                        // value as a string; RecordSet.type below carries
+                                        // the enum needed at the create-only match seam.
+                                        StructField::provider_populated(
+                                            "type",
+                                            AttributeType::string(),
+                                        )
+                                        .build(),
+                                        StructField::provider_populated(
+                                            "value",
+                                            AttributeType::string(),
+                                        )
+                                        .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )),
         aws(ResourceSchema::new("acm.CertificateValidation")
             .attribute(create_only_string("certificate_arn"))
             .attribute(create_only_string("validation_record_id"))),
@@ -57,7 +94,11 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
         aws(ResourceSchema::new("route53.RecordSet")
             .attribute(create_only_string("hosted_zone_id"))
             .attribute(create_only_string("name"))
-            .attribute(create_only_string("type"))),
+            .attribute(
+                AttributeSchema::optional("type", fixture_route53_record_type())
+                    .create_only()
+                    .build(),
+            )),
         aws(ResourceSchema::new("s3.Bucket").attribute(create_only_string("bucket_name"))),
         awscc(ResourceSchema::new("ec2.RouteTable").attribute(create_only_string("vpc_id"))),
         awscc(
@@ -153,7 +194,14 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
                 .attribute(create_only_string("target_id"))
                 .attribute(create_only_string("target_type")),
         ),
-        awscc(ResourceSchema::new("test.Widget").attribute(create_only_string("external_name"))),
+        awscc(
+            ResourceSchema::new("test.Widget")
+                .attribute(create_only_string("external_name"))
+                .attribute(
+                    AttributeSchema::optional("b", AttributeType::list(AttributeType::string()))
+                        .build(),
+                ),
+        ),
     ];
     schemas
         .into_iter()
@@ -169,6 +217,7 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
 /// Complete output of fixture-based plan construction.
 pub struct FixturePlan {
     pub plan: Plan,
+    pub moved_hints: MovedBlockHints,
     /// Resolved desired resources, including unchanged resources omitted from
     /// `plan.effects()`. Plan-image tests use these to retain only unchanged
     /// connectors between changed nodes.
@@ -405,147 +454,26 @@ where
             data_source_states.insert(ds.id.clone(), State::not_found(ds.id.clone()));
         }
     }
-    let mut data_source_values =
-        DataSourceValues::from_data_sources(&data_sources, |data_source| {
-            DataSourceValue::read(
-                data_source_states
-                    .get(&data_source.id)
-                    .cloned()
-                    .expect("fixture initialized every data-source state"),
-            )
-        });
-
-    let managed_bindings: HashSet<String> = expansion_prelude
-        .sorted_resources()
-        .iter()
-        .filter_map(|resource| resource.binding.clone())
-        .collect();
-    let non_managed_deferred_for = parsed
-        .deferred_for_expressions
-        .iter()
-        .filter(|deferred| {
-            !deferred
-                .root_bindings()
-                .iter()
-                .any(|binding| managed_bindings.contains(binding))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut reconciled_expansion = expansion_prelude
-        .bind_projected_phase1_state(managed_current, orphans, HashSet::new())
-        .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Print)
-        .expect("fixture move routes must match their loaded current states");
-
-    // Match the production plan order: expand upstream-resolved deferred loops
-    // before building the override-aware desired view and running the late
-    // anonymous identity/migration seam.
-    let prepared_for_expansion =
-        reconciled_expansion.prepared_clone_for_fixture(data_source_values.clone());
-    let (validated_expansion, deferred_for_expansion) = validated_config
-        .expand_deferred_for(
-            &prepared_for_expansion,
-            &remote_bindings,
-            crate::wiring::DeferredForWarningPolicy::Print,
+    let data_source_values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
+        DataSourceValue::read(
+            data_source_states
+                .get(&data_source.id)
+                .cloned()
+                .expect("fixture initialized every data-source state"),
         )
-        .expect("fixture deferred-for expansion failed");
-    let (wiring, expanded_canonical_resources) = validated_expansion.context_and_resources();
-    let parsed = expanded_canonical_resources.parsed();
-    let sorted_resources = &deferred_for_expansion.sorted_resources;
-    {
-        let (managed_current, _) = reconciled_expansion.managed_current_and_orphans_mut();
-        for resource in sorted_resources
-            .iter()
-            .filter(|resource| deferred_for_expansion.new_child_ids.contains(&resource.id))
-        {
-            managed_current
-                .entry(resource.id.clone())
-                .or_insert_with(|| Current::absent(resource.id.clone()));
-        }
-    }
+    });
 
-    // carina#3248: build unified pre-apply bindings (managed +
-    // composition + data sources) so composition-rooted refs in the fixture
-    // resolve through the composition layer to the managed sibling.
-    let upstream_binding_names_owned: HashSet<String> = parsed
-        .upstream_binding_names()
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    let upstream_binding_names: HashSet<&str> = upstream_binding_names_owned
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let pre_apply_input_current = carina_core::resource::into_plan_input_current_map(
-        reconciled_expansion.managed_current().clone(),
-        wiring.schemas(),
-        sorted_resources,
-    );
-    let managed_stability = crate::wiring::derive_managed_binding_stability(
-        parsed,
-        sorted_resources,
-        reconciled_expansion.managed_current(),
-        &data_source_values,
-        wiring.schemas(),
-        reconciled_expansion.saved_attrs(),
-        reconciled_expansion.prev_explicit(),
-        &remote_bindings,
-        reconciled_expansion.wait_aliases(),
-    )
-    .expect("fixture managed binding stability must resolve");
-    let projected_state = reconciled_expansion.projected_state(state_file.as_ref());
-    let (mut override_aware_resources, unresolved_override_aware_resources) =
-        OverrideAwareResources::build_pair_with_stability(
-            expanded_canonical_resources.as_pair(),
-            &projected_state,
-            carina_core::binding_index::LivePreApplyInputs {
-                managed: &[],
-                compositions: &parsed.compositions,
-                managed_current: &pre_apply_input_current,
-                data_source_values: &data_source_values,
-                remote_bindings: &remote_bindings,
-                wait_aliases: reconciled_expansion.wait_aliases(),
-            },
-            &managed_stability,
-            OverrideAwareBuildMode::Plan {
-                unresolved_upstream_bindings: &upstream_binding_names,
-            },
-        )
-        .expect("Failed to build override-aware resources");
-    crate::legacy_name_overrides::emit_legacy_override_warnings(
-        &override_aware_resources,
-        &projected_state,
-    );
-
-    // Resolve data-source input refs for the plan (carina#3181).
-    let mut data_sources_for_plan = data_sources.clone();
-    carina_core::resolver::resolve_data_source_refs_for_plan(
-        &mut data_sources_for_plan,
-        override_aware_resources.bindings(),
-        &upstream_binding_names,
-    )
-    .expect("Failed to resolve data source refs with state");
-
-    crate::wiring::lift_data_source_value_enum_leaves(
-        &mut data_source_values,
-        &data_sources,
-        wiring.schemas(),
-    );
-    let constraint_origin_resources = override_aware_resources
-        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
-    let prepared_compositions = parsed.compositions.clone();
-    let module_gate =
-        carina_core::executor::ModuleConstraintGate::from_live_compositions(&prepared_compositions);
-    let wait_bindings = parsed.wait_bindings.clone();
     let mut provider_router = ProviderRouter::new();
-    let preparation = {
+    {
         // Provider config validation may use `block_in_place` to bridge a
-        // synchronous factory hook to async WASM calls. Keep both preparation
-        // and normalizer creation inside a compatible runtime.
+        // synchronous factory hook to async WASM calls. Build fixture
+        // normalizers inside a compatible runtime; the shared post-expansion
+        // seam invokes them later.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
-            .expect("failed to build tokio runtime for plan preprocessing");
+            .expect("failed to build tokio runtime for fixture normalizers");
         for factory in wiring.factories() {
             let resolved_config = resolved_provider_configs.provider_or_implicit(factory.name());
             let config = rt
@@ -566,231 +494,182 @@ where
                 Box::new(carina_provider_mock::MockProvider::new()),
             );
         }
-        let (managed_current, orphans) = reconciled_expansion.managed_current_and_orphans_mut();
-        rt.block_on(async {
-            PlanPreprocessor::new(&provider_router, wiring)
-                .prepare(
-                    &mut override_aware_resources,
-                    &constraint_origin_resources,
-                    &module_gate,
-                    managed_current,
-                    &mut data_source_values,
-                    orphans,
-                    raw_provider_configs,
-                    &mut data_sources_for_plan,
-                    &data_sources,
-                )
-                .await
-        })
-    };
-    if let Err(error) = preparation {
-        let errors = match error {
-            PlanPreparationError::Plan(errors) => errors,
-            PlanPreparationError::Provider(error) => {
-                panic!("fixture no-op normalizer unexpectedly failed: {error}")
-            }
-        };
-        let mut plan = Plan::new();
-        for error in errors {
-            plan.add_error(error);
-        }
-        let managed_current = into_all_prior_states(
-            reconciled_expansion.orphans().clone(),
-            reconciled_expansion.managed_current().clone(),
-        );
-        let prev_explicit = reconciled_expansion.prev_explicit().clone();
-        return FixturePlan {
-            plan,
-            // Error plans are never rendered, so they intentionally do not
-            // expose a partial resolved-resource view to fixture callers.
-            desired_resources: Vec::new(),
-            unresolved_resources: Vec::new(),
-            compositions: parsed.compositions.clone(),
-            managed_current,
-            data_source_states: data_source_values.read_states_map(),
-            state_file,
-            schemas: wiring.schemas().clone(),
-            moved_origins: HashMap::new(),
-            deferred_for_expressions: parsed.deferred_for_expressions.clone(),
-            export_params: parsed.export_params.clone(),
-            resolved_export_params: carina_core::validation::check_export_values_pre_apply(
-                &[],
-                &carina_core::binding_index::ResolvedBindings::default(),
-                &carina_core::parser::ProviderContext::default(),
-            )
-            .expect("empty exports are checked"),
-            prev_explicit,
-            expansion_trace: parsed.expansion_trace.clone(),
-        };
     }
-    let resolved_desired_ids = reconciled_expansion
-        .reconcile_late_anonymous_identities(
-            wiring,
-            &mut override_aware_resources,
-            &data_sources_for_plan,
-            state_file.as_ref(),
-            &state_block_claims,
-            raw_provider_configs,
-        )
-        .expect("fixture late anonymous identities must resolve uniquely");
-    crate::wiring::validate_plan_time_state_block_collisions(
-        &resolved_desired_ids,
-        reconciled_expansion.moved_pairs(),
-        &resolved_state_block_targets,
-        &state_file,
-    )
-    .expect("state block collision validation failed");
-    let directives_map = reconciled_expansion
-        .projected_state(state_file.as_ref())
-        .build_directives();
-
-    let reconciled_provider_states = provider_states_for(
-        reconciled_expansion.managed_current(),
-        reconciled_expansion.orphans(),
-        override_aware_resources.resources(),
-    );
-    let reconciled_input_current = carina_core::resource::into_plan_input_current_map(
-        reconciled_provider_states,
-        wiring.schemas(),
-        override_aware_resources.resources(),
-    );
-    let stability_resources = carina_core::resource::ResolvedResource::collect_resolved(
-        override_aware_resources.resources().iter().cloned(),
-    )
-    .expect("fixture managed resources must have identities");
-    let managed_stability = carina_core::differ::managed_binding_stability(
-        &stability_resources,
-        &reconciled_input_current,
-        wiring.schemas(),
-        reconciled_expansion.saved_attrs(),
-        reconciled_expansion.prev_explicit(),
-    );
-    override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
-        RebuildBindingsInputs {
-            compositions: &parsed.compositions,
-            managed_current: &reconciled_input_current,
-            data_source_values: &data_source_values,
-            remote_bindings: &remote_bindings,
-            wait_aliases: reconciled_expansion.wait_aliases(),
-        },
-        &managed_stability,
-    );
-
-    let prepared_expansion = reconciled_expansion.seal(data_source_values);
-    let crate::wiring::PreparedDeferredForExpansionParts {
-        addressed,
-        data_source_values,
-        wait_aliases: _,
-    } = prepared_expansion.into_parts();
-    let crate::wiring::AddressedStateParts {
-        mut managed_current,
-        orphans,
-        saved_attrs,
-        prev_explicit,
-        moved_pairs,
-    } = addressed.into_parts();
-    let deferred_create_targets: Vec<_> = deferred_for_expansion
-        .deferred_create_targets
-        .into_iter()
-        .filter(|target| {
-            target
-                .template
+    // Fixtures have no provider/upstream I/O phase. Only loops rooted in the
+    // loaded managed-state view can materialize here; keep every other loop as
+    // a display residual instead of turning it into an executable deferred
+    // create. This stays fixture-only because production must retain those
+    // deferred creates for apply-time expansion.
+    let managed_bindings: HashSet<String> = expansion_prelude
+        .sorted_resources()
+        .iter()
+        .filter_map(|resource| resource.binding.clone())
+        .collect();
+    let non_managed_deferred_for = parsed
+        .deferred_for_expressions
+        .iter()
+        .filter(|deferred| {
+            !deferred
                 .root_bindings()
                 .iter()
                 .any(|binding| managed_bindings.contains(binding))
         })
-        .collect();
-    let mut residual_deferred_for = deferred_for_expansion.residual_deferred_for;
-    residual_deferred_for.extend(non_managed_deferred_for);
-    let image_compositions = parsed.compositions.clone();
-    let resolved_resources =
-        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())
-            .expect("fixture resources must have assigned identities");
-    let resolved_unresolved_resources =
-        ResolvedResource::collect_resolved(override_aware_resources.paired_unresolved_resources())
-            .expect("fixture unresolved resources must have paired identities");
-    let plan_input_current = carina_core::resource::into_plan_input_current_map(
-        managed_current.clone(),
-        wiring.schemas(),
-        override_aware_resources.resources(),
-    );
-    let mut plan = create_plan_with_cascades(
-        &resolved_resources,
-        &resolved_unresolved_resources,
-        &data_sources_for_plan,
-        &provider_router,
-        PlanPriorStates::new(&plan_input_current, &orphans),
-        &directives_map,
-        wiring.schemas(),
-        &saved_attrs,
-        &prev_explicit,
-        &wait_bindings,
-    )
-    .expect("fixture providers must return valid satisfier hints");
-    crate::wiring::add_deposed_delete_effects(&mut plan, &state_file, &moved_pairs);
-    override_aware_resources.apply_plan_stability(&plan_input_current, &plan, wiring.schemas());
+        .cloned()
+        .collect::<Vec<_>>();
+    let reconciled_expansion = expansion_prelude
+        .bind_projected_phase1_state(managed_current, orphans, HashSet::new())
+        .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Print)
+        .expect("fixture move routes must match their loaded current states");
 
-    // Keep this after both identifier-error producers. The
-    // `removed_missing_identifier` fixture pins the fixture planner's copy of
-    // the same recovery ordering used by plan and live apply.
-    crate::wiring::add_state_block_effects(
-        &mut plan,
-        &parsed.state_blocks,
-        &state_file,
-        &moved_pairs,
-        override_aware_resources.resources(),
-        override_aware_resources.bindings(),
-        &upstream_binding_names,
-    );
-    add_deferred_create_effects(&mut plan, &deferred_create_targets);
-    managed_current = into_all_prior_states(orphans, managed_current);
-
-    let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
-        .iter()
-        .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
-        .collect();
+    let prepared_expansion = reconciled_expansion.seal(data_source_values);
+    let mut validated_expansion = validated_config
+        .expand_deferred_for_plan(
+            prepared_expansion,
+            &remote_bindings,
+            crate::wiring::DeferredForWarningPolicy::Print,
+        )
+        .expect("fixture deferred-for expansion failed");
+    validated_expansion.retain_fixture_deferred_for(&managed_bindings, non_managed_deferred_for);
+    let parsed = validated_expansion.resources().parsed();
+    let export_params = parsed.export_params.clone();
+    let expansion_trace = parsed.expansion_trace.clone();
     let export_wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
         .wait_bindings
         .iter()
         .map(carina_core::binding_index::WaitAliasSpec::from)
         .collect();
-    let provider_context = carina_core::parser::ProviderContext::default();
-    let resolved_export_params = crate::commands::plan::check_exports_pre_apply(
-        crate::commands::plan::CheckExportsPreApplyInput {
-            export_params: &parsed.export_params,
-            resources: override_aware_resources.resources(),
-            compositions: &parsed.compositions,
-            managed_current: &managed_current,
-            data_source_values: &data_source_values,
-            state_file: state_file.as_ref(),
-            plan: &plan,
-            schemas: wiring.schemas(),
-            wait_aliases: &export_wait_aliases,
-            provider_context: &provider_context,
-        },
-    )
-    .expect("fixture exports must resolve without secrets");
+    let schemas = validated_expansion.context().schemas().clone();
+    let post_expansion = {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime for post-expansion plan construction");
+        let validated_expansion = match state_file.as_ref() {
+            Some(state_file) => rt
+                .block_on(
+                    validated_expansion
+                        .settle_expanded_children_from_cache(&provider_router, state_file),
+                )
+                .expect("fixture expanded-child cached-state restore must succeed"),
+            None => validated_expansion.settle_expanded_children_absent(),
+        };
+        rt.block_on(
+            validated_expansion.finish_post_expansion_plan::<crate::wiring::PlanMode>(
+                crate::wiring::PostExpansionPlanEnvironment {
+                    data_sources: &data_sources,
+                    provider: &provider_router,
+                    normalizer: &provider_router,
+                    provider_configs: raw_provider_configs,
+                    remote_bindings: &remote_bindings,
+                    state_file: &state_file,
+                    state_block_claims: &state_block_claims,
+                    resolved_state_block_targets: &resolved_state_block_targets,
+                    preparation_errors: None,
+                },
+            ),
+        )
+        .expect("fixture post-expansion plan construction must succeed")
+    };
+    match post_expansion {
+        crate::wiring::PostExpansionOutcome::Diagnostics(diagnostics) => {
+            let crate::wiring::PostExpansionArtifacts {
+                expanded_resources: _,
+                residual_deferred_for,
+                plan,
+                compositions,
+                data_sources: _,
+                managed_current,
+                data_source_values,
+                moved_origins,
+                prev_explicit,
+                wait_aliases: _,
+            } = diagnostics.into_artifacts();
+            let moved_hints = detect_moved_block_hints(&plan, &managed_current, &schemas);
+            FixturePlan {
+                plan,
+                moved_hints,
+                // Error plans abort before resolved-resource and export consumers.
+                desired_resources: Vec::new(),
+                unresolved_resources: Vec::new(),
+                compositions,
+                managed_current,
+                data_source_states: data_source_values.read_states_map(),
+                state_file,
+                schemas,
+                moved_origins,
+                deferred_for_expressions: residual_deferred_for,
+                export_params,
+                resolved_export_params: carina_core::validation::check_export_values_pre_apply(
+                    &[],
+                    &carina_core::binding_index::ResolvedBindings::default(),
+                    &carina_core::parser::ProviderContext::default(),
+                )
+                .expect("empty exports are checked"),
+                prev_explicit,
+                expansion_trace,
+            }
+        }
+        crate::wiring::PostExpansionOutcome::Planned(crate::wiring::PostExpansionPlan {
+            artifacts,
+            resources:
+                crate::wiring::PostExpansionResolvedResources {
+                    resolved: resolved_resources,
+                    unresolved: unresolved_resources,
+                },
+        }) => {
+            let crate::wiring::PostExpansionArtifacts {
+                expanded_resources: _,
+                residual_deferred_for,
+                plan,
+                compositions,
+                data_sources: _,
+                managed_current,
+                data_source_values,
+                moved_origins,
+                prev_explicit,
+                wait_aliases: _,
+            } = artifacts;
+            let moved_hints = detect_moved_block_hints(&plan, &managed_current, &schemas);
+            let resources_for_exports = resolved_resources
+                .iter()
+                .map(|resource| resource.as_inner().clone())
+                .collect::<Vec<_>>();
+            let provider_context = carina_core::parser::ProviderContext::default();
+            let resolved_export_params = crate::commands::plan::check_exports_pre_apply(
+                crate::commands::plan::CheckExportsPreApplyInput {
+                    export_params: &export_params,
+                    resources: &resources_for_exports,
+                    compositions: &compositions,
+                    managed_current: &managed_current,
+                    data_source_values: &data_source_values,
+                    state_file: state_file.as_ref(),
+                    plan: &plan,
+                    schemas: &schemas,
+                    wait_aliases: &export_wait_aliases,
+                    provider_context: &provider_context,
+                },
+            )
+            .expect("fixture exports must resolve without secrets");
 
-    let unresolved_resources = resolved_unresolved_resources
-        .into_iter()
-        .map(ResolvedResource::into_inner)
-        .map(UnresolvedResource::from_pre_resolve)
-        .collect();
-    FixturePlan {
-        plan,
-        desired_resources: resolved_resources,
-        unresolved_resources,
-        compositions: image_compositions,
-        managed_current,
-        data_source_states: data_source_values.into_read_states(),
-        state_file,
-        schemas: wiring.schemas().clone(),
-        moved_origins,
-        deferred_for_expressions: residual_deferred_for,
-        export_params: parsed.export_params.clone(),
-        resolved_export_params,
-        prev_explicit,
-        expansion_trace: parsed.expansion_trace.clone(),
+            FixturePlan {
+                plan,
+                moved_hints,
+                desired_resources: resolved_resources,
+                unresolved_resources,
+                compositions,
+                managed_current,
+                data_source_states: data_source_values.into_read_states(),
+                state_file,
+                schemas,
+                moved_origins,
+                deferred_for_expressions: residual_deferred_for,
+                export_params,
+                resolved_export_params,
+                prev_explicit,
+                expansion_trace,
+            }
+        }
     }
 }
 
@@ -844,7 +723,7 @@ fn fixture_provider_config_factories() -> Vec<Box<dyn ProviderFactory>> {
 }
 
 fn fixture_validation_enum_schemas(fixture_path: &Path) -> Vec<(String, ValidatedResourceSchema)> {
-    let schemas = match fixture_path.file_name().and_then(|name| name.to_str()) {
+    let mut schemas = match fixture_path.file_name().and_then(|name| name.to_str()) {
         Some("dynamic_enum_az_no_diff") => vec![(
             "fixture".to_string(),
             ResourceSchema::new("network.Subnet").attribute(
@@ -866,6 +745,14 @@ fn fixture_validation_enum_schemas(fixture_path: &Path) -> Vec<(String, Validate
         )],
         _ => Vec::new(),
     };
+    schemas.push((
+        "aws".to_string(),
+        ResourceSchema::new("route53.RecordSet").attribute(
+            AttributeSchema::optional("type", fixture_route53_record_type())
+                .create_only()
+                .build(),
+        ),
+    ));
     schemas
         .into_iter()
         .map(|(provider, schema)| {
@@ -902,6 +789,16 @@ fn fixture_instance_tenancy_type() -> AttributeType {
             "host".to_string(),
         ]),
         vec![],
+        None,
+        None,
+    )
+}
+
+fn fixture_route53_record_type() -> AttributeType {
+    AttributeType::enum_(
+        TypeIdentity::new(Some("aws"), ["route53"], "RecordType"),
+        Some(vec!["CNAME".to_string()]),
+        vec![("CNAME".to_string(), "cname".to_string())],
         None,
         None,
     )

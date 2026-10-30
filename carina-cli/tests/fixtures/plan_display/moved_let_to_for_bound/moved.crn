@@ -1,0 +1,4 @@
+moved {
+  from = awscc.ec2.Vpc 'old_vpc'
+  to   = awscc.ec2.Vpc 'vpcs[0]'
+}

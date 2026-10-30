@@ -1,0 +1,27 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: moved_hint_snapshot_output(&fp)
+---
+Execution Plan:
+
+  - aws.route53.RecordSet r.validation_record
+      hosted_zone_id: 'Z123'
+      name: '_acme.registry.example.com'
+      resource_records: ['_validation.example.com']
+      ttl: 60
+      type: 'CNAME'
+  + aws.route53.RecordSet r.validation_records[0]
+      hosted_zone_id: 'Z123'
+      name: '_acme.registry.example.com'
+      resource_records: ['_validation.example.com']
+      ttl: 60
+      type: CNAME
+
+Plan: 1 to add, 0 to change, 1 to destroy.
+
+Warning: this plan destroys aws.route53.RecordSet 'r.validation_record' and creates aws.route53.RecordSet 'r.validation_records[0]', whose configured create-only values match. If they are the same resource, add this block to keep it instead of replacing it:
+
+  moved {
+    from = aws.route53.RecordSet 'r.validation_record'
+    to   = aws.route53.RecordSet 'r.validation_records[0]'
+  }
