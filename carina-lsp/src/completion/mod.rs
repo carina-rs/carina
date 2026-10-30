@@ -176,6 +176,9 @@ impl CompletionProvider {
                     position,
                     base_path,
                 ),
+            CompletionContext::InsideDirectivesIgnoreChangesList { resource_type } => {
+                self.directives_ignore_changes_completions(&resource_type)
+            }
             CompletionContext::InsideDirectivesProviderValue => {
                 self.directives_provider_completions(provider_ctx, base_path)
             }
@@ -352,17 +355,17 @@ impl CompletionProvider {
 
         // `directives { ... }` is the meta-arg block, not a struct
         // attribute — short-circuit before the struct router runs (#2873).
-        let directives_binding = match resource_block {
-            Some((_, StructPath::Known(struct_path), binding))
+        let directives_context = match resource_block {
+            Some((resource_type, StructPath::Known(struct_path), binding))
                 if struct_path.first().map(String::as_str) == Some("directives") =>
             {
-                Some(binding)
+                Some((resource_type, binding))
             }
             Some((_, StructPath::Known(_), _)) | Some((_, StructPath::Unresolvable, _)) | None => {
                 None
             }
         };
-        if let Some(directives_binding) = directives_binding {
+        if let Some((directives_resource_type, directives_binding)) = directives_context {
             // Cursor inside `depends_on = [...]` → list-element completion.
             if let Some(after_eq) = prefix.split('=').next_back()
                 && let Some(open) = after_eq.rfind('[')
@@ -372,6 +375,11 @@ impl CompletionProvider {
                 if attr_name == "depends_on" {
                     return CompletionContext::InsideDirectivesDependsOnList {
                         current_binding: directives_binding.cloned(),
+                    };
+                }
+                if attr_name == "ignore_changes" {
+                    return CompletionContext::InsideDirectivesIgnoreChangesList {
+                        resource_type: directives_resource_type.to_string(),
                     };
                 }
             }
@@ -807,6 +815,10 @@ enum CompletionContext {
     /// the enclosing binding name and any names already in the list.
     InsideDirectivesDependsOnList {
         current_binding: Option<String>,
+    },
+    /// Cursor is inside `directives { ignore_changes = [|] }`.
+    InsideDirectivesIgnoreChangesList {
+        resource_type: String,
     },
     /// Cursor is inside `directives { provider = | }` (carina#2191
     /// Phase 5). Suggests every named provider instance binding

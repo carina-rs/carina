@@ -23,7 +23,7 @@ pub use carina_core::resource::DeposedKey;
 use carina_core::resource::Resource;
 use carina_core::resource::{
     ConcreteValue, Current, DataSource, Directives, PartialReadMarker, PendingReRead,
-    ResolvedResource, ResourceId, ResourceIdentity, State, Value,
+    PersistedDirectives, ResolvedResource, ResourceId, ResourceIdentity, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys};
 use carina_core::value::{
@@ -1265,7 +1265,7 @@ impl StateFile {
         let mut directives_map = HashMap::new();
         for rs in &self.resources {
             let id = Self::id_for_resource_state(rs);
-            directives_map.insert(id, rs.directives.clone());
+            directives_map.insert(id, Directives::from(&rs.directives));
         }
         directives_map
     }
@@ -1462,18 +1462,18 @@ impl StateFile {
             let orphan = match self.build_state_for_resource(&id) {
                 Current::Absent(_state) => continue,
                 Current::Present(present) => {
-                    Orphan::present(present, rs.binding.clone(), rs.directives.clone())
+                    Orphan::present(present, rs.binding.clone(), (&rs.directives).into())
                 }
                 Current::CreateInFlight(pending) => {
-                    Orphan::create_in_flight(pending, rs.binding.clone(), rs.directives.clone())
+                    Orphan::create_in_flight(pending, rs.binding.clone(), (&rs.directives).into())
                 }
                 Current::CreateOutcomeUnknown(unknown) => Orphan::create_outcome_unknown(
                     unknown,
                     rs.binding.clone(),
-                    rs.directives.clone(),
+                    (&rs.directives).into(),
                 ),
                 Current::MissingIdentifier(state) => {
-                    Orphan::missing_identifier(state, rs.binding.clone(), rs.directives.clone())
+                    Orphan::missing_identifier(state, rs.binding.clone(), (&rs.directives).into())
                 }
             };
             loaded.insert(orphan);
@@ -2351,7 +2351,7 @@ pub struct ResourceState {
     pub protected: bool,
     /// Carina-side directives persisted from the DSL `directives` block.
     #[serde(default)]
-    pub directives: Directives,
+    pub directives: PersistedDirectives,
     /// Attribute prefixes used to generate names (e.g., {"bucket_name": "my-app-"})
     #[serde(default)]
     pub prefixes: HashMap<String, String>,
@@ -2434,7 +2434,7 @@ struct EncodedResourceState {
     #[serde(default)]
     protected: bool,
     #[serde(default)]
-    directives: Directives,
+    directives: PersistedDirectives,
     #[serde(default)]
     prefixes: HashMap<String, String>,
     #[serde(default)]
@@ -2729,9 +2729,9 @@ impl ResourceState {
     /// deposed generations. This controls removal of an empty shell only; it
     /// must not be used to classify [`CurrentInstance::None`] while loading.
     fn is_deposed_only_shell(&self) -> bool {
-        let shell_directives = Directives {
+        let shell_directives = PersistedDirectives {
             provider_instance: self.directives.provider_instance.clone(),
-            ..Directives::default()
+            ..PersistedDirectives::default()
         };
         matches!(self.current, CurrentInstance::None)
             && !self.deposed.is_empty()
@@ -2911,7 +2911,7 @@ impl ResourceState {
             current: CurrentInstance::None,
             deposed: Vec::new(),
             protected: false,
-            directives: Directives::default(),
+            directives: PersistedDirectives::default(),
             prefixes: HashMap::new(),
             name_overrides: HashMap::new(),
             explicit: ExplicitFields::default(),
@@ -3184,7 +3184,7 @@ impl ResourceState {
             self.protected = existing.protected;
             self.name_overrides = existing.name_overrides.clone();
         }
-        self.directives = resource.directives.clone();
+        self.directives = PersistedDirectives::from(&resource.directives);
         if self.directives.provider_instance.is_none() {
             self.directives.provider_instance = resource.id.provider_instance.clone();
         }
@@ -3733,7 +3733,7 @@ struct ResourceStateV14CurrentDto {
     #[serde(default)]
     protected: bool,
     #[serde(default)]
-    directives: Directives,
+    directives: PersistedDirectives,
     #[serde(default)]
     prefixes: HashMap<String, String>,
     #[serde(default)]
@@ -3769,9 +3769,9 @@ fn migrate_v14_current_instance(content: &str) -> Result<String, BackendError> {
                     "Failed to migrate state file from v14: {error}"
                 ))
             })?;
-        let shell_directives = Directives {
+        let shell_directives = PersistedDirectives {
             provider_instance: legacy.directives.provider_instance.clone(),
-            ..Directives::default()
+            ..PersistedDirectives::default()
         };
         let is_deposed_only_shell = legacy.identifier.is_none()
             && !legacy.deposed.is_empty()

@@ -2784,11 +2784,12 @@ pub struct ResolvedDesiredIds {
 }
 
 impl ResolvedDesiredIds {
-    fn from_resources(resources: &[Resource]) -> Result<Self, AppError> {
-        let ids = ResolvedResource::collect_resolved(resources.iter().cloned())?
-            .into_iter()
-            .map(|resource| resource.resolved_id())
-            .collect();
+    fn from_resources(resources: &[Resource], schemas: &SchemaRegistry) -> Result<Self, AppError> {
+        let ids =
+            ResolvedResource::collect_resolved_with_schemas(resources.iter().cloned(), schemas)?
+                .into_iter()
+                .map(|resource| resource.resolved_id())
+                .collect();
         Ok(Self { ids })
     }
 }
@@ -2873,7 +2874,7 @@ pub(crate) fn reconcile_late_anonymous_identities(
     // execution as duplicates.
     inputs.resources.unresolved_by_resolved_id()?;
 
-    let desired = ResolvedDesiredIds::from_resources(inputs.resources.resources())?;
+    let desired = ResolvedDesiredIds::from_resources(inputs.resources.resources(), ctx.schemas())?;
     apply_detected_resource_moves(
         inputs.addressed,
         moves,
@@ -4219,7 +4220,7 @@ impl<'state> ProjectedStateRead<'state> {
                     .target_by_source
                     .get(source.as_inner())
                     .map_or_else(|| source.into_inner(), |target| target.as_inner().clone());
-                (id, row.directives.clone())
+                (id, row.directives.clone().into())
             })
             .collect()
     }
@@ -5163,22 +5164,19 @@ pub fn derive_managed_binding_stability<E>(
     // cannot have a refreshed row addressed to them yet, so they are
     // conservatively unavailable; resolved resources can be diffed normally.
     let mut pending_stability = HashMap::new();
-    let resolved = resolved
-        .into_iter()
-        .filter_map(|resource| {
-            let id = resource.id.clone();
-            match ResolvedResource::try_new(resource) {
-                Some(resource) => Some(resource),
-                None => {
-                    pending_stability.insert(
-                        id,
-                        carina_core::binding_index::ManagedBindingStability::Unavailable,
-                    );
-                    None
-                }
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut schema_resolved = Vec::new();
+    for resource in resolved {
+        let id = resource.id.clone();
+        if resource.id.identity_str().is_none() {
+            pending_stability.insert(
+                id,
+                carina_core::binding_index::ManagedBindingStability::Unavailable,
+            );
+        } else {
+            schema_resolved.push(ResolvedResource::resolve_with_schemas(resource, schemas)?);
+        }
+    }
+    let resolved = schema_resolved;
     let mut stability = carina_core::differ::managed_binding_stability(
         &resolved,
         &plan_input_current,
@@ -5802,8 +5800,10 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         context.schemas(),
         override_aware_resources.resources(),
     );
-    let stability_resources =
-        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
+    let stability_resources = ResolvedResource::collect_resolved_with_schemas(
+        override_aware_resources.resources().iter().cloned(),
+        context.schemas(),
+    )?;
     let managed_stability = carina_core::differ::managed_binding_stability(
         &stability_resources,
         &reconciled_input_current,
@@ -5830,10 +5830,14 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         .build_directives();
     let paired_unresolved_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
-    let resolved_resources =
-        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
-    let resolved_unresolved_resources =
-        ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
+    let resolved_resources = ResolvedResource::collect_resolved_with_schemas(
+        override_aware_resources.resources().iter().cloned(),
+        context.schemas(),
+    )?;
+    let resolved_unresolved_resources = ResolvedResource::collect_resolved_with_schemas(
+        paired_unresolved_resources.iter().cloned(),
+        context.schemas(),
+    )?;
     let plan_input_current = carina_core::resource::into_plan_input_current_map(
         addressed.managed_current.clone(),
         context.schemas(),

@@ -288,6 +288,7 @@ mod deferred_template_resource_serde {
             id,
             attributes,
             directives,
+            resolved_ignore_changes: Default::default(),
             prefixes,
             binding,
             dependency_bindings,

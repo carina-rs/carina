@@ -525,7 +525,12 @@ fn create_plan_parts(
                         from,
                         to,
                         changed_attributes,
+                        ignored_readable_differences,
                     } => {
+                        plan.record_ignored_readable_differences(
+                            id.clone(),
+                            ignored_readable_differences,
+                        );
                         let to = *to;
                         // Filter out non-removable attribute removals.
                         // A "removal" is an attribute in changed_attributes that is not in `to`.
@@ -540,6 +545,18 @@ fn create_plan_parts(
 
                         if changed_attributes.is_empty() {
                             continue;
+                        }
+
+                        if !resource.ignore_changes().is_empty() {
+                            if let Err(error) = crate::provider::plan_update_patch(
+                                &changed_attributes,
+                                resource,
+                                &from,
+                                schema,
+                            ) {
+                                plan.add_error(PlanError::new(id, error.into()));
+                                continue;
+                            }
                         }
 
                         let identifier = present.identifier().clone();
@@ -584,7 +601,12 @@ fn create_plan_parts(
                             });
                         }
                     }
-                    PresentDiff::NoChange => {}
+                    PresentDiff::NoChange {
+                        ignored_readable_differences,
+                    } => plan.record_ignored_readable_differences(
+                        resource.id.clone(),
+                        ignored_readable_differences,
+                    ),
                 }
             }
         }

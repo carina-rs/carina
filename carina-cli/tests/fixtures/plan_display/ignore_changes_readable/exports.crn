@@ -1,0 +1,4 @@
+exports {
+  ignored_only_comment   = ignored_only.comment
+  sibling_update_comment = sibling_update.comment
+}

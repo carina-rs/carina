@@ -12878,6 +12878,51 @@ fn extract_directives_reads_depends_on_list() {
 }
 
 #[test]
+fn extract_directives_reads_ignore_changes_attribute_paths() {
+    let src = r#"
+        let function = awscc.lambda.Function {
+            code = { image_uri = "registry.example.test/image:tag" }
+            tags = { Owner = "platform" }
+            directives {
+                ignore_changes = [code.image_uri, tags["Owner"]]
+            }
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let function = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.identity_str() == Some("function"))
+        .expect("function binding");
+    let paths = function
+        .directives
+        .ignore_changes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    assert_eq!(paths, ["code.image_uri", "tags[\"Owner\"]"]);
+}
+
+#[test]
+fn extract_directives_rejects_string_literal_ignore_changes_paths() {
+    let src = r#"
+        let function = awscc.lambda.Function {
+            code = { image_uri = "registry.example.test/image:tag" }
+            directives { ignore_changes = ["code.image_uri"] }
+        }
+    "#;
+    let error = parse(src, &ProviderContext::default())
+        .expect_err("ignore_changes paths must not be string literals")
+        .to_string();
+
+    assert!(
+        error.contains("bare attribute path") && error.contains("code.image_uri"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn parser_resolve_unions_directives_depends_on_into_dependency_bindings() {
     let src = r#"
         let role = aws.iam.Role {

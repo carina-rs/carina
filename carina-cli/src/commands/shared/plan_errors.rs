@@ -53,6 +53,7 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
             | PlanErrorKind::WaitTargetIsDataSource { .. }
             | PlanErrorKind::WaitPredicateInvalid { .. }
             | PlanErrorKind::ResolvedValueConstraint { .. }
+            | PlanErrorKind::IgnoredWriteOnlyValueUnavailable { .. }
             | PlanErrorKind::CreateInFlightOrphan
             | PlanErrorKind::DestroyCreateInFlight
             | PlanErrorKind::CreateOutcomeUnknown { .. }

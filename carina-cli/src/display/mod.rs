@@ -898,6 +898,32 @@ impl<'a, S> TreeRenderContext<'a, S> {
             }
         }
 
+        if let Some(summary) = self
+            .plan
+            .ignored_change_summaries()
+            .iter()
+            .find(|summary| summary.resource_id() == effect.resource_id())
+        {
+            let attr_prefix = if indent == 0 {
+                format!("{}{}", base_indent, attr_base)
+            } else {
+                let continuation = if is_last {
+                    format!("{}{}", prefix, SPACE_CONTINUATION)
+                } else {
+                    format!("{}{}", prefix, VERTICAL_CONTINUATION)
+                };
+                format!("{}{}{}", base_indent, continuation, SPACE_CONTINUATION)
+            };
+            writeln!(
+                self.out,
+                "{}{}",
+                attr_prefix,
+                format!("# {} ignored attribute(s) differ", summary.count()).dimmed()
+            )
+            .unwrap();
+            has_displayed_attrs = true;
+        }
+
         // --- Detail rows (attributes) ---
         if self.detail != DetailLevel::None {
             let attr_prefix = if indent == 0 {
@@ -1242,6 +1268,31 @@ fn format_plan_tree<'a, S>(
     let remaining_items = ctx.child_render_items(&remaining);
     for (i, item) in remaining_items.iter().enumerate() {
         ctx.format_render_item(item, 0, i == remaining_items.len() - 1, "", None)?;
+    }
+
+    let effected_ids: HashSet<_> = plan.effects().iter().map(Effect::resource_id).collect();
+    for summary in plan
+        .ignored_change_summaries()
+        .iter()
+        .filter(|summary| !effected_ids.contains(summary.resource_id()))
+    {
+        let id = summary.resource_id();
+        writeln!(
+            ctx.out,
+            "{}# {} {}",
+            LEFT_MARGIN,
+            id.display_type().cyan().bold(),
+            id.identity_display().to_string().white().bold(),
+        )
+        .unwrap();
+        writeln!(
+            ctx.out,
+            "{}{}{}",
+            LEFT_MARGIN,
+            ATTR_BASE,
+            format!("# {} ignored attribute(s) differ", summary.count()).dimmed(),
+        )
+        .unwrap();
     }
 
     Ok(ctx.out)

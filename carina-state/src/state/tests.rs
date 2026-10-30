@@ -4488,6 +4488,26 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
 }
 
 #[test]
+fn state_json_cannot_persist_ignore_changes_paths() {
+    let runtime: Directives = serde_json::from_value(serde_json::json!({
+        "prevent_destroy": true,
+        "ignore_changes": [{
+            "segments": [{ "kind": "attribute", "value": "comment" }]
+        }]
+    }))
+    .expect("runtime directives decode");
+    assert_eq!(runtime.ignore_changes.len(), 1);
+
+    let mut row = ResourceState::new("test.Widget", "example", "mock");
+    row.directives = (&runtime).into();
+    let encoded = serde_json::to_string(&row).expect("state row serializes");
+
+    assert!(row.directives.prevent_destroy);
+    assert!(!encoded.contains("ignore_changes"), "{encoded}");
+    assert!(!encoded.contains("comment"), "{encoded}");
+}
+
+#[test]
 fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     use carina_core::resource::ResourceId;
 
@@ -4728,6 +4748,8 @@ fn orphan_provider_refresh_never_promotes_provider_keys_into_authoring_metadata(
 
 #[test]
 fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
+    use carina_core::schema::{AttributeSchema, AttributeType};
+
     let legacy_keys = [
         "_binding",
         "_dependency_bindings",
@@ -4785,7 +4807,16 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
         "name",
         Value::Concrete(ConcreteValue::String("kept".into())),
     );
-    let resolved = ResolvedResource::new(desired);
+    let mut schemas = carina_core::schema::SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .validate()
+            .expect("legacy fixture schema is valid"),
+    );
+    let resolved = ResolvedResource::resolve_with_schemas(desired, &schemas)
+        .expect("legacy desired resource resolves against its schema");
     let id = resolved.id.clone();
     let current = match state.build_state_for_resource(&id) {
         Current::Absent(state) => carina_core::resource::Current::Absent(state),
@@ -4798,13 +4829,10 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
             carina_core::resource::Current::MissingIdentifier(state)
         }
     };
-    let plan_input_states =
-        carina_core::resource::into_plan_input_current_map::<carina_core::resource::ModuleSource>(
-            HashMap::from([(id.clone(), current)]),
-            &carina_core::schema::SchemaRegistry::new(),
-            &[],
-        );
-    let plan = carina_core::differ::create_plan(
+    let plan_input_states = carina_core::resource::into_plan_input_current_map::<
+        carina_core::resource::ModuleSource,
+    >(HashMap::from([(id.clone(), current)]), &schemas, &[]);
+    let plan = carina_core::differ::create_plan_for_test(
         &[resolved],
         &[],
         &carina_core::provider::ProviderRouter::new(),
@@ -4813,10 +4841,8 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
             &carina_core::differ::Orphans::new(),
         ),
         &state.build_directives(),
-        &carina_core::schema::SchemaRegistry::new(),
-        &state
-            .build_saved_attrs()
-            .lift(&carina_core::schema::SchemaRegistry::new()),
+        &schemas,
+        &state.build_saved_attrs().lift(&schemas),
         &state.build_explicit(),
         &[],
     )

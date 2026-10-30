@@ -1,7 +1,7 @@
 use super::*;
 use carina_core::binding_index::LivePreApplyInputs;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
-use carina_core::effect::Effect;
+use carina_core::effect::{Effect, UnresolvedSavedEffect};
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
     PatchOp, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
@@ -390,7 +390,7 @@ fn record_with_builtin_mock_schemas(contents: PlanFileContents) -> PlanFile {
 }
 
 #[test]
-fn plan_format_30_round_trip_includes_format_29_loop_provenance_and_deferred_targets() {
+fn current_plan_format_round_trip_includes_format_29_loop_provenance_and_deferred_targets() {
     let parsed = carina_core::parser::parse_file(
         r#"
 let orgs = upstream_state { source = "../orgs" }
@@ -504,13 +504,16 @@ for account_id in orgs.accounts {
         wait_bindings: Vec::new(),
     });
 
-    let encoded = serde_json::to_value(&plan_file).expect("serialize format-30 plan");
-    assert_eq!(encoded["version"], serde_json::json!(30));
+    let encoded = serde_json::to_value(&plan_file).expect("serialize current-format plan");
+    assert_eq!(
+        encoded["version"],
+        serde_json::json!(PlanFile::CURRENT_VERSION)
+    );
     let decoded: PlanFile =
-        serde_json::from_value(encoded).expect("deserialize format-30 saved plan");
+        serde_json::from_value(encoded).expect("deserialize current-format saved plan");
     let decoded = decoded.into_contents();
 
-    assert_eq!(decoded.version, 30);
+    assert_eq!(decoded.version, PlanFile::CURRENT_VERSION);
     assert_eq!(
         decoded.sorted_resources[0]
             .loop_provenance
@@ -524,7 +527,7 @@ for account_id in orgs.accounts {
         .effects()
         .iter()
         .find_map(|effect| match effect {
-            Effect::Move { origin, .. } => origin.as_ref(),
+            UnresolvedSavedEffect::Move { origin, .. } => origin.as_ref(),
             _ => None,
         })
         .expect("Move origin after round-trip");
@@ -535,7 +538,7 @@ for account_id in orgs.accounts {
         .effects()
         .iter()
         .filter_map(|effect| match effect {
-            Effect::DeferredCreate { template, .. } => Some(&template.target),
+            UnresolvedSavedEffect::DeferredCreate { template, .. } => Some(&template.target),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1018,7 +1021,9 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
 
     let mut plan_file = plan_file
         .reload_in_flight_from_locked_state(None)
-        .expect("test plan should cross the locked-state reload boundary");
+        .expect("test plan should cross the locked-state reload boundary")
+        .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
+        .expect("test plan should cross schema resolution");
     let result = rehydrate_desired_plan_file_from_parts(
         &mut plan_file,
         candidates.parsed(),
@@ -8968,10 +8973,11 @@ mod apply_deferred_for_parity {
 #[cfg(test)]
 mod saved_plan_version_tests {
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 29 persists anonymous
-    //! loop provenance, typed deferred targets, and Move origins (carina#4109).
-    //! Version 30 adds mandatory provider-instance reference scopes
-    //! (carina#4065).
+    //! `carina plan` is the supported migration. Version 32 adds mandatory
+    //! provider-instance reference scopes and the create-outcome-unknown marker
+    //! for provider protocol v13. Version 31 persists authored ignore paths;
+    //! version 30 was never emitted. Version 29 persists anonymous loop
+    //! provenance, typed deferred targets, and Move origins (carina#4109).
     //! Version 26 persists exact provider artifact identities (carina#4045);
     //! version 25 persists total data-source outcomes (carina#3993); version 24
     //! removed the wait target schema kind (carina#3916), and version 23 added
@@ -9027,7 +9033,7 @@ mod saved_plan_version_tests {
             panic!("expected typed unsupported plan version error")
         };
         assert_eq!(found, 28);
-        assert_eq!(expected, 30);
+        assert_eq!(expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
     }
 
     #[tokio::test]

@@ -1035,10 +1035,13 @@ fn build_update_rows<S>(
     comparison: DetailComparison<'_>,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
+    let from_attributes = &historical.attributes;
+    let mut display_attributes = to.attributes.clone();
+    to.resolved_ignore_changes
+        .mask_desired_readable_leaves(&mut display_attributes, from_attributes);
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
-    let from_attributes = &historical.attributes;
     let projected = project_from_attrs(
         from_attributes,
         historical.stored_attributes.as_ref(),
@@ -1051,6 +1054,7 @@ fn build_update_rows<S>(
 
     let attr_rows = build_attribute_diff_rows(
         to,
+        &display_attributes,
         AttributeDiffContext::for_update(
             from_attributes,
             from_attrs_projected,
@@ -1069,7 +1073,7 @@ fn build_update_rows<S>(
     // removals (refs awscc#206).
     let mut removed_keys: Vec<_> = changed_attributes
         .iter()
-        .filter(|k| !to.attributes.contains_key(k.as_str()))
+        .filter(|k| !display_attributes.contains_key(k.as_str()))
         .collect();
     removed_keys.sort();
     for key in removed_keys {
@@ -1085,12 +1089,13 @@ fn build_update_rows<S>(
 
     // In Full mode, show count of unchanged attributes hidden
     if detail == DetailLevel::Full {
-        let unchanged_count = comparison.unchanged_count(
-            from_attrs_projected,
-            &to.resolved_attributes(),
-            None,
-            schema,
-        ) + attr_rows.effectively_unchanged;
+        let displayed_attributes = display_attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let unchanged_count =
+            comparison.unchanged_count(from_attrs_projected, &displayed_attributes, None, schema)
+                + attr_rows.effectively_unchanged;
         if unchanged_count > 0 {
             rows.push(DetailRow::HiddenUnchanged {
                 count: unchanged_count,
@@ -1354,11 +1359,12 @@ fn project_previous_attrs(
 
 fn build_attribute_diff_rows<S>(
     to: &crate::resource::Resource<S>,
+    to_attributes: &IndexMap<String, Value>,
     ctx: AttributeDiffContext<'_>,
 ) -> AttributeDiffRows {
     let mut rows = Vec::new();
 
-    let mut keys: Vec<_> = to.attributes.keys().collect();
+    let mut keys: Vec<_> = to_attributes.keys().collect();
     keys.sort();
 
     // Attributes where `semantically_equal` reported a diff but the
@@ -1371,7 +1377,7 @@ fn build_attribute_diff_rows<S>(
     let mut effectively_unchanged: usize = 0;
 
     for key in keys {
-        let new_value = &to.attributes[key];
+        let new_value = &to_attributes[key];
         // Look up `old_value` from the projected map so MapDiff /
         // ListOfMapsDiff rows don't surface server-side default leaves
         // the user never authored (refs awscc#206). The same value the
@@ -1705,6 +1711,7 @@ fn build_replace_rows_from_attributes<S>(
 
     let attr_rows = build_attribute_diff_rows(
         to,
+        &to.attributes,
         AttributeDiffContext::for_replace(
             previous_attributes,
             from_attrs_projected,

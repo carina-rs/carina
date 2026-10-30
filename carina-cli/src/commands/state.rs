@@ -1067,7 +1067,7 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
             identity,
             rs.directives.provider_instance.clone(),
         );
-        resource.directives = rs.directives.clone();
+        resource.directives = rs.directives.clone().into();
 
         // Set typed metadata fields from state
         resource.binding = rs.binding.clone();
@@ -1755,7 +1755,10 @@ pub(crate) async fn run_state_refresh_locked(
         ctx.schemas(),
     );
 
-    let resolved_resources = ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?;
+    let resolved_resources = ResolvedResource::collect_resolved_with_schemas(
+        sorted_resources.iter().cloned(),
+        ctx.schemas(),
+    )?;
 
     let mut state = state_file.take().unwrap();
 
@@ -5624,7 +5627,9 @@ mod tests {
             prevent_destroy: true,
             depends_on: vec!["security_group".to_string()],
             provider_instance: Some("west".to_string()),
-        };
+            ignore_changes: Vec::new(),
+        }
+        .into();
         row.prefixes = HashMap::from([("name".to_string(), "prod-".to_string())]);
         row.protected = true;
         row.name_overrides.insert(
@@ -5703,6 +5708,7 @@ mod tests {
                 prevent_destroy: true,
                 depends_on: vec!["security_group".to_string()],
                 provider_instance: Some("west".to_string()),
+                ignore_changes: Vec::new(),
             }
         );
         assert_eq!(

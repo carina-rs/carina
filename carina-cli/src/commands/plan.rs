@@ -10,13 +10,13 @@ use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::data_source_value::DataSourceValue;
 use carina_core::detail_rows::HistoricalDisplayAttributes;
 use carina_core::differ::rebind_current_for_move;
-use carina_core::effect::{Effect, EffectGeneration};
+use carina_core::effect::{Effect, EffectGeneration, UnresolvedSavedEffect};
 #[cfg(test)]
 use carina_core::parser::ProviderConfig;
 use carina_core::parser::{
     BackendConfig, ProviderContext, ResolvedProviderConfigs, SavedProviderConfigs, UpstreamState,
 };
-use carina_core::plan::{Plan, SavedPlan};
+use carina_core::plan::{Plan, SavedPlan, UnresolvedSavedPlan};
 use carina_core::provider::{ProviderInstanceKey, ProviderRouter, ReferenceScope};
 use carina_core::provider_source::ProviderSource;
 #[cfg(test)]
@@ -464,7 +464,7 @@ mod provider_scope_evidence_tests {
     }
 
     #[test]
-    fn saved_plan_v30_round_trips_provider_scopes() {
+    fn current_saved_plan_round_trips_provider_scopes() {
         let mut default_config = provider_config("unused");
         default_config.binding = None;
         default_config.source = Some("file:///test-provider.wasm".parse().unwrap());
@@ -506,7 +506,10 @@ mod provider_scope_evidence_tests {
             .record_for_test_with_provider(&wiring, &provider)
             .expect("provider scopes form valid evidence");
         let json = serde_json::to_value(&plan).expect("saved plan serializes");
-        assert_eq!(json["version"], serde_json::json!(30));
+        assert_eq!(
+            json["version"],
+            serde_json::json!(PlanFile::CURRENT_VERSION)
+        );
         let scopes = json["provider_scopes"].as_array().unwrap();
         assert_eq!(scopes.len(), 3);
         assert_eq!(
@@ -584,20 +587,21 @@ mod provider_scope_evidence_tests {
 /// }
 /// ```
 #[derive(Debug, Clone)]
-pub struct PlanFileContents<S = ModuleSource> {
+pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// Plan file format version.
     ///
     /// `PlanFileHeader` in `commands/apply/mod.rs` relies on this field and
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 29 persists anonymous-loop provenance, typed deferred-loop
-    /// targets, and Move origins.
+    /// Plan format 32 records provider-instance reference-scope evidence and
+    /// the create-outcome-unknown marker for provider protocol v13.
     ///
-    /// Plan format 30 binds every initialized provider instance to its reference
-    /// scope.
-    ///
-    /// Plan format 28 added typed pending re-read reasons.
+    /// Plan format 31 persists authored `ignore_changes` paths for schema-time
+    /// re-resolution. Plan format 30 was never emitted; provider protocol v13
+    /// uses format 32. Plan format 29 persists anonymous-loop provenance, typed
+    /// deferred-loop targets, and Move origins. Plan format 28 added typed
+    /// pending re-read reasons.
     /// Plan format 27 adds a mandatory normalized module-call origin path to
     /// every saved composition. Plan format 26 adds mandatory identities for
     /// every loaded provider artifact. Plan format 25 adds the mandatory typed
@@ -632,7 +636,7 @@ pub struct PlanFileContents<S = ModuleSource> {
     /// Backend configuration
     pub backend_config: Option<BackendConfig>,
     /// The plan (effects)
-    pub plan: Plan<S>,
+    pub plan: P,
     /// Pre-resolution resources sorted by dependencies and keyed with their
     /// paired resolved IDs (for post-apply state saving).
     pub sorted_resources: Vec<Resource<S>>,
@@ -722,6 +726,9 @@ pub struct PlanFileContents<S = ModuleSource> {
     pub wait_bindings: Vec<PlanWaitBinding>,
 }
 
+pub(crate) type UnresolvedPlanFileContents =
+    PlanFileContents<SavedModuleSource, UnresolvedSavedPlan>;
+
 impl From<PlanFileContents> for PlanFileContents<SavedModuleSource> {
     fn from(contents: PlanFileContents) -> Self {
         let PlanFileContents {
@@ -781,6 +788,53 @@ impl From<PlanFileContents> for PlanFileContents<SavedModuleSource> {
     }
 }
 
+impl From<PlanFileContents<SavedModuleSource>> for UnresolvedPlanFileContents {
+    fn from(contents: PlanFileContents<SavedModuleSource>) -> Self {
+        let PlanFileContents {
+            version,
+            carina_version,
+            timestamp,
+            source_path,
+            state_lineage,
+            state_serial,
+            provider_configs,
+            backend_config,
+            plan,
+            sorted_resources,
+            unresolved_resources,
+            compositions,
+            data_sources,
+            data_source_origins,
+            data_source_values,
+            current_states,
+            upstream_snapshot,
+            upstream_sources,
+            wait_bindings,
+        } = contents;
+        Self {
+            version,
+            carina_version,
+            timestamp,
+            source_path,
+            state_lineage,
+            state_serial,
+            provider_configs,
+            backend_config,
+            plan: plan.into(),
+            sorted_resources,
+            unresolved_resources,
+            compositions,
+            data_sources,
+            data_source_origins,
+            data_source_values,
+            current_states,
+            upstream_snapshot,
+            upstream_sources,
+            wait_bindings,
+        }
+    }
+}
+
 /// Provider evidence captured atomically from the wiring context used to plan.
 ///
 /// The fields are private so production code cannot assemble stale, partial,
@@ -805,20 +859,22 @@ struct ProviderEvidence {
 /// inventory to match every referenced type exactly and the provider-artifact
 /// keys to match the providers implied by the saved provider configurations.
 ///
-/// Format 29 persists anonymous-loop provenance, typed deferred-loop targets,
-/// and Move origins.
+/// Format 32 records provider-instance reference-scope evidence and the
+/// create-outcome-unknown marker for provider protocol v13.
 ///
-/// Format 30 binds every initialized provider instance to its reference scope.
-/// Provider evidence is validated both when recording and when decoding a saved
-/// plan.
+/// Format 31 persists authored `ignore_changes` paths for schema-time
+/// re-resolution. Format 30 was never emitted; provider protocol v13 uses
+/// format 32. Format 29 persists anonymous-loop provenance, typed deferred-loop
+/// targets, and Move origins. Provider evidence is validated both when
+/// recording and when decoding a saved plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(into = "PlanFileWire", try_from = "PlanFileWire")]
 pub struct PlanFile {
-    contents: PlanFileContents<SavedModuleSource>,
+    contents: UnresolvedPlanFileContents,
     evidence: ProviderEvidence,
 }
 
-/// Private format-30 wire representation.
+/// Private format-32 wire representation.
 ///
 /// Field order is intentionally identical to the historical `PlanFile`
 /// serialization order. Evidence is mandatory and is never defaulted.
@@ -832,7 +888,7 @@ struct PlanFileWire {
     state_serial: Option<u64>,
     provider_configs: SavedProviderConfigs,
     backend_config: Option<BackendConfig>,
-    plan: SavedPlan,
+    plan: UnresolvedSavedPlan,
     sorted_resources: Vec<SavedResource>,
     unresolved_resources: Vec<SavedResource>,
     compositions: Vec<SavedComposition>,
@@ -1316,7 +1372,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
 }
 
 impl Deref for PlanFile {
-    type Target = PlanFileContents<SavedModuleSource>;
+    type Target = UnresolvedPlanFileContents;
 
     fn deref(&self) -> &Self::Target {
         &self.contents
@@ -1374,17 +1430,16 @@ impl PlanFileContents {
             provider,
             &expected_instances,
         )?;
+        let saved: PlanFileContents<SavedModuleSource> = self.into();
         Ok(PlanFile {
-            contents: self.into(),
+            contents: saved.into(),
             evidence,
         })
     }
 }
 
 #[cfg(test)]
-impl PlanFileContents<SavedModuleSource> {
-    /// Re-record saved contents after a fixture mutates them without
-    /// converting the saved module source back into a live source.
+impl UnresolvedPlanFileContents {
     fn record_for_test<R>(
         self,
         validated: &ValidatedConfig<R>,
@@ -1624,11 +1679,169 @@ fn test_provider_router(instances: &BTreeSet<ProviderInstanceKey>) -> ProviderRo
     provider
 }
 
+impl UnresolvedPlanFileContents {
+    pub(crate) fn referenced_schema_types(&self) -> PlanSchemaReferences {
+        fn insert(
+            references: &mut BTreeSet<PlanSchemaReference>,
+            id: &ResourceId,
+            kind: SchemaKind,
+        ) {
+            references.insert(PlanSchemaReference {
+                provider: id.provider.clone(),
+                kind,
+                resource_type: id.resource_type.clone(),
+            });
+        }
+
+        let mut references = BTreeSet::new();
+        for effect in self.plan.effects() {
+            match effect {
+                UnresolvedSavedEffect::Read { resource } => {
+                    insert(&mut references, &resource.id, SchemaKind::DataSource);
+                }
+                UnresolvedSavedEffect::Create(resource)
+                | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
+                    insert(&mut references, &resource.id, SchemaKind::Resource);
+                }
+                UnresolvedSavedEffect::Update { from, to, .. } => {
+                    insert(&mut references, &from.id, SchemaKind::Resource);
+                    insert(&mut references, &to.id, SchemaKind::Resource);
+                }
+                UnresolvedSavedEffect::Delete { id, .. }
+                | UnresolvedSavedEffect::Import { id, .. }
+                | UnresolvedSavedEffect::Remove { id } => {
+                    insert(&mut references, id, SchemaKind::Resource);
+                }
+                UnresolvedSavedEffect::DeferredCreate { template, .. } => {
+                    insert(
+                        &mut references,
+                        &template.template_resource.id,
+                        SchemaKind::Resource,
+                    );
+                }
+                UnresolvedSavedEffect::Move { from, to, .. } => {
+                    insert(&mut references, from, SchemaKind::Resource);
+                    insert(&mut references, to, SchemaKind::Resource);
+                }
+                UnresolvedSavedEffect::Wait { target_id, .. } => {
+                    insert(
+                        &mut references,
+                        target_id.id().as_inner(),
+                        SchemaKind::Resource,
+                    );
+                }
+                UnresolvedSavedEffect::DeferredReplace(payload) => {
+                    insert(
+                        &mut references,
+                        &payload.template.template_resource.id,
+                        SchemaKind::Resource,
+                    );
+                    for delete in &payload.deletes {
+                        insert(&mut references, &delete.id, SchemaKind::Resource);
+                    }
+                }
+            }
+        }
+
+        for resource in &self.sorted_resources {
+            insert(&mut references, &resource.id, SchemaKind::Resource);
+        }
+        for resource in &self.unresolved_resources {
+            insert(&mut references, &resource.id, SchemaKind::Resource);
+        }
+        for data_source in self.data_sources.iter().chain(&self.data_source_origins) {
+            insert(&mut references, &data_source.id, SchemaKind::DataSource);
+        }
+        for saved in &self.data_source_values {
+            insert(&mut references, &saved.id, SchemaKind::DataSource);
+        }
+        for current in &self.current_states {
+            let CurrentStateEntry::Managed { id, .. } = current;
+            insert(&mut references, id, SchemaKind::Resource);
+        }
+        PlanSchemaReferences(references)
+    }
+
+    fn expected_provider_instances(
+        &self,
+        available_providers: &BTreeSet<String>,
+    ) -> BTreeSet<ProviderInstanceKey> {
+        fn insert(instances: &mut BTreeSet<ProviderInstanceKey>, id: &ResourceId) {
+            instances.insert(ProviderInstanceKey::from(id));
+        }
+
+        let mut instances = self
+            .provider_configs
+            .as_provider_configs()
+            .iter()
+            .map(ProviderInstanceKey::from)
+            .collect::<BTreeSet<_>>();
+        for effect in self.plan.effects() {
+            match effect {
+                UnresolvedSavedEffect::Read { resource } => insert(&mut instances, &resource.id),
+                UnresolvedSavedEffect::Create(resource)
+                | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
+                    insert(&mut instances, &resource.id)
+                }
+                UnresolvedSavedEffect::Update { from, to, .. } => {
+                    insert(&mut instances, &from.id);
+                    insert(&mut instances, &to.id);
+                }
+                UnresolvedSavedEffect::Delete { id, .. }
+                | UnresolvedSavedEffect::Import { id, .. }
+                | UnresolvedSavedEffect::Remove { id } => insert(&mut instances, id),
+                UnresolvedSavedEffect::DeferredCreate { id, template } => {
+                    insert(&mut instances, id);
+                    insert(&mut instances, &template.template_resource.id);
+                }
+                UnresolvedSavedEffect::Move { from, to, .. } => {
+                    insert(&mut instances, from);
+                    insert(&mut instances, to);
+                }
+                UnresolvedSavedEffect::Wait { target_id, .. } => {
+                    insert(&mut instances, target_id.id().as_inner());
+                }
+                UnresolvedSavedEffect::DeferredReplace(payload) => {
+                    insert(&mut instances, &payload.template.template_resource.id);
+                    for delete in &payload.deletes {
+                        insert(&mut instances, &delete.id);
+                    }
+                }
+            }
+        }
+        for resource in self
+            .sorted_resources
+            .iter()
+            .chain(&self.unresolved_resources)
+        {
+            insert(&mut instances, &resource.id);
+        }
+        for data_source in self.data_sources.iter().chain(&self.data_source_origins) {
+            insert(&mut instances, &data_source.id);
+        }
+        for saved in &self.data_source_values {
+            insert(&mut instances, &saved.id);
+        }
+        for current in &self.current_states {
+            let CurrentStateEntry::Managed { id, .. } = current;
+            insert(&mut instances, id);
+        }
+        if instances.is_empty() {
+            instances.insert(ProviderInstanceKey::new(
+                carina_provider_mock::BUILTIN_PROVIDER_NAME,
+                None,
+            ));
+        }
+        instances.retain(|instance| available_providers.contains(instance.provider()));
+        instances
+    }
+}
+
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 30;
+    pub const CURRENT_VERSION: u32 = 32;
 
     #[cfg(test)]
-    pub(crate) fn into_contents(self) -> PlanFileContents<SavedModuleSource> {
+    pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
         self.contents
     }
 
@@ -1650,12 +1863,12 @@ impl PlanFile {
     pub(crate) fn reload_in_flight_from_locked_state(
         self,
         state_file: Option<&StateFile>,
-    ) -> Result<ReloadedPlanFile, String> {
+    ) -> Result<UnresolvedReloadedPlanFile, String> {
         let PlanFile {
             mut contents,
             evidence,
         } = self;
-        let moved_origins = MovedOrigins::from_plan(&contents.plan);
+        let moved_origins = MovedOrigins::from_unresolved_plan(&contents.plan);
         let planned_in_flight_origins: HashSet<_> = contents
             .current_states
             .iter()
@@ -1794,7 +2007,7 @@ impl PlanFile {
                 }
             }
         }
-        Ok(ReloadedPlanFile {
+        Ok(UnresolvedReloadedPlanFile {
             contents,
             evidence,
             current_states,
@@ -1807,21 +2020,7 @@ impl PlanFile {
         use carina_core::resource::{DataSource, SavedComposition};
 
         fn resource_contains<S>(resource: &Resource<S>) -> bool {
-            let Resource {
-                id: _id,
-                attributes,
-                directives: _directives,
-                prefixes: _prefixes,
-                binding: _binding,
-                dependency_bindings: _dependency_bindings,
-                module_source: _module_source,
-                default_tag_keys: _default_tag_keys,
-                loop_provenance: _loop_provenance,
-                quoted_string_attrs: _quoted_string_attrs,
-            } = resource;
-            attributes
-                .values()
-                .any(carina_core::value::contains_redacted_secret)
+            resource.contains_redacted_secret_placeholders()
         }
 
         fn data_source_contains<S>(data_source: &DataSource<S>) -> bool {
@@ -2037,18 +2236,21 @@ impl PlanFile {
         for (index, effect) in self.plan.effects().iter().enumerate() {
             let location = format!("plan.effects[{index}]");
             match effect {
-                Effect::Read { resource } => require_identity(&resource.id, &location)?,
-                Effect::Create(resource) | Effect::ResumeCreate { resource, .. } => {
+                UnresolvedSavedEffect::Read { resource } => {
                     require_identity(&resource.id, &location)?
                 }
-                Effect::Update { from, to, .. } => {
+                UnresolvedSavedEffect::Create(resource)
+                | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
+                    require_identity(&resource.id, &location)?
+                }
+                UnresolvedSavedEffect::Update { from, to, .. } => {
                     require_identity(&from.id, &format!("{location}.from"))?;
                     require_identity(&to.id, &format!("{location}.to"))?;
                 }
-                Effect::Delete { id, .. } | Effect::Import { id, .. } | Effect::Remove { id } => {
-                    require_identity(id, &location)?
-                }
-                Effect::Wait {
+                UnresolvedSavedEffect::Delete { id, .. }
+                | UnresolvedSavedEffect::Import { id, .. }
+                | UnresolvedSavedEffect::Remove { id } => require_identity(id, &location)?,
+                UnresolvedSavedEffect::Wait {
                     identity,
                     target_id,
                     until: _until,
@@ -2069,15 +2271,15 @@ impl PlanFile {
                         ));
                     }
                 }
-                Effect::Move { from, to, .. } => {
+                UnresolvedSavedEffect::Move { from, to, .. } => {
                     require_identity(from, &format!("{location}.from"))?;
                     require_identity(to, &format!("{location}.to"))?;
                 }
-                Effect::DeferredCreate { id, template, .. } => {
+                UnresolvedSavedEffect::DeferredCreate { id, template, .. } => {
                     require_identity(id, &location)?;
                     validate_deferred_template(template, &format!("{location}.template_resource"))?;
                 }
-                Effect::DeferredReplace(payload) => {
+                UnresolvedSavedEffect::DeferredReplace(payload) => {
                     require_identity(&payload.id, &location)?;
                     validate_deferred_template(
                         &payload.template,
@@ -2113,7 +2315,7 @@ impl PlanFile {
                     effects.len()
                 )
             })?;
-            if !matches!(create, Effect::Create(_)) {
+            if !matches!(create, UnresolvedSavedEffect::Create(_)) {
                 return Err(format!(
                     "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].create_idx {} points at {}, expected Create",
                     replacement.create_idx,
@@ -2135,11 +2337,11 @@ impl PlanFile {
                 )
             })?;
             match delete {
-                Effect::Delete {
+                UnresolvedSavedEffect::Delete {
                     generation: EffectGeneration::Current,
                     ..
                 } => {}
-                Effect::Delete { generation, .. } => {
+                UnresolvedSavedEffect::Delete { generation, .. } => {
                     return Err(format!(
                         "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].delete_idx {} points at Delete({generation:?}), expected Current Delete",
                         replacement.delete_idx
@@ -2571,6 +2773,20 @@ impl MovedOrigins {
         Self { by_destination }
     }
 
+    fn from_unresolved_plan(plan: &UnresolvedSavedPlan) -> Self {
+        let by_destination = plan
+            .effects()
+            .iter()
+            .filter_map(|effect| match effect {
+                UnresolvedSavedEffect::Move { from, to, .. } => {
+                    Some((to.as_inner().clone(), from.as_inner().clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        Self { by_destination }
+    }
+
     pub(crate) fn origin_for<'a>(&'a self, id: &'a ResourceId) -> &'a ResourceId {
         self.by_destination.get(id).unwrap_or(id)
     }
@@ -2769,6 +2985,13 @@ impl ReloadedCurrentStateEntry {
 /// siblings so apply-time mutation cannot make an in-memory [`PlanFile`]
 /// inconsistent with its evidence.
 #[derive(Debug)]
+pub(crate) struct UnresolvedReloadedPlanFile {
+    contents: UnresolvedPlanFileContents,
+    evidence: ProviderEvidence,
+    current_states: Vec<ReloadedCurrentStateEntry>,
+}
+
+#[derive(Debug)]
 pub(crate) struct ReloadedPlanFile {
     contents: PlanFileContents<SavedModuleSource>,
     evidence: ProviderEvidence,
@@ -2782,7 +3005,7 @@ pub(crate) enum ReloadedCompositionRehydrationError {
     Secret(carina_core::value::SecretRehydrationSiteError),
 }
 
-impl ReloadedPlanFile {
+impl UnresolvedReloadedPlanFile {
     pub(crate) fn verify_schema_fingerprints(
         &self,
         references: &PlanSchemaReferences,
@@ -2797,6 +3020,80 @@ impl ReloadedPlanFile {
         &self.evidence.provider_artifacts
     }
 
+    #[cfg(test)]
+    pub(crate) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
+        &self.current_states
+    }
+
+    pub(crate) fn resolve_with_schemas(
+        self,
+        schemas: &carina_core::schema::SchemaRegistry,
+    ) -> Result<ReloadedPlanFile, carina_core::resource::ResolvedResourceError> {
+        let Self {
+            contents,
+            evidence,
+            current_states,
+        } = self;
+        let PlanFileContents {
+            version,
+            carina_version,
+            timestamp,
+            source_path,
+            state_lineage,
+            state_serial,
+            provider_configs,
+            backend_config,
+            plan,
+            sorted_resources,
+            unresolved_resources,
+            compositions,
+            data_sources,
+            data_source_origins,
+            data_source_values,
+            current_states: saved_current_states,
+            upstream_snapshot,
+            upstream_sources,
+            wait_bindings,
+        } = contents;
+        let resolve_resources = |resources: Vec<SavedResource>| {
+            resources
+                .into_iter()
+                .map(|resource| {
+                    carina_core::resource::ResolvedResource::resolve_with_schemas(resource, schemas)
+                        .map(carina_core::resource::ResolvedResource::into_inner)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let contents = PlanFileContents {
+            version,
+            carina_version,
+            timestamp,
+            source_path,
+            state_lineage,
+            state_serial,
+            provider_configs,
+            backend_config,
+            plan: plan.resolve_with_schemas(schemas)?,
+            sorted_resources: resolve_resources(sorted_resources)?,
+            unresolved_resources: resolve_resources(unresolved_resources)?,
+            compositions,
+            data_sources,
+            data_source_origins,
+            data_source_values,
+            current_states: saved_current_states,
+            upstream_snapshot,
+            upstream_sources,
+            wait_bindings,
+        };
+        Ok(ReloadedPlanFile {
+            contents,
+            evidence,
+            current_states,
+        })
+    }
+}
+
+impl ReloadedPlanFile {
     pub(crate) fn provider_scopes(&self) -> &RecordedProviderScopes {
         &self.evidence.provider_scopes
     }
@@ -3161,6 +3458,7 @@ mod managed_current_serde_tests {
         CurrentStateEntry, PlanFile, PlanFileContents, ReloadSavedManagedCurrent,
         ReloadedCurrentStateEntry, SavedManagedCurrent, SavedManagedCurrentKind,
     };
+    use carina_core::effect::UnresolvedSavedEffect;
     use carina_core::provider::{
         AppliedIdentifier, CreateAttempt, CreateFailureKind, EgressSent, ProviderError, Sent,
         UnknownCreateOutcome,
@@ -3435,7 +3733,6 @@ mod managed_current_serde_tests {
 
     #[test]
     fn saved_plan_reloads_moved_in_flight_row_from_its_source_address() {
-        use carina_core::effect::Effect;
         use carina_core::resource::ResolvedResourceId;
 
         let source = ResourceId::with_provider_identity("mock", "test.Resource", "source", None);
@@ -3466,7 +3763,7 @@ mod managed_current_serde_tests {
             SavedManagedCurrent::create_in_flight_marker(),
         )
         .into_contents();
-        contents.plan.add(Effect::Move {
+        contents.plan.add(UnresolvedSavedEffect::Move {
             from: ResolvedResourceId::new(source),
             to: ResolvedResourceId::new(destination.clone()),
             origin: None,
@@ -3499,7 +3796,6 @@ mod managed_current_serde_tests {
 
     #[test]
     fn saved_plan_reloads_moved_outcome_unknown_row_from_its_source_address() {
-        use carina_core::effect::Effect;
         use carina_core::resource::ResolvedResourceId;
 
         let source = ResourceId::with_provider_identity("mock", "test.Resource", "source", None);
@@ -3526,7 +3822,7 @@ mod managed_current_serde_tests {
             }),
         )
         .into_contents();
-        contents.plan.add(Effect::Move {
+        contents.plan.add(UnresolvedSavedEffect::Move {
             from: ResolvedResourceId::new(source),
             to: ResolvedResourceId::new(destination.clone()),
             origin: None,
@@ -3793,11 +4089,16 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
+        // carina#4067: bumped 29→31 — saved plans retain authored
+        // `ignore_changes` paths and re-resolve them only after schema
+        // fingerprint verification. Version 30 was never emitted; provider
+        // protocol v13 uses version 32.
+        // carina#4065: bumped 31→32 — saved plans bind every initialized
+        // provider instance to its reference scope and persist the
+        // create-outcome-unknown marker.
         // carina#4109: bumped 28→29 — saved plans persist anonymous-loop
         // provenance, typed bound/unbound deferred targets, and Move origins.
         // V28 plans carry the old deferred payload and must be regenerated.
-        // carina#4065: bumped 29→30 — saved plans bind every initialized
-        // provider instance to its reference scope.
         // carina#3883: bumped 27→28 — pending re-read unknowns now persist a
         // typed reason shared with state markers. V27 plans carry the removed
         // untyped unknown shape and must be regenerated.
@@ -4370,9 +4671,13 @@ pub async fn run_plan(
     render_plan_errors_and_abort(&ctx.plan, path)?;
 
     let iam_preflight_result = if check_iam {
-        let result =
-            crate::commands::iam_preflight::run_iam_preflight(&ctx.plan, &ctx.provider, strict_iam)
-                .await?;
+        let result = crate::commands::iam_preflight::run_iam_preflight(
+            &ctx.plan,
+            &ctx.provider,
+            ctx_wiring.schemas(),
+            strict_iam,
+        )
+        .await?;
         Some(result)
     } else {
         None
@@ -6259,10 +6564,10 @@ mod run_plan_out_tests {
             &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
         )
         .expect("saved plan should serialize");
-        let Effect::Create(created_effect) = &saved.plan.effects()[0] else {
+        let UnresolvedSavedEffect::Create(created_effect) = &saved.plan.effects()[0] else {
             panic!("expected create effect")
         };
-        let Effect::Update {
+        let UnresolvedSavedEffect::Update {
             to: updated_effect, ..
         } = &saved.plan.effects()[1]
         else {

@@ -6,10 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::binding_index::{ResolvedBindings, SecretPreservingAttributes};
-use crate::differ::{
-    AttrComparison, LeafProvenance, TypedAttr, key_should_enter_patch,
-    secret_grafted_comparison_view,
-};
+use crate::differ::{AttrComparison, LeafProvenance, TypedAttr, secret_grafted_comparison_view};
 use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
 use crate::executor::provider_ready::{
     CheckInput, ProviderPreparationContext, ResolvedCheckInput, managed_update_schema,
@@ -1100,7 +1097,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 // Apply-time augmentation detects newly resolved observable
                 // references. The plan already decided the unobservable leaf
                 // half, and keys it marked changed were skipped above.
-                let changed = key_should_enter_patch(
+                let changed = crate::differ::key_should_enter_patch_with_ignores(
                     key,
                     Some(schema),
                     LeafProvenance::DecidedByPlan { key_changed: false },
@@ -1110,14 +1107,31 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         saved: None,
                         type_info,
                     },
+                    resolved_to.ignore_changes(),
                     &comparison,
                 );
                 if changed {
                     effective_changed.push(key.clone());
                 }
             }
-            let request =
-                UpdateRequest::checked(from.clone(), &effective_changed, &resolved_to, schema);
+            let request = match UpdateRequest::checked(
+                from.clone(),
+                &effective_changed,
+                &resolved_to,
+                schema,
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    return StartedBasicEffectResult::new(
+                        started_effect,
+                        started,
+                        BasicEffectResult::Failure {
+                            error: error.to_string(),
+                            refresh: None,
+                        },
+                    );
+                }
+            };
             let accepted_request =
                 AcceptedRequest::from_update_request(&request, resolved_desired_attributes.clone());
             match provider.update(id, identifier, request).await {

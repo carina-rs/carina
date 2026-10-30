@@ -1066,6 +1066,92 @@ mock.test.Thing {
     }
 
     #[test]
+    fn ignore_changes_validation_matches_core_in_directory_scoped_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let providers = "provider mock {}\n";
+        let backend = "backend local { path = \"carina.state.json\" }\n";
+        let main = r#"let missing = mock.test.resource {
+  name = "missing"
+  directives { ignore_changes = [does_not_exist] }
+}
+
+let read_only = mock.test.resource {
+  name = "read-only"
+  directives { ignore_changes = [identifier] }
+}
+
+let indexed = mock.test.resource {
+  name = "indexed"
+  rule { action = "allow" }
+  directives { ignore_changes = [rule[0].action] }
+}
+
+let union_path = mock.test.resource {
+  name = "union"
+  choice = { value = "selected" }
+  directives { ignore_changes = [choice.value] }
+}
+
+let unwritten = mock.test.resource {
+  name = "unwritten"
+  directives { ignore_changes = [comment] }
+}
+
+let duplicate = mock.test.resource {
+  name = "duplicate"
+  comment = "recorded"
+  directives { ignore_changes = [comment, comment] }
+}
+"#;
+        std::fs::write(temp.path().join("providers.crn"), providers).unwrap();
+        std::fs::write(temp.path().join("backend.crn"), backend).unwrap();
+        std::fs::write(temp.path().join("main.crn"), main).unwrap();
+
+        let discovered = workspace::discover_providers_by_dir(temp.path());
+        let configs = discovered[temp.path()]
+            .iter()
+            .cloned()
+            .map(|config| (temp.path().to_path_buf(), config))
+            .collect();
+        let state = ProviderState::new(
+            vec![],
+            HashMap::new(),
+            configs,
+            None,
+            vec![(
+                "mock".to_string(),
+                Ok(ProviderArtifactFingerprint::default()),
+            )],
+        );
+        let main_path = temp.path().join("main.crn");
+        let document = Document::new_with_path(
+            main.to_string(),
+            main_path.clone(),
+            Arc::new(carina_core::parser::ProviderContext::default()),
+        );
+        let messages = state
+            .diagnostic_engine
+            .analyze(&document, Some(&main_path))
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "ignore_changes path `does_not_exist` does not exist in the resource schema",
+            "ignore_changes path `identifier` reaches a read-only or provider-populated node",
+            "ignore_changes path `rule[0].action` contains a list index, which is not supported",
+            "ignore_changes path `choice.value` passes through a union",
+            "ignore_changes path `comment` is not written in this resource block",
+            "ignore_changes path `comment` is listed more than once",
+        ] {
+            assert!(
+                messages.iter().any(|message| message.ends_with(expected)),
+                "missing `{expected}` from {messages:#?}",
+            );
+        }
+    }
+
+    #[test]
     fn sourced_mock_load_failure_does_not_activate_builtin_catalog_across_sibling_files() {
         let temp = tempfile::tempdir().unwrap();
         let providers = r#"provider mock {

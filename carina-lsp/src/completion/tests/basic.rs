@@ -2566,7 +2566,7 @@ let rd = registry_deploy {
 }
 
 #[test]
-fn directives_block_completion_includes_all_five_keys() {
+fn directives_block_completion_includes_all_six_keys() {
     let provider = test_provider_single_attr();
     let doc = create_document("test.foo.bar {\n  attr = \"x\"\n  directives {\n    \n  }\n}\n");
     // Cursor inside directives block, line 3, char 4
@@ -2584,6 +2584,7 @@ fn directives_block_completion_includes_all_five_keys() {
         "create_before_destroy",
         "prevent_destroy",
         "depends_on",
+        "ignore_changes",
         "provider",
     ] {
         assert!(
@@ -2591,6 +2592,36 @@ fn directives_block_completion_includes_all_five_keys() {
             "directives block completion missing `{key}`; got {labels:?}"
         );
     }
+}
+
+#[test]
+fn directives_ignore_changes_completion_offers_writable_attribute_paths() {
+    let provider = test_provider_with_nested_structs();
+    let doc = create_document(
+        "test.nested.resource {\n  outer = { inner = { leaf_field = \"x\" } }\n  directives {\n    ignore_changes = []\n  }\n}\n",
+    );
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 3,
+            character: 22,
+        },
+        None,
+    );
+    let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+
+    for path in [
+        "outer",
+        "outer.inner",
+        "outer.inner.leaf_field",
+        "outer.inner.leaf_bool",
+    ] {
+        assert!(labels.contains(&path), "missing `{path}` from {labels:?}");
+    }
+    assert!(
+        !labels.contains(&"outer.inner.provider_leaf"),
+        "provider-populated paths must not be offered: {labels:?}"
+    );
 }
 
 #[test]

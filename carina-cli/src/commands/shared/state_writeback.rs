@@ -19,8 +19,8 @@ use carina_core::provider::{
     UnknownCreateOutcome,
 };
 use carina_core::resource::{
-    ConcreteValue, Current, DefaultTagKeys, ModuleSource, ResolvedResource, ResolvedResourceId,
-    Resource, ResourceId, State, Value,
+    ConcreteValue, Current, ModuleSource, ResolvedResource, ResolvedResourceId, Resource,
+    ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedExportValue;
@@ -1708,18 +1708,13 @@ pub(crate) fn build_orphan_resource(
         .persisted_attributes()
         .map(PersistedAttributes::to_values)
         .unwrap_or_default();
-    Resource {
-        id: id.as_inner().clone(),
-        attributes: attributes.into_iter().collect(),
-        directives: rs.directives.clone(),
-        prefixes: rs.prefixes.clone(),
-        binding: rs.binding.clone(),
-        dependency_bindings: rs.dependency_bindings.clone(),
-        module_source: None,
-        default_tag_keys: DefaultTagKeys::default(),
-        loop_provenance: Default::default(),
-        quoted_string_attrs: HashSet::new(),
-    }
+    let mut resource = Resource::from_id(id.as_inner().clone());
+    resource.attributes = attributes.into_iter().collect();
+    resource.directives = rs.directives.clone().into();
+    resource.prefixes = rs.prefixes.clone();
+    resource.binding = rs.binding.clone();
+    resource.dependency_bindings = rs.dependency_bindings.clone();
+    resource
 }
 
 #[cfg(test)]

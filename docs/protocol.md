@@ -36,7 +36,11 @@ exists, while `carina state forget` clears only the current instance after the
 operator confirms the resource is absent; any deposed generations remain
 tracked for deletion.
 
-Saved-plan format 30 records the `reference-scope` of every loaded provider
+Saved-plan format 31 persists authored `ignore_changes` paths for schema-time
+re-resolution. Format 30 was never emitted; provider protocol v13 uses format
+32.
+
+Saved-plan format 32 records the `reference-scope` of every loaded provider
 instance next to its provider artifact evidence. Saved-plan apply initializes
 those same provider instances and refuses a missing or different scope before
 drift reads, secret evaluation, or provider effects. The evidence is keyed by
