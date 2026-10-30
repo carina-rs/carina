@@ -289,6 +289,78 @@ fn outcome_unknown_lookup_rejects_normal_and_missing_rows_with_removed_hint() {
     );
 }
 
+fn outcome_unknown_row_with_instance(instance: &str) -> ResourceState {
+    let json = serde_json::json!({
+        "version": 20,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "outcome-unknown-instance",
+        "carina_version": "test",
+        "resources": [{
+            "resource_type": "test.Resource",
+            "identity": "shared",
+            "provider": "mock",
+            "current": {
+                "kind": "create_outcome_unknown",
+                "started_at": "2026-10-23T08:00:00Z"
+            },
+            "directives": { "provider_instance": instance }
+        }],
+        "exports": {}
+    });
+    check_and_migrate(&json.to_string())
+        .unwrap()
+        .into_state()
+        .resources()[0]
+        .clone()
+}
+
+#[test]
+fn outcome_unknown_lookup_selects_the_unique_unknown_row_across_all_routes() {
+    let mut applied =
+        ResourceState::try_applied("test.Resource", "shared", "mock", "provider-id").unwrap();
+    applied.directives.provider_instance = Some("applied".to_string());
+    let unknown = outcome_unknown_row_with_instance("unknown");
+    let mut state = StateFile::from_unchecked_resources_for_test(vec![applied, unknown]);
+    let address = StateBlockAddress::new("mock", "test.Resource", "shared");
+
+    let forgotten = StateFile::forget(
+        state
+            .find_outcome_unknown(&address)
+            .expect("the only outcome-unknown row must be selected"),
+    );
+
+    assert_eq!(
+        forgotten.directives.provider_instance.as_deref(),
+        Some("unknown")
+    );
+    assert_eq!(state.resources().len(), 1);
+    assert_eq!(
+        state.resources()[0].directives.provider_instance.as_deref(),
+        Some("applied")
+    );
+}
+
+#[test]
+fn outcome_unknown_lookup_rejects_multiple_unknown_rows_as_ambiguous() {
+    let mut state = StateFile::from_unchecked_resources_for_test(vec![
+        outcome_unknown_row_with_instance("west"),
+        outcome_unknown_row_with_instance("east"),
+    ]);
+    let address = StateBlockAddress::new("mock", "test.Resource", "shared");
+
+    let error = state.find_outcome_unknown(&address).unwrap_err();
+
+    assert_eq!(error.kind(), NotOutcomeUnknownKind::Ambiguous);
+    assert!(matches!(
+        error,
+        NotOutcomeUnknown::Ambiguous {
+            provider_instances,
+            ..
+        } if provider_instances == vec![Some("west".to_string()), Some("east".to_string())]
+    ));
+}
+
 #[test]
 fn v15_migrates_to_current_and_round_trips_all_current_instance_variants() {
     let json = serde_json::json!({

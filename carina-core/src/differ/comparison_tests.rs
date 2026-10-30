@@ -103,11 +103,7 @@ fn lambda_function_reference_fixture(
 }
 
 fn available_reference_scope() -> ReferenceScope {
-    ReferenceScope::Available {
-        partition: "aws".to_string(),
-        region: "us-east-1".to_string(),
-        account: "123456789012".to_string(),
-    }
+    ReferenceScope::available("aws", "us-east-1", "123456789012").expect("fixture scope is valid")
 }
 
 fn string_value(value: &str) -> Value {
@@ -129,22 +125,34 @@ fn refined_string_reference_form_equates_bare_name_and_local_arn() {
 }
 
 #[test]
-fn refined_string_reference_form_does_not_expand_placeholder_text_inside_scope_values() {
-    let scope = ReferenceScope::Available {
-        partition: "aws{name}".to_string(),
-        region: "us-east-1".to_string(),
-        account: "123456789012".to_string(),
-    };
-    let (scope, forms, attr_type) = lambda_function_reference_fixture(scope);
+fn refined_string_applies_to_dsl_before_reference_form_canonicalization() {
+    let (scope, forms, _) = lambda_function_reference_fixture(available_reference_scope());
+    let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
+    let attr_type = AttributeType::refined_string(
+        Some(identity),
+        None,
+        None,
+        Some(crate::schema::DslTransform::StripSuffix("_api".to_string())),
+    );
     let context = ComparisonContext::for_test(&scope, &forms);
 
     assert!(super::type_aware_equal(
-        &string_value("processor"),
-        &string_value("arn:aws{name}:lambda:us-east-1:123456789012:function:processor"),
+        &string_value("processor_api"),
+        &string_value("arn:aws:lambda:us-east-1:123456789012:function:processor_api"),
         Some(&attr_type),
         crate::schema::empty_defs_for_schema_walks(),
         &context,
     ));
+}
+
+#[test]
+fn reference_scope_rejects_placeholder_text() {
+    assert_eq!(
+        ReferenceScope::available("aws{name}", "us-east-1", "123456789012").unwrap_err(),
+        crate::provider::ReferenceScopeError::ContainsBrace {
+            field: crate::provider::ReferenceScopeField::Partition,
+        }
+    );
 }
 
 #[test]

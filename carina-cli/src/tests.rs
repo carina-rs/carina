@@ -26,7 +26,7 @@ use carina_state::{
 };
 
 use crate::commands::apply::{
-    ApplyResult, ApplyTarget, detect_drift, finalize_apply, refresh_pending_states,
+    ApplyResult, ApplyTarget, detect_drift_for_test, finalize_apply, refresh_pending_states,
     save_state_locked,
 };
 use crate::commands::plan::{
@@ -267,26 +267,6 @@ impl TestProvider {
         let mut read_results = HashMap::new();
         read_results.insert((id.to_string(), identifier.to_string()), result);
         Self { read_results }
-    }
-}
-
-impl crate::commands::apply::ComparisonProvider for TestProvider {
-    fn operation_provider(&self) -> &dyn Provider {
-        self
-    }
-
-    fn comparison_context_for<'a>(
-        &'a self,
-        id: &ResourceId,
-        schema: carina_core::schema::OwnerBoundResourceSchema<'a>,
-    ) -> ProviderResult<carina_core::differ::ComparisonContext<'a>> {
-        assert_eq!(id.provider, schema.owner());
-        static SCOPE: carina_core::provider::ReferenceScope =
-            carina_core::provider::ReferenceScope::Unavailable;
-        Ok(carina_core::differ::ComparisonContext::for_test(
-            &SCOPE,
-            schema.reference_forms(),
-        ))
     }
 }
 
@@ -1570,7 +1550,7 @@ async fn detect_drift_errors_when_resource_missing_from_planned_states() {
     // planned_states is empty - resource is missing
     let planned_states = Vec::new();
 
-    let result = detect_drift(
+    let result = detect_drift_for_test(
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
@@ -1611,7 +1591,7 @@ async fn detect_drift_returns_none_when_no_drift() {
     let provider = TestProvider::with_read_state(&id, identifier, state.clone());
     let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), state)];
 
-    let result = detect_drift(
+    let result = detect_drift_for_test(
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
@@ -1688,18 +1668,16 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
         "aws".to_string(),
         InitializedProvider::for_test(
             Box::new(TestProvider::with_read_state(&id, identifier, actual)),
-            ReferenceScope::Available {
-                partition: "aws".to_string(),
-                region: "us-east-1".to_string(),
-                account: "123456789012".to_string(),
-            },
+            ReferenceScope::available("aws", "us-east-1", "123456789012")
+                .expect("fixture scope is valid"),
         ),
     );
 
-    let result = detect_drift(
+    let result = crate::commands::apply::detect_drift(
         &[resource],
         &[ReloadedCurrentStateEntry::managed(id, planned)],
         &MovedOrigins::from_plan(&Plan::new()),
+        &provider,
         &provider,
         None,
         &schemas,
@@ -1767,7 +1745,7 @@ async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file
         .expect("schema fixture must be valid"),
     );
 
-    let result = detect_drift(
+    let result = detect_drift_for_test(
         &[resource],
         &[ReloadedCurrentStateEntry::managed(id.clone(), planned)],
         &MovedOrigins::from_plan(&Plan::new()),
@@ -1796,7 +1774,7 @@ async fn detect_drift_uses_identifier_carried_by_present_current() {
         carina_core::resource::fixture_present_current(planned, identifier),
     )];
 
-    let result = detect_drift(
+    let result = detect_drift_for_test(
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
@@ -1839,7 +1817,7 @@ async fn detect_drift_returns_messages_when_drift_detected() {
     let provider = TestProvider::with_read_state(&id, identifier, actual);
     let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), planned)];
 
-    let result = detect_drift(
+    let result = detect_drift_for_test(
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),

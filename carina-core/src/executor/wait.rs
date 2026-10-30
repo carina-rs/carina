@@ -317,6 +317,7 @@ struct InterruptedRegistry<S> {
     abandoning: bool,
     effects: Vec<InterruptedEffect<S>>,
     create_cancellations: HashMap<usize, CreateCallCancellationReceiver>,
+    create_reports: Vec<CancelledCreateReport>,
     fail_safe_count: usize,
 }
 
@@ -326,8 +327,29 @@ impl<S> Default for InterruptedRegistry<S> {
             abandoning: false,
             effects: Vec::new(),
             create_cancellations: HashMap::new(),
+            create_reports: Vec::new(),
             fail_safe_count: 0,
         }
+    }
+}
+
+impl<S> InterruptedRegistry<S> {
+    fn retain_create_cancellation_reports(
+        &mut self,
+        receivers: impl IntoIterator<Item = CreateCallCancellationReceiver>,
+    ) {
+        self.create_reports
+            .extend(receivers.into_iter().flat_map(|receiver| receiver.drain()));
+    }
+
+    fn retain_create_cancellation_report(&mut self, idx: usize) {
+        let receiver = self.create_cancellations.remove(&idx);
+        self.retain_create_cancellation_reports(receiver);
+    }
+
+    fn retain_all_create_cancellation_reports(&mut self) {
+        let receivers = std::mem::take(&mut self.create_cancellations).into_values();
+        self.retain_create_cancellation_reports(receivers);
     }
 }
 
@@ -471,7 +493,7 @@ impl<S> Drop for StartedEffect<'_, S> {
             return;
         }
         registry.fail_safe_count += 1;
-        registry.create_cancellations.remove(&self.idx);
+        registry.retain_create_cancellation_report(self.idx);
         drop(registry);
 
         debug_assert!(
@@ -553,14 +575,15 @@ impl<'fut, R, S> WaitAwareInFlight<'fut, R, S> {
             .expect("interrupted effect registry poisoned")
             .abandoning = true;
         drop(self);
-        let (mut interrupted, fail_safe_count, cancellation_receivers) = {
+        let (mut interrupted, fail_safe_count, create_reports) = {
             let mut registry = interrupted_registry
                 .lock()
                 .expect("interrupted effect registry poisoned");
+            registry.retain_all_create_cancellation_reports();
             (
                 std::mem::take(&mut registry.effects),
                 std::mem::take(&mut registry.fail_safe_count),
-                std::mem::take(&mut registry.create_cancellations),
+                std::mem::take(&mut registry.create_reports),
             )
         };
         interrupted.sort_by_key(|entry| entry.idx);
@@ -574,10 +597,6 @@ impl<'fut, R, S> WaitAwareInFlight<'fut, R, S> {
                 progress,
             });
         }
-        let create_reports = cancellation_receivers
-            .into_values()
-            .flat_map(|receiver| receiver.drain())
-            .collect();
         Abandonment {
             interrupted_count: count,
             create_reports,
@@ -1077,6 +1096,53 @@ mod tests {
         let abandonment = in_flight.abandon(&observer);
         assert_eq!(abandonment.interrupted_count, 1);
         assert!(abandonment.create_reports.is_empty());
+    }
+
+    #[test]
+    fn fail_safe_drop_retains_unknown_create_report_for_checkpoint() {
+        let observer = NoopWaitObserver;
+        let in_flight: WaitAwareInFlight<'_, (), crate::resource::ModuleSource> =
+            WaitAwareInFlight::new();
+        let id = ResourceId::with_provider_identity(
+            "test",
+            "test.resource",
+            "unknown-after-fail-safe",
+            None,
+        );
+        let (attempt, receiver) =
+            crate::provider::CreateAttempt::with_cancellation_report(id.clone());
+        let guest_call = attempt.start_guest_call();
+        guest_call.egress_recorder().begin_request().dispatched();
+        drop(guest_call);
+
+        let start = InFlightStart {
+            idx: 1,
+            interrupted: Arc::clone(&in_flight.interrupted),
+        };
+        let effect = wait_effect(Duration::from_secs(60), Duration::from_secs(5));
+        let mut started = start.emit_started(
+            &observer,
+            &effect,
+            ProgressInfo {
+                completed: 1,
+                total: 1,
+            },
+        );
+        started.track_create_cancellation(receiver);
+
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(started)));
+        assert!(
+            dropped.is_err(),
+            "debug builds must catch the invariant violation"
+        );
+
+        let abandonment = in_flight.abandon(&observer);
+        let [CancelledCreateReport::OutcomeUnknown(unknown)] =
+            abandonment.create_reports.as_slice()
+        else {
+            panic!("the fail-safe drop lost the queued outcome-unknown report")
+        };
+        assert_eq!(unknown.id(), &id);
     }
 
     #[test]

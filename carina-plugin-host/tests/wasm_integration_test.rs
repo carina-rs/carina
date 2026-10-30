@@ -427,6 +427,7 @@ async fn initial_create_trap_after_dispatched_egress_is_outcome_unknown() {
     );
 
     let failure = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("the guest must trap after the request completes");
@@ -465,6 +466,7 @@ async fn initial_create_trap_without_egress_is_untracked() {
     );
 
     let failure = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("the guest must trap before issuing the request");
@@ -504,6 +506,7 @@ async fn provider_declared_untracked_remains_untracked_after_egress() {
     );
 
     let failure = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("the provider must return its declared verdict");
@@ -646,21 +649,27 @@ async fn initialized_reference_scope_is_kept_per_provider_instance() {
 
     assert_eq!(
         factory.initialized_reference_scope_for_test(None).await,
-        Some(carina_provider_protocol::types::ReferenceScope::Available {
-            partition: "mock".to_string(),
-            region: "ap-northeast-1".to_string(),
-            account: "test-account".to_string(),
-        })
+        Some(
+            carina_provider_protocol::types::ReferenceScope::available(
+                "mock",
+                "ap-northeast-1",
+                "test-account",
+            )
+            .expect("fixture scope is valid"),
+        )
     );
     assert_eq!(
         factory
             .initialized_reference_scope_for_test(Some("virginia"))
             .await,
-        Some(carina_provider_protocol::types::ReferenceScope::Available {
-            partition: "mock".to_string(),
-            region: "us-east-1".to_string(),
-            account: "test-account".to_string(),
-        })
+        Some(
+            carina_provider_protocol::types::ReferenceScope::available(
+                "mock",
+                "us-east-1",
+                "test-account",
+            )
+            .expect("fixture scope is valid"),
+        )
     );
 }
 
@@ -717,6 +726,7 @@ async fn host_egress_denial_traps_instead_of_reaching_guest_send_phase_classific
     );
 
     let failure = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("the host egress policy must trap the guest");
@@ -769,6 +779,7 @@ async fn untrusted_metadata_denial_is_immediate_and_poisons_the_provider_instanc
 
     let started = Instant::now();
     let failure = provider
+        .provider()
         .create_for_test(&id, request)
         .await
         .expect_err("an untrusted provider must trap on an IMDS request");
@@ -805,6 +816,7 @@ async fn untrusted_metadata_denial_is_immediate_and_poisons_the_provider_instanc
     );
     let followup_started = Instant::now();
     let followup_error = provider
+        .provider()
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("the trapping metadata denial must poison the shared instance");
@@ -848,6 +860,7 @@ async fn post_resolution_metadata_denial_traps_and_poisons_the_provider_instance
 
     let started = Instant::now();
     let failure = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("post-resolution metadata policy must trap the guest");
@@ -886,6 +899,7 @@ async fn post_resolution_metadata_denial_traps_and_poisons_the_provider_instance
     );
     let followup_started = Instant::now();
     let followup_error = provider
+        .provider()
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("the post-resolution metadata trap must poison the shared instance");
@@ -943,6 +957,7 @@ async fn wasm_guest_classifies_post_body_closed_tcp_port_as_not_sent() {
 
     let state = create_state_for_writeback(
         provider
+            .provider()
             .create_for_test(&id, create_request_for_test(resource).await)
             .await
             .expect("the mock transport probe should report its phase"),
@@ -1024,6 +1039,7 @@ async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
 
     let state = create_state_for_writeback(
         provider
+            .provider()
             .create_for_test(&id, create_request_for_test(resource).await)
             .await
             .expect("the mock transport probe should report its phase"),
@@ -1104,6 +1120,7 @@ async fn wasm_guest_classifies_post_body_first_byte_timeout_as_maybe_sent() {
     });
 
     let outcome = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await;
     release_server
@@ -1141,6 +1158,7 @@ async fn test_wasm_pending_create_polls_until_success() {
 
     let state = create_state_for_writeback(
         provider
+            .provider()
             .create_for_test(&id, create_request_for_test(resource).await)
             .await
             .expect("pending create should settle"),
@@ -1170,6 +1188,7 @@ async fn test_wasm_pending_update_polls_until_success() {
     let mut resource = resource_with_int_attribute("test.resource", "pending-update", "value", 1);
     let created = create_state_for_writeback(
         provider
+            .provider()
             .create_for_test(&id, create_request_for_test(resource.clone()).await)
             .await
             .expect("setup create should succeed"),
@@ -1187,6 +1206,7 @@ async fn test_wasm_pending_update_polls_until_success() {
     .await;
 
     let state = provider
+        .provider()
         .update(&id, &mock_identifier(), request)
         .await
         .expect("pending update should settle")
@@ -1222,12 +1242,14 @@ async fn test_wasm_pending_delete_polls_until_success() {
         i64::from(PENDING_POLLS),
     );
     provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect("setup create should succeed");
 
     let delete_started = Instant::now();
     provider
+        .provider()
         .delete(&id, &mock_identifier(), DeleteRequest::default())
         .await
         .expect("pending delete should settle");
@@ -1237,6 +1259,7 @@ async fn test_wasm_pending_delete_polls_until_success() {
     );
 
     let state = provider
+        .provider()
         .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect("provider should remain usable")
@@ -1269,6 +1292,7 @@ async fn test_wasm_pending_create_can_settle_on_final_poll_at_deadline() {
 
     let state = create_state_for_writeback(
         provider
+            .provider()
             .create_for_test(&id, create_request_for_test(resource).await)
             .await
             .expect("the final poll at the schema deadline should be allowed"),
@@ -1301,7 +1325,9 @@ async fn test_wasm_cancel_between_polls_does_not_poison_instance() {
 
     tokio::time::timeout(
         Duration::from_millis(750),
-        provider.create_for_test(&pending_id, create_request_for_test(pending).await),
+        provider
+            .provider()
+            .create_for_test(&pending_id, create_request_for_test(pending).await),
     )
     .await
     .expect_err("the caller timeout should drop the operation between polls");
@@ -1310,6 +1336,7 @@ async fn test_wasm_cancel_between_polls_does_not_poison_instance() {
         ResourceId::with_provider_identity("mock", "test.resource", "after-cancel", None);
     let healthy = resource_with_int_attribute("test.resource", "after-cancel", "value", 1);
     provider
+        .provider()
         .create_for_test(&healthy_id, create_request_for_test(healthy).await)
         .await
         .expect("cancellation between polls must not poison the WASM instance");
@@ -1332,6 +1359,7 @@ async fn test_wasm_pending_over_budget_times_out_without_poisoning_instance() {
     );
 
     let error = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("pending create should exhaust its schema budget")
@@ -1358,6 +1386,7 @@ async fn test_wasm_pending_over_budget_times_out_without_poisoning_instance() {
         ResourceId::with_provider_identity("mock", "test.resource", "after-timeout", None);
     let healthy = resource_with_int_attribute("test.resource", "after-timeout", "value", 1);
     provider
+        .provider()
         .create_for_test(&healthy_id, create_request_for_test(healthy).await)
         .await
         .expect("budget exhaustion must not poison the WASM instance");
@@ -1381,6 +1410,7 @@ async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() 
         "untracked",
     );
     let untracked = provider
+        .provider()
         .create_for_test(&untracked_id, create_request_for_test(untracked).await)
         .await
         .expect_err("untracked mode must return a classified failure")
@@ -1400,6 +1430,7 @@ async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() 
         Value::Concrete(ConcreteValue::String("name".into())),
     );
     let created = provider
+        .provider()
         .create_for_test(&created_id, create_request_for_test(created).await)
         .await
         .expect_err("created mode must preserve its observed resource")
@@ -1433,6 +1464,7 @@ async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() 
         "malformed_pending",
     );
     let malformed = provider
+        .provider()
         .create_for_test(&malformed_id, create_request_for_test(malformed).await)
         .await
         .expect_err("an undecodable poll token must remain in flight")
@@ -1474,6 +1506,7 @@ async fn initial_issued_encode_failure_is_created_never_untracked() {
     );
 
     let failure = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("guest encoding failure must remain classified")
@@ -1518,6 +1551,7 @@ async fn initial_unissued_pending_token_encode_failure_is_untracked() {
     );
 
     match provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("an unissued unencodable continuation cannot be tracked")
@@ -1562,6 +1596,7 @@ async fn initial_issued_pending_token_encode_failure_is_created() {
     );
 
     match provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("an issued create with no encodable continuation must be retained")
@@ -1618,6 +1653,7 @@ async fn unissued_poll_token_encode_failure_keeps_previous_continuation() {
     );
 
     match provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("an unissued poll with no replacement token must remain in flight")
@@ -1666,6 +1702,7 @@ async fn issued_poll_token_encode_failure_keeps_previous_continuation() {
     );
 
     match provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("an issued poll with no encodable replacement must remain in flight")
@@ -1727,6 +1764,7 @@ async fn resume_pending_token_encode_failure_keeps_previous_continuation() {
         .expect("resume fixture route must match");
 
     match provider
+        .provider()
         .resume_create(request)
         .await
         .map(ResumeOutcome::into_kind)
@@ -1797,6 +1835,7 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
             ResumeCreateRequest::for_test(pending, create_request_for_test(resource).await)
                 .expect("resume fixture route must match");
         let result = provider
+            .provider()
             .resume_create(request)
             .await
             .map(ResumeOutcome::into_kind)
@@ -1852,6 +1891,7 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
         ResumeCreateRequest::for_test(malformed, create_request_for_test(malformed_resource).await)
             .expect("malformed-token fixture route must match");
     match provider
+        .provider()
         .resume_create(malformed_request)
         .await
         .map(ResumeOutcome::into_kind)
@@ -1897,6 +1937,7 @@ async fn canonicalized_composite_identifiers_survive_finished_and_resumed_paths(
         canonical,
     );
     let finished = provider
+        .provider()
         .create_for_test(&finished_id, create_request_for_test(finished).await)
         .await
         .expect("canonicalized finished create should succeed")
@@ -1928,6 +1969,7 @@ async fn canonicalized_composite_identifiers_survive_finished_and_resumed_paths(
     let request = ResumeCreateRequest::for_test(pending, create_request_for_test(resumed).await)
         .expect("resume fixture route must match");
     match provider
+        .provider()
         .resume_create(request)
         .await
         .map(ResumeOutcome::into_kind)
@@ -1971,6 +2013,7 @@ async fn test_wasm_operation_budget_includes_initial_guest_call() {
     );
 
     let error = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("the slow initial guest call should exhaust the schema budget");
@@ -2015,6 +2058,7 @@ async fn test_wasm_production_budget_allows_25s_host_wait() {
     );
 
     provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect("a host wait below the compute budget should succeed");
@@ -2038,6 +2082,7 @@ async fn test_wasm_production_budget_allows_35s_host_wait() {
     );
 
     provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect("time parked in a host import must not consume guest compute budget");
@@ -2061,6 +2106,7 @@ async fn test_wasm_short_compute_budget_excludes_5s_host_wait() {
         resource_with_int_attribute("test.resource", "host-wait-5s", "call_delay_millis", 5_000);
 
     provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect("host wait longer than the compute budget should succeed");
@@ -2088,6 +2134,7 @@ async fn test_wasm_short_compute_budget_interrupts_busy_loop() {
     let started = Instant::now();
 
     let error = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("busy guest computation should exhaust its compute budget");
@@ -2136,7 +2183,9 @@ async fn test_wasm_short_compute_budget_interrupts_spin_with_host_calls() {
 
     let error = tokio::time::timeout(
         Duration::from_secs(10),
-        provider.create_for_test(&id, create_request_for_test(resource).await),
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource).await),
     )
     .await
     .expect("compute timeout should fire within 10s even when the guest calls host imports")
@@ -2176,6 +2225,7 @@ async fn test_wasm_short_wall_budget_times_out_host_wait() {
     let started = Instant::now();
 
     let error = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("the whole guest call should be bounded by its wall budget");
@@ -2233,10 +2283,11 @@ async fn test_wasm_queued_sibling_observes_poison_before_dead_store() {
     let sibling_id =
         ResourceId::with_provider_identity("mock", "test.resource", "queued-sibling", None);
 
-    let timed_out = provider.create_for_test(&slow_id, slow);
+    let timed_out = provider.provider().create_for_test(&slow_id, slow);
     let sibling = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
         provider
+            .provider()
             .read(&sibling_id, &mock_identifier(), ReadRequest)
             .await
     };
@@ -2282,7 +2333,7 @@ async fn test_wasm_cancelled_guest_call_drops_live_instance_before_followup() {
 
     tokio::time::timeout(
         Duration::from_millis(500),
-        provider.create_for_test(&slow_id, slow),
+        provider.provider().create_for_test(&slow_id, slow),
     )
     .await
     .expect_err("the outer timeout must cancel the in-flight guest call");
@@ -2290,6 +2341,7 @@ async fn test_wasm_cancelled_guest_call_drops_live_instance_before_followup() {
     let followup_id =
         ResourceId::with_provider_identity("mock", "test.resource", "after-cancel", None);
     let followup = provider
+        .provider()
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("cancelling an in-flight call must poison the configured instance");
@@ -2321,12 +2373,14 @@ async fn test_wasm_poll_sleep_does_not_block_sibling_operation() {
     let sibling_id =
         ResourceId::with_provider_identity("mock", "test.resource", "sibling-read", None);
 
-    let pending_operation = provider.create_for_test(&pending_id, request);
+    let pending_operation = provider.provider().create_for_test(&pending_id, request);
     let sibling_operation = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
         tokio::time::timeout(
             Duration::from_millis(500),
-            provider.read(&sibling_id, &mock_identifier(), ReadRequest),
+            provider
+                .provider()
+                .read(&sibling_id, &mock_identifier(), ReadRequest),
         )
         .await
         .expect("sibling read must not wait for the provider's poll sleep")
@@ -2695,15 +2749,18 @@ async fn test_wasm_store_lock_wait_does_not_count_against_guest_call_timeout() {
     ))
     .await;
 
-    let first_operation = provider.create_for_test(&first_id, first);
+    let first_operation = provider.provider().create_for_test(&first_id, first);
     let second_operation = async {
         tokio::time::sleep(Duration::from_millis(25)).await;
-        provider.create_for_test(&second_id, second).await
+        provider
+            .provider()
+            .create_for_test(&second_id, second)
+            .await
     };
     let fast_operation = async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let queued_at = Instant::now();
-        let result = provider.create_for_test(&fast_id, fast).await;
+        let result = provider.provider().create_for_test(&fast_id, fast).await;
         (result, queued_at.elapsed())
     };
     let (first_result, second_result, (fast_result, fast_elapsed)) =
@@ -2727,11 +2784,12 @@ async fn test_wasm_mock_provider_create_and_read() {
         .await
         .expect("provider should init");
 
-    assert_eq!(provider.name(), "mock");
+    assert_eq!(provider.provider().name(), "mock");
 
     // Read before create - should return a state with no identifier and empty attributes
     let id = ResourceId::with_provider_identity("mock", "test.resource", "my-resource", None);
     let state = provider
+        .provider()
         .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect("read should not error")
@@ -2755,6 +2813,7 @@ async fn test_wasm_mock_provider_create_and_read() {
 
     let created = create_state_for_writeback(
         provider
+            .provider()
             .create_for_test(&id, create_request_for_test(resource.clone()).await)
             .await
             .expect("create should succeed"),
@@ -2777,6 +2836,7 @@ async fn test_wasm_mock_provider_create_and_read() {
 
     // Read back - should return the created state
     let read_state = provider
+        .provider()
         .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect("read should not error")
@@ -2814,6 +2874,7 @@ async fn test_wasm_guest_read_reports_nested_non_finite_float_as_provider_error(
     );
 
     let error = provider
+        .provider()
         .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("guest output containing nested NaN must be a provider error");
@@ -2854,6 +2915,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     let created = create_state_for_writeback(
         provider
+            .provider()
             .create_for_test(&id, create_request_for_test(resource.clone()).await)
             .await
             .expect("create should succeed"),
@@ -2882,6 +2944,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     .await;
 
     let updated = provider
+        .provider()
         .update(&id, &mock_identifier(), request)
         .await
         .expect("update should succeed")
@@ -2929,6 +2992,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     // Read to verify update persisted in memory
     let read_state = provider
+        .provider()
         .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect("read should not error")
@@ -2940,12 +3004,14 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     // Delete
     provider
+        .provider()
         .delete(&id, &mock_identifier(), DeleteRequest::default())
         .await
         .expect("delete should succeed");
 
     // Read after delete - should return empty state (no identifier, no attributes)
     let deleted_state = provider
+        .provider()
         .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect("read should not error")
@@ -2988,6 +3054,7 @@ async fn test_wasm_update_accepts_redacted_secret_in_current_state() {
     .await;
 
     let updated = provider
+        .provider()
         .update(&id, &mock_identifier(), request)
         .await
         .expect("persisted current-state secrets must cross the update boundary")
@@ -3032,6 +3099,7 @@ async fn test_wasm_update_carries_unchanged_redacted_secret_into_outcome() {
     let request = update_request_for_test(resource, from, &["color".to_string()]).await;
 
     let updated = provider
+        .provider()
         .update(&id, &mock_identifier(), request)
         .await
         .expect("unchanged persisted secrets must cross the update outcome boundary")
@@ -3070,6 +3138,7 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
         ("payload".into(), cloud_payload.clone()),
     ]);
     provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource.clone()).await)
         .await
         .expect("create should seed the mock cloud store");
@@ -3098,11 +3167,13 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
     );
     let request = update_request_for_test(resource, from, &["color".to_string()]).await;
     provider
+        .provider()
         .update(&id, &mock_identifier(), request)
         .await
         .expect("update should preserve the unchanged persisted attribute");
 
     let read = provider
+        .provider()
         .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect("read after update should succeed")
@@ -3907,6 +3978,7 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
     let create_id = ResourceId::with_provider_identity("mock", "test.resource", "after-trap", None);
     let resource = Resource::with_provider("mock", "test.resource", "after-trap", None);
     let error = provider
+        .provider()
         .create_for_test(&create_id, create_request_for_test(resource).await)
         .await
         .expect_err("the shared provider instance must remain poisoned after a normalizer trap");
@@ -3943,6 +4015,7 @@ async fn test_wasm_crud_trap_poisons_instance_with_original_operation() {
         Resource::with_provider("mock", "test.resource", "__mock_create_trap__", None);
 
     let initial_error = provider
+        .provider()
         .create_for_test(&trap_id, create_request_for_test(trap_resource).await)
         .await
         .expect_err("the mock create hook must trap");
@@ -3961,6 +4034,7 @@ async fn test_wasm_crud_trap_poisons_instance_with_original_operation() {
     let followup_id =
         ResourceId::with_provider_identity("mock", "test.resource", "after-create-trap", None);
     let followup_error = provider
+        .provider()
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("the shared instance must remain poisoned after a CRUD trap");
@@ -3993,6 +4067,7 @@ async fn test_wasm_provider_returned_error_does_not_poison_instance() {
         Resource::with_provider("mock", "test.resource", "__mock_create_error__", None);
 
     let error = provider
+        .provider()
         .create_for_test(&error_id, create_request_for_test(error_resource).await)
         .await
         .expect_err("the mock create hook must return a provider error");
@@ -4010,6 +4085,7 @@ async fn test_wasm_provider_returned_error_does_not_poison_instance() {
     let followup_id =
         ResourceId::with_provider_identity("mock", "test.resource", "after-create-error", None);
     let state = provider
+        .provider()
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect("a provider-returned error must not poison the shared instance")
@@ -4029,6 +4105,7 @@ async fn test_wasm_provider_returned_wit_error_does_not_poison_fail_fast_instanc
         ResourceId::with_provider_identity("mock", "test.resource", "__mock_read_error__", None);
 
     let error = provider
+        .provider()
         .read(&error_id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("the mock read hook must return a WIT provider-error");
@@ -4038,6 +4115,7 @@ async fn test_wasm_provider_returned_wit_error_does_not_poison_fail_fast_instanc
     let followup_id =
         ResourceId::with_provider_identity("mock", "test.resource", "after-read-error", None);
     let state = provider
+        .provider()
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect("a provider-returned WIT error must not poison the FailFast instance")
@@ -4186,6 +4264,7 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         None,
     );
     let state = provider
+        .provider()
         .read(&read_id, &mock_identifier(), ReadRequest)
         .await
         .expect("provider-returned normalizer errors must not poison a later CRUD call")
@@ -4404,6 +4483,7 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
             .expect("data-source request should pass the checked host boundary");
 
     let state = provider
+        .provider()
         .read_data_source(&resource)
         .await
         .expect("read_data_source should dispatch to the plugin override");
@@ -4441,6 +4521,7 @@ async fn test_wasm_mock_provider_required_permissions_dispatches_through_wit() {
 
     assert_eq!(
         provider
+            .provider()
             .required_permissions(&id, PlanOp::Create)
             .expect("required_permissions should succeed"),
         Vec::<String>::new()
@@ -4463,6 +4544,7 @@ async fn test_wasm_required_permissions_trap_is_not_an_empty_permission_set() {
     );
 
     let error = provider
+        .provider()
         .required_permissions(&id, PlanOp::Create)
         .expect_err("a guest trap must be returned to the caller");
 
@@ -4488,6 +4570,7 @@ async fn test_wasm_invalid_satisfier_hint_is_not_silently_dropped() {
     );
 
     let error = provider
+        .provider()
         .satisfier_hint(
             &id,
             &carina_core::wait::predicate::AttrPath::single("status"),

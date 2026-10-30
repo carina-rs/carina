@@ -577,7 +577,7 @@ async fn test_precompiled_factory_creates_provider() {
         .create_initialized_provider(None, &config)
         .await
         .expect("provider should init");
-    assert_eq!(provider.name(), "mock");
+    assert_eq!(provider.provider().name(), "mock");
 }
 
 #[tokio::test(flavor = "multi_thread")]

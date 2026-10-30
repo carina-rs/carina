@@ -179,10 +179,6 @@ impl RecordedProviderScopes {
         Ok(())
     }
 
-    fn as_map(&self) -> &PlanProviderScopes {
-        &self.0
-    }
-
     fn into_wire(self) -> Vec<RecordedProviderScope> {
         self.0
             .into_iter()
@@ -419,11 +415,7 @@ mod provider_scope_evidence_tests {
     }
 
     fn available(region: &str) -> ReferenceScope {
-        ReferenceScope::Available {
-            partition: "aws".to_string(),
-            region: region.to_string(),
-            account: "123456789012".to_string(),
-        }
+        ReferenceScope::available("aws", region, "123456789012").expect("fixture scope is valid")
     }
 
     fn router(scopes: [(&str, ReferenceScope); 2]) -> ProviderRouter {
@@ -843,11 +835,10 @@ pub enum ProviderEvidenceError {
     DuplicateProviderScope {
         instance: ProviderInstanceKey,
     },
-    MissingProviderScope {
+    ProviderScopeMismatch {
         instance: ProviderInstanceKey,
-    },
-    UnexpectedProviderScope {
-        instance: ProviderInstanceKey,
+        recorded: Option<()>,
+        initialized: Option<()>,
     },
 }
 
@@ -915,17 +906,25 @@ impl std::fmt::Display for ProviderEvidenceError {
                 "provider_scopes contains duplicate instance `{}`",
                 display_provider_instance(instance)
             ),
-            Self::MissingProviderScope { instance } => write!(
+            Self::ProviderScopeMismatch {
+                instance,
+                recorded,
+                initialized,
+            } => write!(
                 formatter,
-                "provider_scopes is missing initialized instance `{}`",
-                display_provider_instance(instance)
-            ),
-            Self::UnexpectedProviderScope { instance } => write!(
-                formatter,
-                "provider_scopes contains unexpected instance `{}`",
-                display_provider_instance(instance)
+                "provider_scopes differs for instance `{}`: recorded {}, initialized {}",
+                display_provider_instance(instance),
+                display_scope_presence(*recorded),
+                display_scope_presence(*initialized)
             ),
         }
+    }
+}
+
+fn display_scope_presence(scope: Option<()>) -> &'static str {
+    match scope {
+        Some(()) => "present",
+        None => "missing",
     }
 }
 
@@ -1120,21 +1119,21 @@ impl ProviderEvidence {
                 }
             }
         }
-        let recorded_instances = self
-            .provider_scopes
-            .as_map()
-            .keys()
+        let instances = expected_instances
+            .iter()
+            .chain(self.provider_scopes.0.keys())
             .cloned()
             .collect::<BTreeSet<_>>();
-        if let Some(instance) = expected_instances.difference(&recorded_instances).next() {
-            return Err(ProviderEvidenceError::MissingProviderScope {
-                instance: instance.clone(),
-            });
-        }
-        if let Some(instance) = recorded_instances.difference(expected_instances).next() {
-            return Err(ProviderEvidenceError::UnexpectedProviderScope {
-                instance: instance.clone(),
-            });
+        for instance in instances {
+            let recorded = self.provider_scopes.0.contains_key(&instance).then_some(());
+            let initialized = expected_instances.contains(&instance).then_some(());
+            if recorded != initialized {
+                return Err(ProviderEvidenceError::ProviderScopeMismatch {
+                    instance,
+                    recorded,
+                    initialized,
+                });
+            }
         }
         Ok(())
     }
@@ -1477,34 +1476,16 @@ impl<S> PlanFileContents<S> {
             match effect {
                 Effect::Read { resource } => insert(&mut instances, &resource.id),
                 Effect::Create(resource) => insert(&mut instances, &resource.id),
-                Effect::ResumeCreate {
-                    resource,
-                    started_at: _started_at,
-                } => insert(&mut instances, &resource.id),
-                Effect::Update {
-                    from,
-                    identifier: _identifier,
-                    to,
-                    changed_attributes: _changed_attributes,
-                } => {
+                Effect::ResumeCreate { resource, .. } => {
+                    insert(&mut instances, &resource.id);
+                }
+                Effect::Update { from, to, .. } => {
                     insert(&mut instances, &from.id);
                     insert(&mut instances, &to.id);
                 }
-                Effect::Delete {
-                    id,
-                    identifier: _identifier,
-                    generation: _generation,
-                    directives: _directives,
-                    binding: _binding,
-                    dependencies: _dependencies,
-                    explicit_dependencies: _explicit_dependencies,
-                    blocked_by_updates: _blocked_by_updates,
-                } => insert(&mut instances, id),
-                Effect::Import {
-                    id,
-                    identifier: _identifier,
-                } => insert(&mut instances, id),
-                Effect::Remove { id } => insert(&mut instances, id),
+                Effect::Delete { id, .. } | Effect::Import { id, .. } | Effect::Remove { id } => {
+                    insert(&mut instances, id)
+                }
                 Effect::DeferredCreate { id, template } => {
                     insert(&mut instances, id);
                     insert(&mut instances, &template.template_resource.id);
@@ -1513,15 +1494,9 @@ impl<S> PlanFileContents<S> {
                     insert(&mut instances, from);
                     insert(&mut instances, to);
                 }
-                Effect::Wait {
-                    identity: _identity,
-                    target_id,
-                    until: _until,
-                    until_surface: _until_surface,
-                    timeout: _timeout,
-                    interval: _interval,
-                    explicit_dependencies: _explicit_dependencies,
-                } => insert(&mut instances, target_id.id().as_inner()),
+                Effect::Wait { target_id, .. } => {
+                    insert(&mut instances, target_id.id().as_inner());
+                }
                 Effect::DeferredReplace(payload) => {
                     insert(&mut instances, &payload.id);
                     insert(&mut instances, &payload.template.template_resource.id);
@@ -1589,7 +1564,7 @@ impl PlanFile {
     }
 
     pub fn provider_scopes(&self) -> &PlanProviderScopes {
-        self.evidence.provider_scopes.as_map()
+        &self.evidence.provider_scopes.0
     }
 
     /// Reload state-owned create continuations after the saved-plan apply has

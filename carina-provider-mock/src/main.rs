@@ -550,11 +550,10 @@ impl CarinaProvider for MockProcessProvider {
             return Err("intentional mock initialization failure".to_string());
         }
         match attrs.get("__mock_reference_scope_region__") {
-            Some(Value::String(region)) => Ok(ReferenceScope::Available {
-                partition: "mock".to_string(),
-                region: region.clone(),
-                account: "test-account".to_string(),
-            }),
+            Some(Value::String(region)) => {
+                ReferenceScope::available("mock", region.clone(), "test-account")
+                    .map_err(|error| error.to_string())
+            }
             Some(_) | None => Ok(ReferenceScope::Unavailable),
         }
     }

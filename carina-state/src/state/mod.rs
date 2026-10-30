@@ -516,34 +516,65 @@ pub enum ImportTargetDisposition {
 pub enum NotOutcomeUnknownKind {
     Missing,
     DifferentLifecycle,
+    Ambiguous,
 }
 
 /// Typed rejection from [`StateFile::find_outcome_unknown`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NotOutcomeUnknown {
-    address: StateBlockAddress,
-    kind: NotOutcomeUnknownKind,
+pub enum NotOutcomeUnknown {
+    Missing {
+        address: StateBlockAddress,
+    },
+    DifferentLifecycle {
+        address: StateBlockAddress,
+    },
+    Ambiguous {
+        address: StateBlockAddress,
+        provider_instances: Vec<Option<String>>,
+    },
 }
 
 impl NotOutcomeUnknown {
     pub fn kind(&self) -> NotOutcomeUnknownKind {
-        self.kind
+        match self {
+            Self::Missing { .. } => NotOutcomeUnknownKind::Missing,
+            Self::DifferentLifecycle { .. } => NotOutcomeUnknownKind::DifferentLifecycle,
+            Self::Ambiguous { .. } => NotOutcomeUnknownKind::Ambiguous,
+        }
     }
 }
 
 impl std::fmt::Display for NotOutcomeUnknown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let reason = match self.kind {
-            NotOutcomeUnknownKind::Missing => "no state row exists at this address",
-            NotOutcomeUnknownKind::DifferentLifecycle => {
-                "the state row is not a create whose outcome is unknown"
+        let (address, reason) = match self {
+            Self::Missing { address } => (address, "no state row exists at this address"),
+            Self::DifferentLifecycle { address } => (
+                address,
+                "no state row at this address is a create whose outcome is unknown",
+            ),
+            Self::Ambiguous {
+                address,
+                provider_instances,
+            } => {
+                let routes = provider_instances
+                    .iter()
+                    .map(|instance| instance.as_deref().unwrap_or("default"))
+                    .map(|instance| format!("`{instance}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return write!(
+                    f,
+                    "multiple create-outcome-unknown rows exist at {} {} on provider instances {routes}; refusing to choose one",
+                    address.display_type(),
+                    carina_core::parser::display_string_literal(address.name_str()),
+                );
             }
         };
-        let identity = carina_core::parser::display_string_literal(self.address.name_str());
+        let identity = carina_core::parser::display_string_literal(address.name_str());
         write!(
             f,
             "{reason}; `carina state forget` only accepts create-outcome-unknown rows; use `removed {{ from = {} {identity} }}` for ordinary state removal",
-            self.address.display_type(),
+            address.display_type(),
         )
     }
 }
@@ -1002,58 +1033,87 @@ impl StateFile {
         }
     }
 
+    /// Classify an import target using its complete provider route.
+    pub fn import_target_disposition_for_id(&self, id: &ResourceId) -> ImportTargetDisposition {
+        let Some(row) = self.find_resource_for_id(id) else {
+            return ImportTargetDisposition::Vacant;
+        };
+        match row.current() {
+            CurrentInstance::CreateOutcomeUnknown { .. } => {
+                ImportTargetDisposition::ReplaceCreateOutcomeUnknown
+            }
+            CurrentInstance::None
+            | CurrentInstance::Applied { .. }
+            | CurrentInstance::CreateInFlight { .. }
+            | CurrentInstance::MissingIdentifier { .. } => ImportTargetDisposition::Occupied,
+        }
+    }
+
     /// Borrow the state file through a proof that `address` currently names
     /// an outcome-unknown create. No other lifecycle can mint this handle.
     pub fn find_outcome_unknown(
         &mut self,
         address: &StateBlockAddress,
     ) -> Result<OutcomeUnknownRow<'_>, NotOutcomeUnknown> {
-        let Some(index) = self.resources.iter().position(|row| {
-            let resource_id = Self::id_for_resource_state(row);
-            address.matches_resource_id(&resource_id)
-        }) else {
-            return Err(NotOutcomeUnknown {
+        let matching_indices = self
+            .resources
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let resource_id = Self::id_for_resource_state(row);
+                address.matches_resource_id(&resource_id).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if matching_indices.is_empty() {
+            return Err(NotOutcomeUnknown::Missing {
                 address: address.clone(),
-                kind: NotOutcomeUnknownKind::Missing,
-            });
-        };
-        let rejection = match self.resources[index].current() {
-            CurrentInstance::CreateOutcomeUnknown { .. } => None,
-            CurrentInstance::None
-            | CurrentInstance::Applied { .. }
-            | CurrentInstance::CreateInFlight { .. }
-            | CurrentInstance::MissingIdentifier { .. } => {
-                Some(NotOutcomeUnknownKind::DifferentLifecycle)
-            }
-        };
-        if let Some(kind) = rejection {
-            return Err(NotOutcomeUnknown {
-                address: address.clone(),
-                kind,
             });
         }
-        Ok(OutcomeUnknownRow { state: self, index })
+        let unknown_indices = matching_indices
+            .iter()
+            .copied()
+            .filter(|index| {
+                matches!(
+                    self.resources[*index].current(),
+                    CurrentInstance::CreateOutcomeUnknown { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        match unknown_indices.as_slice() {
+            [index] => Ok(OutcomeUnknownRow {
+                state: self,
+                index: *index,
+            }),
+            [] => Err(NotOutcomeUnknown::DifferentLifecycle {
+                address: address.clone(),
+            }),
+            [_, _, ..] => Err(NotOutcomeUnknown::Ambiguous {
+                address: address.clone(),
+                provider_instances: unknown_indices
+                    .into_iter()
+                    .map(|index| self.resources[index].directives.provider_instance.clone())
+                    .collect(),
+            }),
+        }
     }
 
     /// Consume the only typed authorization for forgetting an unknown create.
     /// Deposed generations remain tracked through `remove_resource`.
     pub fn forget(row: OutcomeUnknownRow<'_>) -> ResourceState {
         let OutcomeUnknownRow { state, index } = row;
-        let current = &state.resources[index];
-        let provider = current.provider.clone();
-        let resource_type = current.resource_type.clone();
-        let identity = current.identity.clone();
-        state
-            .remove_resource(&provider, &resource_type, identity.as_str())
-            .expect("an exclusively borrowed outcome-unknown row remains present")
+        state.resources.remove(index)
     }
 
     /// Find the persisted row addressed by a full resource ID, including its
     /// provider-instance routing dimension.
     pub fn find_resource_for_id(&self, id: &ResourceId) -> Option<&ResourceState> {
         let identity = id.identity_str()?;
-        self.find_resource(&id.provider, &id.resource_type, identity)
-            .filter(|row| row.directives.provider_instance == id.provider_instance)
+        self.resources.iter().find(|row| {
+            row.provider == id.provider
+                && row.resource_type == id.resource_type
+                && row.identity.as_str() == identity
+                && row.directives.provider_instance == id.provider_instance
+        })
     }
 
     /// Find all resources matching a provider and resource type

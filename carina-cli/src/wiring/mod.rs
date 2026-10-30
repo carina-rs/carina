@@ -5602,6 +5602,11 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         context.schemas(),
         override_aware_resources.resources(),
     );
+    let outcome_unknown_import_replacements = outcome_unknown_import_replacements(
+        &parsed.state_blocks,
+        state_file,
+        override_aware_resources.resources(),
+    );
     let mut plan = create_plan_with_cascades(
         &resolved_resources,
         &resolved_unresolved_resources,
@@ -5613,6 +5618,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         &addressed.saved_attrs,
         &addressed.prev_explicit,
         &wait_bindings,
+        &outcome_unknown_import_replacements,
     )?;
     add_deposed_delete_effects(&mut plan, state_file, &addressed.moved_pairs);
     block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
@@ -7153,17 +7159,17 @@ pub fn resolve_state_blocks(
                 }
             }
             StateBlock::Import { to: import_to, .. } => {
-                let Some(resolved_to) = resolve_import_target_in_desired(import_to, desired) else {
+                let Some(resource) = import_to.find_resource(desired) else {
                     continue;
                 };
                 let disposition = state_file
                     .as_ref()
-                    .map(|state| state.import_target_disposition(&resolved_to))
+                    .map(|state| state.import_target_disposition_for_id(&resource.id))
                     .unwrap_or(carina_state::ImportTargetDisposition::Vacant);
                 match disposition {
                     carina_state::ImportTargetDisposition::Vacant
                     | carina_state::ImportTargetDisposition::ReplaceCreateOutcomeUnknown => {
-                        to.insert(resolved_to);
+                        to.insert(import_to.clone());
                     }
                     carina_state::ImportTargetDisposition::Occupied => {}
                 }
@@ -7287,18 +7293,28 @@ fn find_desired_id<'a>(
         .and_then(ResolvedResourceId::try_new)
 }
 
-fn resolve_import_target_in_desired(
-    to: &StateBlockAddress,
-    desired: &[Resource],
-) -> Option<StateBlockAddress> {
-    to.find_resource(desired).and_then(|resource| {
-        let identity = resource.id.identity()?.clone();
-        Some(StateBlockAddress::new(
-            resource.id.provider.clone(),
-            resource.id.resource_type.clone(),
-            identity,
-        ))
-    })
+fn outcome_unknown_import_replacements(
+    state_blocks: &[StateBlock],
+    state_file: &Option<StateFile>,
+    desired_resources: &[Resource],
+) -> HashSet<ResourceId> {
+    let Some(state_file) = state_file else {
+        return HashSet::new();
+    };
+    state_blocks
+        .iter()
+        .filter_map(|block| {
+            let StateBlock::Import { to, .. } = block else {
+                return None;
+            };
+            let resource = to.find_resource(desired_resources)?;
+            matches!(
+                state_file.import_target_disposition_for_id(&resource.id),
+                carina_state::ImportTargetDisposition::ReplaceCreateOutcomeUnknown
+            )
+            .then(|| resource.id.clone())
+        })
+        .collect()
 }
 
 /// Add state block effects (import/removed/moved) to the plan.
@@ -7341,8 +7357,6 @@ pub fn add_state_block_effects(
         std::collections::HashSet::new();
     let mut suppress_identifier_errors: std::collections::HashSet<StateBlockAddress> =
         std::collections::HashSet::new();
-    let mut suppress_outcome_unknown_errors: std::collections::HashSet<StateBlockAddress> =
-        std::collections::HashSet::new();
     let desired_ids: std::collections::HashSet<ResourceId> = desired_resources
         .iter()
         .map(|resource| resource.id.clone())
@@ -7357,14 +7371,11 @@ pub fn add_state_block_effects(
 
                 let disposition = state_file
                     .as_ref()
-                    .map(|state| state.import_target_disposition(to))
+                    .map(|state| state.import_target_disposition_for_id(effective_to.as_inner()))
                     .unwrap_or(carina_state::ImportTargetDisposition::Vacant);
                 let apply_import = match disposition {
                     carina_state::ImportTargetDisposition::Vacant => true,
-                    carina_state::ImportTargetDisposition::ReplaceCreateOutcomeUnknown => {
-                        suppress_outcome_unknown_errors.insert(to.clone());
-                        true
-                    }
+                    carina_state::ImportTargetDisposition::ReplaceCreateOutcomeUnknown => true,
                     carina_state::ImportTargetDisposition::Occupied => false,
                 };
                 if apply_import {
@@ -7499,35 +7510,6 @@ pub fn add_state_block_effects(
                 error.resource_id.resource_type.clone(),
                 identity.clone(),
             ))
-        });
-    }
-
-    if !suppress_outcome_unknown_errors.is_empty() {
-        plan.retain_errors(|error| match &error.kind {
-            carina_core::plan::PlanErrorKind::CreateOutcomeUnknown { resource } => {
-                let Some(identity) = resource.identity() else {
-                    return true;
-                };
-                !suppress_outcome_unknown_errors.contains(&StateBlockAddress::new(
-                    resource.provider.clone(),
-                    resource.resource_type.clone(),
-                    identity.clone(),
-                ))
-            }
-            carina_core::plan::PlanErrorKind::PreventDestroy { .. }
-            | carina_core::plan::PlanErrorKind::SchemaNotRegistered(_)
-            | carina_core::plan::PlanErrorKind::ReplacementCannotCoexist(_)
-            | carina_core::plan::PlanErrorKind::MissingProviderIdentifier
-            | carina_core::plan::PlanErrorKind::CreateInFlightOrphan
-            | carina_core::plan::PlanErrorKind::DestroyCreateInFlight
-            | carina_core::plan::PlanErrorKind::ResumeCreateRoutingMismatch { .. }
-            | carina_core::plan::PlanErrorKind::InvalidImportProviderIdentifier
-            | carina_core::plan::PlanErrorKind::MissingDeposedProviderIdentifier { .. }
-            | carina_core::plan::PlanErrorKind::WaitTargetMissing { .. }
-            | carina_core::plan::PlanErrorKind::WaitTargetIsDataSource { .. }
-            | carina_core::plan::PlanErrorKind::WaitPredicateInvalid { .. }
-            | carina_core::plan::PlanErrorKind::ResolvedValueConstraint { .. }
-            | carina_core::plan::PlanErrorKind::ModuleConstraint(_) => true,
         });
     }
 

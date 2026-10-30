@@ -17,7 +17,8 @@ use tokio::sync::Notify;
 
 use carina_provider_protocol::types as protocol_types;
 pub use carina_provider_protocol::types::{
-    AppliedIdentifier, EmptyAppliedIdentifier, PendingToken, ReferenceScope, Sent,
+    AppliedIdentifier, EmptyAppliedIdentifier, PendingToken, ReferenceScope, ReferenceScopeError,
+    ReferenceScopeField, ReferenceScopeValues, Sent,
 };
 use carina_provider_protocol::types::{
     ProviderError as WireProviderError, ProviderErrorKind as WireProviderErrorKind,
@@ -2766,14 +2767,9 @@ impl CallEgressRecorder {
         }
     }
 
-    fn cancellation_egress(&self) -> CancelledCallEgress {
-        if self.state.pending.load(Ordering::Acquire) > 0 {
-            CancelledCallEgress::PendingDispatch
-        } else if self.state.dispatched.load(Ordering::Acquire) {
-            CancelledCallEgress::Sent(EgressSent(()))
-        } else {
-            CancelledCallEgress::None(NoEgress(()))
-        }
+    fn may_have_dispatched(&self) -> bool {
+        self.state.pending.load(Ordering::Acquire) > 0
+            || self.state.dispatched.load(Ordering::Acquire)
     }
 }
 
@@ -2853,14 +2849,6 @@ struct CreateCallCancellationReporter {
     sender: mpsc::Sender<CancelledCreateReport>,
 }
 
-/// Egress knowledge available when a started guest create is dropped.
-#[derive(Debug)]
-enum CancelledCallEgress {
-    None(NoEgress),
-    Sent(EgressSent),
-    PendingDispatch,
-}
-
 /// The only two states a dropped started guest create can report.
 #[derive(Debug)]
 pub(crate) enum CancelledCreateReport {
@@ -2877,14 +2865,7 @@ pub(crate) struct CreateCallCancellationReceiver {
 
 impl CreateCallCancellationReceiver {
     pub(crate) fn drain(&self) -> Vec<CancelledCreateReport> {
-        let mut reports = Vec::new();
-        loop {
-            match self.receiver.try_recv() {
-                Ok(report) => reports.push(report),
-                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
-        reports
+        self.receiver.try_iter().collect()
     }
 }
 
@@ -2892,38 +2873,47 @@ impl CreateCallCancellationReceiver {
 /// reported as cancelled.
 #[derive(Debug)]
 pub struct StartedGuestCreateCall {
-    attempt: Option<CreateAttempt>,
+    inner: Option<GuestCreateCallInner>,
+}
+
+#[derive(Debug)]
+struct GuestCreateCallInner {
+    attempt: CreateAttempt,
     recorder: CallEgressRecorder,
     cancellation: Option<CreateCallCancellationReporter>,
 }
 
 impl StartedGuestCreateCall {
     pub fn egress_recorder(&self) -> CallEgressRecorder {
-        self.recorder.clone()
+        self.inner
+            .as_ref()
+            .expect("a started guest create call owns its inner state")
+            .recorder
+            .clone()
     }
 
     pub fn finish(mut self) -> FinishedGuestCreateCall {
-        let attempt = self
-            .attempt
+        let inner = self
+            .inner
             .take()
-            .expect("a started guest create call owns its attempt");
-        FinishedGuestCreateCall {
-            attempt: Some(attempt),
-            recorder: Some(self.recorder.clone()),
-            cancellation: self.cancellation.take(),
-        }
+            .expect("a started guest create call owns its inner state");
+        FinishedGuestCreateCall { inner: Some(inner) }
     }
 }
 
 impl Drop for StartedGuestCreateCall {
     fn drop(&mut self) {
-        let Some(attempt) = self.attempt.take() else {
+        let Some(inner) = self.inner.take() else {
             return;
         };
-        let Some(reporter) = self.cancellation.take() else {
+        let Some(reporter) = inner.cancellation else {
             return;
         };
-        report_cancelled_guest_create(attempt, self.recorder.cancellation_egress(), reporter);
+        report_cancelled_guest_create(
+            inner.attempt,
+            inner.recorder.may_have_dispatched(),
+            reporter,
+        );
     }
 }
 
@@ -2931,24 +2921,33 @@ impl Drop for StartedGuestCreateCall {
 /// decoded.
 #[derive(Debug)]
 pub struct FinishedGuestCreateCall {
-    attempt: Option<CreateAttempt>,
-    recorder: Option<CallEgressRecorder>,
-    cancellation: Option<CreateCallCancellationReporter>,
+    inner: Option<GuestCreateCallInner>,
 }
 
 impl FinishedGuestCreateCall {
     pub async fn failed(mut self, error: ProviderError) -> GuestCallFailure {
         let egress = self
-            .recorder
+            .inner
             .as_ref()
-            .expect("a finished guest create call owns its egress recorder")
+            .expect("a finished guest create call owns its inner state")
+            .recorder
             .settled_snapshot()
             .await;
+        let GuestCreateCallInner {
+            attempt,
+            recorder: _recorder,
+            cancellation,
+        } = self
+            .inner
+            .take()
+            .expect("a finished guest create call owns its inner state");
         GuestCallFailure {
-            attempt: self.attempt.take(),
-            egress: Some(egress),
-            error: Some(error),
-            cancellation: self.cancellation.take(),
+            inner: Some(GuestCallFailureInner {
+                attempt,
+                egress,
+                error,
+                cancellation,
+            }),
         }
     }
 
@@ -2962,17 +2961,14 @@ impl FinishedGuestCreateCall {
     ) -> Result<DecodedGuestCreateCall<U>, CreateFailure> {
         match decode(value) {
             Ok(value) => {
-                let attempt = self
-                    .attempt
+                let inner = self
+                    .inner
                     .take()
-                    .expect("a finished guest create call owns its attempt");
-                let recorder = self
-                    .recorder
-                    .take()
-                    .expect("a finished guest create call owns its egress recorder");
-                drop(recorder);
-                drop(self.cancellation.take());
-                Ok(DecodedGuestCreateCall { attempt, value })
+                    .expect("a finished guest create call owns its inner state");
+                Ok(DecodedGuestCreateCall {
+                    attempt: inner.attempt,
+                    value,
+                })
             }
             Err(error) => Err(self.failed(error).await.classify()),
         }
@@ -2981,16 +2977,17 @@ impl FinishedGuestCreateCall {
 
 impl Drop for FinishedGuestCreateCall {
     fn drop(&mut self) {
-        let Some(attempt) = self.attempt.take() else {
+        let Some(inner) = self.inner.take() else {
             return;
         };
-        let Some(recorder) = self.recorder.take() else {
+        let Some(reporter) = inner.cancellation else {
             return;
         };
-        let Some(reporter) = self.cancellation.take() else {
-            return;
-        };
-        report_cancelled_guest_create(attempt, recorder.cancellation_egress(), reporter);
+        report_cancelled_guest_create(
+            inner.attempt,
+            inner.recorder.may_have_dispatched(),
+            reporter,
+        );
     }
 }
 
@@ -3012,27 +3009,28 @@ impl<T> DecodedGuestCreateCall<T> {
 /// consumed through [`GuestCallFailure::classify`].
 #[derive(Debug)]
 pub struct GuestCallFailure {
-    attempt: Option<CreateAttempt>,
-    egress: Option<CallEgress>,
-    error: Option<ProviderError>,
+    inner: Option<GuestCallFailureInner>,
+}
+
+#[derive(Debug)]
+struct GuestCallFailureInner {
+    attempt: CreateAttempt,
+    egress: CallEgress,
+    error: ProviderError,
     cancellation: Option<CreateCallCancellationReporter>,
 }
 
 impl GuestCallFailure {
     pub fn classify(mut self) -> CreateFailure {
-        let attempt = self
-            .attempt
+        let GuestCallFailureInner {
+            attempt,
+            egress,
+            error,
+            cancellation: _cancellation,
+        } = self
+            .inner
             .take()
-            .expect("a guest call failure owns its attempt");
-        let egress = self
-            .egress
-            .take()
-            .expect("a guest call failure owns its egress record");
-        let error = self
-            .error
-            .take()
-            .expect("a guest call failure owns its provider error");
-        drop(self.cancellation.take());
+            .expect("a guest call failure owns its inner state");
         match egress {
             CallEgress::None(_no_egress) => attempt.untracked(error),
             CallEgress::Sent(sent) => attempt.outcome_unknown(sent, error),
@@ -3042,17 +3040,16 @@ impl GuestCallFailure {
 
 fn report_cancelled_guest_create(
     attempt: CreateAttempt,
-    egress: CancelledCallEgress,
+    may_have_dispatched: bool,
     reporter: CreateCallCancellationReporter,
 ) {
-    let report = match egress {
-        CancelledCallEgress::None(_no_egress) => CancelledCreateReport::Untracked,
-        CancelledCallEgress::Sent(_sent) => CancelledCreateReport::OutcomeUnknown(
-            UnknownCreateOutcome::new(attempt.id, attempt.started_at),
-        ),
-        CancelledCallEgress::PendingDispatch => CancelledCreateReport::OutcomeUnknown(
-            UnknownCreateOutcome::new(attempt.id, attempt.started_at),
-        ),
+    let report = if may_have_dispatched {
+        CancelledCreateReport::OutcomeUnknown(UnknownCreateOutcome::new(
+            attempt.id,
+            attempt.started_at,
+        ))
+    } else {
+        CancelledCreateReport::Untracked
     };
     let _send_result = reporter.sender.send(report);
 }
@@ -3455,9 +3452,11 @@ impl CreateAttempt {
     pub fn start_guest_call(mut self) -> StartedGuestCreateCall {
         let cancellation = self.cancellation.take();
         StartedGuestCreateCall {
-            attempt: Some(self),
-            recorder: CallEgressRecorder::new(),
-            cancellation,
+            inner: Some(GuestCreateCallInner {
+                attempt: self,
+                recorder: CallEgressRecorder::new(),
+                cancellation,
+            }),
         }
     }
 
@@ -4858,14 +4857,9 @@ impl InitializeOutcomeMint {
         partition: impl Into<String>,
         region: impl Into<String>,
         account: impl Into<String>,
-    ) -> InitializeOutcome {
-        InitializeOutcome {
-            reference_scope: ReferenceScope::Available {
-                partition: partition.into(),
-                region: region.into(),
-                account: account.into(),
-            },
-        }
+    ) -> Result<InitializeOutcome, ReferenceScopeError> {
+        ReferenceScope::available(partition, region, account)
+            .map(|reference_scope| InitializeOutcome { reference_scope })
     }
 }
 
@@ -4923,14 +4917,6 @@ impl InitializedProvider {
 
     pub fn provider(&self) -> &(dyn Provider + 'static) {
         self.provider.as_ref()
-    }
-}
-
-impl std::ops::Deref for InitializedProvider {
-    type Target = dyn Provider + 'static;
-
-    fn deref(&self) -> &Self::Target {
-        self.provider()
     }
 }
 
@@ -5023,20 +5009,234 @@ pub struct ProviderRouter {
     normalizers: NormalizerRouter,
 }
 
-/// Internal provider surface for code that both dispatches operations and
-/// performs schema-aware comparisons.
-///
-/// Production implementations are initialized routers. Tests may use the
-/// scoped adapter below so focused provider fixtures do not need to reproduce
-/// the full initialization pipeline.
-pub(crate) trait ContextualProvider: Send + Sync {
-    fn provider(&self) -> &dyn Provider;
+/// Why an initialized provider comparison could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComparisonResolutionError {
+    MissingResourceSchema { id: ResourceId },
+    UnknownProviderInstance { instance: ProviderInstanceKey },
+    SchemaOwnerMismatch { id: ResourceId, owner: String },
+}
 
-    fn comparison_context_for<'a>(
-        &'a self,
-        id: &ResourceId,
-        schema: crate::schema::OwnerBoundResourceSchema<'a>,
-    ) -> ProviderResult<crate::differ::ComparisonContext<'a>>;
+impl std::fmt::Display for ComparisonResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingResourceSchema { id } => {
+                write!(formatter, "missing managed resource schema for `{id}`")
+            }
+            Self::UnknownProviderInstance { instance } => match instance.provider_instance() {
+                Some(binding) => write!(
+                    formatter,
+                    "unknown provider instance `{binding}` for kind `{}`",
+                    instance.provider(),
+                ),
+                None => write!(
+                    formatter,
+                    "unknown default provider instance for kind `{}`",
+                    instance.provider(),
+                ),
+            },
+            Self::SchemaOwnerMismatch { id, owner } => write!(
+                formatter,
+                "resource `{id}` routes to provider `{}` but its schema is owned by `{owner}`",
+                id.provider,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ComparisonResolutionError {}
+
+impl From<ComparisonResolutionError> for ProviderError {
+    fn from(error: ComparisonResolutionError) -> Self {
+        ProviderError::internal_caused_by("Failed to resolve resource comparison", error)
+    }
+}
+
+/// One owner schema paired with the initialized provider context that may
+/// compare values under that schema.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedComparison<'a> {
+    owner_schema: crate::schema::OwnerBoundResourceSchema<'a>,
+    context: crate::differ::ComparisonContext<'a>,
+}
+
+impl<'a> ResolvedComparison<'a> {
+    pub fn owner_schema(self) -> crate::schema::OwnerBoundResourceSchema<'a> {
+        self.owner_schema
+    }
+
+    pub fn context(&self) -> &crate::differ::ComparisonContext<'a> {
+        &self.context
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ResolvedComparisonKey {
+    instance: ProviderInstanceKey,
+    resource_type: String,
+}
+
+impl From<&ResourceId> for ResolvedComparisonKey {
+    fn from(id: &ResourceId) -> Self {
+        Self {
+            instance: ProviderInstanceKey::from(id),
+            resource_type: id.resource_type.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedComparisonData {
+    owner: String,
+    schema: ValidatedResourceSchema,
+    reference_forms: crate::schema::ReferenceForms,
+    scope: ReferenceScope,
+}
+
+/// Apply-start witness containing every comparison state writeback may need.
+///
+/// Its constructor resolves provider routing and schema ownership before any
+/// provider mutation begins. Writeback can therefore borrow comparisons from
+/// this table without performing another fallible route or schema lookup.
+#[derive(Debug, Clone)]
+pub struct ResolvedComparisonTable {
+    entries: HashMap<ResolvedComparisonKey, ResolvedComparisonData>,
+}
+
+impl ResolvedComparisonTable {
+    pub fn comparison_for(&self, id: &ResourceId) -> ResolvedComparison<'_> {
+        let key = ResolvedComparisonKey::from(id);
+        let data = self
+            .entries
+            .get(&key)
+            .unwrap_or_else(|| panic!("comparison for `{id}` was not resolved at apply start"));
+        let owner_schema = crate::schema::OwnerBoundResourceSchema::new(
+            &data.owner,
+            &data.schema,
+            &data.reference_forms,
+        );
+        ResolvedComparison {
+            owner_schema,
+            context: crate::differ::ComparisonContext::from_scope_and_forms(
+                &data.scope,
+                &data.reference_forms,
+            ),
+        }
+    }
+}
+
+/// Build the complete schema/router pair used by comparison-focused tests.
+///
+/// Every requested resource type receives an empty schema when the fixture did
+/// not declare one, and every provider route receives an unavailable-scope
+/// initialized provider. Tests therefore exercise the production comparison
+/// resolver without duplicating schema admission or route setup.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn comparison_fixture_for_test<'a>(
+    registry: &SchemaRegistry,
+    ids: impl IntoIterator<Item = &'a ResourceId>,
+) -> (SchemaRegistry, ProviderRouter) {
+    let ids = ids.into_iter().cloned().collect::<Vec<_>>();
+    let mut registry = registry.clone();
+    let missing_schemas = ids
+        .iter()
+        .filter(|id| {
+            registry
+                .get(
+                    &id.provider,
+                    &id.resource_type,
+                    crate::schema::SchemaKind::Resource,
+                )
+                .is_none()
+        })
+        .map(|id| (id.provider.clone(), id.resource_type.clone()))
+        .collect::<BTreeSet<_>>();
+    for (owner, resource_type) in missing_schemas {
+        registry.insert(
+            owner,
+            crate::schema::ResourceSchema::new(resource_type)
+                .validate()
+                .expect("empty comparison fixture schema must validate"),
+        );
+    }
+
+    let routes = ids
+        .iter()
+        .map(ProviderInstanceKey::from)
+        .collect::<BTreeSet<_>>();
+    let mut router = ProviderRouter::new();
+    for route in routes {
+        router.add_provider_instance(
+            route,
+            InitializedProvider::unavailable(Box::new(ComparisonFixtureProvider)),
+        );
+    }
+    (registry, router)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+struct ComparisonFixtureProvider;
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Provider for ComparisonFixtureProvider {
+    fn name(&self) -> &str {
+        "comparison-fixture"
+    }
+
+    fn read(
+        &self,
+        _id: &ResourceId,
+        _identifier: &AppliedIdentifier,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
+        Box::pin(async { panic!("comparison fixture must not dispatch read") })
+    }
+
+    fn read_data_source(
+        &self,
+        _resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { panic!("comparison fixture must not dispatch data-source read") })
+    }
+
+    fn create(
+        &self,
+        _id: &ResourceId,
+        _request: CreateRequest,
+        _attempt: CreateAttempt,
+    ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+        Box::pin(async { panic!("comparison fixture must not dispatch create") })
+    }
+
+    fn resume_create(
+        &self,
+        _request: ResumeCreateRequest,
+    ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
+        Box::pin(async { panic!("comparison fixture must not dispatch resume-create") })
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &AppliedIdentifier,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+        Box::pin(async { panic!("comparison fixture must not dispatch update") })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &AppliedIdentifier,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { panic!("comparison fixture must not dispatch delete") })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> ProviderResult<Vec<String>> {
+        panic!("comparison fixture must not dispatch permission lookup")
+    }
 }
 
 impl Default for ProviderRouter {
@@ -5126,70 +5326,79 @@ impl ProviderRouter {
         id: &ResourceId,
         schema: crate::schema::OwnerBoundResourceSchema<'a>,
     ) -> ProviderResult<crate::differ::ComparisonContext<'a>> {
+        self.resolve_comparison(id, schema)
+            .map(|resolved| resolved.context)
+            .map_err(ProviderError::from)
+    }
+
+    /// Resolve the owner schema and initialized provider comparison context in
+    /// one typed step.
+    pub fn comparison_for<'a>(
+        &'a self,
+        registry: &'a SchemaRegistry,
+        id: &ResourceId,
+    ) -> Result<ResolvedComparison<'a>, ComparisonResolutionError> {
+        let schema = registry
+            .get(
+                &id.provider,
+                &id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .ok_or_else(|| ComparisonResolutionError::MissingResourceSchema { id: id.clone() })?;
+        self.resolve_comparison(id, schema)
+    }
+
+    /// Resolve every resource comparison required by one apply before the
+    /// executor can mutate provider state.
+    pub fn resolve_comparisons<'i>(
+        &self,
+        registry: &SchemaRegistry,
+        ids: impl IntoIterator<Item = &'i ResourceId>,
+    ) -> Result<ResolvedComparisonTable, ComparisonResolutionError> {
+        let mut entries = HashMap::new();
+        for id in ids {
+            let resolved = self.comparison_for(registry, id)?;
+            let owner_schema = resolved.owner_schema();
+            let key = ResolvedComparisonKey::from(id);
+            let provider = self.providers.get(&key.instance).ok_or_else(|| {
+                ComparisonResolutionError::UnknownProviderInstance {
+                    instance: key.instance.clone(),
+                }
+            })?;
+            entries.insert(
+                key,
+                ResolvedComparisonData {
+                    owner: owner_schema.owner().to_string(),
+                    schema: owner_schema.schema().clone(),
+                    reference_forms: owner_schema.reference_forms().clone(),
+                    scope: provider.reference_scope().clone(),
+                },
+            );
+        }
+        Ok(ResolvedComparisonTable { entries })
+    }
+
+    fn resolve_comparison<'a>(
+        &'a self,
+        id: &ResourceId,
+        schema: crate::schema::OwnerBoundResourceSchema<'a>,
+    ) -> Result<ResolvedComparison<'a>, ComparisonResolutionError> {
         let key = ProviderInstanceKey::from(id);
         if key.provider() != schema.owner() {
-            return Err(ProviderError::internal(format!(
-                "resource `{id}` routes to provider `{}` but its schema is owned by `{}`",
-                key.provider(),
-                schema.owner(),
-            )));
+            return Err(ComparisonResolutionError::SchemaOwnerMismatch {
+                id: id.clone(),
+                owner: schema.owner().to_string(),
+            });
         }
-        let provider = self.get_initialized_provider_or_error(id)?;
-        Ok(crate::differ::ComparisonContext::from_initialized_provider(
-            provider, schema,
-        ))
-    }
-}
-
-impl ContextualProvider for ProviderRouter {
-    fn provider(&self) -> &dyn Provider {
-        self
-    }
-
-    fn comparison_context_for<'a>(
-        &'a self,
-        id: &ResourceId,
-        schema: crate::schema::OwnerBoundResourceSchema<'a>,
-    ) -> ProviderResult<crate::differ::ComparisonContext<'a>> {
-        ProviderRouter::comparison_context_for(self, id, schema)
-    }
-}
-
-#[cfg(any(test, feature = "test-utils"))]
-pub(crate) struct TestContextualProvider<'a> {
-    provider: &'a dyn Provider,
-}
-
-#[cfg(any(test, feature = "test-utils"))]
-impl<'a> TestContextualProvider<'a> {
-    pub(crate) fn new(provider: &'a dyn Provider) -> Self {
-        Self { provider }
-    }
-}
-
-#[cfg(any(test, feature = "test-utils"))]
-impl ContextualProvider for TestContextualProvider<'_> {
-    fn provider(&self) -> &dyn Provider {
-        self.provider
-    }
-
-    fn comparison_context_for<'a>(
-        &'a self,
-        id: &ResourceId,
-        schema: crate::schema::OwnerBoundResourceSchema<'a>,
-    ) -> ProviderResult<crate::differ::ComparisonContext<'a>> {
-        if id.provider != schema.owner() {
-            return Err(ProviderError::internal(format!(
-                "resource `{id}` routes to provider `{}` but its schema is owned by `{}`",
-                id.provider,
-                schema.owner(),
-            )));
-        }
-        static SCOPE: ReferenceScope = ReferenceScope::Unavailable;
-        Ok(crate::differ::ComparisonContext::for_test(
-            &SCOPE,
-            schema.reference_forms(),
-        ))
+        let provider = self.providers.get(&key).ok_or_else(|| {
+            ComparisonResolutionError::UnknownProviderInstance {
+                instance: key.clone(),
+            }
+        })?;
+        Ok(ResolvedComparison {
+            owner_schema: schema,
+            context: crate::differ::ComparisonContext::from_initialized_provider(provider, schema),
+        })
     }
 }
 
@@ -9934,11 +10143,7 @@ mod tests {
     }
 
     fn reference_scope(region: &str) -> ReferenceScope {
-        ReferenceScope::Available {
-            partition: "aws".to_string(),
-            region: region.to_string(),
-            account: "123456789012".to_string(),
-        }
+        ReferenceScope::available("aws", region, "123456789012").expect("fixture scope is valid")
     }
 
     fn string_value(value: &str) -> Value {
@@ -10020,6 +10225,25 @@ mod tests {
                 .to_string()
                 .contains("routes to provider `other` but its schema is owned by `mock`")
         );
+    }
+
+    #[test]
+    fn comparison_resolution_reports_missing_schema_as_typed_error() {
+        let mut router = ProviderRouter::new();
+        router.add_provider(
+            "mock".to_string(),
+            InitializedProvider::for_test(Box::new(MockProvider), ReferenceScope::Unavailable),
+        );
+        let registry = crate::schema::SchemaRegistry::new();
+        let id = ResourceId::with_provider_identity("mock", "lambda.Permission", "invoke", None);
+
+        let error = router
+            .comparison_for(&registry, &id)
+            .expect_err("a comparison requires the owner's managed schema");
+        assert!(matches!(
+            error,
+            ComparisonResolutionError::MissingResourceSchema { id: actual } if actual == id
+        ));
     }
 
     #[tokio::test]

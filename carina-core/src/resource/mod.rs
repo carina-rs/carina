@@ -5420,7 +5420,7 @@ where
             Value::Concrete(ConcreteValue::Map(map)) => {
                 for (key, value) in map {
                     let field_type = map_entry_subtype(attr_type, key, defs);
-                    for value_hash in pairing_hashes(value, field_type, defs) {
+                    for value_hash in pairing_hashes(value, field_type, defs, context) {
                         map_field_buckets
                             .entry(key)
                             .or_default()
@@ -5431,7 +5431,7 @@ where
                 }
             }
             value => {
-                for value_hash in pairing_hashes(value, attr_type, defs) {
+                for value_hash in pairing_hashes(value, attr_type, defs, context) {
                     value_buckets
                         .entry(value_hash)
                         .or_default()
@@ -5509,7 +5509,7 @@ where
             Value::Concrete(ConcreteValue::Map(map)) => {
                 for (key, value) in map {
                     let field_type = map_entry_subtype(attr_type, key, defs);
-                    let value_hashes = pairing_hashes(value, field_type, defs);
+                    let value_hashes = pairing_hashes(value, field_type, defs, context);
                     let field_is_universal =
                         universal_map_fields
                             .get(key.as_str())
@@ -5542,7 +5542,7 @@ where
                 }
             }
             value => {
-                let value_hashes = pairing_hashes(value, attr_type, defs);
+                let value_hashes = pairing_hashes(value, attr_type, defs, context);
                 let value_is_universal = value_hashes.iter().any(|value_hash| {
                     universal_values
                         .get(value_hash)
@@ -5590,6 +5590,7 @@ fn pairing_hashes(
     value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> Vec<u64> {
     let mut hashes = vec![value.canonical_hash()];
     match value {
@@ -5601,7 +5602,7 @@ fn pairing_hashes(
             // hashes cover plaintext (including schema normalizations); the
             // fixed tag deliberately admits every state-secret spelling for
             // exact verification by `similarity_score`.
-            hashes.extend(pairing_hashes(inner, attr_type, defs));
+            hashes.extend(pairing_hashes(inner, attr_type, defs, context));
             hashes.push(secret_state_pairing_hash());
         }
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
@@ -5610,7 +5611,7 @@ fn pairing_hashes(
         _ => {}
     }
     if let Some(attr_type) = attr_type {
-        append_schema_pairing_hashes(value, attr_type, defs, &mut hashes, 0);
+        append_schema_pairing_hashes(value, attr_type, defs, context, &mut hashes, 0);
     }
     hashes.sort_unstable();
     hashes.dedup();
@@ -5625,6 +5626,7 @@ fn append_schema_pairing_hashes(
     value: &Value,
     attr_type: &AttributeType,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
     hashes: &mut Vec<u64>,
     depth: usize,
 ) {
@@ -5634,17 +5636,16 @@ fn append_schema_pairing_hashes(
     }
     match attr_type.shape_with_defs(defs) {
         Shape::String {
-            to_dsl: Some(transform),
-            ..
+            identity, to_dsl, ..
         } => {
             if let Value::Concrete(ConcreteValue::String(text)) = value {
                 hashes.push(pairing_component_hash(
                     0x01,
-                    &transform.apply(text.expose_plaintext()),
+                    &context.canonical_string(text.expose_plaintext(), identity, to_dsl),
                 ));
             }
         }
-        Shape::String { to_dsl: None, .. } | Shape::Bool | Shape::Duration => {}
+        Shape::Bool | Shape::Duration => {}
         Shape::Int { .. } | Shape::Float { .. } => {
             if let Some(hash) = numeric_pairing_hash(value) {
                 hashes.push(hash);
@@ -5701,7 +5702,14 @@ fn append_schema_pairing_hashes(
             let members = crate::schema::union_members_with_defs(attr_type, defs)
                 .expect("Shape::Union must expose union members internally");
             for member in members.iter().flatten() {
-                append_schema_pairing_hashes(value, member.as_attr(), defs, hashes, depth + 1);
+                append_schema_pairing_hashes(
+                    value,
+                    member.as_attr(),
+                    defs,
+                    context,
+                    hashes,
+                    depth + 1,
+                );
             }
         }
     }

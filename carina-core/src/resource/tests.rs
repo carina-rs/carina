@@ -2013,6 +2013,57 @@ fn union_typed_string_or_list_pairing_uses_the_list_element_schema() {
 }
 
 #[test]
+fn reference_form_pairing_is_identical_on_both_sides_of_hash_threshold() {
+    use crate::provider::ReferenceScope;
+    use crate::schema::{ReferenceForm, ReferenceForms, ReferenceTemplate};
+
+    let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
+    let attr_type = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+    let forms = ReferenceForms::from([(
+        identity,
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:lambda:{region}:{account}:function:{name}",
+            )
+            .expect("valid reference template"),
+        },
+    )]);
+    let scope = ReferenceScope::available("aws", "us-east-1", "123456789012")
+        .expect("fixture scope is valid");
+    let context = crate::differ::ComparisonContext::for_test(&scope, &forms);
+
+    for len in [HASH_THRESHOLD - 1, HASH_THRESHOLD] {
+        let desired = (0..len)
+            .map(|index| Value::Concrete(ConcreteValue::String(format!("function-{index}").into())))
+            .collect::<Vec<_>>();
+        let saved = (0..len)
+            .rev()
+            .map(|index| {
+                Value::Concrete(ConcreteValue::String(
+                    format!("arn:aws:lambda:us-east-1:123456789012:function:function-{index}")
+                        .into(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let expected = (0..len)
+            .map(|index| Some(len - index - 1))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            super::pair_list_elements(
+                &desired,
+                &saved,
+                Some(&attr_type),
+                crate::schema::empty_defs_for_schema_walks(),
+                &context,
+            ),
+            expected,
+            "list pairing changed at length {len}"
+        );
+    }
+}
+
+#[test]
 fn enum_pairing_hashes_keep_dotted_strings_literal() {
     let attr_type = AttributeType::enum_(
         TypeIdentity::bare("Format"),
@@ -2024,8 +2075,9 @@ fn enum_pairing_hashes_keep_dotted_strings_literal() {
     let dotted = Value::Concrete(ConcreteValue::String("A.json".into()));
     let api = Value::Concrete(ConcreteValue::String("json".into()));
     let defs = crate::schema::empty_defs_for_schema_walks();
-    let dotted_hashes = pairing_hashes(&dotted, Some(&attr_type), defs);
-    let api_hashes = pairing_hashes(&api, Some(&attr_type), defs);
+    let context = crate::differ::exact_comparison_context_for_tests();
+    let dotted_hashes = pairing_hashes(&dotted, Some(&attr_type), defs, &context);
+    let api_hashes = pairing_hashes(&api, Some(&attr_type), defs, &context);
 
     assert!(
         dotted_hashes.iter().all(|hash| !api_hashes.contains(hash)),

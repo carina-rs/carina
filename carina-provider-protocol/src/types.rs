@@ -42,7 +42,19 @@ pub struct TypeIdentity {
 /// `{region}`, `{account}`, and `{name}`. The `{name}` placeholder appears
 /// exactly once and denotes the short form of the reference.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ReferenceTemplate(String);
+pub struct ReferenceTemplate(ValidatedReferenceTemplate);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ValidatedReferenceTemplate {
+    source: String,
+    segments: Vec<ReferenceTemplateSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ReferenceTemplateSegment {
+    Literal(String),
+    Placeholder(ReferenceTemplatePlaceholder),
+}
 
 /// Why a reference template could not be admitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +65,7 @@ pub enum ReferenceTemplateError {
     StrayClosingBrace,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ReferenceTemplatePlaceholder {
     Partition,
     Region,
@@ -107,10 +119,17 @@ impl ReferenceTemplate {
         let value = value.into();
         let bytes = value.as_bytes();
         let mut index = 0;
+        let mut literal_start = 0;
         let mut name_count = 0;
+        let mut segments = Vec::new();
 
         while index < bytes.len() {
             if bytes[index] == b'{' {
+                if literal_start < index {
+                    segments.push(ReferenceTemplateSegment::Literal(
+                        value[literal_start..index].to_string(),
+                    ));
+                }
                 let start = index + 1;
                 let mut end = start;
                 while end < bytes.len() && bytes[end] != b'}' {
@@ -123,13 +142,16 @@ impl ReferenceTemplate {
                     return Err(ReferenceTemplateError::StrayOpeningBrace);
                 }
                 let placeholder = &value[start..end];
-                match reference_template_placeholder(placeholder)? {
+                let placeholder = reference_template_placeholder(placeholder)?;
+                match placeholder {
                     ReferenceTemplatePlaceholder::Partition
                     | ReferenceTemplatePlaceholder::Region
                     | ReferenceTemplatePlaceholder::Account => {}
                     ReferenceTemplatePlaceholder::Name => name_count += 1,
                 }
+                segments.push(ReferenceTemplateSegment::Placeholder(placeholder));
                 index = end + 1;
+                literal_start = index;
             } else if bytes[index] == b'}' {
                 return Err(ReferenceTemplateError::StrayClosingBrace);
             } else {
@@ -140,45 +162,44 @@ impl ReferenceTemplate {
         if name_count != 1 {
             return Err(ReferenceTemplateError::NamePlaceholderCount { actual: name_count });
         }
-        Ok(Self(value))
+        if literal_start < value.len() {
+            segments.push(ReferenceTemplateSegment::Literal(
+                value[literal_start..].to_string(),
+            ));
+        }
+        Ok(Self(ValidatedReferenceTemplate {
+            source: value,
+            segments,
+        }))
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.0.source
     }
 
     /// Expand this validated template once using one initialized provider
     /// scope. Inserted values are appended as literal text and are never
     /// parsed again as template placeholders.
     pub fn render(&self, scope: &ReferenceScope, name: &str) -> Option<String> {
-        let (partition, region, account) = match scope {
-            ReferenceScope::Available {
-                partition,
-                region,
-                account,
-            } => (partition, region, account),
-            ReferenceScope::Unavailable => return None,
-        };
-        let mut rendered = String::with_capacity(self.0.len() + name.len());
-        let mut rest = self.as_str();
-        while let Some(open) = rest.find('{') {
-            rendered.push_str(&rest[..open]);
-            let placeholder_and_rest = &rest[open + 1..];
-            let close = placeholder_and_rest
-                .find('}')
-                .expect("validated reference template closes every placeholder");
-            let placeholder = &placeholder_and_rest[..close];
-            match reference_template_placeholder(placeholder)
-                .expect("validated reference template contains only known placeholders")
-            {
-                ReferenceTemplatePlaceholder::Partition => rendered.push_str(partition),
-                ReferenceTemplatePlaceholder::Region => rendered.push_str(region),
-                ReferenceTemplatePlaceholder::Account => rendered.push_str(account),
-                ReferenceTemplatePlaceholder::Name => rendered.push_str(name),
+        let values = scope.available_values()?;
+        let mut rendered = String::with_capacity(self.as_str().len() + name.len());
+        for segment in &self.0.segments {
+            match segment {
+                ReferenceTemplateSegment::Literal(literal) => rendered.push_str(literal),
+                ReferenceTemplateSegment::Placeholder(ReferenceTemplatePlaceholder::Partition) => {
+                    rendered.push_str(values.partition())
+                }
+                ReferenceTemplateSegment::Placeholder(ReferenceTemplatePlaceholder::Region) => {
+                    rendered.push_str(values.region())
+                }
+                ReferenceTemplateSegment::Placeholder(ReferenceTemplatePlaceholder::Account) => {
+                    rendered.push_str(values.account())
+                }
+                ReferenceTemplateSegment::Placeholder(ReferenceTemplatePlaceholder::Name) => {
+                    rendered.push_str(name)
+                }
             }
-            rest = &placeholder_and_rest[close + 1..];
         }
-        rendered.push_str(rest);
         Some(rendered)
     }
 }
@@ -249,15 +270,171 @@ pub struct ProviderSchemaEnvelope {
 
 /// Values an initialized provider instance exposes for expanding short
 /// provider references into their long form.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceScopeField {
+    Partition,
+    Region,
+    Account,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceScopeError {
+    Empty { field: ReferenceScopeField },
+    ContainsBrace { field: ReferenceScopeField },
+}
+
+impl std::fmt::Display for ReferenceScopeField {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Partition => formatter.write_str("partition"),
+            Self::Region => formatter.write_str("region"),
+            Self::Account => formatter.write_str("account"),
+        }
+    }
+}
+
+impl std::fmt::Display for ReferenceScopeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty { field } => write!(formatter, "reference scope {field} must not be empty"),
+            Self::ContainsBrace { field } => write!(
+                formatter,
+                "reference scope {field} must not contain `{{` or `}}`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReferenceScopeError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceScopeValues {
+    partition: String,
+    region: String,
+    account: String,
+}
+
+impl ReferenceScopeValues {
+    pub fn new(
+        partition: impl Into<String>,
+        region: impl Into<String>,
+        account: impl Into<String>,
+    ) -> Result<Self, ReferenceScopeError> {
+        let partition = partition.into();
+        let region = region.into();
+        let account = account.into();
+        validate_reference_scope_value(ReferenceScopeField::Partition, &partition)?;
+        validate_reference_scope_value(ReferenceScopeField::Region, &region)?;
+        validate_reference_scope_value(ReferenceScopeField::Account, &account)?;
+        Ok(Self {
+            partition,
+            region,
+            account,
+        })
+    }
+
+    pub fn partition(&self) -> &str {
+        &self.partition
+    }
+
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+}
+
+fn validate_reference_scope_value(
+    field: ReferenceScopeField,
+    value: &str,
+) -> Result<(), ReferenceScopeError> {
+    if value.is_empty() {
+        return Err(ReferenceScopeError::Empty { field });
+    }
+    if value.contains(['{', '}']) {
+        return Err(ReferenceScopeError::ContainsBrace { field });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReferenceScope {
+    Available(ReferenceScopeValues),
+    Unavailable,
+}
+
+impl ReferenceScope {
+    pub fn available(
+        partition: impl Into<String>,
+        region: impl Into<String>,
+        account: impl Into<String>,
+    ) -> Result<Self, ReferenceScopeError> {
+        ReferenceScopeValues::new(partition, region, account).map(Self::Available)
+    }
+
+    pub fn available_values(&self) -> Option<&ReferenceScopeValues> {
+        match self {
+            Self::Available(values) => Some(values),
+            Self::Unavailable => None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum SerializedReferenceScope<'a> {
+    Available {
+        partition: &'a str,
+        region: &'a str,
+        account: &'a str,
+    },
+    Unavailable,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum DeserializedReferenceScope {
     Available {
         partition: String,
         region: String,
         account: String,
     },
     Unavailable,
+}
+
+impl Serialize for ReferenceScope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Available(values) => SerializedReferenceScope::Available {
+                partition: values.partition(),
+                region: values.region(),
+                account: values.account(),
+            }
+            .serialize(serializer),
+            Self::Unavailable => SerializedReferenceScope::Unavailable.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReferenceScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match DeserializedReferenceScope::deserialize(deserializer)? {
+            DeserializedReferenceScope::Available {
+                partition,
+                region,
+                account,
+            } => Self::available(partition, region, account).map_err(D::Error::custom),
+            DeserializedReferenceScope::Unavailable => Ok(Self::Unavailable),
+        }
+    }
 }
 
 /// Mirrors `carina_core::resource::Value`.
@@ -1696,11 +1873,8 @@ mod tests {
     #[test]
     fn reference_scope_roundtrips_without_losing_the_closed_variant() {
         let scopes = [
-            ReferenceScope::Available {
-                partition: "aws".to_string(),
-                region: "ap-northeast-1".to_string(),
-                account: "123456789012".to_string(),
-            },
+            ReferenceScope::available("aws", "ap-northeast-1", "123456789012")
+                .expect("fixture scope is valid"),
             ReferenceScope::Unavailable,
         ];
 
@@ -1710,6 +1884,32 @@ mod tests {
                 serde_json::from_str(&encoded).expect("scope must deserialize");
             assert_eq!(decoded, scope);
         }
+    }
+
+    #[test]
+    fn reference_scope_constructor_and_serde_reject_invalid_values() {
+        assert_eq!(
+            ReferenceScope::available("aws", "", "123456789012").unwrap_err(),
+            ReferenceScopeError::Empty {
+                field: ReferenceScopeField::Region,
+            }
+        );
+        assert_eq!(
+            ReferenceScope::available("aws", "us-{name}-1", "123456789012").unwrap_err(),
+            ReferenceScopeError::ContainsBrace {
+                field: ReferenceScopeField::Region,
+            }
+        );
+        assert!(
+            serde_json::from_value::<ReferenceScope>(serde_json::json!({
+                "kind": "available",
+                "partition": "aws",
+                "region": "",
+                "account": "123456789012"
+            }))
+            .is_err(),
+            "deserialization must enter through ReferenceScope::available",
+        );
     }
 
     #[test]

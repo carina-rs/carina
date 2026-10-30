@@ -12,7 +12,7 @@ use crate::resource::{
     merge_with_saved,
 };
 use crate::schema::{
-    AttributeType, LeafPath, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms,
+    AttributeType, DslTransform, LeafPath, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms,
     ResourceSchema, TypeIdentity, empty_defs_for_schema_walks,
 };
 use crate::value::{PersistedValue, canonical_secret_hash_material, contains_secret};
@@ -62,7 +62,7 @@ use crate::value::{PersistedValue, canonical_secret_hash_material, contains_secr
 // rows agree with `find_changed_attributes`' own verdict. Reusing it
 // — never reimplementing — is the carina#3073 fix; a second equality
 // notion is precisely the drift this avoids.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct ComparisonContext<'a> {
     scope: &'a ReferenceScope,
     reference_forms: &'a ReferenceForms,
@@ -73,22 +73,49 @@ impl<'a> ComparisonContext<'a> {
         provider: &'a InitializedProvider,
         schema: OwnerBoundResourceSchema<'a>,
     ) -> Self {
-        Self {
-            scope: provider.reference_scope(),
-            reference_forms: schema.reference_forms(),
-        }
+        Self::from_scope_and_forms(provider.reference_scope(), schema.reference_forms())
     }
 
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn for_test(scope: &'a ReferenceScope, reference_forms: &'a ReferenceForms) -> Self {
+    pub(crate) fn from_scope_and_forms(
+        scope: &'a ReferenceScope,
+        reference_forms: &'a ReferenceForms,
+    ) -> Self {
         Self {
             scope,
             reference_forms,
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(scope: &'a ReferenceScope, reference_forms: &'a ReferenceForms) -> Self {
+        Self::from_scope_and_forms(scope, reference_forms)
+    }
+
     fn reference_form(&self, identity: &TypeIdentity) -> Option<&ReferenceForm> {
         self.reference_forms.get(identity)
+    }
+
+    pub(crate) fn canonical_string<'b>(
+        &self,
+        value: &'b str,
+        identity: Option<&TypeIdentity>,
+        to_dsl: Option<&DslTransform>,
+    ) -> Cow<'b, str> {
+        let transformed = to_dsl
+            .map(|transform| transform.apply(value))
+            .unwrap_or(Cow::Borrowed(value));
+        let Some(form) = identity.and_then(|identity| self.reference_form(identity)) else {
+            return transformed;
+        };
+        if transformed.is_empty() || transformed.contains(':') || transformed.contains('/') {
+            return transformed;
+        }
+        match form {
+            ReferenceForm::Template { long } => long
+                .render(self.scope, transformed.as_ref())
+                .map(Cow::Owned)
+                .unwrap_or(transformed),
+        }
     }
 }
 
@@ -179,12 +206,8 @@ fn type_aware_equal_on_path<'a>(
             ) => {
                 let a = sa.expose_plaintext();
                 let b = sb.expose_plaintext();
-                let transformed_equal = to_dsl
-                    .map(|transform| transform.apply(a) == transform.apply(b))
-                    .unwrap_or(a == b);
-                transformed_equal
-                    || identity
-                        .is_some_and(|identity| reference_form_equal(a, b, identity, context))
+                context.canonical_string(a, identity, to_dsl)
+                    == context.canonical_string(b, identity, to_dsl)
             }
 
             // Lists: ordered or multiset comparison with inner type awareness
@@ -366,24 +389,6 @@ fn type_aware_equal_on_path<'a>(
             _ => a.semantically_equal(b),
         },
     }
-}
-
-fn reference_form_equal(
-    a: &str,
-    b: &str,
-    identity: &TypeIdentity,
-    context: &ComparisonContext<'_>,
-) -> bool {
-    let Some(form) = context.reference_form(identity) else {
-        return false;
-    };
-    let expand = |name: &str| match form {
-        ReferenceForm::Template { long } => long.render(context.scope, name),
-    };
-    let is_name = |value: &str| !value.is_empty() && !value.contains(':') && !value.contains('/');
-
-    (is_name(a) && expand(a).is_some_and(|expanded| expanded == b))
-        || (is_name(b) && expand(b).is_some_and(|expanded| expanded == a))
 }
 
 /// List comparison with type-aware element comparison.

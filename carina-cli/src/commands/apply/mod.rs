@@ -23,9 +23,7 @@ use carina_core::executor::{
 };
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
-use carina_core::provider::{
-    self as provider_mod, Provider, ProviderNormalizer, ProviderResult, ProviderRouter,
-};
+use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ProviderRouter};
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
 use carina_core::resource::{
@@ -200,32 +198,9 @@ struct BootstrapCreateContext<'a> {
     schemas: &'a carina_core::schema::SchemaRegistry,
 }
 
-pub(crate) trait ComparisonProvider: Send + Sync {
-    fn operation_provider(&self) -> &dyn Provider;
-
-    fn comparison_context_for<'a>(
-        &'a self,
-        id: &ResourceId,
-        schema: carina_core::schema::OwnerBoundResourceSchema<'a>,
-    ) -> ProviderResult<carina_core::differ::ComparisonContext<'a>>;
-}
-
-impl ComparisonProvider for ProviderRouter {
-    fn operation_provider(&self) -> &dyn Provider {
-        self
-    }
-
-    fn comparison_context_for<'a>(
-        &'a self,
-        id: &ResourceId,
-        schema: carina_core::schema::OwnerBoundResourceSchema<'a>,
-    ) -> ProviderResult<carina_core::differ::ComparisonContext<'a>> {
-        ProviderRouter::comparison_context_for(self, id, schema)
-    }
-}
-
 async fn create_checked_bootstrap_resource(
-    provider: &dyn ComparisonProvider,
+    operation_provider: &dyn Provider,
+    comparison_provider: &ProviderRouter,
     resource: Resource,
     context: BootstrapCreateContext<'_>,
 ) -> Result<(), AppError> {
@@ -253,18 +228,11 @@ async fn create_checked_bootstrap_resource(
         .await
         .map_err(AppError::from_state_bucket_preparation)?;
     let resolved = ResolvedResource::new(request.resource().as_resource().clone());
-    let owner_schema = schemas.get_for(resolved.as_resource()).ok_or_else(|| {
-        AppError::Provider(carina_core::provider::ProviderError::internal(format!(
-            "missing managed resource schema for bootstrap resource `{}`",
-            resolved.id
-        )))
-    })?;
-    let comparison = provider
-        .comparison_context_for(&resolved.id, owner_schema)
-        .map_err(AppError::Provider)?;
+    let resolved_comparison = comparison_provider.comparison_for(schemas, &resolved.id)?;
+    let owner_schema = resolved_comparison.owner_schema();
+    let comparison = resolved_comparison.context();
     let schema = Some(owner_schema.schema().as_schema());
-    match carina_core::executor::dispatch_create(provider.operation_provider(), &id, request).await
-    {
+    match carina_core::executor::dispatch_create(operation_provider, &id, request).await {
         Ok(outcome) => {
             let identifier = outcome.identifier().as_str().to_string();
             let (state, accepted_request, diagnostic) =
@@ -276,7 +244,7 @@ async fn create_checked_bootstrap_resource(
                 schema,
                 RowBasis::Applied(&accepted_request),
                 None,
-                &comparison,
+                comparison,
             )
             .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?;
             seed_protected_bootstrap_resource(backend, row)
@@ -356,6 +324,40 @@ async fn create_checked_bootstrap_resource(
             ))
         }
     }
+}
+
+#[cfg(test)]
+async fn create_checked_bootstrap_resource_for_test(
+    operation_provider: &dyn Provider,
+    resource: Resource,
+    context: BootstrapCreateContext<'_>,
+) -> Result<(), AppError> {
+    let (schemas, comparison_provider) = carina_core::provider::comparison_fixture_for_test(
+        context.schemas,
+        std::iter::once(&resource.id),
+    );
+    let BootstrapCreateContext {
+        backend,
+        parsed,
+        provider_configs,
+        normalizer,
+        factories,
+        schemas: _schemas,
+    } = context;
+    create_checked_bootstrap_resource(
+        operation_provider,
+        &comparison_provider,
+        resource,
+        BootstrapCreateContext {
+            backend,
+            parsed,
+            provider_configs,
+            normalizer,
+            factories,
+            schemas: &schemas,
+        },
+    )
+    .await
 }
 
 async fn seed_protected_bootstrap_resource(
@@ -1200,7 +1202,8 @@ pub(crate) async fn detect_drift<S>(
     sorted_resources: &[carina_core::resource::Resource<S>],
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     historical_addresses: &HistoricalResourceAddresses,
-    provider: &dyn ComparisonProvider,
+    operation_provider: &dyn Provider,
+    comparison_provider: &ProviderRouter,
     state_file: Option<&StateFile>,
     schemas: &carina_core::schema::SchemaRegistry,
     apply_target: ApplyTarget<'_>,
@@ -1222,15 +1225,7 @@ pub(crate) async fn detect_drift<S>(
         // carina#3181: `sorted_resources` is managed-only — drift
         // detection only operates over provider-backed managed
         // resources.
-        let typed_comparison = schemas
-            .get_for(resource)
-            .map(|owner_schema| {
-                provider
-                    .comparison_context_for(&resource.id, owner_schema)
-                    .map(|comparison| (owner_schema, comparison))
-            })
-            .transpose()
-            .map_err(AppError::Provider)?;
+        let typed_comparison = comparison_provider.comparison_for(schemas, &resource.id)?;
         let planned_snapshot = planned_states.get(&resource.id).copied();
         let planned_current = planned_snapshot.map(|snapshot| snapshot.as_ref());
         let planned_state = planned_current.and_then(|current| match current {
@@ -1253,7 +1248,7 @@ pub(crate) async fn detect_drift<S>(
 
         let mut actual_state = match planned_current {
             Some(Current::Present(present)) => read_managed_state_with_retry(
-                provider.operation_provider(),
+                operation_provider,
                 historical_id,
                 present.identifier(),
                 state_file,
@@ -1329,18 +1324,13 @@ pub(crate) async fn detect_drift<S>(
                             ));
                         }
                         Some(actual_val)
-                            if !match &typed_comparison {
-                                Some((owner_schema, comparison)) => {
-                                    carina_core::diff_helpers::resource_attribute_values_equal(
-                                        actual_val,
-                                        planned_val,
-                                        Some(owner_schema.schema()),
-                                        key,
-                                        comparison,
-                                    )
-                                }
-                                None => actual_val.semantically_equal(planned_val),
-                            } =>
+                            if !carina_core::diff_helpers::resource_attribute_values_equal(
+                                actual_val,
+                                planned_val,
+                                Some(typed_comparison.owner_schema().schema()),
+                                key,
+                                typed_comparison.context(),
+                            ) =>
                         {
                             let masked = carina_core::value::mask_plaintext_using_secret_shape(
                                 actual_val,
@@ -1404,6 +1394,33 @@ pub(crate) async fn detect_drift<S>(
         actual_states,
         verified_planned_states,
     })
+}
+
+#[cfg(test)]
+pub(crate) async fn detect_drift_for_test<S>(
+    sorted_resources: &[carina_core::resource::Resource<S>],
+    planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
+    historical_addresses: &HistoricalResourceAddresses,
+    operation_provider: &dyn Provider,
+    state_file: Option<&StateFile>,
+    schemas: &carina_core::schema::SchemaRegistry,
+    apply_target: ApplyTarget<'_>,
+) -> Result<DriftCheckResult, AppError> {
+    let (schemas, comparison_provider) = carina_core::provider::comparison_fixture_for_test(
+        schemas,
+        sorted_resources.iter().map(|resource| &resource.id),
+    );
+    detect_drift(
+        sorted_resources,
+        planned_state_entries,
+        historical_addresses,
+        operation_provider,
+        &comparison_provider,
+        state_file,
+        &schemas,
+        apply_target,
+    )
+    .await
 }
 
 fn drift_replan_hint(apply_target: ApplyTarget<'_>) -> String {
@@ -1545,6 +1562,7 @@ async fn run_apply_with_observer_factory(
                 // the same expanded compositions and resolved config values
                 // that are available before any provider effect runs.
                 create_checked_bootstrap_resource(
+                    &bucket_provider,
                     &bucket_provider,
                     bucket_resource.clone(),
                     BootstrapCreateContext {
@@ -2269,8 +2287,8 @@ async fn run_apply_locked_owned(
                 plan.clone(),
                 ctx.schemas().clone(),
                 None,
-                Arc::clone(&provider),
-            ));
+                provider.as_ref(),
+            )?);
             let saver =
                 start_apply_state_saver(state_file, mid_run_writer, Arc::clone(&state_save_inputs));
             let publisher = saver.publisher();
@@ -3350,6 +3368,7 @@ async fn run_apply_from_plan_locked_owned(
                 validated_plan.current_states(),
                 &historical_addresses,
                 validated_plan.provider(),
+                validated_plan.provider(),
                 state_file.as_ref(),
                 wiring.schemas(),
                 apply_target,
@@ -3557,8 +3576,8 @@ async fn run_apply_from_plan_locked_owned(
                 (*plan).clone(),
                 wiring.schemas().clone(),
                 Some(rehydrated_plan_file.planned_secret_hashes().clone()),
-                Arc::clone(&provider),
-            ));
+                provider.as_ref(),
+            )?);
             let saver =
                 start_apply_state_saver(state_file, mid_run_writer, Arc::clone(&state_save_inputs));
             let publisher = saver.publisher();

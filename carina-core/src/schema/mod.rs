@@ -11827,7 +11827,7 @@ pub struct OwnerBoundResourceSchema<'a> {
 }
 
 impl<'a> OwnerBoundResourceSchema<'a> {
-    fn new(
+    pub(crate) fn new(
         owner: &'a str,
         schema: &'a ValidatedResourceSchema,
         reference_forms: &'a ReferenceForms,

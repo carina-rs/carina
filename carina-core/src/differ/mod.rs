@@ -19,7 +19,7 @@ use crate::resource::{
     Current, Directives, PlanInputCurrent, PresentResourceState, ResolvedResource, Resource,
     ResourceId, State, UnidentifiedState, Value, into_plan_input_current_map,
 };
-use crate::schema::{ResourceSchema, SchemaKind, SchemaRegistry};
+use crate::schema::{ResourceSchema, SchemaRegistry};
 
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
@@ -51,19 +51,9 @@ pub fn managed_binding_stability(
             result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
             continue;
         };
-        let owner_schema = registry
-            .get(
-                &resource.id.provider,
-                &resource.id.resource_type,
-                SchemaKind::Resource,
-            )
-            .ok_or_else(|| {
-                ProviderError::internal(format!(
-                    "missing managed resource schema for `{}`",
-                    resource.id
-                ))
-            })?;
-        let context = provider.comparison_context_for(&resource.id, owner_schema)?;
+        let resolved_comparison = provider.comparison_for(registry, &resource.id)?;
+        let owner_schema = resolved_comparison.owner_schema();
+        let context = resolved_comparison.context();
         let schema = owner_schema.schema().as_schema();
         let changed_attributes = match diff_present(
             resource,
@@ -72,7 +62,7 @@ pub fn managed_binding_stability(
             saved_attrs.nested_write_only(&resource.id),
             prev_explicit.get(&resource.id),
             Some(schema),
-            &context,
+            context,
         ) {
             PresentDiff::NoChange => {
                 result.insert(
@@ -796,28 +786,13 @@ fn create_plan_for_tests(
 ) -> crate::plan::Plan {
     let managed = ResolvedResource::collect_resolved(managed.iter().cloned())
         .expect("differ test resources must have resolved identities");
-    let mut registry = registry.clone();
-    for resource in &managed {
-        let present = current_states
-            .get(&resource.id)
-            .is_some_and(|current| matches!(current.current(), Current::Present(_)));
-        if present && registry.get_for(resource).is_none() {
-            registry.insert(
-                resource.id.provider.clone(),
-                ResourceSchema::new(resource.id.resource_type.clone())
-                    .validate()
-                    .expect("empty differ fixture schema must validate"),
-            );
-        }
-    }
-    let provider = crate::provider::TestContextualProvider::new(provider);
-    plan::create_plan_with_contextual_provider(
+    plan::create_plan_for_test(
         &managed,
         data_sources,
-        &provider,
+        provider,
         PlanPriorStates::new(current_states, orphans),
         directives_map,
-        &registry,
+        registry,
         saved_attrs,
         prev_explicit,
         wait_bindings,

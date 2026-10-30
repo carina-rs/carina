@@ -307,6 +307,57 @@ fn outcome_unknown_blocks_both_desired_create_and_orphan_cleanup() {
 }
 
 #[test]
+fn import_replacement_suppresses_only_the_matching_provider_instance() {
+    let imported = Resource::with_provider(
+        "mock",
+        "test.Resource",
+        "shared",
+        Some("imported".to_string()),
+    );
+    let other =
+        Resource::with_provider("mock", "test.Resource", "shared", Some("other".to_string()));
+    let imported_id = imported.id.clone();
+    let other_id = other.id.clone();
+    let current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(
+            imported_id.clone(),
+            Current::create_outcome_unknown(unknown_create_outcome(imported_id.clone())),
+        )]),
+        &SchemaRegistry::new(),
+        std::slice::from_ref(&imported),
+    );
+    let orphans = Orphans::from([Orphan::create_outcome_unknown(
+        unknown_create_outcome(other_id.clone()),
+        Some("shared".to_string()),
+        Directives::default(),
+    )]);
+    let managed = ResolvedResource::collect_resolved([imported]).unwrap();
+
+    let plan = create_plan_with_cascades(
+        &managed,
+        &managed,
+        &[],
+        &ProviderRouter::new(),
+        PlanPriorStates::new(&current, &orphans),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &[],
+        &HashSet::from([imported_id]),
+    )
+    .unwrap();
+
+    assert!(plan.effects().is_empty());
+    assert_eq!(plan.errors().len(), 1);
+    assert_eq!(plan.errors()[0].resource_id, other_id);
+    assert!(matches!(
+        plan.errors()[0].kind,
+        PlanErrorKind::CreateOutcomeUnknown { .. }
+    ));
+}
+
+#[test]
 fn changed_provider_instance_rejects_resume() {
     use crate::effect::Effect;
     use crate::provider::{CreateAttempt, InFlightCreate, PendingToken, Sent};
@@ -460,11 +511,8 @@ fn provider_scoped_reference_form_suppresses_create_only_replacement_in_plan() {
         "aws".to_string(),
         InitializedProvider::for_test(
             Box::new(HintProvider { hints: Vec::new() }),
-            ReferenceScope::Available {
-                partition: "aws".to_string(),
-                region: "us-east-1".to_string(),
-                account: "123456789012".to_string(),
-            },
+            ReferenceScope::available("aws", "us-east-1", "123456789012")
+                .expect("fixture scope is valid"),
         ),
     );
     let saved = crate::provider::RawSavedAttrs::default().lift(&registry);

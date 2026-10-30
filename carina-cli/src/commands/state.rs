@@ -2441,30 +2441,10 @@ fn diff_display_update_resource_with_provider(
         }
     };
 
-    let owner_schema = match resource {
-        Some(resource) => schemas.get_for(resource),
-        None => schemas.get(
-            &id.provider,
-            &id.resource_type,
-            carina_core::schema::SchemaKind::Resource,
-        ),
-    };
-    let typed_comparison = owner_schema
-        .map(|owner_schema| {
-            provider
-                .comparison_context_for(id.as_inner(), owner_schema)
-                .map(|comparison| (owner_schema, comparison))
-        })
-        .transpose()
-        .map_err(AppError::Provider)?;
-    if resource.is_some() && typed_comparison.is_none() {
-        return Err(AppError::Provider(ProviderError::internal(format!(
-            "missing managed resource schema while refreshing `{id}`"
-        ))));
-    }
-    let resource_schema = typed_comparison
-        .as_ref()
-        .map(|(owner_schema, _comparison)| owner_schema.schema().as_schema());
+    let resolved_comparison = provider.comparison_for(schemas, id.as_inner())?;
+    let owner_schema = resolved_comparison.owner_schema();
+    let comparison = resolved_comparison.context();
+    let resource_schema = Some(owner_schema.schema().as_schema());
 
     let refreshed_resource_state = if exists {
         match resource {
@@ -2476,10 +2456,7 @@ fn diff_display_update_resource_with_provider(
                     resource_schema,
                     RowBasis::Carried,
                     None,
-                    &typed_comparison
-                        .as_ref()
-                        .expect("desired resource refresh requires a registered schema")
-                        .1,
+                    comparison,
                 )
                 .map_err(|source| {
                     AppError::from_resource_state_encoding(resource.id.clone(), source)
@@ -2537,18 +2514,13 @@ fn diff_display_update_resource_with_provider(
 
             match (old_val, new_val) {
                 (Some(old), Some(new))
-                    if !match &typed_comparison {
-                        Some((owner_schema, comparison)) => {
-                            carina_core::diff_helpers::resource_attribute_values_equal(
-                                old,
-                                new,
-                                Some(owner_schema.schema()),
-                                key,
-                                comparison,
-                            )
-                        }
-                        None => old.semantically_equal(new),
-                    } =>
+                    if !carina_core::diff_helpers::resource_attribute_values_equal(
+                        old,
+                        new,
+                        Some(owner_schema.schema()),
+                        key,
+                        comparison,
+                    ) =>
                 {
                     has_changes = true;
                     changes.push(format!(
@@ -2619,24 +2591,8 @@ fn diff_display_update_resource(
     label_suffix: &str,
     counts: &mut StateRefreshCounts,
 ) -> Result<(), AppError> {
-    let mut schemas = schemas.clone();
-    if let Some(resource) = resource
-        && schemas.get_for(resource).is_none()
-    {
-        schemas.insert(
-            resource.id.provider.clone(),
-            carina_core::schema::ResourceSchema::new(resource.id.resource_type.clone())
-                .validate()
-                .expect("empty state-refresh fixture schema must validate"),
-        );
-    }
-    let mut provider = ProviderRouter::new();
-    provider.add_provider_instance(
-        carina_core::provider::ProviderInstanceKey::from(id.as_inner()),
-        carina_core::provider::InitializedProvider::unavailable(Box::new(
-            carina_provider_mock::MockProvider::new(),
-        )),
-    );
+    let (schemas, provider) =
+        carina_core::provider::comparison_fixture_for_test(schemas, std::iter::once(id.as_inner()));
     diff_display_update_resource_with_provider(
         id,
         fresh_current,
@@ -2774,11 +2730,8 @@ mod tests {
             "aws".to_string(),
             InitializedProvider::for_test(
                 Box::new(carina_provider_mock::MockProvider::new()),
-                ReferenceScope::Available {
-                    partition: "aws".to_string(),
-                    region: "us-east-1".to_string(),
-                    account: "123456789012".to_string(),
-                },
+                ReferenceScope::available("aws", "us-east-1", "123456789012")
+                    .expect("fixture scope is valid"),
             ),
         );
         let mut counts = StateRefreshCounts::default();

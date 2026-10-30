@@ -14,8 +14,9 @@ use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesF
 #[cfg(test)]
 use carina_core::provider::SentRecord;
 use carina_core::provider::{
-    AppliedIdentifier, InFlightCreate, InFlightPersistence, ObservedCreate, PersistedAttributes,
-    ProviderError, ProviderRouter, UnknownCreateOutcome,
+    AppliedIdentifier, ComparisonResolutionError, InFlightCreate, InFlightPersistence,
+    ObservedCreate, PersistedAttributes, ProviderRouter, ResolvedComparisonTable,
+    UnknownCreateOutcome,
 };
 use carina_core::resource::{
     ConcreteValue, Current, DefaultTagKeys, ModuleSource, ResolvedResource, ResolvedResourceId,
@@ -151,12 +152,42 @@ impl PostApplyStates {
 /// Owning these together prevents the background saver and final write from
 /// silently diverging on the desired resources, plan, schemas, or saved-plan
 /// secret hashes.
+fn writeback_comparison_ids<'a, S>(
+    sorted_resources: &'a [ResolvedResource<S>],
+    plan: &'a Plan<S>,
+) -> Vec<&'a ResourceId> {
+    let mut ids = sorted_resources
+        .iter()
+        .map(|resource| &resource.id)
+        .collect::<Vec<_>>();
+    for effect in plan.effects() {
+        match effect {
+            Effect::DeferredCreate { template, .. } => {
+                ids.push(&template.template_resource.id);
+            }
+            Effect::DeferredReplace(payload) => {
+                ids.push(&payload.template.template_resource.id);
+            }
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::Wait { .. } => {}
+        }
+    }
+    ids
+}
+
 pub(crate) struct ApplyStateSaveInputs<S = ModuleSource> {
     sorted_resources: Vec<ResolvedResource<S>>,
     plan: Plan<S>,
     schemas: SchemaRegistry,
     planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
-    provider: Arc<ProviderRouter>,
+    comparisons: ResolvedComparisonTable,
 }
 
 impl<S: Clone> ApplyStateSaveInputs<S> {
@@ -165,15 +196,17 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
         plan: Plan<S>,
         schemas: SchemaRegistry,
         planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
-        provider: Arc<ProviderRouter>,
-    ) -> Self {
-        Self {
+        provider: &ProviderRouter,
+    ) -> Result<Self, ComparisonResolutionError> {
+        let comparison_ids = writeback_comparison_ids(&sorted_resources, &plan);
+        let comparisons = provider.resolve_comparisons(&schemas, comparison_ids)?;
+        Ok(Self {
             sorted_resources,
             plan,
             schemas,
             planned_secret_hashes,
-            provider,
-        }
+            comparisons,
+        })
     }
 
     pub(crate) fn sorted_resources(&self) -> &[ResolvedResource<S>] {
@@ -188,47 +221,20 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
     pub(crate) fn new_for_test(
         sorted_resources: Vec<ResolvedResource<S>>,
         plan: Plan<S>,
-        mut schemas: SchemaRegistry,
+        schemas: SchemaRegistry,
         planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
     ) -> Self {
-        let missing_schemas = sorted_resources
-            .iter()
-            .filter(|resource| schemas.get_for(*resource).is_none())
-            .map(|resource| {
-                (
-                    resource.id.provider.clone(),
-                    resource.id.resource_type.clone(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        for (owner, resource_type) in missing_schemas {
-            schemas.insert(
-                owner,
-                ResourceSchema::new(resource_type)
-                    .validate()
-                    .expect("empty test schema must validate"),
-            );
-        }
-        let routes = sorted_resources
-            .iter()
-            .map(|resource| carina_core::provider::ProviderInstanceKey::from(&resource.id))
-            .collect::<BTreeSet<_>>();
-        let mut provider = ProviderRouter::new();
-        for route in routes {
-            provider.add_provider_instance(
-                route,
-                carina_core::provider::InitializedProvider::unavailable(Box::new(
-                    carina_provider_mock::MockProvider::new(),
-                )),
-            );
-        }
+        let comparison_ids = writeback_comparison_ids(&sorted_resources, &plan);
+        let (schemas, provider) =
+            carina_core::provider::comparison_fixture_for_test(&schemas, comparison_ids);
         Self::new(
             sorted_resources,
             plan,
             schemas,
             planned_secret_hashes,
-            Arc::new(provider),
+            &provider,
         )
+        .expect("test state-save inputs must resolve every comparison")
     }
 
     pub(crate) fn build_state(
@@ -236,7 +242,7 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
         state: StateFile,
         result: &ExecutionResult<S>,
     ) -> Result<StateFile, AppError> {
-        build_state_after_apply_with_provider(
+        build_state_after_apply_with_comparisons(
             ApplyStateSave {
                 state_file: state,
                 sorted_resources: &self.sorted_resources,
@@ -249,7 +255,7 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
                 schemas: &self.schemas,
             },
             self.planned_secret_hashes.as_ref(),
-            self.provider.as_ref(),
+            &self.comparisons,
         )
     }
 }
@@ -1454,42 +1460,19 @@ pub(crate) fn build_state_after_apply<S: Clone>(
         .iter()
         .chain(runtime_synthesized_resources.iter())
         .collect::<Vec<_>>();
-    let mut complete_schemas = schemas.clone();
-    let missing_schemas = resources
-        .iter()
-        .copied()
-        .filter(|resource| complete_schemas.get_for(resource).is_none())
-        .map(|resource| {
-            (
-                resource.id.provider.clone(),
-                resource.id.resource_type.clone(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    for (owner, resource_type) in missing_schemas {
-        complete_schemas.insert(
-            owner,
-            ResourceSchema::new(resource_type)
-                .validate()
-                .expect("empty test schema must validate"),
-        );
-    }
+    let (complete_schemas, provider) = carina_core::provider::comparison_fixture_for_test(
+        schemas,
+        resources.iter().map(|resource| &resource.id),
+    );
 
-    let routes = resources
-        .iter()
-        .map(|resource| carina_core::provider::ProviderInstanceKey::from(&resource.id))
-        .collect::<BTreeSet<_>>();
-    let mut provider = ProviderRouter::new();
-    for route in routes {
-        provider.add_provider_instance(
-            route,
-            carina_core::provider::InitializedProvider::unavailable(Box::new(
-                carina_provider_mock::MockProvider::new(),
-            )),
-        );
-    }
+    let comparisons = provider
+        .resolve_comparisons(
+            &complete_schemas,
+            resources.iter().map(|resource| &resource.id),
+        )
+        .map_err(AppError::from)?;
 
-    build_state_after_apply_with_provider(
+    build_state_after_apply_with_comparisons(
         ApplyStateSave {
             state_file,
             sorted_resources,
@@ -1502,14 +1485,14 @@ pub(crate) fn build_state_after_apply<S: Clone>(
             schemas: &complete_schemas,
         },
         planned_secret_hashes,
-        &provider,
+        &comparisons,
     )
 }
 
-pub(crate) fn build_state_after_apply_with_provider<S: Clone>(
+fn build_state_after_apply_with_comparisons<S: Clone>(
     save: ApplyStateSave<'_, S>,
     planned_secret_hashes: Option<&HashMap<ResourceId, PersistedAttributes>>,
-    provider: &ProviderRouter,
+    comparisons: &ResolvedComparisonTable,
 ) -> Result<StateFile, AppError> {
     let ApplyStateSave {
         state_file,
@@ -1544,14 +1527,9 @@ pub(crate) fn build_state_after_apply_with_provider<S: Clone>(
         let resource = planned.resource;
         let existing = moved_origins.find_persisted_row(&state, id);
         let preferred_hashes = planned_secret_hashes.and_then(|hashes| hashes.get(id));
-        let owner_schema = schemas.get_for(resource).ok_or_else(|| {
-            AppError::Provider(ProviderError::internal(format!(
-                "missing managed resource schema while writing state for `{id}`"
-            )))
-        })?;
-        let comparison = provider
-            .comparison_context_for(&resource.id, owner_schema)
-            .map_err(AppError::Provider)?;
+        let resolved_comparison = comparisons.comparison_for(&resource.id);
+        let owner_schema = resolved_comparison.owner_schema();
+        let comparison = resolved_comparison.context();
         let schema = Some(owner_schema.schema().as_schema());
         let mut resource_state = match &planned.source {
             UpsertSource::Complete { state, request } => {
@@ -1562,7 +1540,7 @@ pub(crate) fn build_state_after_apply_with_provider<S: Clone>(
                     schema,
                     RowBasis::Applied(request),
                     preferred_hashes,
-                    &comparison,
+                    comparison,
                 )
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
             }
@@ -1577,7 +1555,7 @@ pub(crate) fn build_state_after_apply_with_provider<S: Clone>(
                     schema,
                     RowBasis::Imported,
                     preferred_hashes,
-                    &comparison,
+                    comparison,
                 )
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
             }
@@ -1589,7 +1567,7 @@ pub(crate) fn build_state_after_apply_with_provider<S: Clone>(
                     schema,
                     RowBasis::Carried,
                     preferred_hashes,
-                    &comparison,
+                    comparison,
                 )
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
             }
@@ -1599,7 +1577,7 @@ pub(crate) fn build_state_after_apply_with_provider<S: Clone>(
                 existing,
                 schema,
                 preferred_hashes,
-                &comparison,
+                comparison,
             )
             .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?,
             UpsertSource::CreateInFlight(pending)
@@ -1609,17 +1587,13 @@ pub(crate) fn build_state_after_apply_with_provider<S: Clone>(
                 existing,
                 schema,
                 preferred_hashes,
-                &comparison,
+                comparison,
             )
             .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?,
             UpsertSource::CreateOutcomeUnknown(unknown)
             | UpsertSource::CurrentCreateOutcomeUnknown(unknown) => {
                 ResourceState::from_unknown_create_outcome(
-                    resource,
-                    unknown,
-                    existing,
-                    schema,
-                    &comparison,
+                    resource, unknown, existing, schema, comparison,
                 )
             }
         };
@@ -1976,6 +1950,80 @@ mod apply_state_save_tests {
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
+    }
+
+    #[test]
+    fn apply_state_save_inputs_resolve_comparisons_before_writeback() {
+        let resource = resolved(Resource::with_provider(
+            "mock",
+            "test.Resource",
+            "main",
+            None,
+        ));
+        let id = resource.id.clone();
+        let mut provider = ProviderRouter::new();
+        provider.add_provider(
+            "mock".to_string(),
+            carina_core::provider::InitializedProvider::unavailable(Box::new(
+                carina_provider_mock::MockProvider::new(),
+            )),
+        );
+
+        let result = ApplyStateSaveInputs::new(
+            vec![resource],
+            Plan::new(),
+            SchemaRegistry::new(),
+            None,
+            &provider,
+        );
+        let Err(error) = result else {
+            panic!("apply setup must reject a missing comparison before execution starts")
+        };
+        assert!(matches!(
+            error,
+            carina_core::provider::ComparisonResolutionError::MissingResourceSchema {
+                id: actual
+            } if actual == id
+        ));
+    }
+
+    #[test]
+    fn apply_state_save_inputs_pre_resolve_deferred_runtime_comparisons() {
+        let mut plan = Plan::new();
+        plan.add(Effect::DeferredCreate {
+            id: ResolvedResourceId::new(ResourceId::with_identity(
+                "__deferred_for",
+                "validation_records",
+            )),
+            template: Box::new(DeferredForExpression {
+                file: Some("main.crn".to_string()),
+                line: 1,
+                header: "for opt in cert.domain_validation_options".to_string(),
+                resource_type: "aws.route53.Record".to_string(),
+                attributes: Vec::new(),
+                binding_name: "validation_records".to_string(),
+                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                binding: ForBinding::Simple("opt".to_string()),
+                template_resource: Resource::with_provider(
+                    "aws",
+                    "route53.Record",
+                    "validation_records",
+                    None,
+                ),
+            }),
+        });
+        let runtime_id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            None,
+        );
+
+        let inputs =
+            ApplyStateSaveInputs::new_for_test(Vec::new(), plan, SchemaRegistry::new(), None);
+        let comparison = inputs.comparisons.comparison_for(&runtime_id);
+
+        assert_eq!(comparison.owner_schema().owner(), "aws");
     }
 
     fn complete_create(state: State) -> Applied {

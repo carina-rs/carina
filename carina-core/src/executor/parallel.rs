@@ -7,9 +7,7 @@ use std::time::Instant;
 use crate::effect::Effect;
 #[cfg(test)]
 use crate::effect::deps::UnresolvedResource;
-#[cfg(test)]
-use crate::provider::Provider;
-use crate::provider::{AppliedIdentifier, CancelledCreateReport, ContextualProvider};
+use crate::provider::{AppliedIdentifier, CancelledCreateReport, Provider, ProviderRouter};
 #[cfg(test)]
 use crate::resource::Resource;
 use crate::resource::{ResourceId, ResourceIdentity};
@@ -237,7 +235,8 @@ pub(super) fn build_dependency_levels(
 }
 
 pub(super) async fn execute_effects_sequential<S: Clone>(
-    provider: &dyn ContextualProvider,
+    provider: &dyn Provider,
+    comparison_provider: &ProviderRouter,
     input: &mut RuntimeExecutionInput<'_, S>,
     observer: &dyn ExecutionObserver<S>,
     shutdown: &ShutdownToken,
@@ -554,6 +553,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                             basic,
                             &BasicEffectCtx {
                                 provider,
+                                comparison_provider,
                                 provider_check_inputs,
                                 runtime_authored,
                                 preparation: &preparation,
@@ -616,7 +616,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                                                         &provider_values,
                                                     );
                                                     super::read_data_source_with_retry(
-                                                        provider.provider(), &ready,
+                                                        provider, &ready,
                                                     )
                                                     .await
                                                     .map(|state| (resolved_attrs, state))
@@ -697,7 +697,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                             let binding = wait.identity().to_string();
                             let outcome = super::wait::execute_wait_effect(
                                 &cleanup_loop,
-                                provider.provider(),
+                                provider,
                                 wait,
                                 &identifier_resolver,
                                 wait_cancel_rx.expect("wait dispatch must have a cancel receiver"),
@@ -955,7 +955,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
         LoopStep::Abandon => true,
         LoopStep::Continue(cleanup_wait) => {
             let refresh = refresh_pending_states(
-                provider.provider(),
+                provider,
                 &mut accumulated,
                 &pending_refreshes,
                 observer,
@@ -1267,7 +1267,10 @@ mod tests {
                 UnresolvedResource::from_pre_resolve(alb.clone()),
             ),
         ]);
-        let schemas = SchemaRegistry::new();
+        let (schemas, comparison_provider) = crate::provider::comparison_fixture_for_test(
+            &SchemaRegistry::new(),
+            plan.effects().iter().map(Effect::resource_id),
+        );
         let mut input: RuntimeExecutionInput = ExecutionInput {
             plan: &plan,
             provider_check_inputs: ProviderCheckInputs::PlanNormalized {
@@ -1292,7 +1295,8 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             execute_effects_sequential(
-                &crate::provider::TestContextualProvider::new(&provider),
+                &provider,
+                &comparison_provider,
                 &mut input,
                 &observer,
                 &ShutdownToken::running(),
@@ -1390,7 +1394,10 @@ mod tests {
             "listener should depend on both alb and cert_issued; deps: {deps:?}"
         );
 
-        let schemas = SchemaRegistry::new();
+        let (schemas, comparison_provider) = crate::provider::comparison_fixture_for_test(
+            &SchemaRegistry::new(),
+            plan.effects().iter().map(Effect::resource_id),
+        );
         let mut input: RuntimeExecutionInput = ExecutionInput {
             plan: &plan,
             provider_check_inputs: ProviderCheckInputs::PlanNormalized {
@@ -1415,7 +1422,8 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             execute_effects_sequential(
-                &crate::provider::TestContextualProvider::new(&provider),
+                &provider,
+                &comparison_provider,
                 &mut input,
                 &observer,
                 &ShutdownToken::running(),

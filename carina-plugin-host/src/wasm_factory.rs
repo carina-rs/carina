@@ -718,6 +718,7 @@ enum WasmProviderInstanceError {
     InitializeValueEncode(SerializationError),
     InitializeCall(wasmtime::Error),
     Initialize(ProviderError),
+    InitializeReferenceScope(proto::ReferenceScopeError),
     ProtocolVersion(String),
 }
 
@@ -746,6 +747,12 @@ impl WasmProviderInstanceError {
                 wasm_trap_provider_error("initialize", error)
             }
             WasmProviderInstanceError::Initialize(error) => error,
+            WasmProviderInstanceError::InitializeReferenceScope(error) => {
+                ProviderError::invalid_input_caused_by(
+                    "provider returned an invalid reference scope from initialize",
+                    error,
+                )
+            }
             WasmProviderInstanceError::ProtocolVersion(message) => ProviderError::internal(message),
         }
     }
@@ -1437,7 +1444,11 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                             )),
                             Ok(vetted) => {
                                 if let Some(pending) = pending_egress.take() {
-                                    pending.dispatched();
+                                    if vetted.is_metadata {
+                                        pending.not_dispatched();
+                                    } else {
+                                        pending.dispatched();
+                                    }
                                 }
                                 let mut config = config;
                                 let cap = if vetted.is_metadata {
@@ -4188,7 +4199,8 @@ impl WasmProviderFactory {
 
         Ok(InitializedWasmInstance {
             instance: live,
-            reference_scope: wasm_convert::wit_to_core_reference_scope(reference_scope),
+            reference_scope: wasm_convert::wit_to_core_reference_scope(reference_scope)
+                .map_err(WasmProviderInstanceError::InitializeReferenceScope)?,
         })
     }
 
@@ -4405,12 +4417,15 @@ impl ProviderFactory for WasmProviderFactory {
                 .map_err(|error| {
                     error.into_provider_error_with(&self.instantiation_error_mapper)
                 })?;
-            let outcome = match instance.reference_scope().clone() {
-                proto::ReferenceScope::Available {
-                    partition,
-                    region,
-                    account,
-                } => initialize_outcome.available(partition, region, account),
+            let outcome = match instance.reference_scope() {
+                proto::ReferenceScope::Available(values) => initialize_outcome
+                    .available(values.partition(), values.region(), values.account())
+                    .map_err(|error| {
+                        ProviderError::internal_caused_by(
+                            "validated provider reference scope became invalid",
+                            error,
+                        )
+                    })?,
                 proto::ReferenceScope::Unavailable => InitializeOutcome::unavailable(),
             };
             let provider: Box<dyn Provider> = Box::new(WasmProvider {
@@ -4462,6 +4477,18 @@ struct PendingCreate {
     wit_id: wit_types::ResourceId,
     wit_request: wit_types::CreateRequest,
     pending: CorePendingCreate,
+}
+
+struct PendingCreateParts {
+    token: proto::PendingToken,
+    identifier: Option<AppliedIdentifier>,
+    sent: Sent,
+    poll_after_secs: u32,
+}
+
+struct PendingCreateBoundaryError {
+    safe_parts: PendingCreateParts,
+    error: ProviderError,
 }
 
 enum PendingResume {
@@ -4771,6 +4798,41 @@ impl WasmProvider {
         .for_resource(id.clone())
     }
 
+    fn validate_and_unpack_pending_create(
+        id: &ResourceId,
+        wit_request: &wit_types::CreateRequest,
+        pending: proto::PendingCreate<proto::PendingToken>,
+        expected_sent: Option<&Sent>,
+        detail: &'static str,
+    ) -> Result<PendingCreateParts, PendingCreateBoundaryError> {
+        let request_names = Self::create_request_attribute_names(wit_request);
+        let (token, identifier, mut sent, poll_after_secs) = pending.into_parts();
+        let same_sent = match expected_sent {
+            Some(expected) => &sent == expected,
+            None => true,
+        };
+        let valid_subset = sent.is_valid_for(&request_names);
+        if same_sent && valid_subset {
+            return Ok(PendingCreateParts {
+                token,
+                identifier,
+                sent,
+                poll_after_secs,
+            });
+        }
+
+        sent.clip_to(&request_names);
+        Err(PendingCreateBoundaryError {
+            safe_parts: PendingCreateParts {
+                token,
+                identifier,
+                sent,
+                poll_after_secs,
+            },
+            error: Self::create_boundary_error(id, detail),
+        })
+    }
+
     /// Turn a boundary decode failure that happened after a valid create
     /// identifier into the only safe classification: the resource was
     /// created, but its post-create observation could not be decoded.
@@ -4871,23 +4933,30 @@ impl WasmProvider {
         attempt: CreateAttempt,
         pending: proto::PendingCreate<proto::PendingToken>,
     ) -> Result<CorePendingCreate, CreateFailure> {
-        let request_names = Self::create_request_attribute_names(wit_request);
-        let (token, identifier, mut sent, poll_after_secs) = pending.into_parts();
-        let invalid_sent = !sent.is_valid_for(&request_names);
-        if invalid_sent {
-            sent.clip_to(&request_names);
-        }
+        let (parts, boundary_error) = match Self::validate_and_unpack_pending_create(
+            id,
+            wit_request,
+            pending,
+            None,
+            "pending sent attributes are not a subset of the request",
+        ) {
+            Ok(parts) => (parts, None),
+            Err(PendingCreateBoundaryError { safe_parts, error }) => (safe_parts, Some(error)),
+        };
+        let PendingCreateParts {
+            token,
+            identifier,
+            sent,
+            poll_after_secs,
+        } = parts;
         let pending = match identifier {
             Some(identifier) => attempt
                 .issued(identifier, sent)
                 .pending(token, poll_after_secs),
             None => attempt.pending(token, sent, poll_after_secs),
         };
-        if invalid_sent {
-            return Err(pending.preserve(Self::create_boundary_error(
-                id,
-                "pending sent attributes are not a subset of the request",
-            )));
+        if let Some(error) = boundary_error {
+            return Err(pending.preserve(error));
         }
         Ok(pending)
     }
@@ -4974,15 +5043,23 @@ impl WasmProvider {
         starting: PendingCreate,
         next: proto::PendingCreate<proto::PendingToken>,
     ) -> Result<PendingCreate, CreateFailure> {
-        let request_names = Self::create_request_attribute_names(&starting.wit_request);
-        let same_sent = next.sent() == starting.pending.sent();
-        if !same_sent || !next.sent().is_valid_for(&request_names) {
-            let error =
-                Self::create_boundary_error(&starting.id, "pending changed its sent attributes");
-            return Err(starting.pending.preserve(error));
-        }
+        let parts = match Self::validate_and_unpack_pending_create(
+            &starting.id,
+            &starting.wit_request,
+            next,
+            Some(starting.pending.sent()),
+            "pending changed its sent attributes",
+        ) {
+            Ok(parts) => parts,
+            Err(boundary) => return Err(starting.pending.preserve(boundary.error)),
+        };
         let poll = starting.pending.into_poll();
-        let (token, identifier, sent, poll_after_secs) = next.into_parts();
+        let PendingCreateParts {
+            token,
+            identifier,
+            sent,
+            poll_after_secs,
+        } = parts;
         let pending = match poll {
             CorePoll::Unissued(attempt) => match identifier {
                 Some(identifier) => attempt.issued(identifier).pending(token, poll_after_secs),
@@ -5103,17 +5180,23 @@ impl WasmProvider {
         starting: PendingResentCreate,
         next: proto::PendingCreate<proto::PendingToken>,
     ) -> Result<PendingResentCreate, ResumeFailure> {
-        let request_names = Self::create_request_attribute_names(&starting.wit_request);
-        let same_sent = next.sent() == starting.pending.sent();
-        if !same_sent || !next.sent().is_valid_for(&request_names) {
-            let error = Self::create_boundary_error(
-                &starting.id,
-                "resent pending changed its sent attributes",
-            );
-            return Err(starting.pending.preserve(error));
-        }
+        let parts = match Self::validate_and_unpack_pending_create(
+            &starting.id,
+            &starting.wit_request,
+            next,
+            Some(starting.pending.sent()),
+            "resent pending changed its sent attributes",
+        ) {
+            Ok(parts) => parts,
+            Err(boundary) => return Err(starting.pending.preserve(boundary.error)),
+        };
         let poll = starting.pending.into_poll();
-        let (token, identifier, sent, poll_after_secs) = next.into_parts();
+        let PendingCreateParts {
+            token,
+            identifier,
+            sent,
+            poll_after_secs,
+        } = parts;
         let pending = match poll {
             CoreResentPoll::Unissued(attempt) => match identifier {
                 Some(identifier) => attempt.issued(identifier).pending(token, poll_after_secs),
@@ -5334,14 +5417,22 @@ impl WasmProvider {
                 )));
             }
         };
-        let request_names = Self::create_request_attribute_names(wit_request);
-        if !pending.sent().is_valid_for(&request_names) {
-            return Err(attempt.preserve(Self::create_boundary_error(
-                id,
-                "resent pending attributes are not a subset of the request",
-            )));
-        }
-        let (token, identifier, sent, poll_after_secs) = pending.into_parts();
+        let parts = match Self::validate_and_unpack_pending_create(
+            id,
+            wit_request,
+            pending,
+            None,
+            "resent pending attributes are not a subset of the request",
+        ) {
+            Ok(parts) => parts,
+            Err(boundary) => return Err(attempt.preserve(boundary.error)),
+        };
+        let PendingCreateParts {
+            token,
+            identifier,
+            sent,
+            poll_after_secs,
+        } = parts;
         Ok(match identifier {
             Some(identifier) => attempt
                 .issued(identifier, sent)
@@ -9203,6 +9294,50 @@ mod tests {
             DestinationDenied::MetadataWithheld(address)
                 if address == IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))
         ));
+    }
+
+    #[tokio::test]
+    async fn metadata_request_then_guest_trap_is_untracked() {
+        use wasmtime_wasi::p2::Pollable;
+
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "test.metadata_probe",
+            "metadata-then-trap",
+            None,
+        );
+        let started = CreateAttempt::for_test(id).start_guest_call();
+        let mut hooks = AllowListHttpHooks::with_resolver(
+            local_provider_label("aws"),
+            Some(ProviderKind::Aws),
+            Arc::new(NeverResolver),
+        );
+        hooks.call_egress = Some(started.egress_recorder());
+        let request = hyper::Request::builder()
+            .uri("http://169.254.169.254/latest/meta-data/")
+            .body(empty_outgoing_body())
+            .unwrap();
+
+        let mut response = wasmtime_wasi_http::p2::WasiHttpHooks::send_request(
+            &mut hooks,
+            request,
+            test_outgoing_request_config(false),
+        )
+        .expect("AWS metadata requests pass host policy");
+        response.ready().await;
+        drop(response.unwrap_ready());
+
+        let failure = started
+            .finish()
+            .failed(ProviderError::internal(
+                "guest trapped after credential fetch",
+            ))
+            .await
+            .classify();
+        let CreateFailureKind::Untracked(error) = failure.into_kind() else {
+            panic!("a credential fetch must not make a later guest trap outcome-unknown")
+        };
+        assert_eq!(error.to_string(), "guest trapped after credential fetch");
     }
 
     #[test]

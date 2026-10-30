@@ -145,6 +145,7 @@ fn plan_for(
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &[],
+        &HashSet::new(),
     )
     .expect("test provider hints should succeed")
 }

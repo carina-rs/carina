@@ -186,11 +186,14 @@ fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
                     Some("west".to_string()),
                 ),
                 recorded: Some(carina_core::provider::ReferenceScope::Unavailable),
-                initialized: Some(carina_core::provider::ReferenceScope::Available {
-                    partition: "aws".to_string(),
-                    region: "us-west-2".to_string(),
-                    account: "123456789012".to_string(),
-                }),
+                initialized: Some(
+                    carina_core::provider::ReferenceScope::available(
+                        "aws",
+                        "us-west-2",
+                        "123456789012",
+                    )
+                    .expect("fixture scope is valid"),
+                ),
                 replan_command: "carina plan --out reviewed-plan.json infra".to_string(),
             },
         ),
@@ -283,7 +286,7 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
         "legacy".to_string(),
         HashMap::from([("name".to_string(), string_value("kept"))]),
     );
-    let result = detect_drift(
+    let result = detect_drift_for_test(
         &[resource],
         &[crate::commands::plan::ReloadedCurrentStateEntry::managed(
             id,
@@ -1991,26 +1994,6 @@ impl ProviderFactory for ApplyTimeReadFactory {
 
 struct ApplyTimeReadProvider {
     shared: ApplyTimeReadShared,
-}
-
-impl ComparisonProvider for ApplyTimeReadProvider {
-    fn operation_provider(&self) -> &dyn Provider {
-        self
-    }
-
-    fn comparison_context_for<'a>(
-        &'a self,
-        id: &ResourceId,
-        schema: carina_core::schema::OwnerBoundResourceSchema<'a>,
-    ) -> ProviderResult<carina_core::differ::ComparisonContext<'a>> {
-        assert_eq!(id.provider, schema.owner());
-        static SCOPE: carina_core::provider::ReferenceScope =
-            carina_core::provider::ReferenceScope::Unavailable;
-        Ok(carina_core::differ::ComparisonContext::for_test(
-            &SCOPE,
-            schema.reference_forms(),
-        ))
-    }
 }
 
 #[derive(Clone, Default)]
@@ -5684,26 +5667,6 @@ struct BootstrapRecordingProvider {
     behavior: BootstrapCreateBehavior,
 }
 
-impl ComparisonProvider for BootstrapRecordingProvider {
-    fn operation_provider(&self) -> &dyn Provider {
-        self
-    }
-
-    fn comparison_context_for<'a>(
-        &'a self,
-        id: &ResourceId,
-        schema: carina_core::schema::OwnerBoundResourceSchema<'a>,
-    ) -> ProviderResult<carina_core::differ::ComparisonContext<'a>> {
-        assert_eq!(id.provider, schema.owner());
-        static SCOPE: carina_core::provider::ReferenceScope =
-            carina_core::provider::ReferenceScope::Unavailable;
-        Ok(carina_core::differ::ComparisonContext::for_test(
-            &SCOPE,
-            schema.reference_forms(),
-        ))
-    }
-}
-
 impl Provider for BootstrapRecordingProvider {
     fn name(&self) -> &str {
         "aws"
@@ -5949,7 +5912,7 @@ async fn bootstrap_declared_state_bucket(
     let parsed = carina_core::parser::InferredFile::default();
     let provider_configs = empty_resolved_provider_configs();
 
-    create_checked_bootstrap_resource(
+    create_checked_bootstrap_resource_for_test(
         provider,
         resource.clone(),
         BootstrapCreateContext {
@@ -6217,7 +6180,7 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
     let parsed = carina_core::parser::InferredFile::default();
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
-    let error = create_checked_bootstrap_resource(
+    let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
@@ -6287,7 +6250,7 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
 
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
-    let error = create_checked_bootstrap_resource(
+    let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
@@ -6340,7 +6303,7 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
 
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
-    let result = create_checked_bootstrap_resource(
+    let result = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
@@ -6388,7 +6351,7 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
 
-    let error = create_checked_bootstrap_resource(
+    let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
@@ -6473,7 +6436,7 @@ async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
 
-    let error = create_checked_bootstrap_resource(
+    let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
@@ -6563,7 +6526,7 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
 
-    let error = create_checked_bootstrap_resource(
+    let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
@@ -6628,7 +6591,7 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
     );
     let provider_configs = empty_resolved_provider_configs();
 
-    let error = create_checked_bootstrap_resource(
+    let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {

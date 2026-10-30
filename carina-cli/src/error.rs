@@ -169,11 +169,12 @@ impl std::fmt::Display for SavedPlanProviderScopeMismatchError {
 
 fn reference_scope_summary(scope: Option<&ReferenceScope>) -> String {
     match scope {
-        Some(ReferenceScope::Available {
-            partition,
-            region,
-            account,
-        }) => format!("{partition}/{region}/{account}"),
+        Some(ReferenceScope::Available(values)) => format!(
+            "{}/{}/{}",
+            values.partition(),
+            values.region(),
+            values.account()
+        ),
         Some(ReferenceScope::Unavailable) => "unavailable".to_string(),
         None => "missing".to_string(),
     }
@@ -648,6 +649,11 @@ pub enum AppError {
     /// Provider errors (AWS API failures, timeouts, etc.)
     #[error(transparent)]
     Provider(#[from] ProviderError),
+
+    /// A resource's initialized provider and owner schema could not be paired
+    /// for type-aware comparison.
+    #[error(transparent)]
+    ComparisonResolution(#[from] carina_core::provider::ComparisonResolutionError),
 
     /// A module argument constraint became decidable during an operation.
     #[error(transparent)]

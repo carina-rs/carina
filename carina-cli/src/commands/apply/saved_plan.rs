@@ -1333,11 +1333,7 @@ mod tests {
     }
 
     fn available_scope(region: &str) -> ReferenceScope {
-        ReferenceScope::Available {
-            partition: "aws".to_string(),
-            region: region.to_string(),
-            account: "123456789012".to_string(),
-        }
+        ReferenceScope::available("aws", region, "123456789012").expect("fixture scope is valid")
     }
 
     fn named_scope_router(scopes: [(&str, ReferenceScope); 2]) -> ProviderRouter {

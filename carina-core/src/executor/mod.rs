@@ -1192,7 +1192,7 @@ pub async fn execute_live_plan(
     observer: &dyn ExecutionObserver,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome {
-    execute_runtime_plan(provider, input.into(), observer, shutdown).await
+    execute_runtime_plan(provider, provider, input.into(), observer, shutdown).await
 }
 
 /// Test-only execution entry point for focused provider fixtures without an
@@ -1205,8 +1205,7 @@ pub async fn execute_live_plan_for_test(
     observer: &dyn ExecutionObserver,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome {
-    let provider = crate::provider::TestContextualProvider::new(provider);
-    execute_runtime_plan(&provider, input.into(), observer, shutdown).await
+    execute_test_runtime_plan(provider, input, observer, shutdown).await
 }
 
 #[cfg(test)]
@@ -1219,8 +1218,7 @@ async fn execute_plan(
     observer: &dyn ExecutionObserver,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome {
-    let provider = crate::provider::TestContextualProvider::new(provider);
-    execute_runtime_plan(&provider, input.into(), observer, shutdown).await
+    execute_test_runtime_plan(provider, input, observer, shutdown).await
 }
 
 pub async fn execute_saved_plan(
@@ -1229,22 +1227,45 @@ pub async fn execute_saved_plan(
     observer: &dyn ExecutionObserver<SavedModuleSource>,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome<SavedModuleSource> {
-    execute_runtime_plan(provider, input.into(), observer, shutdown).await
+    execute_runtime_plan(provider, provider, input.into(), observer, shutdown).await
 }
 
 async fn execute_runtime_plan<S: Clone>(
-    provider: &dyn crate::provider::ContextualProvider,
+    provider: &dyn Provider,
+    comparison_provider: &crate::provider::ProviderRouter,
     mut input: RuntimeExecutionInput<'_, S>,
     observer: &dyn ExecutionObserver<S>,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome<S> {
-    let (result, was_cancelled) =
-        execute_effects_sequential(provider, &mut input, observer, &shutdown).await;
+    let (result, was_cancelled) = execute_effects_sequential(
+        provider,
+        comparison_provider,
+        &mut input,
+        observer,
+        &shutdown,
+    )
+    .await;
     if was_cancelled {
         ExecutionOutcome::Cancelled(result)
     } else {
         ExecutionOutcome::Completed(result)
     }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+async fn execute_test_runtime_plan(
+    provider: &dyn Provider,
+    input: LiveExecutionInput<'_>,
+    observer: &dyn ExecutionObserver,
+    shutdown: ShutdownToken,
+) -> ExecutionOutcome {
+    let (schemas, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        input.schemas,
+        input.plan.effects().iter().map(Effect::resource_id),
+    );
+    let mut input: RuntimeExecutionInput<'_> = input.into();
+    input.schemas = &schemas;
+    execute_runtime_plan(provider, &comparison_provider, input, observer, shutdown).await
 }
 
 #[cfg(test)]

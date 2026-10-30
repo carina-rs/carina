@@ -4983,11 +4983,8 @@ mod tests {
             changed_attributes: vec!["function_name".to_string()],
         });
         let historical = HistoricalDisplayAttributes::for_plan(&plan);
-        let scope = ReferenceScope::Available {
-            partition: "aws".to_string(),
-            region: "us-east-1".to_string(),
-            account: "123456789012".to_string(),
-        };
+        let scope = ReferenceScope::available("aws", "us-east-1", "123456789012")
+            .expect("fixture scope is valid");
         let comparison = ComparisonContext::for_test(&scope, &forms);
 
         let rows = build_detail_rows_by_instance_for_test(

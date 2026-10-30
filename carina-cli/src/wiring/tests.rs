@@ -4419,9 +4419,16 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
         &SchemaRegistry::new(),
     );
     assert!(resolution.claims.claims_to(&resource.id));
+    assert_eq!(
+        outcome_unknown_import_replacements(
+            &state_blocks,
+            &state_file,
+            std::slice::from_ref(&resource),
+        ),
+        std::collections::HashSet::from([resource.id.clone()]),
+    );
 
     let mut plan = Plan::new();
-    plan.add_error(PlanError::create_outcome_unknown(resource.id.clone()));
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
     add_state_block_effects(
@@ -4456,6 +4463,85 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
             kind: carina_core::plan::PlanErrorKind::CreateOutcomeUnknown { .. },
             ..
         }]
+    ));
+}
+
+#[test]
+fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
+    use carina_core::effect::Effect;
+    use carina_core::plan::{Plan, PlanError, PlanErrorKind};
+
+    let imported = Resource::with_provider(
+        "mock",
+        "test.Resource",
+        "shared",
+        Some("imported".to_string()),
+    );
+    let unknown_id = ResourceId::with_provider_identity(
+        "mock",
+        "test.Resource",
+        "shared",
+        Some("unknown".to_string()),
+    );
+    let state = carina_state::check_and_migrate(
+        &serde_json::json!({
+            "version": 20,
+            "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+            "serial": 1,
+            "lineage": "import-other-instance",
+            "carina_version": "test",
+            "resources": [{
+                "resource_type": "test.Resource",
+                "identity": "shared",
+                "provider": "mock",
+                "current": {
+                    "kind": "create_outcome_unknown",
+                    "started_at": "2026-10-23T08:00:00Z"
+                },
+                "directives": { "provider_instance": "unknown" }
+            }],
+            "exports": {}
+        })
+        .to_string(),
+    )
+    .unwrap()
+    .into_state();
+    let state_file = Some(state);
+    let state_blocks = vec![StateBlock::Import {
+        to: StateBlockAddress::new("mock", "test.Resource", "shared"),
+        id: Value::Concrete(ConcreteValue::String("provider-id".to_string().into())),
+    }];
+
+    assert!(
+        outcome_unknown_import_replacements(
+            &state_blocks,
+            &state_file,
+            std::slice::from_ref(&imported),
+        )
+        .is_empty(),
+        "the import target is vacant on its selected provider instance",
+    );
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resolved(imported.clone())));
+    plan.add_error(PlanError::create_outcome_unknown(unknown_id.clone()));
+    add_state_block_effects(
+        &mut plan,
+        &state_blocks,
+        &state_file,
+        &[],
+        std::slice::from_ref(&imported),
+        &carina_core::binding_index::ResolvedBindings::default(),
+        &std::collections::HashSet::new(),
+    );
+
+    assert!(matches!(plan.effects(), [Effect::Import { id, .. }] if id.as_inner() == &imported.id));
+    assert!(matches!(
+        plan.errors(),
+        [PlanError {
+            resource_id,
+            kind: PlanErrorKind::CreateOutcomeUnknown { resource },
+        }] if resource_id == &unknown_id && resource == &unknown_id
     ));
 }
 

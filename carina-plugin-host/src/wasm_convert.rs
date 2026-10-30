@@ -1343,7 +1343,9 @@ fn wit_to_core_resume_pending(
     })
 }
 
-pub(crate) fn wit_to_core_reference_scope(scope: wit::ReferenceScope) -> proto::ReferenceScope {
+pub(crate) fn wit_to_core_reference_scope(
+    scope: wit::ReferenceScope,
+) -> Result<proto::ReferenceScope, proto::ReferenceScopeError> {
     match scope {
         wit::ReferenceScope::Available(values) => {
             let wit::ReferenceScopeValues {
@@ -1351,13 +1353,9 @@ pub(crate) fn wit_to_core_reference_scope(scope: wit::ReferenceScope) -> proto::
                 region,
                 account,
             } = values;
-            proto::ReferenceScope::Available {
-                partition,
-                region,
-                account,
-            }
+            proto::ReferenceScope::available(partition, region, account)
         }
-        wit::ReferenceScope::Unavailable => proto::ReferenceScope::Unavailable,
+        wit::ReferenceScope::Unavailable => Ok(proto::ReferenceScope::Unavailable),
     }
 }
 
@@ -1989,16 +1987,30 @@ mod tests {
             account: "123456789012".to_string(),
         });
         assert_eq!(
-            wit_to_core_reference_scope(available),
-            proto::ReferenceScope::Available {
-                partition: "aws".to_string(),
-                region: "ap-northeast-1".to_string(),
-                account: "123456789012".to_string(),
-            }
+            wit_to_core_reference_scope(available).expect("valid scope must cross the boundary"),
+            proto::ReferenceScope::available("aws", "ap-northeast-1", "123456789012")
+                .expect("fixture scope is valid")
         );
         assert_eq!(
-            wit_to_core_reference_scope(wit::ReferenceScope::Unavailable),
+            wit_to_core_reference_scope(wit::ReferenceScope::Unavailable)
+                .expect("unavailable is always valid"),
             proto::ReferenceScope::Unavailable
+        );
+    }
+
+    #[test]
+    fn reference_scope_transport_rejects_invalid_guest_values() {
+        let invalid = wit::ReferenceScope::Available(wit::ReferenceScopeValues {
+            partition: "aws{name}".to_string(),
+            region: String::new(),
+            account: "123456789012".to_string(),
+        });
+
+        assert_eq!(
+            wit_to_core_reference_scope(invalid).unwrap_err(),
+            proto::ReferenceScopeError::ContainsBrace {
+                field: proto::ReferenceScopeField::Partition,
+            }
         );
     }
 

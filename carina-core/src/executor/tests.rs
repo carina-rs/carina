@@ -8372,6 +8372,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         &crate::provider::RawSavedAttrs::default().lift(&crate::schema::SchemaRegistry::new()),
         &HashMap::new(),
         &[],
+        &std::collections::HashSet::new(),
     )
     .expect("test provider hints should succeed");
     assert_eq!(plan.replace_display_info().count(), 2);

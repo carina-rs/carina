@@ -930,15 +930,11 @@ macro_rules! export_provider {
                 scope: proto::ReferenceScope,
             ) -> wit_types::ReferenceScope {
                 match scope {
-                    proto::ReferenceScope::Available {
-                        partition,
-                        region,
-                        account,
-                    } => wit_types::ReferenceScope::Available(
+                    proto::ReferenceScope::Available(values) => wit_types::ReferenceScope::Available(
                         wit_types::ReferenceScopeValues {
-                            partition,
-                            region,
-                            account,
+                            partition: values.partition().to_string(),
+                            region: values.region().to_string(),
+                            account: values.account().to_string(),
                         },
                     ),
                     proto::ReferenceScope::Unavailable => wit_types::ReferenceScope::Unavailable,
