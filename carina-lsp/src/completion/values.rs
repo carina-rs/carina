@@ -1944,7 +1944,7 @@ fn resolve_upstream_export_keys(
         source: std::path::PathBuf::from(source),
     };
     let (mut exports, _errors) =
-        carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+        carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
             base,
             &[upstream],
             &Default::default(),
@@ -2020,7 +2020,7 @@ fn infer_for_binding_type(
                 source: std::path::PathBuf::from(source),
             };
             let (mut resolved, _errors) =
-                carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+                carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
                     base,
                     &[upstream],
                     &Default::default(),

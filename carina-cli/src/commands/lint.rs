@@ -87,7 +87,7 @@ pub fn run_lint(
     // is more useful than aborting lint entirely. Full schema-backed
     // suggestions return once the blocking finding is fixed.
     if module_boundary_findings.is_empty() {
-        module_resolver::resolve_modules_with_config(
+        module_resolver::resolve_modules_with_providerless_config(
             &mut parsed,
             base_dir,
             provider_context,

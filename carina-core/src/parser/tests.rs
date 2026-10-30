@@ -8395,29 +8395,24 @@ fn provider_context_lookup_preserves_typed_custom_validation_errors() {
 }
 
 #[test]
-fn unloaded_provider_custom_types_report_the_typed_state_error() {
+fn schema_custom_type_validation_accepts_a_loaded_context_witness() {
     let owned = crate::parser::OwnedTypeIdentity::provider(
         "test",
         TypeIdentity::from_dotted("test.Widget.Id"),
     );
 
-    let error = validate_schema_custom_type(
+    validate_schema_custom_type(
         &owned,
         &Value::Concrete(ConcreteValue::String("widget-1".into())),
-        &ProviderContext::default(),
+        &crate::parser::LoadedProviderContext::empty_for_test(),
     )
-    .expect_err("provider annotations cannot be validated before providers are loaded");
-
-    assert!(matches!(
-        error,
-        crate::parser::CustomTypeValidationError::ProvidersNotLoaded
-    ));
+    .expect("the loaded fixture resolver accepts the annotation");
 }
 
 #[test]
 fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
     let identity = TypeIdentity::from_dotted("test.Widget.SecretId");
-    let config = ProviderContext {
+    let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
@@ -8426,7 +8421,7 @@ fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
             Box::new(|_target, _value| panic!("secret plaintext reached provider validation")),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     validate_schema_custom_type(
         &crate::parser::OwnedTypeIdentity::provider("test", identity),
@@ -8445,7 +8440,7 @@ fn provider_context_validator_receives_canonical_numeric_text() {
     let identity = TypeIdentity::bare("NumericBridge");
     let seen = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&seen);
-    let config = ProviderContext {
+    let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
@@ -8465,7 +8460,7 @@ fn provider_context_validator_receives_canonical_numeric_text() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     for value in [
         Value::Concrete(ConcreteValue::Int(-42)),
@@ -8532,7 +8527,7 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
         .expect("two value")
         .attr_type()
         .clone();
-    let config = ProviderContext {
+    let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([
                 crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
@@ -8565,7 +8560,7 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     validate_schema_custom_type(
         &crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
@@ -8605,7 +8600,7 @@ fn parse_custom_validator_rejects_invalid() {
     // Actually, let's test validate_custom_type directly to avoid grammar issues.
     let identity = TypeIdentity::bare("CustomType");
     let validator_identity = identity.clone();
-    let config = ProviderContext {
+    let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
@@ -8633,7 +8628,7 @@ fn parse_custom_validator_rejects_invalid() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     // Test validate_custom_type directly since the grammar may not accept
     // arbitrary type names. This verifies the custom validator is called.
@@ -11749,7 +11744,7 @@ fn parse_directory_files_preserves_sibling_resource_ref_rhs() {
 #[test]
 fn parse_directory_preserves_module_arg_dotted_string_literal() {
     use crate::config_loader::parse_directory;
-    use crate::module_resolver::resolve_modules;
+    use crate::module_resolver::resolve_modules_providerless as resolve_modules;
 
     let tmp = tempfile::tempdir().unwrap();
     let module_dir = tmp.path().join("uc");

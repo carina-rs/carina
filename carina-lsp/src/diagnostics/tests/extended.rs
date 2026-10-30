@@ -4692,6 +4692,64 @@ attributes {
 }
 
 #[test]
+fn orphan_export_dotted_unresolved_literal_mismatch_warns_without_loaded_providers() {
+    let engine = DiagnosticEngine::new(
+        Arc::new(SchemaRegistry::new()),
+        Vec::new(),
+        Arc::new(Vec::new()),
+    );
+    let doc = create_document(
+        r#"exports {
+  x: aws.AccountId = 42
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == Some(DiagnosticSeverity::WARNING)
+                && diagnostic
+                    .message
+                    .contains("expected aws.AccountId, got int")
+        }),
+        "providerless dotted export annotations must retain literal mismatch warnings: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn orphan_attribute_nested_dotted_unresolved_shape_mismatch_warns_without_loaded_providers() {
+    let engine = DiagnosticEngine::new(
+        Arc::new(SchemaRegistry::new()),
+        Vec::new(),
+        Arc::new(Vec::new()),
+    );
+    let doc = create_document(
+        r#"attributes {
+  x: map(aws.AccountId) = ['a']
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == Some(DiagnosticSeverity::WARNING)
+                && diagnostic
+                    .message
+                    .contains("expected map(aws.AccountId), got list")
+        }),
+        "providerless nested dotted attribute annotations must retain shape mismatch warnings: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn exports_type_warning_multiline_vs_oneline() {
     let engine = test_engine();
     // Multi-line (before format)
@@ -6255,13 +6313,26 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
     let path = fixture.path().join("main.crn");
     let document = create_document_at(source, path.clone());
     let resolver_input = document.parsed().expect("root parse").clone();
-    let report = carina_core::module_resolver::resolve_modules_with_diagnostics(
-        &resolver_input,
-        fixture.path(),
-        &engine.provider_context,
-        &engine.schemas,
-        &[],
-    );
+    let report = match &engine.provider_context {
+        DiagnosticProviderContext::Loaded(provider_context) => {
+            carina_core::module_resolver::resolve_modules_with_diagnostics(
+                &resolver_input,
+                fixture.path(),
+                provider_context,
+                &engine.schemas,
+                &[],
+            )
+        }
+        DiagnosticProviderContext::Unloaded(provider_context) => {
+            carina_core::module_resolver::resolve_modules_with_providerless_diagnostics(
+                &resolver_input,
+                fixture.path(),
+                provider_context,
+                &engine.schemas,
+                &[],
+            )
+        }
+    };
     let residuals = match report {
         carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
             panic!(

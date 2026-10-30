@@ -82,10 +82,10 @@ fn module_call_findings_for_test(
     let schemas = SchemaRegistry::new();
     let binding_use_report = check_bare_binding_uses(
         parsed,
-        &ValidationTypeContext::new(parsed, &schemas, provider_context, signatures),
+        &ValidationTypeContext::new_providerless(parsed, &schemas, provider_context, signatures),
     );
     let bindings = BindingIndex::from_parsed_with_module_signatures(parsed, &schemas, signatures);
-    check_module_calls(ModuleCallCheckInput {
+    check_module_calls_providerless(ModuleCallCheckInput {
         authored: parsed,
         semantic: Some(parsed),
         base_dir: Some(std::path::Path::new(".")),
@@ -799,8 +799,12 @@ fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
     let schemas = SchemaRegistry::new();
     let provider_context = ProviderContext::default();
     let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
-    let context =
-        ValidationTypeContext::new(&parsed, &schemas, &provider_context, &module_signatures);
+    let context = ValidationTypeContext::new_providerless(
+        &parsed,
+        &schemas,
+        &provider_context,
+        &module_signatures,
+    );
     let report = check_bare_binding_uses(&parsed, &context);
     let finding = report.findings().first().expect("binding-use finding");
     let detail = finding.error.to_string();
@@ -1124,7 +1128,7 @@ mock.test.Consumer { name = shared }
     let schemas = SchemaRegistry::new();
     let mut parsed = crate::config_loader::parse_directory(fixture.path(), &config)
         .expect("load module fixture");
-    crate::module_resolver::resolve_modules_with_config(
+    crate::module_resolver::resolve_modules_with_providerless_config(
         &mut parsed,
         fixture.path(),
         &config,
@@ -3899,7 +3903,12 @@ child { values = [vpc] }
     let schemas = SchemaRegistry::new();
     let report = check_bare_binding_uses(
         &parsed,
-        &ValidationTypeContext::new(&parsed, &schemas, &ProviderContext::default(), &signatures),
+        &ValidationTypeContext::new_providerless(
+            &parsed,
+            &schemas,
+            &ProviderContext::default(),
+            &signatures,
+        ),
     );
     assert!(!report.is_ready(), "fixture must produce a binding finding");
 
@@ -3951,7 +3960,12 @@ let child = child_module { value = forwarded }
     )]);
     let report = check_bare_binding_uses(
         &parsed,
-        &ValidationTypeContext::new(&parsed, &schemas, &ProviderContext::default(), &signatures),
+        &ValidationTypeContext::new_providerless(
+            &parsed,
+            &schemas,
+            &ProviderContext::default(),
+            &signatures,
+        ),
     );
     assert_eq!(report.findings().len(), 1, "unexpected report: {report:#?}");
     assert!(matches!(
@@ -3959,7 +3973,7 @@ let child = child_module { value = forwarded }
         BindingResolutionError::ReferenceType(_)
     ));
     let bindings = BindingIndex::from_parsed_with_module_signatures(&parsed, &schemas, &signatures);
-    let authored = check_module_calls(ModuleCallCheckInput {
+    let authored = check_module_calls_providerless(ModuleCallCheckInput {
         authored: &parsed,
         semantic: Some(&parsed),
         base_dir: None,

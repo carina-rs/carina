@@ -70,6 +70,7 @@ pub use functions::{
 };
 pub(crate) use functions::{
     custom_type_lookup_for_schema, evaluate_resolved_user_function, function_argument_as_eval,
+    validate_schema_custom_type_with_context,
 };
 pub use resolve::{
     ProviderConfigInvariantError, ProviderConfigResolutionError, ResolvedProviderConfig,

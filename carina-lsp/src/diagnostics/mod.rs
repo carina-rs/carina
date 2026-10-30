@@ -436,14 +436,24 @@ impl DiagnosticEngine {
             ));
         }
         let upstream_resolution = match (base_path, merged) {
-            (Some(base), Some(merged)) => Some(
-                carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
-                    base,
-                    &merged.upstream_states,
-                    &self.provider_context,
-                    Some(&self.schemas),
-                ),
-            ),
+            (Some(base), Some(merged)) => Some(match &self.provider_context {
+                DiagnosticProviderContext::Loaded(provider_context) => {
+                    carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+                        base,
+                        &merged.upstream_states,
+                        provider_context,
+                        Some(&self.schemas),
+                    )
+                }
+                DiagnosticProviderContext::Unloaded(provider_context) => {
+                    carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
+                        base,
+                        &merged.upstream_states,
+                        provider_context,
+                        Some(&self.schemas),
+                    )
+                }
+            }),
             _ => None,
         };
 
@@ -682,12 +692,24 @@ impl DiagnosticEngine {
             );
             let inference_bindings =
                 carina_core::validation::inference::bindings_from_parsed(binding_input);
-            let binding_type_context = carina_core::validation::ValidationTypeContext::new(
-                binding_input,
-                &self.schemas,
-                &self.provider_context,
-                &module_signatures,
-            );
+            let binding_type_context = match &self.provider_context {
+                DiagnosticProviderContext::Loaded(provider_context) => {
+                    carina_core::validation::ValidationTypeContext::new(
+                        binding_input,
+                        &self.schemas,
+                        provider_context,
+                        &module_signatures,
+                    )
+                }
+                DiagnosticProviderContext::Unloaded(provider_context) => {
+                    carina_core::validation::ValidationTypeContext::new_providerless(
+                        binding_input,
+                        &self.schemas,
+                        provider_context,
+                        &module_signatures,
+                    )
+                }
+            };
             let binding_use_report = carina_core::validation::check_bare_binding_uses(
                 binding_input,
                 &binding_type_context,
@@ -797,19 +819,40 @@ impl DiagnosticEngine {
                     },
                     None => &[],
                 };
-            let authored_findings = carina_core::validation::check_module_calls(
-                carina_core::validation::ModuleCallCheckInput {
-                    authored: parsed,
-                    semantic: merged,
-                    base_dir: base_path,
-                    imported_signatures: &module_signatures,
-                    provider_context: &self.provider_context,
-                    schemas: &self.schemas,
-                    binding_use_report: &binding_use_report,
-                    bindings: &binding_index,
-                    reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
-                },
-            );
+            let authored_findings = match &self.provider_context {
+                DiagnosticProviderContext::Loaded(provider_context) => {
+                    carina_core::validation::check_module_calls(
+                        carina_core::validation::ModuleCallCheckInput {
+                            authored: parsed,
+                            semantic: merged,
+                            base_dir: base_path,
+                            imported_signatures: &module_signatures,
+                            provider_context,
+                            schemas: &self.schemas,
+                            binding_use_report: &binding_use_report,
+                            bindings: &binding_index,
+                            reference_checks:
+                                carina_core::validation::ModuleCallReferenceChecks::Enabled,
+                        },
+                    )
+                }
+                DiagnosticProviderContext::Unloaded(provider_context) => {
+                    carina_core::validation::check_module_calls_providerless(
+                        carina_core::validation::ModuleCallCheckInput {
+                            authored: parsed,
+                            semantic: merged,
+                            base_dir: base_path,
+                            imported_signatures: &module_signatures,
+                            provider_context,
+                            schemas: &self.schemas,
+                            binding_use_report: &binding_use_report,
+                            bindings: &binding_index,
+                            reference_checks:
+                                carina_core::validation::ModuleCallReferenceChecks::Enabled,
+                        },
+                    )
+                }
+            };
             let compositions = expanded_compositions.unwrap_or(&[]);
             let expanded_binding_findings = match expanded_compositions {
                 Some(compositions) => carina_core::validation::check_expanded_module_calls(

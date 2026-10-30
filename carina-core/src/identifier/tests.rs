@@ -546,7 +546,7 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
     let error = crate::validation::resolve_bare_binding_uses(
         parsed,
         &SchemaRegistry::new(),
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::LoadedProviderContext::empty_for_test(),
         &crate::module_resolver::ResolvedModuleSignatures::default(),
     )
     .expect_err("bare handles must never reach identity hashing");

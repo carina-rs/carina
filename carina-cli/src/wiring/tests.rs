@@ -355,7 +355,7 @@ query {}
     let config = carina_core::parser::ProviderContext::default();
     let mut parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
         .expect("root fixture must parse");
-    carina_core::module_resolver::resolve_modules_with_config(
+    carina_core::module_resolver::resolve_modules_with_providerless_config(
         &mut parsed,
         &root_dir,
         &config,
@@ -444,7 +444,7 @@ outer {{}}
     let config = carina_core::parser::ProviderContext::default();
     let mut parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
         .expect("root fixture must parse");
-    carina_core::module_resolver::resolve_modules_with_config(
+    carina_core::module_resolver::resolve_modules_with_providerless_config(
         &mut parsed,
         &root_dir,
         &config,
@@ -6745,8 +6745,8 @@ fn validate_resources_with_ctx_returns_each_error_as_app_error() {
     let mut parsed = ParsedFile::default();
     parsed.resources = vec![r1, r2];
 
-    let provider_ctx = carina_core::parser::ProviderContext::default();
-    let errors = validate_resources_with_ctx(&ctx, &parsed, &provider_ctx);
+    let provider_ctx = ctx.provider_context();
+    let errors = validate_resources_with_ctx(&ctx, &parsed, provider_ctx);
     assert_eq!(errors.len(), 2, "got {errors:?}");
     for err in &errors {
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -7574,7 +7574,7 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
 fn module_checker_and_provider_wrappers_accept_empty_input() {
     let ctx = WiringContext::new_for_test(vec![], &[]);
     let parsed = ParsedFile::default();
-    let provider_ctx = carina_core::parser::ProviderContext::default();
+    let provider_ctx = ctx.provider_context();
 
     let errors = validate_provider_region_with_ctx(&ctx, &parsed);
     assert!(errors.is_empty(), "provider_region: got {errors:?}");
@@ -7585,7 +7585,7 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
         &carina_core::validation::ValidationTypeContext::new(
             &parsed,
             ctx.schemas(),
-            &provider_ctx,
+            provider_ctx,
             &module_signatures,
         ),
     );
@@ -7600,7 +7600,7 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
             semantic: Some(&parsed),
             base_dir: Some(std::path::Path::new(".")),
             imported_signatures: &module_signatures,
-            provider_context: &provider_ctx,
+            provider_context: provider_ctx,
             schemas: ctx.schemas(),
             binding_use_report: &binding_use_report,
             bindings: &bindings,

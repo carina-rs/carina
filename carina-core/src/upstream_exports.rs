@@ -18,7 +18,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
-use crate::parser::{ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState};
+use crate::parser::{
+    LoadedProviderContext, ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState,
+};
 use crate::resource::{DeferredValue, Subscript, Value};
 use crate::schema::suggest_similar_name;
 
@@ -177,9 +179,19 @@ impl UpstreamRefDiagnostic for UpstreamFieldError {
 pub fn resolve_upstream_exports(
     base_dir: &Path,
     upstream_states: &[UpstreamState],
-    config: &ProviderContext,
+    config: &LoadedProviderContext,
 ) -> (UpstreamExports, Vec<UpstreamResolveError>) {
     resolve_upstream_exports_with_schemas(base_dir, upstream_states, config, None)
+}
+
+/// Bootstrap/discovery variant of [`resolve_upstream_exports`]. Module value
+/// checks are limited to provider-independent types.
+pub fn resolve_upstream_exports_providerless(
+    base_dir: &Path,
+    upstream_states: &[UpstreamState],
+    config: &ProviderContext,
+) -> (UpstreamExports, Vec<UpstreamResolveError>) {
+    resolve_upstream_exports_providerless_with_schemas(base_dir, upstream_states, config, None)
 }
 
 /// As [`resolve_upstream_exports`], but consult `schemas` to infer
@@ -192,9 +204,40 @@ pub fn resolve_upstream_exports(
 pub fn resolve_upstream_exports_with_schemas(
     base_dir: &Path,
     upstream_states: &[UpstreamState],
+    config: &LoadedProviderContext,
+    schemas: Option<&crate::schema::SchemaRegistry>,
+) -> (UpstreamExports, Vec<UpstreamResolveError>) {
+    resolve_upstream_exports_with_context(
+        base_dir,
+        upstream_states,
+        crate::validation::typecheck::TypecheckProviderContext::loaded(config),
+        schemas,
+    )
+}
+
+/// Bootstrap/discovery variant of
+/// [`resolve_upstream_exports_with_schemas`].
+pub fn resolve_upstream_exports_providerless_with_schemas(
+    base_dir: &Path,
+    upstream_states: &[UpstreamState],
     config: &ProviderContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
 ) -> (UpstreamExports, Vec<UpstreamResolveError>) {
+    resolve_upstream_exports_with_context(
+        base_dir,
+        upstream_states,
+        crate::validation::typecheck::TypecheckProviderContext::providerless(config),
+        schemas,
+    )
+}
+
+fn resolve_upstream_exports_with_context(
+    base_dir: &Path,
+    upstream_states: &[UpstreamState],
+    provider_context: crate::validation::typecheck::TypecheckProviderContext<'_>,
+    schemas: Option<&crate::schema::SchemaRegistry>,
+) -> (UpstreamExports, Vec<UpstreamResolveError>) {
+    let config = provider_context.as_provider_context();
     let mut out: UpstreamExports = HashMap::new();
     let mut errors: Vec<UpstreamResolveError> = Vec::new();
     for us in upstream_states {
@@ -228,12 +271,23 @@ pub fn resolve_upstream_exports_with_schemas(
                 // here matches what the CLI sees post-expansion.
                 let empty_schemas = crate::schema::SchemaRegistry::new();
                 let expansion_schemas = schemas.unwrap_or(&empty_schemas);
-                if let Err(reason) = crate::module_resolver::resolve_upstream_modules_with_config(
-                    &mut parsed,
-                    &source_abs,
-                    config,
-                    expansion_schemas,
-                ) {
+                let module_resolution = match provider_context.loaded_context() {
+                    Some(loaded) => crate::module_resolver::resolve_upstream_modules_with_config(
+                        &mut parsed,
+                        &source_abs,
+                        loaded,
+                        expansion_schemas,
+                    ),
+                    None => {
+                        crate::module_resolver::resolve_upstream_modules_with_providerless_config(
+                            &mut parsed,
+                            &source_abs,
+                            config,
+                            expansion_schemas,
+                        )
+                    }
+                };
+                if let Err(reason) = module_resolution {
                     errors.push(UpstreamResolveError {
                         binding: us.binding.clone(),
                         source: us.source.clone(),
@@ -1089,8 +1143,8 @@ mod tests {
         fs::write(dir.join(name), body).unwrap();
     }
 
-    fn ctx() -> ProviderContext {
-        ProviderContext::default()
+    fn ctx() -> LoadedProviderContext {
+        LoadedProviderContext::empty_for_test()
     }
 
     fn upstream(binding: &str, source: &str) -> UpstreamState {
@@ -3976,7 +4030,7 @@ exports { out: Int = instance.out }
     }
 
     #[test]
-    fn upstream_module_unknown_consumer_custom_type_is_unchecked() {
+    fn providerless_upstream_module_unknown_consumer_custom_type_is_unchecked() {
         let tmp = tempfile::tempdir().unwrap();
         let upstream_dir = tmp.path().join("upstream");
         let module_dir = upstream_dir.join("module");
@@ -3995,10 +4049,10 @@ exports { out: String = instance.out }
 "#,
         );
 
-        let (exports, errors) = resolve_upstream_exports_with_schemas(
+        let (exports, errors) = resolve_upstream_exports_providerless_with_schemas(
             tmp.path(),
             &[upstream("ups", "upstream")],
-            &ctx(),
+            &ProviderContext::default(),
             Some(&crate::schema::SchemaRegistry::new()),
         );
 

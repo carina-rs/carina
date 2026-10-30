@@ -201,7 +201,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 default_line: call_line,
                 caller_source_file: call_source_file,
                 binding_index,
-                config: self.config,
+                config: self.config(),
             };
             for arg in &module.arguments {
                 // Call-site expressions are evaluated in the caller's scope,
@@ -265,7 +265,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             default_line: call_line,
             caller_source_file: call_source_file,
             binding_index,
-            config: self.config,
+            config: self.config(),
         };
         let argument_values: HashMap<String, Value> = resolved_arguments
             .iter()
@@ -283,7 +283,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 ArgumentOrigin::Defaulted => call_line,
             };
             let Some(resolved_parameter) =
-                crate::validation::resolve_parameter_type_for_check(&arg.type_expr, self.config)
+                crate::validation::resolve_parameter_type_for_check(&arg.type_expr, self.config())
                     .map_err(|message| {
                         ModuleError::Parse(ParseError::InvalidExpression { line, message })
                     })?
@@ -312,17 +312,17 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .value()
                 .expect("value-shaped module argument was matched above");
             let resolved_type = resolved_parameter.as_type_expr();
-            crate::validation::typecheck::check_type_expr_value_with_context(
+            if let Some(result) = self.provider_context.check_if_available(
                 &resolved_type,
                 value,
-                self.config,
                 crate::validation::typecheck::TypecheckInference::Unavailable,
-            )
-            .map_err(|mismatch| ModuleError::InvalidArgumentType {
-                module: call.module_name.clone(),
-                argument: arg.name.clone(),
-                mismatch,
-            })?;
+            ) {
+                result.map_err(|mismatch| ModuleError::InvalidArgumentType {
+                    module: call.module_name.clone(),
+                    argument: arg.name.clone(),
+                    mismatch,
+                })?;
+            }
         }
 
         // Collect and evaluate argument-local validations and module-level
@@ -527,7 +527,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 &intra_module_bindings,
                 argument_substitutions,
                 &expanded_call,
-                self.config,
+                self.provider_context,
                 resolved_bindings,
             )
             .map_err(contextualize_access_error)?;
@@ -1529,7 +1529,7 @@ fn prefix_module_composition(
     intra_module_bindings: &HashSet<String>,
     arguments: ArgumentSubstitutions<'_>,
     root_call: &CompositionCall,
-    config: &crate::parser::ProviderContext,
+    config: crate::validation::typecheck::TypecheckProviderContext<'_>,
     resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
 ) -> Result<LiveComposition, ArgumentSubstitutionError> {
     let mut new_virtual = composition.clone();
@@ -1718,19 +1718,20 @@ fn settle_prefixed_composition_constraints(
 fn check_composition_argument_type(
     parameter: &str,
     argument: &crate::resource::LiveCompositionArgument,
-    config: &crate::parser::ProviderContext,
+    config: crate::validation::typecheck::TypecheckProviderContext<'_>,
     line: usize,
 ) -> Result<(), ArgumentSubstitutionError> {
     let declared_type = argument.declared_type();
-    let Some(resolved_parameter) =
-        crate::validation::resolve_parameter_type_for_check(declared_type, config).map_err(
-            |message| ArgumentSubstitutionError {
-                source_file: None,
-                line,
-                message,
-                parse_error: None,
-            },
-        )?
+    let Some(resolved_parameter) = crate::validation::resolve_parameter_type_for_check(
+        declared_type,
+        config.as_provider_context(),
+    )
+    .map_err(|message| ArgumentSubstitutionError {
+        source_file: None,
+        line,
+        message,
+        parse_error: None,
+    })?
     else {
         return Ok(());
     };
@@ -1747,13 +1748,14 @@ fn check_composition_argument_type(
         return Ok(());
     }
 
-    crate::validation::typecheck::check_type_expr_value_with_context(
+    let Some(result) = config.check_if_available(
         &resolved_parameter.as_type_expr(),
         argument.value(),
-        config,
         crate::validation::typecheck::TypecheckInference::Unavailable,
-    )
-    .map_err(|mismatch| ArgumentSubstitutionError {
+    ) else {
+        return Ok(());
+    };
+    result.map_err(|mismatch| ArgumentSubstitutionError {
         source_file: None,
         line,
         message: format!("parameter '{parameter}': {mismatch}"),

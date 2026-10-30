@@ -544,7 +544,27 @@ pub fn validate_custom_type(
 
 /// Validate an authored provider schema annotation against every owner that
 /// declares its semantic identity.
+///
+/// ```compile_fail
+/// use carina_core::parser::{
+///     OwnedTypeIdentity, ProviderContext, validate_schema_custom_type,
+/// };
+/// use carina_core::resource::{ConcreteValue, Value};
+/// use carina_core::schema::TypeIdentity;
+///
+/// let owned = OwnedTypeIdentity::provider("test", TypeIdentity::bare("Id"));
+/// let value = Value::Concrete(ConcreteValue::String("id".into()));
+/// let _ = validate_schema_custom_type(&owned, &value, &ProviderContext::default());
+/// ```
 pub fn validate_schema_custom_type(
+    owned: &crate::parser::OwnedTypeIdentity,
+    value: &Value,
+    config: &crate::parser::LoadedProviderContext,
+) -> Result<(), crate::parser::CustomTypeValidationError> {
+    validate_schema_custom_type_with_context(owned, value, config)
+}
+
+pub(crate) fn validate_schema_custom_type_with_context(
     owned: &crate::parser::OwnedTypeIdentity,
     value: &Value,
     config: &ProviderContext,

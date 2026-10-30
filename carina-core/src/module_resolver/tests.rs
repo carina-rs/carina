@@ -24,7 +24,7 @@ use crate::resource::{
 use crate::schema::TypeIdentity;
 
 fn resolve_modules(parsed: &mut ParsedFile, base_dir: &std::path::Path) -> Result<(), ModuleError> {
-    super::resolve_modules(parsed, base_dir)
+    super::resolve_modules_providerless(parsed, base_dir)
 }
 
 fn resolve_modules_with_config(
@@ -33,7 +33,7 @@ fn resolve_modules_with_config(
     config: &ProviderContext,
     schemas: &crate::schema::SchemaRegistry,
 ) -> Result<(), ModuleError> {
-    super::resolve_modules_with_config(parsed, base_dir, config, schemas)
+    super::resolve_modules_with_providerless_config(parsed, base_dir, config, schemas)
 }
 
 fn reconcile_anonymous_module_instances(
@@ -77,7 +77,7 @@ fn resolver_error_from_parsed_call_retains_call_identity() {
         "fixture must pin the authored call range",
     );
 
-    let error = super::resolve_modules_with_config(
+    let error = super::resolve_modules_with_providerless_config(
         &mut parsed,
         base.path(),
         &ProviderContext::default(),

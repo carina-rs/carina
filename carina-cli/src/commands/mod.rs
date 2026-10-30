@@ -1468,7 +1468,7 @@ child { values = [source] }
         let schemas = carina_core::schema::SchemaRegistry::new();
         let report = carina_core::validation::check_bare_binding_uses(
             &parsed,
-            &carina_core::validation::ValidationTypeContext::new(
+            &carina_core::validation::ValidationTypeContext::new_providerless(
                 &parsed,
                 &schemas,
                 &ProviderContext::default(),

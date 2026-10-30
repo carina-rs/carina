@@ -812,7 +812,7 @@ fn resolve_file_binding_uses<E>(
     base_dir: &Path,
     context: &WiringContext,
 ) -> Result<carina_core::validation::ResolvedFile<E>, AppError> {
-    let provider_context = context.provider_context().as_provider_context();
+    let provider_context = context.provider_context();
     let module_signatures =
         module_resolver::load_resolved_module_signatures(&file, base_dir, provider_context);
     carina_core::validation::resolve_bare_binding_uses(

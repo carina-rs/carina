@@ -1138,28 +1138,62 @@ impl DiagnosticEngine {
             base_path,
             &self.provider_context,
         );
-        let binding_use_report = carina_core::validation::check_bare_binding_uses(
-            parsed,
-            &carina_core::validation::ValidationTypeContext::new(
-                parsed,
-                &self.schemas,
-                &self.provider_context,
-                &signatures,
-            ),
-        );
+        let validation_context = match &self.provider_context {
+            super::DiagnosticProviderContext::Loaded(provider_context) => {
+                carina_core::validation::ValidationTypeContext::new(
+                    parsed,
+                    &self.schemas,
+                    provider_context,
+                    &signatures,
+                )
+            }
+            super::DiagnosticProviderContext::Unloaded(provider_context) => {
+                carina_core::validation::ValidationTypeContext::new_providerless(
+                    parsed,
+                    &self.schemas,
+                    provider_context,
+                    &signatures,
+                )
+            }
+        };
+        let binding_use_report =
+            carina_core::validation::check_bare_binding_uses(parsed, &validation_context);
         let bindings =
             BindingIndex::from_parsed_with_module_signatures(parsed, &self.schemas, &signatures);
-        carina_core::validation::check_module_calls(carina_core::validation::ModuleCallCheckInput {
-            authored: parsed,
-            semantic: Some(parsed),
-            base_dir: Some(base_path),
-            imported_signatures: &signatures,
-            provider_context: &self.provider_context,
-            schemas: &self.schemas,
-            binding_use_report: &binding_use_report,
-            bindings: &bindings,
-            reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
-        })
+        match &self.provider_context {
+            super::DiagnosticProviderContext::Loaded(provider_context) => {
+                carina_core::validation::check_module_calls(
+                    carina_core::validation::ModuleCallCheckInput {
+                        authored: parsed,
+                        semantic: Some(parsed),
+                        base_dir: Some(base_path),
+                        imported_signatures: &signatures,
+                        provider_context,
+                        schemas: &self.schemas,
+                        binding_use_report: &binding_use_report,
+                        bindings: &bindings,
+                        reference_checks:
+                            carina_core::validation::ModuleCallReferenceChecks::Enabled,
+                    },
+                )
+            }
+            super::DiagnosticProviderContext::Unloaded(provider_context) => {
+                carina_core::validation::check_module_calls_providerless(
+                    carina_core::validation::ModuleCallCheckInput {
+                        authored: parsed,
+                        semantic: Some(parsed),
+                        base_dir: Some(base_path),
+                        imported_signatures: &signatures,
+                        provider_context,
+                        schemas: &self.schemas,
+                        binding_use_report: &binding_use_report,
+                        bindings: &bindings,
+                        reference_checks:
+                            carina_core::validation::ModuleCallReferenceChecks::Enabled,
+                    },
+                )
+            }
+        }
     }
 
     /// Run a directory-scoped parse with the current editor buffer substituted
@@ -1193,13 +1227,26 @@ impl DiagnosticEngine {
         // Module expansion is a no-op for configs without `module_call`.
         // Failures retain the authored parse for source-level checks; only the
         // successful outcome can replace it with the expanded graph.
-        let module_resolution = carina_core::module_resolver::resolve_modules_with_diagnostics(
-            &result.parsed,
-            base_path,
-            &self.provider_context,
-            &self.schemas,
-            &covered_findings,
-        );
+        let module_resolution = match &self.provider_context {
+            super::DiagnosticProviderContext::Loaded(provider_context) => {
+                carina_core::module_resolver::resolve_modules_with_diagnostics(
+                    &result.parsed,
+                    base_path,
+                    provider_context,
+                    &self.schemas,
+                    &covered_findings,
+                )
+            }
+            super::DiagnosticProviderContext::Unloaded(provider_context) => {
+                carina_core::module_resolver::resolve_modules_with_providerless_diagnostics(
+                    &result.parsed,
+                    base_path,
+                    provider_context,
+                    &self.schemas,
+                    &covered_findings,
+                )
+            }
+        };
         let module_resolution = match module_resolution {
             carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
                 result.parsed = *graph;
@@ -1526,12 +1573,24 @@ impl DiagnosticEngine {
             &overrides,
         )
         .ok()?;
-        let module_resolution_failed = carina_core::module_resolver::resolve_modules_with_config(
-            &mut merged,
-            base_path,
-            &self.provider_context,
-            &self.schemas,
-        )
+        let module_resolution_failed = match &self.provider_context {
+            super::DiagnosticProviderContext::Loaded(provider_context) => {
+                carina_core::module_resolver::resolve_modules_with_config(
+                    &mut merged,
+                    base_path,
+                    provider_context,
+                    &self.schemas,
+                )
+            }
+            super::DiagnosticProviderContext::Unloaded(provider_context) => {
+                carina_core::module_resolver::resolve_modules_with_providerless_config(
+                    &mut merged,
+                    base_path,
+                    provider_context,
+                    &self.schemas,
+                )
+            }
+        }
         .is_err();
         if module_resolution_failed {
             // The primary diagnostics pass owns the module error. A provider
