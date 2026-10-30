@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "test.server_added_list",
-      "identity": "target",
+      "identity": "mock_test_server_added_list_e646b73c",
       "provider": "mock",
       "identifier": "mock-id",
       "attributes": {
@@ -30,7 +30,7 @@
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "binding": "target",
+      "binding": null,
       "dependency_bindings": [],
       "explicit": {
         "kind": "struct",

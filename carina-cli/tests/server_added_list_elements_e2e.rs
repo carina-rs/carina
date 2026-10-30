@@ -124,7 +124,7 @@ impl Scenario {
         fs::write(
             self.project.join("main.crn"),
             format!(
-                "let target = mock.test.server_added_list {{\n  name        = 'target'\n  description = '{description}'\n{blocks}}}\n"
+                "mock.test.server_added_list {{\n  name        = 'target'\n  description = '{description}'\n{blocks}}}\n"
             ),
         )
         .expect("rewrite authored list value");

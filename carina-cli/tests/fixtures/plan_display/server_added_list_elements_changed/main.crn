@@ -1,4 +1,4 @@
-let target = mock.test.server_added_list {
+mock.test.server_added_list {
   name = 'target'
 
   target_group_attribute {
