@@ -210,7 +210,7 @@ fn warning_after_bars_yields_single_blank_line_on_pty() {
         "backend local { path = \"carina.state.json\" }\n\
          provider mock {}\n\
          mock.test.resource { name = \"r1\" }\n\
-         for x in [\"a\", \"b\"] {\n\
+         let resources = for x in [\"a\", \"b\"] {\n\
          \u{20}\u{20}mock.test.resource { name = \"static\" }\n\
          }\n",
     );

@@ -32,6 +32,26 @@ plan-anonymous-old-identity-name-override:
 	$(PLAN_FIXTURE) anonymous_old_identity_name_override
 plan-anonymous-old-identity-update:
 	$(PLAN_FIXTURE) anonymous_old_identity_update
+plan-anonymous-loop-insert-before:
+	$(PLAN_FIXTURE) anonymous_loop_insert_before
+plan-anonymous-loop-reorder:
+	$(PLAN_FIXTURE) anonymous_loop_reorder
+plan-anonymous-loop-delete-earlier:
+	$(PLAN_FIXTURE) anonymous_loop_delete_earlier
+plan-anonymous-loop-sibling-files:
+	$(PLAN_FIXTURE) anonymous_loop_sibling_files
+plan-anonymous-loop-same-tail:
+	$(PLAN_FIXTURE) anonymous_loop_same_tail
+plan-anonymous-if-legacy:
+	$(PLAN_FIXTURE) anonymous_if_legacy
+plan-anonymous-loop-deferred-map:
+	$(PLAN_FIXTURE) anonymous_loop_deferred_map
+plan-anonymous-loop-module-call:
+	$(PLAN_FIXTURE) anonymous_loop_module_call
+plan-anonymous-loop-claimed-legacy:
+	$(PLAN_FIXTURE) anonymous_loop_claimed_legacy
+plan-anonymous-loop-new-id-exists:
+	$(PLAN_FIXTURE) anonymous_loop_new_id_exists
 plan-replace-with-non-forcing-diffs:
 	$(PLAN_FIXTURE) replace_with_non_forcing_diffs
 plan-delete:
@@ -357,6 +377,11 @@ plan-multi-instance-module:
 .PHONY: plan-image plan-all-create plan-no-changes plan-empty-explicit-children-no-changes plan-no-changes-enum plan-dynamic-enum-az-no-diff plan-route53-hosted-zone-name-strip-suffix-no-diff plan-mixed plan-image-module-cascade plan-image-reference-layout plan-image-anonymous plan-delete plan-deposed-delete plan-deposed-delete-update-dependency plan-delete-list-of-maps plan-compact plan-import-deferred-interpolation \
         plan-map-diff plan-replace-create-only plan-anonymous-create-only-rekey \
         plan-anonymous-old-identity-name-override plan-anonymous-old-identity-update \
+        plan-anonymous-loop-insert-before plan-anonymous-loop-reorder \
+        plan-anonymous-loop-delete-earlier plan-anonymous-loop-sibling-files \
+        plan-anonymous-loop-same-tail plan-anonymous-if-legacy \
+        plan-anonymous-loop-deferred-map plan-anonymous-loop-module-call \
+        plan-anonymous-loop-claimed-legacy plan-anonymous-loop-new-id-exists \
         plan-replace-with-non-forcing-diffs \
         plan-list-diff-added-struct plan-list-diff-removed-struct \
         plan-list-diff-modified-with-unchanged \

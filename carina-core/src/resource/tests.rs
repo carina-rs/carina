@@ -2433,6 +2433,7 @@ fn resource_module_source_typed_field() {
             instance: "web".to_string(),
             module_source: Some("./web".to_string()),
             module_directory: None,
+            loop_origin: None,
         }),
     );
     let resource =
@@ -2456,6 +2457,7 @@ fn live_module_source_equality_and_hash_use_call_path_identity() {
             instance: "fixture_0000000000000000".to_string(),
             module_source: Some("./fixture".to_string()),
             module_directory: None,
+            loop_origin: None,
         };
         ModuleSource::expanded_module(
             "fixture",
@@ -2484,6 +2486,7 @@ fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_
         instance: "instance".to_string(),
         module_source: Some("./fixture".to_string()),
         module_directory: None,
+        loop_origin: None,
     };
     let live = ModuleSource::expanded_module(
         "fixture",

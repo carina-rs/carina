@@ -515,6 +515,9 @@ pub struct CompositionCall {
     pub instance: String,
     pub module_source: Option<String>,
     pub module_directory: Option<PathBuf>,
+    /// Validation-only origin when an unbound loop produced this call.
+    #[doc(hidden)]
+    pub loop_origin: Option<Box<super::LoopElementOrigin>>,
 }
 
 impl PartialEq for CompositionCall {
@@ -532,6 +535,15 @@ impl std::hash::Hash for CompositionCall {
 }
 
 impl CompositionCall {
+    #[cfg(test)]
+    pub(crate) fn set_loop_origin(&mut self, origin: Option<super::LoopElementOrigin>) {
+        self.loop_origin = origin.map(Box::new);
+    }
+
+    pub(crate) fn loop_origin(&self) -> Option<&super::LoopElementOrigin> {
+        self.loop_origin.as_deref()
+    }
+
     /// User-facing call label. Anonymous calls deliberately hide their
     /// content-derived synthetic instance identifier.
     pub fn display_label(&self) -> String {
@@ -606,6 +618,7 @@ impl Default for CompositionCallPath {
             instance: "test_call".to_string(),
             module_source: None,
             module_directory: None,
+            loop_origin: None,
         })
     }
 }
@@ -1364,6 +1377,7 @@ mod tests {
                 instance: binding.to_string(),
                 module_source: Some(format!("../{binding}")),
                 module_directory: None,
+                loop_origin: None,
             })
         };
         let left = LiveComposition {
@@ -1665,6 +1679,7 @@ mod tests {
             instance: "module".to_string(),
             module_source: Some("./module".to_string()),
             module_directory: None,
+            loop_origin: None,
         });
         let mut source_identities = CompositionSourceIdentityResolver::new(source_root.path())
             .expect("create composition source identity resolver");
@@ -1727,6 +1742,7 @@ mod tests {
             instance: "module".to_string(),
             module_source: Some("./module".to_string()),
             module_directory: None,
+            loop_origin: None,
         });
         let mut source_identities = CompositionSourceIdentityResolver::new(source_root.path())
             .expect("create composition source identity resolver");

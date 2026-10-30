@@ -609,7 +609,7 @@ fn node_from_effect(
 ) -> GraphNode {
     let module_label = module.map(|info| info.label.as_str());
     let anonymous_discriminator = effect_anonymous_discriminator(effect);
-    let (label, resource_type, kind, mut attribute_names, note) = match effect {
+    let (mut label, resource_type, kind, mut attribute_names, note) = match effect {
         Effect::Read { resource } => (
             resource_label(resource.binding.as_deref(), &resource.id, module_label),
             resource.id.display_type(),
@@ -690,7 +690,7 @@ fn node_from_effect(
             Vec::new(),
             Some("remove from state".to_string()),
         ),
-        Effect::Move { from, to } => (
+        Effect::Move { from, to, .. } => (
             to.identity_str().to_string(),
             to.display_type(),
             EffectKind::Move,
@@ -713,20 +713,25 @@ fn node_from_effect(
             None,
         ),
         Effect::DeferredCreate { id, template } => (
-            deferred_label(&template.binding_name, id),
+            deferred_label(template, id),
             id.display_type(),
             EffectKind::DeferredCreate,
             Vec::new(),
             deferred_after_note(template),
         ),
         Effect::DeferredReplace(payload) => (
-            deferred_label(&payload.template.binding_name, &payload.id),
+            deferred_label(&payload.template, &payload.id),
             payload.id.display_type(),
             EffectKind::DeferredReplace,
             Vec::new(),
             deferred_after_note(&payload.template),
         ),
     };
+
+    if let Some(origin) = effect.loop_origin() {
+        label.push_str("  ");
+        label.push_str(&origin.display_suffix());
+    }
 
     attribute_names.sort();
     attribute_names.dedup();
@@ -789,11 +794,22 @@ fn resource_label(binding: Option<&str>, id: &ResourceId, module_label: Option<&
         .unwrap_or_else(|| short_type.to_string())
 }
 
-fn deferred_label(binding: &str, id: &ResolvedResourceId) -> String {
-    if binding.is_empty() {
-        id.identity_str().to_string()
-    } else {
-        binding.to_string()
+fn deferred_label(
+    template: &carina_core::parser::DeferredForExpression,
+    id: &ResolvedResourceId,
+) -> String {
+    match &template.target {
+        carina_core::parser::DeferredForTarget::Bound { binding } => binding.clone(),
+        carina_core::parser::DeferredForTarget::Unbound { .. } => {
+            let location = template.file.as_deref().map_or_else(
+                || template.line.to_string(),
+                |file| format!("{file}:{}", template.line),
+            );
+            format!(
+                "{}.<pending> (deferred for at {location})",
+                id.display_type()
+            )
+        }
     }
 }
 
@@ -1241,7 +1257,9 @@ mod tests {
             header: "for item in literal".to_string(),
             resource_type: "test.Widget".to_string(),
             attributes: Vec::new(),
-            binding_name: "widgets".to_string(),
+            target: carina_core::parser::DeferredForTarget::Bound {
+                binding: "widgets".to_string(),
+            },
             iterable: Value::Concrete(ConcreteValue::String(ITERABLE_VALUE.into())),
             binding: ForBinding::Simple("item".to_string()),
             template_resource: Resource::new("test.Widget", "widgets"),

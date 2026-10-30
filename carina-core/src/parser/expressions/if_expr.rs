@@ -12,13 +12,14 @@
 use crate::ValueDescription;
 use crate::eval_value::EvalValue;
 use crate::parser::context::ExpressionMode;
+use crate::parser::expressions::for_expr::LoopParseTarget;
 use crate::parser::{
     LetBindingKind, LetBindingRhs, ModuleCall, ParseContext, ParseError, PreprocessedFile, Rule,
     evaluate_static_value, first_inner, if_structural_handle, is_static_value, next_pair,
     parse_expression, parse_expression_eval, parse_module_call, parse_read_resource_expr,
-    parse_resource_expr,
+    parse_resource_expr_for_target,
 };
-use crate::resource::{ConcreteValue, DataSource, Resource, Value};
+use crate::resource::{ConcreteValue, DataSource, LoopKind, Resource, Value};
 
 /// Result of parsing an if expression body: a managed resource, a data
 /// source, a module call, or a value.
@@ -38,7 +39,7 @@ pub(crate) enum IfBodyResult {
 pub(crate) fn parse_if_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &mut ParseContext,
-    binding_name: &str,
+    target: LoopParseTarget,
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<LetBindingRhs, ParseError> {
@@ -58,13 +59,7 @@ pub(crate) fn parse_if_expr(
         && ctx.defer_provisional_static_conditions
     {
         let if_body_pair = next_pair(&mut inner, "if body", "if expression")?;
-        return parse_if_body_to_rhs(
-            if_body_pair,
-            ctx,
-            binding_name,
-            preprocessed_file,
-            source_file,
-        );
+        return parse_if_body_to_rhs(if_body_pair, ctx, &target, preprocessed_file, source_file);
     }
     let condition_value = condition_value
         .into_value()
@@ -104,21 +99,15 @@ pub(crate) fn parse_if_expr(
 
     if condition {
         // Use the if branch
-        parse_if_body_to_rhs(
-            if_body_pair,
-            ctx,
-            binding_name,
-            preprocessed_file,
-            source_file,
-        )
+        parse_if_body_to_rhs(if_body_pair, ctx, &target, preprocessed_file, source_file)
     } else if let Some(else_pair) = else_body_pair {
         // Use the else branch
         let else_body = first_inner(else_pair, "else body", "else clause")?;
-        parse_if_body_to_rhs(else_body, ctx, binding_name, preprocessed_file, source_file)
+        parse_if_body_to_rhs(else_body, ctx, &target, preprocessed_file, source_file)
     } else {
         // No else clause and condition is false: produce nothing
         Ok((
-            if_structural_handle(binding_name),
+            if_structural_handle(target.scheduler_key()),
             vec![],
             vec![],
             vec![],
@@ -132,14 +121,14 @@ pub(crate) fn parse_if_expr(
 pub(crate) fn parse_if_body_to_rhs(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-    binding_name: &str,
+    target: &LoopParseTarget,
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<LetBindingRhs, ParseError> {
-    let result = parse_if_body(pair, ctx, binding_name, preprocessed_file, source_file)?;
+    let result = parse_if_body(pair, ctx, target, preprocessed_file, source_file)?;
     match result {
         IfBodyResult::Resource(r) => Ok((
-            if_structural_handle(binding_name),
+            if_structural_handle(target.scheduler_key()),
             vec![*r],
             vec![],
             vec![],
@@ -147,7 +136,7 @@ pub(crate) fn parse_if_body_to_rhs(
             LetBindingKind::Structural,
         )),
         IfBodyResult::DataSource(d) => Ok((
-            if_structural_handle(binding_name),
+            if_structural_handle(target.scheduler_key()),
             vec![],
             vec![*d],
             vec![],
@@ -155,7 +144,7 @@ pub(crate) fn parse_if_body_to_rhs(
             LetBindingKind::Structural,
         )),
         IfBodyResult::ModuleCall(c) => {
-            let handle = if_structural_handle(binding_name);
+            let handle = if_structural_handle(target.scheduler_key());
             Ok((
                 handle,
                 vec![],
@@ -180,7 +169,7 @@ pub(crate) fn parse_if_body_to_rhs(
 pub(crate) fn parse_if_body(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-    binding_name: &str,
+    target: &LoopParseTarget,
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<IfBodyResult, ParseError> {
@@ -200,20 +189,27 @@ pub(crate) fn parse_if_body(
                 local_ctx.set_variable(name, value);
             }
             Rule::resource_expr => {
-                let resource = parse_resource_expr(
+                let resource = parse_resource_expr_for_target(
                     inner,
                     &local_ctx,
-                    binding_name,
+                    target.if_resource_target(),
                     preprocessed_file,
                     source_file,
                 )?;
                 return Ok(IfBodyResult::Resource(Box::new(resource)));
             }
             Rule::read_resource_expr => {
+                if target.is_unbound() {
+                    return Err(ParseError::UnboundLoopRead {
+                        kind: LoopKind::If,
+                        line: target.source_line().expect("unbound target has source"),
+                        span: target.source_span().expect("unbound target has source"),
+                    });
+                }
                 let data_source = parse_read_resource_expr(
                     inner,
                     &local_ctx,
-                    binding_name,
+                    target.scheduler_key(),
                     preprocessed_file,
                     source_file,
                 )?;
@@ -222,7 +218,9 @@ pub(crate) fn parse_if_body(
             Rule::module_call => {
                 let mut call =
                     parse_module_call(inner, &local_ctx, preprocessed_file, source_file)?;
-                call.binding_name = Some(binding_name.to_string());
+                call.binding_name =
+                    (!target.is_unbound()).then(|| target.scheduler_key().to_string());
+                call.set_loop_origin(target.if_origin());
                 return Ok(IfBodyResult::ModuleCall(call));
             }
             Rule::expression => {

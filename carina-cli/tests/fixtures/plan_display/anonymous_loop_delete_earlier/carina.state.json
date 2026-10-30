@@ -1,0 +1,50 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "anonymous-loop-delete-earlier",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "_for0[0]",
+      "provider": "awscc",
+      "identifier": "vpc-for00",
+      "attributes": { "vpc_id": "vpc-for00", "cidr_block": "10.0.0.0/16" },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "_for0[0]",
+      "dependency_bindings": [],
+      "explicit": { "kind": "struct", "children": { "cidr_block": { "kind": "leaf" } } }
+    },
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "_for0[1]",
+      "provider": "awscc",
+      "identifier": "vpc-for01",
+      "attributes": { "vpc_id": "vpc-for01", "cidr_block": "10.1.0.0/16" },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "_for0[1]",
+      "dependency_bindings": [],
+      "explicit": { "kind": "struct", "children": { "cidr_block": { "kind": "leaf" } } }
+    },
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "_for1[0]",
+      "provider": "awscc",
+      "identifier": "vpc-for10",
+      "attributes": { "vpc_id": "vpc-for10", "cidr_block": "10.8.0.0/16" },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "_for1[0]",
+      "dependency_bindings": [],
+      "explicit": { "kind": "struct", "children": { "cidr_block": { "kind": "leaf" } } }
+    }
+  ]
+}

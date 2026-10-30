@@ -3553,7 +3553,7 @@ mod tests {
                     name = "source"
                 }
 
-                for (_, item) in source.items {
+                let widgets = for (_, item) in source.items {
                     aws.service.Widget {
                         name = item
                     }

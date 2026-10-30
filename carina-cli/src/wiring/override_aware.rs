@@ -85,8 +85,8 @@ pub enum DeferredForExpansionChoice {
 pub enum CanonicalResourceIdentityError {
     #[error(transparent)]
     EnumCanonicalization(#[from] carina_core::value::EnumCanonicalizationError),
-    #[error("{0}")]
-    Identity(String),
+    #[error(transparent)]
+    Identity(#[from] carina_core::identifier::AnonymousIdentityError),
 }
 
 impl<E> CanonicalResourcePair<E> {
@@ -624,6 +624,7 @@ fn paired_unresolved_resource(resource: &Resource, unresolved: &Resource) -> Res
 
 fn can_pair_by_binding(resource: &Resource, source: &Resource) -> bool {
     resource.binding == source.binding
+        && (resource.binding.is_some() || resource.loop_provenance == source.loop_provenance)
         && resource.module_source == source.module_source
         && resource.id.provider == source.id.provider
         && resource.id.resource_type == source.id.resource_type

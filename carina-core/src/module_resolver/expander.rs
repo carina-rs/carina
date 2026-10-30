@@ -453,6 +453,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             instance: instance_prefix.to_string(),
             module_source: module_source.clone(),
             module_directory,
+            loop_origin: call.loop_origin().cloned().map(Box::new),
         };
         let module_instance_scope = ModuleInstanceScope::for_call(
             &call.module_name,
@@ -1392,6 +1393,22 @@ fn prefix_module_resource(
         ),
     };
 
+    let instance_identity = ResourceIdentity::try_from(instance_prefix.to_string())
+        .expect("module instance prefix is non-empty");
+    if let Some(origin) = new_resource.loop_provenance.direct_origin_mut() {
+        origin.prefix_legacy(&instance_identity);
+        origin.source_mut().scope_to_module(&instance_identity);
+    }
+    if let Some(origin) = module_call.loop_origin() {
+        new_resource.loop_provenance.push_module_prefix(
+            crate::resource::LoopModulePrefixOrigin::new(
+                origin.clone(),
+                instance_identity,
+                origin.legacy_address().clone(),
+            ),
+        );
+    }
+
     if let Some(ref binding) = new_resource.binding {
         new_resource.binding = Some(apply_instance_prefix(instance_prefix, binding));
     }
@@ -1752,7 +1769,7 @@ fn prefix_deferred_for_expression(
         header,
         resource_type,
         attributes,
-        binding_name,
+        target,
         iterable,
         binding,
         template_resource,
@@ -1786,7 +1803,21 @@ fn prefix_deferred_for_expression(
         // not apply: prefix it unconditionally (same as
         // `Resource.binding`) to isolate each module instance's loop
         // resources.
-        binding_name: apply_instance_prefix(instance_prefix, binding_name),
+        target: match target {
+            crate::parser::DeferredForTarget::Bound { binding } => {
+                crate::parser::DeferredForTarget::Bound {
+                    binding: apply_instance_prefix(instance_prefix, binding),
+                }
+            }
+            crate::parser::DeferredForTarget::Unbound { template } => {
+                let mut template = template.clone();
+                let prefix =
+                    crate::resource::ResourceIdentity::try_from(instance_prefix.to_string())
+                        .expect("module instance prefix is non-empty");
+                template.prefix_for_module(&prefix);
+                crate::parser::DeferredForTarget::Unbound { template }
+            }
+        },
         // The full iterable is a value expression: rewrite every reference
         // and substitute module arguments in both coalesce operands.
         iterable: prefix_attr_value(iterable, instance_prefix, intra_module_bindings, arguments)?,
@@ -2543,6 +2574,12 @@ pub fn reconcile_anonymous_module_instances(
             let new_prefix = format!("{}_{:016x}", module, target);
             let new_name = format!("{}.{}", new_prefix, rest);
             r.id.set_identity(ResourceIdentity::new(new_name));
+            for origin in r.loop_provenance.module_prefixes_mut() {
+                origin.remap_current_prefix(
+                    &ResourceIdentity::new(old_prefix.clone()),
+                    &ResourceIdentity::new(new_prefix.clone()),
+                );
+            }
             if let Some(ref binding) = r.binding
                 && let Some((_, binding_rest)) = split_instance_prefix(binding)
             {
@@ -2766,6 +2803,7 @@ mod tests {
             instance: "registry_publish".to_string(),
             module_source: Some("./registry".to_string()),
             module_directory: None,
+            loop_origin: None,
         }
     }
 
@@ -2857,6 +2895,121 @@ mod tests {
                 "outer_binding".to_string(),
                 "registry_publish.target".to_string(),
             ])
+        );
+    }
+
+    #[test]
+    fn prefix_module_resource_prefixes_loop_legacy_and_current_paths() {
+        let parsed = crate::parser::parse_file(
+            "for value in ['one'] {\n  mock.test.Leaf { value = value }\n}\n",
+            std::path::Path::new("module/loop.crn"),
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("loop fixture parses");
+        let resource = &parsed.resources[0];
+        let call_origin = resource
+            .loop_provenance
+            .direct_origin()
+            .expect("direct loop origin")
+            .clone();
+        let mut module_call = test_expanded_call();
+        module_call.set_loop_origin(Some(call_origin));
+
+        let arguments = HashMap::new();
+        let config = crate::parser::ProviderContext::default();
+        let substitutions = ArgumentSubstitutions {
+            arguments: &arguments,
+            default_line: 1,
+            caller_source_file: std::path::Path::new("test.crn"),
+            binding_index: None,
+            config: &config,
+        };
+        let prefixed = prefix_module_resource(
+            resource,
+            "registry_publish",
+            "registry",
+            &ModuleInstanceScope::for_call(
+                "registry",
+                Some("registry_publish"),
+                "registry_publish",
+            ),
+            &module_call,
+            &HashSet::new(),
+            substitutions,
+        )
+        .expect("prefix loop resource");
+
+        assert_eq!(
+            prefixed
+                .loop_provenance
+                .direct_origin()
+                .expect("direct origin retained")
+                .legacy_address()
+                .exact_state_name(),
+            "registry_publish._for0[0]",
+        );
+        let [module_prefix] = prefixed.loop_provenance.module_prefixes() else {
+            panic!("loop-generated module call must add one prefix origin");
+        };
+        assert_eq!(module_prefix.current_prefix().as_str(), "registry_publish");
+        assert_eq!(module_prefix.legacy_prefix().exact_state_name(), "_for0[0]");
+    }
+
+    #[test]
+    fn anonymous_module_reconcile_remaps_loop_current_prefix_only() {
+        let seed = crate::parser::parse_file(
+            "for value in ['one'] {\n  mock.test.Leaf { value = value }\n}\n",
+            std::path::Path::new("root.crn"),
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("loop fixture parses")
+        .resources
+        .remove(0);
+        let origin = seed
+            .loop_provenance
+            .direct_origin()
+            .expect("loop origin")
+            .clone();
+        let current_hash =
+            crate::identifier::compute_simhash(&std::collections::BTreeMap::from([(
+                "argument",
+                "current".to_string(),
+            )]));
+        let state_hash = current_hash.with_flipped_mask_for_test(1);
+        let current_prefix = format!("web_{current_hash:016x}");
+        let state_prefix = format!("web_{state_hash:016x}");
+        let mut resource = Resource::with_provider(
+            "mock",
+            "test.Leaf",
+            ResourceIdentity::new(format!("{current_prefix}.leaf")),
+            None,
+        );
+        let mut provenance = crate::resource::LoopProvenance::default();
+        provenance.push_module_prefix(crate::resource::LoopModulePrefixOrigin::new(
+            origin,
+            ResourceIdentity::new(current_prefix.clone()),
+            crate::resource::LegacyLoopAddress::new("_for0[0]"),
+        ));
+        resource.loop_provenance = provenance;
+        let mut resources = vec![resource];
+
+        reconcile_anonymous_module_instances(
+            &mut resources,
+            &mut [],
+            &|_, _| vec![format!("{state_prefix}.leaf")],
+            &crate::identifier::StateBlockClaims::empty(),
+        );
+
+        let expected_name = format!("{state_prefix}.leaf");
+        assert_eq!(resources[0].id.identity_str(), Some(expected_name.as_str()));
+        let [module_prefix] = resources[0].loop_provenance.module_prefixes() else {
+            panic!("module prefix provenance retained");
+        };
+        assert_eq!(module_prefix.current_prefix().as_str(), state_prefix);
+        assert_eq!(
+            module_prefix.legacy_prefix().exact_state_name(),
+            "_for0[0]",
+            "legacy migration oracle must not follow current SimHash reconciliation",
         );
     }
 

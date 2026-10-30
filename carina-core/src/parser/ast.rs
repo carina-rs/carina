@@ -15,15 +15,84 @@ use crate::binding_index::IterableBindings;
 use crate::eval_value::{StructuralHandle, StructuralHandleKind, StructuralHandleMetadata};
 use crate::provider_source::ProviderSource;
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, FunctionArgument, GraphNode, LeafNode,
-    LiveComposition, ModuleSource, PathSegment, Resource, ResourceId, ResourceIdentity,
-    SavedModuleSource, StructuralOperand, StructuralOperandRef, UnknownReason, Value,
+    ConcreteValue, DataSource, DeferredValue, Directives, ForLoopElement, FunctionArgument,
+    GraphNode, LeafNode, LiveComposition, ModuleSource, PathSegment, Resource, ResourceId,
+    ResourceIdentity, SavedModuleSource, StructuralOperand, StructuralOperandRef,
+    UnboundLoopTemplate, UnknownReason, Value,
 };
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Whether a deferred `for` writes user-addressable bound resources or
+/// anonymous resources carrying migration-only loop provenance.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DeferredForTarget {
+    Bound { binding: String },
+    Unbound { template: UnboundLoopTemplate },
+}
+
+impl DeferredForTarget {
+    pub fn bound_binding(&self) -> Option<&str> {
+        match self {
+            Self::Bound { binding } => Some(binding),
+            Self::Unbound { .. } => None,
+        }
+    }
+
+    pub fn scheduler_key(&self) -> &str {
+        match self {
+            Self::Bound { binding } => binding,
+            Self::Unbound { template } => template.scheduler_key(),
+        }
+    }
+
+    pub fn display_name(&self) -> &str {
+        match self {
+            Self::Bound { binding } => binding,
+            Self::Unbound { .. } => "<pending>",
+        }
+    }
+
+    pub(crate) fn element_origin(
+        &self,
+        element: ForLoopElement,
+    ) -> Option<crate::resource::LoopElementOrigin> {
+        match self {
+            Self::Bound { .. } => None,
+            Self::Unbound { template } => Some(template.element_origin(element)),
+        }
+    }
+
+    pub(crate) fn same_system_target(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Bound { binding: left }, Self::Bound { binding: right }) => left == right,
+            (Self::Unbound { template: left }, Self::Unbound { template: right }) => {
+                left.same_system_target(right)
+            }
+            (Self::Bound { .. }, Self::Unbound { .. })
+            | (Self::Unbound { .. }, Self::Bound { .. }) => false,
+        }
+    }
+
+    pub(crate) fn matches_legacy_binding(&self, binding: &str) -> bool {
+        match self {
+            Self::Bound {
+                binding: target_binding,
+            } => target_binding == binding,
+            Self::Unbound { template } => template.matches_legacy_binding(binding),
+        }
+    }
+
+    pub(crate) fn set_loop_display_file(&mut self, file: &str) {
+        if let Self::Unbound { template } = self {
+            template.set_display_file(file);
+        }
+    }
+}
 
 /// A for-expression whose iterable is unresolved (e.g., upstream_state not yet available).
 /// Captures the structural shape of the loop body so the plan can show what
@@ -50,8 +119,8 @@ pub struct DeferredForExpression<S = ModuleSource> {
     /// Attribute template: key → value (concrete values are resolved;
     /// loop-bound values remain as deferred postfix access expressions).
     pub attributes: Vec<(String, Value)>,
-    /// The binding address prefix for generated resources (e.g., `_for0`).
-    pub binding_name: String,
+    /// Typed destination for the generated resources.
+    pub target: DeferredForTarget,
     /// Complete iterable expression. This can remain a deferred coalesce until
     /// its referenced binding reaches a complete resolution boundary.
     pub iterable: Value,
@@ -60,6 +129,7 @@ pub struct DeferredForExpression<S = ModuleSource> {
     /// correct variable(s).
     pub binding: ForBinding,
     /// Template resource for expansion (the for body parsed with placeholders).
+    #[serde(with = "deferred_template_resource_serde")]
     pub template_resource: Resource<S>,
 }
 
@@ -73,7 +143,7 @@ impl From<DeferredForExpression> for SavedDeferredForExpression {
             header,
             resource_type,
             attributes,
-            binding_name,
+            target,
             iterable,
             binding,
             template_resource,
@@ -84,11 +154,149 @@ impl From<DeferredForExpression> for SavedDeferredForExpression {
             header,
             resource_type,
             attributes,
-            binding_name,
+            target,
             iterable,
             binding,
             template_resource: template_resource.into(),
         }
+    }
+}
+
+/// Saved deferred templates are the one resource-shaped payload allowed to
+/// retain a pending identity: the identity is assigned only after the iterable
+/// materializes. Keep that exception local to this field so ordinary resource
+/// and state serialization continues to reject process-local pending tokens.
+mod deferred_template_resource_serde {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
+    #[derive(Serialize)]
+    struct ResourceIdRef<'a> {
+        provider: &'a str,
+        resource_type: &'a str,
+        identity: Option<&'a ResourceIdentity>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_instance: &'a Option<String>,
+    }
+
+    #[derive(Serialize)]
+    #[serde(bound(serialize = "S: Serialize"))]
+    struct ResourceRef<'a, S> {
+        id: ResourceIdRef<'a>,
+        attributes: &'a IndexMap<String, Value>,
+        directives: &'a Directives,
+        prefixes: &'a HashMap<String, String>,
+        binding: &'a Option<String>,
+        dependency_bindings: &'a BTreeSet<String>,
+        module_source: &'a Option<S>,
+        #[serde(skip_serializing_if = "crate::resource::DefaultTagKeys::is_empty")]
+        default_tag_keys: &'a crate::resource::DefaultTagKeys,
+        #[serde(skip_serializing_if = "crate::resource::LoopProvenance::is_empty")]
+        loop_provenance: &'a crate::resource::LoopProvenance,
+    }
+
+    #[derive(Deserialize)]
+    struct ResourceIdWire {
+        provider: String,
+        resource_type: String,
+        #[serde(default, alias = "name")]
+        identity: Option<ResourceIdentity>,
+        #[serde(default)]
+        provider_instance: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(bound(deserialize = "S: Deserialize<'de>"))]
+    struct ResourceWire<S> {
+        id: ResourceIdWire,
+        attributes: IndexMap<String, Value>,
+        #[serde(default)]
+        directives: Directives,
+        #[serde(default)]
+        prefixes: HashMap<String, String>,
+        #[serde(default)]
+        binding: Option<String>,
+        #[serde(default)]
+        dependency_bindings: BTreeSet<String>,
+        #[serde(default)]
+        module_source: Option<S>,
+        #[serde(default)]
+        default_tag_keys: crate::resource::DefaultTagKeys,
+        #[serde(default)]
+        loop_provenance: crate::resource::LoopProvenance,
+    }
+
+    pub(super) fn serialize<S, Ser>(
+        resource: &Resource<S>,
+        serializer: Ser,
+    ) -> Result<Ser::Ok, Ser::Error>
+    where
+        S: Serialize,
+        Ser: Serializer,
+    {
+        ResourceRef {
+            id: ResourceIdRef {
+                provider: &resource.id.provider,
+                resource_type: &resource.id.resource_type,
+                identity: resource.id.identity(),
+                provider_instance: &resource.id.provider_instance,
+            },
+            attributes: &resource.attributes,
+            directives: &resource.directives,
+            prefixes: &resource.prefixes,
+            binding: &resource.binding,
+            dependency_bindings: &resource.dependency_bindings,
+            module_source: &resource.module_source,
+            default_tag_keys: &resource.default_tag_keys,
+            loop_provenance: &resource.loop_provenance,
+        }
+        .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, S, De>(deserializer: De) -> Result<Resource<S>, De::Error>
+    where
+        S: Deserialize<'de>,
+        De: Deserializer<'de>,
+    {
+        let ResourceWire {
+            id:
+                ResourceIdWire {
+                    provider,
+                    resource_type,
+                    identity,
+                    provider_instance,
+                },
+            attributes,
+            directives,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+        } = ResourceWire::deserialize(deserializer)?;
+        let id = match identity {
+            Some(identity) => ResourceId::with_provider_identity(
+                provider,
+                resource_type,
+                identity,
+                provider_instance,
+            ),
+            None => ResourceId::pending_with_provider(provider, resource_type, provider_instance),
+        };
+        Ok(Resource {
+            id,
+            attributes,
+            directives,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs: HashSet::new(),
+        })
     }
 }
 
@@ -1033,6 +1241,8 @@ pub struct MovedAddresses {
     resource_type: String,
     from_name: crate::resource::ResourceIdentity,
     to_name: crate::resource::ResourceIdentity,
+    #[serde(skip, default)]
+    to_span: Option<SourceSpan>,
 }
 
 impl MovedAddresses {
@@ -1054,7 +1264,13 @@ impl MovedAddresses {
             to_name: crate::resource::ResourceIdentity::new(
                 crate::utils::canonicalize_map_key_address(to_name.as_str()),
             ),
+            to_span: None,
         }
+    }
+
+    pub(in crate::parser) fn with_to_span(mut self, to_span: SourceSpan) -> Self {
+        self.to_span = Some(to_span);
+        self
     }
 
     /// Build the full source address.
@@ -1073,6 +1289,11 @@ impl MovedAddresses {
             resource_type: self.resource_type.clone(),
             name: self.to_name.clone(),
         }
+    }
+
+    /// Parser span of the authored destination address, when available.
+    pub fn to_span(&self) -> Option<SourceSpan> {
+        self.to_span
     }
 }
 
@@ -1598,6 +1819,7 @@ pub struct ModuleCall {
     pub binding_name: Option<String>,
     arguments: HashMap<String, AuthoredModuleArgument>,
     source: Box<ModuleCallSite>,
+    loop_origin: Option<Box<crate::resource::LoopElementOrigin>>,
 }
 
 impl ModuleCall {
@@ -1615,6 +1837,7 @@ impl ModuleCall {
             source: Box::new(ModuleCallSite {
                 id: ModuleCallId::direct(source_file, call_span),
             }),
+            loop_origin: None,
         }
     }
 
@@ -1639,6 +1862,21 @@ impl ModuleCall {
 
     pub(super) fn set_expansion_key(&mut self, expansion_key: String) {
         self.source.id.expand(expansion_key);
+    }
+
+    pub(in crate::parser) fn set_loop_origin(
+        &mut self,
+        origin: Option<crate::resource::LoopElementOrigin>,
+    ) {
+        self.loop_origin = origin.map(Box::new);
+    }
+
+    pub(crate) fn loop_origin(&self) -> Option<&crate::resource::LoopElementOrigin> {
+        self.loop_origin.as_deref()
+    }
+
+    pub(crate) fn loop_origin_mut(&mut self) -> Option<&mut crate::resource::LoopElementOrigin> {
+        self.loop_origin.as_deref_mut()
     }
 
     pub fn id(&self) -> &ModuleCallId {
@@ -1812,6 +2050,13 @@ impl SourceSpan {
         pair: &pest::iterators::Pair<'_, crate::parser::Rule>,
         file: &crate::parser::PreprocessedFile,
     ) -> Self {
+        let range = Self::preprocessed_range(pair);
+        Self::from_preprocessed_range(range.start, range.end, file)
+    }
+
+    pub(in crate::parser) fn preprocessed_range(
+        pair: &pest::iterators::Pair<'_, crate::parser::Rule>,
+    ) -> std::ops::Range<usize> {
         let span = pair.as_span();
         let start = span.start();
         let token_end = pair
@@ -1832,12 +2077,17 @@ impl SourceSpan {
         // inner pair. The module-call pair itself ends exactly at that brace;
         // unlike declaration/value pairs, it cannot absorb trailing trivia
         // outside the block.
-        let end = if pair.as_rule() == crate::parser::Rule::module_call {
+        let end = if matches!(
+            pair.as_rule(),
+            crate::parser::Rule::module_call
+                | crate::parser::Rule::for_expr
+                | crate::parser::Rule::if_expr
+        ) {
             span.end()
         } else {
             token_end
         };
-        Self::from_preprocessed_range(start, end, file)
+        start..end
     }
 
     pub(in crate::parser) fn from_preprocessed_range(
@@ -2868,18 +3118,23 @@ pub fn expand_deferred_children<S: Clone>(
             .iter()
             .enumerate()
             .map(|(index, item)| {
-                let address = format!("{}[{index}]", deferred.binding_name);
-                build_expanded_child(deferred, address, None, None, item, miss_policy)
+                build_expanded_child(
+                    deferred,
+                    ForLoopElement::Index(index),
+                    None,
+                    None,
+                    item,
+                    miss_policy,
+                )
             })
             .collect(),
         (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::List(items))) => items
             .iter()
             .enumerate()
             .map(|(index, item)| {
-                let address = format!("{}[{index}]", deferred.binding_name);
                 build_expanded_child(
                     deferred,
-                    address,
+                    ForLoopElement::Index(index),
                     Some(index as i64),
                     None,
                     item,
@@ -2892,8 +3147,14 @@ pub fn expand_deferred_children<S: Clone>(
             keys.sort();
             keys.into_iter()
                 .map(|key| {
-                    let address = crate::utils::map_key_address(&deferred.binding_name, key);
-                    build_expanded_child(deferred, address, None, Some(key), &map[key], miss_policy)
+                    build_expanded_child(
+                        deferred,
+                        ForLoopElement::Key(key.clone()),
+                        None,
+                        Some(key),
+                        &map[key],
+                        miss_policy,
+                    )
                 })
                 .collect()
         }
@@ -2935,23 +3196,43 @@ fn deferred_iterable_kind(value: &Value) -> &'static str {
 
 fn build_expanded_child<S: Clone>(
     deferred: &DeferredForExpression<S>,
-    address: String,
+    element: ForLoopElement,
     index: Option<i64>,
     key: Option<&str>,
     item: &Value,
     miss_policy: crate::resource::AccessMissPolicy,
 ) -> Result<Resource<S>, DeferredForExpansionError> {
-    let mut resource = deferred
-        .template_resource
-        .instantiate_with_identity(ResourceIdentity::new(address.clone()));
-    resource.binding = Some(address);
+    let mut resource = match &deferred.target {
+        DeferredForTarget::Bound { binding } => {
+            let address = match &element {
+                ForLoopElement::Index(index) => format!("{binding}[{index}]"),
+                ForLoopElement::Key(key) => crate::utils::map_key_address(binding, key),
+            };
+            let mut resource = deferred
+                .template_resource
+                .instantiate_with_identity(ResourceIdentity::new(address.clone()));
+            resource.binding = Some(address);
+            resource
+        }
+        DeferredForTarget::Unbound { .. } => {
+            let mut resource = deferred.template_resource.instantiate();
+            resource.binding = None;
+            resource.loop_provenance = crate::resource::LoopProvenance::direct(
+                deferred
+                    .target
+                    .element_origin(element)
+                    .expect("unbound target produces loop provenance"),
+            );
+            resource
+        }
+    };
     resource
         .dependency_bindings
         .extend(deferred.root_bindings());
     if let Err((attribute, error)) = substitute_attrs(&mut resource, index, key, item, miss_policy)
     {
         return Err(DeferredForExpansionError::ValueAccess {
-            binding: deferred.binding_name.clone(),
+            binding: deferred.target.scheduler_key().to_string(),
             line: error.line,
             attribute,
             message: error.message,
@@ -3445,7 +3726,9 @@ mod substitute_placeholder_tests {
             header: "for opt in cert.options".to_string(),
             resource_type: "mock.Target".to_string(),
             attributes: Vec::new(),
-            binding_name: "children".to_string(),
+            target: DeferredForTarget::Bound {
+                binding: "children".to_string(),
+            },
             iterable: Value::resource_ref("cert", "options", Vec::new()),
             binding: ForBinding::Simple("opt".to_string()),
             template_resource,
@@ -3474,7 +3757,9 @@ mod substitute_placeholder_tests {
             header: "for child in source.children".to_string(),
             resource_type: "mock.Target".to_string(),
             attributes: Vec::new(),
-            binding_name: "children".to_string(),
+            target: DeferredForTarget::Bound {
+                binding: "children".to_string(),
+            },
             iterable: Value::resource_ref("source", "children", Vec::new()),
             binding,
             template_resource: Resource::pending_with_provider("mock", "Target", None),
@@ -3521,6 +3806,48 @@ mod substitute_placeholder_tests {
     }
 
     #[test]
+    fn deferred_unbound_children_are_pending_with_origin() {
+        let parsed = crate::parser::parse(
+            "let upstream = upstream_state { source = '../upstream' }\n\
+             for value in upstream.values {\n\
+               mock.test.Child { identity_input = value }\n\
+             }\n",
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("deferred unbound loop parses");
+        let deferred = &parsed.deferred_for_expressions[0];
+        let children = expand_deferred_children(
+            deferred,
+            &Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("alpha".into())),
+                Value::Concrete(ConcreteValue::String("beta".into())),
+            ])),
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .expect("deferred children expand");
+
+        assert_eq!(children.len(), 2);
+        for (index, child) in children.iter().enumerate() {
+            assert!(child.id.identity_str().is_none());
+            assert_eq!(child.binding, None);
+            let origin = child
+                .loop_provenance
+                .direct_origin()
+                .expect("unbound deferred child origin");
+            assert_eq!(
+                origin.kind(),
+                &crate::resource::LoopOriginKind::For {
+                    element: crate::resource::ForLoopElement::Index(index),
+                }
+            );
+            assert_eq!(
+                origin.legacy_address().exact_state_name(),
+                format!("_values[{index}]")
+            );
+        }
+    }
+
+    #[test]
     fn deferred_for_expression_serde_skips_diagnostic_location() {
         let deferred = DeferredForExpression {
             file: Some("/abs/path.crn".to_string()),
@@ -3528,7 +3855,9 @@ mod substitute_placeholder_tests {
             header: "for opt in cert.options".to_string(),
             resource_type: "mock.Target".to_string(),
             attributes: Vec::new(),
-            binding_name: "children".to_string(),
+            target: DeferredForTarget::Bound {
+                binding: "children".to_string(),
+            },
             iterable: Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(Value::resource_ref("cert", "options", Vec::new())),
                 default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),

@@ -69,7 +69,7 @@ let gamma = mock.test.resource {
   name = "source"
 }
 
-for _, resource_name in (source.tags ?? {}) {
+let generated = for _, resource_name in (source.tags ?? {}) {
   mock.test.resource {
     name = resource_name
   }
@@ -837,7 +837,9 @@ fn state_refresh_closes_post_expansion_progress_before_its_summary() {
 
     assert_pty_success("carina state refresh", &output);
     assert!(
-        output.screen.contains("mock.test.resource _for0.two took"),
+        output
+            .screen
+            .contains("mock.test.resource generated.two took"),
         "fixture must exercise the post-expansion progress backend\nscreen:\n{}",
         output.screen,
     );

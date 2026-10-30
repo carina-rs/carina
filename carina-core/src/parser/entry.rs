@@ -19,7 +19,7 @@ use super::error::{
     ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
     WarningKind,
 };
-use super::expressions::for_expr::{extract_for_iterable_name, parse_for_expr};
+use super::expressions::for_expr::{LoopParseTarget, extract_for_iterable_name, parse_for_expr};
 use super::expressions::if_expr::parse_if_expr;
 use super::expressions::pipe::{parse_coalesce_expr, parse_coalesce_expr_with_mode};
 use super::functions::parse_fn_def;
@@ -30,7 +30,7 @@ use super::resolve::{
 use crate::eval_value::{
     EvalValue, EvalValueError, ParsedSinkValue, StructuralHandle, StructuralHandleMetadata,
 };
-use crate::resource::{DataSource, Resource, Value};
+use crate::resource::{DataSource, LegacyLoopAddress, LoopKind, Resource, Value};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -728,7 +728,7 @@ fn parse_with_seeded_bindings_inner(
                                 state_blocks.push(parse_removed_block(stmt)?);
                             }
                             Rule::moved_block => {
-                                state_blocks.push(parse_moved_block(stmt)?);
+                                state_blocks.push(parse_moved_block(stmt, &preprocessed_file)?);
                             }
                             Rule::require_statement => {
                                 requires.push(parse_require_statement(
@@ -742,6 +742,16 @@ fn parse_with_seeded_bindings_inner(
                                 let iterable_name =
                                     extract_for_iterable_name(&stmt, anon_for_counter);
                                 anon_for_counter += 1;
+                                let source = preprocessed_file.loop_source(
+                                    &stmt,
+                                    LoopKind::For,
+                                    source_file,
+                                    ctx.occupied_binding_names(),
+                                );
+                                let target = LoopParseTarget::unbound(
+                                    source,
+                                    LegacyLoopAddress::new(iterable_name),
+                                );
                                 let (
                                     expanded_resources,
                                     expanded_data_sources,
@@ -749,7 +759,7 @@ fn parse_with_seeded_bindings_inner(
                                 ) = parse_for_expr(
                                     stmt,
                                     &mut ctx,
-                                    &iterable_name,
+                                    target,
                                     &preprocessed_file,
                                     source_file,
                                 )?;
@@ -758,8 +768,18 @@ fn parse_with_seeded_bindings_inner(
                                 module_calls.extend(expanded_module_calls);
                             }
                             Rule::if_expr => {
-                                let binding_name = format!("_if{}", anon_if_counter);
+                                let legacy_name = format!("_if{}", anon_if_counter);
                                 anon_if_counter += 1;
+                                let source = preprocessed_file.loop_source(
+                                    &stmt,
+                                    LoopKind::If,
+                                    source_file,
+                                    ctx.occupied_binding_names(),
+                                );
+                                let target = LoopParseTarget::unbound(
+                                    source,
+                                    LegacyLoopAddress::new(legacy_name),
+                                );
                                 let (
                                     _value,
                                     expanded_resources,
@@ -770,7 +790,7 @@ fn parse_with_seeded_bindings_inner(
                                 ) = parse_if_expr(
                                     stmt,
                                     &mut ctx,
-                                    &binding_name,
+                                    target,
                                     &preprocessed_file,
                                     source_file,
                                 )?;

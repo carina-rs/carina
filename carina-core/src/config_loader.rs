@@ -1197,12 +1197,32 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path) {
     for function in parsed.user_functions.values_mut() {
         function.body.source_file = Some(path.to_path_buf());
     }
-    let file = Some(path.display().to_string());
-    for warning in &mut parsed.warnings {
-        warning.file = file.clone();
+    let display_file = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    for resource in &mut parsed.resources {
+        resource.loop_provenance.set_display_file(&display_file);
+    }
+    for call in &mut parsed.module_calls {
+        if let Some(origin) = call.loop_origin_mut() {
+            origin.set_display_file(&display_file);
+        }
     }
     for deferred in &mut parsed.deferred_for_expressions {
-        deferred.file = file.clone();
+        deferred.target.set_loop_display_file(&display_file);
+        deferred
+            .template_resource
+            .loop_provenance
+            .set_display_file(&display_file);
+    }
+
+    let warning_file = Some(path.display().to_string());
+    for warning in &mut parsed.warnings {
+        warning.file = warning_file.clone();
+    }
+    for deferred in &mut parsed.deferred_for_expressions {
+        deferred.file = Some(display_file.clone());
     }
 }
 

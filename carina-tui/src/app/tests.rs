@@ -112,7 +112,9 @@ fn deferred_create_uses_create_symbol_and_kind() {
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
         attributes: Vec::new(),
-        binding_name: "validation_records".to_string(),
+        target: carina_core::parser::DeferredForTarget::Bound {
+            binding: "validation_records".to_string(),
+        },
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: ForBinding::Simple("opt".to_string()),
         template_resource,
@@ -795,6 +797,7 @@ fn move_suppressed_when_update_exists_for_same_target() {
             "s3.Bucket",
             "new-name",
         )),
+        origin: None,
     });
     // Update for the same target
     plan.add(Effect::Update {
@@ -836,6 +839,7 @@ fn pure_move_not_suppressed() {
             "s3.Bucket",
             "new-name",
         )),
+        origin: None,
     });
 
     let app = App::for_plan(&plan, &SchemaRegistry::new());

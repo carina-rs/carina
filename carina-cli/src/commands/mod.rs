@@ -771,6 +771,12 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
                 ctx.schemas(),
             )
             .into_iter()
+            .filter(|conflict| {
+                !parsed.resources.iter().any(|resource| {
+                    !resource.loop_provenance.is_empty()
+                        && conflict.includes(resource, ctx.schemas())
+                })
+            })
             .map(|conflict| AppError::Validation(conflict.to_string())),
         );
         errors.extend(
@@ -857,6 +863,18 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         return Err(errors);
     }
     let parsed = resolved_config.parsed();
+
+    errors.extend(
+        carina_core::identifier::check_legacy_loop_move_targets(
+            &parsed.state_blocks,
+            &parsed.resources,
+        )
+        .into_iter()
+        .map(|error| AppError::AnonymousIdentity(error.into())),
+    );
+    if !errors.is_empty() {
+        return Err(errors);
+    }
 
     // Reject references to `upstream_state` fields that the upstream's
     // `exports { }` block does not declare. Gated like the other

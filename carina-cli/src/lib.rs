@@ -59,6 +59,7 @@ pub(crate) fn test_composition_call_path_in(
         instance: "fixture_module".to_string(),
         module_source: Some("./fixture_module".to_string()),
         module_directory: None,
+        loop_origin: None,
     })
 }
 

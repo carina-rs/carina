@@ -28,6 +28,15 @@ pub enum ParseError {
     #[error("Invalid expression at line {line}: {message}")]
     InvalidExpression { line: usize, message: String },
 
+    #[error(
+        "Invalid {kind} expression at line {line}: an unbound {kind} cannot contain `read`; bind the {kind} expression with `let` so the data source has an address"
+    )]
+    UnboundLoopRead {
+        kind: crate::resource::LoopKind,
+        line: usize,
+        span: super::SourceSpan,
+    },
+
     /// A call whose name is neither a declared user function nor a builtin.
     /// Keeping this structured lets the declaration prepass defer forward and
     /// sibling calls without treating a genuinely unknown name as a builtin.

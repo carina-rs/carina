@@ -325,7 +325,7 @@ fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
         Effect::Delete { id, .. } => vec![id.as_inner()],
         Effect::Import { id, .. } => vec![id.as_inner()],
         Effect::Remove { id, .. } => vec![id.as_inner()],
-        Effect::Move { from, to } => vec![from.as_inner(), to.as_inner()],
+        Effect::Move { from, to, .. } => vec![from.as_inner(), to.as_inner()],
         Effect::Wait { .. } => Vec::new(),
         Effect::DeferredCreate { id, .. } => vec![id.as_inner()],
         Effect::DeferredReplace(payload) => {
@@ -916,6 +916,7 @@ mod tests {
                 "y",
                 None,
             )),
+            origin: None,
         });
 
         let entries = collect_required_actions(&plan, &PermissionProvider { fail: false })
@@ -952,7 +953,9 @@ mod tests {
                 header: "for opt in cert.domain_validation_options".to_string(),
                 resource_type: "aws.route53.RecordSet".to_string(),
                 attributes: Default::default(),
-                binding_name: "validation_records".to_string(),
+                target: carina_core::parser::DeferredForTarget::Bound {
+                    binding: "validation_records".to_string(),
+                },
                 iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,

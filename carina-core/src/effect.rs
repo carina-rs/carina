@@ -22,8 +22,8 @@ use crate::provider::AppliedIdentifier;
 #[cfg(test)]
 use crate::resource::{DataSource, DeferredValue, Resource, Value};
 use crate::resource::{
-    DeposedKey, Directives, ModuleSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId,
-    ResourceId, ResourceIdentity, SavedModuleSource, State,
+    DeposedKey, Directives, LoopElementOrigin, ModuleSource, ResolvedDataSource, ResolvedResource,
+    ResolvedResourceId, ResourceId, ResourceIdentity, SavedModuleSource, State,
 };
 use crate::wait::ManagedWaitTarget;
 use crate::wait::predicate::WaitPredicate;
@@ -489,6 +489,7 @@ impl ResolvedMove {
         Effect::Move {
             from: self.from,
             to: self.to,
+            origin: None,
         }
     }
 }
@@ -584,6 +585,9 @@ pub enum EffectWithSource<S> {
         from: ResolvedResourceId,
         /// New resource address
         to: ResolvedResourceId,
+        /// Authored unbound-loop element that owns the destination.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<LoopElementOrigin>,
     },
 
     /// Wait for `target` to satisfy `until` by polling `read()`.
@@ -694,7 +698,7 @@ impl From<Effect> for SavedEffect {
             },
             Effect::Import { id, identifier } => Self::Import { id, identifier },
             Effect::Remove { id } => Self::Remove { id },
-            Effect::Move { from, to } => Self::Move { from, to },
+            Effect::Move { from, to, origin } => Self::Move { from, to, origin },
             Effect::Wait {
                 identity,
                 target_id,
@@ -802,10 +806,28 @@ impl<'a, S> BasicEffect<'a, S> {
 }
 
 impl<S> EffectWithSource<S> {
+    /// Loop element shown beside this effect in human-facing plan renderers.
+    pub fn loop_origin(&self) -> Option<&LoopElementOrigin> {
+        match self {
+            Self::Create(resource) | Self::ResumeCreate { resource, .. } => {
+                resource.loop_provenance.display_origin()
+            }
+            Self::Update { to, .. } => to.loop_provenance.display_origin(),
+            Self::Move { origin, .. } => origin.as_ref(),
+            Self::Read { .. }
+            | Self::Delete { .. }
+            | Self::Import { .. }
+            | Self::Remove { .. }
+            | Self::Wait { .. }
+            | Self::DeferredCreate { .. }
+            | Self::DeferredReplace(_) => None,
+        }
+    }
+
     /// Mint route-rebinding authority only from a resolved move effect.
     pub fn move_authority(&self) -> Option<MoveAuthority<'_>> {
         match self {
-            Self::Move { from, to } => Some(MoveAuthority { from, to }),
+            Self::Move { from, to, .. } => Some(MoveAuthority { from, to }),
             _ => None,
         }
     }
@@ -916,6 +938,7 @@ impl EffectWithSource<ModuleSource> {
                     to: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "test", "y"
                     )),
+                    origin: None,
                 },
                 Effect::Move { .. }
             ),
@@ -947,7 +970,9 @@ impl EffectWithSource<ModuleSource> {
                         header: "for opt in cert.domain_validation_options".to_string(),
                         resource_type: "route53.Record".to_string(),
                         attributes: vec![],
-                        binding_name: "validation_records".to_string(),
+                        target: crate::parser::DeferredForTarget::Bound {
+                            binding: "validation_records".to_string(),
+                        },
                         iterable: Value::resource_ref(
                             "cert",
                             "domain_validation_options",
@@ -984,7 +1009,9 @@ impl EffectWithSource<ModuleSource> {
                         header: "for opt in cert.domain_validation_options".to_string(),
                         resource_type: "route53.Record".to_string(),
                         attributes: vec![],
-                        binding_name: "validation_records".to_string(),
+                        target: crate::parser::DeferredForTarget::Bound {
+                            binding: "validation_records".to_string(),
+                        },
                         iterable: Value::resource_ref(
                             "cert",
                             "domain_validation_options",
@@ -1272,7 +1299,9 @@ impl<S> EffectWithSource<S> {
             // `plan.effects().filter_map(|e| e.binding_name())` will see
             // DeferredReplaces and skip DeferredCreates — this is intentional.
             Effect::DeferredCreate { .. } => None,
-            Effect::DeferredReplace(payload) => Some(payload.template.binding_name.clone()),
+            Effect::DeferredReplace(payload) => {
+                payload.template.target.bound_binding().map(str::to_string)
+            }
         }
     }
 
@@ -1646,7 +1675,9 @@ mod tests {
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "route53.Record".to_string(),
             attributes: vec![],
-            binding_name: "validation_records".to_string(),
+            target: crate::parser::DeferredForTarget::Bound {
+                binding: "validation_records".to_string(),
+            },
             iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
             binding: crate::parser::ForBinding::Simple("opt".to_string()),
             template_resource: Resource::new("route53.Record", "validation_records"),
@@ -1750,6 +1781,7 @@ mod tests {
                     to: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "test", "y",
                     )),
+                    origin: None,
                 },
             ),
             (
@@ -1983,7 +2015,7 @@ mod tests {
                 assert_eq!(template.line, 0);
                 assert_eq!(template.header, "for opt in cert.domain_validation_options");
                 assert_eq!(template.resource_type, "route53.Record");
-                assert_eq!(template.binding_name, "validation_records");
+                assert_eq!(template.target.bound_binding(), Some("validation_records"));
                 assert_eq!(
                     template.reference_candidates(),
                     BTreeSet::from(["cert.domain_validation_options".to_string()])
@@ -2270,6 +2302,7 @@ mod tests {
                 "s3.Bucket",
                 "new",
             )),
+            origin: None,
         };
         for e in [imp, rem, mov] {
             assert!(
@@ -2491,6 +2524,7 @@ mod tests {
         let mov = Effect::Move {
             from: crate::resource::ResolvedResourceId::new(rid.clone()),
             to: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("test", "y")),
+            origin: None,
         };
         let wait = Effect::Wait {
             identity: ResourceIdentity::new("w"),

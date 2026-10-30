@@ -137,7 +137,9 @@ fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression 
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
-        binding_name: "validation_records".to_string(),
+        target: crate::parser::DeferredForTarget::Bound {
+            binding: "validation_records".to_string(),
+        },
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: crate::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
@@ -3876,6 +3878,7 @@ fn mark_module_resource(resource: &mut Resource, instance: &str) {
             instance: instance.to_string(),
             module_source: Some("./checked_module".to_string()),
             module_directory: None,
+            loop_origin: None,
         }),
     ));
 }

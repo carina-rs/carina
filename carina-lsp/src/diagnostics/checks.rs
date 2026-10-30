@@ -17,7 +17,10 @@ use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::suggest_similar_name;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
-use super::{DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic};
+use super::{
+    DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic, carina_diagnostic_range,
+    parser_span_range,
+};
 
 /// Directory parse plus the module-expansion error, if expansion stopped.
 ///
@@ -611,7 +614,7 @@ impl DiagnosticEngine {
         for resource in current_file
             .resources
             .iter()
-            .filter(|resource| resource.binding.is_none())
+            .filter(|resource| resource.binding.is_none() && resource.loop_provenance.is_empty())
         {
             let key = (
                 resource.id.provider.clone(),
@@ -647,6 +650,96 @@ impl DiagnosticEngine {
         }
 
         diagnostics
+    }
+
+    /// Run the same typed anonymous-loop identity checks as validate/plan and
+    /// anchor their messages on the authored loop or `moved.to` destination.
+    pub(super) fn loop_anonymous_identity_diagnostics(
+        &self,
+        doc: &Document,
+        current_file: &ParsedFile,
+        directory: &ParsedFile,
+    ) -> Vec<Diagnostic> {
+        let mut resources = directory.resources.clone();
+        let canonical_providers =
+            match carina_core::value::canonicalize_provider_configs_with_schemas(
+                &directory.providers,
+                &|provider_name| {
+                    self.factories
+                        .iter()
+                        .find(|factory| factory.name() == provider_name)
+                        .map(|factory| factory.provider_config_attribute_types())
+                },
+            ) {
+                Ok(providers) => providers,
+                Err(_) => return Vec::new(),
+            };
+        let mut canonical_resources = match carina_core::value::canonicalize_resources_with_schemas(
+            &mut resources,
+            &self.schemas,
+        ) {
+            Ok(resources) => resources,
+            Err(_) => return Vec::new(),
+        };
+        let identity_result =
+            carina_core::identifier::compute_anonymous_identifiers_with_provider_configs(
+                canonical_resources.as_mut_slice(),
+                &canonical_providers,
+                &self.schemas,
+                &|provider_name| {
+                    self.factories
+                        .iter()
+                        .find(|factory| factory.name() == provider_name)
+                        .map(|factory| {
+                            factory
+                                .identity_attributes()
+                                .into_iter()
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                },
+            );
+        let current_name = doc
+            .source_file()
+            .file_name()
+            .map(|name| name.to_string_lossy());
+        match identity_result {
+            Err(carina_core::identifier::AnonymousIdentityError::Loop(conflict)) => {
+                if current_name.as_deref() != Some(conflict.file()) {
+                    return Vec::new();
+                }
+                let Some(span) = conflict.source_span() else {
+                    return Vec::new();
+                };
+                let Some(range) = parser_span_range(doc, span) else {
+                    return Vec::new();
+                };
+                return vec![carina_diagnostic_range(
+                    range,
+                    DiagnosticSeverity::ERROR,
+                    conflict.to_string(),
+                )];
+            }
+            Err(_) => return Vec::new(),
+            Ok(()) => {}
+        }
+
+        carina_core::identifier::check_legacy_loop_move_targets(
+            &current_file.state_blocks,
+            &resources,
+        )
+        .into_iter()
+        .filter_map(|error| {
+            let span = error.source_span()?;
+            let range = parser_span_range(doc, span)?;
+            Some(carina_diagnostic_range(
+                range,
+                DiagnosticSeverity::ERROR,
+                error.to_string(),
+            ))
+        })
+        .collect()
     }
 
     /// Flag `arguments` blocks placed in a root configuration.

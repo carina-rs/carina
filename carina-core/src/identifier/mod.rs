@@ -8,10 +8,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::effect::ResolvedMove;
 #[cfg(test)]
 use crate::parser::ProviderConfig;
-use crate::parser::StateBlockAddress;
+use crate::parser::{SourceSpan, StateBlock, StateBlockAddress};
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, PendingReRead, ResolvedResourceId, Resource,
-    ResourceId, ResourceIdentity, UnknownReason, Value, ValueString,
+    AnonymousIdentityModuleSource, ConcreteValue, DataSource, DeferredValue, LegacyLoopAddress,
+    LoopElementOrigin, PendingReRead, ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
+    UnknownReason, Value, ValueString,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use crate::validation::is_string_compatible_type;
@@ -158,8 +159,8 @@ pub enum AnonymousIdentityBasis {
 /// bytes hashed for that basis. An unresolved `<attribute>_prefix` is treated
 /// identically to the same prefix after [`resolve_attr_prefixes`] moves it into
 /// [`Resource::prefixes`].
-fn stable_anonymous_hash_inputs(
-    resource: &Resource,
+fn stable_anonymous_hash_inputs<S>(
+    resource: &Resource<S>,
     schema: &ResourceSchema,
 ) -> BTreeMap<String, String> {
     let mut inputs = BTreeMap::new();
@@ -201,8 +202,8 @@ fn stable_anonymous_hash_inputs(
 /// unknown. Otherwise, presence is what matters here, not whether a value is
 /// concrete yet. A deferred create-only or identity value will become
 /// concrete later but is still an immutable identity input.
-pub fn classify_anonymous_identity_basis(
-    resource: &Resource,
+pub fn classify_anonymous_identity_basis<S>(
+    resource: &Resource<S>,
     registry: &SchemaRegistry,
 ) -> Option<AnonymousIdentityBasis> {
     let schema = registry.get_for(resource)?;
@@ -256,17 +257,17 @@ impl Ord for AnonymousResourceKind {
 }
 
 impl AnonymousResourceKind {
-    fn of(resource: &Resource) -> Self {
+    fn of<S: AnonymousIdentityModuleSource>(resource: &Resource<S>) -> Self {
         let module_scope = resource
             .module_source
             .as_ref()
-            .and_then(crate::resource::ModuleSource::identity_scope);
+            .and_then(AnonymousIdentityModuleSource::anonymous_scope);
         Self {
             provider: resource.id.provider.clone(),
             resource_type: resource.id.resource_type.clone(),
             provider_instance: resource.id.provider_instance.clone(),
-            module_scope_key: module_scope.as_ref().map(|scope| scope.key().to_string()),
-            module_scope_description: module_scope.map(|scope| scope.description()),
+            module_scope_key: module_scope.as_ref().map(|(key, _)| key.clone()),
+            module_scope_description: module_scope.map(|(_, description)| description),
         }
     }
 
@@ -290,7 +291,11 @@ impl AttributeDerivedAnonymousResourceConflict {
     /// Return whether `resource` is one of the declarations represented by
     /// this conflict. This lets source-aware callers attach the shared error to
     /// each declaration without reimplementing the grouping rule.
-    pub fn includes(&self, resource: &Resource, registry: &SchemaRegistry) -> bool {
+    pub fn includes<S: AnonymousIdentityModuleSource>(
+        &self,
+        resource: &Resource<S>,
+        registry: &SchemaRegistry,
+    ) -> bool {
         resource.binding.is_none()
             && classify_anonymous_identity_basis(resource, registry)
                 == Some(AnonymousIdentityBasis::AttributeDerived)
@@ -322,11 +327,270 @@ impl std::fmt::Display for AttributeDerivedAnonymousResourceConflict {
 
 impl std::error::Error for AttributeDerivedAnonymousResourceConflict {}
 
+/// Why one authored unbound loop cannot receive anonymous identities safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopConflictReason {
+    AttributeDerived,
+    IdenticalIdentityInputs,
+}
+
+#[derive(Debug, Clone)]
+struct LoopRewriteMove {
+    provider: String,
+    resource_type: String,
+    from: LegacyLoopAddress,
+    to: String,
+}
+
+/// A hard anonymous-identity error that can be repaired by binding one loop.
+#[derive(Debug, Clone)]
+pub struct LoopAnonymousIdentityConflict {
+    reason: LoopConflictReason,
+    origin: LoopElementOrigin,
+    resource_type: String,
+    suggested_binding: String,
+    moves: Vec<LoopRewriteMove>,
+}
+
+impl LoopAnonymousIdentityConflict {
+    pub fn file(&self) -> &str {
+        self.origin.file()
+    }
+
+    pub fn line(&self) -> usize {
+        self.origin.line()
+    }
+
+    pub fn column(&self) -> usize {
+        self.origin.column()
+    }
+
+    pub fn source_span(&self) -> Option<crate::parser::SourceSpan> {
+        self.origin.source().source_span()
+    }
+
+    pub fn reason(&self) -> LoopConflictReason {
+        self.reason
+    }
+}
+
+impl std::fmt::Display for LoopAnonymousIdentityConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self.reason {
+            LoopConflictReason::AttributeDerived => "derive identity from mutable attributes",
+            LoopConflictReason::IdenticalIdentityInputs => "have identical stable identity inputs",
+        };
+        write!(
+            formatter,
+            "Anonymous resources produced by the unbound `{}` at {}:{} cannot be identified \
+             safely because multiple '{}' elements {reason}.",
+            self.origin.kind().loop_kind(),
+            self.file(),
+            self.line(),
+            self.resource_type,
+        )?;
+
+        let Some(source) = self.origin.source().source_text() else {
+            return Ok(());
+        };
+        write!(
+            formatter,
+            "\nRewrite the loop with a binding and migrate its existing state addresses:\n\n\
+             let {} = {}",
+            self.suggested_binding, source,
+        )?;
+        for migration in &self.moves {
+            let display_type = if migration.provider.is_empty() {
+                migration.resource_type.clone()
+            } else {
+                format!("{}.{}", migration.provider, migration.resource_type)
+            };
+            write!(
+                formatter,
+                "\n\nmoved {{\n  from = {} {}\n  to = {} {}\n}}",
+                display_type,
+                crate::parser::display_string_literal(migration.from.exact_state_name()),
+                display_type,
+                crate::parser::display_string_literal(&migration.to),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for LoopAnonymousIdentityConflict {}
+
+/// A generated anonymous identifier shared by declarations that cannot be
+/// repaired as one authored loop rewrite.
+#[derive(Debug, Clone)]
+pub struct AnonymousResourceIdentifierCollision {
+    first_type: String,
+    second_type: String,
+    identifier: String,
+}
+
+impl std::fmt::Display for AnonymousResourceIdentifierCollision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Anonymous resource identifier collision: '{}' and '{}' produce the same identifier \
+             '{}'. Use `let` bindings to give them distinct names.",
+            self.first_type, self.second_type, self.identifier,
+        )
+    }
+}
+
+impl std::error::Error for AnonymousResourceIdentifierCollision {}
+
+/// Typed failures from anonymous identity assignment.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum AnonymousIdentityError {
+    #[error(transparent)]
+    AttributeDerived(Box<AttributeDerivedAnonymousResourceConflict>),
+    #[error(transparent)]
+    Collision(#[from] AnonymousResourceIdentifierCollision),
+    #[error(transparent)]
+    Loop(Box<LoopAnonymousIdentityConflict>),
+    #[error(transparent)]
+    LegacyMoveTarget(Box<LegacyLoopMoveTargetError>),
+}
+
+impl From<AttributeDerivedAnonymousResourceConflict> for AnonymousIdentityError {
+    fn from(error: AttributeDerivedAnonymousResourceConflict) -> Self {
+        Self::AttributeDerived(Box::new(error))
+    }
+}
+
+impl From<LoopAnonymousIdentityConflict> for AnonymousIdentityError {
+    fn from(error: LoopAnonymousIdentityConflict) -> Self {
+        Self::Loop(Box::new(error))
+    }
+}
+
+impl From<LegacyLoopMoveTargetError> for AnonymousIdentityError {
+    fn from(error: LegacyLoopMoveTargetError) -> Self {
+        Self::LegacyMoveTarget(Box::new(error))
+    }
+}
+
+/// An operator-written move whose destination is one of Carina's historical
+/// synthetic loop identities.
+#[derive(Debug, Clone)]
+pub struct LegacyLoopMoveTargetError {
+    target: StateBlockAddress,
+    replacement: Option<StateBlockAddress>,
+    source_span: Option<SourceSpan>,
+}
+
+impl LegacyLoopMoveTargetError {
+    pub fn target(&self) -> &StateBlockAddress {
+        &self.target
+    }
+
+    pub fn replacement(&self) -> Option<&StateBlockAddress> {
+        self.replacement.as_ref()
+    }
+
+    pub fn source_span(&self) -> Option<SourceSpan> {
+        self.source_span
+    }
+}
+
+fn display_state_block_address(address: &StateBlockAddress) -> String {
+    format!(
+        "{} {}",
+        address.display_type(),
+        crate::parser::display_string_literal(address.name_str()),
+    )
+}
+
+impl std::fmt::Display for LegacyLoopMoveTargetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "The `moved.to` address {} is a legacy synthetic loop address and cannot be a \
+             destination.",
+            display_state_block_address(&self.target),
+        )?;
+        if let Some(replacement) = &self.replacement {
+            write!(
+                formatter,
+                " Use the current anonymous address {} instead.",
+                display_state_block_address(replacement),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for LegacyLoopMoveTargetError {}
+
+/// Reject historical synthetic loop identities as `moved.to` destinations.
+///
+/// A legacy identity remains valid as `moved.from`, which is how users can
+/// explicitly migrate old state to a newly bound loop. When provenance points
+/// to exactly one current resource, include that resource's resolved address
+/// in the repair text.
+pub fn check_legacy_loop_move_targets<S>(
+    state_blocks: &[StateBlock],
+    resources: &[Resource<S>],
+) -> Vec<LegacyLoopMoveTargetError> {
+    state_blocks
+        .iter()
+        .filter_map(|block| {
+            let StateBlock::Moved { addresses } = block else {
+                return None;
+            };
+            let target = addresses.to();
+            if !target.name_str().starts_with('_') {
+                return None;
+            }
+
+            let mut replacements = Vec::new();
+            for resource in resources {
+                if resource.id.provider != target.provider
+                    || resource.id.resource_type != target.resource_type
+                {
+                    continue;
+                }
+                let Some(identity) = resource.id.identity() else {
+                    continue;
+                };
+                if !resource
+                    .loop_provenance
+                    .legacy_candidates(identity)
+                    .iter()
+                    .any(|(_, legacy)| legacy.exact_state_name() == target.name_str())
+                {
+                    continue;
+                }
+                let replacement = StateBlockAddress::new(
+                    resource.id.provider.clone(),
+                    resource.id.resource_type.clone(),
+                    identity.clone(),
+                );
+                if !replacements.contains(&replacement) {
+                    replacements.push(replacement);
+                }
+            }
+
+            Some(LegacyLoopMoveTargetError {
+                target,
+                replacement: match replacements.as_slice() {
+                    [replacement] => Some(replacement.clone()),
+                    _ => None,
+                },
+                source_span: addresses.to_span(),
+            })
+        })
+        .collect()
+}
+
 /// Find ambiguous anonymous-resource groups before any generated identity is
 /// assigned. A mutable-attribute identity is safe to reconcile only when it is
 /// the sole anonymous declaration of its kind and ownership scope.
-pub fn check_attribute_derived_anonymous_resource_conflicts(
-    resources: &[Resource],
+pub fn check_attribute_derived_anonymous_resource_conflicts<S: AnonymousIdentityModuleSource>(
+    resources: &[Resource<S>],
     registry: &SchemaRegistry,
 ) -> Vec<AttributeDerivedAnonymousResourceConflict> {
     let mut counts = BTreeMap::<AnonymousResourceKind, usize>::new();
@@ -917,9 +1181,9 @@ pub fn anonymous_identity_discriminator(identity: &ResourceIdentity) -> Option<S
 /// This is the shared feature set used by both anonymous identifier computation
 /// (when the schema has no create-only attributes) and `compute_resource_simhash`
 /// so the two always agree on what a resource's anonymous ID would be.
-fn simhash_from_identity_and_resource(
+fn simhash_from_identity_and_resource<S>(
     identity_values: &BTreeMap<String, String>,
-    resource: &Resource,
+    resource: &Resource<S>,
 ) -> SimHash {
     let mut simhash_values = identity_values.clone();
     for (key, value) in &resource.attributes {
@@ -955,13 +1219,89 @@ fn compute_resource_simhash(
     simhash_from_identity_and_resource(&identity_values, resource)
 }
 
+fn loop_conflict_for_members<S>(
+    reason: LoopConflictReason,
+    member_indices: &[usize],
+    resources: &[Resource<S>],
+) -> Option<LoopAnonymousIdentityConflict> {
+    for &seed_index in member_indices {
+        let Some(seed_origin) = resources[seed_index].loop_provenance.display_origin() else {
+            continue;
+        };
+        let matching_indices: Vec<usize> = member_indices
+            .iter()
+            .copied()
+            .filter(|&index| {
+                resources[index]
+                    .loop_provenance
+                    .display_origin()
+                    .is_some_and(|origin| seed_origin.source().same_system_target(origin.source()))
+            })
+            .collect();
+        if matching_indices.len() < 2 {
+            continue;
+        }
+
+        let mut occupied = seed_origin
+            .source()
+            .occupied_bindings()
+            .cloned()
+            .unwrap_or_default();
+        occupied.extend(
+            resources
+                .iter()
+                .filter_map(|resource| resource.binding.clone()),
+        );
+        let base = resources[seed_index]
+            .id
+            .resource_type
+            .rsplit('.')
+            .next()
+            .map(crate::parser::pascal_to_snake)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "resource".to_string());
+        let mut suggested_binding = base.clone();
+        let mut suffix = 2usize;
+        while occupied.contains(&suggested_binding) {
+            suggested_binding = format!("{base}_{suffix}");
+            suffix += 1;
+        }
+
+        let moves = matching_indices
+            .iter()
+            .filter_map(|&index| {
+                let resource = &resources[index];
+                let origin = resource.loop_provenance.direct_origin()?;
+                seed_origin
+                    .source()
+                    .same_system_target(origin.source())
+                    .then(|| LoopRewriteMove {
+                        provider: resource.id.provider.clone(),
+                        resource_type: resource.id.resource_type.clone(),
+                        from: origin.legacy_address().clone(),
+                        to: origin.rewritten_address(&suggested_binding),
+                    })
+            })
+            .collect();
+
+        return Some(LoopAnonymousIdentityConflict {
+            reason,
+            origin: seed_origin.clone(),
+            resource_type: resources[seed_index].id.display_type(),
+            suggested_binding,
+            moves,
+        });
+    }
+    None
+}
+
 #[cfg(test)]
 pub fn compute_anonymous_identifiers_for_test(
     resources: &mut [Resource],
     providers: &[ProviderConfig],
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), AnonymousIdentityError> {
     let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
     compute_anonymous_identifiers_with_provider_configs(
         resources,
@@ -976,16 +1316,29 @@ pub fn compute_anonymous_identifiers_for_test(
 ///
 /// `identity_attributes_fn` takes a provider name and returns the list of identity attribute names
 /// for that provider (e.g., `["region"]`).
-pub fn compute_anonymous_identifiers_with_provider_configs(
-    resources: &mut [Resource],
+pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityModuleSource>(
+    resources: &mut [Resource<S>],
     providers: &CanonicalizedProviderConfigs,
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), AnonymousIdentityError> {
     use std::hash::{Hash, Hasher};
 
+    for conflict in check_attribute_derived_anonymous_resource_conflicts(resources, registry) {
+        let members: Vec<usize> = resources
+            .iter()
+            .enumerate()
+            .filter_map(|(index, resource)| conflict.includes(resource, registry).then_some(index))
+            .collect();
+        if let Some(loop_conflict) =
+            loop_conflict_for_members(LoopConflictReason::AttributeDerived, &members, resources)
+        {
+            return Err(loop_conflict.into());
+        }
+    }
+
     // First pass: compute identifiers and detect collisions
-    let mut computed: Vec<(usize, String)> = Vec::new();
+    let mut computed: Vec<(usize, String, BTreeMap<String, String>)> = Vec::new();
 
     for (idx, resource) in resources.iter().enumerate() {
         if resource.id.identity_str().is_some() {
@@ -1072,32 +1425,55 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
         let identifier = resource
             .module_source
             .as_ref()
-            .and_then(crate::resource::ModuleSource::outer_instance_identity)
+            .and_then(AnonymousIdentityModuleSource::anonymous_outer_instance_identity)
             .map_or_else(
                 || bare_identifier.clone(),
                 |instance| format!("{}.{}", instance, bare_identifier),
             );
 
-        computed.push((idx, identifier));
+        computed.push((idx, identifier, hash_values));
     }
 
     // Detect collisions
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    for (idx, identifier) in &computed {
-        if let Some(first_idx) = seen.get(identifier) {
-            return Err(format!(
-                "Anonymous resource identifier collision: '{}' and '{}' produce the same identifier '{}'. \
-                 Use `let` bindings to give them distinct names.",
-                resources[*first_idx].id.display_type(),
-                resources[*idx].id.display_type(),
-                identifier,
-            ));
+    let mut collisions: HashMap<String, Vec<usize>> = HashMap::new();
+    for (computed_index, (_, identifier, _)) in computed.iter().enumerate() {
+        collisions
+            .entry(identifier.clone())
+            .or_default()
+            .push(computed_index);
+    }
+    for (identifier, collision_members) in collisions {
+        if collision_members.len() < 2 {
+            continue;
         }
-        seen.insert(identifier.clone(), *idx);
+        let resource_indices: Vec<usize> = collision_members
+            .iter()
+            .map(|&computed_index| computed[computed_index].0)
+            .collect();
+        let first_inputs = &computed[collision_members[0]].2;
+        let identical_stable_inputs = !first_inputs.is_empty()
+            && collision_members
+                .iter()
+                .all(|&computed_index| &computed[computed_index].2 == first_inputs);
+        if identical_stable_inputs
+            && let Some(loop_conflict) = loop_conflict_for_members(
+                LoopConflictReason::IdenticalIdentityInputs,
+                &resource_indices,
+                resources,
+            )
+        {
+            return Err(loop_conflict.into());
+        }
+        return Err(AnonymousResourceIdentifierCollision {
+            first_type: resources[resource_indices[0]].id.display_type(),
+            second_type: resources[resource_indices[1]].id.display_type(),
+            identifier,
+        }
+        .into());
     }
 
     // Second pass: apply identifiers
-    for (idx, identifier) in computed {
+    for (idx, identifier, _) in computed {
         let provider = resources[idx].id.provider.clone();
         let resource_type = resources[idx].id.resource_type.clone();
         let provider_instance = resources[idx].id.provider_instance.clone();
@@ -1118,7 +1494,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs_for_test(
     providers: &[ProviderConfig],
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), AnonymousIdentityError> {
     let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
     compute_anonymous_identifiers_with_provider_configs(
         resources,
@@ -1135,7 +1511,9 @@ pub struct AnonymousIdStateInfo {
     pub name: String,
     /// Provider-instance routing carried by the persisted state row.
     pub provider_instance: Option<String>,
-    /// Create-only attribute values from state, keyed by DSL attribute name
+    /// Stable create-only and identity attribute values from state, keyed by
+    /// DSL attribute name. Existing reconciliation consumes the create-only
+    /// subset; exact legacy-loop disambiguation also consumes identity fields.
     pub create_only_values: HashMap<String, String>,
 }
 
@@ -1150,6 +1528,200 @@ fn resolved_anonymous_state_id(
         ResourceIdentity::new(entry.name.clone()),
         entry.provider_instance.clone(),
     )
+}
+
+fn stable_identity_match_values(
+    resource: &Resource,
+    schema: &ResourceSchema,
+) -> Option<BTreeMap<String, String>> {
+    let mut values = BTreeMap::new();
+    for attribute in schema
+        .create_only_attributes()
+        .into_iter()
+        .chain(schema.identity_attributes())
+    {
+        if values.contains_key(attribute) {
+            continue;
+        }
+        let value = if let Some(prefix) = resource.prefixes.get(attribute) {
+            format!("Prefix({prefix:?})")
+        } else if let Some(value) = resource.get_attr(attribute) {
+            canonical_create_only_value_string(value)?
+        } else {
+            continue;
+        };
+        values.insert(attribute.to_string(), value);
+    }
+    Some(values)
+}
+
+fn legacy_row_stable_identity_matches(
+    candidate: &LegacyLoopMoveCandidate<'_>,
+    state_entry: &AnonymousIdStateInfo,
+    registry: &SchemaRegistry,
+) -> Option<bool> {
+    let schema = registry.get_for(candidate.resource)?;
+    let desired_values = stable_identity_match_values(candidate.resource, schema.as_schema())?;
+    if desired_values.is_empty() || state_entry.create_only_values.is_empty() {
+        return None;
+    }
+    Some(
+        desired_values.len() == state_entry.create_only_values.len()
+            && desired_values.iter().all(|(attribute, value)| {
+                state_entry.create_only_values.get(attribute) == Some(value)
+            }),
+    )
+}
+
+type LegacyLoopAddressKey = (String, String, String, Option<String>);
+
+fn loop_address_key(id: &ResolvedResourceId) -> LegacyLoopAddressKey {
+    (
+        id.provider().to_string(),
+        id.resource_type().to_string(),
+        id.identity_str().to_string(),
+        id.provider_instance().map(str::to_string),
+    )
+}
+
+struct LegacyLoopMoveCandidate<'a> {
+    resource: &'a Resource,
+    destination: ResolvedResourceId,
+    legacy: LegacyLoopAddress,
+}
+
+/// Detect exact state moves from historical synthetic loop addresses to the
+/// anonymous identities now assigned to the same authored elements.
+///
+/// This is deliberately an exact-address migration oracle. It never falls
+/// back to SimHash or distance matching. When multiple desired elements claim
+/// the same historical address, the persisted stable identity fields must
+/// select exactly one owner.
+pub fn detect_legacy_loop_address_moves(
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+    find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
+    claims: &StateBlockClaims,
+    reserved_moves: &[ResolvedMove],
+) -> Vec<ResolvedMove> {
+    let desired_ids: HashSet<LegacyLoopAddressKey> = resources
+        .iter()
+        .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
+        .map(|id| loop_address_key(&id))
+        .collect();
+    let reserved_sources: HashSet<LegacyLoopAddressKey> = reserved_moves
+        .iter()
+        .map(|migration| loop_address_key(migration.from()))
+        .collect();
+
+    let mut candidates = Vec::new();
+    for resource in resources {
+        let Some(destination) = ResolvedResourceId::try_new(resource.id.clone()) else {
+            continue;
+        };
+        let Some(identity) = resource.id.identity() else {
+            continue;
+        };
+        for (_, legacy) in resource.loop_provenance.legacy_candidates(identity) {
+            if candidates
+                .iter()
+                .any(|candidate: &LegacyLoopMoveCandidate<'_>| {
+                    candidate.destination == destination && candidate.legacy == legacy
+                })
+            {
+                continue;
+            }
+            candidates.push(LegacyLoopMoveCandidate {
+                resource,
+                destination: destination.clone(),
+                legacy,
+            });
+        }
+    }
+
+    let mut visited_groups = HashSet::new();
+    let mut used_sources = HashSet::new();
+    let mut migrations = Vec::new();
+    for candidate in &candidates {
+        let group_key = (
+            candidate.destination.provider().to_string(),
+            candidate.destination.resource_type().to_string(),
+            candidate.legacy.exact_state_name().to_string(),
+            candidate
+                .destination
+                .provider_instance()
+                .map(str::to_string),
+        );
+        if !visited_groups.insert(group_key.clone()) {
+            continue;
+        }
+
+        let state_entries = find_state_by_type(&group_key.0, &group_key.1);
+        let exact_rows: Vec<&AnonymousIdStateInfo> = state_entries
+            .all()
+            .filter(|entry| entry.name == group_key.2 && entry.provider_instance == group_key.3)
+            .collect();
+        let [state_entry] = exact_rows.as_slice() else {
+            continue;
+        };
+        let source = resolved_anonymous_state_id(&group_key.0, &group_key.1, state_entry);
+        let source_key = loop_address_key(&source);
+        if claims.claims_from(source.as_inner())
+            || reserved_sources.contains(&source_key)
+            || desired_ids.contains(&source_key)
+            || used_sources.contains(&source_key)
+        {
+            continue;
+        }
+
+        let eligible: Vec<&LegacyLoopMoveCandidate<'_>> = candidates
+            .iter()
+            .filter(|other| {
+                other.destination.provider() == group_key.0
+                    && other.destination.resource_type() == group_key.1
+                    && other.legacy.exact_state_name() == group_key.2
+                    && other.destination.provider_instance() == group_key.3.as_deref()
+            })
+            .filter(|other| {
+                !claims.claims_to(other.destination.as_inner())
+                    && !state_entries.all().any(|entry| {
+                        entry.name == other.destination.identity_str()
+                            && entry.provider_instance.as_deref()
+                                == other.destination.provider_instance()
+                    })
+            })
+            .collect();
+        let selected = match eligible.as_slice() {
+            [only] => match legacy_row_stable_identity_matches(only, state_entry, registry) {
+                Some(true) | None => Some(*only),
+                Some(false) => None,
+            },
+            [] => None,
+            multiple => {
+                let stable_matches: Vec<_> = multiple
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        legacy_row_stable_identity_matches(candidate, state_entry, registry)
+                            == Some(true)
+                    })
+                    .collect();
+                match stable_matches.as_slice() {
+                    [only] => Some(*only),
+                    _ => None,
+                }
+            }
+        };
+
+        if let Some(selected) = selected {
+            migrations.push(ResolvedMove::from_detected_rename(
+                source,
+                selected.destination.clone(),
+            ));
+            used_sources.insert(source_key);
+        }
+    }
+    migrations
 }
 
 /// Cross-resource state information used to resolve simple deferred

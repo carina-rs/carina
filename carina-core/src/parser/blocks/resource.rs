@@ -14,8 +14,8 @@ use crate::parser::error::ParseError;
 use crate::parser::util::expression_is_plain_string_literal;
 use crate::parser::{parse_expression, parse_expression_eval, parse_expression_in_sink};
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId, ResourceIdentity,
-    Value,
+    ConcreteValue, DataSource, DeferredValue, Directives, LoopElementOrigin, LoopProvenance,
+    Resource, ResourceId, ResourceIdentity, Value,
 };
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -26,10 +26,48 @@ pub(in crate::parser) fn parse_anonymous_resource(
     preprocessed_file: &crate::parser::PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<Resource, ParseError> {
-    let inner = pair.into_inner();
+    parse_resource_for_target(
+        pair,
+        ctx,
+        ResourceParseTarget::Pending { origin: None },
+        preprocessed_file,
+        source_file,
+        "anonymous resource",
+    )
+}
 
-    let mut iter = inner;
-    let namespaced_type = next_pair(&mut iter, "resource type", "anonymous resource")?
+pub(crate) enum ResourceParseTarget {
+    Pending { origin: Option<LoopElementOrigin> },
+    Bound { binding: String },
+}
+
+pub(crate) fn parse_resource_expr_for_target(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    target: ResourceParseTarget,
+    preprocessed_file: &crate::parser::PreprocessedFile,
+    source_file: &std::path::Path,
+) -> Result<Resource, ParseError> {
+    parse_resource_for_target(
+        pair,
+        ctx,
+        target,
+        preprocessed_file,
+        source_file,
+        "resource expression",
+    )
+}
+
+fn parse_resource_for_target(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    target: ResourceParseTarget,
+    preprocessed_file: &crate::parser::PreprocessedFile,
+    source_file: &std::path::Path,
+    context: &'static str,
+) -> Result<Resource, ParseError> {
+    let mut iter = pair.into_inner();
+    let namespaced_type = next_pair(&mut iter, "resource type", context)?
         .as_str()
         .to_string();
 
@@ -42,7 +80,17 @@ pub(in crate::parser) fn parse_anonymous_resource(
     let provider = parts[0];
     let resource_type = parts[1..].join(".");
 
-    let provisional_id = ResourceId::pending_with_provider(provider, resource_type.clone(), None);
+    let provisional_id = match &target {
+        ResourceParseTarget::Pending { .. } => {
+            ResourceId::pending_with_provider(provider, resource_type.clone(), None)
+        }
+        ResourceParseTarget::Bound { binding } => ResourceId::with_provider_identity(
+            provider,
+            resource_type.clone(),
+            ResourceIdentity::new(binding.clone()),
+            None,
+        ),
+    };
     let mode = ExpressionMode::resource(provisional_id.clone(), source_file, preprocessed_file);
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
     let parsed_contents = parse_block_contents_with_quoted(
@@ -56,11 +104,27 @@ pub(in crate::parser) fn parse_anonymous_resource(
     let attributes = parsed_contents.attributes;
     let directives = parsed_contents.directives.unwrap_or_default();
 
-    let id = ResourceId::pending_with_provider(
-        provider,
-        resource_type,
-        directives.provider_instance.clone(),
-    );
+    let (id, binding, loop_provenance) = match target {
+        ResourceParseTarget::Pending { origin } => (
+            ResourceId::pending_with_provider(
+                provider,
+                resource_type,
+                directives.provider_instance.clone(),
+            ),
+            None,
+            origin.map(LoopProvenance::direct).unwrap_or_default(),
+        ),
+        ResourceParseTarget::Bound { binding } => (
+            ResourceId::with_provider_identity(
+                provider,
+                resource_type,
+                ResourceIdentity::new(binding.clone()),
+                directives.provider_instance.clone(),
+            ),
+            Some(binding),
+            LoopProvenance::default(),
+        ),
+    };
     ctx.remap_binding_use_resource(&provisional_id, &id);
 
     Ok(Resource {
@@ -68,10 +132,11 @@ pub(in crate::parser) fn parse_anonymous_resource(
         attributes: attributes.into_iter().collect(),
         directives,
         prefixes: HashMap::new(),
-        binding: None,
+        binding,
         dependency_bindings: BTreeSet::new(),
         module_source: None,
         default_tag_keys: Default::default(),
+        loop_provenance,
         quoted_string_attrs,
     })
 }
@@ -293,63 +358,15 @@ pub(crate) fn parse_resource_expr(
     preprocessed_file: &crate::parser::PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<Resource, ParseError> {
-    let mut inner = pair.into_inner();
-
-    let namespaced_type = next_pair(&mut inner, "resource type", "resource expression")?
-        .as_str()
-        .to_string();
-
-    // Extract resource type from namespace (aws.s3_bucket -> s3_bucket)
-    let parts: Vec<&str> = namespaced_type.split('.').collect();
-    if parts.len() < 2 {
-        return Err(ParseError::InvalidResourceType(namespaced_type));
-    }
-
-    // First part is provider name, the rest is resource type
-    let provider = parts[0];
-    let resource_type = parts[1..].join(".");
-
-    let provisional_id = ResourceId::with_provider_identity(
-        provider,
-        resource_type.clone(),
-        ResourceIdentity::new(binding_name.to_string()),
-        None,
-    );
-    let mode = ExpressionMode::resource(provisional_id.clone(), source_file, preprocessed_file);
-    let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
-    let parsed_contents = parse_block_contents_with_quoted(
-        inner,
+    parse_resource_expr_for_target(
+        pair,
         ctx,
-        &mode,
-        &mut quoted_out,
-        ReservedAttributeNamePolicy::Reject,
-    )?;
-    let quoted_string_attrs = quoted_out.unwrap_or_default();
-    let attributes = parsed_contents.attributes;
-    let directives = parsed_contents.directives.unwrap_or_default();
-
-    // All providers: use binding name as identifier.
-    let resource_name = binding_name.to_string();
-
-    let id = ResourceId::with_provider_identity(
-        provider,
-        resource_type,
-        ResourceIdentity::new(resource_name),
-        directives.provider_instance.clone(),
-    );
-    ctx.remap_binding_use_resource(&provisional_id, &id);
-
-    Ok(Resource {
-        id,
-        attributes: attributes.into_iter().collect(),
-        directives,
-        prefixes: HashMap::new(),
-        binding: Some(binding_name.to_string()),
-        dependency_bindings: BTreeSet::new(),
-        module_source: None,
-        default_tag_keys: Default::default(),
-        quoted_string_attrs,
-    })
+        ResourceParseTarget::Bound {
+            binding: binding_name.to_string(),
+        },
+        preprocessed_file,
+        source_file,
+    )
 }
 
 /// Parse a read resource expression (data source): read aws.s3_bucket { ... }

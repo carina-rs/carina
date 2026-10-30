@@ -51,7 +51,7 @@ pub(super) enum PureMetaOutcome<S> {
     Failed,
 }
 
-pub(super) fn try_dispatch_pure_meta<S: Clone>(
+pub(super) fn try_dispatch_pure_meta<S: Clone + crate::resource::AnonymousIdentityModuleSource>(
     effect: &Effect<S>,
     bindings: &ResolvedBindings,
     ctx: &PureMetaCtx<'_, S>,
@@ -68,8 +68,12 @@ pub(super) fn try_dispatch_pure_meta<S: Clone>(
 
 pub(super) fn failure_binding_name<S>(effect: &Effect<S>) -> Option<String> {
     match effect {
-        Effect::DeferredCreate { template, .. } => Some(template.binding_name.clone()),
-        Effect::DeferredReplace(payload) => Some(payload.template.binding_name.clone()),
+        Effect::DeferredCreate { template, .. } => {
+            Some(template.target.scheduler_key().to_string())
+        }
+        Effect::DeferredReplace(payload) => {
+            Some(payload.template.target.scheduler_key().to_string())
+        }
         _ => effect.binding_name(),
     }
 }

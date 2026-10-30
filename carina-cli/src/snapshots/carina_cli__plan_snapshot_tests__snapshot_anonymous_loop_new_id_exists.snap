@@ -1,0 +1,9 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  - awscc.ec2.Vpc _for0[0]
+
+Plan: 0 to add, 0 to change, 1 to destroy.

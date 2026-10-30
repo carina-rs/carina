@@ -1,14 +1,16 @@
 use super::*;
 use crate::parser::StateBlockAddress;
 use crate::resource::{
-    AccessPath, CompositionCall, CompositionCallPath, ModuleInstanceScope, ModuleSource,
-    PendingReRead, ReReadReason, Resource, Subscript, UnknownReason, ValueString,
+    AccessPath, CompositionCall, CompositionCallPath, LoopModulePrefixOrigin, LoopProvenance,
+    ModuleInstanceScope, ModuleSource, PendingReRead, ReReadReason, Resource, ResourceIdentity,
+    Subscript, UnknownReason, ValueString,
 };
 use crate::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry,
     ValidatedConfigSchema, enum_identity,
 };
 use indexmap::IndexMap;
+use std::path::Path;
 
 fn live_module_source(name: &str, instance: &str) -> ModuleSource {
     ModuleSource::expanded_module(
@@ -22,7 +24,72 @@ fn live_module_source(name: &str, instance: &str) -> ModuleSource {
             instance: instance.to_string(),
             module_source: Some(format!("./{name}")),
             module_directory: None,
+            loop_origin: None,
         }),
+    )
+}
+
+fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
+    crate::parser::parse_file(
+        source,
+        Path::new(file),
+        &crate::parser::ProviderContext::default(),
+    )
+    .expect("valid loop fixture")
+    .resources
+}
+
+fn loop_identity_registry(stable: bool) -> SchemaRegistry {
+    let attribute = AttributeSchema::optional("identity_input", AttributeType::string());
+    let schema = if stable {
+        ResourceSchema::new("ec2.Vpc").attribute(attribute.create_only().build())
+    } else {
+        ResourceSchema::new("ec2.Vpc").attribute(attribute.build())
+    };
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+    registry
+}
+
+fn loop_state_entry(
+    name: &str,
+    provider_instance: Option<&str>,
+    identity_input: Option<&str>,
+) -> AnonymousIdStateInfo {
+    AnonymousIdStateInfo {
+        name: name.to_string(),
+        provider_instance: provider_instance.map(str::to_string),
+        create_only_values: identity_input
+            .map(|value| {
+                [("identity_input".to_string(), value.to_string())]
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn detect_legacy_loop_moves_for_test(
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+    state_entries: &[AnonymousIdStateInfo],
+    claims: &StateBlockClaims,
+    reserved_moves: &[ResolvedMove],
+) -> Vec<ResolvedMove> {
+    let find_state_by_type = |provider: &str, resource_type: &str| {
+        claims.screen_entries(provider, resource_type, state_entries.to_vec(), |entry| {
+            entry.name.as_str()
+        })
+    };
+    super::detect_legacy_loop_address_moves(
+        resources,
+        registry,
+        &find_state_by_type,
+        claims,
+        reserved_moves,
     )
 }
 
@@ -2225,7 +2292,7 @@ fn test_anonymous_resource_no_create_only_collision() {
         compute_anonymous_identifiers_for_test(&mut resources, &providers, &schemas, &identity_fn);
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("collision"));
+    assert!(result.unwrap_err().to_string().contains("collision"));
 }
 
 #[test]
@@ -5709,4 +5776,290 @@ fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_move() {
         vec![(old_name, new_name)],
         "should emit a move from the old state identity to the new identifier",
     );
+}
+
+#[test]
+fn loop_attribute_derived_conflict_renders_exact_rewrite() {
+    let source = "for cidr in ['10.0.0.0/16', '10.1.0.0/16'] {\n  mock.ec2.Vpc {\n    identity_input = cidr\n  }\n}";
+    let mut resources = parse_loop_fixture(source, "loops.crn");
+    let registry = loop_identity_registry(false);
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("one unbound loop cannot safely emit mutable-derived peers");
+
+    assert!(matches!(error, AnonymousIdentityError::Loop(_)));
+    assert_eq!(
+        error.to_string(),
+        concat!(
+            "Anonymous resources produced by the unbound `for` at loops.crn:1 cannot be ",
+            "identified safely because multiple 'mock.ec2.Vpc' elements derive identity ",
+            "from mutable attributes.\n",
+            "Rewrite the loop with a binding and migrate its existing state addresses:\n\n",
+            "let vpc = for cidr in ['10.0.0.0/16', '10.1.0.0/16'] {\n",
+            "  mock.ec2.Vpc {\n",
+            "    identity_input = cidr\n",
+            "  }\n",
+            "}\n\n",
+            "moved {\n",
+            "  from = mock.ec2.Vpc '_for0[0]'\n",
+            "  to = mock.ec2.Vpc 'vpc[0]'\n",
+            "}\n\n",
+            "moved {\n",
+            "  from = mock.ec2.Vpc '_for0[1]'\n",
+            "  to = mock.ec2.Vpc 'vpc[1]'\n",
+            "}",
+        )
+    );
+}
+
+#[test]
+fn loop_identical_identity_inputs_renders_exact_moves() {
+    let source = "let entries = {\n  alpha = 'same'\n  \"can't\" = 'same'\n}\nfor key, name in entries {\n  mock.ec2.Vpc {\n    identity_input = name\n  }\n}";
+    let mut resources = parse_loop_fixture(source, "quoted-key.crn");
+    let registry = loop_identity_registry(true);
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("identical stable inputs must not silently share an identity");
+
+    assert!(matches!(error, AnonymousIdentityError::Loop(_)));
+    assert_eq!(
+        error.to_string(),
+        concat!(
+            "Anonymous resources produced by the unbound `for` at quoted-key.crn:5 cannot be ",
+            "identified safely because multiple 'mock.ec2.Vpc' elements have identical stable ",
+            "identity inputs.\n",
+            "Rewrite the loop with a binding and migrate its existing state addresses:\n\n",
+            "let vpc = for key, name in entries {\n",
+            "  mock.ec2.Vpc {\n",
+            "    identity_input = name\n",
+            "  }\n",
+            "}\n\n",
+            "moved {\n",
+            "  from = mock.ec2.Vpc '_entries.alpha'\n",
+            "  to = mock.ec2.Vpc 'vpc.alpha'\n",
+            "}\n\n",
+            "moved {\n",
+            "  from = mock.ec2.Vpc \"_entries['can't']\"\n",
+            "  to = mock.ec2.Vpc \"vpc['can't']\"\n",
+            "}",
+        )
+    );
+}
+
+fn resolved_single_loop_resource(provider_instance: Option<&str>) -> (Resource, SchemaRegistry) {
+    let source = "for value in ['stable'] {\n  mock.ec2.Vpc {\n    identity_input = value\n  }\n}";
+    let mut resources = parse_loop_fixture(source, "legacy.crn");
+    resources[0].id.provider_instance = provider_instance.map(str::to_string);
+    let registry = loop_identity_registry(true);
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("single loop element has a stable anonymous identity");
+    (resources.remove(0), registry)
+}
+
+#[test]
+fn legacy_loop_detector_exact_match() {
+    let (resource, registry) = resolved_single_loop_resource(None);
+    let claims = StateBlockClaims::empty();
+    let moves = detect_legacy_loop_moves_for_test(
+        std::slice::from_ref(&resource),
+        &registry,
+        &[loop_state_entry("_for0[0]", None, Some("stable"))],
+        &claims,
+        &[],
+    );
+
+    assert_eq!(moves.len(), 1);
+    assert_eq!(moves[0].from().identity_str(), "_for0[0]");
+    assert_eq!(
+        moves[0].to().identity_str(),
+        resource.id.identity_str().expect("resolved destination")
+    );
+}
+
+#[test]
+fn legacy_loop_detector_skips_claimed_source() {
+    let (resource, registry) = resolved_single_loop_resource(None);
+    let claims = StateBlockClaims::new(
+        HashSet::from([StateBlockAddress::new("mock", "ec2.Vpc", "_for0[0]")]),
+        HashSet::new(),
+    );
+    let moves = detect_legacy_loop_moves_for_test(
+        &[resource],
+        &registry,
+        &[loop_state_entry("_for0[0]", None, Some("stable"))],
+        &claims,
+        &[],
+    );
+
+    assert!(moves.is_empty());
+}
+
+#[test]
+fn legacy_loop_detector_skips_existing_destination() {
+    let (resource, registry) = resolved_single_loop_resource(None);
+    let destination = resource
+        .id
+        .identity_str()
+        .expect("resolved destination")
+        .to_string();
+    let claims = StateBlockClaims::empty();
+    let moves = detect_legacy_loop_moves_for_test(
+        &[resource],
+        &registry,
+        &[
+            loop_state_entry("_for0[0]", None, Some("stable")),
+            loop_state_entry(&destination, None, Some("stable")),
+        ],
+        &claims,
+        &[],
+    );
+
+    assert!(moves.is_empty());
+}
+
+#[test]
+fn legacy_loop_detector_matches_provider_instance() {
+    let (resource, registry) = resolved_single_loop_resource(Some("west"));
+    let claims = StateBlockClaims::empty();
+    let moves = detect_legacy_loop_moves_for_test(
+        &[resource],
+        &registry,
+        &[
+            loop_state_entry("_for0[0]", None, Some("stable")),
+            loop_state_entry("_for0[0]", Some("west"), Some("stable")),
+        ],
+        &claims,
+        &[],
+    );
+
+    assert_eq!(moves.len(), 1);
+    assert_eq!(moves[0].from().provider_instance(), Some("west"));
+    assert_eq!(moves[0].to().provider_instance(), Some("west"));
+}
+
+#[test]
+fn legacy_loop_detector_moves_named_and_anonymous_module_leaves() {
+    let (seed, _) = resolved_single_loop_resource(None);
+    let outer_origin = seed
+        .loop_provenance
+        .direct_origin()
+        .expect("seed loop origin")
+        .clone();
+    let current_prefix = ResourceIdentity::new("web_0123456789abcdef");
+    let legacy_prefix = outer_origin.legacy_address().clone();
+    let provenance = || {
+        let mut provenance = LoopProvenance::default();
+        provenance.push_module_prefix(LoopModulePrefixOrigin::new(
+            outer_origin.clone(),
+            current_prefix.clone(),
+            legacy_prefix.clone(),
+        ));
+        provenance
+    };
+
+    let mut named =
+        Resource::with_provider("mock", "test.NamedLeaf", "web_0123456789abcdef.named", None);
+    named.binding = Some("named".to_string());
+    named.loop_provenance = provenance();
+    let mut anonymous = Resource::with_provider(
+        "mock",
+        "test.AnonymousLeaf",
+        "web_0123456789abcdef.mock_test_anonymous_leaf_12345678",
+        None,
+    );
+    anonymous.loop_provenance = provenance();
+
+    let claims = StateBlockClaims::empty();
+    let moves = detect_legacy_loop_moves_for_test(
+        &[named, anonymous],
+        &SchemaRegistry::new(),
+        &[
+            loop_state_entry("_for0[0].named", None, None),
+            loop_state_entry("_for0[0].mock_test_anonymous_leaf_12345678", None, None),
+        ],
+        &claims,
+        &[],
+    );
+
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![
+            (
+                "_for0[0].named".to_string(),
+                "web_0123456789abcdef.named".to_string(),
+            ),
+            (
+                "_for0[0].mock_test_anonymous_leaf_12345678".to_string(),
+                "web_0123456789abcdef.mock_test_anonymous_leaf_12345678".to_string(),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn legacy_loop_detector_breaks_ambiguous_owner_with_exact_stable_inputs() {
+    let source_a =
+        "let xs = ['alpha']\nfor value in xs {\n  mock.ec2.Vpc { identity_input = value }\n}";
+    let source_b =
+        "let xs = ['beta']\nfor value in xs {\n  mock.ec2.Vpc { identity_input = value }\n}";
+    let mut resources = parse_loop_fixture(source_a, "a.crn");
+    resources.extend(parse_loop_fixture(source_b, "b.crn"));
+    let registry = loop_identity_registry(true);
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("distinct stable inputs produce distinct destinations");
+    let beta_destination = resources[1]
+        .id
+        .identity_str()
+        .expect("resolved beta destination")
+        .to_string();
+
+    let claims = StateBlockClaims::empty();
+    let moves = detect_legacy_loop_moves_for_test(
+        &resources,
+        &registry,
+        &[loop_state_entry("_xs[0]", None, Some("beta"))],
+        &claims,
+        &[],
+    );
+
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![("_xs[0]".into(), beta_destination)]
+    );
+}
+
+#[test]
+fn legacy_loop_detector_skips_ambiguous_owner_without_one_exact_input_match() {
+    let source_a =
+        "let xs = ['same']\nfor value in xs {\n  mock.ec2.Vpc { identity_input = value }\n}";
+    let source_b =
+        "let xs = ['same']\nfor value in xs {\n  mock.ec2.Vpc { identity_input = value }\n}";
+    let mut resources = parse_loop_fixture(source_a, "a.crn");
+    resources.extend(parse_loop_fixture(source_b, "b.crn"));
+    for (index, resource) in resources.iter_mut().enumerate() {
+        resource.id = crate::resource::ResourceId::with_provider_identity(
+            "mock",
+            "ec2.Vpc",
+            ResourceIdentity::new(format!("manual_destination_{index}")),
+            None,
+        );
+    }
+    let registry = loop_identity_registry(true);
+    let claims = StateBlockClaims::empty();
+
+    for persisted_value in [Some("different"), Some("same"), None] {
+        let moves = detect_legacy_loop_moves_for_test(
+            &resources,
+            &registry,
+            &[loop_state_entry("_xs[0]", None, persisted_value)],
+            &claims,
+            &[],
+        );
+        assert!(
+            moves.is_empty(),
+            "zero or multiple exact stable-input owners must not be guessed: {persisted_value:?}"
+        );
+    }
 }

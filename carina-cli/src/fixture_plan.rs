@@ -301,6 +301,16 @@ where
         name == "moved_claims_precede_heuristics"
             || name == "anonymous_old_identity_name_override"
             || name == "anonymous_old_identity_update"
+            || name == "anonymous_loop_insert_before"
+            || name == "anonymous_loop_reorder"
+            || name == "anonymous_loop_delete_earlier"
+            || name == "anonymous_loop_sibling_files"
+            || name == "anonymous_loop_same_tail"
+            || name == "anonymous_if_legacy"
+            || name == "anonymous_loop_deferred_map"
+            || name == "anonymous_loop_module_call"
+            || name == "anonymous_loop_claimed_legacy"
+            || name == "anonymous_loop_new_id_exists"
     }) {
         // These fixtures exercise pre-refresh anonymous reconciliation, so
         // compute their desired addresses before claims and move detection.
@@ -405,6 +415,54 @@ where
             )
         });
 
+    let managed_bindings: HashSet<String> = expansion_prelude
+        .sorted_resources()
+        .iter()
+        .filter_map(|resource| resource.binding.clone())
+        .collect();
+    let non_managed_deferred_for = parsed
+        .deferred_for_expressions
+        .iter()
+        .filter(|deferred| {
+            !deferred
+                .root_bindings()
+                .iter()
+                .any(|binding| managed_bindings.contains(binding))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut reconciled_expansion = expansion_prelude
+        .bind_projected_phase1_state(managed_current, orphans, HashSet::new())
+        .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Print)
+        .expect("fixture move routes must match their loaded current states");
+
+    // Match the production plan order: expand upstream-resolved deferred loops
+    // before building the override-aware desired view and running the late
+    // anonymous identity/migration seam.
+    let prepared_for_expansion =
+        reconciled_expansion.prepared_clone_for_fixture(data_source_values.clone());
+    let (validated_expansion, deferred_for_expansion) = validated_config
+        .expand_deferred_for(
+            &prepared_for_expansion,
+            &remote_bindings,
+            crate::wiring::DeferredForWarningPolicy::Print,
+        )
+        .expect("fixture deferred-for expansion failed");
+    let (wiring, expanded_canonical_resources) = validated_expansion.context_and_resources();
+    let parsed = expanded_canonical_resources.parsed();
+    let sorted_resources = &deferred_for_expansion.sorted_resources;
+    {
+        let (managed_current, _) = reconciled_expansion.managed_current_and_orphans_mut();
+        for resource in sorted_resources
+            .iter()
+            .filter(|resource| deferred_for_expansion.new_child_ids.contains(&resource.id))
+        {
+            managed_current
+                .entry(resource.id.clone())
+                .or_insert_with(|| Current::absent(resource.id.clone()));
+        }
+    }
+
     // carina#3248: build unified pre-apply bindings (managed +
     // composition + data sources) so composition-rooted refs in the fixture
     // resolve through the composition layer to the managed sibling.
@@ -418,26 +476,26 @@ where
         .map(String::as_str)
         .collect();
     let pre_apply_input_current = carina_core::resource::into_plan_input_current_map(
-        managed_current.clone(),
+        reconciled_expansion.managed_current().clone(),
         wiring.schemas(),
         sorted_resources,
     );
     let managed_stability = crate::wiring::derive_managed_binding_stability(
         parsed,
         sorted_resources,
-        &managed_current,
+        reconciled_expansion.managed_current(),
         &data_source_values,
         wiring.schemas(),
-        expansion_prelude.saved_attrs(),
-        expansion_prelude.prev_explicit(),
+        reconciled_expansion.saved_attrs(),
+        reconciled_expansion.prev_explicit(),
         &remote_bindings,
-        expansion_prelude.wait_aliases(),
+        reconciled_expansion.wait_aliases(),
     )
     .expect("fixture managed binding stability must resolve");
-    let projected_state = expansion_prelude.projected_state();
+    let projected_state = reconciled_expansion.projected_state(state_file.as_ref());
     let (mut override_aware_resources, unresolved_override_aware_resources) =
         OverrideAwareResources::build_pair_with_stability(
-            canonical_resources,
+            expanded_canonical_resources.as_pair(),
             &projected_state,
             carina_core::binding_index::LivePreApplyInputs {
                 managed: &[],
@@ -445,7 +503,7 @@ where
                 managed_current: &pre_apply_input_current,
                 data_source_values: &data_source_values,
                 remote_bindings: &remote_bindings,
-                wait_aliases: expansion_prelude.wait_aliases(),
+                wait_aliases: reconciled_expansion.wait_aliases(),
             },
             &managed_stability,
             OverrideAwareBuildMode::Plan {
@@ -508,15 +566,16 @@ where
                 Box::new(carina_provider_mock::MockProvider::new()),
             );
         }
+        let (managed_current, orphans) = reconciled_expansion.managed_current_and_orphans_mut();
         rt.block_on(async {
             PlanPreprocessor::new(&provider_router, wiring)
                 .prepare(
                     &mut override_aware_resources,
                     &constraint_origin_resources,
                     &module_gate,
-                    &mut managed_current,
+                    managed_current,
                     &mut data_source_values,
-                    &mut orphans,
+                    orphans,
                     raw_provider_configs,
                     &mut data_sources_for_plan,
                     &data_sources,
@@ -535,9 +594,11 @@ where
         for error in errors {
             plan.add_error(error);
         }
-        managed_current = into_all_prior_states(orphans, managed_current);
-        let prev_explicit = expansion_prelude.prev_explicit().clone();
-        drop(expansion_prelude);
+        let managed_current = into_all_prior_states(
+            reconciled_expansion.orphans().clone(),
+            reconciled_expansion.managed_current().clone(),
+        );
+        let prev_explicit = reconciled_expansion.prev_explicit().clone();
         return FixturePlan {
             plan,
             // Error plans are never rendered, so they intentionally do not
@@ -562,26 +623,6 @@ where
             expansion_trace: parsed.expansion_trace.clone(),
         };
     }
-    let managed_bindings: HashSet<String> = expansion_prelude
-        .sorted_resources()
-        .iter()
-        .filter_map(|resource| resource.binding.clone())
-        .collect();
-    let non_managed_deferred_for = parsed
-        .deferred_for_expressions
-        .iter()
-        .filter(|deferred| {
-            !deferred
-                .root_bindings()
-                .iter()
-                .any(|binding| managed_bindings.contains(binding))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut reconciled_expansion = expansion_prelude
-        .bind_projected_phase1_state(managed_current, orphans, HashSet::new())
-        .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Print)
-        .expect("fixture move routes must match their loaded current states");
     let resolved_desired_ids = reconciled_expansion
         .reconcile_late_anonymous_identities(
             wiring,
@@ -636,13 +677,6 @@ where
     );
 
     let prepared_expansion = reconciled_expansion.seal(data_source_values);
-    let (validated_expansion, deferred_for_expansion) = validated_config
-        .expand_deferred_for(
-            &prepared_expansion,
-            &remote_bindings,
-            crate::wiring::DeferredForWarningPolicy::Print,
-        )
-        .expect("fixture deferred-for expansion failed");
     let crate::wiring::PreparedDeferredForExpansionParts {
         addressed,
         data_source_values,
@@ -655,8 +689,6 @@ where
         prev_explicit,
         moved_pairs,
     } = addressed.into_parts();
-    let (wiring, expanded_canonical_resources) = validated_expansion.context_and_resources();
-    let parsed = expanded_canonical_resources.parsed();
     let deferred_create_targets: Vec<_> = deferred_for_expansion
         .deferred_create_targets
         .into_iter()

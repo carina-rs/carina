@@ -120,6 +120,7 @@ fn create_test_module() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -263,6 +264,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -453,6 +455,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -563,9 +566,11 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
                 instance: current_prefix.clone(),
                 module_source: None,
                 module_directory: None,
+                loop_origin: None,
             }),
         )),
         default_tag_keys: Default::default(),
+        loop_provenance: Default::default(),
         quoted_string_attrs: std::collections::HashSet::new(),
     }];
 
@@ -611,6 +616,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 default_tag_keys: Default::default(),
+                loop_provenance: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
             },
             Resource {
@@ -629,6 +635,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 default_tag_keys: Default::default(),
+                loop_provenance: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
             },
         ],
@@ -771,6 +778,7 @@ fn create_module_with_attributes() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -2144,6 +2152,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         });
         m.wait_bindings.push(WaitBinding {
@@ -2440,6 +2449,7 @@ fn create_module_with_interpolation() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -3203,6 +3213,7 @@ let root = outer { outer_port = producer.port }
         instance: "inner".to_string(),
         module_source: None,
         module_directory: None,
+        loop_origin: None,
         id: inner_id.clone(),
     };
     let inner = LiveComposition {
@@ -5940,7 +5951,7 @@ m { foo = 'x' }
 /// the PR-A → PR-B boundary.
 #[test]
 fn test_expand_module_call_propagates_deferred_for_expressions() {
-    use crate::parser::{DeferredForExpression, ForBinding};
+    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
 
     let module = {
         let mut m = create_module_with_intra_refs();
@@ -5958,6 +5969,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         });
         m.deferred_for_expressions.push(DeferredForExpression {
@@ -5966,7 +5978,9 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             header: "for _, opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.RecordSet".to_string(),
             attributes: vec![],
-            binding_name: "_domain_validation_options".to_string(),
+            target: DeferredForTarget::Bound {
+                binding: "_domain_validation_options".to_string(),
+            },
             iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
             binding: ForBinding::Map("_".to_string(), "opt".to_string()),
             template_resource: Resource {
@@ -5993,6 +6007,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 default_tag_keys: Default::default(),
+                loop_provenance: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
             },
         });
@@ -6038,7 +6053,8 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     // `binding_name` is the generated-resource address prefix →
     // prefixed unconditionally (mirrors `Resource.binding`).
     assert_eq!(
-        d.binding_name, "r._domain_validation_options",
+        d.target.bound_binding(),
+        Some("r._domain_validation_options"),
         "PR-B must instance-prefix binding_name"
     );
     // `cert` is a module-internal `let cert` binding → prefixed
@@ -6084,7 +6100,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
 
 #[test]
 fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
-    use crate::parser::{DeferredForExpression, ForBinding};
+    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
 
     let mut module = create_test_module_with_anonymous_resource();
     module.resources.clear();
@@ -6094,7 +6110,9 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
         header: "for _, account in accounts.items".to_string(),
         resource_type: "awscc.sso.Assignment".to_string(),
         attributes: Vec::new(),
-        binding_name: "assignments".to_string(),
+        target: DeferredForTarget::Bound {
+            binding: "assignments".to_string(),
+        },
         iterable: Value::resource_ref("accounts", "items", Vec::new()),
         binding: ForBinding::Map("_".to_string(), "account".to_string()),
         template_resource: Resource::pending_with_provider("awscc", "sso.Assignment", None),
@@ -6142,7 +6160,7 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
 /// CI while silently breaking caller-passed iterables.
 #[test]
 fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
-    use crate::parser::{DeferredForExpression, ForBinding};
+    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
 
     let module = {
         let mut m = create_module_with_intra_refs();
@@ -6155,7 +6173,9 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
             header: "for _, a in accounts.list".to_string(),
             resource_type: "awscc.sso.Assignment".to_string(),
             attributes: vec![],
-            binding_name: "_list".to_string(),
+            target: DeferredForTarget::Bound {
+                binding: "_list".to_string(),
+            },
             iterable: Value::resource_ref("accounts", "list", Vec::new()),
             binding: ForBinding::Map("_".to_string(), "a".to_string()),
             template_resource: Resource {
@@ -6167,6 +6187,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 default_tag_keys: Default::default(),
+                loop_provenance: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
             },
         });
@@ -6191,7 +6212,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
     let expanded = resolver.expand_module_call(&call, "prod").unwrap();
     let d = &expanded.deferred_for_expressions[0];
     // `binding_name` is a synthesized address prefix → always prefixed.
-    assert_eq!(d.binding_name, "prod._list");
+    assert_eq!(d.target.bound_binding(), Some("prod._list"));
     // `accounts` is NOT module-internal → must stay UNPREFIXED
     // (caller-collision guard). A regression to unconditional
     // prefixing would make this `prod.accounts` and fail here.
@@ -6287,10 +6308,17 @@ let r = registry {
             .contains("r.cert.domain_validation_options")
     );
     // carina#3126 PR-B: through the full resolve_modules pipeline the
-    // deferred-for's binding-name fields are instance-prefixed (call
-    // binding is `r`), so the loop resolves against the prefixed
-    // module `cert` and its generated resources are instance-scoped.
-    assert_eq!(d.binding_name, "r._domain_validation_options");
+    // deferred-for's iterable resolves against the prefixed module `cert`.
+    // carina#4109: because this loop has no `let` binding, its generated
+    // resources stay anonymous; only the migration-only legacy base receives
+    // the module-instance prefix.
+    let crate::parser::DeferredForTarget::Unbound { template } = &d.target else {
+        panic!("unbound module loop must remain an unbound deferred target")
+    };
+    assert_eq!(
+        template.legacy_base().exact_state_name(),
+        "r._domain_validation_options"
+    );
     assert_eq!(
         d.root_bindings(),
         std::collections::BTreeSet::from(["r.cert".to_string()])

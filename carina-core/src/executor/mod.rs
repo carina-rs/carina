@@ -1200,7 +1200,7 @@ pub async fn execute_saved_plan(
     execute_runtime_plan(provider, input.into(), observer, shutdown).await
 }
 
-async fn execute_runtime_plan<S: Clone>(
+async fn execute_runtime_plan<S: Clone + crate::resource::AnonymousIdentityModuleSource>(
     provider: &dyn Provider,
     mut input: RuntimeExecutionInput<'_, S>,
     observer: &dyn ExecutionObserver<S>,

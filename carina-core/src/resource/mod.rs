@@ -5,8 +5,20 @@
 //! yet" forms.
 //! `notes/specs/2026-10-29-unknown-forms-current-state.md` explains each form,
 //! which stage produces and consumes it, and how validation treats it.
+//!
+//! Legacy loop addresses are migration-only provenance and cannot be projected
+//! into a public live identity or string:
+//!
+//! ```compile_fail
+//! use carina_core::resource::LegacyLoopAddress;
+//!
+//! fn leak_legacy_address(address: LegacyLoopAddress) -> String {
+//!     address.into()
+//! }
+//! ```
 
 mod enum_value;
+mod loop_origin;
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -34,6 +46,11 @@ pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
 };
 pub(crate) use enum_value::{enum_value_comparison_key, enum_values_equal};
+pub use loop_origin::{
+    ForLoopElement, LoopElementOrigin, LoopKind, LoopOriginKind, LoopProvenance, LoopSource,
+    UnboundLoopTemplate,
+};
+pub(crate) use loop_origin::{LegacyLoopAddress, LoopModulePrefixOrigin};
 
 #[derive(Clone, Copy)]
 pub struct EnumAttr<'a> {
@@ -5970,6 +5987,56 @@ pub enum SavedModuleSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderModuleSource {}
 
+/// Module metadata needed while assigning an anonymous resource identity.
+///
+/// Live and saved plans carry different source types, but apply-time deferred
+/// expansion must derive the same instance-qualified identity from either.
+#[doc(hidden)]
+pub trait AnonymousIdentityModuleSource {
+    fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity>;
+
+    fn anonymous_scope(&self) -> Option<(String, String)>;
+}
+
+impl AnonymousIdentityModuleSource for ModuleSource {
+    fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity> {
+        self.outer_instance_identity()
+    }
+
+    fn anonymous_scope(&self) -> Option<(String, String)> {
+        self.identity_scope()
+            .map(|scope| (scope.key().to_string(), scope.description()))
+    }
+}
+
+impl AnonymousIdentityModuleSource for SavedModuleSource {
+    fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity> {
+        match self {
+            Self::Root => None,
+            Self::Module { instance, .. } => ResourceIdentity::try_from(instance.clone()).ok(),
+        }
+    }
+
+    fn anonymous_scope(&self) -> Option<(String, String)> {
+        match self {
+            Self::Root => None,
+            Self::Module { instance, .. } => {
+                Some((instance.clone(), format!("module instance '{instance}'")))
+            }
+        }
+    }
+}
+
+impl AnonymousIdentityModuleSource for ProviderModuleSource {
+    fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity> {
+        match *self {}
+    }
+
+    fn anonymous_scope(&self) -> Option<(String, String)> {
+        match *self {}
+    }
+}
+
 impl From<&ModuleSource> for SavedModuleSource {
     fn from(source: &ModuleSource) -> Self {
         match source {
@@ -6143,6 +6210,12 @@ pub struct Resource<S = ModuleSource> {
     /// after a plan round-trip, but it never enters persisted provider state.
     #[serde(default, skip_serializing_if = "DefaultTagKeys::is_empty")]
     pub default_tag_keys: DefaultTagKeys,
+    /// Source provenance for resources emitted by an unbound `for` or `if`.
+    ///
+    /// This host-owned metadata is serialized in saved plans for migration and
+    /// display, but never enters provider payloads or persisted state rows.
+    #[serde(default, skip_serializing_if = "LoopProvenance::is_empty")]
+    pub loop_provenance: LoopProvenance,
     /// Top-level attribute names whose value was written as a quoted
     /// string literal (`attr = "..."`) in the source `.crn`.
     ///
@@ -6188,6 +6261,7 @@ impl From<Resource> for SavedResource {
             dependency_bindings,
             module_source,
             default_tag_keys,
+            loop_provenance,
             quoted_string_attrs,
         } = resource;
         Self {
@@ -6199,6 +6273,7 @@ impl From<Resource> for SavedResource {
             dependency_bindings,
             module_source: module_source.as_ref().map(SavedModuleSource::from),
             default_tag_keys,
+            loop_provenance,
             quoted_string_attrs,
         }
     }
@@ -6215,6 +6290,7 @@ impl Resource {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: DefaultTagKeys::default(),
+            loop_provenance: LoopProvenance::default(),
             quoted_string_attrs: HashSet::new(),
         }
     }
@@ -6290,6 +6366,7 @@ impl<S> Resource<S> {
             dependency_bindings,
             module_source: _,
             default_tag_keys,
+            loop_provenance: _,
             quoted_string_attrs,
         } = self;
         ProviderResource {
@@ -6301,6 +6378,7 @@ impl<S> Resource<S> {
             dependency_bindings,
             module_source: None,
             default_tag_keys,
+            loop_provenance: LoopProvenance::default(),
             quoted_string_attrs,
         }
     }
@@ -6309,6 +6387,7 @@ impl<S> Resource<S> {
     /// saved module provenance already attached to this resource.
     pub(crate) fn apply_provider_resource(&mut self, provider: ProviderResource) {
         let module_source = self.module_source.take();
+        let loop_provenance = std::mem::take(&mut self.loop_provenance);
         let Resource {
             id,
             attributes,
@@ -6318,6 +6397,7 @@ impl<S> Resource<S> {
             dependency_bindings,
             module_source: _,
             default_tag_keys,
+            loop_provenance: _,
             quoted_string_attrs,
         } = provider;
         *self = Self {
@@ -6329,6 +6409,7 @@ impl<S> Resource<S> {
             dependency_bindings,
             module_source,
             default_tag_keys,
+            loop_provenance,
             quoted_string_attrs,
         };
     }

@@ -1858,6 +1858,7 @@ fn orphan_collection_rekeys_index_and_provider_state_together() {
     let move_effect: Effect = Effect::Move {
         from: ResolvedResourceId::new(old_id.clone()),
         to: ResolvedResourceId::new(new_id.clone()),
+        origin: None,
     };
     let authority = move_effect
         .move_authority()

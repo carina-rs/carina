@@ -234,7 +234,9 @@ pub(super) fn build_dependency_levels(
     result
 }
 
-pub(super) async fn execute_effects_sequential<S: Clone>(
+pub(super) async fn execute_effects_sequential<
+    S: Clone + crate::resource::AnonymousIdentityModuleSource,
+>(
     provider: &dyn Provider,
     input: &mut RuntimeExecutionInput<'_, S>,
     observer: &dyn ExecutionObserver<S>,
@@ -441,6 +443,11 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                 completed: &completed,
                 total,
                 observer,
+                identity_inputs: super::deferred_dispatch::DeferredIdentityInputs {
+                    provider_configs: input.provider_configs,
+                    factories: input.factories,
+                    schemas: input.schemas,
+                },
             };
             match try_dispatch_pure_meta(&effect, &accumulated.result().bindings, &dispatch_ctx) {
                 PureMetaOutcome::NotPureMeta => {}

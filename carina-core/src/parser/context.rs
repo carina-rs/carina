@@ -363,6 +363,10 @@ impl<'cfg> ParseContext<'cfg> {
         self.bindings.contains_key(name)
     }
 
+    pub(super) fn occupied_binding_names(&self) -> std::collections::BTreeSet<String> {
+        self.bindings.keys().cloned().collect()
+    }
+
     pub(super) fn set_resource_binding(&mut self, name: String, resource: Resource) {
         if !matches!(
             self.bindings.get(&name),

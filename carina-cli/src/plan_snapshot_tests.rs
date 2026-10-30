@@ -704,6 +704,124 @@ fn snapshot_anonymous_old_identity_update() {
     insta::assert_snapshot!(output);
 }
 
+fn assert_anonymous_loop_fixture(
+    fixture_name: &str,
+    expected_create: usize,
+    expected_delete: usize,
+    expected_moved: usize,
+) -> String {
+    let fixture = build_plan_from_fixture_name(fixture_name);
+    let summary = fixture.plan.summary();
+
+    assert_eq!(
+        summary.create, expected_create,
+        "{fixture_name}: create count"
+    );
+    assert_eq!(summary.update, 0, "{fixture_name}: update count");
+    assert_eq!(
+        summary.replace, 0,
+        "{fixture_name}: replacement means a legacy row cross-moved"
+    );
+    assert_eq!(
+        summary.delete, expected_delete,
+        "{fixture_name}: delete count"
+    );
+    assert_eq!(summary.moved, expected_moved, "{fixture_name}: move count");
+    assert_eq!(
+        fixture.moved_origins.len(),
+        expected_moved,
+        "{fixture_name}: every move must retain its source address",
+    );
+
+    strip_ansi(&format_plan(
+        &fixture.plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&fixture.schemas),
+        &fixture.moved_origins,
+        &[],
+        &[],
+        None,
+        None,
+    ))
+}
+
+#[test]
+fn snapshot_anonymous_loop_insert_before() {
+    let output = assert_anonymous_loop_fixture("anonymous_loop_insert_before", 1, 0, 2);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_anonymous_loop_origin_labels() {
+    let output = assert_anonymous_loop_fixture("anonymous_loop_insert_before", 1, 0, 2);
+    let origin_lines = output
+        .lines()
+        .filter(|line| line.contains("(for ["))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    insta::assert_snapshot!(origin_lines, @r###"
+      -> awscc.ec2.Vpc awscc_ec2_vpc_0bc2a2bb (moved from: _for0[0])  (for [0] at main.crn:11)
+      -> awscc.ec2.Vpc awscc_ec2_vpc_23be212c (moved from: _for0[1])  (for [1] at main.crn:11)
+      + awscc.ec2.Vpc awscc_ec2_vpc_2620ba6c  (for [0] at main.crn:5)
+    "###);
+}
+
+#[test]
+fn snapshot_anonymous_loop_reorder() {
+    let output = assert_anonymous_loop_fixture("anonymous_loop_reorder", 0, 0, 3);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_anonymous_loop_delete_earlier() {
+    let output = assert_anonymous_loop_fixture("anonymous_loop_delete_earlier", 0, 2, 1);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_anonymous_loop_sibling_files() {
+    let output = assert_anonymous_loop_fixture("anonymous_loop_sibling_files", 1, 0, 1);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_anonymous_loop_same_tail() {
+    let output = assert_anonymous_loop_fixture("anonymous_loop_same_tail", 1, 0, 1);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_anonymous_if_legacy() {
+    let output = assert_anonymous_loop_fixture("anonymous_if_legacy", 0, 0, 1);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_anonymous_loop_deferred_map() {
+    let output = assert_anonymous_loop_fixture("anonymous_loop_deferred_map", 0, 0, 1);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_anonymous_loop_module_call() {
+    let output = assert_anonymous_loop_fixture("anonymous_loop_module_call", 0, 0, 1);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_anonymous_loop_claimed_legacy() {
+    let output = assert_anonymous_loop_fixture("anonymous_loop_claimed_legacy", 1, 0, 1);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_anonymous_loop_new_id_exists() {
+    let output = assert_anonymous_loop_fixture("anonymous_loop_new_id_exists", 0, 1, 0);
+    insta::assert_snapshot!(output);
+}
+
 #[test]
 fn snapshot_replace_with_non_forcing_diffs() {
     let (plan, schemas, _moved) = build_plan_from_fixture("replace_with_non_forcing_diffs");
@@ -2595,7 +2713,9 @@ fn snapshot_top_level_sigil_alignment() {
             "name".to_string(),
             Value::resource_ref("option", "name", vec![]),
         )],
-        binding_name: "validation_records".to_string(),
+        target: carina_core::parser::DeferredForTarget::Bound {
+            binding: "validation_records".to_string(),
+        },
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: ForBinding::Simple("option".to_string()),
         template_resource: deferred_template,
