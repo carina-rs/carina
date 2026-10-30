@@ -2119,7 +2119,9 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             DiagnosticSeverity::ERROR,
             "interpolation is not allowed in this string literal".to_string(),
         ),
-        ParseError::UnboundLoopRead { span, .. } => carina_diagnostic_range(
+        ParseError::UnboundLoopRead {
+            span: Some(span), ..
+        } => carina_diagnostic_range(
             Range {
                 start: Position {
                     line: span.start_line().saturating_sub(1) as u32,
@@ -2130,6 +2132,15 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
                     character: span.end_column().saturating_sub(1) as u32,
                 },
             },
+            DiagnosticSeverity::ERROR,
+            error.to_string(),
+        ),
+        ParseError::UnboundLoopRead {
+            line, span: None, ..
+        } => carina_diagnostic(
+            line.saturating_sub(1) as u32,
+            0,
+            100,
             DiagnosticSeverity::ERROR,
             error.to_string(),
         ),

@@ -188,6 +188,26 @@ impl LoopSource {
         self.system_identity == other.system_identity
     }
 
+    pub(crate) fn same_authored_source(&self, other: &Self) -> bool {
+        match (self.source_span(), other.source_span()) {
+            (Some(left), Some(right)) => {
+                self.display_file == other.display_file
+                    && left.start_byte() == right.start_byte()
+                    && left.end_byte() == right.end_byte()
+                    && self.kind == other.kind
+            }
+            (None, None) => self.same_system_target(other),
+            (Some(_), None) | (None, Some(_)) => false,
+        }
+    }
+
+    pub(crate) fn binding_scope_key(&self) -> String {
+        Path::new(&self.display_file)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map_or_else(|| ".".to_string(), |parent| parent.display().to_string())
+    }
+
     pub(crate) fn source_text(&self) -> Option<&str> {
         self.authoring
             .as_ref()
@@ -270,6 +290,8 @@ pub struct LoopElementOrigin {
     kind: LoopOriginKind,
     source: LoopSource,
     legacy: LegacyLoopAddress,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    current_parent: Option<ResourceIdentity>,
 }
 
 impl LoopElementOrigin {
@@ -278,6 +300,7 @@ impl LoopElementOrigin {
             kind,
             source,
             legacy,
+            current_parent: None,
         }
     }
 
@@ -346,8 +369,23 @@ impl LoopElementOrigin {
         self.legacy = self.legacy.with_parent_legacy(prefix);
     }
 
-    fn remap_legacy_identity_prefix(&mut self, from: &ResourceIdentity, to: &ResourceIdentity) {
+    fn prefix_current_parent(&mut self, prefix: &ResourceIdentity) {
+        self.current_parent = Some(ResourceIdentity::new(
+            self.current_parent.as_ref().map_or_else(
+                || prefix.as_str().to_string(),
+                |current| format!("{}.{}", prefix.as_str(), current.as_str()),
+            ),
+        ));
+    }
+
+    fn remap_identity_prefix(&mut self, from: &ResourceIdentity, to: &ResourceIdentity) {
         self.legacy.remap_identity_prefix(from, to);
+        if let Some(current_parent) = &mut self.current_parent
+            && let Some(rewritten) =
+                replace_identity_prefix(current_parent.as_str(), from.as_str(), to.as_str())
+        {
+            *current_parent = ResourceIdentity::new(rewritten);
+        }
     }
 
     pub(crate) fn set_binding_scope(&mut self, binding_scope: Arc<BTreeSet<String>>) {
@@ -359,11 +397,10 @@ impl LoopElementOrigin {
             LoopOriginKind::For { element } => element.address(""),
             LoopOriginKind::If => String::new(),
         };
-        let legacy = self.legacy.exact_state_name();
-        let legacy_base = legacy.strip_suffix(&element_suffix).unwrap_or(legacy);
-        let parent = legacy_base
-            .rsplit_once('.')
-            .map(|(parent, _)| format!("{parent}."))
+        let parent = self
+            .current_parent
+            .as_ref()
+            .map(|parent| format!("{}.", parent.as_str()))
             .unwrap_or_default();
         format!("{parent}{binding}{element_suffix}")
     }
@@ -400,6 +437,25 @@ impl LoopModulePrefixOrigin {
         self.origin.legacy_address()
     }
 
+    pub(crate) fn rewritten_resource_addresses(
+        &self,
+        current_identity: &ResourceIdentity,
+        binding: &str,
+    ) -> Option<(LegacyLoopAddress, String)> {
+        let from = replace_identity_prefix(
+            current_identity.as_str(),
+            self.current_prefix.as_str(),
+            self.legacy_prefix().exact_state_name(),
+        )?;
+        let bound_prefix = self.origin.rewritten_address(binding);
+        let to = replace_identity_prefix(
+            current_identity.as_str(),
+            self.current_prefix.as_str(),
+            &bound_prefix,
+        )?;
+        Some((LegacyLoopAddress::new(from), to))
+    }
+
     pub(crate) fn remap_current_prefix(&mut self, from: &ResourceIdentity, to: &ResourceIdentity) {
         if let Some(rewritten) =
             replace_identity_prefix(self.current_prefix.as_str(), from.as_str(), to.as_str())
@@ -419,12 +475,13 @@ impl LoopModulePrefixOrigin {
             self.current_prefix.as_str(),
         ));
         self.origin.prefix_legacy_address(legacy_parent);
+        self.origin.prefix_current_parent(current_parent);
         self.origin.source_mut().scope_to_module(current_parent);
     }
 
     fn remap_identity_prefix(&mut self, from: &ResourceIdentity, to: &ResourceIdentity) {
         self.remap_current_prefix(from, to);
-        self.origin.remap_legacy_identity_prefix(from, to);
+        self.origin.remap_identity_prefix(from, to);
     }
 }
 
@@ -466,7 +523,6 @@ impl LoopProvenance {
         self.direct.as_deref_mut()
     }
 
-    #[cfg(test)]
     pub(crate) fn module_prefixes(&self) -> &[LoopModulePrefixOrigin] {
         &self.module_prefixes
     }
@@ -482,6 +538,7 @@ impl LoopProvenance {
     ) {
         if let Some(origin) = &mut self.direct {
             origin.prefix_legacy_address(legacy_parent);
+            origin.prefix_current_parent(current_parent);
             origin.source_mut().scope_to_module(current_parent);
         }
         for prefix in &mut self.module_prefixes {
@@ -491,7 +548,7 @@ impl LoopProvenance {
 
     pub(crate) fn remap_identity_prefix(&mut self, from: &ResourceIdentity, to: &ResourceIdentity) {
         if let Some(origin) = &mut self.direct {
-            origin.remap_legacy_identity_prefix(from, to);
+            origin.remap_identity_prefix(from, to);
         }
         for prefix in &mut self.module_prefixes {
             prefix.remap_identity_prefix(from, to);
@@ -581,12 +638,12 @@ impl UnboundLoopTemplate {
         )
     }
 
-    pub(crate) fn unbound_read_error(&self, kind: LoopKind) -> Option<crate::parser::ParseError> {
-        Some(crate::parser::ParseError::UnboundLoopRead {
+    pub(crate) fn unbound_read_error(&self, kind: LoopKind) -> crate::parser::ParseError {
+        crate::parser::ParseError::UnboundLoopRead {
             kind,
             line: self.source.line(),
-            span: self.source.source_span()?,
-        })
+            span: self.source.source_span(),
+        }
     }
 
     pub(crate) fn matches_legacy_binding(&self, binding: &str) -> bool {

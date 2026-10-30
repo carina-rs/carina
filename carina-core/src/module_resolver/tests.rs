@@ -58,6 +58,200 @@ fn module_arguments(
         .collect()
 }
 
+fn resolve_anonymous_loop_module_fixture(module_body: &str, root_body: &str) -> ParsedFile {
+    let root = tempfile::tempdir().expect("temporary module fixture");
+    let module_dir = root.path().join("modules/network");
+    fs::create_dir_all(&module_dir).expect("create module directory");
+    fs::write(module_dir.join("main.crn"), module_body).expect("write module body");
+    let root_file = root.path().join("main.crn");
+    fs::write(&root_file, root_body).expect("write root body");
+
+    let mut parsed = crate::parser::parse_file(root_body, &root_file, &ProviderContext::default())
+        .expect("root fixture parses");
+    resolve_modules(&mut parsed, root.path()).expect("module fixture expands");
+    parsed
+}
+
+fn loop_module_identity_registry() -> crate::schema::SchemaRegistry {
+    let mut registry = crate::schema::SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.Leaf")
+            .attribute(
+                AttributeSchema::optional("identity_input", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .expect("loop module schema is valid"),
+    );
+    registry
+}
+
+#[test]
+fn identical_loop_generated_module_calls_emit_one_complete_loop_rewrite() {
+    let module =
+        "arguments { label: String }\nlet leaf = mock.test.Leaf { identity_input = label }\n";
+    let root = "let network = use { source = './modules/network' }\n\
+                for label in ['same', 'same', 'other'] {\n  network { label = label }\n}\n";
+    let mut parsed = resolve_anonymous_loop_module_fixture(module, root);
+
+    let error = crate::identifier::compute_anonymous_identifiers_for_test(
+        &mut parsed.resources,
+        &[],
+        &crate::schema::SchemaRegistry::new(),
+        &|_| Vec::new(),
+    )
+    .expect_err("identical anonymous module prefixes must not silently share rows");
+    let rendered = error.to_string();
+
+    assert_eq!(
+        rendered.matches("Anonymous resources produced by").count(),
+        1,
+        "one authored loop must produce one error: {rendered}",
+    );
+    assert!(
+        rendered.contains("let network_2 = for label in ['same', 'same', 'other']"),
+        "the module use binding must remain available inside the rewritten loop: {rendered}",
+    );
+    for index in 0..3 {
+        assert!(
+            rendered.contains(&format!("from = mock.test.Leaf '_for0[{index}].leaf'")),
+            "missing legacy inner-row move for element {index}: {rendered}",
+        );
+        assert!(
+            rendered.contains(&format!("to = mock.test.Leaf 'network_2[{index}].leaf'")),
+            "missing bound inner-row move for element {index}: {rendered}",
+        );
+    }
+}
+
+#[test]
+fn loop_generated_module_calls_do_not_hide_module_internal_collisions() {
+    let module = "arguments { label: String }\n\
+                  mock.test.Leaf { identity_input = 'inner' }\n\
+                  mock.test.Leaf { identity_input = 'inner' }\n";
+    let root = "let network = use { source = './modules/network' }\n\
+                for label in ['same', 'same'] { network { label = label } }\n";
+    let mut parsed = resolve_anonymous_loop_module_fixture(module, root);
+
+    let error = crate::identifier::compute_anonymous_identifiers_for_test(
+        &mut parsed.resources,
+        &[],
+        &loop_module_identity_registry(),
+        &|_| Vec::new(),
+    )
+    .expect_err("binding the outer loop cannot repair a collision inside the module");
+    let rendered = error.to_string();
+
+    assert_eq!(
+        rendered.matches("Anonymous resources produced by").count(),
+        1,
+        "the outer loop still needs one complete rewrite: {rendered}",
+    );
+    assert!(
+        rendered.contains("Anonymous resource identifier collision"),
+        "the independent module-internal collision was hidden: {rendered}",
+    );
+}
+
+#[test]
+fn identical_module_prefixes_from_distinct_loop_sources_are_typed_errors() {
+    let module =
+        "arguments { label: String }\nlet leaf = mock.test.Leaf { identity_input = label }\n";
+    let root = "let network = use { source = './modules/network' }\n\
+                for label in ['same'] { network { label = label } }\n\
+                for label in ['same'] { network { label = label } }\n";
+    let mut parsed = resolve_anonymous_loop_module_fixture(module, root);
+
+    let error = crate::identifier::compute_anonymous_identifiers_for_test(
+        &mut parsed.resources,
+        &[],
+        &crate::schema::SchemaRegistry::new(),
+        &|_| Vec::new(),
+    )
+    .expect_err("distinct loop sources cannot share an anonymous module prefix");
+
+    assert!(
+        matches!(
+            error,
+            crate::identifier::AnonymousIdentityError::Collision(_)
+        ),
+        "cross-source sharing must use a typed plain collision: {error:?}",
+    );
+}
+
+#[test]
+fn identical_plain_anonymous_module_calls_are_typed_errors() {
+    let module =
+        "arguments { label: String }\nlet leaf = mock.test.Leaf { identity_input = label }\n";
+    let root = "let network = use { source = './modules/network' }\n\
+                network { label = 'same' }\n\
+                network { label = 'same' }\n";
+    let mut parsed = resolve_anonymous_loop_module_fixture(module, root);
+
+    let error = crate::identifier::compute_anonymous_identifiers_for_test(
+        &mut parsed.resources,
+        &[],
+        &crate::schema::SchemaRegistry::new(),
+        &|_| Vec::new(),
+    )
+    .expect_err("plain anonymous calls cannot silently share an instance prefix");
+
+    assert!(
+        matches!(
+            error,
+            crate::identifier::AnonymousIdentityError::Collision(_)
+        ),
+        "plain-call sharing must use a typed collision: {error:?}",
+    );
+}
+
+#[test]
+fn loop_inside_module_is_reported_once_across_instances_with_local_name_scope() {
+    let module = "arguments { label: String }\n\
+                  for value in ['same', 'same'] {\n  mock.test.Leaf { identity_input = value }\n}\n";
+    let root = "let leaf = mock.test.Root { value = 'reserved only at root' }\n\
+                let network = use { source = './modules/network' }\n\
+                let first = network { label = 'first' }\n\
+                let second = network { label = 'second' }\n";
+    let mut parsed = resolve_anonymous_loop_module_fixture(module, root);
+
+    let error = crate::identifier::compute_anonymous_identifiers_for_test(
+        &mut parsed.resources,
+        &[],
+        &loop_module_identity_registry(),
+        &|_| Vec::new(),
+    )
+    .expect_err("each expanded instance contains the same unsafe authored loop");
+    let rendered = error.to_string();
+
+    assert_eq!(
+        rendered.matches("Anonymous resources produced by").count(),
+        1,
+        "the authored module loop must be reported once: {rendered}",
+    );
+    assert!(
+        rendered.contains("let leaf = for value in ['same', 'same']"),
+        "a root binding must not reserve a module-local suggestion: {rendered}",
+    );
+    assert!(!rendered.contains("let leaf_2 = for"));
+    for instance in ["first", "second"] {
+        for index in 0..2 {
+            assert!(
+                rendered.contains(&format!(
+                    "from = mock.test.Leaf '{instance}._for0[{index}]'"
+                )),
+                "missing legacy move for {instance}[{index}]: {rendered}",
+            );
+            assert!(
+                rendered.contains(&format!("to = mock.test.Leaf '{instance}.leaf[{index}]'")),
+                "missing current-prefix move for {instance}[{index}]: {rendered}",
+            );
+        }
+    }
+}
+
 #[test]
 fn nested_unbound_module_loop_migrates_composed_legacy_address() {
     let root = tempfile::tempdir().expect("temporary configuration root");

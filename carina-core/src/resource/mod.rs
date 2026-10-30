@@ -6,16 +6,8 @@
 //! `notes/specs/2026-10-29-unknown-forms-current-state.md` explains each form,
 //! which stage produces and consumes it, and how validation treats it.
 //!
-//! Legacy loop addresses are migration-only provenance and cannot be projected
-//! into a public live identity or string:
-//!
-//! ```compile_fail
-//! use carina_core::resource::LegacyLoopAddress;
-//!
-//! fn leak_legacy_address(address: LegacyLoopAddress) -> String {
-//!     address.into()
-//! }
-//! ```
+//! Legacy loop addresses remain crate-private migration provenance rather than
+//! public live resource identities.
 
 mod enum_value;
 mod loop_origin;

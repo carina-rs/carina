@@ -20,7 +20,7 @@ pub(super) struct DeferredIdentityInputs<'a> {
 
 /// Failure while expanding a deferred-for create half against apply-time
 /// upstream state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) enum DeferredCreateFailure {
     /// Every candidate was complete, but a direct iterable reference was
     /// absent and there was no coalesce fallback.
@@ -44,8 +44,11 @@ pub(super) enum DeferredCreateFailure {
     ValueAccess {
         error: DeferredForExpansionError,
     },
+    ProviderConfig {
+        error: crate::value::ProviderConfigCanonicalizationError,
+    },
     AnonymousIdentity {
-        message: String,
+        error: crate::identifier::AnonymousIdentityError,
     },
     AnonymousIdentityCollision {
         id: ResourceId,
@@ -153,7 +156,8 @@ impl DeferredCreateFailure {
                 candidates.join(", ")
             ),
             DeferredCreateFailure::ValueAccess { error } => error.to_string(),
-            DeferredCreateFailure::AnonymousIdentity { message } => message.clone(),
+            DeferredCreateFailure::ProviderConfig { error } => error.to_string(),
+            DeferredCreateFailure::AnonymousIdentity { error } => error.to_string(),
             DeferredCreateFailure::AnonymousIdentityCollision { id, occupied_by } => {
                 let owner = match occupied_by {
                     AnonymousIdentityCollisionSource::DesiredPlan => "a desired plan resource",
@@ -168,6 +172,26 @@ impl DeferredCreateFailure {
                     "anonymous deferred-loop identity collided at `{id}`: the address is already owned by {owner}"
                 )
             }
+        }
+    }
+}
+
+impl std::fmt::Display for DeferredCreateFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for DeferredCreateFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ValueAccess { error } => Some(error),
+            Self::ProviderConfig { error } => Some(error),
+            Self::AnonymousIdentity { error } => Some(error),
+            Self::IterableAbsent { .. }
+            | Self::IterableUnknown { .. }
+            | Self::ShapeMismatch { .. }
+            | Self::AnonymousIdentityCollision { .. } => None,
         }
     }
 }
@@ -237,8 +261,13 @@ pub(super) fn materialize_deferred_create<
             identity_inputs.factories,
             identity_inputs.schemas,
         )
-        .map_err(|error| DeferredCreateFailure::AnonymousIdentity {
-            message: error.to_string(),
+        .map_err(|error| match error {
+            crate::identifier::AnonymousIdentityComputationError::ProviderConfig(error) => {
+                DeferredCreateFailure::ProviderConfig { error }
+            }
+            crate::identifier::AnonymousIdentityComputationError::Identity(error) => {
+                DeferredCreateFailure::AnonymousIdentity { error }
+            }
         })?;
     }
 
@@ -442,6 +471,62 @@ mod tests {
         );
         assert!(child.binding.is_none());
         assert!(child.loop_provenance.direct_origin().is_some());
+    }
+
+    #[test]
+    fn apply_time_anonymous_identity_failure_preserves_the_typed_source() {
+        let parsed = crate::parser::parse(
+            "let upstream = upstream_state { source = '../upstream' }\n\
+             for value in upstream.values {\n\
+               mock.test.Child { identity_input = value }\n\
+             }\n",
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("deferred unbound loop parses");
+        let template = &parsed.deferred_for_expressions[0];
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_with_completeness(
+            "upstream",
+            HashMap::from([(
+                "values".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Concrete(ConcreteValue::String("same".into())),
+                    Value::Concrete(ConcreteValue::String("same".into())),
+                ])),
+            )]),
+            BindingValueSource::Local,
+            BindingCompleteness::Complete,
+        );
+        let schema = crate::schema::ResourceSchema::new("test.Child").attribute(
+            crate::schema::AttributeSchema::optional(
+                "identity_input",
+                crate::schema::AttributeType::string(),
+            )
+            .create_only()
+            .build(),
+        );
+        let mut schemas = crate::schema::SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            schema.validate().expect("schema fixture must be valid"),
+        );
+        let identity_inputs = DeferredIdentityInputs {
+            provider_configs: &[],
+            factories: &[],
+            schemas: &schemas,
+        };
+
+        let error = materialize_deferred_create(template, &bindings, &identity_inputs)
+            .expect_err("identical apply-time children must fail identity assignment");
+        let source = std::error::Error::source(&error)
+            .expect("deferred failure must retain its typed identity source");
+
+        assert!(
+            source
+                .downcast_ref::<crate::identifier::AnonymousIdentityError>()
+                .is_some(),
+            "unexpected source type: {source:?}",
+        );
     }
 
     #[test]

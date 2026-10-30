@@ -215,6 +215,39 @@ fn anonymous_loop_moved_to_legacy_diagnostic_has_exact_range() {
 }
 
 #[test]
+fn anonymous_identity_and_legacy_move_target_diagnostics_are_both_reported() {
+    let source = concat!(
+        "moved {\n",
+        "  from = mock.test.resource 'old'\n",
+        "  to = mock.test.resource '_for9[0]'\n",
+        "}\n\n",
+        "for name in ['same', 'same'] {\n",
+        "  mock.test.resource { name = name }\n",
+        "}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic
+                .message
+                .contains("identical stable identity inputs"))
+            .count(),
+        1,
+        "identity diagnostic missing: {diagnostics:#?}",
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("legacy synthetic loop address"))
+            .count(),
+        1,
+        "legacy moved.to diagnostic missing: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn unbound_loop_read_diagnostics_require_let_at_the_loop_range() {
     for (source, kind) in [
         (

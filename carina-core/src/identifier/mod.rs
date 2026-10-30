@@ -596,6 +596,46 @@ impl std::fmt::Display for LegacyLoopMoveTargetError {
 
 impl std::error::Error for LegacyLoopMoveTargetError {}
 
+fn has_underscore_leading_identity_segment(identity: &str) -> bool {
+    let mut at_segment_start = true;
+    let mut bracket_depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+
+    for character in identity.chars() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if bracket_depth > 0 {
+            match character {
+                '\'' | '"' => quote = Some(character),
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        match character {
+            '[' => {
+                bracket_depth = 1;
+                at_segment_start = false;
+            }
+            '.' => at_segment_start = true,
+            '_' if at_segment_start => return true,
+            _ => at_segment_start = false,
+        }
+    }
+
+    false
+}
+
 /// Reject historical synthetic loop identities as `moved.to` destinations.
 ///
 /// A legacy identity remains valid as `moved.from`, which is how users can
@@ -613,11 +653,15 @@ pub fn check_legacy_loop_move_targets<S>(
                 return None;
             };
             let target = addresses.to();
-            let starts_with_legacy_segment = target
-                .name_str()
-                .split('.')
-                .next()
-                .is_some_and(|segment| segment.starts_with('_'));
+            let is_desired_address = resources.iter().any(|resource| {
+                resource.id.provider == target.provider
+                    && resource.id.resource_type == target.resource_type
+                    && resource.id.identity_str() == Some(target.name_str())
+            });
+            if is_desired_address {
+                return None;
+            }
+            let has_reserved_segment = has_underscore_leading_identity_segment(target.name_str());
 
             let mut replacements = Vec::new();
             for resource in resources {
@@ -647,7 +691,7 @@ pub fn check_legacy_loop_move_targets<S>(
                 }
             }
 
-            if !starts_with_legacy_segment && replacements.is_empty() {
+            if !has_reserved_segment && replacements.is_empty() {
                 return None;
             }
 
@@ -1296,36 +1340,62 @@ fn compute_resource_simhash(
     simhash_from_identity_and_resource(&identity_values, resource)
 }
 
-fn loop_conflicts_for_members<S>(
+#[derive(Default)]
+struct LoopBindingReservations {
+    by_scope: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl LoopBindingReservations {
+    fn suggest(&mut self, origin: &LoopElementOrigin, base: &str) -> String {
+        let occupied = self
+            .by_scope
+            .entry(origin.source().binding_scope_key())
+            .or_insert_with(|| origin.source().binding_scope().cloned().unwrap_or_default());
+        let mut suggested = base.to_string();
+        let mut suffix = 2usize;
+        while occupied.contains(&suggested) {
+            suggested = format!("{base}_{suffix}");
+            suffix += 1;
+        }
+        occupied.insert(suggested.clone());
+        suggested
+    }
+}
+
+fn record_direct_loop_conflict(
+    conflicts: &mut Vec<(LoopConflictReason, LoopElementOrigin)>,
     reason: LoopConflictReason,
-    member_indices: &[usize],
+    origin: &LoopElementOrigin,
+) {
+    if conflicts.iter().any(|(seen_reason, seen)| {
+        *seen_reason == reason && seen.source().same_authored_source(origin.source())
+    }) {
+        return;
+    }
+    conflicts.push((reason, origin.clone()));
+}
+
+fn direct_loop_conflicts<S>(
+    sources: &[(LoopConflictReason, LoopElementOrigin)],
     resources: &[Resource<S>],
-    occupied: &mut BTreeSet<String>,
+    reservations: &mut LoopBindingReservations,
 ) -> Vec<LoopAnonymousIdentityConflict> {
     let mut conflicts = Vec::new();
-    let mut seen_origins = Vec::<LoopElementOrigin>::new();
-    for &seed_index in member_indices {
-        let Some(seed_origin) = resources[seed_index].loop_provenance.display_origin() else {
-            continue;
-        };
-        if seen_origins
+    for (reason, seed_origin) in sources {
+        let matching: Vec<_> = resources
             .iter()
-            .any(|seen| seen.source().same_system_target(seed_origin.source()))
-        {
-            continue;
-        }
-        seen_origins.push(seed_origin.clone());
-        let matching_indices: Vec<usize> = member_indices
-            .iter()
-            .copied()
-            .filter(|&index| {
-                resources[index]
-                    .loop_provenance
-                    .display_origin()
-                    .is_some_and(|origin| seed_origin.source().same_system_target(origin.source()))
+            .filter_map(|resource| {
+                let origin = resource.loop_provenance.direct_origin()?;
+                seed_origin
+                    .source()
+                    .same_authored_source(origin.source())
+                    .then_some((resource, origin))
             })
             .collect();
-        let base = resources[seed_index]
+        let Some((seed_resource, _)) = matching.first() else {
+            continue;
+        };
+        let base = seed_resource
             .id
             .resource_type
             .rsplit('.')
@@ -1333,35 +1403,215 @@ fn loop_conflicts_for_members<S>(
             .map(crate::parser::pascal_to_snake)
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "resource".to_string());
-        let mut suggested_binding = base.clone();
-        let mut suffix = 2usize;
-        while occupied.contains(&suggested_binding) {
-            suggested_binding = format!("{base}_{suffix}");
-            suffix += 1;
-        }
-        occupied.insert(suggested_binding.clone());
-
-        let moves = matching_indices
-            .iter()
-            .filter_map(|&index| {
-                let resource = &resources[index];
-                let origin = resource.loop_provenance.direct_origin()?;
-                seed_origin
-                    .source()
-                    .same_system_target(origin.source())
-                    .then(|| LoopRewriteMove {
-                        provider: resource.id.provider.clone(),
-                        resource_type: resource.id.resource_type.clone(),
-                        from: origin.legacy_address().clone(),
-                        to: origin.rewritten_address(&suggested_binding),
-                    })
+        let resource_type = seed_resource.id.display_type();
+        let suggested_binding = reservations.suggest(seed_origin, &base);
+        let moves = matching
+            .into_iter()
+            .map(|(resource, origin)| LoopRewriteMove {
+                provider: resource.id.provider.clone(),
+                resource_type: resource.id.resource_type.clone(),
+                from: origin.legacy_address().clone(),
+                to: origin.rewritten_address(&suggested_binding),
             })
             .collect();
 
         conflicts.push(LoopAnonymousIdentityConflict {
-            reason,
+            reason: *reason,
             origin: seed_origin.clone(),
-            resource_type: resources[seed_index].id.display_type(),
+            resource_type,
+            suggested_binding,
+            moves,
+        });
+    }
+    conflicts
+}
+
+#[derive(Debug, Clone)]
+struct LoopModuleConflictSource {
+    origin: LoopElementOrigin,
+    module_name: String,
+}
+
+struct LoopModuleCollisionDiscovery {
+    sources: Vec<LoopModuleConflictSource>,
+    colliding_current_prefixes: BTreeSet<String>,
+    plain_errors: Vec<AnonymousIdentityError>,
+}
+
+fn module_prefix_collision_fully_explains_members<S>(
+    member_indices: &[usize],
+    resources: &[Resource<S>],
+    discovery: &LoopModuleCollisionDiscovery,
+) -> bool {
+    if member_indices.len() < 2 {
+        return false;
+    }
+
+    discovery.colliding_current_prefixes.iter().any(|prefix| {
+        let mut origins = Vec::with_capacity(member_indices.len());
+        for &index in member_indices {
+            let Some(origin) = resources[index]
+                .loop_provenance
+                .module_prefixes()
+                .iter()
+                .find(|candidate| candidate.current_prefix().as_str() == prefix)
+                .map(|candidate| candidate.origin())
+            else {
+                return false;
+            };
+            if origins.contains(&origin) {
+                // Two declarations from one module call still collide after
+                // the outer call receives a distinct bound prefix. That is an
+                // independent module-internal error, not part of this rewrite.
+                return false;
+            }
+            origins.push(origin);
+        }
+        true
+    })
+}
+
+fn module_name_from_instance_prefix(prefix: &str) -> String {
+    let tail = prefix.rsplit('.').next().unwrap_or(prefix);
+    tail.rsplit_once('_')
+        .filter(|(_, hash)| hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(|(module, _)| module.to_string())
+        .filter(|module| !module.is_empty())
+        .unwrap_or_else(|| "module".to_string())
+}
+
+fn discover_loop_module_prefix_collisions<S>(
+    resources: &[Resource<S>],
+) -> LoopModuleCollisionDiscovery {
+    let mut by_current_prefix = BTreeMap::<String, Vec<(usize, usize)>>::new();
+    for (resource_index, resource) in resources.iter().enumerate() {
+        for (prefix_index, prefix) in resource
+            .loop_provenance
+            .module_prefixes()
+            .iter()
+            .enumerate()
+        {
+            by_current_prefix
+                .entry(prefix.current_prefix().as_str().to_string())
+                .or_default()
+                .push((resource_index, prefix_index));
+        }
+    }
+
+    let mut sources = Vec::<LoopModuleConflictSource>::new();
+    let mut colliding_current_prefixes = BTreeSet::new();
+    let mut plain_errors = Vec::new();
+    for (current_prefix, entries) in by_current_prefix {
+        let mut distinct_origins = Vec::<(usize, usize)>::new();
+        for entry in entries.iter().copied() {
+            let origin = resources[entry.0].loop_provenance.module_prefixes()[entry.1].origin();
+            if distinct_origins.iter().any(|seen| {
+                resources[seen.0].loop_provenance.module_prefixes()[seen.1].origin() == origin
+            }) {
+                continue;
+            }
+            distinct_origins.push(entry);
+        }
+        if distinct_origins.len() < 2 {
+            continue;
+        }
+
+        let seed = resources[distinct_origins[0].0]
+            .loop_provenance
+            .module_prefixes()[distinct_origins[0].1]
+            .origin();
+        let one_authored_source = distinct_origins.iter().all(|entry| {
+            let origin = resources[entry.0].loop_provenance.module_prefixes()[entry.1].origin();
+            seed.source().same_authored_source(origin.source())
+        });
+        if one_authored_source {
+            if !sources
+                .iter()
+                .any(|source| source.origin.source().same_authored_source(seed.source()))
+            {
+                sources.push(LoopModuleConflictSource {
+                    origin: seed.clone(),
+                    module_name: module_name_from_instance_prefix(&current_prefix),
+                });
+            }
+        } else {
+            let first = &resources[distinct_origins[0].0];
+            let second = &resources[distinct_origins[1].0];
+            plain_errors.push(
+                AnonymousResourceIdentifierCollision {
+                    first_type: first.id.display_type(),
+                    second_type: second.id.display_type(),
+                    identifier: current_prefix.clone(),
+                }
+                .into(),
+            );
+        }
+        colliding_current_prefixes.insert(current_prefix);
+    }
+
+    LoopModuleCollisionDiscovery {
+        sources,
+        colliding_current_prefixes,
+        plain_errors,
+    }
+}
+
+fn loop_module_conflicts<S>(
+    sources: &[LoopModuleConflictSource],
+    resources: &[Resource<S>],
+    computed_identities: &HashMap<usize, String>,
+    reservations: &mut LoopBindingReservations,
+) -> Vec<LoopAnonymousIdentityConflict> {
+    let mut conflicts = Vec::new();
+    for source in sources {
+        let base = crate::parser::pascal_to_snake(&source.module_name);
+        let base = if base.is_empty() { "module" } else { &base };
+        let suggested_binding = reservations.suggest(&source.origin, base);
+        let mut seen_moves = BTreeSet::new();
+        let mut moves = Vec::new();
+        for (index, resource) in resources.iter().enumerate() {
+            let Some(current_identity) = resource.id.identity().cloned().or_else(|| {
+                computed_identities
+                    .get(&index)
+                    .cloned()
+                    .map(ResourceIdentity::new)
+            }) else {
+                continue;
+            };
+            for prefix in resource.loop_provenance.module_prefixes() {
+                if !source
+                    .origin
+                    .source()
+                    .same_authored_source(prefix.origin().source())
+                {
+                    continue;
+                }
+                let Some((from, to)) =
+                    prefix.rewritten_resource_addresses(&current_identity, &suggested_binding)
+                else {
+                    continue;
+                };
+                let key = (
+                    resource.id.provider.clone(),
+                    resource.id.resource_type.clone(),
+                    from.exact_state_name().to_string(),
+                    to.clone(),
+                );
+                if !seen_moves.insert(key) {
+                    continue;
+                }
+                moves.push(LoopRewriteMove {
+                    provider: resource.id.provider.clone(),
+                    resource_type: resource.id.resource_type.clone(),
+                    from,
+                    to,
+                });
+            }
+        }
+        conflicts.push(LoopAnonymousIdentityConflict {
+            reason: LoopConflictReason::IdenticalIdentityInputs,
+            origin: source.origin.clone(),
+            resource_type: format!("module {}", source.module_name),
             suggested_binding,
             moves,
         });
@@ -1398,19 +1648,9 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
 ) -> Result<(), AnonymousIdentityError> {
     use std::hash::{Hash, Hasher};
 
-    let mut occupied_bindings = resources
-        .iter()
-        .filter_map(|resource| resource.binding.clone())
-        .collect::<BTreeSet<_>>();
-    for origin in resources
-        .iter()
-        .filter_map(|resource| resource.loop_provenance.display_origin())
-    {
-        if let Some(scope) = origin.source().binding_scope() {
-            occupied_bindings.extend(scope.iter().cloned());
-        }
-    }
-    let mut identity_errors = Vec::new();
+    let mut module_collision_discovery = discover_loop_module_prefix_collisions(resources);
+    let mut identity_errors = std::mem::take(&mut module_collision_discovery.plain_errors);
+    let mut direct_conflict_sources = Vec::new();
 
     for conflict in check_attribute_derived_anonymous_resource_conflicts(resources, registry) {
         let members: Vec<usize> = resources
@@ -1418,22 +1658,30 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
             .enumerate()
             .filter_map(|(index, resource)| conflict.includes(resource, registry).then_some(index))
             .collect();
-        if members
-            .iter()
-            .any(|&index| resources[index].loop_provenance.display_origin().is_none())
+        let explained_by_module_prefix = module_prefix_collision_fully_explains_members(
+            &members,
+            resources,
+            &module_collision_discovery,
+        );
+        if !explained_by_module_prefix
+            && members
+                .iter()
+                .any(|&index| resources[index].loop_provenance.direct_origin().is_none())
         {
             identity_errors.push(conflict.into());
         }
-        identity_errors.extend(
-            loop_conflicts_for_members(
-                LoopConflictReason::AttributeDerived,
-                &members,
-                resources,
-                &mut occupied_bindings,
-            )
-            .into_iter()
-            .map(AnonymousIdentityError::from),
-        );
+        if !explained_by_module_prefix {
+            for origin in members
+                .iter()
+                .filter_map(|&index| resources[index].loop_provenance.direct_origin().cloned())
+            {
+                record_direct_loop_conflict(
+                    &mut direct_conflict_sources,
+                    LoopConflictReason::AttributeDerived,
+                    &origin,
+                );
+            }
+        }
     }
 
     // First pass: compute identifiers and detect collisions
@@ -1533,7 +1781,12 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
         computed.push((idx, identifier, hash_values));
     }
 
-    // Detect collisions
+    let computed_identities = computed
+        .iter()
+        .map(|(index, identity, _)| (*index, identity.clone()))
+        .collect::<HashMap<_, _>>();
+
+    // Detect collisions among identities generated in this pass.
     let mut collisions: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (computed_index, (_, identifier, _)) in computed.iter().enumerate() {
         collisions
@@ -1549,27 +1802,36 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
             .iter()
             .map(|&computed_index| computed[computed_index].0)
             .collect();
+        if module_prefix_collision_fully_explains_members(
+            &resource_indices,
+            resources,
+            &module_collision_discovery,
+        ) {
+            continue;
+        }
         let first_inputs = &computed[collision_members[0]].2;
         let identical_stable_inputs = !first_inputs.is_empty()
             && collision_members
                 .iter()
                 .all(|&computed_index| &computed[computed_index].2 == first_inputs);
         if identical_stable_inputs {
-            let loop_conflicts = loop_conflicts_for_members(
-                LoopConflictReason::IdenticalIdentityInputs,
-                &resource_indices,
-                resources,
-                &mut occupied_bindings,
-            );
-            if !loop_conflicts.is_empty() {
-                let has_plain_member = resource_indices
-                    .iter()
-                    .any(|&index| resources[index].loop_provenance.display_origin().is_none());
-                identity_errors
-                    .extend(loop_conflicts.into_iter().map(AnonymousIdentityError::from));
-                if !has_plain_member {
-                    continue;
-                }
+            let mut has_direct_member = false;
+            for origin in resource_indices
+                .iter()
+                .filter_map(|&index| resources[index].loop_provenance.direct_origin().cloned())
+            {
+                has_direct_member = true;
+                record_direct_loop_conflict(
+                    &mut direct_conflict_sources,
+                    LoopConflictReason::IdenticalIdentityInputs,
+                    &origin,
+                );
+            }
+            let has_plain_member = resource_indices
+                .iter()
+                .any(|&index| resources[index].loop_provenance.direct_origin().is_none());
+            if has_direct_member && !has_plain_member {
+                continue;
             }
         }
         identity_errors.push(
@@ -1581,6 +1843,62 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
             .into(),
         );
     }
+
+    // Module-internal resources with assigned names never enter the generated
+    // identity pass above. Still reject two anonymous module calls that
+    // resolve to the same complete resource address.
+    let mut resolved_identities =
+        BTreeMap::<(String, String, Option<String>, String), Vec<usize>>::new();
+    for (index, resource) in resources.iter().enumerate() {
+        let Some(identity) = resource.id.identity_str() else {
+            continue;
+        };
+        resolved_identities
+            .entry((
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+                resource.id.provider_instance.clone(),
+                identity.to_string(),
+            ))
+            .or_default()
+            .push(index);
+    }
+    for ((_, _, _, identity), resource_indices) in resolved_identities {
+        if resource_indices.len() < 2
+            || module_prefix_collision_fully_explains_members(
+                &resource_indices,
+                resources,
+                &module_collision_discovery,
+            )
+        {
+            continue;
+        }
+        identity_errors.push(
+            AnonymousResourceIdentifierCollision {
+                first_type: resources[resource_indices[0]].id.display_type(),
+                second_type: resources[resource_indices[1]].id.display_type(),
+                identifier: identity,
+            }
+            .into(),
+        );
+    }
+
+    let mut reservations = LoopBindingReservations::default();
+    identity_errors.extend(
+        direct_loop_conflicts(&direct_conflict_sources, resources, &mut reservations)
+            .into_iter()
+            .map(AnonymousIdentityError::from),
+    );
+    identity_errors.extend(
+        loop_module_conflicts(
+            &module_collision_discovery.sources,
+            resources,
+            &computed_identities,
+            &mut reservations,
+        )
+        .into_iter()
+        .map(AnonymousIdentityError::from),
+    );
 
     if !identity_errors.is_empty() {
         return Err(AnonymousIdentityError::from_errors(identity_errors));

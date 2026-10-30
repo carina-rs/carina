@@ -222,3 +222,34 @@ fn anonymous_loop_moved_to_legacy() {
         ),
     );
 }
+
+#[test]
+fn anonymous_identity_and_legacy_move_target_errors_are_reported_together() {
+    let scenario = Scenario::from_fixture("anonymous_loop_multiple_errors");
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+
+    for args in [
+        ["validate", "."].as_slice(),
+        ["plan", "--refresh=false", "."].as_slice(),
+    ] {
+        let output = scenario.carina(args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "carina {} succeeded", args[0]);
+        assert_eq!(
+            stderr
+                .matches("Anonymous resources produced by the unbound `for`")
+                .count(),
+            1,
+            "identity error missing from carina {}: {stderr}",
+            args[0],
+        );
+        assert_eq!(
+            stderr
+                .matches("is a legacy synthetic loop address and cannot be a destination")
+                .count(),
+            1,
+            "legacy moved.to error missing from carina {}: {stderr}",
+            args[0],
+        );
+    }
+}

@@ -34,7 +34,7 @@ pub enum ParseError {
     UnboundLoopRead {
         kind: crate::resource::LoopKind,
         line: usize,
-        span: super::SourceSpan,
+        span: Option<super::SourceSpan>,
     },
 
     /// A call whose name is neither a declared user function nor a builtin.

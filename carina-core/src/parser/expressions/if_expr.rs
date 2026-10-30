@@ -199,9 +199,7 @@ pub(crate) fn parse_if_body(
                 return Ok(IfBodyResult::Resource(Box::new(resource)));
             }
             Rule::read_resource_expr => {
-                if let Some(error) = target.unbound_read_error(LoopKind::If) {
-                    return Err(error);
-                }
+                target.reject_unbound_read(LoopKind::If)?;
                 let data_source = parse_read_resource_expr(
                     inner,
                     &local_ctx,

@@ -7319,6 +7319,103 @@ fn anonymous_route_resource() -> Resource {
     resource
 }
 
+fn two_anonymous_loop_collision_file() -> carina_core::parser::ParsedFile {
+    carina_core::parser::parse_file(
+        "for subnet in ['same', 'same'] {\n  awscc.ec2.SubnetRouteTableAssociation { route_table_id = 'rtb-a' subnet_id = subnet }\n}\n\
+         for subnet in ['same', 'same'] {\n  awscc.ec2.SubnetRouteTableAssociation { route_table_id = 'rtb-b' subnet_id = subnet }\n}\n",
+        std::path::Path::new("aggregate.crn"),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("two-loop identity fixture parses")
+}
+
+fn assert_two_loop_identity_aggregate(error: AppError) {
+    let rendered = error.to_string();
+    assert!(
+        matches!(
+            error,
+            AppError::AnonymousIdentity(
+                carina_core::identifier::AnonymousIdentityError::Aggregate(_)
+            )
+        ),
+        "identity failures must retain the typed aggregate: {rendered}",
+    );
+    assert!(rendered.contains("at aggregate.crn:1"), "{rendered}");
+    assert!(rendered.contains("at aggregate.crn:4"), "{rendered}");
+}
+
+#[test]
+fn file_deferred_expansion_target_reports_all_anonymous_identity_errors() {
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let mut parsed = two_anonymous_loop_collision_file();
+
+    let error = <carina_core::parser::ParsedFile as DeferredExpansionTarget<
+        carina_core::parser::ParsedExportParam,
+    >>::compute_anonymous_identifiers(&mut parsed, &ctx, &[])
+    .expect_err("both loop collisions must fail identity assignment");
+
+    assert_two_loop_identity_aggregate(error);
+}
+
+#[test]
+fn canonical_pair_deferred_expansion_target_reports_all_anonymous_identity_errors() {
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let parsed = two_anonymous_loop_collision_file();
+    let mut pair = canonical_pair(&parsed, parsed.resources.clone(), ctx.schemas());
+
+    let error = <CanonicalResourcePair<carina_core::parser::ParsedExportParam> as DeferredExpansionTarget<
+        carina_core::parser::ParsedExportParam,
+    >>::compute_anonymous_identifiers(&mut pair, &ctx, &[])
+    .expect_err("both pair-owned loop collisions must fail identity assignment");
+
+    assert_two_loop_identity_aggregate(error);
+}
+
+#[test]
+fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let parsed = two_anonymous_loop_collision_file();
+    let (mut resources, _) = build_override_aware_pair_for_test(
+        canonical_unresolved(parsed.resources, ctx.schemas()),
+        None::<&StateFile>,
+        LivePreApplyInputs {
+            managed: &[],
+            compositions: &[],
+            managed_current: &HashMap::new(),
+            data_source_values: &DataSourceValues::empty(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        },
+    )
+    .expect("identity fixture has no unresolved references");
+    let claims = StateBlockClaims::empty();
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
+
+    let result = reconcile_late_anonymous_identities(
+        &ctx,
+        LateAnonymousIdentityInputs {
+            resources: &mut resources,
+            addressed: &mut addressed,
+            data_sources: &[],
+            state_file: None,
+            state_block_claims: &claims,
+            providers: &[],
+        },
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("late identity assignment must retain both loop failures"),
+    };
+
+    assert_two_loop_identity_aggregate(error);
+}
+
 #[test]
 fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas() {
     let ctx = WiringContext::new_for_test(vec![], &[]);
@@ -8611,6 +8708,7 @@ mod expand_same_config_deferred_for_tests {
         let mut parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
         let state_file = None;
         let schemas = SchemaRegistry::new();
+        let identity_context = WiringContext::new_for_test(Vec::new(), &[]);
         let prelude = DeferredForExpansionPrelude::new_for_test(&parsed, &state_file, &schemas)
             .expect("build expansion prelude");
         let prepared = prelude
@@ -8627,7 +8725,7 @@ mod expand_same_config_deferred_for_tests {
                 &schemas,
                 &HashMap::new(),
                 DeferredForWarningPolicy::Suppress,
-                None,
+                &identity_context,
             )
             .expect("deferred-for expansion should succeed");
         assert!(

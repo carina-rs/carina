@@ -2538,6 +2538,34 @@ fn loop_scheduler_identity_uses_the_persisted_stable_hash_contract() {
 }
 
 #[test]
+fn deserialized_unbound_loop_template_still_rejects_read_without_a_source_span() {
+    let parsed = crate::parser::parse(
+        "let upstream = upstream_state { source = '../upstream' }\n\
+         for value in upstream.values { mock.test.Leaf { value = value } }\n",
+        &crate::parser::ProviderContext::default(),
+    )
+    .expect("deferred loop parses");
+    let crate::parser::DeferredForTarget::Unbound { template } =
+        &parsed.deferred_for_expressions[0].target
+    else {
+        panic!("fixture must produce an unbound target")
+    };
+    let serialized = serde_json::to_string(template).expect("serialize loop template");
+    let round_trip: UnboundLoopTemplate =
+        serde_json::from_str(&serialized).expect("deserialize loop template");
+
+    let error = round_trip.unbound_read_error(LoopKind::For);
+    assert!(matches!(
+        error,
+        crate::parser::ParseError::UnboundLoopRead {
+            kind: LoopKind::For,
+            span: None,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn scoped_for_and_if_loop_sources_keep_distinct_system_identities() {
     let span = SourceSpan::dummy();
     let mut for_source = LoopSource::authored(

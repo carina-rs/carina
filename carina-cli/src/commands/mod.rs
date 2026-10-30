@@ -834,23 +834,15 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         }
     }
 
-    let anonymous_identifier_errors = match resolved_config.compute_anonymous_identifiers(ctx) {
-        Ok(errors) => errors,
-        Err(error) => {
-            errors.push(error);
-            return Err(errors);
-        }
-    };
-
-    // Compute anonymous identifiers — downstream plan code assumes
-    // every resource has a stable id, so a collision error must stop
-    // the pipeline here.
-    errors.extend(anonymous_identifier_errors);
-    if !errors.is_empty() {
-        return Err(errors);
+    match resolved_config.compute_anonymous_identifiers(ctx) {
+        Ok(identifier_errors) => errors.extend(identifier_errors),
+        Err(error) => errors.push(error),
     }
     let parsed = resolved_config.parsed();
 
+    // Identity assignment and move-target validation are independent
+    // diagnostics. Run both before stopping so one validation pass reports
+    // every repair the operator must make.
     errors.extend(
         carina_core::identifier::check_legacy_loop_move_targets(
             &parsed.state_blocks,
@@ -859,6 +851,8 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         .into_iter()
         .map(|error| AppError::AnonymousIdentity(error.into())),
     );
+    // Downstream plan code assumes every resource has a stable id, so any
+    // identity or move-target error must stop the pipeline here.
     if !errors.is_empty() {
         return Err(errors);
     }

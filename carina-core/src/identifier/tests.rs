@@ -5937,6 +5937,146 @@ fn loop_identical_identity_inputs_renders_exact_moves() {
 }
 
 #[test]
+fn loop_identical_identity_inputs_rewrite_covers_noncolliding_elements() {
+    let source =
+        "for name in ['same', 'same', 'other'] {\n  mock.ec2.Vpc { identity_input = name }\n}";
+    let mut resources = parse_loop_fixture(source, "partial-collision.crn");
+
+    let error = compute_anonymous_identifiers_for_test(
+        &mut resources,
+        &[],
+        &loop_identity_registry(true),
+        &|_| Vec::new(),
+    )
+    .expect_err("one colliding pair must require one complete loop rewrite");
+    let rendered = error.to_string();
+
+    assert_eq!(
+        rendered.matches("Anonymous resources produced by").count(),
+        1,
+        "one authored loop must produce one error: {rendered}",
+    );
+    assert_eq!(
+        rendered.matches("moved {").count(),
+        3,
+        "the rewrite must migrate every loop element: {rendered}",
+    );
+    assert!(rendered.contains("from = mock.ec2.Vpc '_for0[2]'"));
+    assert!(rendered.contains("to = mock.ec2.Vpc 'vpc[2]'"));
+}
+
+#[test]
+fn loop_multiple_identity_collision_buckets_emit_one_complete_rewrite() {
+    let source = "for name in ['a', 'a', 'b', 'b'] {\n  mock.ec2.Vpc { identity_input = name }\n}";
+    let mut resources = parse_loop_fixture(source, "multiple-collisions.crn");
+
+    let error = compute_anonymous_identifiers_for_test(
+        &mut resources,
+        &[],
+        &loop_identity_registry(true),
+        &|_| Vec::new(),
+    )
+    .expect_err("all collision buckets belong to one authored loop");
+    let rendered = error.to_string();
+
+    assert_eq!(
+        rendered.matches("Anonymous resources produced by").count(),
+        1,
+        "one authored loop must produce one error: {rendered}",
+    );
+    assert_eq!(
+        rendered.matches("moved {").count(),
+        4,
+        "the rewrite must migrate all four elements: {rendered}",
+    );
+    assert!(rendered.contains("from = mock.ec2.Vpc '_for0[3]'"));
+    assert!(rendered.contains("to = mock.ec2.Vpc 'vpc[3]'"));
+}
+
+#[test]
+fn module_prefix_only_resource_collision_stays_a_plain_typed_error() {
+    let (seed, _) = resolved_single_loop_resource(None);
+    let outer_origin = seed
+        .loop_provenance
+        .direct_origin()
+        .expect("seed loop origin")
+        .clone();
+    let current_prefix = ResourceIdentity::new("network_0123456789abcdef");
+    let make_resource = || {
+        let mut resource = Resource::pending_with_provider("mock", "ec2.Vpc", None).with_attribute(
+            "identity_input",
+            Value::Concrete(ConcreteValue::String("same".into())),
+        );
+        resource.module_source = Some(live_module_source("network", current_prefix.as_str()));
+        resource
+            .loop_provenance
+            .push_module_prefix(LoopModulePrefixOrigin::new(
+                outer_origin.clone(),
+                current_prefix.clone(),
+            ));
+        resource
+    };
+    let mut resources = vec![make_resource(), make_resource()];
+
+    let error = compute_anonymous_identifiers_for_test(
+        &mut resources,
+        &[],
+        &loop_identity_registry(true),
+        &|_| Vec::new(),
+    )
+    .expect_err("the conflicting declarations inside the module must fail");
+
+    assert!(
+        matches!(error, AnonymousIdentityError::Collision(_)),
+        "module-prefix-only provenance must not impersonate a direct loop member: {error:?}",
+    );
+    assert!(!error.to_string().contains("produced by the unbound `for`"));
+}
+
+#[test]
+fn nested_loop_rewrite_uses_current_module_prefix_and_is_a_valid_move_target() {
+    let mut resources = parse_loop_fixture(
+        "for value in ['same', 'same'] {\n  mock.ec2.Vpc { identity_input = value }\n}",
+        "modules/network/main.crn",
+    );
+    let current_parent = ResourceIdentity::new("network_0123456789abcdef");
+    let legacy_parent = LegacyLoopAddress::new("_for0[0]");
+    for resource in &mut resources {
+        resource
+            .loop_provenance
+            .prefix_for_module(&current_parent, &legacy_parent);
+        resource.module_source = Some(live_module_source("network", current_parent.as_str()));
+    }
+
+    let error = compute_anonymous_identifiers_for_test(
+        &mut resources,
+        &[],
+        &loop_identity_registry(true),
+        &|_| Vec::new(),
+    )
+    .expect_err("nested loop collision must produce a rewrite");
+    let rendered = error.to_string();
+    let expected_target = "network_0123456789abcdef.vpc[0]";
+    assert!(
+        rendered.contains(&format!("to = mock.ec2.Vpc '{expected_target}'")),
+        "rewrite used the legacy parent instead of the current instance prefix: {rendered}",
+    );
+    assert!(!rendered.contains("to = mock.ec2.Vpc '_for0[0].vpc[0]'"));
+
+    let parsed = crate::parser::parse(
+        &format!(
+            "moved {{\n  from = mock.ec2.Vpc 'old'\n  to = mock.ec2.Vpc '{expected_target}'\n}}\n"
+        ),
+        &crate::parser::ProviderContext::default(),
+    )
+    .expect("rendered move target must parse");
+    assert!(
+        check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[]).is_empty(),
+        "the suggested current-prefix target must not be classified as legacy",
+    );
+}
+
+#[test]
 fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
     let fixture = tempfile::tempdir().expect("directory fixture");
     std::fs::write(
@@ -6203,12 +6343,30 @@ fn moved_to_allows_bound_map_keys_that_begin_with_underscore() {
     )
     .expect("bound map-key move destinations parse");
 
-    let errors = check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[]);
+    let resources = vec![
+        Resource::with_provider("mock", "ec2.Vpc", "items._private", None),
+        Resource::with_provider("mock", "ec2.Vpc", "items['a._b']", None),
+    ];
+    let errors = check_legacy_loop_move_targets(&parsed.state_blocks, &resources);
 
     assert!(
         errors.is_empty(),
         "real bound map-key addresses were rejected: {errors:#?}"
     );
+}
+
+#[test]
+fn moved_to_rejects_an_orphaned_legacy_segment_below_a_regular_prefix() {
+    let parsed = crate::parser::parse(
+        "moved {\n  from = mock.ec2.Vpc 'old'\n  to = mock.ec2.Vpc 'net._for0[0]'\n}\n",
+        &crate::parser::ProviderContext::default(),
+    )
+    .expect("moved block parses");
+
+    let errors = check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[]);
+
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].to_string().contains("net._for0[0]"));
 }
 
 #[test]

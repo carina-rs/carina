@@ -156,10 +156,10 @@ impl LoopParseTarget {
         }
     }
 
-    pub(crate) fn unbound_read_error(&self, kind: LoopKind) -> Option<ParseError> {
+    pub(crate) fn reject_unbound_read(&self, kind: LoopKind) -> Result<(), ParseError> {
         match self {
-            Self::Bound { .. } => None,
-            Self::Unbound(template) => template.unbound_read_error(kind),
+            Self::Bound { .. } => Ok(()),
+            Self::Unbound(template) => Err(template.unbound_read_error(kind)),
         }
     }
 
@@ -751,9 +751,7 @@ pub(crate) fn parse_for_body(
                 return Ok(ForBodyResult::Resource(Box::new(resource)));
             }
             Rule::read_resource_expr => {
-                if let Some(error) = target.unbound_read_error(LoopKind::For) {
-                    return Err(error);
-                }
+                target.reject_unbound_read(LoopKind::For)?;
                 let address = element.as_ref().map_or_else(
                     || format!("{}[?]", target.scheduler_key()),
                     |element| target.element_address(element),
