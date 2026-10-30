@@ -14,7 +14,7 @@ carinaには、「今はまだ決まっていない」を表す形がいくつ�
 | --- | --- | --- | --- | --- |
 | `DeferredValue`の参照と式（`ResourceRef`、`BindingRef`、`Interpolation`、`FunctionCall`、`ResolvedFunctionCall`、`Access`、`Coalesce`） | 値 | 評価すれば具体的な値になる式。参照先がまだ決まっていない | パーサー | スキーマの検証は飛ばす。providerやstateに渡す境界では拒む |
 | `DeferredValue::Unavailable` | 値 | 組み込み関数を評価しようとして失敗した呼び出し。待っている仕事ではない | 参照の解決（寛容なモード） | 同上。保存するときは`FunctionCall`に戻す |
-| `DeferredValue::Unknown(UnknownReason)` | 値 | plan時には分からない値。理由が11種類ある（次の節） | 理由ごとに違う | 飛ばす。境界では`UnknownNotAllowed`で拒む |
+| `DeferredValue::Unknown(UnknownReason)` | 値 | plan時には分からない値。理由が10種類ある（次の節） | 理由ごとに違う | 飛ばす。境界では`UnknownNotAllowed`で拒む |
 | `DeferredValue::Secret`、`RedactedSecret` | 値 | 秘匿の印。未確定とは別の軸 | `secret()`、stateと保存したplanの読み込み | `Secret`は中を検証する。`RedactedSecret`はパーサーからは作れない |
 | `StaticType::Unchecked` | 型の検査状態 | `TypeExpr`で検査できない理由を型付きで保持 | exportの推論と利用側の型解決 | 参照先の存在だけを確かめる |
 | 絞り込みの型の`MetadataOnly(None)` | 型（静的） | 名前（`TypeIdentity`）を持たない型。素の`String`か、名前のない絞り込み | スキーマのbuilder | 検査できる普通の型。名前のある型へは代入できない |
@@ -25,7 +25,7 @@ carinaには、「今はまだ決まっていない」を表す形がいくつ�
 - 作成途中の資源（#3909）は、資源の状態`Current::CreateInFlight`です。属性を持たないので、未確定の値は作られません。
 - `PendingToken`は、資源のidentityがまだ決まっていないことを表す、プロセスの中だけの印です。値の未確定ではありません。protocolとplugin-hostにある同じ名前の型とは別物です。
 
-## `UnknownReason`の11種類
+## `UnknownReason`の10種類
 
 `DeferredValue::Unknown`は1つの型ですが、理由ごとに生まれる段階も消える段階も違います。
 
@@ -36,9 +36,9 @@ carinaには、「今はまだ決まっていない」を表す形がいくつ�
 | `FnParam`、`FnLocal` | 利用者定義の関数の解析 | 関数を呼んで置き換えたとき | `(unresolved function …)` |
 | `ModuleArgument` | moduleの引数の解析 | moduleの展開で置き換えたとき。providerに向けた検証より前 | `(unresolved module argument: …)` |
 | `EmptyInterpolation` | `${}`の解析 | 消えない。書きかけの印で、発生した場所で診断を出す | `(empty interpolation)` |
-| `PostCreateReadIncomplete` | stateの読み込み後、planの入力を作るとき | 次のapplyで読み直したとき | `(known after next apply: …)` |
+| `PendingReRead` | stateの読み込み後、planの入力を作るとき | 次のrefreshで読み直したとき | `(unknown until next refresh: …)` |
 
-`PostCreateReadIncomplete`は#4084で入りました。作成は成功したものの、その後の読み取りで資源が見つからなかったか読めなかった場合（`CreateObservation::Unobserved`）、stateには値ではなく`PartialReadMarker`という印が記録されます。部分的に成功した作成や更新も同じです。planの入力を作るとき（`materialize_partial_read_unknowns`）、その印の付いた属性がこの理由の未確定の値として組み立て直されます。stateに未確定の値そのものが保存されることはありません。差分の計算は、この値を含む望ましい値に向けては変更を作りません。
+`PendingReRead`は#4084で`PostCreateReadIncomplete`として入り、後に今の名前になりました（読み直す理由を、読めたが不完全・読めなかった・見つからなかったの3つで持ちます）。作成は成功したものの、その後の読み取りで資源が見つからなかったか読めなかった場合（`CreateObservation::Unobserved`）、stateには値ではなく`PartialReadMarker`という印が記録されます。部分的に成功した作成や更新も同じです。planの入力を作るとき（`materialize_partial_read_unknowns`）、その印の付いた属性がこの理由の未確定の値として組み立て直されます。stateに未確定の値そのものが保存されることはありません。差分の計算は、この値を含む望ましい値に向けては変更を作りません。
 
 `Unknown`は、何とも等しくなりません。同じ理由の`Unknown`どうしでもです。例外は`ModuleArgument`どうしです。ディレクトリの解析を不動点まで繰り返すときに、同じ置き場所だと分かる必要があるからです。
 
@@ -82,7 +82,7 @@ carinaには、「今はまだ決まっていない」を表す形がいくつ�
 
 `StaticType::Unchecked`と、名前のない絞り込みの型は、1つの`Dynamic`にまとめません。前者は「型を検査できない理由」で、後者は「検査できる型の形」です。設計文書のPhase 2.b（`CustomTypeOrigin`）は取り下げます。`AttributeType::Custom`はすでになく、組み込みの型も名前を持つようになり、#3218の健全性の修正も軸ごとの代入（`assignable_to`）として入ったので、前提がなくなりました。
 
-`Value::Unknown`と`Value::Deferred`は、すでに1つの`DeferredValue`にまとまっています。残っている問題は逆向きで、1つの型に意味の違うものが入っていることです。参照と式は評価すれば具体的になり、`Unknown`はplan時には分からず、`Secret`は秘匿の印です。`UnknownReason`の中にも、パーサーの中でしか存在してはいけない置き場所（`FnParam`、`FnLocal`、`ModuleArgument`、`EmptyInterpolation`）と、planやapplyまで残る印（upstream、`PostCreateReadIncomplete`）が混ざっています。これを型で分けるのがPhase 2.cで、#4094で扱います。
+`Value::Unknown`と`Value::Deferred`は、すでに1つの`DeferredValue`にまとまっています。残っている問題は逆向きで、1つの型に意味の違うものが入っていることです。参照と式は評価すれば具体的になり、`Unknown`はplan時には分からず、`Secret`は秘匿の印です。`UnknownReason`の中にも、パーサーの中でしか存在してはいけない置き場所（`FnParam`、`FnLocal`、`ModuleArgument`、`EmptyInterpolation`）と、planやapplyまで残る印（upstream、`PendingReRead`）が混ざっています。これを型で分けるのがPhase 2.cで、#4094で扱います。
 
 Phase 2.aは#4093で完了しました。推論の失敗、利用側では名前を解決できない型、iterableの外形を別の型で表し、#2597と#2598の診断経路も統合しました。
 
@@ -93,7 +93,7 @@ Phase 2.aは#4093で完了しました。推論の失敗、利用側では名前
 - 6行目の`AttributeType::Custom { identity: None }`はありません。名前を持つかどうかは、絞り込みの型が持つ`RefinementBinding`（`MetadataOnly(Option<TypeIdentity>)`か、名前が必須の`Validator`）が表します。
 - `None`の3つの意味のうち、組み込みの型はもう`None`ではありません。
 - `TypeExpr::Unknown`は#4093で削除され、3つの用途は別の型に分かれました。
-- `UnknownReason`には、表にない`FnParam`、`FnLocal`、`ModuleArgument`、`PostCreateReadIncomplete`があります。`DeferredValue`にも、`Coalesce`、`Unavailable`、`Access`、`ResolvedFunctionCall`、`RedactedSecret`が加わっています。
+- `UnknownReason`には、表にない`FnParam`、`FnLocal`、`ModuleArgument`、`PendingReRead`があります。`DeferredValue`にも、`Coalesce`、`Unavailable`、`Access`、`ResolvedFunctionCall`、`RedactedSecret`が加わっています。
 
 ## 関連する文書
 
