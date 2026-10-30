@@ -952,9 +952,11 @@ macro_rules! export_provider {
             }
 
             enum CreateStepEncodeFailure {
-                /// An initial create has no prior continuation to retain. A
-                /// poll reuses its last decodable token and carries these
-                /// newer continuation fields in an in-flight verdict.
+                /// A dispatched continuation failed token encoding. An
+                /// initial create without an identifier must trap so the host
+                /// classifies its per-call egress record; a poll can instead
+                /// reuse its last decodable token. Once an identifier exists,
+                /// the failure becomes `Created` plus `ReadFailed`.
                 PendingToken {
                     identifier: Option<String>,
                     sent: wit_types::SentAttributes,
@@ -996,7 +998,9 @@ macro_rules! export_provider {
                                     error,
                                 })
                             }
-                            None => wit_types::CreateVerdict::Untracked(error),
+                            None => panic!(
+                                "WASM boundary failed to encode a dispatched create continuation token without an identifier; refusing to report the create as untracked"
+                            ),
                         },
                         Self::CreatedAttributes(created) => {
                             wit_types::CreateVerdict::Created(created)
@@ -1052,6 +1056,9 @@ macro_rules! export_provider {
                     error: wit_types::ProviderError,
                 },
                 Created(wit_types::ResumedFailure),
+                /// A resent create still has the persisted pre-call resume
+                /// continuation available if its replacement token cannot be
+                /// encoded.
                 Resent(CreateStepEncodeFailure),
             }
 
@@ -1097,8 +1104,32 @@ macro_rules! export_provider {
                             })
                         }
                         Self::Created(created) => wit_types::ResumeVerdict::Created(created),
-                        Self::Resent(error) => wit_types::ResumeVerdict::Resent(
-                            error.into_create_verdict(),
+                        Self::Resent(error) => {
+                            error.into_resent_resume_verdict(previous)
+                        }
+                    }
+                }
+            }
+
+            impl CreateStepEncodeFailure {
+                fn into_resent_resume_verdict(
+                    self,
+                    previous: wit_types::ResumePending,
+                ) -> wit_types::ResumeVerdict {
+                    match self {
+                        Self::PendingToken {
+                            identifier: None,
+                            sent: _sent,
+                            poll_after_secs: _poll_after_secs,
+                            error,
+                        } => wit_types::ResumeVerdict::InFlight(
+                            wit_types::ResumeInFlight {
+                                pending: previous,
+                                error,
+                            },
+                        ),
+                        failure => wit_types::ResumeVerdict::Resent(
+                            failure.into_create_verdict(),
                         ),
                     }
                 }
@@ -1263,28 +1294,27 @@ macro_rules! export_provider {
             fn sdk_to_wit_create_verdict<T: serde::Serialize>(
                 verdict: proto::CreateVerdict<proto::ReadOutcome, T, proto::ProviderError>,
                 operation: &'static str,
-            ) -> wit_types::CreateVerdict {
+            ) -> Result<wit_types::CreateVerdict, CreateStepEncodeFailure> {
                 match verdict {
-                    proto::CreateVerdict::Untracked(error) => {
-                        wit_types::CreateVerdict::Untracked(proto_to_wit_provider_error(error))
-                    }
-                    proto::CreateVerdict::Created(created) => wit_types::CreateVerdict::Created(
-                        sdk_to_wit_created_failure(created, operation),
+                    proto::CreateVerdict::Untracked(error) => Ok(
+                        wit_types::CreateVerdict::Untracked(proto_to_wit_provider_error(error)),
                     ),
-                    proto::CreateVerdict::Discarded(error) => {
-                        wit_types::CreateVerdict::Discarded(proto_to_wit_provider_error(error))
-                    }
+                    proto::CreateVerdict::Created(created) => Ok(
+                        wit_types::CreateVerdict::Created(sdk_to_wit_created_failure(
+                            created, operation,
+                        )),
+                    ),
+                    proto::CreateVerdict::Discarded(error) => Ok(
+                        wit_types::CreateVerdict::Discarded(proto_to_wit_provider_error(error)),
+                    ),
                     proto::CreateVerdict::InFlight(in_flight) => {
                         let proto::CreateInFlight { pending, error } = in_flight;
-                        match sdk_to_wit_pending_create(pending, operation) {
-                            Ok(pending) => {
-                                wit_types::CreateVerdict::InFlight(wit_types::CreateInFlight {
+                        sdk_to_wit_pending_create(pending, operation).map(|pending| {
+                            wit_types::CreateVerdict::InFlight(wit_types::CreateInFlight {
                                     pending,
                                     error: proto_to_wit_provider_error(error),
                                 })
-                            }
-                            Err(failure) => failure.into_create_verdict(),
-                        }
+                        })
                     }
                 }
             }
@@ -1380,9 +1410,14 @@ macro_rules! export_provider {
                             Err(failure) => failure.into_resume_verdict(previous_pending),
                         }
                     }
-                    proto::ResumeVerdict::Resent(verdict) => wit_types::ResumeVerdict::Resent(
-                        sdk_to_wit_create_verdict(verdict, operation),
-                    ),
+                    proto::ResumeVerdict::Resent(verdict) => {
+                        match sdk_to_wit_create_verdict(verdict, operation) {
+                            Ok(verdict) => wit_types::ResumeVerdict::Resent(verdict),
+                            Err(failure) => {
+                                failure.into_resent_resume_verdict(previous_pending)
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1900,7 +1935,10 @@ macro_rules! export_provider {
                     ) {
                         Ok(step) => sdk_to_wit_create_step(step, "create")
                             .map_err(CreateStepEncodeFailure::into_create_verdict),
-                        Err(verdict) => Err(sdk_to_wit_create_verdict(*verdict, "create")),
+                        Err(verdict) => Err(match sdk_to_wit_create_verdict(*verdict, "create") {
+                            Ok(verdict) => verdict,
+                            Err(failure) => failure.into_create_verdict(),
+                        }),
                     }
                 }
 

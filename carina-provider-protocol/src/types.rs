@@ -250,18 +250,22 @@ pub enum ReferenceForm {
     Template { long: ReferenceTemplate },
 }
 
-/// One structured identity/form pair in the provider schema envelope.
+/// One dotted identity/form pair in the provider schema envelope.
+///
+/// The string takes the same wire path as identities embedded in attribute
+/// types. Hosts therefore apply one decoding rule to both declarations before
+/// validating that a form belongs to an identified refined string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferenceFormDeclaration {
-    pub identity: TypeIdentity,
+    pub identity: String,
     pub form: ReferenceForm,
 }
 
 /// Resource schemas and provider-wide reference-form declarations.
 ///
-/// `reference_forms` is a list because JSON object keys cannot retain the
-/// structured [`TypeIdentity`]. Core encoding sorts the list and core decoding
-/// rejects duplicate identities.
+/// `reference_forms` is a list so core decoding can reject duplicate decoded
+/// identities explicitly. Core encoding sorts the list by its typed identity
+/// before projecting each key onto the dotted wire form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderSchemaEnvelope {
     pub resources: Vec<ResourceSchema>,
@@ -1986,11 +1990,7 @@ mod tests {
 
     #[test]
     fn provider_schema_envelope_roundtrips_reference_form_records() {
-        let identity = TypeIdentity {
-            provider: "aws".to_string(),
-            segments: vec!["lambda".to_string(), "Function".to_string()],
-            kind: "Name".to_string(),
-        };
+        let identity = "aws.lambda.Function.Name".to_string();
         let form = ReferenceForm::Template {
             long: ReferenceTemplate::new(
                 "arn:{partition}:lambda:{region}:{account}:function:{name}",

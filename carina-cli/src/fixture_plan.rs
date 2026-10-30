@@ -5,7 +5,7 @@
 //! performing live provider reads, so rendering works without installed
 //! providers.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
@@ -463,6 +463,32 @@ where
             carina_core::provider::InitializedProvider::unavailable(Box::new(
                 carina_provider_mock::MockProvider::new(),
             )),
+        );
+    }
+    // Built-in fixture providers (notably `mock`) do not have a loaded
+    // factory, so the loop above cannot register their routes. Register every
+    // exact route named by provider configuration or fixture resources; this
+    // also keeps named instances aligned with the ResourceId used later by
+    // comparison resolution.
+    let fixture_routes = raw_provider_configs
+        .iter()
+        .map(ProviderInstanceKey::from)
+        .chain(
+            parsed
+                .resources
+                .iter()
+                .map(|resource| ProviderInstanceKey::from(&resource.id)),
+        )
+        .chain(
+            data_sources
+                .iter()
+                .map(|resource| ProviderInstanceKey::from(&resource.id)),
+        )
+        .collect::<BTreeSet<_>>();
+    for route in fixture_routes {
+        provider_router.add_provider_instance(
+            route,
+            InitializedProvider::unavailable(Box::new(carina_provider_mock::MockProvider::new())),
         );
     }
     let expansion_prelude = expansion_prelude

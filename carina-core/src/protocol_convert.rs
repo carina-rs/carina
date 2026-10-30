@@ -508,30 +508,12 @@ pub fn resource_schemas_to_protocol<'a>(
         .collect()
 }
 
-fn type_identity_to_protocol(identity: &TypeIdentity) -> protocol::TypeIdentity {
-    let TypeIdentity {
-        provider,
-        segments,
-        kind,
-    } = identity;
-    protocol::TypeIdentity {
-        provider: provider.clone().unwrap_or_default(),
-        segments: segments.clone(),
-        kind: kind.clone(),
-    }
+fn type_identity_to_protocol(identity: &TypeIdentity) -> String {
+    identity.to_string()
 }
 
-fn protocol_to_type_identity(identity: &protocol::TypeIdentity) -> TypeIdentity {
-    let protocol::TypeIdentity {
-        provider,
-        segments,
-        kind,
-    } = identity;
-    TypeIdentity {
-        provider: (!provider.is_empty()).then(|| provider.clone()),
-        segments: segments.clone(),
-        kind: kind.clone(),
-    }
+fn protocol_to_type_identity(identity: &str) -> TypeIdentity {
+    TypeIdentity::from_dotted(identity)
 }
 
 /// Project one aggregate provider-schema witness onto the version-13 envelope.
@@ -665,7 +647,7 @@ pub fn attribute_type_to_protocol(
                 length,
                 validate: None,
                 to_dsl: to_dsl.cloned(),
-                identity: identity.map(ToString::to_string),
+                identity: identity.map(type_identity_to_protocol),
             })
         }
         RawShape::Int {
@@ -677,7 +659,7 @@ pub fn attribute_type_to_protocol(
             let _validate_via_identity = validate;
             Ok(protocol::AttributeType::Int {
                 range,
-                identity: identity.map(ToString::to_string),
+                identity: identity.map(type_identity_to_protocol),
             })
         }
         RawShape::Float {
@@ -689,7 +671,7 @@ pub fn attribute_type_to_protocol(
             let _validate_via_identity = validate;
             Ok(protocol::AttributeType::Float {
                 range,
-                identity: identity.map(ToString::to_string),
+                identity: identity.map(type_identity_to_protocol),
             })
         }
         RawShape::Bool => Ok(protocol::AttributeType::Bool),
@@ -1184,7 +1166,7 @@ fn decode_optional_identity(identity: &Option<String>) -> Option<TypeIdentity> {
     identity
         .as_deref()
         .filter(|identity| !identity.is_empty())
-        .map(TypeIdentity::from_dotted)
+        .map(protocol_to_type_identity)
 }
 
 fn reject_opaque_validator(
@@ -2423,12 +2405,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("fixture for {identity} must validate: {error}"))
     }
 
-    fn protocol_identity(identity: &TypeIdentity) -> protocol::TypeIdentity {
-        protocol::TypeIdentity {
-            provider: identity.provider.clone().unwrap_or_default(),
-            segments: identity.segments.clone(),
-            kind: identity.kind.clone(),
-        }
+    fn protocol_identity(identity: &TypeIdentity) -> String {
+        identity.to_string()
     }
 
     fn envelope_with_form(
@@ -2481,9 +2459,9 @@ mod tests {
         assert_eq!(
             wire.reference_forms
                 .iter()
-                .map(|record| record.identity.kind.as_str())
+                .map(|record| record.identity.as_str())
                 .collect::<Vec<_>>(),
-            ["Alias", "Name"],
+            ["aws.lambda.Function.Alias", "aws.lambda.Function.Name"],
             "BTreeMap order is the wire order",
         );
         let json = serde_json::to_string(&wire).expect("envelope must serialize");
@@ -2500,6 +2478,31 @@ mod tests {
         );
         assert_eq!(
             decoded.reference_forms().get(&second),
+            Some(&reference_form())
+        );
+    }
+
+    #[test]
+    fn provider_schema_envelope_decodes_form_and_attribute_identities_identically() {
+        let identity = TypeIdentity::new(None::<String>, ["shared"], "Name");
+        let schema = schema_with_identified_type(
+            &identity,
+            AttributeType::refined_string(Some(identity.clone()), None, None, None),
+        );
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![schema],
+            ValidatedConfigSchema::default(),
+            ReferenceForms::from([(identity.clone(), reference_form())]),
+        )
+        .expect("the SDK-side aggregate identity is internally consistent");
+
+        let wire = provider_schema_to_protocol(&witness).expect("witness must encode");
+        let decoded = protocol_to_provider_schema_witness(&wire, ValidatedConfigSchema::default())
+            .expect("forms and attributes must take the same lossy dotted identity path");
+        let decoded_identity = TypeIdentity::from_dotted(&identity.to_string());
+
+        assert_eq!(
+            decoded.reference_forms().get(&decoded_identity),
             Some(&reference_form())
         );
     }

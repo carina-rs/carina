@@ -443,6 +443,50 @@ async fn initial_create_trap_after_dispatched_egress_is_outcome_unknown() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn initial_create_unencodable_pending_token_after_egress_is_outcome_unknown() {
+    let path = skip_if_no_http_wasm!();
+    let Some((server_address, server)) = spawn_http_ok_server() else {
+        return;
+    };
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", server_address);
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should initialize");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "unencodable-pending-after-egress",
+        None,
+    );
+    let resource = with_http_create_behavior(
+        http_send_phase_resource(
+            "unencodable-pending-after-egress",
+            &format!("http://phase-test.invalid:{}/", server_address.port()),
+            "POST",
+            &http_probe_body(),
+        ),
+        "pending_nan_after_send",
+    );
+
+    let failure = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("the guest must trap while encoding the NaN continuation token");
+    let bytes_read = server.join().expect("loopback server should finish");
+
+    assert!(bytes_read > 0, "the request must actually leave the guest");
+    let CreateFailureKind::OutcomeUnknown { unknown, error } = failure.into_kind() else {
+        panic!("a continuation encode failure after egress must never be untracked")
+    };
+    assert_eq!(unknown.id(), &id);
+    let rendered = error.to_string();
+    assert!(rendered.contains("WASM guest trapped"), "{rendered}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn initial_create_trap_without_egress_is_untracked() {
     let path = skip_if_no_http_wasm!();
     let (factory, _cache) = load_http_factory(&path).await;
@@ -1531,7 +1575,7 @@ async fn initial_issued_encode_failure_is_created_never_untracked() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn initial_unissued_pending_token_encode_failure_is_untracked() {
+async fn initial_unissued_pending_token_encode_failure_without_egress_is_untracked() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
@@ -1555,11 +1599,11 @@ async fn initial_unissued_pending_token_encode_failure_is_untracked() {
         .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
-        .expect_err("an unissued unencodable continuation cannot be tracked")
+        .expect_err("an unissued unencodable continuation must trap")
         .into_kind()
     {
         CreateFailureKind::Untracked(error) => {
-            assert!(error.to_string().contains("pending token"));
+            assert!(error.to_string().contains("WASM guest trapped"));
         }
         CreateFailureKind::Created { created, error } => panic!(
             "unissued create unexpectedly retained identifier {}: {error}",

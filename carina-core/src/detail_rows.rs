@@ -733,8 +733,7 @@ pub fn build_detail_rows_by_instance<S>(
                 Some(registry) if registry.get_for(to).is_some() => {
                     let resolved = provider.comparison_for(registry, &to.id)?;
                     build_update_rows(
-                        &historical.attributes,
-                        historical.stored_attributes.as_ref(),
+                        historical,
                         to,
                         changed_attributes,
                         Some(resolved.owner_schema().schema().as_schema()),
@@ -744,8 +743,7 @@ pub fn build_detail_rows_by_instance<S>(
                     )
                 }
                 None => build_update_rows(
-                    &historical.attributes,
-                    historical.stored_attributes.as_ref(),
+                    historical,
                     to,
                     changed_attributes,
                     None,
@@ -754,8 +752,7 @@ pub fn build_detail_rows_by_instance<S>(
                     DetailComparison::SchemaBlind,
                 ),
                 Some(_) => build_update_rows(
-                    &historical.attributes,
-                    historical.stored_attributes.as_ref(),
+                    historical,
                     to,
                     changed_attributes,
                     None,
@@ -841,8 +838,7 @@ pub fn build_detail_rows_by_instance_for_test<S>(
             };
             match registry.and_then(|registry| registry.get_for(to)) {
                 Some(owner_schema) => build_update_rows(
-                    &historical.attributes,
-                    historical.stored_attributes.as_ref(),
+                    historical,
                     to,
                     changed_attributes,
                     Some(owner_schema.schema().as_schema()),
@@ -851,8 +847,7 @@ pub fn build_detail_rows_by_instance_for_test<S>(
                     DetailComparison::Typed(*comparison),
                 ),
                 None => build_update_rows(
-                    &historical.attributes,
-                    historical.stored_attributes.as_ref(),
+                    historical,
                     to,
                     changed_attributes,
                     None,
@@ -1031,8 +1026,7 @@ fn default_tag_annotation(default_tag_keys: &DefaultTagKeys, key: &str) -> Optio
 }
 
 fn build_update_rows<S>(
-    historical_attributes: &HashMap<String, Value>,
-    stored_attributes: Option<&HashMap<String, Value>>,
+    historical: &HistoricalUpdateAttributes,
     to: &crate::resource::Resource<S>,
     changed_attributes: &[String],
     schema: Option<&ResourceSchema>,
@@ -1044,10 +1038,10 @@ fn build_update_rows<S>(
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
-    let from_attributes = historical_attributes;
+    let from_attributes = &historical.attributes;
     let projected = project_from_attrs(
         from_attributes,
-        stored_attributes,
+        historical.stored_attributes.as_ref(),
         &to.attributes,
         explicit,
         schema,

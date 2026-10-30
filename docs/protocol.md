@@ -12,10 +12,12 @@ two named instances of one provider kind may report different values.
 
 The `schemas` JSON is now a provider-schema envelope containing `resources`
 and `reference_forms`. Reference forms are a sorted list of `{identity, form}`
-records on the wire and a map in validated Rust witnesses. A form is currently
-the closed `template` variant, whose `long` value must contain `{name}` exactly
-once and may otherwise contain only `{partition}`, `{region}`, and `{account}`
-placeholders. Stray braces and unknown placeholders fail typed validation.
+records on the wire and a map in validated Rust witnesses. The `identity` is
+the same dotted string used by attribute-type identities and follows the same
+decode path. A form is currently the closed `template` variant, whose `long`
+value must contain `{name}` exactly once and may otherwise contain only
+`{partition}`, `{region}`, and `{account}` placeholders. Stray braces and
+unknown placeholders fail typed validation.
 
 The host admits resources, provider config, and forms as one provider-wide
 witness. Every form identity must be declared by that provider as a refined

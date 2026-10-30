@@ -215,7 +215,11 @@ pub enum BindingPattern {
 /// well under the host's per-call hard timeout; providers must never run an
 /// in-call waiter. A poll may return another `Pending`. The host supplies the
 /// original request on every poll, so `token` must contain only opaque
-/// continuation metadata and must never contain request or secret data.
+/// continuation metadata and must never contain request or secret data. A
+/// token must also serialize as finite JSON. If an initial create has already
+/// dispatched work but its identifier-less token cannot cross the WASM
+/// boundary, the guest traps so the host can classify the attempt from its
+/// per-call egress record instead of erasing it as untracked.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Pending<T> {
     pub token: T,

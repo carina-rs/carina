@@ -22,6 +22,23 @@ const CREATE_BEHAVIOR_ATTRIBUTE: &str = "create_behavior";
 #[derive(Default)]
 struct MockHttpProvider;
 
+#[derive(Debug, serde::Deserialize)]
+struct CreateToken(f64);
+
+impl serde::Serialize for CreateToken {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if !self.0.is_finite() {
+            return Err(serde::ser::Error::custom(
+                "intentional non-finite mock HTTP create token",
+            ));
+        }
+        serde::Serialize::serialize(&self.0, serializer)
+    }
+}
+
 impl MockHttpProvider {
     fn error(
         id: &ResourceId,
@@ -71,7 +88,7 @@ impl MockHttpProvider {
                 .expect("HTTP probe method must be valid");
             *request.body_mut() = body.as_bytes().to_vec().into();
 
-            return match futures::executor::block_on(connector.call(request)) {
+            match futures::executor::block_on(connector.call(request)) {
                 Ok(_) => "success".to_string(),
                 Err(error) => {
                     let sdk_error: SdkError<(), ()> = SdkError::dispatch_failure(error);
@@ -115,7 +132,7 @@ impl MockHttpProvider {
                     );
                     format!("{phase}:{code}")
                 }
-            };
+            }
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -127,7 +144,7 @@ impl MockHttpProvider {
 }
 
 impl CarinaProvider for MockHttpProvider {
-    type CreateToken = Never;
+    type CreateToken = CreateToken;
     type UpdateToken = Never;
     type DeleteToken = Never;
 
@@ -254,6 +271,9 @@ impl CarinaProvider for MockHttpProvider {
         let phase = Self::wasi_http_send_phase(url, method, body);
         match behavior.as_deref() {
             Some("trap_after_send") => panic!("intentional mock HTTP trap after send"),
+            Some("pending_nan_after_send") => {
+                return Ok(attempt.pending(CreateToken(f64::NAN), Sent::AllRequestAttributes, 1));
+            }
             Some("untracked_after_send") => {
                 return Err(attempt.untracked(Self::error(
                     id,
@@ -284,22 +304,18 @@ impl CarinaProvider for MockHttpProvider {
         &self,
         _id: &ResourceId,
         _request: CreateRequest,
-        poll: Poll<Self::CreateToken>,
+        _poll: Poll<Self::CreateToken>,
     ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
-        match poll {
-            Poll::Unissued(_, token) | Poll::Issued(_, token) => match token {},
-        }
+        unreachable!("the NaN fixture token cannot cross the guest boundary")
     }
 
     fn resume_create(
         &self,
         _id: &ResourceId,
         _request: CreateRequest,
-        resume: Resume<Self::CreateToken>,
+        _resume: Resume<Self::CreateToken>,
     ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
-        match resume {
-            Resume::Unissued(_, token) | Resume::Issued(_, token) => match token {},
-        }
+        unreachable!("the NaN fixture token cannot cross the guest boundary")
     }
 
     fn update(
