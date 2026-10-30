@@ -44,7 +44,7 @@ pub(in crate::parser) fn parse_arguments_block(
                 .to_string();
             let type_pair = next_pair(&mut param_inner, "type expression", "arguments parameter")?;
             let type_span = SourceSpan::from_pest(&type_pair, preprocessed_file);
-            let type_expr = parse_type_expr(type_pair, config, warnings)?;
+            let type_expr = parse_type_expr(type_pair, config, warnings, Some(preprocessed_file))?;
 
             let mut description = None;
             let mut default = None;
@@ -211,7 +211,12 @@ pub(in crate::parser) fn parse_attributes_block(
             )?;
             let (type_expr, value) = if next.as_rule() == Rule::type_expr {
                 // Has explicit type annotation: name: type = expr
-                let type_expr = Some(parse_type_expr(next, ctx.config, warnings)?);
+                let type_expr = Some(parse_type_expr(
+                    next,
+                    ctx.config,
+                    warnings,
+                    Some(preprocessed_file),
+                )?);
                 let expr = next_pair(&mut param_inner, "value expression", "attributes parameter")?;
                 let value = Some(parse_expression(expr, ctx)?);
                 (type_expr, value)
@@ -253,7 +258,12 @@ pub(in crate::parser) fn parse_exports_block(
 
             let next = next_pair(&mut param_inner, "type or expression", "exports parameter")?;
             let (type_expr, value) = if next.as_rule() == Rule::type_expr {
-                let type_expr = Some(parse_type_expr(next, ctx.config, warnings)?);
+                let type_expr = Some(parse_type_expr(
+                    next,
+                    ctx.config,
+                    warnings,
+                    Some(preprocessed_file),
+                )?);
                 let expr = next_pair(&mut param_inner, "value expression", "exports parameter")?;
                 let value = Some(parse_expression(expr, ctx)?);
                 (type_expr, value)

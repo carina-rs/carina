@@ -5093,10 +5093,10 @@ let b = consumer {
     );
     assert_eq!(
         typo_diagnostics[0].range.start.line, 7,
-        "the structured argument name should anchor the diagnostic on `arn`",
+        "the authored argument value should anchor the diagnostic",
     );
-    assert_eq!(typo_diagnostics[0].range.start.character, 2);
-    assert_eq!(typo_diagnostics[0].range.end.character, 5);
+    assert_eq!(typo_diagnostics[0].range.start.character, 8);
+    assert_eq!(typo_diagnostics[0].range.end.character, 26);
 }
 
 #[test]
@@ -5148,8 +5148,8 @@ let b = consumer {
             .collect::<Vec<_>>(),
     );
     assert_eq!(typo_diagnostics[0].range.start.line, 7);
-    assert_eq!(typo_diagnostics[0].range.start.character, 2);
-    assert_eq!(typo_diagnostics[0].range.end.character, 5);
+    assert_eq!(typo_diagnostics[0].range.start.character, 8);
+    assert_eq!(typo_diagnostics[0].range.end.character, 26);
 }
 
 fn module_boundary_identity_engine() -> DiagnosticEngine {
@@ -5677,7 +5677,8 @@ let broken = needs_vpc {
         .collect();
     assert_eq!(mismatches.len(), 1);
     assert_eq!(mismatches[0].range.start.line, 7);
-    assert_eq!(mismatches[0].range.start.character, 2);
+    assert_eq!(mismatches[0].range.start.character, 11);
+    assert_eq!(mismatches[0].range.end.character, 22);
 }
 
 #[test]
@@ -5770,7 +5771,8 @@ let instance = checked {
     );
     let diagnostic = matching[0];
     assert_eq!(diagnostic.range.start.line, 3);
-    assert_eq!(diagnostic.range.start.character, 2);
+    assert_eq!(diagnostic.range.start.character, 9);
+    assert_eq!(diagnostic.range.end.character, 11);
 }
 
 #[test]
@@ -6065,7 +6067,7 @@ let b = selector { items = ['x', 'y'] }\n";
 }
 
 #[test]
-fn heredoc_argument_type_diagnostic_anchors_the_argument_key() {
+fn heredoc_argument_type_diagnostic_anchors_the_argument_value() {
     let main = r#"let m = use { source = './m' }
 let inst = m {
   enabled = <<EOT
@@ -6089,8 +6091,8 @@ EOT
 
     assert_eq!(
         diagnostic.range,
-        Range::new(Position::new(2, 2), Position::new(2, 9)),
-        "type mismatches must underline the argument key"
+        Range::new(Position::new(2, 12), Position::new(4, 3)),
+        "type mismatches must underline the authored argument value"
     );
 }
 
@@ -6376,8 +6378,8 @@ fn multifile_sibling_let_violating_module_constraint_has_one_lsp_diagnostic() {
     );
     assert_eq!(
         matching[0].range,
-        Range::new(Position::new(3, 2), Position::new(3, 6)),
-        "an authored argument constraint must underline its key"
+        Range::new(Position::new(3, 9), Position::new(3, 10)),
+        "an authored argument constraint must underline its value"
     );
 }
 
@@ -6728,7 +6730,8 @@ let web2 = issue {
         mismatch.range.start.line, 11,
         "the structured call label must anchor the second call, not the first",
     );
-    assert_eq!(mismatch.range.start.character, 2);
+    assert_eq!(mismatch.range.start.character, 11);
+    assert_eq!(mismatch.range.end.character, 32);
 }
 
 #[test]
@@ -6775,8 +6778,8 @@ checked {
             .map(|diagnostic| diagnostic.range)
             .collect::<Vec<_>>(),
         vec![
-            Range::new(Position::new(7, 2), Position::new(7, 8)),
-            Range::new(Position::new(11, 2), Position::new(11, 8)),
+            Range::new(Position::new(7, 11), Position::new(7, 22)),
+            Range::new(Position::new(11, 11), Position::new(11, 22)),
         ],
     );
 }
@@ -6899,7 +6902,8 @@ let b = needs_vpc {
             .collect::<Vec<_>>(),
     );
     assert_eq!(mismatches[0].range.start.line, 12);
-    assert_eq!(mismatches[0].range.start.character, 2);
+    assert_eq!(mismatches[0].range.start.character, 11);
+    assert_eq!(mismatches[0].range.end.character, 18);
 }
 
 struct NestedModuleCallLspFixture {
@@ -11050,7 +11054,7 @@ exports {
 }
 
 #[test]
-fn one_line_module_call_type_mismatch_is_anchored_to_argument_key() {
+fn one_line_module_call_type_mismatch_is_anchored_to_argument_value() {
     let main = "let m = use { source = './m' }\n\
 let inst = m { n = 'abc' label = 'x' }\n";
     let temp = write_tag_key_fixture(&[
@@ -11072,7 +11076,7 @@ let inst = m { n = 'abc' label = 'x' }\n";
     assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
     assert_eq!(
         matching[0].range,
-        Range::new(Position::new(1, 15), Position::new(1, 16))
+        Range::new(Position::new(1, 19), Position::new(1, 24))
     );
 }
 
@@ -11158,7 +11162,7 @@ m { label = 'x' }\n";
     assert_eq!(mismatch.len(), 1, "diagnostics: {diagnostics:#?}");
     assert_eq!(
         mismatch[0].range,
-        Range::new(Position::new(1, 4), Position::new(1, 5))
+        Range::new(Position::new(1, 8), Position::new(1, 13))
     );
     assert_eq!(missing_label.len(), 1, "diagnostics: {diagnostics:#?}");
     assert_eq!(

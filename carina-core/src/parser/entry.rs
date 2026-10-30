@@ -517,7 +517,7 @@ fn resolve_top_level_user_functions(
                     }
 
                     let mut warnings = Vec::new();
-                    match parse_fn_def(statement, &ctx, &mut warnings) {
+                    match parse_fn_def(statement, &ctx, &mut warnings, &preprocessed_file) {
                         Ok(mut function) => {
                             function.body.source_file = path.map(Path::to_path_buf);
                             ctx.insert_user_function(name.clone(), function.clone());
@@ -788,7 +788,8 @@ fn parse_with_seeded_bindings_inner(
                                 let user_fn = {
                                     let warnings = std::mem::take(&mut ctx.warnings);
                                     let mut warnings = warnings;
-                                    let result = parse_fn_def(stmt, &ctx, &mut warnings);
+                                    let result =
+                                        parse_fn_def(stmt, &ctx, &mut warnings, &preprocessed_file);
                                     ctx.warnings = warnings;
                                     result?
                                 };

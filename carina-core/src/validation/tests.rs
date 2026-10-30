@@ -3701,7 +3701,7 @@ let inst = m { n = 'abc' }
 }
 
 #[test]
-fn check_module_calls_uses_argument_keys_and_call_span_as_authored_anchors() {
+fn check_module_calls_uses_argument_values_and_call_span_as_authored_anchors() {
     use crate::parser::ArgumentParameter;
 
     let parsed = crate::parser::parse(
@@ -3742,7 +3742,7 @@ child {}
         .arguments_with_source_spans()
         .find(|argument| argument.name() == "count")
         .expect("count argument")
-        .key_span();
+        .value_span();
 
     let anchor_for = |kind| {
         findings
@@ -7276,17 +7276,26 @@ fn resolve_file_type_exprs_rejects_unknown_in_arguments() {
 }
 
 #[test]
-fn file_type_resolution_report_owns_matching_parser_error_coverage() {
+fn file_type_resolution_parser_error_coverage_ignores_rendered_wording() {
     let source_file = std::path::Path::new("arguments.crn");
-    let mut parsed = crate::parser::parse_file(
-        "arguments {\n  bad_arg: TotallyMadeUpType\n}\n",
-        source_file,
-        &ProviderContext::default(),
-    )
-    .expect("bootstrap parsing must retain the unresolved declaration");
-    let parser_error = crate::parser::ParseError::InvalidExpression {
-        line: 2,
-        message: "unknown custom type 'TotallyMadeUpType'".to_string(),
+    let source = "arguments {\n  bad_arg: TotallyMadeUpType\n}\n";
+    let mut parsed = crate::parser::parse_file(source, source_file, &ProviderContext::default())
+        .expect("bootstrap parsing must retain the unresolved declaration");
+    let enriched_context = enriched_context_with_iam_policy_arn();
+    let strict_error = crate::parser::parse_file(source, source_file, &enriched_context)
+        .expect_err("enriched parsing must emit a typed unresolved declaration");
+    let crate::parser::ParseError::UnresolvedDeclarationType {
+        token,
+        line,
+        message: _message,
+    } = strict_error
+    else {
+        panic!("unexpected strict parser error: {strict_error:?}");
+    };
+    let parser_error = crate::parser::ParseError::UnresolvedDeclarationType {
+        token,
+        line,
+        message: "wording drift must not change typed coverage".to_string(),
     };
 
     let bootstrap_report = resolve_file_type_exprs_report(
@@ -7299,7 +7308,7 @@ fn file_type_resolution_report_owns_matching_parser_error_coverage() {
 
     let report = resolve_file_type_exprs_report(
         &mut parsed,
-        &enriched_context_with_iam_policy_arn(),
+        &enriched_context,
         Some(TypeResolutionParserError::new(source_file, &parser_error)),
     );
 

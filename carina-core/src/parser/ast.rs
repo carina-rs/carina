@@ -1334,6 +1334,7 @@ pub enum BindingUseOwner {
     ModuleArgument {
         call: ModuleCallId,
         argument: String,
+        value_span: SourceSpan,
     },
 }
 
@@ -1871,6 +1872,28 @@ impl SourceSpan {
             token_end
         };
         Self::from_preprocessed_range(start, end, file)
+    }
+
+    /// Build a span for a standalone parser fragment that has no heredoc
+    /// preprocessing map. Production file parsing uses [`Self::from_pest`].
+    pub(in crate::parser) fn from_unmapped_pest(
+        pair: &pest::iterators::Pair<'_, crate::parser::Rule>,
+    ) -> Self {
+        let span = pair.as_span();
+        let (start_line, start_column) = span.start_pos().line_col();
+        let (end_line, end_column) = span.end_pos().line_col();
+        Self {
+            start_byte: span.start(),
+            end_byte: span.end(),
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+        }
+    }
+
+    pub(crate) fn contains(self, other: Self) -> bool {
+        self.start_byte <= other.start_byte && self.end_byte >= other.end_byte
     }
 
     pub(in crate::parser) fn from_preprocessed_range(

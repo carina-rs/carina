@@ -1032,6 +1032,7 @@ pub fn binding_use_authority_owns_module_argument<E>(
             crate::parser::BindingUseOwner::ModuleArgument {
                 call: owner,
                 argument: owner_argument,
+                value_span: _,
             } if owner == call && owner_argument == argument
         ) && (use_site.path.segments().len() == 1
             || report
@@ -1054,6 +1055,7 @@ pub fn module_argument_has_pending_binding_use<E>(
             crate::parser::BindingUseOwner::ModuleArgument {
                 call: owner,
                 argument: owner_argument,
+                value_span: _,
             } if owner == call && owner_argument == argument
         )
     })
@@ -1104,17 +1106,19 @@ pub fn check_bare_binding_uses<E>(
                     },
                 }
             }
-            crate::parser::BindingUseOwner::ModuleArgument { call, argument } => {
-                match module_argument_type(file, call, argument, context.module_signatures) {
-                    Some(expected) => resolve_record_against_module(record, &expected, context),
-                    None => match &record.source {
-                        crate::parser::BareBindingSource::Value { .. } => Ok(()),
-                        crate::parser::BareBindingSource::Structural(handle) => Err(
-                            BindingResolutionError::Existing(handle.bare_error().to_string()),
-                        ),
-                    },
-                }
-            }
+            crate::parser::BindingUseOwner::ModuleArgument {
+                call,
+                argument,
+                value_span: _,
+            } => match module_argument_type(file, call, argument, context.module_signatures) {
+                Some(expected) => resolve_record_against_module(record, &expected, context),
+                None => match &record.source {
+                    crate::parser::BareBindingSource::Value { .. } => Ok(()),
+                    crate::parser::BareBindingSource::Structural(handle) => Err(
+                        BindingResolutionError::Existing(handle.bare_error().to_string()),
+                    ),
+                },
+            },
         };
 
         // A pending slot means the parser deliberately omitted the owning
@@ -3661,19 +3665,46 @@ pub fn resolve_parameter_type_for_check(
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
 pub struct TypeResolutionError {
-    message: String,
+    message: Box<str>,
+    unresolved_type_name: Option<Box<UnresolvedTypeName>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnresolvedTypeName(Box<str>);
+
+impl UnresolvedTypeName {
+    fn new(name: String) -> Self {
+        Self(name.into_boxed_str())
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl From<String> for TypeResolutionError {
     fn from(message: String) -> Self {
-        Self { message }
+        Self {
+            message: message.into_boxed_str(),
+            unresolved_type_name: None,
+        }
     }
 }
 
 impl From<&str> for TypeResolutionError {
     fn from(message: &str) -> Self {
         Self {
-            message: message.to_string(),
+            message: message.into(),
+            unresolved_type_name: None,
+        }
+    }
+}
+
+impl TypeResolutionError {
+    fn unresolved_custom_type(name: String, config: &ProviderContext) -> Self {
+        Self {
+            message: crate::parser::unknown_custom_type_message(&name, config).into_boxed_str(),
+            unresolved_type_name: Some(Box::new(UnresolvedTypeName::new(name))),
         }
     }
 }
@@ -3782,14 +3813,23 @@ impl TypeResolutionDiagnostic {
         source_file: &std::path::Path,
         parse_error: &crate::parser::ParseError,
     ) -> bool {
-        let crate::parser::ParseError::InvalidExpression { line, message } = parse_error else {
+        let crate::parser::ParseError::UnresolvedDeclarationType {
+            token,
+            line: _line,
+            message: _message,
+        } = parse_error
+        else {
             return false;
         };
-        let parser_error = TypeResolutionError::from(message.as_str());
         self.location.as_ref().is_some_and(|location| {
             location.source_file.path() == source_file
-                && location.span.start_line() == *line
-                && self.error == parser_error
+                && location.span.contains(token.span())
+                && self
+                    .error
+                    .unresolved_type_name
+                    .as_deref()
+                    .map(UnresolvedTypeName::as_str)
+                    == Some(token.name())
         })
     }
 }
@@ -3808,10 +3848,24 @@ impl<'a> TypeResolutionParserError<'a> {
     }
 }
 
+/// The sole decision point for replacing a parser backstop with typed
+/// declaration diagnostics. Both resolver/CLI and LSP paths use this gate.
+pub(crate) fn type_resolution_parser_error_is_covered<'a>(
+    config: &ProviderContext,
+    diagnostics: impl IntoIterator<Item = &'a TypeResolutionDiagnostic>,
+    parser_error: TypeResolutionParserError<'_>,
+) -> bool {
+    config.custom_types_loaded()
+        && diagnostics.into_iter().any(|diagnostic| {
+            diagnostic.covers_parser_error(parser_error.source_file, parser_error.error)
+        })
+}
+
 /// Core-owned declaration-resolution outcome consumed by CLI and LSP.
 ///
 /// `covered_parser_error` lets a frontend omit a coarse parser backstop only
-/// when one of these typed diagnostics names the same file, line, and error.
+/// when one of these typed diagnostics owns the same file, type token, and
+/// source span.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileTypeResolutionReport {
     diagnostics: Vec<TypeResolutionDiagnostic>,
@@ -3842,13 +3896,10 @@ fn unresolved_bare_type_errors(
             if config.custom_types_loaded()
                 && !crate::parser::BUILTIN_BARE_CUSTOM_TYPES.contains(&name.as_str()) =>
         {
-            errors.push(
-                crate::parser::unknown_custom_type_message(
-                    &crate::parser::snake_to_pascal(name),
-                    config,
-                )
-                .into(),
-            );
+            errors.push(TypeResolutionError::unresolved_custom_type(
+                crate::parser::snake_to_pascal(name),
+                config,
+            ));
         }
         TypeExpr::List(inner) | TypeExpr::Map(inner) => {
             unresolved_bare_type_errors(inner, config, errors);
@@ -3997,13 +4048,9 @@ pub fn resolve_file_type_exprs_report<E: crate::parser::ExportParamLike>(
     parser_error: Option<TypeResolutionParserError<'_>>,
 ) -> FileTypeResolutionReport {
     let diagnostics = resolve_file_type_exprs_impl(parsed, config);
-    let covered_parser_error = config.custom_types_loaded()
-        && match parser_error {
-            Some(parser_error) => diagnostics.iter().any(|diagnostic| {
-                diagnostic.covers_parser_error(parser_error.source_file, parser_error.error)
-            }),
-            None => false,
-        };
+    let covered_parser_error = parser_error.is_some_and(|parser_error| {
+        type_resolution_parser_error_is_covered(config, &diagnostics, parser_error)
+    });
     FileTypeResolutionReport {
         diagnostics,
         covered_parser_error,
@@ -4512,15 +4559,9 @@ impl ModuleCallFindingMessage {
         }
     }
 
-    pub(crate) fn covers_type_resolution_parser_error(
-        &self,
-        source_file: &std::path::Path,
-        parse_error: &crate::parser::ParseError,
-    ) -> bool {
+    pub(crate) fn type_resolution_diagnostic(&self) -> Option<&TypeResolutionDiagnostic> {
         match self {
-            Self::TypeResolution(diagnostic) => {
-                diagnostic.covers_parser_error(source_file, parse_error)
-            }
+            Self::TypeResolution(diagnostic) => Some(diagnostic),
             Self::UnknownArgument {
                 module: _,
                 argument: _,
@@ -4546,7 +4587,7 @@ impl ModuleCallFindingMessage {
             }
             | Self::ReferenceType(_)
             | Self::AttributeReference(_)
-            | Self::Constraint(_) => false,
+            | Self::Constraint(_) => None,
         }
     }
 }
@@ -4640,7 +4681,8 @@ impl std::error::Error for ModuleCallFindingMessage {
     }
 }
 
-/// One module-call result with typed ownership and source.
+/// Typed identity used to merge equivalent findings across authored and
+/// expanded validation passes.
 #[derive(Debug, Clone, PartialEq)]
 enum ModuleCallFindingIdentity {
     BindingUse {
@@ -4651,6 +4693,7 @@ enum ModuleCallFindingIdentity {
     ReferenceType(ModuleCallReferenceIdentity),
 }
 
+/// One module-call result with typed ownership and source.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleCallFinding {
     kind: ModuleCallFindingKind,
@@ -4661,6 +4704,23 @@ pub struct ModuleCallFinding {
 }
 
 impl ModuleCallFinding {
+    fn argument_value(
+        kind: ModuleCallFindingKind,
+        owner: ModuleCallFindingOwner,
+        call: &ModuleCallId,
+        value_span: SourceSpan,
+        message: ModuleCallFindingMessage,
+        identity: Option<ModuleCallFindingIdentity>,
+    ) -> Self {
+        Self {
+            kind,
+            owners: vec![owner],
+            anchor: module_argument_value_anchor(call, value_span),
+            message,
+            identity,
+        }
+    }
+
     pub fn try_from_type_resolution(
         diagnostic: TypeResolutionDiagnostic,
     ) -> Result<Self, TypeResolutionDiagnostic> {
@@ -4688,33 +4748,30 @@ impl ModuleCallFinding {
         call_label: &str,
         identity: ModuleCallReferenceIdentity,
         owner: ModuleCallFindingOwner,
-        anchor: ModuleCallFindingAnchor,
+        value_span: SourceSpan,
     ) -> Self {
-        Self {
-            kind: ModuleCallFindingKind::ReferenceType,
-            owners: vec![owner],
-            anchor,
-            message: ModuleCallFindingMessage::ReferenceType(Box::new(
-                ModuleCallReferenceDiagnostic {
-                    call_label: call_label.to_string(),
-                    identity: identity.clone(),
-                },
-            )),
-            identity: Some(ModuleCallFindingIdentity::ReferenceType(identity)),
-        }
+        let call = identity.call.clone();
+        Self::argument_value(
+            ModuleCallFindingKind::ReferenceType,
+            owner,
+            &call,
+            value_span,
+            ModuleCallFindingMessage::ReferenceType(Box::new(ModuleCallReferenceDiagnostic {
+                call_label: call_label.to_string(),
+                identity: identity.clone(),
+            })),
+            Some(ModuleCallFindingIdentity::ReferenceType(identity)),
+        )
     }
 
     fn binding_use(
         call_label: &str,
         call: &ModuleCallId,
         argument: &str,
+        value_span: SourceSpan,
         finding: &BindingUseFinding,
         owner: ModuleCallFindingOwner,
     ) -> Self {
-        let anchor = ModuleCallFindingAnchor {
-            source_file: finding.use_site.source_file.clone(),
-            span: finding.use_site.span,
-        };
         let (kind, message) = match &finding.error {
             BindingResolutionError::ValueType(error) => (
                 ModuleCallFindingKind::ValueType,
@@ -4738,7 +4795,7 @@ impl ModuleCallFinding {
                         },
                     },
                     owner,
-                    anchor,
+                    value_span,
                 );
             }
             error @ (BindingResolutionError::Type(_)
@@ -4752,17 +4809,18 @@ impl ModuleCallFinding {
                 },
             ),
         };
-        Self {
+        Self::argument_value(
             kind,
-            owners: vec![owner],
-            anchor,
+            owner,
+            call,
+            value_span,
             message,
-            identity: Some(ModuleCallFindingIdentity::BindingUse {
+            Some(ModuleCallFindingIdentity::BindingUse {
                 call: call.clone(),
                 argument: argument.to_string(),
                 error: finding.error.clone(),
             }),
-        }
+        )
     }
 
     fn has_same_identity(&self, other: &Self) -> bool {
@@ -5044,6 +5102,7 @@ impl ModuleCallChecker<'_> {
             let crate::parser::BindingUseOwner::ModuleArgument {
                 call: finding_call,
                 argument,
+                value_span,
             } = &finding.use_site.owner
             else {
                 continue;
@@ -5056,6 +5115,7 @@ impl ModuleCallChecker<'_> {
                 &module_call_label(call),
                 finding_call,
                 argument,
+                *value_span,
                 finding,
                 owner,
             );
@@ -5067,6 +5127,7 @@ impl ModuleCallChecker<'_> {
         call_label: &str,
         call: &ModuleCallId,
         argument: &str,
+        value_span: SourceSpan,
         finding: &BindingUseFinding,
         owner: &ModuleCallFindingOwner,
     ) {
@@ -5074,6 +5135,7 @@ impl ModuleCallChecker<'_> {
             call_label,
             call,
             argument,
+            value_span,
             finding,
             owner.clone(),
         ));
@@ -5164,16 +5226,18 @@ impl ModuleCallChecker<'_> {
             let argument_value = semantic_argument.unwrap_or_else(|| authored.argument());
             if let Some(handle) = argument_value.handle() {
                 if let Err(error) = check_handle_sink(handle, &resolved_parameter) {
-                    self.push(
+                    self.push_finding(ModuleCallFinding::argument_value(
                         ModuleCallFindingKind::HandleSink,
                         owner.clone(),
-                        module_call_anchor(authored_call.id(), authored.key_span()),
+                        authored_call.id(),
+                        authored.value_span(),
                         ModuleCallFindingMessage::HandleSink {
                             call_label: call_label.clone(),
                             argument: argument.to_string(),
                             error,
                         },
-                    );
+                        None,
+                    ));
                 }
                 continue;
             }
@@ -5200,16 +5264,18 @@ impl ModuleCallChecker<'_> {
                 self.provider_context,
                 inference,
             ) {
-                self.push(
+                self.push_finding(ModuleCallFinding::argument_value(
                     ModuleCallFindingKind::ValueType,
                     owner.clone(),
-                    module_call_anchor(authored_call.id(), authored.key_span()),
+                    authored_call.id(),
+                    authored.value_span(),
                     ModuleCallFindingMessage::ValueType {
                         call_label: call_label.clone(),
                         argument: argument.to_string(),
                         error: Box::new(error),
                     },
-                );
+                    None,
+                ));
             }
         }
 
@@ -5278,13 +5344,13 @@ impl ModuleCallChecker<'_> {
             let argument_span = authored_call
                 .arguments_with_source_spans()
                 .find(|argument| argument.name() == error.identity.argument)
-                .map(|argument| argument.key_span())
+                .map(|argument| argument.value_span())
                 .unwrap_or(error.argument_span);
             self.push_finding(ModuleCallFinding::reference_type(
                 &module_call_label(authored_call),
                 error.identity,
                 owner.clone(),
-                module_call_anchor(authored_call.id(), argument_span),
+                argument_span,
             ));
         }
     }
@@ -5389,9 +5455,9 @@ impl ModuleCallChecker<'_> {
                     let immediate = error.call_path.immediate();
                     let span = match *error.origin {
                         crate::parser::ArgumentOrigin::Authored {
-                            key_span,
-                            value_span: _value_span,
-                        } => key_span,
+                            key_span: _key_span,
+                            value_span,
+                        } => value_span,
                         crate::parser::ArgumentOrigin::Defaulted => immediate.id.call_span(),
                     };
                     self.push_finding(ModuleCallFinding::reference_type(
@@ -5408,7 +5474,7 @@ impl ModuleCallChecker<'_> {
                                 immediate.id.clone(),
                             ),
                         },
-                        module_call_anchor(&immediate.id, span),
+                        span,
                     ));
                 }
                 CompositionRefError::Attribute(error) => {
@@ -5444,8 +5510,11 @@ impl ModuleCallChecker<'_> {
         compositions: &[crate::resource::LiveComposition],
     ) {
         for finding in report.findings() {
-            let crate::parser::BindingUseOwner::ModuleArgument { call, argument } =
-                &finding.use_site.owner
+            let crate::parser::BindingUseOwner::ModuleArgument {
+                call,
+                argument,
+                value_span,
+            } = &finding.use_site.owner
             else {
                 continue;
             };
@@ -5472,7 +5541,14 @@ impl ModuleCallChecker<'_> {
                 ));
             }
             for (owner, call_label) in owners {
-                self.push_binding_use_finding(&call_label, call, argument, finding, &owner);
+                self.push_binding_use_finding(
+                    &call_label,
+                    call,
+                    argument,
+                    *value_span,
+                    finding,
+                    &owner,
+                );
             }
         }
     }
@@ -5491,19 +5567,17 @@ impl ModuleCallChecker<'_> {
                 else {
                     continue;
                 };
-                let span = match origin {
+                let argument_value_span = match origin {
                     crate::module_resolver::ResolvedModuleConstraintOrigin::Argument(
                         crate::parser::ArgumentOrigin::Authored {
-                            key_span,
-                            value_span: _value_span,
+                            key_span: _key_span,
+                            value_span,
                         },
-                    ) => *key_span,
+                    ) => Some(*value_span),
                     crate::module_resolver::ResolvedModuleConstraintOrigin::Argument(
                         crate::parser::ArgumentOrigin::Defaulted,
                     )
-                    | crate::module_resolver::ResolvedModuleConstraintOrigin::Call => {
-                        report.source.call_span()
-                    }
+                    | crate::module_resolver::ResolvedModuleConstraintOrigin::Call => None,
                 };
                 let mut owners = compositions
                     .iter()
@@ -5532,15 +5606,23 @@ impl ModuleCallChecker<'_> {
                     });
                 }
                 for owner in owners {
-                    self.push(
-                        ModuleCallFindingKind::Constraint,
-                        owner,
-                        ModuleCallFindingAnchor {
-                            source_file: report.source.id.source_file_id().clone(),
-                            span,
-                        },
-                        ModuleCallFindingMessage::Constraint(diagnostic.clone()),
-                    );
+                    let message = ModuleCallFindingMessage::Constraint(diagnostic.clone());
+                    match argument_value_span {
+                        Some(value_span) => self.push_finding(ModuleCallFinding::argument_value(
+                            ModuleCallFindingKind::Constraint,
+                            owner,
+                            &report.source.id,
+                            value_span,
+                            message,
+                            None,
+                        )),
+                        None => self.push(
+                            ModuleCallFindingKind::Constraint,
+                            owner,
+                            module_call_anchor(&report.source.id, report.source.call_span()),
+                            message,
+                        ),
+                    }
                 }
             }
         }
@@ -5566,6 +5648,13 @@ fn module_call_anchor(call: &ModuleCallId, span: SourceSpan) -> ModuleCallFindin
     }
 }
 
+fn module_argument_value_anchor(
+    call: &ModuleCallId,
+    value_span: SourceSpan,
+) -> ModuleCallFindingAnchor {
+    module_call_anchor(call, value_span)
+}
+
 fn module_use_anchor(import: &crate::parser::UseStatement) -> ModuleCallFindingAnchor {
     ModuleCallFindingAnchor {
         source_file: SourceFileId::new(import.source_file().to_path_buf()),
@@ -5574,15 +5663,7 @@ fn module_use_anchor(import: &crate::parser::UseStatement) -> ModuleCallFindingA
 }
 
 fn module_call_label(call: &ModuleCall) -> String {
-    if matches!(
-        call.id().expansion(),
-        crate::parser::CallExpansion::Expanded(_expansion_key)
-    ) {
-        return format!("{} (anonymous call)", call.module_name);
-    }
-    call.binding_name
-        .clone()
-        .unwrap_or_else(|| format!("{} (anonymous call)", call.module_name))
+    crate::resource::CompositionCall::display_label_for_module_call(call)
 }
 
 fn module_call_value_is_context_free(value: &Value) -> bool {

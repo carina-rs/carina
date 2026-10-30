@@ -545,6 +545,20 @@ impl CompositionCall {
             }
         }
     }
+
+    /// Project an authored parser call onto this display authority. Fields
+    /// unrelated to labels are intentionally empty and never escape this call.
+    pub(crate) fn display_label_for_module_call(call: &crate::parser::ModuleCall) -> String {
+        Self {
+            id: call.id().clone(),
+            module_name: call.module_name.clone(),
+            binding: call.binding_name.clone(),
+            instance: String::new(),
+            module_source: None,
+            module_directory: None,
+        }
+        .display_label()
+    }
 }
 
 /// Complete non-empty module-call ancestry of one live composition.

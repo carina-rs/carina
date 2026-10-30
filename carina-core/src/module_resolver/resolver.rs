@@ -98,10 +98,14 @@ pub enum ResidualModuleResolutionDiagnostic<'a> {
 }
 
 impl ResidualModuleResolutionError {
-    fn new(error: ModuleError, findings: &[crate::validation::ModuleCallFinding]) -> Option<Self> {
+    fn new(
+        error: ModuleError,
+        findings: &[crate::validation::ModuleCallFinding],
+        config: &ProviderContext,
+    ) -> Option<Self> {
         let error = without_covered_reference_type_members(error, findings)?;
         let residual = Self(Box::new(error));
-        (!residual.is_covered_by(findings)).then_some(residual)
+        (!residual.is_covered_by(findings, config)).then_some(residual)
     }
 
     pub fn call_source(&self) -> ModuleErrorCallSource<'_> {
@@ -193,7 +197,11 @@ impl ResidualModuleResolutionError {
         }
     }
 
-    fn is_covered_by(&self, findings: &[crate::validation::ModuleCallFinding]) -> bool {
+    fn is_covered_by(
+        &self,
+        findings: &[crate::validation::ModuleCallFinding],
+        config: &ProviderContext,
+    ) -> bool {
         let root_cause = self.0.root_cause();
         match root_cause {
             ModuleError::MissingArgument { module, argument } => findings.iter().any(|finding| {
@@ -237,13 +245,22 @@ impl ResidualModuleResolutionError {
             } => false,
             ModuleError::Io(_) => false,
             ModuleError::Parse(error) => match error {
-                ParseError::Located { path, error } => findings.iter().any(|finding| {
-                    finding
-                        .message()
-                        .covers_type_resolution_parser_error(path, error)
-                }),
+                ParseError::Located { path, error } => {
+                    crate::validation::type_resolution_parser_error_is_covered(
+                        config,
+                        findings
+                            .iter()
+                            .filter_map(|finding| finding.message().type_resolution_diagnostic()),
+                        crate::validation::TypeResolutionParserError::new(path, error),
+                    )
+                }
                 ParseError::Syntax(_)
                 | ParseError::InvalidExpression {
+                    line: _,
+                    message: _,
+                }
+                | ParseError::UnresolvedDeclarationType {
+                    token: _,
                     line: _,
                     message: _,
                 }
@@ -287,11 +304,15 @@ impl ResidualModuleResolutionError {
                 | ParseError::CyclicLetBinding { chain: _ }
                 | ParseError::UserFunctionError(_) => false,
             },
-            ModuleError::ParseInFile { path, error } => findings.iter().any(|finding| {
-                finding
-                    .message()
-                    .covers_type_resolution_parser_error(path, error)
-            }),
+            ModuleError::ParseInFile { path, error } => {
+                crate::validation::type_resolution_parser_error_is_covered(
+                    config,
+                    findings
+                        .iter()
+                        .filter_map(|finding| finding.message().type_resolution_diagnostic()),
+                    crate::validation::TypeResolutionParserError::new(path, error),
+                )
+            }
             ModuleError::UnknownModule(_) => false,
             ModuleError::ProviderInModule => false,
             ModuleError::StateBlockInModule => false,
@@ -512,7 +533,7 @@ mod diagnostic_status_tests {
         }
         .with_failing_call(parsed.module_calls[0].id().clone());
         assert!(
-            ResidualModuleResolutionError::new(error, &[]).is_some(),
+            ResidualModuleResolutionError::new(error, &[], &provider_context).is_some(),
             "a resolver error cannot be hidden before a concrete finding covers it",
         );
         let unrelated = ModuleError::MissingArgument {
@@ -521,7 +542,7 @@ mod diagnostic_status_tests {
         }
         .with_failing_call(parsed.module_calls[0].id().clone());
         assert!(
-            ResidualModuleResolutionError::new(unrelated, &findings).is_some(),
+            ResidualModuleResolutionError::new(unrelated, &findings, &provider_context).is_some(),
             "a finding for another argument must not claim this resolver error",
         );
         let covered = ModuleError::MissingArgument {
@@ -530,7 +551,7 @@ mod diagnostic_status_tests {
         }
         .with_failing_call(parsed.module_calls[0].id().clone());
         assert!(
-            ResidualModuleResolutionError::new(covered, &findings).is_none(),
+            ResidualModuleResolutionError::new(covered, &findings, &provider_context).is_none(),
             "the exact call-owner finding must cover the resolver backstop",
         );
     }
@@ -1188,7 +1209,7 @@ pub fn resolve_modules_with_diagnostics<E: crate::parser::ExportParamLike + Clon
     let resolution_failed = !errors.is_empty();
     let errors = errors
         .into_iter()
-        .filter_map(|error| ResidualModuleResolutionError::new(error, covered_findings))
+        .filter_map(|error| ResidualModuleResolutionError::new(error, covered_findings, config))
         .collect::<Vec<_>>();
     if !findings.is_empty() {
         ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors }
@@ -1319,6 +1340,7 @@ mod type_resolution_policy_tests {
                 ),
             ),
             &[],
+            &ProviderContext::default(),
         )
         .expect("a non-call reference error remains residual");
 

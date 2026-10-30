@@ -444,7 +444,7 @@ impl DiagnosticEngine {
         // 2. The buffer-only parse (`doc.parsed()`) — load-bearing
         //    fallback when the merged parse failed. The merged parse
         //    uses the enriched `ProviderCustomTypes::Loaded` context, so the
-        //    parser's strict gate raises `ParseError::InvalidExpression`
+        //    parser's strict gate raises `ParseError::UnresolvedDeclarationType`
         //    on the very unknown-type-name shape we want to report.
         //    `parse_merged_with_buffer` returns that directory error; the
         //    owner-aware path above surfaces errors from the current file,
@@ -2131,6 +2131,27 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             DiagnosticSeverity::ERROR,
             message.clone(),
         ),
+        ParseError::UnresolvedDeclarationType {
+            token,
+            line: _line,
+            message,
+        } => {
+            let span = token.span();
+            carina_diagnostic_range(
+                Range::new(
+                    Position::new(
+                        span.start_line().saturating_sub(1) as u32,
+                        span.start_column().saturating_sub(1) as u32,
+                    ),
+                    Position::new(
+                        span.end_line().saturating_sub(1) as u32,
+                        span.end_column().saturating_sub(1) as u32,
+                    ),
+                ),
+                DiagnosticSeverity::ERROR,
+                message.clone(),
+            )
+        }
         ParseError::UnknownFunction { name, line, column } => carina_diagnostic(
             (*line as u32).saturating_sub(1),
             (*column as u32).saturating_sub(1),

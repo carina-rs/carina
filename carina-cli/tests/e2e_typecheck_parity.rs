@@ -240,6 +240,8 @@ struct ModuleCallParityCase {
     outer_arguments: &'static str,
     outer_calls: &'static str,
     expected: &'static [&'static str],
+    expected_cli_line: Option<usize>,
+    expected_lsp_range: Option<((u32, u32), (u32, u32))>,
 }
 
 fn module_call_parity_fixture(case: &ModuleCallParityCase) -> TempDir {
@@ -376,6 +378,8 @@ fn module_call_failures_have_exact_cli_lsp_error_parity_across_directory_files()
             outer_arguments: "arguments {\n  value: String\n}\n",
             outer_calls: "",
             expected: &["Unknown argument 'surprise' for module 'outer'"],
+            expected_cli_line: None,
+            expected_lsp_range: None,
         },
         ModuleCallParityCase {
             name: "missing required argument",
@@ -383,6 +387,8 @@ fn module_call_failures_have_exact_cli_lsp_error_parity_across_directory_files()
             outer_arguments: "arguments {\n  value: String\n}\n",
             outer_calls: "",
             expected: &["Missing required argument 'value' for module 'outer'"],
+            expected_cli_line: None,
+            expected_lsp_range: None,
         },
         ModuleCallParityCase {
             name: "ordinary type mismatch",
@@ -392,6 +398,8 @@ fn module_call_failures_have_exact_cli_lsp_error_parity_across_directory_files()
             expected: &[
                 "module call 'outer (anonymous call)': argument 'count': expected Int, got string 'not-an-int'",
             ],
+            expected_cli_line: Some(2),
+            expected_lsp_range: Some(((1, 10), (1, 22))),
         },
         ModuleCallParityCase {
             name: "attribute reference mismatch",
@@ -401,6 +409,8 @@ fn module_call_failures_have_exact_cli_lsp_error_parity_across_directory_files()
             expected: &[
                 "module call 'outer (anonymous call)': argument 'value': cannot assign Int to 'value': expected String, got Int (from source.count)",
             ],
+            expected_cli_line: Some(2),
+            expected_lsp_range: Some(((1, 10), (1, 22))),
         },
         ModuleCallParityCase {
             name: "nested outer to inner mismatch",
@@ -410,6 +420,8 @@ fn module_call_failures_have_exact_cli_lsp_error_parity_across_directory_files()
             expected: &[
                 "module call 'inner (anonymous call)': argument 'value': cannot assign String to 'value': expected Int, got String (from value)",
             ],
+            expected_cli_line: None,
+            expected_lsp_range: None,
         },
         ModuleCallParityCase {
             name: "for-expanded call",
@@ -424,6 +436,8 @@ fn module_call_failures_have_exact_cli_lsp_error_parity_across_directory_files()
             expected: &[
                 "module call 'outer (anonymous call)': argument 'count': expected Int, got string 'not-an-int'",
             ],
+            expected_cli_line: Some(3),
+            expected_lsp_range: Some(((2, 12), (2, 24))),
         },
     ];
 
@@ -453,6 +467,25 @@ fn module_call_failures_have_exact_cli_lsp_error_parity_across_directory_files()
             "{}: CLI and LSP must preserve the same message multiplicities; CLI={cli:#?}; LSP={lsp:#?}",
             case.name,
         );
+        if let Some(line) = case.expected_cli_line {
+            assert!(
+                cli.iter()
+                    .any(|diagnostic| diagnostic.contains(&format!("calls.crn at line {line}\n"))),
+                "{}: CLI must retain the authored argument-value line; CLI={cli:#?}",
+                case.name,
+            );
+        }
+        if let Some((start, end)) = case.expected_lsp_range {
+            assert_eq!(
+                lsp[0].range,
+                tower_lsp::lsp_types::Range::new(
+                    tower_lsp::lsp_types::Position::new(start.0, start.1),
+                    tower_lsp::lsp_types::Position::new(end.0, end.1),
+                ),
+                "{}: LSP must underline the authored argument value",
+                case.name,
+            );
+        }
     }
 }
 
@@ -1004,8 +1037,13 @@ fn standalone_module_type_resolution_keeps_cli_location_and_lsp_range() {
     assert!(directory_failure.parse_error().is_some_and(|error| {
         matches!(
             error,
-            carina_core::parser::ParseError::InvalidExpression { line, message }
-                if *line == 2 && message == "unknown custom type 'NoSuchType'"
+            carina_core::parser::ParseError::UnresolvedDeclarationType {
+                token,
+                line,
+                message,
+            } if *line == 2
+                && token.name() == "NoSuchType"
+                && message == "unknown custom type 'NoSuchType'"
         )
     }));
 
@@ -1120,8 +1158,8 @@ attributes { loaded: Bool = true }
     assert_eq!(
         nested_diagnostic.range,
         tower_lsp::lsp_types::Range::new(
-            tower_lsp::lsp_types::Position::new(3, 2),
-            tower_lsp::lsp_types::Position::new(3, 6),
+            tower_lsp::lsp_types::Position::new(3, 9),
+            tower_lsp::lsp_types::Position::new(3, 11),
         ),
         "the CLI line-four anchor and nested LSP range must name the same argument",
     );
@@ -1231,8 +1269,8 @@ other {
         (
             constraint,
             tower_lsp::lsp_types::Range::new(
-                tower_lsp::lsp_types::Position::new(1, 2),
-                tower_lsp::lsp_types::Position::new(1, 6),
+                tower_lsp::lsp_types::Position::new(1, 9),
+                tower_lsp::lsp_types::Position::new(1, 11),
             ),
         ),
         (
