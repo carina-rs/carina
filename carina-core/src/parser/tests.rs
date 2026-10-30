@@ -5853,8 +5853,12 @@ fn unbound_for_elements_are_pending_and_unbound() {
     )
     .unwrap();
 
-    assert_eq!(parsed.resources.len(), 2);
-    for (index, resource) in parsed.resources.iter().enumerate() {
+    let resources = parsed.iter_all_resources().collect::<Vec<_>>();
+    assert_eq!(resources.len(), 2);
+    for (index, resource) in resources.into_iter().enumerate() {
+        let ResourceRef::Resource(resource) = resource else {
+            panic!("unbound for fixture must emit managed resources")
+        };
         assert!(resource.id.identity_str().is_none());
         assert_eq!(resource.binding, None);
         let origin = resource
@@ -5921,8 +5925,11 @@ fn unbound_if_is_pending_and_unbound() {
     )
     .unwrap();
 
-    assert_eq!(parsed.resources.len(), 1);
-    let resource = &parsed.resources[0];
+    let resources = parsed.iter_all_resources().collect::<Vec<_>>();
+    assert_eq!(resources.len(), 1);
+    let ResourceRef::Resource(resource) = resources[0] else {
+        panic!("unbound if fixture must emit a managed resource")
+    };
     assert!(resource.id.identity_str().is_none());
     assert_eq!(resource.binding, None);
     let origin = resource

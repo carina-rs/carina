@@ -640,13 +640,14 @@ impl std::fmt::Display for LegacyLoopMoveTargetError {
 
 impl std::error::Error for LegacyLoopMoveTargetError {}
 
-fn has_underscore_leading_identity_segment(identity: &str) -> bool {
+fn has_legacy_synthetic_identity_segment(identity: &str) -> bool {
+    let mut characters = identity.chars().peekable();
     let mut at_segment_start = true;
     let mut bracket_depth = 0usize;
     let mut quote = None;
     let mut escaped = false;
 
-    for character in identity.chars() {
+    while let Some(character) = characters.next() {
         if let Some(delimiter) = quote {
             if escaped {
                 escaped = false;
@@ -672,7 +673,12 @@ fn has_underscore_leading_identity_segment(identity: &str) -> bool {
                 at_segment_start = false;
             }
             '.' => at_segment_start = true,
-            '_' if at_segment_start => return true,
+            '_' if at_segment_start => {
+                if !matches!(characters.peek().copied(), None | Some('[' | '.')) {
+                    return true;
+                }
+                at_segment_start = false;
+            }
             _ => at_segment_start = false,
         }
     }
@@ -713,7 +719,7 @@ pub fn check_legacy_loop_move_targets<S>(
             if is_desired_address {
                 return None;
             }
-            let has_reserved_segment = has_underscore_leading_identity_segment(target.name_str());
+            let has_reserved_segment = has_legacy_synthetic_identity_segment(target.name_str());
 
             let mut replacements = Vec::new();
             for resource in resources {

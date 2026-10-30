@@ -273,7 +273,7 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
             .expect("root fixture parses");
     resolve_modules(&mut parsed, root.path()).expect("nested loop module expands");
     assert_eq!(
-        parsed.resources.len(),
+        parsed.resources.len(), // allow: direct — fixture test inspection
         1,
         "fixture emits one inner resource"
     );

@@ -207,9 +207,12 @@ impl std::fmt::Display for ValidatedEntry<'_> {
                 file,
                 line,
             } => {
-                let location = match file {
-                    Some(file) => format!("{file}:{line}"),
-                    None => line.to_string(),
+                let location = match target {
+                    carina_core::parser::DeferredForTarget::Bound { .. } => match file {
+                        Some(file) => format!("{file}:{line}"),
+                        None => line.to_string(),
+                    },
+                    carina_core::parser::DeferredForTarget::Unbound { .. } => target.display_name(),
                 };
                 match target {
                     carina_core::parser::DeferredForTarget::Bound { binding } => write!(
@@ -579,7 +582,8 @@ backend s3 {
         assert!(
             listed.iter().any(|r| {
                 let s = r.as_str().unwrap();
-                s.contains("route53.RecordSet.<pending>") && s.contains("(deferred for at 7)")
+                s.contains("route53.RecordSet.<pending>")
+                    && s.contains("(deferred for at validate_fixture.crn:7)")
             }),
             "json must list the deferred for-loop body as a placeholder \
              entry; got: {listed:?}"

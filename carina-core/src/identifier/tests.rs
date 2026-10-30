@@ -6362,6 +6362,42 @@ fn import_to_rejects_a_legacy_loop_address_with_the_current_replacement() {
 }
 
 #[test]
+fn state_block_destinations_allow_deferred_bound_discard_addresses() {
+    let parsed = crate::parser::parse(
+        r#"
+let _ = for item in upstream.items {
+  mock.ec2.Vpc { identity_input = item }
+}
+moved {
+  from = mock.ec2.Vpc 'old'
+  to = mock.ec2.Vpc '_[0]'
+}
+import {
+  to = mock.ec2.Vpc '_[1]'
+  id = 'vpc-existing'
+}
+"#,
+        &crate::parser::ProviderContext::default(),
+    )
+    .expect("bound discard loop and state blocks parse");
+    assert!(matches!(
+        parsed.deferred_for_expressions.as_slice(),
+        [crate::parser::DeferredForExpression {
+            target: crate::parser::DeferredForTarget::Bound { binding },
+            ..
+        }] if binding == "_"
+    ));
+
+    let errors =
+        check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &parsed.resources);
+
+    assert!(
+        errors.is_empty(),
+        "the bare discard binding is not a legacy synthetic name: {errors:#?}",
+    );
+}
+
+#[test]
 fn moved_to_allows_bound_map_keys_that_begin_with_underscore() {
     let parsed = crate::parser::parse(
         concat!(

@@ -7362,7 +7362,11 @@ fn file_deferred_expansion_target_reports_all_anonymous_identity_errors() {
 fn canonical_pair_deferred_expansion_target_reports_all_anonymous_identity_errors() {
     let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let parsed = two_anonymous_loop_collision_file();
-    let mut pair = canonical_pair(&parsed, parsed.resources.clone(), ctx.schemas());
+    let mut pair = canonical_pair(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        ctx.schemas(),
+    );
 
     let error = <CanonicalResourcePair<carina_core::parser::ParsedExportParam> as DeferredExpansionTarget<
         carina_core::parser::ParsedExportParam,
