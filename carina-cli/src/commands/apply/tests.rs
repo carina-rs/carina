@@ -826,7 +826,9 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
 
     let mut plan_file = plan_file
         .reload_in_flight_from_locked_state(None)
-        .expect("test plan should cross the locked-state reload boundary");
+        .expect("test plan should cross the locked-state reload boundary")
+        .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
+        .expect("test plan should cross schema resolution");
     let result = rehydrate_desired_plan_file_from_parts(
         &mut plan_file,
         candidates.parsed(),

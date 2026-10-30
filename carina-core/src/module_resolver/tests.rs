@@ -115,6 +115,7 @@ fn create_test_module() -> ParsedFile {
                 attrs.into_iter().collect()
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
@@ -258,6 +259,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
                 attrs
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
@@ -448,6 +450,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
                 provider_instance: Some("us".to_string()),
                 ..Directives::default()
             },
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".to_string()),
             dependency_bindings: BTreeSet::new(),
@@ -549,6 +552,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
             provider_instance: Some("us".to_string()),
             ..Directives::default()
         },
+        resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding: Some(format!("{}.role", current_prefix)),
         dependency_bindings: BTreeSet::new(),
@@ -606,6 +610,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                     attrs.into_iter().collect()
                 },
                 directives: Directives::default(),
+                resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: Some("vpc".to_string()),
                 dependency_bindings: BTreeSet::new(),
@@ -624,6 +629,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                     attrs.into_iter().collect()
                 },
                 directives: Directives::default(),
+                resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: Some("subnet".to_string()),
                 dependency_bindings: BTreeSet::new(),
@@ -766,6 +772,7 @@ fn create_module_with_attributes() -> ParsedFile {
                 attrs.into_iter().collect()
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("sg".to_string()),
             dependency_bindings: BTreeSet::new(),
@@ -2139,6 +2146,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
                 attrs.into_iter().collect()
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("distribution".to_string()),
             dependency_bindings: BTreeSet::new(),
@@ -2435,6 +2443,7 @@ fn create_module_with_interpolation() -> ParsedFile {
                 attrs.into_iter().collect()
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("vpc".to_string()),
             dependency_bindings: BTreeSet::new(),
@@ -5953,6 +5962,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             id: ResourceId::with_identity("acm.Certificate", "cert"),
             attributes: HashMap::new().into_iter().collect(),
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".to_string()),
             dependency_bindings: BTreeSet::new(),
@@ -5988,6 +5998,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                     a
                 },
                 directives: Directives::default(),
+                resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: None,
                 dependency_bindings: BTreeSet::new(),
@@ -6162,6 +6173,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                 id: ResourceId::with_identity("sso.Assignment", "placeholder"),
                 attributes: HashMap::new().into_iter().collect(),
                 directives: Directives::default(),
+                resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: None,
                 dependency_bindings: BTreeSet::new(),

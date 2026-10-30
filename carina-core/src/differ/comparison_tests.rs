@@ -7,6 +7,126 @@ use crate::schema::{ResourceSchema, TypeIdentity};
 use crate::value::value_to_json;
 use indexmap::IndexMap;
 
+fn resolved_ignored_resource(
+    mut resource: Resource,
+    schema: ResourceSchema,
+    path: &[&str],
+) -> (ResolvedResource, SchemaRegistry) {
+    resource.directives.ignore_changes = vec![crate::resource::ParsedIgnorePath::new(
+        path.iter()
+            .map(|part| crate::resource::ParsedIgnorePathSegment::Attribute((*part).to_string()))
+            .collect(),
+    )];
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        resource.id.provider.clone(),
+        schema.validate().expect("ignore_changes schema is valid"),
+    );
+    let resource = ResolvedResource::resolve_with_schemas(resource, &registry)
+        .expect("ignore_changes path resolves");
+    (resource, registry)
+}
+
+#[test]
+fn ignored_top_level_readable_and_create_only_attributes_do_not_diff() {
+    use crate::schema::AttributeSchema;
+
+    let schema = ResourceSchema::new("Widget")
+        .attribute(
+            AttributeSchema::optional("function_version", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(AttributeSchema::optional("comment", AttributeType::string()).build());
+    let desired = Resource::with_provider("test", "Widget", "alias", None)
+        .with_attribute(
+            "function_version",
+            Value::Concrete(ConcreteValue::String("1".into())),
+        )
+        .with_attribute(
+            "comment",
+            Value::Concrete(ConcreteValue::String("same".into())),
+        );
+    let (desired, registry) = resolved_ignored_resource(desired, schema, &["function_version"]);
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([
+            (
+                "function_version".to_string(),
+                Value::Concrete(ConcreteValue::String("42".into())),
+            ),
+            (
+                "comment".to_string(),
+                Value::Concrete(ConcreteValue::String("same".into())),
+            ),
+        ]),
+    );
+    let saved = crate::provider::RawSavedAttrs::default().lift(&registry);
+    let schema = registry
+        .get_for(desired.as_resource())
+        .expect("schema")
+        .schema()
+        .as_schema();
+
+    assert!(matches!(
+        diff(&desired, &current, &saved, None, Some(schema)),
+        Diff::NoChange(_)
+    ));
+}
+
+#[test]
+fn ignored_readable_struct_leaf_does_not_hide_changed_sibling() {
+    use crate::schema::{AttributeSchema, StructField};
+
+    let schema = ResourceSchema::new("Widget").attribute(
+        AttributeSchema::optional(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional("function_version", AttributeType::string()).build(),
+                    StructField::optional("memory", AttributeType::int()).build(),
+                ],
+            ),
+        )
+        .build(),
+    );
+    let config = |version: &str, memory: i64| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "function_version".to_string(),
+                Value::Concrete(ConcreteValue::String(version.into())),
+            ),
+            (
+                "memory".to_string(),
+                Value::Concrete(ConcreteValue::Int(memory)),
+            ),
+        ])))
+    };
+    let desired = Resource::with_provider("test", "Widget", "function", None)
+        .with_attribute("config", config("recorded", 256));
+    let (desired, registry) =
+        resolved_ignored_resource(desired, schema, &["config", "function_version"]);
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([("config".to_string(), config("external", 128))]),
+    );
+    let saved = crate::provider::RawSavedAttrs::default().lift(&registry);
+    let schema = registry
+        .get_for(desired.as_resource())
+        .expect("schema")
+        .schema()
+        .as_schema();
+
+    let Diff::Update {
+        changed_attributes, ..
+    } = diff(&desired, &current, &saved, None, Some(schema))
+    else {
+        panic!("memory change must still produce an update")
+    };
+    assert_eq!(changed_attributes, ["config"]);
+}
+
 fn persisted_secret(encoded: &serde_json::Value) -> Value {
     crate::value::PersistedValue::from_serialized_json(encoded.clone())
         .expect("valid persisted secret")

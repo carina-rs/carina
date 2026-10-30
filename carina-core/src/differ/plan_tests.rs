@@ -17,6 +17,135 @@ fn existing_state(id: ResourceId, attributes: HashMap<String, Value>) -> State {
     State::existing(id, attributes).with_identifier(identifier)
 }
 
+fn ignore_path(parts: &[&str]) -> crate::resource::ParsedIgnorePath {
+    crate::resource::ParsedIgnorePath::new(
+        parts
+            .iter()
+            .map(|part| crate::resource::ParsedIgnorePathSegment::Attribute((*part).to_string()))
+            .collect(),
+    )
+}
+
+#[test]
+fn plan_records_readable_ignored_drift_without_an_update() {
+    use crate::schema::{AttributeSchema, AttributeType};
+
+    let mut desired = Resource::with_provider("mock", "Widget", "example", None).with_attribute(
+        "comment",
+        Value::Concrete(ConcreteValue::String("recorded".into())),
+    );
+    desired.directives.ignore_changes = vec![ignore_path(&["comment"])];
+    let id = desired.id.clone();
+    let schema = ResourceSchema::new("Widget")
+        .attribute(AttributeSchema::optional("comment", AttributeType::string()).build());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", schema.validate().expect("valid schema"));
+    let current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(
+            id.clone(),
+            Current::from_state(existing_state(
+                id.clone(),
+                HashMap::from([(
+                    "comment".to_string(),
+                    Value::Concrete(ConcreteValue::String("external".into())),
+                )]),
+            )),
+        )]),
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(plan.effects().is_empty());
+    assert_eq!(plan.ignored_change_summaries().len(), 1);
+    assert_eq!(plan.ignored_change_summaries()[0].resource_id(), &id);
+    assert_eq!(plan.ignored_change_summaries()[0].count(), 1);
+}
+
+#[test]
+fn plan_reports_typed_error_when_changed_parent_contains_ignored_write_only_leaf() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let config = |secret: Option<&str>, memory: i64| {
+        let mut values = IndexMap::new();
+        if let Some(secret) = secret {
+            values.insert(
+                "secret".to_string(),
+                Value::Concrete(ConcreteValue::String(secret.into())),
+            );
+        }
+        values.insert(
+            "memory".to_string(),
+            Value::Concrete(ConcreteValue::Int(memory)),
+        );
+        Value::Concrete(ConcreteValue::Map(values))
+    };
+    let mut desired = Resource::with_provider("mock", "Widget", "example", None)
+        .with_attribute("config", config(Some("recorded"), 256));
+    desired.directives.ignore_changes = vec![ignore_path(&["config", "secret"])];
+    let id = desired.id.clone();
+    let schema = ResourceSchema::new("Widget").attribute(
+        AttributeSchema::optional(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional("secret", AttributeType::string())
+                        .write_only()
+                        .build(),
+                    StructField::optional("memory", AttributeType::int()).build(),
+                ],
+            ),
+        )
+        .build(),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", schema.validate().expect("valid schema"));
+    let current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(
+            id.clone(),
+            Current::from_state(existing_state(
+                id.clone(),
+                HashMap::from([("config".to_string(), config(None, 128))]),
+            )),
+        )]),
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(plan.effects().is_empty());
+    assert!(matches!(
+        &plan.errors()[0].kind,
+        PlanErrorKind::IgnoredWriteOnlyValueUnavailable { attribute, path }
+            if attribute == "config" && path == "config.secret"
+    ));
+}
+
 #[test]
 fn missing_identifier_current_produces_existing_plan_error() {
     let resource = Resource::new("test.resource", "managed");
@@ -1208,7 +1337,8 @@ fn nested_authored_field_removal_produces_update_patch_without_removed_field() {
         &provider_ready(to),
         &from,
         &schema,
-    );
+    )
+    .expect("fixture update patch is valid");
     assert_eq!(patch.ops.len(), 1);
     let crate::provider::PatchOp::Replace {
         value: Value::Concrete(ConcreteValue::Map(patch_config)),
@@ -1510,7 +1640,8 @@ fn whole_value_list_authoring_compares_and_sends_the_full_desired_list() {
         &provider_ready(to),
         &from,
         &schema,
-    );
+    )
+    .expect("fixture update patch is valid");
     assert_eq!(patch.ops.len(), 1);
     assert!(matches!(
         &patch.ops[0],
@@ -1709,7 +1840,8 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
     assert_eq!(changed_attributes, &["distribution_config".to_string()]);
     let ready = provider_ready(to.as_resource().clone());
     let schema = crate::schema::ResourceSchema::new("awscc.cloudfront.Distribution");
-    let patch = crate::provider::build_update_patch(changed_attributes, &ready, from, &schema);
+    let patch = crate::provider::build_update_patch(changed_attributes, &ready, from, &schema)
+        .expect("fixture update patch is valid");
     let crate::provider::PatchOp::Replace {
         value: Value::Concrete(ConcreteValue::Map(patch_config)),
         ..

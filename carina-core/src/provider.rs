@@ -721,9 +721,9 @@ impl UpdateRequest {
         changed_attributes: &[String],
         resource: &ProviderReadyResource,
         schema: &ResourceSchema,
-    ) -> Self {
-        let patch = build_update_patch(changed_attributes, resource, &from, schema);
-        Self { from, patch }
+    ) -> Result<Self, IgnoredWriteOnlyValueError> {
+        let patch = build_update_patch(changed_attributes, resource, &from, schema)?;
+        Ok(Self { from, patch })
     }
 
     /// Current provider-side state.
@@ -779,6 +779,32 @@ pub enum PatchOp {
     Remove { key: String },
 }
 
+/// Sending a top-level value would overwrite an ignored write-only leaf whose
+/// current provider value cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "resource '{resource}' cannot send attribute '{attribute}' because ignored write-only path '{path}' must be preserved, but its current value cannot be known"
+)]
+pub struct IgnoredWriteOnlyValueError {
+    resource: Box<ResourceId>,
+    attribute: String,
+    path: Box<crate::resource::ParsedIgnorePath>,
+}
+
+impl IgnoredWriteOnlyValueError {
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource
+    }
+
+    pub fn attribute(&self) -> &str {
+        &self.attribute
+    }
+
+    pub fn path(&self) -> &crate::resource::ParsedIgnorePath {
+        &self.path
+    }
+}
+
 impl PatchOp {
     /// Top-level attribute name. Nested-field patches are a future extension.
     pub fn key(&self) -> &str {
@@ -830,56 +856,119 @@ pub fn build_update_patch(
     to: &ProviderReadyResource,
     from: &State,
     schema: &ResourceSchema,
-) -> UpdatePatch {
+) -> Result<UpdatePatch, IgnoredWriteOnlyValueError> {
+    plan_update_patch(changed_attributes, to.as_inner(), from, schema)
+}
+
+/// Decide every update operation from one resolved desired/current pair.
+/// Planning discards the returned patch after validating it; apply retains it
+/// as the provider request payload.
+pub(crate) fn plan_update_patch<S>(
+    changed_attributes: &[String],
+    to: &crate::resource::ResolvedResource<S>,
+    from: &State,
+    schema: &ResourceSchema,
+) -> Result<UpdatePatch, IgnoredWriteOnlyValueError> {
+    let ignore_changes = to.ignore_changes();
     let to = to.as_resource();
     let mut patched_keys = HashSet::new();
-    let mut ops = changed_attributes
-        .iter()
-        .filter_map(|key| {
-            let value = to.attributes.get(key);
-            let in_from = from.attributes.contains_key(key);
-            if value.is_none() && !in_from {
-                return None;
-            }
-            if !patched_keys.insert(key.clone()) {
-                return None;
-            }
-            match (value, in_from) {
-                (Some(value), false) => Some(PatchOp::Add {
-                    key: key.clone(),
-                    value: value.clone(),
-                }),
-                (Some(value), true) => Some(PatchOp::Replace {
-                    key: key.clone(),
-                    value: value.clone(),
-                }),
-                (None, true) => Some(PatchOp::Remove { key: key.clone() }),
-                (None, false) => None,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    if ops.is_empty() {
-        return UpdatePatch { ops };
+    let mut ops = Vec::new();
+    for key in changed_attributes {
+        if ignore_changes.ignores_whole_attribute(key) {
+            continue;
+        }
+        let value = to.attributes.get(key);
+        let in_from = from.attributes.contains_key(key);
+        if value.is_none() && !in_from {
+            continue;
+        }
+        if !patched_keys.insert(key.clone()) {
+            continue;
+        }
+        if value.is_some()
+            && let Some(path) = ignore_changes
+                .for_attribute(key)
+                .find(|path| path.is_write_only())
+        {
+            return Err(ignored_write_only_error(&to.id, key, path));
+        }
+        let sent_value = value.map(|value| {
+            ignore_changes.with_observed_readable_leaves(key, value, from.attributes.get(key))
+        });
+        match (sent_value, in_from) {
+            (Some(value), false) => ops.push(PatchOp::Add {
+                key: key.clone(),
+                value,
+            }),
+            (Some(value), true) => ops.push(PatchOp::Replace {
+                key: key.clone(),
+                value,
+            }),
+            (None, true) => ops.push(PatchOp::Remove { key: key.clone() }),
+            (None, false) => {}
+        }
     }
 
-    let mut reasserts = to
-        .attributes
-        .iter()
-        .filter_map(|(key, value)| {
-            let attribute = schema.attributes.get(key)?;
-            ((attribute.write_only || schema.write_only_bearing(key))
-                && !attribute.create_only
-                && !patched_keys.contains(key))
-            .then(|| PatchOp::Reassert {
-                key: key.clone(),
-                value: value.clone(),
-            })
-        })
-        .collect::<Vec<_>>();
+    if ops.is_empty() {
+        return Ok(UpdatePatch { ops });
+    }
+
+    let mut reasserts = Vec::new();
+    for (key, value) in &to.attributes {
+        let Some(attribute) = schema.attributes.get(key) else {
+            continue;
+        };
+        if (!attribute.write_only && !schema.write_only_bearing(key))
+            || attribute.create_only
+            || patched_keys.contains(key)
+        {
+            continue;
+        }
+        let ignored_write_only = ignore_changes
+            .for_attribute(key)
+            .filter(|path| path.is_write_only())
+            .collect::<Vec<_>>();
+        if attribute.write_only {
+            if ignore_changes.ignores_whole_attribute(key) {
+                continue;
+            }
+            if let Some(path) = ignored_write_only.first() {
+                return Err(ignored_write_only_error(&to.id, key, path));
+            }
+        } else if !ignored_write_only.is_empty() {
+            let desired_write_only = schema.write_only_leaf_projection(key, value);
+            if desired_write_only
+                .iter()
+                .all(|(leaf, _, _)| ignore_changes.ignores_leaf(key, leaf))
+            {
+                continue;
+            }
+            return Err(ignored_write_only_error(&to.id, key, ignored_write_only[0]));
+        }
+        reasserts.push(PatchOp::Reassert {
+            key: key.clone(),
+            value: ignore_changes.with_observed_readable_leaves(
+                key,
+                value,
+                from.attributes.get(key),
+            ),
+        });
+    }
     reasserts.sort_by(|left, right| left.key().cmp(right.key()));
     ops.extend(reasserts);
-    UpdatePatch { ops }
+    Ok(UpdatePatch { ops })
+}
+
+fn ignored_write_only_error(
+    resource: &ResourceId,
+    attribute: &str,
+    path: &crate::resource::ResolvedIgnorePath,
+) -> IgnoredWriteOnlyValueError {
+    IgnoredWriteOnlyValueError {
+        resource: Box::new(resource.clone()),
+        attribute: attribute.to_string(),
+        path: Box::new(path.authored().clone()),
+    }
 }
 
 /// Return type for async operations
@@ -8392,7 +8481,7 @@ mod tests {
         let to = resolved_for_test(to);
         let schema = ResourceSchema::new("test");
         let changed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let patch = build_update_patch(&changed, &to, &from, &schema);
+        let patch = build_update_patch(&changed, &to, &from, &schema).expect("valid patch");
         assert_eq!(patch.ops.len(), 3);
 
         let by_key: HashMap<&str, &PatchOp> = patch.ops.iter().map(|op| (op.key(), op)).collect();
@@ -8474,6 +8563,264 @@ mod tests {
         (schema, value)
     }
 
+    fn nested_struct_write_only_patch_fixture() -> (ResourceSchema, Value) {
+        use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+        let schema = ResourceSchema::new("test")
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "default_actions",
+                    AttributeType::struct_(
+                        "Action",
+                        vec![
+                            StructField::optional(
+                                "authenticate_oidc_config",
+                                AttributeType::struct_(
+                                    "AuthenticateOidcConfig",
+                                    vec![
+                                        StructField::optional("issuer", AttributeType::string())
+                                            .build(),
+                                        StructField::optional(
+                                            "client_secret",
+                                            AttributeType::string(),
+                                        )
+                                        .write_only()
+                                        .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            );
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "authenticate_oidc_config".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "issuer".to_string(),
+                    patch_test_value("https://issuer.example.com"),
+                ),
+                (
+                    "client_secret".to_string(),
+                    Value::Deferred(DeferredValue::Secret(Box::new(patch_test_value(
+                        "client-secret",
+                    )))),
+                ),
+            ]))),
+        )])));
+        (schema, value)
+    }
+
+    fn ignored_path(parts: &[&str]) -> crate::resource::ParsedIgnorePath {
+        crate::resource::ParsedIgnorePath::new(
+            parts
+                .iter()
+                .map(|part| {
+                    crate::resource::ParsedIgnorePathSegment::Attribute((*part).to_string())
+                })
+                .collect(),
+        )
+    }
+
+    fn ready_with_ignored_path(
+        mut resource: Resource,
+        schema: &ResourceSchema,
+        path: crate::resource::ParsedIgnorePath,
+    ) -> ProviderReadyResource {
+        resource.directives.ignore_changes = vec![path];
+        let mut registry = crate::schema::SchemaRegistry::new();
+        registry.insert(
+            "",
+            schema
+                .clone()
+                .validate()
+                .expect("ignore_changes patch schema must be valid"),
+        );
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let context = crate::executor::ProviderPreparationContext::new(
+            &bindings,
+            &gate,
+            &[],
+            &NoopNormalizer,
+            &[],
+            &registry,
+        );
+        futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
+            resource, &context,
+        ))
+        .expect("ignore_changes path must resolve during provider preparation")
+    }
+
+    #[test]
+    fn ignored_nested_write_only_leaf_prevents_parent_reassert() {
+        let (schema, default_actions) = nested_struct_write_only_patch_fixture();
+        let from = State::existing(
+            ResourceId::with_identity("test", "example"),
+            HashMap::from([
+                ("description".to_string(), patch_test_value("before")),
+                (
+                    "default_actions".to_string(),
+                    schema.strip_write_only_leaves("default_actions", &default_actions),
+                ),
+            ]),
+        );
+        let to = ready_with_ignored_path(
+            Resource::new("test", "example")
+                .with_attribute("description", patch_test_value("after"))
+                .with_attribute("default_actions", default_actions),
+            &schema,
+            ignored_path(&[
+                "default_actions",
+                "authenticate_oidc_config",
+                "client_secret",
+            ]),
+        );
+
+        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema)
+            .expect("fully ignored write-only leaves need no reassertion");
+
+        assert!(matches!(
+            &patch.ops[..],
+            [PatchOp::Replace { key, .. }] if key == "description"
+        ));
+    }
+
+    #[test]
+    fn plan_and_apply_use_the_same_update_patch_decision() {
+        let (schema, default_actions) = nested_struct_write_only_patch_fixture();
+        let from = State::existing(
+            ResourceId::with_identity("test", "example"),
+            HashMap::from([
+                ("description".to_string(), patch_test_value("before")),
+                (
+                    "default_actions".to_string(),
+                    schema.strip_write_only_leaves("default_actions", &default_actions),
+                ),
+            ]),
+        );
+        let to = ready_with_ignored_path(
+            Resource::new("test", "example")
+                .with_attribute("description", patch_test_value("after"))
+                .with_attribute("default_actions", default_actions),
+            &schema,
+            ignored_path(&[
+                "default_actions",
+                "authenticate_oidc_config",
+                "client_secret",
+            ]),
+        );
+        let changed = ["description".to_string()];
+
+        let planned = plan_update_patch(&changed, to.as_inner(), &from, &schema)
+            .expect("planning must accept the patch");
+        let applied = build_update_patch(&changed, &to, &from, &schema)
+            .expect("apply must accept the same patch");
+
+        assert_eq!(planned.ops, applied.ops);
+    }
+
+    #[test]
+    fn ignored_readable_leaf_uses_observed_value_when_sibling_is_sent() {
+        use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+        let schema = ResourceSchema::new("test").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("version", AttributeType::string()).build(),
+                        StructField::optional("memory", AttributeType::int()).build(),
+                    ],
+                ),
+            )
+            .build(),
+        );
+        let struct_value = |version: &str, memory: i64| {
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                ("version".to_string(), patch_test_value(version)),
+                (
+                    "memory".to_string(),
+                    Value::Concrete(ConcreteValue::Int(memory)),
+                ),
+            ])))
+        };
+        let from = State::existing(
+            ResourceId::with_identity("test", "example"),
+            HashMap::from([("config".to_string(), struct_value("external", 128))]),
+        );
+        let to = ready_with_ignored_path(
+            Resource::new("test", "example")
+                .with_attribute("config", struct_value("recorded", 256)),
+            &schema,
+            ignored_path(&["config", "version"]),
+        );
+
+        let patch = build_update_patch(&["config".to_string()], &to, &from, &schema)
+            .expect("readable ignored leaf can be filled from the read");
+        let PatchOp::Replace { value, .. } = &patch.ops[0] else {
+            panic!("expected config replacement: {:?}", patch.ops);
+        };
+        let Value::Concrete(ConcreteValue::Map(config)) = value else {
+            panic!("expected config map")
+        };
+        assert_eq!(config["version"], patch_test_value("external"));
+        assert_eq!(config["memory"], Value::Concrete(ConcreteValue::Int(256)));
+    }
+
+    #[test]
+    fn sending_parent_of_ignored_write_only_leaf_is_a_typed_error() {
+        use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+        let schema = ResourceSchema::new("test").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("secret", AttributeType::string())
+                            .write_only()
+                            .build(),
+                        StructField::optional("memory", AttributeType::int()).build(),
+                    ],
+                ),
+            )
+            .build(),
+        );
+        let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("secret".to_string(), patch_test_value("recorded")),
+            (
+                "memory".to_string(),
+                Value::Concrete(ConcreteValue::Int(256)),
+            ),
+        ])));
+        let observed = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "memory".to_string(),
+            Value::Concrete(ConcreteValue::Int(128)),
+        )])));
+        let from = State::existing(
+            ResourceId::with_identity("test", "example"),
+            HashMap::from([("config".to_string(), observed)]),
+        );
+        let to = ready_with_ignored_path(
+            Resource::new("test", "example").with_attribute("config", desired),
+            &schema,
+            ignored_path(&["config", "secret"]),
+        );
+
+        let error = build_update_patch(&["config".to_string()], &to, &from, &schema)
+            .expect_err("the current ignored write-only value is unknowable");
+
+        assert_eq!(error.resource_id(), &to.id);
+        assert_eq!(error.attribute(), "config");
+        assert_eq!(error.path().to_string(), "config.secret");
+        assert!(error.to_string().contains("current value cannot be known"));
+    }
+
     #[test]
     fn nested_write_only_record_sent_skips_non_bearing_keys() {
         use crate::schema::{AttributeSchema, AttributeType, StructField};
@@ -8537,7 +8884,8 @@ mod tests {
             .expect("fixture includes default_actions")
             .clone();
 
-        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema);
+        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema)
+            .expect("valid reassert patch");
 
         assert!(matches!(
             &patch.ops[..],
@@ -8596,7 +8944,8 @@ mod tests {
                     .build(),
             );
 
-        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema);
+        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema)
+            .expect("valid write-only patch");
 
         assert!(matches!(
             &patch.ops[0],
@@ -8656,7 +9005,8 @@ mod tests {
             &to,
             &from,
             &schema,
-        );
+        )
+        .expect("valid changed write-only patch");
 
         assert!(matches!(
             &patch.ops[0],
@@ -8691,9 +9041,15 @@ mod tests {
                 .build(),
         );
 
-        assert!(build_update_patch(&[], &to, &from, &schema).ops.is_empty());
+        assert!(
+            build_update_patch(&[], &to, &from, &schema)
+                .expect("empty patch is valid")
+                .ops
+                .is_empty()
+        );
         assert!(
             build_update_patch(&["absent".to_string()], &to, &from, &schema)
+                .expect("absent patch is valid")
                 .ops
                 .is_empty(),
             "a changed key absent from both sides must be dropped and cannot trigger reassertion"
@@ -8708,7 +9064,10 @@ mod tests {
             Resource::new("test", "nested").with_attribute("default_actions", default_actions),
         );
         assert!(
-            build_update_patch(&[], &to, &from, &schema).ops.is_empty(),
+            build_update_patch(&[], &to, &from, &schema)
+                .expect("empty nested patch is valid")
+                .ops
+                .is_empty(),
             "a write-only-bearing attribute cannot create a reassert-only patch"
         );
     }
@@ -8757,7 +9116,8 @@ mod tests {
 
                             let from = State::existing(id, from_attributes);
                             let desired = resolved_for_test(desired);
-                            let patch = build_update_patch(&changed, &desired, &from, &schema);
+                            let patch = build_update_patch(&changed, &desired, &from, &schema)
+                                .expect("generated fixture has no ignored paths");
                             let patch_keys: Vec<&str> =
                                 patch.ops.iter().map(PatchOp::key).collect();
                             let unique: std::collections::HashSet<_> =
@@ -8836,7 +9196,8 @@ mod tests {
         let from = State::existing(id.clone(), HashMap::new());
         let ready = resolved_for_test(Resource::with_provider("mock", "test", "example", None));
         let schema = crate::schema::ResourceSchema::new("test");
-        let request = UpdateRequest::checked(from, &[], &ready, &schema);
+        let request = UpdateRequest::checked(from, &[], &ready, &schema)
+            .expect("fixture has no ignored write-only paths");
         let identifier =
             AppliedIdentifier::new("mock-id-123").expect("fixture identifier is non-empty");
         let state = router

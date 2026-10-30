@@ -7,7 +7,8 @@ use crate::effect::Effect;
 use crate::parser::{
     DeferredForExpansionError, DeferredForExpression, ShapeMismatch, expand_deferred_children,
 };
-use crate::resource::ResolvedResource;
+use crate::resource::{ResolvedResource, ResolvedResourceError};
+use crate::schema::SchemaRegistry;
 
 /// Failure while expanding a deferred-for create half against apply-time
 /// upstream state.
@@ -34,6 +35,9 @@ pub(super) enum DeferredCreateFailure {
     },
     ValueAccess {
         error: DeferredForExpansionError,
+    },
+    ResolveResource {
+        error: ResolvedResourceError,
     },
 }
 
@@ -69,6 +73,7 @@ impl DeferredCreateFailure {
                 candidates.join(", ")
             ),
             DeferredCreateFailure::ValueAccess { error } => error.to_string(),
+            DeferredCreateFailure::ResolveResource { error } => error.to_string(),
         }
     }
 }
@@ -78,6 +83,7 @@ impl DeferredCreateFailure {
 pub(super) fn materialize_deferred_create<S: Clone>(
     template: &DeferredForExpression<S>,
     bindings: &ResolvedBindings,
+    schemas: &SchemaRegistry,
 ) -> Result<Vec<Effect<S>>, DeferredCreateFailure> {
     let expression = crate::value::format_value(&template.iterable);
     let candidates = template
@@ -108,7 +114,7 @@ pub(super) fn materialize_deferred_create<S: Clone>(
     };
     let miss_policy = bindings.access_miss_policy_for_value(&template.iterable);
 
-    Ok(expand_deferred_children(template, &iterable, miss_policy)
+    expand_deferred_children(template, &iterable, miss_policy)
         .map_err(|error| match error {
             DeferredForExpansionError::ShapeMismatch(mismatch) => {
                 DeferredCreateFailure::ShapeMismatch {
@@ -132,9 +138,11 @@ pub(super) fn materialize_deferred_create<S: Clone>(
                     .is_subset(&resource.dependency_bindings),
                 "apply-time deferred-for child must retain iterable dependencies"
             );
-            Effect::Create(ResolvedResource::new(resource))
+            ResolvedResource::resolve_with_schemas(resource, schemas)
+                .map(Effect::Create)
+                .map_err(|error| DeferredCreateFailure::ResolveResource { error })
         })
-        .collect())
+        .collect::<Result<Vec<_>, _>>()
 }
 
 /// Result of synchronously dispatching a deferred scheduler-meta effect.
@@ -152,6 +160,7 @@ pub(super) struct PureMetaCtx<'a, S> {
     pub(super) completed: &'a AtomicUsize,
     pub(super) total: usize,
     pub(super) observer: &'a dyn ExecutionObserver<S>,
+    pub(super) schemas: &'a SchemaRegistry,
 }
 
 /// Dispatch a DeferredCreate meta-effect by materializing its runtime
@@ -163,7 +172,7 @@ pub(super) fn dispatch_deferred_create<S: Clone>(
     bindings: &ResolvedBindings,
     ctx: &PureMetaCtx<'_, S>,
 ) -> DeferredDispatchResult<S> {
-    match materialize_deferred_create(template, bindings) {
+    match materialize_deferred_create(template, bindings, ctx.schemas) {
         Ok(children) => DeferredDispatchResult::Materialized(children),
         Err(err) => {
             let message = err.message();
@@ -188,7 +197,11 @@ mod tests {
     use super::*;
     use crate::binding_index::{BindingCompleteness, BindingValueSource};
     use crate::parser::ForBinding;
-    use crate::resource::{ConcreteValue, DeferredValue, Resource, UnknownReason, Value};
+    use crate::resource::{
+        ConcreteValue, DeferredValue, ParsedIgnorePath, ParsedIgnorePathSegment, Resource,
+        UnknownReason, Value,
+    };
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     fn coalesced_template() -> DeferredForExpression {
         let mut template_resource = Resource::new("test.Child", "children");
@@ -233,9 +246,51 @@ mod tests {
             BindingCompleteness::Complete,
         );
 
-        let children = materialize_deferred_create(&coalesced_template(), &bindings)
-            .expect("present iterable should materialize");
+        let children =
+            materialize_deferred_create(&coalesced_template(), &bindings, &SchemaRegistry::new())
+                .expect("present iterable should materialize");
         assert_eq!(children.len(), 2);
+    }
+
+    #[test]
+    fn deferred_create_resolves_authored_ignore_changes() {
+        let mut template = coalesced_template();
+        let comment = Value::Concrete(ConcreteValue::String("managed-elsewhere".into()));
+        template
+            .attributes
+            .push(("comment".to_string(), comment.clone()));
+        template.template_resource.set_attr("comment", comment);
+        template.template_resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
+            ParsedIgnorePathSegment::Attribute("comment".to_string()),
+        ])];
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_with_completeness(
+            "up",
+            HashMap::from([(
+                "accounts".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("a".into()),
+                )])),
+            )]),
+            BindingValueSource::Local,
+            BindingCompleteness::Complete,
+        );
+
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            ResourceSchema::new("test.Child")
+                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+                .validate()
+                .expect("valid deferred child schema"),
+        );
+        let children = materialize_deferred_create(&template, &bindings, &schemas)
+            .expect("deferred children must resolve authored ignore paths");
+
+        let Effect::Create(child) = &children[0] else {
+            panic!("expected a create child");
+        };
+        assert_eq!(child.ignore_changes().iter().len(), 1);
     }
 
     #[test]
@@ -248,8 +303,9 @@ mod tests {
             BindingCompleteness::Complete,
         );
 
-        let children = materialize_deferred_create(&coalesced_template(), &bindings)
-            .expect("complete missing attribute should select []");
+        let children =
+            materialize_deferred_create(&coalesced_template(), &bindings, &SchemaRegistry::new())
+                .expect("complete missing attribute should select []");
         assert!(children.is_empty());
     }
 
@@ -264,7 +320,7 @@ mod tests {
         );
 
         assert!(matches!(
-            materialize_deferred_create(&coalesced_template(), &bindings),
+            materialize_deferred_create(&coalesced_template(), &bindings, &SchemaRegistry::new(),),
             Err(DeferredCreateFailure::IterableUnknown { .. })
         ));
     }
@@ -277,8 +333,12 @@ mod tests {
             default: Box::new(Value::resource_ref("fallback", "items", vec![])),
         });
 
-        let error = materialize_deferred_create(&template, &ResolvedBindings::default())
-            .expect_err("both unresolved candidates keep the iterable unknown");
+        let error = materialize_deferred_create(
+            &template,
+            &ResolvedBindings::default(),
+            &SchemaRegistry::new(),
+        )
+        .expect_err("both unresolved candidates keep the iterable unknown");
         let DeferredCreateFailure::IterableUnknown { candidates, .. } = &error else {
             panic!("expected unknown iterable, got {error:?}");
         };

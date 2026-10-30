@@ -110,6 +110,8 @@ plan-secret-values:
 	$(PLAN_FIXTURE) secret_values
 plan-nested-write-only:
 	$(PLAN_FIXTURE) nested_write_only
+plan-ignore-changes-readable:
+	$(PLAN_FIXTURE) ignore_changes_readable
 plan-moved-with-changes:
 	$(PLAN_FIXTURE) moved_with_changes
 plan-moved-prev-keys:

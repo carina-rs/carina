@@ -9,7 +9,7 @@ use carina_core::plan::{Plan, ReplaceDisplayInfo};
 use carina_core::plan_tree::build_dependency_graph_from_effects;
 use carina_core::resource::{
     EphemeralId, ExpansionTrace, LiveComposition, ModuleSource, PersistentId, ResolvedResource,
-    ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
+    ResolvedResourceId, ResourceId, ResourceIdentity,
 };
 
 use crate::plan_summary::{PlanChangeSummary, PlanEffectSummaryPart};
@@ -571,12 +571,17 @@ fn effect_owned_resource_id(effect: &Effect) -> Option<&ResourceId> {
 }
 
 fn dependency_only_create(resource: &ResolvedResource) -> Effect {
-    let mut shell = Resource::from_id(resource.id.clone());
-    shell.binding = resource.binding.clone();
+    // Project from the resolved resource so host-owned schema witnesses stay
+    // attached even though this graph-only shell deliberately drops values.
+    let mut shell = resource.as_inner().clone();
+    shell.attributes.clear();
+    shell.prefixes.clear();
+    shell.module_source = None;
+    shell.default_tag_keys = Default::default();
+    shell.quoted_string_attrs.clear();
     shell.dependency_bindings = carina_core::deps::get_resource_dependencies(resource.as_inner())
         .into_iter()
         .collect();
-    shell.directives = resource.directives.clone();
     Effect::Create(ResolvedResource::new(shell))
 }
 
@@ -1115,6 +1120,40 @@ mod tests {
 
     fn resolved(resources: impl IntoIterator<Item = Resource>) -> Vec<ResolvedResource> {
         ResolvedResource::collect_resolved(resources).expect("test resources have resolved ids")
+    }
+
+    #[test]
+    fn dependency_only_create_preserves_resolved_ignore_changes() {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+
+        let mut resource = Resource::new("test.Widget", "example").with_attribute(
+            "comment",
+            Value::Concrete(ConcreteValue::String("configured".into())),
+        );
+        resource.directives.ignore_changes = vec![
+            serde_json::from_value(serde_json::json!({
+                "segments": [{ "kind": "attribute", "value": "comment" }]
+            }))
+            .expect("valid ignore_changes path"),
+        ];
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            ResourceSchema::new("test.Widget")
+                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+                .validate()
+                .expect("valid graph-model schema"),
+        );
+        let resource = ResolvedResource::resolve_with_schemas(resource, &schemas)
+            .expect("ignore_changes path resolves");
+
+        let effect = dependency_only_create(&resource);
+        let Effect::Create(shell) = effect else {
+            panic!("dependency shell must be a create effect");
+        };
+
+        assert_eq!(shell.ignore_changes(), resource.ignore_changes());
+        assert!(shell.attributes.is_empty());
     }
 
     fn named_resource(binding: &str, dependencies: &[&str]) -> Resource {

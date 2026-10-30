@@ -1821,6 +1821,9 @@ pub fn directives_to_protocol(directives: &Directives) -> protocol::Directives {
         create_before_destroy,
         prevent_destroy,
         depends_on: _depends_on,
+        // Host-only lifecycle metadata. Providers must never receive authored
+        // ignore paths; the host resolves and enforces them around CRUD calls.
+        ignore_changes: _ignore_changes,
         provider_instance: _provider_instance,
     } = directives;
     protocol::Directives {
@@ -1830,8 +1833,7 @@ pub fn directives_to_protocol(directives: &Directives) -> protocol::Directives {
     }
 }
 
-/// Decode provider-visible directives, defaulting host-only dependency and
-/// provider-instance routing metadata.
+/// Decode provider-visible directives, defaulting every host-only field.
 pub fn protocol_to_directives(directives: &protocol::Directives) -> Directives {
     let protocol::Directives {
         force_delete,
@@ -1843,6 +1845,7 @@ pub fn protocol_to_directives(directives: &protocol::Directives) -> Directives {
         create_before_destroy: *create_before_destroy,
         prevent_destroy: *prevent_destroy,
         depends_on: Vec::new(),
+        ignore_changes: Vec::new(),
         provider_instance: None,
     }
 }
@@ -1855,6 +1858,9 @@ pub fn try_resource_to_protocol<S>(
         id,
         attributes,
         directives,
+        // Host-only lifecycle metadata resolved and enforced around provider
+        // calls. It is intentionally absent from the WIT resource record.
+        resolved_ignore_changes: _resolved_ignore_changes,
         prefixes: _prefixes,
         binding: _binding,
         dependency_bindings: _dependency_bindings,

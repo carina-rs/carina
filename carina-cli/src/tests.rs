@@ -702,7 +702,9 @@ fn plan_file_serde_round_trip() {
         }),
         "a decoded plan must keep module metadata attached to its saved resource",
     );
-    let Effect::Create(resource) = &deserialized.plan.effects()[0] else {
+    let carina_core::effect::UnresolvedSavedEffect::Create(resource) =
+        &deserialized.plan.effects()[0]
+    else {
         panic!("fixture effect must remain a create");
     };
     assert_eq!(

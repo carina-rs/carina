@@ -42,6 +42,7 @@ fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
         id: ResourceId::with_identity("aws.s3.Bucket", binding),
         attributes,
         directives: Default::default(),
+        resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding: Some(binding.into()),
         dependency_bindings: BTreeSet::new(),

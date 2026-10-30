@@ -441,6 +441,7 @@ pub(super) async fn execute_effects_sequential<S: Clone>(
                 completed: &completed,
                 total,
                 observer,
+                schemas: input.schemas,
             };
             match try_dispatch_pure_meta(&effect, &accumulated.result().bindings, &dispatch_ctx) {
                 PureMetaOutcome::NotPureMeta => {}

@@ -2547,6 +2547,37 @@ fn deferred_template_contains_redacted_secret<S>(
         || attributes_contain_redacted_secret(template_resource.attributes.values())
 }
 
+pub(crate) fn unresolved_effect_contains_redacted_secret(
+    effect: &crate::effect::UnresolvedSavedEffect,
+) -> bool {
+    use crate::effect::UnresolvedSavedEffect;
+
+    match effect {
+        UnresolvedSavedEffect::Read { resource } => {
+            attributes_contain_redacted_secret(resource.attributes.values())
+        }
+        UnresolvedSavedEffect::Create(resource)
+        | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
+            attributes_contain_redacted_secret(resource.attributes.values())
+        }
+        UnresolvedSavedEffect::Update { from, to, .. } => {
+            attributes_contain_redacted_secret(from.attributes.values())
+                || attributes_contain_redacted_secret(to.attributes.values())
+        }
+        UnresolvedSavedEffect::Import { identifier, .. } => contains_redacted_secret(identifier),
+        UnresolvedSavedEffect::Wait { until, .. } => contains_redacted_secret(until.value()),
+        UnresolvedSavedEffect::DeferredCreate { template, .. } => {
+            deferred_template_contains_redacted_secret(template)
+        }
+        UnresolvedSavedEffect::DeferredReplace(payload) => {
+            deferred_template_contains_redacted_secret(&payload.template)
+        }
+        UnresolvedSavedEffect::Delete { .. }
+        | UnresolvedSavedEffect::Remove { .. }
+        | UnresolvedSavedEffect::Move { .. } => false,
+    }
+}
+
 pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<S>) -> bool {
     use crate::effect::Effect;
 
@@ -12229,6 +12260,7 @@ mod tests {
             id: ResourceId::with_provider_identity("aws", "iam.policy", "p1", None),
             attributes,
             directives: Default::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("p1".to_string()),
             dependency_bindings: BTreeSet::new(),
