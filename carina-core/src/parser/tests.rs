@@ -10048,6 +10048,84 @@ fn coalesced_resource_ref_for_iterable_is_deferred_as_a_complete_expression() {
 }
 
 #[test]
+fn deferred_for_module_call_body_is_rejected_for_bare_unbound_iterable() {
+    let error = parse(
+        r#"let child = use { source = "./child" }
+let mod_items = for x in items { child { item = x } }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect_err("a deferred for must not silently drop a module-call body");
+
+    assert!(matches!(
+        &error,
+        ParseError::DeferredForBodyUnsupported {
+            line: 2,
+            header,
+            body: DeferredForBodyKind::ModuleCall { name },
+        } if header == "for x in items" && name == "child"
+    ));
+    let message = error.to_string();
+    assert!(message.contains("for x in items"), "{message}");
+    assert!(message.contains("child"), "{message}");
+    assert!(message.contains("line 2"), "{message}");
+    assert!(message.contains("managed resource"), "{message}");
+    assert!(message.contains("plan time"), "{message}");
+}
+
+#[test]
+fn deferred_for_read_body_is_rejected_for_bare_unbound_iterable() {
+    let error = parse(
+        r#"let read_items = for x in items {
+  read mock.iam.Roles { name_regex = x }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect_err("a deferred for must not silently drop a read body");
+
+    assert!(matches!(
+        &error,
+        ParseError::DeferredForBodyUnsupported {
+            line: 1,
+            header,
+            body: DeferredForBodyKind::Read { resource_type },
+        } if header == "for x in items" && resource_type == "mock.iam.Roles"
+    ));
+    let message = error.to_string();
+    assert!(message.contains("for x in items"), "{message}");
+    assert!(message.contains("mock.iam.Roles"), "{message}");
+    assert!(message.contains("line 1"), "{message}");
+    assert!(message.contains("managed resource"), "{message}");
+    assert!(message.contains("plan time"), "{message}");
+}
+
+#[test]
+fn deferred_for_resource_body_propagates_reserved_attribute_error() {
+    let error = parse(
+        r#"let src = mock.test.resource { name = "src" }
+let items = for x in src.list {
+  mock.test.resource {
+    name = x
+    "_invalid" = x
+  }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect_err("a genuine parser error in a deferred resource body must be preserved");
+
+    assert!(matches!(
+        error,
+        ParseError::ReservedResourceAttribute {
+            ref attribute,
+            line: 5,
+            ..
+        } if attribute == "_invalid"
+    ));
+}
+
+#[test]
 fn exports_cross_file_binding_detection() {
     let exports_input = r#"
 exports {

@@ -8,6 +8,23 @@ use std::path::{Path, PathBuf};
 
 pub const SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE: &str = "single-quoted string contains '${...}' which is not interpolated; use double quotes (\"...\") for interpolation, or keep single quotes if the literal text is intended";
 
+/// A body kind that cannot be expanded after a deferred `for` iterable
+/// becomes known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferredForBodyKind {
+    ModuleCall { name: String },
+    Read { resource_type: String },
+}
+
+impl std::fmt::Display for DeferredForBodyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ModuleCall { name } => write!(f, "module call `{name}`"),
+            Self::Read { resource_type } => write!(f, "read `{resource_type}`"),
+        }
+    }
+}
+
 /// Typed identity and authored token span for an unresolved declaration type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UnresolvedTypeToken {
@@ -59,6 +76,15 @@ pub enum ParseError {
         kind: crate::resource::LoopKind,
         line: usize,
         span: Option<super::SourceSpan>,
+    },
+
+    #[error(
+        "Invalid deferred `for` expression `{header}` at line {line}: a `for` over a value not known until apply can only contain a managed resource; found {body}. To use {body}, iterate over a value known at plan time"
+    )]
+    DeferredForBodyUnsupported {
+        line: usize,
+        header: String,
+        body: DeferredForBodyKind,
     },
 
     /// Provider-aware parsing could not resolve a type annotation. The

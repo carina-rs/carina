@@ -264,6 +264,11 @@ impl ResidualModuleResolutionError {
                     line: _,
                     span: _,
                 }
+                | ParseError::DeferredForBodyUnsupported {
+                    line: _,
+                    header: _,
+                    body: _,
+                }
                 | ParseError::UnresolvedDeclarationType {
                     token: _,
                     line: _,

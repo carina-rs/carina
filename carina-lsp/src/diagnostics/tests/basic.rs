@@ -82,6 +82,52 @@ fn reserved_resource_attribute_surfaces_parser_diagnostic() {
 }
 
 #[test]
+fn deferred_for_unsupported_bodies_surface_parser_diagnostics() {
+    for (body, body_name) in [
+        ("child { item = x }", "child"),
+        ("read mock.iam.Roles { name_regex = x }", "mock.iam.Roles"),
+    ] {
+        let fixture = tempfile::tempdir().expect("fixture");
+        std::fs::create_dir(fixture.path().join("child")).expect("child module directory");
+        std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+            .expect("providers fixture");
+        std::fs::write(
+            fixture.path().join("backend.crn"),
+            "backend local { path = 'carina.state.json' }\n",
+        )
+        .expect("backend fixture");
+        std::fs::write(
+            fixture.path().join("child/main.crn"),
+            "arguments { item: String }\nmock.test.resource { name = item }\n",
+        )
+        .expect("child module fixture");
+        let source = format!(
+            "let child = use {{ source = './child' }}\n\
+             let src = mock.test.resource {{ name = 'src' }}\n\
+             let items = for x in src.list {{ {body} }}\n"
+        );
+        let main_path = fixture.path().join("main.crn");
+        std::fs::write(&main_path, &source).expect("main fixture");
+
+        let diagnostics = test_engine().analyze(
+            &create_document_at(&source, main_path.clone()),
+            Some(&main_path),
+        );
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.message.contains("for x in src.list")
+                    && diagnostic.message.contains(body_name)
+            })
+            .unwrap_or_else(|| panic!("missing deferred-for diagnostic: {diagnostics:#?}"));
+
+        assert_eq!(diagnostic.range.start.line, 2);
+        assert!(diagnostic.message.contains("managed resource"));
+        assert!(diagnostic.message.contains("plan time"));
+    }
+}
+
+#[test]
 #[ignore = "requires provider schemas"]
 fn unknown_field_in_struct_block() {
     let engine = test_engine();

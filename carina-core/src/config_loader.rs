@@ -2219,6 +2219,133 @@ let orgs = upstream_state {
         );
     }
 
+    fn deferred_for_body_fixture(main: &str) -> tempfile::TempDir {
+        let fixture = tempfile::tempdir().expect("deferred-for fixture");
+        fs::create_dir(fixture.path().join("child")).expect("child module directory");
+        fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+            .expect("providers fixture");
+        fs::write(
+            fixture.path().join("backend.crn"),
+            "backend local { path = 'carina.state.json' }\n",
+        )
+        .expect("backend fixture");
+        fs::write(
+            fixture.path().join("child/main.crn"),
+            "arguments { item: String }\nmock.test.resource { name = item }\n",
+        )
+        .expect("child module fixture");
+        fs::write(fixture.path().join("main.crn"), main).expect("main fixture");
+        fixture
+    }
+
+    fn deferred_for_body_parse_failure(fixture: &tempfile::TempDir) -> DirectoryParseFailure {
+        match parse_directory_with_overrides_and_diagnostics(
+            fixture.path(),
+            &ProviderContext::default(),
+            &HashMap::new(),
+        ) {
+            Ok(_) => panic!("unsupported deferred-for body unexpectedly loaded"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn directory_validate_path_rejects_deferred_for_module_call_body() {
+        let fixture = deferred_for_body_fixture(
+            "let child = use { source = './child' }\n\
+             let src = mock.test.resource { name = 'src' }\n\
+             let res_items = for x in src.list { mock.test.resource { name = x } }\n\
+             let mod_items = for x in src.list { child { item = x } }\n\
+             let read_items = for x in src.list { read mock.iam.Roles { name_regex = x } }\n",
+        );
+
+        let failure = deferred_for_body_parse_failure(&fixture);
+        let error = failure
+            .parse_error()
+            .expect("directory loader must retain the typed parser error");
+        assert!(matches!(
+            error,
+            crate::parser::ParseError::DeferredForBodyUnsupported {
+                line: 4,
+                header,
+                body: crate::parser::DeferredForBodyKind::ModuleCall { name },
+            } if header == "for x in src.list" && name == "child"
+        ));
+        let message = error.to_string();
+        assert!(message.contains("for x in src.list"), "{message}");
+        assert!(message.contains("child"), "{message}");
+        assert!(message.contains("line 4"), "{message}");
+        assert!(message.contains("managed resource"), "{message}");
+        assert!(message.contains("plan time"), "{message}");
+
+        let validate_error = match load_configuration(fixture.path()) {
+            Ok(_) => panic!("the validate loader path unexpectedly accepted the fixture"),
+            Err(error) => error,
+        };
+        assert!(validate_error.contains(&message), "{validate_error}");
+    }
+
+    #[test]
+    fn directory_validate_path_rejects_deferred_for_read_body() {
+        let fixture = deferred_for_body_fixture(
+            "let child = use { source = './child' }\n\
+             let src = mock.test.resource { name = 'src' }\n\
+             let res_items = for x in src.list { mock.test.resource { name = x } }\n\
+             \n\
+             let read_items = for x in src.list { read mock.iam.Roles { name_regex = x } }\n",
+        );
+
+        let failure = deferred_for_body_parse_failure(&fixture);
+        let error = failure
+            .parse_error()
+            .expect("directory loader must retain the typed parser error");
+        assert!(matches!(
+            error,
+            crate::parser::ParseError::DeferredForBodyUnsupported {
+                line: 5,
+                header,
+                body: crate::parser::DeferredForBodyKind::Read { resource_type },
+            } if header == "for x in src.list" && resource_type == "mock.iam.Roles"
+        ));
+        let message = error.to_string();
+        assert!(message.contains("for x in src.list"), "{message}");
+        assert!(message.contains("mock.iam.Roles"), "{message}");
+        assert!(message.contains("line 5"), "{message}");
+        assert!(message.contains("managed resource"), "{message}");
+        assert!(message.contains("plan time"), "{message}");
+
+        let validate_error = match load_configuration(fixture.path()) {
+            Ok(_) => panic!("the validate loader path unexpectedly accepted the fixture"),
+            Err(error) => error,
+        };
+        assert!(validate_error.contains(&message), "{validate_error}");
+    }
+
+    #[test]
+    fn directory_validate_path_keeps_deferred_for_resource_placeholder() {
+        let fixture = deferred_for_body_fixture(
+            "let child = use { source = './child' }\n\
+             let src = mock.test.resource { name = 'src' }\n\
+             let res_items = for x in src.list { mock.test.resource { name = x } }\n",
+        );
+
+        let loaded = load_configuration(fixture.path())
+            .expect("a managed-resource deferred-for body remains supported");
+        let [deferred] = loaded.parsed.deferred_for_expressions.as_slice() else {
+            panic!(
+                "expected exactly one deferred placeholder, got {:?}",
+                loaded.parsed.deferred_for_expressions
+            );
+        };
+        assert_eq!(deferred.header, "for x in src.list");
+        assert_eq!(deferred.line, 3);
+        assert_eq!(deferred.resource_type, "mock.test.resource");
+        assert_eq!(
+            deferred.template_resource.binding.as_deref(),
+            Some("res_items[?]")
+        );
+    }
+
     #[test]
     fn cross_file_upstream_state_refs_emit_no_soft_warning() {
         // Field validity is checked statically by the `upstream_exports`

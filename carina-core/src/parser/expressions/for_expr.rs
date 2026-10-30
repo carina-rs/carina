@@ -10,10 +10,10 @@
 use crate::eval_value::{EvalValue, StructuralHandleMetadata};
 use crate::parser::expressions::primary::parse_postfix_eval;
 use crate::parser::{
-    DeferredForExpression, DeferredForTarget, ModuleCall, ParseContext, ParseError, ParseWarning,
-    PreprocessedFile, ResourceParseTarget, Rule, WarningKind, display_string_literal,
-    evaluate_static_value, first_inner, next_pair, parse_expression, parse_module_call,
-    parse_read_resource_expr, parse_resource_for_target,
+    DeferredForBodyKind, DeferredForExpression, DeferredForTarget, ModuleCall, ParseContext,
+    ParseError, ParseWarning, PreprocessedFile, ResourceParseTarget, Rule, WarningKind,
+    display_string_literal, evaluate_static_value, first_inner, next_pair, parse_expression,
+    parse_module_call, parse_read_resource_expr, parse_resource_for_target,
 };
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, ForLoopElement, LegacyLoopAddress, LoopElementOrigin,
@@ -82,6 +82,11 @@ pub(crate) enum LoopParseTarget {
     Unbound(UnboundLoopTemplate),
 }
 
+struct DeferredForSite<'a> {
+    line: usize,
+    header: &'a str,
+}
+
 fn parse_deferred_resource_template(
     body_pair: pest::iterators::Pair<Rule>,
     binding: &ForBinding,
@@ -89,7 +94,8 @@ fn parse_deferred_resource_template(
     target: &LoopParseTarget,
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
-) -> Result<Option<Box<Resource>>, ParseError> {
+    site: DeferredForSite<'_>,
+) -> Result<Box<Resource>, ParseError> {
     let mut template_ctx = ctx.child_scope();
     let bind = |ctx: &mut ParseContext, name: &str, value: Value| {
         if name != "_" {
@@ -131,10 +137,22 @@ fn parse_deferred_resource_template(
         None,
         preprocessed_file,
         source_file,
-    ) {
-        Err(error @ ParseError::UnboundLoopRead { .. }) => Err(error),
-        Ok(ForBodyResult::Resource(resource)) => Ok(Some(resource)),
-        Ok(ForBodyResult::DataSource(_) | ForBodyResult::ModuleCall(_)) | Err(_) => Ok(None),
+    )? {
+        ForBodyResult::Resource(resource) => Ok(resource),
+        ForBodyResult::DataSource(data_source) => Err(ParseError::DeferredForBodyUnsupported {
+            line: site.line,
+            header: site.header.to_string(),
+            body: DeferredForBodyKind::Read {
+                resource_type: data_source.id.display_type(),
+            },
+        }),
+        ForBodyResult::ModuleCall(call) => Err(ParseError::DeferredForBodyUnsupported {
+            line: site.line,
+            header: site.header.to_string(),
+            body: DeferredForBodyKind::ModuleCall {
+                name: call.module_name,
+            },
+        }),
     }
 }
 
@@ -483,29 +501,31 @@ pub(crate) fn parse_for_expr(
                 &target,
                 preprocessed_file,
                 source_file,
-            )?;
-            if let Some(resource) = resource {
-                let attrs: Vec<(String, Value)> = resource
-                    .attributes
-                    .iter()
-                    .map(|(k, value)| (k.clone(), value.clone()))
-                    .collect();
-                ctx.deferred_for_expressions.push(DeferredForExpression {
-                    file: None,
+                DeferredForSite {
                     line: for_line,
-                    header,
-                    resource_type: if resource.id.provider.is_empty() {
-                        resource.id.resource_type.clone()
-                    } else {
-                        format!("{}.{}", resource.id.provider, resource.id.resource_type)
-                    },
-                    attributes: attrs,
-                    target: target.deferred_target(),
-                    iterable: iterable.clone(),
-                    binding: binding.clone(),
-                    template_resource: *resource,
-                });
-            }
+                    header: &header,
+                },
+            )?;
+            let attrs: Vec<(String, Value)> = resource
+                .attributes
+                .iter()
+                .map(|(k, value)| (k.clone(), value.clone()))
+                .collect();
+            ctx.deferred_for_expressions.push(DeferredForExpression {
+                file: None,
+                line: for_line,
+                header,
+                resource_type: if resource.id.provider.is_empty() {
+                    resource.id.resource_type.clone()
+                } else {
+                    format!("{}.{}", resource.id.provider, resource.id.resource_type)
+                },
+                attributes: attrs,
+                target: target.deferred_target(),
+                iterable: iterable.clone(),
+                binding: binding.clone(),
+                template_resource: *resource,
+            });
             // Return empty — the for body produces zero concrete resources
         }
         _ => {
@@ -529,29 +549,31 @@ pub(crate) fn parse_for_expr(
                     &target,
                     preprocessed_file,
                     source_file,
-                )?;
-                if let Some(resource) = resource {
-                    let attrs: Vec<(String, Value)> = resource
-                        .attributes
-                        .iter()
-                        .map(|(k, value)| (k.clone(), value.clone()))
-                        .collect();
-                    ctx.deferred_for_expressions.push(DeferredForExpression {
-                        file: None,
+                    DeferredForSite {
                         line: for_line,
-                        header,
-                        resource_type: if resource.id.provider.is_empty() {
-                            resource.id.resource_type.clone()
-                        } else {
-                            format!("{}.{}", resource.id.provider, resource.id.resource_type)
-                        },
-                        attributes: attrs,
-                        target: target.deferred_target(),
-                        iterable: Value::Deferred(DeferredValue::BindingRef { binding: s.clone() }),
-                        binding: binding.clone(),
-                        template_resource: *resource,
-                    });
-                }
+                        header: &header,
+                    },
+                )?;
+                let attrs: Vec<(String, Value)> = resource
+                    .attributes
+                    .iter()
+                    .map(|(k, value)| (k.clone(), value.clone()))
+                    .collect();
+                ctx.deferred_for_expressions.push(DeferredForExpression {
+                    file: None,
+                    line: for_line,
+                    header,
+                    resource_type: if resource.id.provider.is_empty() {
+                        resource.id.resource_type.clone()
+                    } else {
+                        format!("{}.{}", resource.id.provider, resource.id.resource_type)
+                    },
+                    attributes: attrs,
+                    target: target.deferred_target(),
+                    iterable: Value::Deferred(DeferredValue::BindingRef { binding: s.clone() }),
+                    binding: binding.clone(),
+                    template_resource: *resource,
+                });
                 return Ok((resources, data_sources, module_calls));
             }
             let iterable_type = if structural_handle_metadata
