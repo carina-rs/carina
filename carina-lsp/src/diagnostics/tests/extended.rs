@@ -906,11 +906,7 @@ mock.test.resource {
 
 #[test]
 fn missing_provider_schema_suppresses_attribute_derived_identity_conflict() {
-    let engine = DiagnosticEngine::new(
-        std::sync::Arc::new(SchemaRegistry::new()),
-        vec![],
-        std::sync::Arc::new(vec![]),
-    );
+    let engine = DiagnosticEngine::without_loaded_provider_schemas();
     let source = r#"awscc.iam.role {
   role_name = "one"
 }
@@ -1639,7 +1635,7 @@ fn list_item_type_validation() {
     );
 
     let engine = DiagnosticEngine::new(
-        Arc::new(schemas),
+        loaded_test_schemas(schemas),
         vec!["test".to_string()],
         Arc::new(vec![]),
     );
@@ -3745,7 +3741,7 @@ fn warning_when_provider_loaded_but_schema_missing() {
     // Provider is loaded but doesn't have a schema for this resource type.
     // Should show WARNING (not ERROR), not "Unknown resource type".
     let engine = DiagnosticEngine::new(
-        Arc::new(SchemaRegistry::new()),
+        loaded_test_schemas(SchemaRegistry::new()),
         vec!["awscc".to_string()],
         Arc::new(vec![]),
     );
@@ -3783,7 +3779,7 @@ fn warning_when_provider_loaded_but_schema_missing() {
 
 #[test]
 fn error_when_provider_has_no_loaded_schema_for_file_configuration() {
-    let engine = DiagnosticEngine::new(Arc::new(SchemaRegistry::new()), vec![], Arc::new(vec![]));
+    let engine = DiagnosticEngine::without_loaded_provider_schemas();
     let doc = create_document(
         r#"awscc.iam.role {
   role_name = 'test'
@@ -3823,11 +3819,26 @@ fn error_when_provider_has_no_loaded_schema_for_file_configuration() {
 }
 
 #[test]
+fn export_inference_without_loaded_providers_does_not_report_provider_checked_failure() {
+    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let doc = create_document("exports {\n  value = missing.attribute\n}\n");
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("type annotation required")),
+        "the no-provider path must not mint provider-schema inference evidence: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn no_undefined_resource_for_namespaced_enum_value() {
     // provider_names includes "awscc", so awscc.xxx.yyy.EnumType.VALUE
     // should NOT be flagged as "Undefined resource"
     let engine = DiagnosticEngine::new(
-        Arc::new(SchemaRegistry::new()),
+        loaded_test_schemas(SchemaRegistry::new()),
         vec!["awscc".to_string()],
         Arc::new(vec![]),
     );
@@ -3858,11 +3869,8 @@ fn no_undefined_resource_for_declared_but_uninstalled_provider() {
     // used to be flagged as `Undefined resource: 'awscc'. Define it with 'let
     // awscc = aws...'` — which is both wrong (awscc is a namespace, not a let
     // binding) and actively misleading (following the fix breaks valid DSL).
-    let engine = DiagnosticEngine::new(
-        Arc::new(SchemaRegistry::new()),
-        vec![], // nothing installed — simulates missing .carina/
-        Arc::new(vec![]),
-    );
+    // Nothing installed — simulates missing .carina/.
+    let engine = DiagnosticEngine::without_loaded_provider_schemas();
     let doc = create_document(
         r#"provider awscc {
   region = awscc.Region.ap_northeast_1
@@ -3888,7 +3896,7 @@ fn undefined_resource_still_fires_when_identifier_is_not_a_declared_provider() {
     // binding diagnostics. When the root identifier is not a declared provider
     // and not a defined binding, the existing "Undefined resource" message
     // should still fire.
-    let engine = DiagnosticEngine::new(Arc::new(SchemaRegistry::new()), vec![], Arc::new(vec![]));
+    let engine = DiagnosticEngine::without_loaded_provider_schemas();
     let doc = create_document(
         r#"provider awscc {
   region = totally_unknown.some_attr
@@ -3950,7 +3958,7 @@ fn map_key_validation_warns_on_invalid_key() {
     );
 
     let engine = DiagnosticEngine::new(
-        Arc::new(schemas),
+        loaded_test_schemas(schemas),
         vec!["test".to_string()],
         Arc::new(vec![]),
     );
@@ -4756,7 +4764,7 @@ fn exports_referencing_module_call_attribute_does_not_require_annotation() {
     // so inference sees the call as a `Virtual` composition and derives
     // the declared attribute through that post-expansion surface.
     let engine = DiagnosticEngine::new(
-        Arc::new(SchemaRegistry::new()),
+        loaded_test_schemas(SchemaRegistry::new()),
         vec!["awscc".to_string()],
         Arc::new(vec![]),
     );
@@ -4912,7 +4920,7 @@ let selected = parts[secret("hunter2")]
 #[test]
 fn module_call_export_typo_reports_attached_inference_failure_once_after_lsp_expansion() {
     let engine = DiagnosticEngine::new(
-        Arc::new(SchemaRegistry::new()),
+        loaded_test_schemas(SchemaRegistry::new()),
         vec!["awscc".to_string()],
         Arc::new(vec![]),
     );
@@ -5259,8 +5267,8 @@ fn consumer_attribute_resolution_marks_unnameable_type_unchecked() {
     assert!(matches!(
         &parameters[0].static_type,
         Some(carina_core::static_type::StaticType::Unchecked(reason))
-            if reason.original
-                == TypeExpr::DottedUnresolved(
+            if reason.original()
+                == &TypeExpr::DottedUnresolved(
                     carina_core::parser::ResourceTypePath::new(
                         "missing",
                         "types.Identifier",
@@ -7244,7 +7252,7 @@ let instance = outer {
 #[test]
 fn no_undefined_resource_for_sibling_binding_in_exports() {
     let engine = DiagnosticEngine::new(
-        Arc::new(SchemaRegistry::new()),
+        loaded_test_schemas(SchemaRegistry::new()),
         vec!["awscc".to_string()],
         Arc::new(vec![]),
     );

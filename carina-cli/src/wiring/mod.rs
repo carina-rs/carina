@@ -122,7 +122,7 @@ use carina_core::parser::{
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::provider::{
     self as provider_mod, AppliedIdentifier, LiftedSavedAttrs, Provider, ProviderError,
-    ProviderFactory, ProviderNormalizer, ProviderRouter,
+    ProviderFactory, ProviderLoadedSchemaRegistry, ProviderNormalizer, ProviderRouter,
 };
 use carina_core::provider_source::ProviderSource;
 use carina_core::resource::{
@@ -133,8 +133,8 @@ use carina_core::resource::{
 #[cfg(test)]
 use carina_core::schema::{AttributeSchema, AttributeType};
 use carina_core::schema::{
-    OwnerBoundResourceSchema, ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
-    ValidatedResourceSchema, resolve_file_block_names_with_schemas,
+    OwnerBoundResourceSchema, ResourceSchema, SchemaRegistry, TypeError, ValidatedResourceSchema,
+    resolve_file_block_names_with_schemas,
 };
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_core::validation;
@@ -362,7 +362,7 @@ pub struct StateBlockResolution {
 pub struct WiringContext {
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
     custom_types: carina_core::parser::ProviderCustomTypes,
-    schemas: SchemaRegistry,
+    schemas: ProviderLoadedSchemaRegistry,
     known_providers: HashSet<String>,
     uses_builtin_mock: bool,
     provider_artifacts: BTreeMap<String, LoadedProviderArtifact>,
@@ -1627,7 +1627,7 @@ impl FormattingProviderLoad {
             build_factories_from_providers_for_formatting(user_dirs, providers, base_dir)?;
         let WiringContext { schemas, .. } = WiringContext::new(factories, providers);
         Ok(Self {
-            schemas,
+            schemas: schemas.into_registry(),
             load_errors,
         })
     }
@@ -1644,7 +1644,7 @@ impl FormattingProviderLoad {
     ) -> Self {
         let WiringContext { schemas, .. } = WiringContext::new(factories, provider_configs);
         Self {
-            schemas,
+            schemas: schemas.into_registry(),
             load_errors,
         }
     }
@@ -1693,28 +1693,27 @@ impl WiringContext {
             .into_iter()
             .map(LoadedProviderFactory::into_factory)
             .collect::<Vec<_>>();
-        let mut schemas = SchemaRegistry::new();
-        for (provider, schema) in additional_schemas {
-            schemas.insert(provider, schema);
-        }
-        for factory in &factories {
-            for schema in factory.schemas() {
-                schemas.insert(factory.name(), schema);
-            }
-        }
+        let mut supplemental_schemas = additional_schemas.into_iter().collect::<Vec<_>>();
         if uses_builtin_mock {
             for schema in carina_provider_mock::builtin_schemas() {
                 let parts = schema.parts();
-                let already_registered = if matches!(parts.kind, SchemaKind::DataSource) {
-                    schemas.has_data_source(BUILTIN_PROVIDER_NAME, parts.resource_type)
-                } else {
-                    schemas.has_managed(BUILTIN_PROVIDER_NAME, parts.resource_type)
-                };
+                let already_registered = supplemental_schemas.iter().any(
+                    |(provider, registered): &(String, ValidatedResourceSchema)| {
+                        let registered_parts = registered.parts();
+                        provider == BUILTIN_PROVIDER_NAME
+                            && registered_parts.kind == parts.kind
+                            && registered_parts.resource_type == parts.resource_type
+                    },
+                );
                 if !already_registered {
-                    schemas.insert(BUILTIN_PROVIDER_NAME, schema);
+                    supplemental_schemas.push((BUILTIN_PROVIDER_NAME.to_string(), schema));
                 }
             }
         }
+        let schemas = provider_mod::provider_loaded_schema_registry_from_factories_with_supplements(
+            &factories,
+            supplemental_schemas,
+        );
         let mut known_providers = factories
             .iter()
             .map(|factory| factory.name().to_string())
@@ -1769,6 +1768,10 @@ impl WiringContext {
     }
 
     pub fn schemas(&self) -> &SchemaRegistry {
+        self.schemas.schemas()
+    }
+
+    pub(crate) fn loaded_provider_schemas(&self) -> &ProviderLoadedSchemaRegistry {
         &self.schemas
     }
 

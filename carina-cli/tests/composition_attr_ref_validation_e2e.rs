@@ -639,23 +639,24 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
     let mut parsed =
         carina_core::config_loader::parse_directory(&fixture.caller, &provider_context)
             .expect("parse directory-scoped fixture");
-    let mut schemas = carina_core::schema::SchemaRegistry::new();
-    for schema in AwsccTestFactory.schemas() {
-        schemas.insert("awscc", schema);
-    }
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AwsccTestFactory)];
+    let schemas = carina_core::provider::provider_loaded_schema_registry_from_factories(&factories);
     carina_core::module_resolver::resolve_modules_with_config(
         &mut parsed,
         carina_core::config_loader::get_base_dir(&fixture.caller),
         &provider_context,
-        &schemas,
+        schemas.schemas(),
     )
     .expect("expand module call");
 
     // Exercise the same post-expansion inference + ref-validation seam used by
     // CLI validation, where both stages can otherwise report this one typo.
     let inferred_exports =
-        carina_core::validation::inference::infer_export_params(&parsed, &schemas);
-    let bindings = carina_core::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+        carina_core::validation::inference::infer_export_params_with_loaded_provider_schemas(
+            &parsed, &schemas,
+        );
+    let bindings =
+        carina_core::binding_index::BindingIndex::from_parsed(&parsed, schemas.schemas());
     let mut diagnostics = carina_core::validation::inference::attached_inference_failures(
         inferred_exports.checked_exports(),
     )

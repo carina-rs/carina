@@ -506,7 +506,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         let schema_checked_exports =
             carina_core::validation::inference::retry_unchecked_export_inference(
                 parsed,
-                ctx.schemas(),
+                ctx.loaded_provider_schemas(),
             );
         errors.extend(
             carina_core::validation::inference::attached_inference_failures(schema_checked_exports)

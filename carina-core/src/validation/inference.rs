@@ -32,6 +32,7 @@ use std::collections::HashMap;
 
 use crate::builtins::{BuiltinReturnType, builtin_functions};
 use crate::parser::TypeExpr;
+use crate::provider::ProviderLoadedSchemaRegistry;
 use crate::resource::{ConcreteValue, DeferredValue, Value};
 use crate::schema::{AttrTypeKind, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry};
 pub use crate::static_type::InferenceError;
@@ -949,12 +950,7 @@ pub fn apply_inference(
     parsed.map_export_params(|_| inferred_exports)
 }
 
-/// Borrowing variant of [`apply_inference`] that returns just the
-/// inferred export parameters. The full
-/// `InferredFile` reconstruction in `apply_inference` clones every
-/// non-export field; consumers that only need the export-side typecheck
-/// (LSP diagnostics, in particular) should use this instead to avoid
-/// the per-keystroke deep-clone.
+/// Export parameters inferred with a caller-supplied schema registry.
 #[derive(Debug, Clone)]
 pub struct SchemaCheckedExportParams {
     parameters: Vec<crate::parser::InferredExportParam>,
@@ -965,17 +961,17 @@ impl SchemaCheckedExportParams {
         &self.parameters
     }
 
-    pub fn checked_exports(&self) -> SchemaCheckedExports<'_> {
-        SchemaCheckedExports {
-            parameters: &self.parameters,
-        }
-    }
-
     fn into_parameters(self) -> Vec<crate::parser::InferredExportParam> {
         self.parameters
     }
 }
 
+/// Borrowing variant of [`apply_inference`] that returns just the
+/// inferred export parameters. The full
+/// `InferredFile` reconstruction in `apply_inference` clones every
+/// non-export field; consumers that only need the export-side typecheck
+/// (LSP diagnostics, in particular) should use this instead to avoid
+/// the per-keystroke deep-clone.
 pub fn infer_export_params(
     parsed: &crate::parser::ParsedFile,
     schemas: &SchemaRegistry,
@@ -1009,19 +1005,52 @@ pub fn infer_export_params(
     SchemaCheckedExportParams { parameters }
 }
 
+/// Export parameters whose inference used a registry minted by provider loading.
+#[derive(Debug, Clone)]
+pub struct ExportParamsInferredWithLoadedProviderSchemas {
+    inferred: SchemaCheckedExportParams,
+}
+
+impl ExportParamsInferredWithLoadedProviderSchemas {
+    pub fn parameters(&self) -> &[crate::parser::InferredExportParam] {
+        self.inferred.parameters()
+    }
+
+    pub fn checked_exports(&self) -> ExportsInferredWithLoadedProviderSchemas<'_> {
+        ExportsInferredWithLoadedProviderSchemas {
+            parameters: self.parameters(),
+        }
+    }
+
+    pub fn into_inferred_export_params(self) -> SchemaCheckedExportParams {
+        self.inferred
+    }
+}
+
+/// Infer export parameters using schemas proven to come from provider loading.
+pub fn infer_export_params_with_loaded_provider_schemas(
+    parsed: &crate::parser::ParsedFile,
+    schemas: &ProviderLoadedSchemaRegistry,
+) -> ExportParamsInferredWithLoadedProviderSchemas {
+    ExportParamsInferredWithLoadedProviderSchemas {
+        inferred: infer_export_params(parsed, schemas.schemas()),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct AttachedInferenceFailure<'a> {
     pub name: &'a str,
     pub error: &'a InferenceError,
 }
 
+/// Proof-bearing export view whose inference ran against loaded provider schemas.
 #[derive(Debug, Clone, Copy)]
-pub struct SchemaCheckedExports<'a> {
+pub struct ExportsInferredWithLoadedProviderSchemas<'a> {
     parameters: &'a [crate::parser::InferredExportParam],
 }
 
 pub fn attached_inference_failures<'a>(
-    checked: SchemaCheckedExports<'a>,
+    checked: ExportsInferredWithLoadedProviderSchemas<'a>,
 ) -> impl Iterator<Item = AttachedInferenceFailure<'a>> + 'a {
     checked
         .parameters
@@ -1046,8 +1075,8 @@ pub fn attached_inference_failures<'a>(
 /// still-deferred probes retain the original provenance.
 pub fn retry_unchecked_export_inference<'a>(
     parsed: &'a mut crate::parser::InferredFile,
-    schemas: &SchemaRegistry,
-) -> SchemaCheckedExports<'a> {
+    schemas: &ProviderLoadedSchemaRegistry,
+) -> ExportsInferredWithLoadedProviderSchemas<'a> {
     let bindings = bindings_from_parsed(parsed);
 
     for parameter in &mut parsed.export_params {
@@ -1074,7 +1103,7 @@ pub fn retry_unchecked_export_inference<'a>(
             continue;
         };
 
-        match infer_type_from_value(value, &bindings, schemas) {
+        match infer_type_from_value(value, &bindings, schemas.schemas()) {
             Ok(_type_expr) => {}
             Err(InferenceIssue::NotInferable(_reason)) => {}
             Err(InferenceIssue::Failed(error)) => {
@@ -1085,7 +1114,7 @@ pub fn retry_unchecked_export_inference<'a>(
         }
     }
 
-    SchemaCheckedExports {
+    ExportsInferredWithLoadedProviderSchemas {
         parameters: &parsed.export_params,
     }
 }
@@ -2042,7 +2071,8 @@ mod tests {
             ))
         );
 
-        let schema_checked = retry_unchecked_export_inference(&mut inferred, &schemas_with_vpc());
+        let loaded_schemas = ProviderLoadedSchemaRegistry::for_test(schemas_with_vpc());
+        let schema_checked = retry_unchecked_export_inference(&mut inferred, &loaded_schemas);
         let failures = attached_inference_failures(schema_checked)
             .map(|failure| (failure.name.to_string(), failure.error.clone()))
             .collect::<Vec<_>>();
@@ -2077,7 +2107,8 @@ mod tests {
             ));
 
         let mut inferred = apply_inference(parsed, &SchemaRegistry::new());
-        let schema_checked = retry_unchecked_export_inference(&mut inferred, &schemas_with_vpc());
+        let loaded_schemas = ProviderLoadedSchemaRegistry::for_test(schemas_with_vpc());
+        let schema_checked = retry_unchecked_export_inference(&mut inferred, &loaded_schemas);
         assert_eq!(attached_inference_failures(schema_checked).count(), 0);
 
         assert_eq!(

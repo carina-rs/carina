@@ -16,7 +16,8 @@ use carina_core::parser::{
     ParseError, ParsedFile, ResourceRef, SourceSpan, WarningKind, contains_function_call,
 };
 use carina_core::provider::{
-    HostErrorCause, ProviderError, ProviderFactory, SuspendedValidationId,
+    HostErrorCause, ProviderError, ProviderFactory, ProviderLoadedSchemaRegistry,
+    SuspendedValidationId,
 };
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
@@ -157,6 +158,7 @@ pub(crate) fn carina_diagnostic_range(
 
 pub struct DiagnosticEngine {
     schemas: Arc<SchemaRegistry>,
+    loaded_provider_schemas: Option<Arc<ProviderLoadedSchemaRegistry>>,
     provider_names: Vec<String>,
     known_provider_names: HashSet<String>,
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
@@ -167,16 +169,47 @@ pub struct DiagnosticEngine {
 }
 
 impl DiagnosticEngine {
+    /// Construct diagnostics backed by schemas minted from provider loading.
     pub fn new(
-        schemas: Arc<SchemaRegistry>,
+        schemas: Arc<ProviderLoadedSchemaRegistry>,
         provider_names: Vec<String>,
         factories: Arc<Vec<Box<dyn ProviderFactory>>>,
     ) -> Self {
         Self::new_with_known_providers(schemas, provider_names, factories, HashSet::new())
     }
 
+    /// Construct diagnostics for the orphaned-file fallback with no loaded
+    /// providers. This path deliberately cannot mint provider-schema inference
+    /// evidence.
+    pub fn without_loaded_provider_schemas() -> Self {
+        Self::from_schema_state(
+            Arc::new(SchemaRegistry::new()),
+            None,
+            Vec::new(),
+            Arc::new(Vec::new()),
+            HashSet::new(),
+        )
+    }
+
     pub(crate) fn new_with_known_providers(
+        schemas: Arc<ProviderLoadedSchemaRegistry>,
+        provider_names: Vec<String>,
+        factories: Arc<Vec<Box<dyn ProviderFactory>>>,
+        known_provider_names: HashSet<String>,
+    ) -> Self {
+        let registry = schemas.schemas_arc();
+        Self::from_schema_state(
+            registry,
+            Some(schemas),
+            provider_names,
+            factories,
+            known_provider_names,
+        )
+    }
+
+    fn from_schema_state(
         schemas: Arc<SchemaRegistry>,
+        loaded_provider_schemas: Option<Arc<ProviderLoadedSchemaRegistry>>,
         provider_names: Vec<String>,
         factories: Arc<Vec<Box<dyn ProviderFactory>>>,
         known_provider_names: HashSet<String>,
@@ -192,15 +225,11 @@ impl DiagnosticEngine {
         // resolve a custom type name, so disabling the strict check
         // avoids a flood of false positives.
         //
-        // The flag keys off `provider_names` rather than
-        // `factories.is_empty()` so a project whose declared
-        // providers failed to load (network error, missing install,
-        // …) still gets the strict check — the user sees the provider
-        // load error and the unknown-custom-type error together
-        // instead of having the carina#3239 fix silently masked by an
-        // unrelated install failure.
-        let has_loaded_providers = !provider_names.is_empty();
-        let custom_types = if has_loaded_providers {
+        // Provider-loaded schema evidence is retained only by the loaded
+        // constructor. The empty fallback takes the separately named
+        // `without_loaded_provider_schemas` path and cannot report attached
+        // export-inference failures as provider-schema checked.
+        let custom_types = if loaded_provider_schemas.is_some() {
             carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories))
         } else {
             carina_core::parser::ProviderCustomTypes::default()
@@ -213,6 +242,7 @@ impl DiagnosticEngine {
         };
         Self {
             schemas,
+            loaded_provider_schemas,
             provider_names,
             known_provider_names,
             factories,

@@ -2281,30 +2281,37 @@ impl DiagnosticEngine {
         let Some(inference_input) = semantic_view.parsed() else {
             return diagnostics;
         };
-        let inferred_export_params =
-            carina_core::validation::inference::infer_export_params(inference_input, &self.schemas);
-        // Surface inference failures as "type annotation required"
-        // diagnostics, anchored at the export name. Errors for
-        // exports declared in sibling `.crn` files (visible only via
-        // `merged`) won't anchor in this buffer and are skipped here —
-        // the buffer that owns the export will surface them on its
-        // own pass.
-        for inference_error in carina_core::validation::inference::attached_inference_failures(
-            inferred_export_params.checked_exports(),
-        ) {
-            if let Some((line, col)) = self.find_exports_param_position(doc, inference_error.name) {
-                diagnostics.push(carina_diagnostic(
-                    line,
-                    col,
-                    col + inference_error.name.len() as u32,
-                    DiagnosticSeverity::WARNING,
-                    carina_core::validation::inference::format_inference_error(
-                        inference_error.name,
-                        inference_error.error,
-                    ),
-                ));
+        let inferred_export_params = if let Some(schemas) = &self.loaded_provider_schemas {
+            let provider_inferred = carina_core::validation::inference::
+                infer_export_params_with_loaded_provider_schemas(inference_input, schemas);
+            // Surface inference failures as "type annotation required"
+            // diagnostics, anchored at the export name. Errors for
+            // exports declared in sibling `.crn` files (visible only via
+            // `merged`) won't anchor in this buffer and are skipped here —
+            // the buffer that owns the export will surface them on its
+            // own pass.
+            for inference_error in carina_core::validation::inference::attached_inference_failures(
+                provider_inferred.checked_exports(),
+            ) {
+                if let Some((line, col)) =
+                    self.find_exports_param_position(doc, inference_error.name)
+                {
+                    diagnostics.push(carina_diagnostic(
+                        line,
+                        col,
+                        col + inference_error.name.len() as u32,
+                        DiagnosticSeverity::WARNING,
+                        carina_core::validation::inference::format_inference_error(
+                            inference_error.name,
+                            inference_error.error,
+                        ),
+                    ));
+                }
             }
-        }
+            provider_inferred.into_inferred_export_params()
+        } else {
+            self.infer_export_params_without_loaded_provider_schemas(inference_input)
+        };
         let export_bindings =
             carina_core::binding_index::BindingIndex::from_parsed(inference_input, &self.schemas);
         if let Err(ref_errors) =
@@ -2327,6 +2334,13 @@ impl DiagnosticEngine {
         }
 
         diagnostics
+    }
+
+    fn infer_export_params_without_loaded_provider_schemas(
+        &self,
+        parsed: &ParsedFile,
+    ) -> carina_core::validation::inference::SchemaCheckedExportParams {
+        carina_core::validation::inference::infer_export_params(parsed, &self.schemas)
     }
 
     /// Find the position of a ref type error in exports by extracting the param name.

@@ -111,7 +111,17 @@ pub fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
         .into_iter()
         .collect();
     let factories = factories_for(&schemas);
-    DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(factories))
+    if provider_names.is_empty() {
+        DiagnosticEngine::without_loaded_provider_schemas()
+    } else {
+        let loaded_schemas =
+            carina_core::provider::provider_loaded_schema_registry_from_factories(&factories);
+        DiagnosticEngine::new(
+            Arc::new(loaded_schemas),
+            provider_names,
+            Arc::new(factories),
+        )
+    }
 }
 
 /// Wrap one `ResourceSchema` in a `SchemaRegistry` registered under the

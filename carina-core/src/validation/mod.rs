@@ -4291,10 +4291,10 @@ pub(crate) fn resolve_consumer_static_type(
 ) -> ConsumerStaticType {
     match resolve_type_expr(type_expr, config) {
         Ok(resolved) => StaticType::Known(ConsumerResolvedType::new(resolved)),
-        Err(resolution_error) => StaticType::Unchecked(UnnameableInConsumer {
-            original: type_expr.clone(),
+        Err(resolution_error) => StaticType::Unchecked(UnnameableInConsumer::new(
+            type_expr.clone(),
             resolution_error,
-        }),
+        )),
     }
 }
 
@@ -4331,12 +4331,11 @@ pub fn resolve_export_static_type_for_consumer(
         ExportStaticType::Inferred(StaticType::Known(type_expr)) => {
             let resolved = match resolve_type_expr(&type_expr, config) {
                 Ok(type_expr) => StaticType::Known(ConsumerResolvedType::new(type_expr)),
-                Err(resolution_error) => StaticType::Unchecked(
-                    ConsumerInferredUncheckedReason::UnnameableInConsumer(UnnameableInConsumer {
-                        original: type_expr,
-                        resolution_error,
-                    }),
-                ),
+                Err(resolution_error) => {
+                    StaticType::Unchecked(ConsumerInferredUncheckedReason::UnnameableInConsumer(
+                        UnnameableInConsumer::new(type_expr, resolution_error),
+                    ))
+                }
             };
             ConsumerExportStaticType::Inferred(resolved)
         }
@@ -5462,7 +5461,7 @@ impl ModuleCallChecker<'_> {
                 ),
                 StaticType::Unchecked(reason) => {
                     if self.provider_context.custom_types_loaded() {
-                        Err(reason.resolution_error.clone())
+                        Err(reason.resolution_error().clone())
                     } else {
                         Ok(None)
                     }

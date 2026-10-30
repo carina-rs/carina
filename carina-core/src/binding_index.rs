@@ -2809,17 +2809,9 @@ let vpc = aws.ec2.Vpc {
             "cidr".to_string(),
             LiveCompositionAttribute::from_value_with_static_type(
                 Value::resource_ref("vpc".to_string(), "cidr_block", vec![]),
-                Some(crate::static_type::StaticType::Unchecked(
-                    crate::static_type::UnnameableInConsumer {
-                        original: TypeExpr::DottedUnresolved(ResourceTypePath::new(
-                            "some",
-                            "unnameable.Type",
-                        )),
-                        resolution_error:
-                            crate::static_type::StaticTypeResolutionError::UnknownCustomType {
-                                name: "some.unnameable.Type".to_string(),
-                            },
-                    },
+                Some(crate::validation::resolve_consumer_static_type(
+                    &TypeExpr::DottedUnresolved(ResourceTypePath::new("some", "unnameable.Type")),
+                    &crate::parser::ProviderContext::default(),
                 )),
             ),
         );

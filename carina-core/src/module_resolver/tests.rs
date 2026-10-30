@@ -7231,13 +7231,13 @@ fn resolved_module_signature_preserves_unresolvable_attribute_type_for_best_effo
         matches!(
             static_type,
             crate::static_type::StaticType::Unchecked(reason)
-                if reason.original
-                    == TypeExpr::DottedUnresolved(ResourceTypePath::new(
+                if reason.original()
+                    == &TypeExpr::DottedUnresolved(ResourceTypePath::new(
                         "missing",
                         "types.Identifier",
                     ))
                     && matches!(
-                        reason.resolution_error,
+                        reason.resolution_error(),
                         crate::static_type::StaticTypeResolutionError::UnknownCustomType { .. }
                     )
         ),

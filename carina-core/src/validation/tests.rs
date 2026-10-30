@@ -119,9 +119,9 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
     assert!(matches!(
         &argument,
         StaticType::Unchecked(reason)
-            if reason.original == unknown
+            if reason.original() == &unknown
                 && matches!(
-                    reason.resolution_error,
+                    reason.resolution_error(),
                     crate::static_type::StaticTypeResolutionError::UnknownCustomType { .. }
                 )
     ));
@@ -131,7 +131,7 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
     );
     assert!(matches!(
         &attributes[0].static_type,
-        Some(StaticType::Unchecked(reason)) if reason.original == unknown
+        Some(StaticType::Unchecked(reason)) if reason.original() == &unknown
     ));
     let parsed_export = resolve_consumer_static_type(
         parsed.export_params[0]
@@ -142,7 +142,7 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
     );
     assert!(matches!(
         &parsed_export,
-        StaticType::Unchecked(reason) if reason.original == unknown
+        StaticType::Unchecked(reason) if reason.original() == &unknown
     ));
 
     let failure = InferenceError::UnknownType {
@@ -173,7 +173,7 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
         resolved.next().expect("resolved inferred export"),
         ConsumerExportStaticType::Inferred(StaticType::Unchecked(
             ConsumerInferredUncheckedReason::UnnameableInConsumer(reason)
-        )) if reason.original == unknown
+        )) if reason.original() == &unknown
     ));
     assert_eq!(
         resolved.next().expect("resolved failed export"),
@@ -3731,9 +3731,9 @@ fn check_module_calls_reports_unnameable_signature_type_resolution_errors() {
         matches!(
             &static_type,
             crate::static_type::StaticType::Unchecked(reason)
-                if reason.original == unresolved
+                if reason.original() == &unresolved
                     && matches!(
-                        reason.resolution_error,
+                        reason.resolution_error(),
                         crate::static_type::StaticTypeResolutionError::UnknownCustomType { .. }
                     )
         ),

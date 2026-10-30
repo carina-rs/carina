@@ -78,18 +78,31 @@ impl ProviderState {
                     .any(|factory| factory.name() == provider_name)
             },
         );
-        let mut schemas = provider_mod::collect_schemas(&factories);
         let mut provider_names: Vec<String> =
             factories.iter().map(|f| f.name().to_string()).collect();
         let mut known_provider_names = HashSet::new();
-        if use_builtin_mock {
-            for schema in carina_provider_mock::builtin_schemas() {
-                schemas.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME, schema);
-            }
+        let supplemental_schemas = if use_builtin_mock {
             provider_names.push(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
             known_provider_names.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
-        }
-        let schemas = Arc::new(schemas);
+            carina_provider_mock::builtin_schemas()
+                .into_iter()
+                .map(|schema| {
+                    (
+                        carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string(),
+                        schema,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let loaded_schemas =
+            provider_mod::provider_loaded_schema_registry_from_factories_with_supplements(
+                &factories,
+                supplemental_schemas,
+            );
+        let loaded_schemas = Arc::new(loaded_schemas);
+        let schemas = loaded_schemas.schemas_arc();
         let region_completions: Vec<CompletionValue> = factories
             .iter()
             .flat_map(|f| f.config_completions().remove("region").unwrap_or_default())
@@ -103,15 +116,20 @@ impl ProviderState {
             .map(|id| id.to_string())
             .collect();
         let factories_arc = Arc::new(factories);
-        Self {
-            schemas: Arc::clone(&schemas),
-            diagnostic_engine: DiagnosticEngine::new_with_known_providers(
-                Arc::clone(&schemas),
+        let diagnostic_engine = if provider_names.is_empty() {
+            DiagnosticEngine::without_loaded_provider_schemas()
+        } else {
+            DiagnosticEngine::new_with_known_providers(
+                Arc::clone(&loaded_schemas),
                 provider_names.clone(),
                 factories_arc,
                 known_provider_names,
             )
-            .with_provider_errors(provider_errors),
+        }
+        .with_provider_errors(provider_errors);
+        Self {
+            schemas: Arc::clone(&schemas),
+            diagnostic_engine,
             completion_provider: CompletionProvider::new(
                 Arc::clone(&schemas),
                 provider_names,

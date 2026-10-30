@@ -55,7 +55,17 @@ fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
         .into_iter()
         .collect();
     let factories = factories_for(&schemas);
-    DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(factories))
+    if provider_names.is_empty() {
+        DiagnosticEngine::without_loaded_provider_schemas()
+    } else {
+        let loaded_schemas =
+            carina_core::provider::provider_loaded_schema_registry_from_factories(&factories);
+        DiagnosticEngine::new(
+            Arc::new(loaded_schemas),
+            provider_names,
+            Arc::new(factories),
+        )
+    }
 }
 
 fn single_schema_map(schema: ResourceSchema) -> SchemaRegistry {
@@ -4236,23 +4246,6 @@ fn wasm_style_vpc_schema() -> ResourceSchema {
         .attribute(AttributeSchema::optional("vpc_id", vpc_id_type).build())
 }
 
-fn wasm_style_schemas() -> SchemaRegistry {
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "awsccmock",
-        (wasm_style_vpc_schema())
-            .validate()
-            .expect("schema fixture must be valid"),
-    );
-    schemas.insert(
-        "awsccmock",
-        wasm_style_flow_log_schema()
-            .validate()
-            .expect("numeric bridge schema fixture must be valid"),
-    );
-    schemas
-}
-
 fn wasm_style_factories() -> Vec<Box<dyn ProviderFactory>> {
     vec![Box::new(WasmStyleProviderFactory {
         name: "awsccmock".to_string(),
@@ -4268,9 +4261,9 @@ fn wasm_style_factories() -> Vec<Box<dyn ProviderFactory>> {
 }
 
 fn wasm_style_engine() -> DiagnosticEngine {
-    let schemas = wasm_style_schemas();
     let factories: Vec<Box<dyn ProviderFactory>> = wasm_style_factories();
     let provider_names = vec!["awsccmock".to_string()];
+    let schemas = carina_core::provider::provider_loaded_schema_registry_from_factories(&factories);
     DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(factories))
 }
 
@@ -4404,17 +4397,6 @@ fn wasm_style_subnet_schema() -> ResourceSchema {
         .attribute(AttributeSchema::optional("vpc_ids", AttributeType::list(vpc_id_type)).build())
 }
 
-fn wasm_style_subnet_schemas() -> SchemaRegistry {
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "awsccmock",
-        (wasm_style_subnet_schema())
-            .validate()
-            .expect("schema fixture must be valid"),
-    );
-    schemas
-}
-
 fn wasm_style_subnet_factories() -> Vec<Box<dyn ProviderFactory>> {
     vec![Box::new(WasmStyleProviderFactory {
         name: "awsccmock".to_string(),
@@ -4436,13 +4418,10 @@ awsccmock.ec2.subnet {
 }
 "#,
     )]);
-    let schemas = wasm_style_subnet_schemas();
     let provider_names = vec!["awsccmock".to_string()];
-    let engine = DiagnosticEngine::new(
-        Arc::new(schemas),
-        provider_names,
-        Arc::new(wasm_style_subnet_factories()),
-    );
+    let factories = wasm_style_subnet_factories();
+    let schemas = carina_core::provider::provider_loaded_schema_registry_from_factories(&factories);
+    let engine = DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(factories));
 
     let lsp_diags = lsp_diagnostics(&engine, &fixture, "main.crn");
     let cli_diags = cli_diagnostics(wasm_style_subnet_factories(), &fixture);
@@ -4534,23 +4513,6 @@ fn security_group_schema_2358() -> ResourceSchema {
         .attribute(AttributeSchema::optional("vpc_id", vpc_id_custom_type_2358()).build())
 }
 
-fn schemas_2358() -> SchemaRegistry {
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "awscc2358",
-        (vpc_resource_schema_2358())
-            .validate()
-            .expect("schema fixture must be valid"),
-    );
-    schemas.insert(
-        "awscc2358",
-        (security_group_schema_2358())
-            .validate()
-            .expect("schema fixture must be valid"),
-    );
-    schemas
-}
-
 fn factories_2358() -> Vec<Box<dyn ProviderFactory>> {
     vec![Box::new(WasmStyleProviderFactory {
         name: "awscc2358".to_string(),
@@ -4566,10 +4528,12 @@ fn factories_2358() -> Vec<Box<dyn ProviderFactory>> {
 }
 
 fn engine_2358() -> DiagnosticEngine {
+    let factories = factories_2358();
+    let schemas = carina_core::provider::provider_loaded_schema_registry_from_factories(&factories);
     DiagnosticEngine::new(
-        Arc::new(schemas_2358()),
+        Arc::new(schemas),
         vec!["awscc2358".to_string()],
-        Arc::new(factories_2358()),
+        Arc::new(factories),
     )
 }
 

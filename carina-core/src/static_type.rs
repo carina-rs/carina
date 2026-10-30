@@ -63,12 +63,43 @@ pub enum StaticTypeResolutionError {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnnameableInConsumer {
-    pub original: TypeExpr,
-    pub resolution_error: StaticTypeResolutionError,
+    original: TypeExpr,
+    resolution_error: StaticTypeResolutionError,
+}
+
+impl UnnameableInConsumer {
+    pub(crate) fn new(original: TypeExpr, resolution_error: StaticTypeResolutionError) -> Self {
+        Self {
+            original,
+            resolution_error,
+        }
+    }
+
+    pub fn original(&self) -> &TypeExpr {
+        &self.original
+    }
+
+    pub fn resolution_error(&self) -> &StaticTypeResolutionError {
+        &self.resolution_error
+    }
 }
 
 /// Parser/local declarations carry [`TypeExpr`] directly; only consumer
 /// resolution outputs can carry [`ConsumerStaticType`] and its unchecked state.
+///
+/// ```compile_fail
+/// use carina_core::parser::TypeExpr;
+/// use carina_core::static_type::{
+///     ConsumerStaticType, StaticType, StaticTypeResolutionError, UnnameableInConsumer,
+/// };
+///
+/// let _forged: ConsumerStaticType = StaticType::Unchecked(UnnameableInConsumer {
+///     original: TypeExpr::String,
+///     resolution_error: StaticTypeResolutionError::UnknownCustomType {
+///         name: "forged".to_string(),
+///     },
+/// });
+/// ```
 pub type ConsumerStaticType = StaticType<UnnameableInConsumer, ConsumerResolvedType>;
 
 /// User-facing label for a declared type. An unchecked consumer boundary is
@@ -77,7 +108,7 @@ pub type ConsumerStaticType = StaticType<UnnameableInConsumer, ConsumerResolvedT
 pub fn consumer_static_type_label(static_type: &ConsumerStaticType) -> &TypeExpr {
     match static_type {
         StaticType::Known(resolved) => resolved.type_expr(),
-        StaticType::Unchecked(reason) => &reason.original,
+        StaticType::Unchecked(reason) => reason.original(),
     }
 }
 

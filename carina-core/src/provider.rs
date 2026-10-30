@@ -5013,19 +5013,82 @@ pub fn find_factory<'a>(
         .map(|f| f.as_ref())
 }
 
-/// Collect all resource schemas from the given factories into a [`SchemaRegistry`].
+/// A schema registry constructed from a completed provider-factory load.
+///
+/// The private field and absence of `Default`/raw-registry conversions prevent
+/// bootstrap registries from being relabeled as provider-loaded. Supplemental
+/// schemas (for example, the built-in mock provider) are admitted only while
+/// this proof is minted from the loaded factory collection.
+#[derive(Debug, Clone)]
+pub struct ProviderLoadedSchemaRegistry {
+    schemas: std::sync::Arc<SchemaRegistry>,
+}
+
+impl ProviderLoadedSchemaRegistry {
+    fn from_registry(schemas: SchemaRegistry) -> Self {
+        Self {
+            schemas: std::sync::Arc::new(schemas),
+        }
+    }
+
+    /// Borrow the provider-loaded registry.
+    pub fn schemas(&self) -> &SchemaRegistry {
+        &self.schemas
+    }
+
+    /// Share the exact registry carried by this proof with read-only consumers.
+    pub fn schemas_arc(&self) -> std::sync::Arc<SchemaRegistry> {
+        std::sync::Arc::clone(&self.schemas)
+    }
+
+    /// Erase the provider-loaded proof for consumers that need only a registry.
+    pub fn into_registry(self) -> SchemaRegistry {
+        std::sync::Arc::try_unwrap(self.schemas).unwrap_or_else(|shared| shared.as_ref().clone())
+    }
+
+    /// Construct provider-loaded schema evidence for cross-crate fixtures.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(schemas: SchemaRegistry) -> Self {
+        Self::from_registry(schemas)
+    }
+}
+
+/// Collect all resource schemas from loaded factories and retain proof of that
+/// provider-loading boundary.
 ///
 /// Each schema is inserted under the factory's `name()` plus `schema.kind`,
 /// so a given `(provider, resource_type)` pair may have both a `Managed`
 /// and a `DataSource` entry registered side by side.
-pub fn collect_schemas(factories: &[Box<dyn ProviderFactory>]) -> SchemaRegistry {
+pub fn provider_loaded_schema_registry_from_factories(
+    factories: &[Box<dyn ProviderFactory>],
+) -> ProviderLoadedSchemaRegistry {
+    provider_loaded_schema_registry_from_factories_with_supplements(
+        factories,
+        std::iter::empty::<(String, ValidatedResourceSchema)>(),
+    )
+}
+
+/// Construct provider-loaded schema evidence with supplemental schemas that
+/// are inserted before factory schemas.
+pub fn provider_loaded_schema_registry_from_factories_with_supplements(
+    factories: &[Box<dyn ProviderFactory>],
+    supplemental_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
+) -> ProviderLoadedSchemaRegistry {
     let mut registry = SchemaRegistry::new();
+    for (provider, schema) in supplemental_schemas {
+        registry.insert(provider, schema);
+    }
     for factory in factories {
         for schema in factory.schemas() {
             registry.insert(factory.name(), schema);
         }
     }
-    registry
+    ProviderLoadedSchemaRegistry::from_registry(registry)
+}
+
+/// Collect all resource schemas from the given factories into a [`SchemaRegistry`].
+pub fn collect_schemas(factories: &[Box<dyn ProviderFactory>]) -> SchemaRegistry {
+    provider_loaded_schema_registry_from_factories(factories).into_registry()
 }
 
 /// Collect custom type identities from a registry for completion display.
