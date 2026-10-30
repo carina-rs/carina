@@ -434,7 +434,10 @@ impl MoveAuthority<'_> {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedMove {
-    from: ResolvedResourceId,
+    /// Persisted row that originally owned the state being moved.
+    origin: ResolvedResourceId,
+    /// Effective source address after any move already applied in this plan.
+    projected_from: ResolvedResourceId,
     to: ResolvedResourceId,
 }
 
@@ -473,19 +476,45 @@ impl ResolvedMove {
                 declared_to: Box::new(declared_to),
             });
         }
-        Ok(Self { from, to })
+        Ok(Self {
+            origin: from.clone(),
+            projected_from: from,
+            to,
+        })
     }
 
-    pub(crate) fn from_detected_rename(from: ResolvedResourceId, to: ResolvedResourceId) -> Self {
-        Self { from, to }
+    /// Build an automatically detected move while retaining its persisted
+    /// origin and current in-memory projection as separate addresses.
+    pub(crate) fn from_detected_rename(
+        origin: ResolvedResourceId,
+        projected_from: ResolvedResourceId,
+        to: ResolvedResourceId,
+    ) -> Self {
+        Self {
+            origin,
+            projected_from,
+            to,
+        }
     }
 
     fn matches_address(resolved: &ResolvedResourceId, declared: &StateBlockAddress) -> bool {
         declared.matches_resource_id(resolved.as_inner())
     }
 
+    /// Persisted row that owns this move.
+    ///
+    /// Effects and saved move pairs use this address even when state has
+    /// already been projected through an earlier move in the same plan.
     pub fn from(&self) -> &ResolvedResourceId {
-        &self.from
+        &self.origin
+    }
+
+    /// Effective source address from which in-memory state must be transferred.
+    ///
+    /// This differs from [`Self::from`] when a persisted row has already been
+    /// projected through an earlier move in the same plan.
+    pub fn projected_from(&self) -> &ResolvedResourceId {
+        &self.projected_from
     }
 
     pub fn to(&self) -> &ResolvedResourceId {
@@ -494,18 +523,19 @@ impl ResolvedMove {
 
     pub fn authority(&self) -> MoveAuthority<'_> {
         MoveAuthority {
-            from: &self.from,
+            from: &self.projected_from,
             to: &self.to,
         }
     }
 
+    /// Consume the move as the persisted origin-to-final-destination pair.
     pub fn into_parts(self) -> (ResolvedResourceId, ResolvedResourceId) {
-        (self.from, self.to)
+        (self.origin, self.to)
     }
 
     pub fn into_effect(self) -> Effect {
         Effect::Move {
-            from: self.from,
+            from: self.origin,
             to: self.to,
             origin: None,
         }
