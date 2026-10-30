@@ -313,41 +313,53 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
     };
     let cache = tempfile::tempdir().expect("create WASM cache directory");
     let wasm_bytes = std::fs::read(wasm_path).expect("read mock HTTP WASM provider");
-    let verified = carina_provider_resolver::VerifiedLoad::for_test(
+    let fresh_verified = carina_provider_resolver::VerifiedLoad::for_test(
         &wasm_bytes,
         carina_provider_resolver::ProviderLoadIdentity::for_test(
             "mock_http",
             carina_provider_resolver::ProviderTrustClass::Untrusted,
         ),
     );
-    let factory =
-        carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(verified, cache.path())
-            .await
-            .expect("load mock HTTP WASM provider")
-            .with_http_test_route("phase-test.invalid", server_address);
-    let ready = mock_http_ready_config(&factory);
-    let initialized = factory
-        .create_initialized_provider(None, &ready)
+    let fresh_factory = carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
+        fresh_verified,
+        cache.path(),
+    )
+    .await
+    .expect("load mock HTTP WASM provider")
+    .with_http_test_route("phase-test.invalid", server_address);
+    let fresh_ready = mock_http_ready_config(&fresh_factory);
+    let fresh_initialized = fresh_factory
+        .create_initialized_provider(None, &fresh_ready)
         .await
         .expect("initialize mock HTTP provider");
-    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(factory)];
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(fresh_factory)];
     let mut schemas = carina_core::provider::collect_schemas(&factories);
     schemas.insert("mock_http", mock_http_replacement_schema());
-    let mut provider = ProviderRouter::new();
-    provider.add_provider("mock_http".to_string(), initialized);
+    let mut fresh_provider = ProviderRouter::new();
+    fresh_provider.add_provider("mock_http".to_string(), fresh_initialized);
 
     let fresh_resource = mock_http_resource("fresh-trap", server_address, "trap_after_send");
     let fresh_id = fresh_resource.id.clone();
     let fresh_resources = vec![ResolvedResource::new(fresh_resource)];
     let mut fresh_plan = Plan::new();
     fresh_plan.add(Effect::Create(fresh_resources[0].clone()));
-    let fresh_result =
-        execute_mock_http_plan(&provider, &factories, &schemas, &fresh_plan, HashMap::new()).await;
-    assert!(matches!(
-        fresh_result.applied_states.get(&fresh_id),
-        Some(carina_core::executor::Applied::CreateOutcomeUnknown(unknown))
-            if unknown.id() == &fresh_id
-    ));
+    let fresh_result = execute_mock_http_plan(
+        &fresh_provider,
+        &factories,
+        &schemas,
+        &fresh_plan,
+        HashMap::new(),
+    )
+    .await;
+    let fresh_entry = fresh_result.applied_states.get(&fresh_id);
+    assert!(
+        matches!(
+            fresh_entry,
+            Some(carina_core::executor::Applied::CreateOutcomeUnknown(unknown))
+                if unknown.id() == &fresh_id
+        ),
+        "{fresh_entry:?}"
+    );
     let fresh_state = build_state_after_apply(
         ApplyStateSave {
             state_file: StateFile::new(),
@@ -370,6 +382,31 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
             .current(),
         carina_state::CurrentInstance::CreateOutcomeUnknown { .. }
     ));
+
+    // A guest trap permanently poisons its configured runtime instance. Use a
+    // separately loaded factory so this half exercises replacement handling,
+    // not the poisoned instance's fail-fast path.
+    let replacement_verified = carina_provider_resolver::VerifiedLoad::for_test(
+        &wasm_bytes,
+        carina_provider_resolver::ProviderLoadIdentity::for_test(
+            "mock_http",
+            carina_provider_resolver::ProviderTrustClass::Untrusted,
+        ),
+    );
+    let replacement_factory = carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
+        replacement_verified,
+        cache.path(),
+    )
+    .await
+    .expect("load replacement mock HTTP WASM provider")
+    .with_http_test_route("phase-test.invalid", server_address);
+    let replacement_ready = mock_http_ready_config(&replacement_factory);
+    let replacement_initialized = replacement_factory
+        .create_initialized_provider(None, &replacement_ready)
+        .await
+        .expect("initialize replacement mock HTTP provider");
+    let mut replacement_provider = ProviderRouter::new();
+    replacement_provider.add_provider("mock_http".to_string(), replacement_initialized);
 
     let mut desired = mock_http_resource("replacement-trap", server_address, "trap_after_send");
     desired.directives.create_before_destroy = true;
@@ -394,7 +431,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
     let replacement_plan = carina_core::differ::create_plan(
         &replacement_resources,
         &[],
-        &provider,
+        &replacement_provider,
         carina_core::differ::PlanPriorStates::new(
             &plan_input_current,
             &carina_core::differ::Orphans::new(),
@@ -433,18 +470,22 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
         .expect("insert old applied state");
 
     let replacement_result = execute_mock_http_plan(
-        &provider,
+        &replacement_provider,
         &factories,
         &schemas,
         &replacement_plan,
         crate::managed_current_from_states(current_states),
     )
     .await;
-    assert!(matches!(
-        replacement_result.applied_states.get(&replacement_id),
-        Some(carina_core::executor::Applied::CreateOutcomeUnknown(unknown))
-            if unknown.id() == &replacement_id
-    ));
+    let replacement_entry = replacement_result.applied_states.get(&replacement_id);
+    assert!(
+        matches!(
+            replacement_entry,
+            Some(carina_core::executor::Applied::CreateOutcomeUnknown(unknown))
+                if unknown.id() == &replacement_id
+        ),
+        "{replacement_entry:?}"
+    );
     let mut replacement_state = build_state_after_apply(
         ApplyStateSave {
             state_file: initial_state,

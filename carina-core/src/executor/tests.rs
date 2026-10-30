@@ -385,6 +385,7 @@ struct MockProvider {
 }
 
 enum ClassifiedCreateFixture {
+    OutcomeUnknown,
     Created,
     CreatedNotFound,
     CreatedReadFailed,
@@ -545,6 +546,10 @@ impl Provider for MockProvider {
             let id = id.clone();
             return Box::pin(async move {
                 match classified {
+                    ClassifiedCreateFixture::OutcomeUnknown => Err(attempt.outcome_unknown(
+                        crate::provider::EgressSent::for_test(),
+                        ProviderError::internal("create outcome is unknown"),
+                    )),
                     ClassifiedCreateFixture::Created => {
                         let identifier = AppliedIdentifier::new("created-id")
                             .expect("fixture identifier is non-empty");
@@ -2408,6 +2413,55 @@ async fn create_untracked_skips_dependents_and_writes_nothing() {
     );
     assert!(!result.applied_states.contains_key(&source_id));
     assert!(!result.applied_states.contains_key(&dependent_id));
+}
+
+#[tokio::test]
+async fn create_before_destroy_outcome_unknown_records_replacement_create_state() {
+    let provider = MockProvider::new();
+    let source = make_resource("source", &[]);
+    let source_id = source.id.clone();
+    let mut directives = Directives::default();
+    directives.create_before_destroy = true;
+    let mut plan = Plan::new();
+    plan.add(create_effect(source));
+    plan.add(Effect::Delete {
+        id: crate::resource::ResolvedResourceId::new(source_id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("old-id"),
+        generation: EffectGeneration::Current,
+        directives,
+        binding: Some("source".to_string()),
+        dependencies: HashSet::new(),
+        explicit_dependencies: HashSet::new(),
+        blocked_by_updates: HashSet::new(),
+    });
+    provider.push_classified_create(ClassifiedCreateFixture::OutcomeUnknown);
+    let old = State::existing(source_id.clone(), HashMap::new()).with_identifier("old-id");
+
+    let result = execute_lifecycle_fixture(
+        &provider,
+        &plan,
+        HashMap::from([(source_id.clone(), Current::from_state(old))]),
+    )
+    .await;
+
+    assert_eq!(
+        (
+            result.success_count,
+            result.failure_count,
+            result.skip_count
+        ),
+        (0, 1, 1)
+    );
+    let entry = result.applied_states.get(&source_id);
+    assert!(
+        matches!(entry, Some(Applied::CreateOutcomeUnknown(unknown)) if unknown.id() == &source_id),
+        "{entry:?}"
+    );
+    assert_eq!(
+        provider.calls(),
+        vec![("create".to_string(), source_id.to_string())],
+        "the failed CBD create must prevent deletion of the old generation"
+    );
 }
 
 #[tokio::test]
