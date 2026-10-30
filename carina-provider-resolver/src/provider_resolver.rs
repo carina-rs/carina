@@ -838,6 +838,20 @@ pub enum RegistrySequence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegistrySequenceAnchor {
     Unestablished,
+    /// An explicit re-bootstrap was committed, but no subsequent resolution
+    /// has successfully established (or consumed the absence of) an anchor.
+    ResetPending,
+    Established(u64),
+}
+
+/// The persisted state seen before validating a registry listing. Unlike an
+/// anchor alone, this distinguishes a source with no lock record from an
+/// existing source whose first sequence-less resolution already completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrySequencePreviousState {
+    FirstContact,
+    Unestablished,
+    ResetPending,
     Established(u64),
 }
 
@@ -1196,14 +1210,8 @@ pub struct RegistryFreshness {
 }
 
 enum RegistryRecoveryTarget<R> {
-    Pinned {
-        index: usize,
-        state: R,
-        sequence_anchor: RegistrySequenceAnchor,
-    },
-    Unpinned {
-        state: R,
-    },
+    Pinned { index: usize, state: R },
+    Unpinned { state: R },
 }
 
 impl<R> RegistryRecoveryTarget<R> {
@@ -1213,25 +1221,11 @@ impl<R> RegistryRecoveryTarget<R> {
         }
     }
 
-    fn sequence_anchor(&self) -> RegistrySequenceAnchor {
-        match self {
-            Self::Pinned {
-                sequence_anchor, ..
-            } => *sequence_anchor,
-            Self::Unpinned { .. } => RegistrySequenceAnchor::Unestablished,
-        }
-    }
-
     fn map_state<S>(self, map: impl FnOnce(R) -> S) -> RegistryRecoveryTarget<S> {
         match self {
-            Self::Pinned {
-                index,
-                state,
-                sequence_anchor,
-            } => RegistryRecoveryTarget::Pinned {
+            Self::Pinned { index, state } => RegistryRecoveryTarget::Pinned {
                 index,
                 state: map(state),
-                sequence_anchor,
             },
             Self::Unpinned { state } => RegistryRecoveryTarget::Unpinned { state: map(state) },
         }
@@ -1242,14 +1236,9 @@ impl<R> RegistryRecoveryTarget<R> {
         map: impl FnOnce(R) -> Result<S, E>,
     ) -> Result<RegistryRecoveryTarget<S>, E> {
         match self {
-            Self::Pinned {
-                index,
-                state,
-                sequence_anchor,
-            } => Ok(RegistryRecoveryTarget::Pinned {
+            Self::Pinned { index, state } => Ok(RegistryRecoveryTarget::Pinned {
                 index,
                 state: map(state)?,
-                sequence_anchor,
             }),
             Self::Unpinned { state } => Ok(RegistryRecoveryTarget::Unpinned { state: map(state)? }),
         }
@@ -1313,6 +1302,7 @@ impl std::error::Error for RegistryLockRecoveryError {}
 #[serde(into = "RegistryRatchetsSerde")]
 struct RegistryRatchets {
     sequence: RegistrySequence,
+    sequence_anchor: RegistrySequenceAnchor,
     valid_until_present: bool,
     yanked_versions: YankedRegistryVersions,
     signature: RegistrySignatureProtection,
@@ -1331,6 +1321,7 @@ struct RegistryIdentityRepinState {
 
 struct RegistryIdentityRepinResidual {
     sequence: RegistrySequence,
+    sequence_anchor: RegistrySequenceAnchor,
     valid_until_present: bool,
     yanked_versions: YankedRegistryVersions,
     transparency_log_present: bool,
@@ -1338,6 +1329,7 @@ struct RegistryIdentityRepinResidual {
 
 struct RegistryRebootstrapState {
     sequence: RegistrySequence,
+    sequence_anchor: RegistrySequenceAnchor,
     residual: RegistryRebootstrapResidual,
 }
 
@@ -1352,6 +1344,7 @@ impl Default for RegistryRatchets {
     fn default() -> Self {
         Self {
             sequence: RegistrySequence::Absent,
+            sequence_anchor: RegistrySequenceAnchor::Unestablished,
             valid_until_present: false,
             yanked_versions: YankedRegistryVersions::default(),
             signature: RegistrySignatureProtection::NotRequired,
@@ -1369,6 +1362,7 @@ impl RegistryRatchets {
             (Some(sequence), None) => RegistrySequence::Present(sequence),
             (None, None) => RegistrySequence::Absent,
         };
+        self.sequence_anchor = self.sequence_anchor.merge(other.sequence_anchor);
         self.valid_until_present |= other.valid_until_present;
         self.yanked_versions = self.yanked_versions.union(&other.yanked_versions);
         self.signature = signature;
@@ -1383,12 +1377,14 @@ impl RegistryRatchets {
         let merged = RegistryRatchets::from(&*registry).merge(&self)?;
         let Self {
             sequence,
+            sequence_anchor,
             valid_until_present,
             yanked_versions,
             signature,
             transparency_log_present,
         } = merged;
         registry.sequence = sequence;
+        registry.sequence_anchor = sequence_anchor;
         registry.valid_until_present = valid_until_present;
         registry.yanked_versions = yanked_versions;
         registry.signature = signature;
@@ -1402,6 +1398,7 @@ impl RegistryRatchets {
     ) -> Result<RegistryIdentityRepinState, RegistryLockRecoveryError> {
         let Self {
             sequence,
+            sequence_anchor,
             valid_until_present,
             yanked_versions,
             signature,
@@ -1425,6 +1422,7 @@ impl RegistryRatchets {
             pin,
             residual: RegistryIdentityRepinResidual {
                 sequence,
+                sequence_anchor,
                 valid_until_present,
                 yanked_versions,
                 transparency_log_present,
@@ -1435,6 +1433,7 @@ impl RegistryRatchets {
     fn into_rebootstrap_state(self) -> RegistryRebootstrapState {
         let Self {
             sequence,
+            sequence_anchor,
             valid_until_present,
             yanked_versions,
             signature,
@@ -1442,6 +1441,7 @@ impl RegistryRatchets {
         } = self;
         RegistryRebootstrapState {
             sequence,
+            sequence_anchor,
             residual: RegistryRebootstrapResidual {
                 valid_until_present,
                 yanked_versions,
@@ -1456,6 +1456,7 @@ impl RegistryIdentityRepinResidual {
     fn into_ratchets(self) -> RegistryRatchets {
         RegistryRatchets {
             sequence: self.sequence,
+            sequence_anchor: self.sequence_anchor,
             valid_until_present: self.valid_until_present,
             yanked_versions: self.yanked_versions,
             signature: RegistrySignatureProtection::Required(SignerPinState::Unpinned),
@@ -1466,12 +1467,14 @@ impl RegistryIdentityRepinResidual {
     fn apply_to_registry(self, registry: &mut RegistryLock) {
         let RegistryRatchets {
             sequence,
+            sequence_anchor,
             valid_until_present,
             yanked_versions,
             signature,
             transparency_log_present,
         } = self.into_ratchets();
         registry.sequence = sequence;
+        registry.sequence_anchor = sequence_anchor;
         registry.valid_until_present = valid_until_present;
         registry.yanked_versions = yanked_versions;
         registry.signature = signature;
@@ -1483,6 +1486,7 @@ impl RegistryRebootstrapResidual {
     fn into_ratchets(self) -> RegistryRatchets {
         RegistryRatchets {
             sequence: RegistrySequence::Absent,
+            sequence_anchor: RegistrySequenceAnchor::ResetPending,
             valid_until_present: self.valid_until_present,
             yanked_versions: self.yanked_versions,
             signature: self.signature,
@@ -1493,12 +1497,14 @@ impl RegistryRebootstrapResidual {
     fn apply_to_registry(self, registry: &mut RegistryLock) {
         let RegistryRatchets {
             sequence,
+            sequence_anchor,
             valid_until_present,
             yanked_versions,
             signature,
             transparency_log_present,
         } = self.into_ratchets();
         registry.sequence = sequence;
+        registry.sequence_anchor = sequence_anchor;
         registry.valid_until_present = valid_until_present;
         registry.yanked_versions = yanked_versions;
         registry.signature = signature;
@@ -1532,6 +1538,7 @@ impl From<&RegistryLock> for RegistryRatchets {
     fn from(registry: &RegistryLock) -> Self {
         Self {
             sequence: registry.sequence.clone(),
+            sequence_anchor: registry.sequence_anchor,
             valid_until_present: registry.valid_until_present,
             yanked_versions: registry.yanked_versions.clone(),
             signature: registry.signature.clone(),
@@ -1728,13 +1735,27 @@ fn sequence_from_wire(
 
 fn sequence_anchor_from_wire(
     established: bool,
+    reset_pending: bool,
     sequence: Option<u64>,
 ) -> Result<RegistrySequenceAnchor, RegistryLockError> {
-    match (established, sequence) {
-        (false, None) => Ok(RegistrySequenceAnchor::Unestablished),
-        (true, Some(sequence)) => Ok(RegistrySequenceAnchor::Established(sequence)),
+    match (established, reset_pending, sequence) {
+        (false, false, None) => Ok(RegistrySequenceAnchor::Unestablished),
+        (false, true, None) => Ok(RegistrySequenceAnchor::ResetPending),
+        (true, false, Some(sequence)) => Ok(RegistrySequenceAnchor::Established(sequence)),
         _ => Err(RegistryLockError::InconsistentSequence),
     }
+}
+
+fn sequence_anchor_to_wire(anchor: RegistrySequenceAnchor) -> (bool, bool, Option<u64>) {
+    match anchor {
+        RegistrySequenceAnchor::Unestablished => (false, false, None),
+        RegistrySequenceAnchor::ResetPending => (false, true, None),
+        RegistrySequenceAnchor::Established(sequence) => (true, false, Some(sequence)),
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn validate_sequence_anchor(
@@ -1750,7 +1771,11 @@ fn validate_sequence_anchor(
         {
             Err(RegistryLockError::InconsistentSequence)
         }
-        _ => Ok(()),
+        (
+            RegistrySequence::Absent | RegistrySequence::Present(_),
+            RegistrySequenceAnchor::Unestablished | RegistrySequenceAnchor::ResetPending,
+        )
+        | (RegistrySequence::Present(_), RegistrySequenceAnchor::Established(_)) => Ok(()),
     }
 }
 
@@ -1760,6 +1785,12 @@ struct RegistryRatchetsSerde {
     sequence_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    sequence_anchor_established: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    sequence_anchor_reset_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sequence_anchor: Option<u64>,
     valid_until_present: bool,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     yanked_versions: BTreeSet<String>,
@@ -1788,6 +1819,9 @@ impl TryFrom<RegistryRatchetsSerde> for RegistryRatchets {
         let RegistryRatchetsSerde {
             sequence_present,
             sequence,
+            sequence_anchor_established,
+            sequence_anchor_reset_pending,
+            sequence_anchor,
             valid_until_present,
             yanked_versions,
             signature_state,
@@ -1800,11 +1834,13 @@ impl TryFrom<RegistryRatchetsSerde> for RegistryRatchets {
             prerelease_workflow,
             transparency_log_present,
         } = value;
-        let sequence = match (sequence_present, sequence) {
-            (false, None) => RegistrySequence::Absent,
-            (true, Some(sequence)) => RegistrySequence::Present(sequence),
-            _ => return Err(RegistryLockError::InconsistentSequence),
-        };
+        let sequence = sequence_from_wire(sequence_present, sequence)?;
+        let sequence_anchor = sequence_anchor_from_wire(
+            sequence_anchor_established,
+            sequence_anchor_reset_pending,
+            sequence_anchor,
+        )?;
+        validate_sequence_anchor(&sequence, sequence_anchor)?;
         let signature = RegistrySignatureProtectionSerde {
             signature_state,
             legacy_certificate_identity,
@@ -1818,6 +1854,7 @@ impl TryFrom<RegistryRatchetsSerde> for RegistryRatchets {
         .try_into()?;
         Ok(Self {
             sequence,
+            sequence_anchor,
             valid_until_present,
             yanked_versions: YankedRegistryVersions::from_serialized(yanked_versions),
             signature,
@@ -1832,6 +1869,8 @@ impl From<RegistryRatchets> for RegistryRatchetsSerde {
             RegistrySequence::Absent => (false, None),
             RegistrySequence::Present(sequence) => (true, Some(sequence)),
         };
+        let (sequence_anchor_established, sequence_anchor_reset_pending, sequence_anchor) =
+            sequence_anchor_to_wire(value.sequence_anchor);
         let RegistrySignatureProtectionSerde {
             signature_state,
             legacy_certificate_identity,
@@ -1845,6 +1884,9 @@ impl From<RegistryRatchets> for RegistryRatchetsSerde {
         Self {
             sequence_present,
             sequence,
+            sequence_anchor_established,
+            sequence_anchor_reset_pending,
+            sequence_anchor,
             valid_until_present: value.valid_until_present,
             yanked_versions: value.yanked_versions.into_serialized(),
             signature_state,
@@ -1879,6 +1921,8 @@ struct RegistryLockSerde {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sequence: Option<u64>,
     sequence_anchor_established: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    sequence_anchor_reset_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sequence_anchor: Option<u64>,
     valid_until_present: bool,
@@ -1911,6 +1955,7 @@ impl TryFrom<RegistryLockSerde> for RegistryLock {
             sequence_present,
             sequence,
             sequence_anchor_established,
+            sequence_anchor_reset_pending,
             sequence_anchor,
             valid_until_present,
             yanked_versions,
@@ -1924,27 +1969,13 @@ impl TryFrom<RegistryLockSerde> for RegistryLock {
             prerelease_workflow,
             transparency_log_present,
         } = value;
-        let sequence = match (sequence_present, sequence) {
-            (false, None) => RegistrySequence::Absent,
-            (true, Some(sequence)) => RegistrySequence::Present(sequence),
-            _ => return Err(RegistryLockError::InconsistentSequence),
-        };
-        let sequence_anchor = match (sequence_anchor_established, sequence_anchor) {
-            (false, None) => RegistrySequenceAnchor::Unestablished,
-            (true, Some(sequence)) => RegistrySequenceAnchor::Established(sequence),
-            _ => return Err(RegistryLockError::InconsistentSequence),
-        };
-        match (&sequence, sequence_anchor) {
-            (RegistrySequence::Absent, RegistrySequenceAnchor::Established(_)) => {
-                return Err(RegistryLockError::InconsistentSequence);
-            }
-            (RegistrySequence::Present(observed), RegistrySequenceAnchor::Established(anchor))
-                if anchor > *observed =>
-            {
-                return Err(RegistryLockError::InconsistentSequence);
-            }
-            (RegistrySequence::Absent | RegistrySequence::Present(_), _) => {}
-        }
+        let sequence = sequence_from_wire(sequence_present, sequence)?;
+        let sequence_anchor = sequence_anchor_from_wire(
+            sequence_anchor_established,
+            sequence_anchor_reset_pending,
+            sequence_anchor,
+        )?;
+        validate_sequence_anchor(&sequence, sequence_anchor)?;
         let signature = RegistrySignatureProtectionSerde {
             signature_state,
             legacy_certificate_identity,
@@ -1974,10 +2005,8 @@ impl From<RegistryLock> for RegistryLockSerde {
             RegistrySequence::Absent => (false, None),
             RegistrySequence::Present(sequence) => (true, Some(sequence)),
         };
-        let (sequence_anchor_established, sequence_anchor) = match value.sequence_anchor {
-            RegistrySequenceAnchor::Unestablished => (false, None),
-            RegistrySequenceAnchor::Established(sequence) => (true, Some(sequence)),
-        };
+        let (sequence_anchor_established, sequence_anchor_reset_pending, sequence_anchor) =
+            sequence_anchor_to_wire(value.sequence_anchor);
         let RegistrySignatureProtectionSerde {
             signature_state,
             legacy_certificate_identity,
@@ -1993,6 +2022,7 @@ impl From<RegistryLock> for RegistryLockSerde {
             sequence_present,
             sequence,
             sequence_anchor_established,
+            sequence_anchor_reset_pending,
             sequence_anchor,
             valid_until_present: value.valid_until_present,
             yanked_versions: value.yanked_versions.into_serialized(),
@@ -2020,7 +2050,7 @@ impl fmt::Display for RegistryLockError {
         match self {
             Self::InconsistentSequence => write!(
                 f,
-                "registry lock is inconsistent: the sequence observation and established sequence anchor must be encoded together, and an anchor cannot exceed its observation"
+                "registry lock is inconsistent: the sequence observation, reset-pending marker, and established sequence anchor must be encoded consistently, and an anchor cannot exceed its observation"
             ),
             Self::InconsistentSignature => write!(
                 f,
@@ -2097,8 +2127,28 @@ impl RegistrySequence {
 impl RegistrySequenceAnchor {
     fn value(self) -> Option<u64> {
         match self {
-            Self::Unestablished => None,
+            Self::Unestablished | Self::ResetPending => None,
             Self::Established(sequence) => Some(sequence),
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::ResetPending, _) | (_, Self::ResetPending) => Self::ResetPending,
+            (Self::Established(left), Self::Established(right)) => {
+                Self::Established(left.max(right))
+            }
+            (Self::Established(sequence), Self::Unestablished)
+            | (Self::Unestablished, Self::Established(sequence)) => Self::Established(sequence),
+            (Self::Unestablished, Self::Unestablished) => Self::Unestablished,
+        }
+    }
+
+    fn into_previous_state(self) -> RegistrySequencePreviousState {
+        match self {
+            Self::Unestablished => RegistrySequencePreviousState::Unestablished,
+            Self::ResetPending => RegistrySequencePreviousState::ResetPending,
+            Self::Established(sequence) => RegistrySequencePreviousState::Established(sequence),
         }
     }
 }
@@ -2398,6 +2448,7 @@ mod registry_lock_with_host {
             } = registry;
             let RegistryRatchets {
                 sequence,
+                sequence_anchor: _,
                 valid_until_present,
                 yanked_versions,
                 signature,
@@ -2759,8 +2810,11 @@ impl TryFrom<RegistryLockV3> for RegistryLock {
 
     fn try_from(value: RegistryLockV3) -> Result<Self, Self::Error> {
         let sequence = sequence_from_wire(value.sequence_present, value.sequence)?;
-        let sequence_anchor =
-            sequence_anchor_from_wire(value.sequence_anchor_established, value.sequence_anchor)?;
+        let sequence_anchor = sequence_anchor_from_wire(
+            value.sequence_anchor_established,
+            false,
+            value.sequence_anchor,
+        )?;
         validate_sequence_anchor(&sequence, sequence_anchor)?;
         Ok(Self {
             resolved_hostname: value.resolved_hostname,
@@ -2784,6 +2838,7 @@ impl TryFrom<RegistryRatchetsV3> for RegistryRatchets {
     fn try_from(value: RegistryRatchetsV3) -> Result<Self, Self::Error> {
         Ok(Self {
             sequence: sequence_from_wire(value.sequence_present, value.sequence)?,
+            sequence_anchor: RegistrySequenceAnchor::Unestablished,
             valid_until_present: value.valid_until_present,
             yanked_versions: YankedRegistryVersions::from_serialized(value.yanked_versions),
             signature: signature_from_v3(
@@ -3411,7 +3466,7 @@ impl PreparedRegistryRebootstrap<'_> {
     pub fn freshness(&self) -> RegistryFreshness {
         RegistryFreshness {
             sequence: self.target.state().sequence.value(),
-            sequence_anchor: self.target.sequence_anchor().value(),
+            sequence_anchor: self.target.state().sequence_anchor.value(),
         }
     }
 
@@ -3994,11 +4049,7 @@ impl LockFile {
             };
             return Ok(ResolvedRegistryRecovery {
                 source_key,
-                target: RegistryRecoveryTarget::Pinned {
-                    index,
-                    state,
-                    sequence_anchor: registry.sequence_anchor,
-                },
+                target: RegistryRecoveryTarget::Pinned { index, state },
             });
         }
         let state = self
@@ -4060,7 +4111,6 @@ impl LockFile {
                         provider: source_key.clone(),
                     })?;
                 state.residual.apply_to_registry(registry);
-                registry.sequence_anchor = RegistrySequenceAnchor::Unestablished;
                 self.unpinned_registry_ratchets.remove(&source_key);
             }
             RegistryRecoveryTarget::Unpinned { state } => {
@@ -4095,6 +4145,8 @@ impl LockFile {
     }
 
     /// Prepare an explicit registry re-bootstrap without mutating the lock file.
+    /// Committing installs a persisted reset-pending anchor state; only a
+    /// subsequent successful provider resolution consumes that marker.
     pub fn prepare_registry_rebootstrap(
         &mut self,
         provider: &str,
@@ -4171,8 +4223,13 @@ impl LockFile {
         source: &str,
     ) -> Result<RegistryRatchets, RegistryIdentityPinConflict> {
         let recorded = self
-            .find_by_source(source)
-            .and_then(|entry| entry.registry.as_ref())
+            .provider
+            .iter()
+            .find_map(|entry| {
+                Self::sources_match(&entry.source, source)
+                    .then_some(entry.registry.as_ref())
+                    .flatten()
+            })
             .map(RegistryRatchets::from)
             .unwrap_or_default();
         let source_key = canonical_lock_source(source);
@@ -4189,18 +4246,45 @@ impl LockFile {
         self.known_registry_ratchets(source.as_str())
     }
 
-    fn registry_sequence_anchor(&self, source: &str) -> RegistrySequenceAnchor {
-        self.find_by_source(source)
-            .and_then(|entry| entry.registry.as_ref())
-            .map(|registry| registry.sequence_anchor)
-            .unwrap_or(RegistrySequenceAnchor::Unestablished)
+    fn recorded_registry_sequence_anchor(&self, source: &str) -> Option<RegistrySequenceAnchor> {
+        let source_key = canonical_lock_source(source);
+        let pinned = self
+            .provider
+            .iter()
+            .find_map(|entry| {
+                Self::sources_match(&entry.source, &source_key)
+                    .then_some(entry.registry.as_ref())
+                    .flatten()
+            })
+            .map(|registry| registry.sequence_anchor);
+        let unpinned = self
+            .unpinned_registry_ratchets
+            .get(&source_key)
+            .map(|ratchets| ratchets.sequence_anchor);
+        match (pinned, unpinned) {
+            (Some(pinned), Some(unpinned)) => Some(pinned.merge(unpinned)),
+            (Some(anchor), None) | (None, Some(anchor)) => Some(anchor),
+            (None, None) => None,
+        }
     }
 
-    fn registry_sequence_anchor_by_source_key(
+    fn registry_sequence_previous_state(&self, source: &str) -> RegistrySequencePreviousState {
+        self.recorded_registry_sequence_anchor(source)
+            .map(RegistrySequenceAnchor::into_previous_state)
+            .unwrap_or(RegistrySequencePreviousState::FirstContact)
+    }
+
+    fn registry_sequence_previous_state_by_source_key(
         &self,
         source: &RemoteSourceKey,
-    ) -> RegistrySequenceAnchor {
-        self.registry_sequence_anchor(source.as_str())
+    ) -> RegistrySequencePreviousState {
+        self.registry_sequence_previous_state(source.as_str())
+    }
+
+    #[cfg(test)]
+    fn registry_sequence_anchor(&self, source: &str) -> RegistrySequenceAnchor {
+        self.recorded_registry_sequence_anchor(source)
+            .unwrap_or(RegistrySequenceAnchor::Unestablished)
     }
 
     fn attach_unpinned_registry_ratchets(
@@ -4414,14 +4498,14 @@ impl<'borrow, 'lock> PersistentLockFile<'borrow, 'lock> {
             .lock_file
             .known_registry_ratchets_by_source_key(source_key)
             .map_err(|error| error.to_string())?;
-        let sequence_anchor = self
+        let previous_sequence_state = self
             .lock_file
-            .registry_sequence_anchor_by_source_key(source_key);
+            .registry_sequence_previous_state_by_source_key(source_key);
         let validated = ValidatedRegistryListing::validate(
             source,
             versions,
             &locked,
-            sequence_anchor,
+            previous_sequence_state,
             self.lock_file.install_lock().project_dir(),
         )?;
         let (observations, validated_sequence) = validated.into_parts();
@@ -6249,7 +6333,7 @@ mod registry_listing_validation {
             source: &RegistrySource,
             versions: &RegistryVersions,
             locked: &RegistryRatchets,
-            sequence_anchor: RegistrySequenceAnchor,
+            previous_sequence_state: RegistrySequencePreviousState,
             project_dir: &Path,
         ) -> Result<Self, String> {
             let source_key = source.source_key();
@@ -6257,19 +6341,27 @@ mod registry_listing_validation {
             let valid_until_present = versions.valid_until.is_some();
             let mut refusals = None;
 
-            let sequence_transition = match (sequence_anchor, versions.sequence) {
-                (RegistrySequenceAnchor::Unestablished, None) => {
-                    Ok(RegistrySequenceTransition::StillUnestablished)
+            let sequence_transition = match (previous_sequence_state, versions.sequence) {
+                (
+                    RegistrySequencePreviousState::FirstContact
+                    | RegistrySequencePreviousState::ResetPending,
+                    None,
+                ) => Ok(RegistrySequenceTransition::StillUnestablished),
+                (RegistrySequencePreviousState::Unestablished, None) => {
+                    Ok(RegistrySequenceTransition::Unchanged)
                 }
-                (RegistrySequenceAnchor::Unestablished, Some(current)) => {
-                    Ok(RegistrySequenceTransition::Established(current))
-                }
-                (RegistrySequenceAnchor::Established(_previous), None) => {
+                (
+                    RegistrySequencePreviousState::FirstContact
+                    | RegistrySequencePreviousState::Unestablished
+                    | RegistrySequencePreviousState::ResetPending,
+                    Some(current),
+                ) => Ok(RegistrySequenceTransition::Established(current)),
+                (RegistrySequencePreviousState::Established(_previous), None) => {
                     Err(RegistryRefusal::SequenceFieldDisappeared {
                         target: target.clone(),
                     })
                 }
-                (RegistrySequenceAnchor::Established(previous), Some(current))
+                (RegistrySequencePreviousState::Established(previous), Some(current))
                     if current < previous =>
                 {
                     Err(RegistryRefusal::SequenceRollback {
@@ -6278,7 +6370,7 @@ mod registry_listing_validation {
                         target: target.clone(),
                     })
                 }
-                (RegistrySequenceAnchor::Established(previous), Some(current))
+                (RegistrySequencePreviousState::Established(previous), Some(current))
                     if current.saturating_sub(previous) > MAX_SEQUENCE_FAST_FORWARD =>
                 {
                     Err(RegistryRefusal::SequenceFastForward {
@@ -6287,12 +6379,12 @@ mod registry_listing_validation {
                         target: target.clone(),
                     })
                 }
-                (RegistrySequenceAnchor::Established(previous), Some(current))
+                (RegistrySequencePreviousState::Established(previous), Some(current))
                     if current == previous =>
                 {
                     Ok(RegistrySequenceTransition::Unchanged)
                 }
-                (RegistrySequenceAnchor::Established(previous), Some(current)) => {
+                (RegistrySequencePreviousState::Established(previous), Some(current)) => {
                     Ok(RegistrySequenceTransition::Advanced { previous, current })
                 }
             };
@@ -6354,6 +6446,7 @@ mod registry_listing_validation {
                 versions.sequence.is_some() || valid_until_present || !yanked_versions.is_empty();
             let observations = has_observations.then_some(RegistryRatchets {
                 sequence: sequence.clone(),
+                sequence_anchor: RegistrySequenceAnchor::Unestablished,
                 valid_until_present,
                 yanked_versions,
                 signature: RegistrySignatureProtection::NotRequired,
@@ -6387,7 +6480,7 @@ mod registry_listing_validation {
         }
 
         fn validate_sequence(
-            anchor: RegistrySequenceAnchor,
+            previous: RegistrySequencePreviousState,
             sequence: Option<u64>,
         ) -> Result<ValidatedRegistryListing, String> {
             ValidatedRegistryListing::validate(
@@ -6398,79 +6491,129 @@ mod registry_listing_validation {
                     versions: Vec::new(),
                 },
                 &RegistryRatchets::default(),
-                anchor,
+                previous,
                 Path::new("."),
             )
         }
 
         #[test]
-        fn registry_sequence_transition_is_established_from_first_contact() {
-            let validated =
-                validate_sequence(RegistrySequenceAnchor::Unestablished, Some(7)).unwrap();
-            let transition = validated.sequence.transition;
-            assert_eq!(transition, RegistrySequenceTransition::Established(7));
-            assert_eq!(
-                transition
-                    .into_notice(&source().source_key())
+        fn registry_sequence_transition_table_is_exhaustive() {
+            for (previous, listing, expected) in [
+                (
+                    RegistrySequencePreviousState::FirstContact,
+                    None,
+                    RegistrySequenceTransition::StillUnestablished,
+                ),
+                (
+                    RegistrySequencePreviousState::FirstContact,
+                    Some(7),
+                    RegistrySequenceTransition::Established(7),
+                ),
+                (
+                    RegistrySequencePreviousState::Unestablished,
+                    None,
+                    RegistrySequenceTransition::Unchanged,
+                ),
+                (
+                    RegistrySequencePreviousState::Unestablished,
+                    Some(7),
+                    RegistrySequenceTransition::Established(7),
+                ),
+                (
+                    RegistrySequencePreviousState::ResetPending,
+                    None,
+                    RegistrySequenceTransition::StillUnestablished,
+                ),
+                (
+                    RegistrySequencePreviousState::ResetPending,
+                    Some(7),
+                    RegistrySequenceTransition::Established(7),
+                ),
+                (
+                    RegistrySequencePreviousState::Established(7),
+                    Some(7),
+                    RegistrySequenceTransition::Unchanged,
+                ),
+                (
+                    RegistrySequencePreviousState::Established(5),
+                    Some(7),
+                    RegistrySequenceTransition::Advanced {
+                        previous: 5,
+                        current: 7,
+                    },
+                ),
+            ] {
+                let transition = validate_sequence(previous, listing)
                     .unwrap()
-                    .to_string(),
+                    .sequence
+                    .transition;
+                assert_eq!(transition, expected, "{previous:?} + {listing:?}");
+            }
+
+            for (previous, listing, expected_error) in [
+                (
+                    RegistrySequencePreviousState::Established(7),
+                    None,
+                    "registry sequence field disappeared",
+                ),
+                (
+                    RegistrySequencePreviousState::Established(7),
+                    Some(6),
+                    "registry sequence rollback",
+                ),
+                (
+                    RegistrySequencePreviousState::Established(7),
+                    Some(7 + MAX_SEQUENCE_FAST_FORWARD + 1),
+                    "registry sequence fast-forward",
+                ),
+            ] {
+                let error = validate_sequence(previous, listing)
+                    .expect_err("the established-anchor transition must be refused");
+                assert!(
+                    error.contains(expected_error),
+                    "{previous:?} + {listing:?}: {error}"
+                );
+            }
+        }
+
+        #[test]
+        fn reset_pending_with_sequence_is_announced_once_then_silent() {
+            let first = validate_sequence(RegistrySequencePreviousState::ResetPending, Some(7))
+                .unwrap()
+                .sequence;
+            let (anchor, notice) = first.into_anchor_and_notice(&source().source_key());
+            assert_eq!(anchor, RegistrySequenceAnchor::Established(7));
+            assert_eq!(
+                notice.unwrap().to_string(),
                 "carina: established registry sequence anchor for carina-rs/aws: 7"
             );
+
+            let second = validate_sequence(anchor.into_previous_state(), Some(7))
+                .unwrap()
+                .sequence;
+            let (anchor, notice) = second.into_anchor_and_notice(&source().source_key());
+            assert_eq!(anchor, RegistrySequenceAnchor::Established(7));
+            assert!(notice.is_none());
         }
 
         #[test]
-        fn registry_sequence_transition_stays_unestablished_without_sequence() {
-            let validated = validate_sequence(RegistrySequenceAnchor::Unestablished, None).unwrap();
-            let transition = validated.sequence.transition;
-            assert_eq!(transition, RegistrySequenceTransition::StillUnestablished);
+        fn reset_pending_without_sequence_is_announced_once_then_silent() {
+            let first = validate_sequence(RegistrySequencePreviousState::ResetPending, None)
+                .unwrap()
+                .sequence;
+            let (anchor, notice) = first.into_anchor_and_notice(&source().source_key());
+            assert_eq!(anchor, RegistrySequenceAnchor::Unestablished);
             assert_eq!(
-                transition
-                    .into_notice(&source().source_key())
-                    .unwrap()
-                    .to_string(),
+                notice.unwrap().to_string(),
                 "carina: registry listing for carina-rs/aws has no sequence; no reference point established"
             );
-        }
 
-        #[test]
-        fn registry_sequence_transition_is_unchanged_at_existing_anchor() {
-            let validated =
-                validate_sequence(RegistrySequenceAnchor::Established(7), Some(7)).unwrap();
-            let transition = validated.sequence.transition;
-            assert_eq!(transition, RegistrySequenceTransition::Unchanged);
-            assert!(transition.into_notice(&source().source_key()).is_none());
-        }
-
-        #[test]
-        fn registry_sequence_transition_advances_existing_anchor() {
-            let validated =
-                validate_sequence(RegistrySequenceAnchor::Established(5), Some(7)).unwrap();
-            let transition = validated.sequence.transition;
-            assert_eq!(
-                transition,
-                RegistrySequenceTransition::Advanced {
-                    previous: 5,
-                    current: 7,
-                }
-            );
-            assert!(transition.into_notice(&source().source_key()).is_none());
-        }
-
-        #[test]
-        fn registry_sequence_transition_still_refuses_rollback_and_disappearance() {
-            let rollback = validate_sequence(RegistrySequenceAnchor::Established(7), Some(6))
-                .expect_err("rollback must remain refused");
-            assert!(
-                rollback.contains("registry sequence rollback"),
-                "{rollback}"
-            );
-
-            let disappearance = validate_sequence(RegistrySequenceAnchor::Established(7), None)
-                .expect_err("disappearance must remain refused");
-            assert!(
-                disappearance.contains("registry sequence field disappeared"),
-                "{disappearance}"
-            );
+            let second = validate_sequence(anchor.into_previous_state(), None)
+                .unwrap()
+                .sequence;
+            let (anchor, notice) = second.into_anchor_and_notice(&source().source_key());
+            assert_eq!(anchor, RegistrySequenceAnchor::Unestablished);
+            assert!(notice.is_none());
         }
     }
 }
@@ -11707,6 +11850,15 @@ sha256 = "def"
         lock.to_toml_string().unwrap()
     }
 
+    fn reset_pending_lock_toml() -> String {
+        let mut lock = lock_with_registry_security_state(signed_fixture_pin());
+        lock.prepare_registry_rebootstrap("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+        lock.to_toml_string().unwrap()
+    }
+
     fn fully_protected_v2_lock_toml() -> &'static str {
         r#"version = 2
 
@@ -11910,7 +12062,7 @@ transparency_log_present = false
             &source,
             &listing,
             &known,
-            lock.registry_sequence_anchor("carina-rs/aws"),
+            lock.registry_sequence_previous_state("carina-rs/aws"),
             Path::new("."),
         ) {
             Ok(_) => panic!("an explicitly recorded yank must not be reversible"),
@@ -13092,6 +13244,74 @@ sha256 = "abc"
         assert!(
             !stderr.contains("carina: established registry sequence anchor"),
             "{stderr}"
+        );
+    }
+
+    #[test]
+    fn registry_sequence_reset_pending_survives_failed_final_save() {
+        let project = tempfile::tempdir().unwrap();
+        let lock_path = project.path().join("carina-providers.lock");
+        let mut initial =
+            lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
+        initial
+            .prepare_registry_rebootstrap("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+        initial.save(&lock_path).unwrap();
+
+        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let mut lock = install_lock.load_lock_file_or_default().unwrap();
+        let source = registry_source("carina-rs/aws");
+        let source_key = source.source_key();
+        let listing = RegistryVersions {
+            sequence: Some(11),
+            valid_until: Some("2999-01-01T00:00:00Z".into()),
+            versions: Vec::new(),
+        };
+        {
+            let mut persistent = PersistentLockFile::new(&mut lock);
+            let validated_sequence = persistent
+                .validate_and_record_registry_listing(&source, &source_key, &listing)
+                .unwrap();
+            persistent
+                .upsert_registry_provider(RegistryProviderLockEntry {
+                    name: "aws".into(),
+                    source: source_key,
+                    kind: LockEntryKind::Version {
+                        version: "0.5.0".into(),
+                        constraint: None,
+                    },
+                    sha256: "fixture-sha256".into(),
+                    registry: resolved_registry(
+                        "registry.carina-rs.dev",
+                        "https://registry.carina-rs.dev/v1/providers/",
+                    ),
+                    validated_sequence,
+                })
+                .unwrap();
+        }
+
+        with_lock_file_rename_hook(
+            |_, _| Err(io::Error::other("injected final save failure")),
+            || lock.save(),
+        )
+        .expect_err("the injected final save failure must prevent marker consumption");
+        drop(lock);
+
+        let reloaded = load_lock_file_for_test(&lock_path).unwrap().unwrap();
+        assert_eq!(
+            reloaded.registry_sequence_previous_state("carina-rs/aws"),
+            RegistrySequencePreviousState::ResetPending
+        );
+        assert_eq!(
+            reloaded
+                .known_registry_ratchets("carina-rs/aws")
+                .unwrap()
+                .sequence
+                .value(),
+            Some(11),
+            "the successful intermediate observation save must remain durable"
         );
     }
 
@@ -15008,6 +15228,28 @@ transparency_log_present = false
     }
 
     #[test]
+    fn lock_load_rejects_reset_pending_with_an_established_anchor() {
+        let reset_pending = reset_pending_lock_toml();
+        assert!(
+            reset_pending.contains("sequence_anchor_reset_pending = true"),
+            "{reset_pending}"
+        );
+
+        for inconsistent in [
+            reset_pending.replace(
+                "sequence_anchor_reset_pending = true\n",
+                "sequence_anchor_reset_pending = true\nsequence_anchor = 7\n",
+            ),
+            reset_pending.replace(
+                "sequence_anchor_established = false\n",
+                "sequence_anchor_established = true\nsequence_anchor = 7\n",
+            ),
+        ] {
+            assert_lock_toml_is_rejected(&inconsistent);
+        }
+    }
+
+    #[test]
     fn lock_load_rejects_stripped_transparency_log_presence() {
         let stripped = fully_protected_lock_toml().replace("transparency_log_present = true\n", "");
         assert_lock_toml_is_rejected(&stripped);
@@ -15193,6 +15435,9 @@ transparency_log_present = false
         let source_without_workflow = RegistryRatchetsSerde {
             sequence_present: false,
             sequence: None,
+            sequence_anchor_established: false,
+            sequence_anchor_reset_pending: false,
+            sequence_anchor: None,
             valid_until_present: false,
             yanked_versions: BTreeSet::new(),
             signature_state: RegistrySignatureStateSerde::RequiredCurrent,
@@ -15213,6 +15458,9 @@ transparency_log_present = false
         let legacy_and_current = RegistryRatchetsSerde {
             sequence_present: false,
             sequence: None,
+            sequence_anchor_established: false,
+            sequence_anchor_reset_pending: false,
+            sequence_anchor: None,
             valid_until_present: false,
             yanked_versions: BTreeSet::new(),
             signature_state: RegistrySignatureStateSerde::RequiredCurrent,
@@ -15229,6 +15477,32 @@ transparency_log_present = false
             RegistryRatchets::try_from(legacy_and_current),
             Err(RegistryLockError::InconsistentSignature)
         ));
+    }
+
+    #[test]
+    fn registry_ratchet_serializer_rejects_contradictory_reset_pending_encodings() {
+        for inconsistent in [
+            r#"sequence_present = false
+sequence_anchor_reset_pending = true
+sequence_anchor = 7
+valid_until_present = false
+signature_state = "not_required"
+transparency_log_present = false
+"#,
+            r#"sequence_present = false
+sequence_anchor_established = true
+sequence_anchor_reset_pending = true
+sequence_anchor = 7
+valid_until_present = false
+signature_state = "not_required"
+transparency_log_present = false
+"#,
+        ] {
+            assert!(
+                toml::from_str::<RegistryRatchets>(inconsistent).is_err(),
+                "inconsistent reset-pending ratchets were accepted: {inconsistent}"
+            );
+        }
     }
 
     #[test]
@@ -15313,7 +15587,7 @@ transparency_log_present = false
         assert!(lock.provider[0].registry.is_none());
         let after = lock.provider[1].registry.as_ref().unwrap();
         assert_eq!(after.sequence, RegistrySequence::Absent);
-        assert_eq!(after.sequence_anchor, RegistrySequenceAnchor::Unestablished);
+        assert_eq!(after.sequence_anchor, RegistrySequenceAnchor::ResetPending);
         assert_eq!(after.yanked_versions, before.yanked_versions);
         assert_eq!(after.signature, before.signature);
         assert_eq!(after.valid_until_present, before.valid_until_present);
@@ -15821,7 +16095,7 @@ transparency_log_present = false
         assert!(ratchets.transparency_log_present);
         assert_eq!(
             lock.registry_sequence_anchor("carina-rs/aws"),
-            RegistrySequenceAnchor::Unestablished
+            RegistrySequenceAnchor::ResetPending
         );
         let after_entry = lock.find_by_source("carina-rs/aws").unwrap();
         assert_eq!(after_entry.sha256, before_entry.sha256);
@@ -15835,7 +16109,7 @@ transparency_log_present = false
         );
         assert_eq!(
             reloaded.registry_sequence_anchor("carina-rs/aws"),
-            RegistrySequenceAnchor::Unestablished
+            RegistrySequenceAnchor::ResetPending
         );
     }
 
@@ -15857,7 +16131,7 @@ transparency_log_present = false
             &source,
             &listing_without_sequence,
             &before,
-            lock.registry_sequence_anchor("carina-rs/aws"),
+            lock.registry_sequence_previous_state("carina-rs/aws"),
             Path::new("."),
         ) {
             Ok(_) => panic!("an established sequence anchor must reject a missing sequence"),
@@ -15881,13 +16155,13 @@ transparency_log_present = false
         assert_eq!(after.sequence, RegistrySequence::Absent);
         assert_eq!(
             lock.registry_sequence_anchor("carina-rs/aws"),
-            RegistrySequenceAnchor::Unestablished
+            RegistrySequenceAnchor::ResetPending
         );
         let validated = ValidatedRegistryListing::validate(
             &source,
             &listing_without_sequence,
             &after,
-            lock.registry_sequence_anchor("carina-rs/aws"),
+            lock.registry_sequence_previous_state("carina-rs/aws"),
             Path::new("."),
         )
         .expect("re-bootstrap must make a sequence-less listing first contact");
@@ -15901,7 +16175,7 @@ transparency_log_present = false
         let source = registry_source("carina-rs/aws");
         let lock = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
         let locked = lock.known_registry_ratchets("carina-rs/aws").unwrap();
-        let sequence_anchor = lock.registry_sequence_anchor("carina-rs/aws");
+        let previous_sequence_state = lock.registry_sequence_previous_state("carina-rs/aws");
         let listing = |yanked| RegistryVersions {
             sequence: Some(4),
             valid_until: Some("2999-01-01T00:00:00Z".into()),
@@ -15915,7 +16189,7 @@ transparency_log_present = false
             &source,
             &listing(true),
             &locked,
-            sequence_anchor,
+            previous_sequence_state,
             Path::new("."),
         ) {
             Ok(_) => panic!("a sequence rollback must be refused"),
@@ -15934,7 +16208,7 @@ transparency_log_present = false
             &source,
             &listing(false),
             &locked,
-            sequence_anchor,
+            previous_sequence_state,
             Path::new("."),
         ) {
             Ok(_) => panic!("a rollback that also drops a yank must report both refusals"),
@@ -16020,7 +16294,7 @@ transparency_log_present = false
         let mut expected = original;
         let expected_registry = expected.provider[0].registry.as_mut().unwrap();
         expected_registry.sequence = RegistrySequence::Absent;
-        expected_registry.sequence_anchor = RegistrySequenceAnchor::Unestablished;
+        expected_registry.sequence_anchor = RegistrySequenceAnchor::ResetPending;
         expected_registry.signature =
             RegistrySignatureProtection::Required(SignerPinState::Unpinned);
         assert_eq!(
@@ -16123,10 +16397,15 @@ transparency_log_present = false
         );
         assert_eq!(
             lock.registry_sequence_anchor("carina-rs/aws"),
-            RegistrySequenceAnchor::Unestablished
+            RegistrySequenceAnchor::ResetPending
         );
 
         lock.save(&lock_path).unwrap();
+        let saved = fs::read_to_string(&lock_path).unwrap();
+        assert!(
+            saved.contains("sequence_anchor_reset_pending = true"),
+            "{saved}"
+        );
         let reloaded = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         assert_eq!(
             reloaded
@@ -16137,13 +16416,19 @@ transparency_log_present = false
         );
         assert_eq!(
             reloaded.registry_sequence_anchor("carina-rs/aws"),
-            RegistrySequenceAnchor::Unestablished
+            RegistrySequenceAnchor::ResetPending
+        );
+        assert_eq!(
+            reloaded.registry_sequence_previous_state("carina-rs/aws"),
+            RegistrySequencePreviousState::ResetPending
         );
     }
 
     #[test]
     fn prepared_unpinned_rebootstrap_uses_the_lock_anchor_value() {
         let source = "carina-rs/aws";
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
         let mut lock = LockFile::default();
         lock.unpinned_registry_ratchets
             .merge(
@@ -16171,7 +16456,19 @@ transparency_log_present = false
         );
         assert_eq!(
             lock.registry_sequence_anchor(source),
-            RegistrySequenceAnchor::Unestablished
+            RegistrySequenceAnchor::ResetPending
+        );
+
+        lock.save(&lock_path).unwrap();
+        let saved = fs::read_to_string(&lock_path).unwrap();
+        assert!(
+            saved.contains("sequence_anchor_reset_pending = true"),
+            "{saved}"
+        );
+        let reloaded = load_lock_file_for_test(&lock_path).unwrap().unwrap();
+        assert_eq!(
+            reloaded.registry_sequence_previous_state(source),
+            RegistrySequencePreviousState::ResetPending
         );
     }
 
@@ -16931,7 +17228,7 @@ transparency_log_present = true
                     versions: Vec::new(),
                 },
                 &RegistryRatchets::default(),
-                RegistrySequenceAnchor::Unestablished,
+                RegistrySequencePreviousState::FirstContact,
                 dir.path(),
             )
             .unwrap();
@@ -18082,6 +18379,56 @@ transparency_log_present = true
             saved_registry_ratchets(dir.path()).sequence.value(),
             Some(hostile_sequence),
             "successful recovery must not erase the durable failed observation"
+        );
+    }
+
+    #[test]
+    fn registry_security_failed_resolution_after_rebootstrap_keeps_reset_pending() {
+        let user_dirs = carina_core::TestUserDirs::new();
+        const ARTIFACT: &[u8] = b"failed post-rebootstrap artifact";
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        let config = provider_config("carina-rs/aws", None);
+        let shasum = sha256_bytes(ARTIFACT);
+        let baseline_http = registry_http_with_listing(
+            ARTIFACT,
+            &shasum,
+            r#"{"sequence":7,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
+        );
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
+
+        let mut lock = load_lock_file_for_test(&lock_path).unwrap().unwrap();
+        lock.prepare_registry_rebootstrap("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+        lock.save(&lock_path).unwrap();
+        assert_eq!(
+            saved_registry_sequence_anchor(dir.path()),
+            RegistrySequenceAnchor::ResetPending
+        );
+
+        let failed_http = FakeRegistryHttp::default()
+            .json(
+                "https://registry.carina-rs.dev/.well-known/carina.json",
+                r#"{"providers.v1":"/v1/providers/"}"#,
+            )
+            .json(
+                REGISTRY_VERSIONS_URL,
+                r#"{"sequence":11,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
+            );
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &failed_http)
+            .unwrap_err();
+
+        assert!(error.contains("unexpected test URL"), "{error}");
+        assert_eq!(
+            saved_registry_ratchets(dir.path()).sequence.value(),
+            Some(11)
+        );
+        assert_eq!(
+            saved_registry_sequence_anchor(dir.path()),
+            RegistrySequenceAnchor::ResetPending,
+            "a failed resolution must not consume the re-bootstrap marker"
         );
     }
 

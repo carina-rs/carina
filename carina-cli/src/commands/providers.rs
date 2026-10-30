@@ -266,6 +266,9 @@ fn run_rebootstrap(provider: &str, force: bool, base_dir: &Path) -> Result<(), A
     if !confirm_recovery(provider, "provider source", force)? {
         return Ok(());
     }
+    // Persist a typed reset-pending anchor state so failed resolutions cannot
+    // consume the operator-authorized reset. The next successful resolution
+    // replaces it with an established or already-seen sequence-less state.
     recovery
         .commit()
         .map_err(|error| AppError::Config(error.to_string()))?;

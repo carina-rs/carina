@@ -520,6 +520,10 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
                     saved.contains("sequence_anchor_established = false"),
                     "{saved}"
                 );
+                assert!(
+                    saved.contains("sequence_anchor_reset_pending = true"),
+                    "{saved}"
+                );
                 assert!(saved.contains("signature_state = \"required_legacy\""));
                 assert!(saved.contains("legacy_certificate_identity = \"identity-a\""));
             }
@@ -1025,6 +1029,10 @@ fn rebootstrap_prints_and_clears_both_freshness_values_only() {
         saved.contains("sequence_anchor_established = false"),
         "{saved}"
     );
+    assert!(
+        saved.contains("sequence_anchor_reset_pending = true"),
+        "{saved}"
+    );
     assert!(!saved.contains("sequence = "), "{saved}");
     assert!(!saved.contains("sequence_anchor = "), "{saved}");
     assert!(saved.contains("yanked_versions = [\"0.4.0\"]"), "{saved}");
@@ -1124,12 +1132,49 @@ fn rebootstrap_sequence_less_listing_prints_no_reference_point_notice() {
         let user_dirs = UserDirs::under(user_root.path());
         let http = registry_fixture(None);
         resolve_with_fixture(project.path(), &user_dirs, &http);
+        resolve_with_fixture(project.path(), &user_dirs, &http);
 
         let saved = fs::read_to_string(project.path().join("carina-providers.lock")).unwrap();
         assert!(
             saved.contains("sequence_anchor_established = false"),
             "{saved}"
         );
+        return;
+    }
+
+    let output = run_child_test(TEST_NAME, CHILD_ENV);
+    assert!(output.status.success(), "child test failed: {output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let notice = "carina: registry listing for carina-rs/aws has no sequence; no reference point established";
+    assert_eq!(stderr.matches(notice).count(), 1, "{stderr}");
+    assert!(
+        !stderr.contains("carina: established registry sequence anchor"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn sequence_less_registry_first_contact_prints_no_reference_point_notice_once() {
+    const CHILD_ENV: &str = "CARINA_TEST_FIRST_CONTACT_NO_SEQUENCE_NOTICE";
+    const TEST_NAME: &str =
+        "sequence_less_registry_first_contact_prints_no_reference_point_notice_once";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let project = tempfile::tempdir().unwrap();
+        let user_root = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(user_root.path());
+        let http = registry_fixture(None);
+
+        for _ in 0..3 {
+            resolve_with_fixture(project.path(), &user_dirs, &http);
+        }
+
+        let saved = fs::read_to_string(project.path().join("carina-providers.lock")).unwrap();
+        assert!(
+            saved.contains("sequence_anchor_established = false"),
+            "{saved}"
+        );
+        assert!(!saved.contains("sequence_anchor_reset_pending"), "{saved}");
         return;
     }
 
