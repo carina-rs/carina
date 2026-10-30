@@ -143,6 +143,24 @@ fn detect_anonymous_to_named_renames_for_test(
     providers: &[ProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
+    detect_anonymous_to_named_renames_with_bindings_for_test(
+        resources,
+        registry,
+        find_state_by_type,
+        &|_binding| Vec::new(),
+        providers,
+        identity_attributes_fn,
+    )
+}
+
+fn detect_anonymous_to_named_renames_with_bindings_for_test(
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+    find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
+    find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+    providers: &[ProviderConfig],
+    identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
+) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
     let claims = StateBlockClaims::empty();
     let find_screened_state_by_type = |provider: &str, resource_type: &str| {
         claims.screen_entries(
@@ -156,6 +174,7 @@ fn detect_anonymous_to_named_renames_for_test(
         resources,
         registry,
         &find_screened_state_by_type,
+        find_state_by_binding,
         providers,
         identity_attributes_fn,
         &claims,
@@ -4842,6 +4861,233 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
 }
 
 #[test]
+fn test_detect_rename_resolves_deferred_create_only_attrs_from_state_bindings() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        subnet_route_table_association_schema()
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+
+    let mut resource =
+        subnet_route_table_association_resource("nat_gw", "private_rtb", "private_subnet");
+    resource.binding = Some("nat_gw".to_string());
+    let resources = vec![resource];
+    let state_entries = vec![association_state_entry(
+        "awscc_ec2_subnet_route_table_association_11111111",
+        "rtb-private",
+        "subnet-private",
+    )];
+    let binding_entries = [
+        binding_state_entry("private_rtb", "private_rtb", &[("id", "rtb-private")]),
+        binding_state_entry(
+            "private_subnet",
+            "private_subnet",
+            &[("id", "subnet-private")],
+        ),
+    ];
+
+    let renames = detect_anonymous_to_named_renames_with_bindings_for_test(
+        &resources,
+        &schemas,
+        &|_provider, _resource_type| state_entries.clone(),
+        &|binding| {
+            binding_entries
+                .iter()
+                .filter(|(entry_binding, _)| entry_binding == binding)
+                .map(|(_, entry)| entry.clone())
+                .collect()
+        },
+        &[],
+        &|_provider| Vec::new(),
+    );
+
+    assert_eq!(renames.len(), 1);
+    assert_eq!(
+        renames[0].0.identity_str(),
+        "awscc_ec2_subnet_route_table_association_11111111"
+    );
+    assert_eq!(renames[0].1.identity_str(), "nat_gw");
+}
+
+#[test]
+fn test_detect_rename_matches_map_create_only_attr() {
+    let schema = ResourceSchema::new("test.MapIdentity").attribute(
+        AttributeSchema::optional("settings", AttributeType::map(AttributeType::string()))
+            .create_only()
+            .build(),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+
+    let settings = Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
+        "mode".to_string() => Value::Concrete(ConcreteValue::String("private".into())),
+        "zone".to_string() => Value::Concrete(ConcreteValue::String("a".into())),
+    }));
+    let mut resource = Resource::with_provider("awscc", "test.MapIdentity", "mapped", None);
+    resource.binding = Some("mapped".to_string());
+    resource.set_attr("settings".to_string(), settings.clone());
+    let resources = vec![resource];
+    let state_entries = vec![AnonymousIdStateInfo {
+        provider_instance: None,
+        name: "awscc_test_map_identity_11111111".to_string(),
+        create_only_values: HashMap::from([(
+            "settings".to_string(),
+            canonical_create_only_value_string(&settings).expect("concrete map is canonical"),
+        )]),
+    }];
+
+    let renames = detect_anonymous_to_named_renames_for_test(
+        &resources,
+        &schemas,
+        &|_provider, _resource_type| state_entries.clone(),
+        &[],
+        &|_provider| Vec::new(),
+    );
+
+    assert_eq!(renames.len(), 1);
+    assert_eq!(renames[0].1.identity_str(), "mapped");
+}
+
+#[test]
+fn test_detect_rename_matches_enum_and_int_create_only_attrs() {
+    let schema = ResourceSchema::new("test.TypedIdentity")
+        .attribute(
+            AttributeSchema::optional("domain", eip_domain_type("awscc"))
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("priority", AttributeType::int())
+                .create_only()
+                .build(),
+        );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+
+    let domain = Value::Concrete(ConcreteValue::CanonicalEnum(canonical_eip_domain(
+        "awscc",
+        "awscc.ec2.Eip.Domain.vpc",
+    )));
+    let priority = Value::Concrete(ConcreteValue::Int(7));
+    let mut resource = Resource::with_provider("awscc", "test.TypedIdentity", "typed", None);
+    resource.binding = Some("typed".to_string());
+    resource.set_attr("domain".to_string(), domain.clone());
+    resource.set_attr("priority".to_string(), priority.clone());
+    let resources = vec![resource];
+    let state_entries = vec![AnonymousIdStateInfo {
+        provider_instance: None,
+        name: "awscc_test_typed_identity_11111111".to_string(),
+        create_only_values: HashMap::from([
+            (
+                "domain".to_string(),
+                canonical_create_only_value_string(&domain).expect("canonical enum is canonical"),
+            ),
+            (
+                "priority".to_string(),
+                canonical_create_only_value_string(&priority).expect("integer is canonical"),
+            ),
+        ]),
+    }];
+
+    let renames = detect_anonymous_to_named_renames_for_test(
+        &resources,
+        &schemas,
+        &|_provider, _resource_type| state_entries.clone(),
+        &[],
+        &|_provider| Vec::new(),
+    );
+
+    assert_eq!(renames.len(), 1);
+    assert_eq!(renames[0].1.identity_str(), "typed");
+}
+
+#[test]
+fn test_detect_rename_skips_ambiguous_resolved_create_only_matches() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        subnet_route_table_association_schema()
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let mut resource =
+        subnet_route_table_association_resource("nat_gw", "private_rtb", "private_subnet");
+    resource.binding = Some("nat_gw".to_string());
+    let resources = vec![resource];
+    let state_entries = vec![
+        association_state_entry(
+            "awscc_ec2_subnet_route_table_association_11111111",
+            "rtb-private",
+            "subnet-private",
+        ),
+        association_state_entry(
+            "awscc_ec2_subnet_route_table_association_22222222",
+            "rtb-private",
+            "subnet-private",
+        ),
+    ];
+    let binding_entries = [
+        binding_state_entry("private_rtb", "private_rtb", &[("id", "rtb-private")]),
+        binding_state_entry(
+            "private_subnet",
+            "private_subnet",
+            &[("id", "subnet-private")],
+        ),
+    ];
+
+    let renames = detect_anonymous_to_named_renames_with_bindings_for_test(
+        &resources,
+        &schemas,
+        &|_provider, _resource_type| state_entries.clone(),
+        &|binding| {
+            binding_entries
+                .iter()
+                .filter(|(entry_binding, _)| entry_binding == binding)
+                .map(|(_, entry)| entry.clone())
+                .collect()
+        },
+        &[],
+        &|_provider| Vec::new(),
+    );
+
+    assert!(renames.is_empty());
+}
+
+#[test]
+fn test_detect_rename_does_not_match_unresolvable_create_only_ref() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        route_schema_with_create_only_route_table()
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let mut resource = route_with_deferred_route_table("route", "missing_rtb");
+    resource.binding = Some("route".to_string());
+    let resources = vec![resource];
+    let state_entries = vec![route_state_entry("awscc_ec2_route_11111111", "rtb-private")];
+
+    let renames = detect_anonymous_to_named_renames_with_bindings_for_test(
+        &resources,
+        &schemas,
+        &|_provider, _resource_type| state_entries.clone(),
+        &|_binding| Vec::new(),
+        &[],
+        &|_provider| Vec::new(),
+    );
+
+    assert!(renames.is_empty());
+}
+
+#[test]
 fn test_detect_anonymous_to_named_skips_claimed_from() {
     let schemas = make_sso_instance_registry();
 
@@ -4875,6 +5121,7 @@ fn test_detect_anonymous_to_named_skips_claimed_from() {
                 entry.name.as_str()
             })
         },
+        &|_binding| Vec::new(),
         &[],
         &|_provider| Vec::new(),
         &claims,
@@ -4919,6 +5166,7 @@ fn test_detect_anonymous_to_named_skips_claimed_to() {
                 entry.name.as_str()
             })
         },
+        &|_binding| Vec::new(),
         &[],
         &|_provider| Vec::new(),
         &claims,
@@ -5119,6 +5367,7 @@ fn test_detect_rename_existing_removed_from_binding_does_not_use_orphan() {
                 entry.name.as_str()
             })
         },
+        &|_binding| Vec::new(),
         &[],
         &|_| Vec::new(),
         &claims,

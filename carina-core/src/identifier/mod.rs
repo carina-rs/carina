@@ -1197,6 +1197,86 @@ fn canonical_or_resolved_create_only_value_string(
         .or_else(|| resolve_deferred_create_only_value_string(value, find_state_by_binding))
 }
 
+/// Canonical create-only values selected by a resource schema.
+///
+/// This is the shared extraction and comparison seam for anonymous identity
+/// reconciliation and anonymous-to-named rename detection. Desired resources
+/// may contain concrete values or single-hop `binding.attr` references; state
+/// attributes have already crossed the persisted-value canonicalization
+/// boundary before they enter this type.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CreateOnlyValues {
+    values: HashMap<String, String>,
+}
+
+impl CreateOnlyValues {
+    /// Extract the canonical create-only values configured on a resource.
+    pub fn of(
+        resource: &Resource,
+        schema: &ResourceSchema,
+        find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+    ) -> Self {
+        let values = schema
+            .create_only_attributes()
+            .into_iter()
+            .filter_map(|attribute| {
+                resource.get_attr(attribute).and_then(|value| {
+                    canonical_or_resolved_create_only_value_string(value, find_state_by_binding)
+                        .map(|value| (attribute.to_string(), value))
+                })
+            })
+            .collect();
+        Self { values }
+    }
+
+    /// Select create-only values from canonical persisted state attributes.
+    pub fn from_canonical_state_attributes(
+        schema: &ResourceSchema,
+        attributes: &HashMap<String, String>,
+    ) -> Self {
+        let values = schema
+            .create_only_attributes()
+            .into_iter()
+            .filter_map(|attribute| {
+                attributes
+                    .get(attribute)
+                    .cloned()
+                    .map(|value| (attribute.to_string(), value))
+            })
+            .collect();
+        Self { values }
+    }
+
+    /// Return the canonical map for storage alongside an anonymous state row.
+    pub fn into_map(self) -> HashMap<String, String> {
+        self.values
+    }
+
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    fn match_counts(&self, state_values: &HashMap<String, String>) -> (usize, usize) {
+        let mut matched = 0;
+        let mut mismatched = 0;
+        for (attribute, desired_value) in &self.values {
+            if let Some(state_value) = state_values.get(attribute) {
+                if state_value == desired_value {
+                    matched += 1;
+                } else {
+                    mismatched += 1;
+                }
+            }
+        }
+        (matched, mismatched)
+    }
+
+    fn all_match(&self, state_values: &HashMap<String, String>) -> bool {
+        let (matched, mismatched) = self.match_counts(state_values);
+        mismatched == 0 && matched == self.values.len()
+    }
+}
+
 /// Reconcile anonymous resource identifiers with existing state.
 ///
 /// When a create-only property changes on an anonymous resource, the computed
@@ -1283,7 +1363,6 @@ pub fn reconcile_anonymous_identifiers(
         };
         let schema = schema.as_schema();
 
-        let create_only_attrs = schema.create_only_attributes();
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
         let key = (
             resource.id.provider.clone(),
@@ -1295,18 +1374,9 @@ pub fn reconcile_anonymous_identifiers(
             continue;
         }
 
-        // Collect this resource's create-only values
-        let mut resource_co_values: HashMap<&str, String> = HashMap::new();
-        for attr_name in &create_only_attrs {
-            if let Some(value) = resource.get_attr(attr_name)
-                && let Some(value) =
-                    canonical_or_resolved_create_only_value_string(value, find_state_by_binding)
-            {
-                resource_co_values.insert(attr_name, value);
-            }
-        }
+        let resource_co_values = CreateOnlyValues::of(resource, schema, find_state_by_binding);
 
-        if create_only_attrs.is_empty() || resource_co_values.is_empty() {
+        if resource_co_values.is_empty() {
             // No create-only properties or none set: use SimHash-based Hamming distance
             // matching to find the closest state entry.
             let Some(AnonymousHashSuffix::SimHash(resource_hash)) =
@@ -1380,19 +1450,7 @@ pub fn reconcile_anonymous_identifiers(
                 continue;
             }
 
-            // Compare create-only values: count matches and mismatches
-            let mut matched = 0;
-            let mut mismatched = 0;
-            for (attr, value) in &resource_co_values {
-                if let Some(state_value) = entry.create_only_values.get(*attr) {
-                    let state_value = state_value.to_string();
-                    if &state_value == value {
-                        matched += 1;
-                    } else {
-                        mismatched += 1;
-                    }
-                }
-            }
+            let (matched, mismatched) = resource_co_values.match_counts(&entry.create_only_values);
 
             if matched > 0 && mismatched == 0 {
                 full_matches.push(entry);
@@ -1438,6 +1496,9 @@ pub fn reconcile_anonymous_identifiers(
 ///
 /// Returns resolved moves from each old anonymous state row to the matched
 /// named resource. The wiring layer applies them before running the differ.
+/// `find_state_by_binding` resolves the same single-hop `binding.attr`
+/// references as [`reconcile_anonymous_identifiers`]; missing or ambiguous
+/// binding rows leave that create-only value unresolved.
 ///
 /// Matching rules:
 /// 1. Only `let`-bound resources are candidates (those with `binding.is_some()`)
@@ -1457,6 +1518,7 @@ pub fn detect_anonymous_to_named_renames(
     resources: &[Resource],
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
+    find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
@@ -1512,15 +1574,9 @@ pub fn detect_anonymous_to_named_renames(
             .cloned()
             .unwrap_or_default();
 
-        // Collect this resource's create-only values (may be empty if the
-        // schema has no create-only attributes or none are set).
-        let create_only_attrs = schema.create_only_attributes();
-        let mut resource_co_values: HashMap<&str, String> = HashMap::new();
-        for attr_name in &create_only_attrs {
-            if let Some(Value::Concrete(ConcreteValue::String(v))) = resource.get_attr(attr_name) {
-                resource_co_values.insert(attr_name, v.expose_plaintext().to_owned());
-            }
-        }
+        // This may be empty when the schema has no create-only attributes or
+        // none of their configured values can be resolved.
+        let resource_co_values = CreateOnlyValues::of(resource, schema, find_state_by_binding);
 
         let matched_entry: Option<&AnonymousIdStateInfo> = if !resource_co_values.is_empty() {
             // Create-only path: find orphaned entries whose create-only values all match.
@@ -1532,12 +1588,7 @@ pub fn detect_anonymous_to_named_renames(
                 if extract_hash_from_identifier(&entry.name).is_none() {
                     continue;
                 }
-                let all_match = resource_co_values.iter().all(|(attr, value)| {
-                    entry
-                        .create_only_values
-                        .get(*attr)
-                        .is_some_and(|v| v == value)
-                });
+                let all_match = resource_co_values.all_match(&entry.create_only_values);
                 if all_match {
                     matches.push(entry);
                 }
@@ -1585,6 +1636,7 @@ pub fn detect_anonymous_to_named_renames_for_test(
     resources: &[Resource],
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
+    find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     providers: &[ProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
@@ -1594,6 +1646,7 @@ pub fn detect_anonymous_to_named_renames_for_test(
         resources,
         registry,
         find_state_by_type,
+        find_state_by_binding,
         &providers,
         identity_attributes_fn,
         claims,

@@ -2466,8 +2466,6 @@ impl AnonymousReconciliationStateView {
             .iter()
             .map(|(from, to)| (from.as_inner().clone(), to.clone()))
             .collect::<HashMap<_, _>>();
-        let mut create_only_by_type = HashMap::<(String, String), Vec<String>>::new();
-
         for state_resource in state_file.resources() {
             let state_row_id = resolved_state_row_id(
                 state_resource,
@@ -2493,35 +2491,21 @@ impl AnonymousReconciliationStateView {
                 projected_id.provider().to_string(),
                 projected_id.resource_type().to_string(),
             );
-            let create_only_attributes = create_only_by_type
-                .entry(type_key.clone())
-                .or_insert_with(|| {
-                    ctx.schemas()
-                        .get(
-                            projected_id.provider(),
-                            projected_id.resource_type(),
-                            carina_core::schema::SchemaKind::Resource,
-                        )
-                        .map(|schema| {
-                            schema
-                                .schema()
-                                .as_schema()
-                                .create_only_attributes()
-                                .into_iter()
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                });
-            let create_only_values = create_only_attributes
-                .iter()
-                .filter_map(|attribute| {
-                    attribute_values
-                        .get(attribute)
-                        .cloned()
-                        .map(|value| (attribute.clone(), value))
+            let create_only_values = ctx
+                .schemas()
+                .get(
+                    projected_id.provider(),
+                    projected_id.resource_type(),
+                    carina_core::schema::SchemaKind::Resource,
+                )
+                .map(|schema| {
+                    identifier::CreateOnlyValues::from_canonical_state_attributes(
+                        schema.schema().as_schema(),
+                        &attribute_values,
+                    )
+                    .into_map()
                 })
-                .collect();
+                .unwrap_or_default();
             let projected_name = projected_id.identity_str().to_string();
             origins_by_projected_name
                 .entry(type_key.clone())
@@ -2631,6 +2615,7 @@ fn detect_anonymous_to_named_moves_with_ctx(
         resources,
         ctx.schemas(),
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
+        &|binding| state_view.entries_by_binding(binding),
         &canonical_providers,
         &|name| identity_attributes_for_provider(ctx, name),
         claims,
