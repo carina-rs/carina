@@ -1124,6 +1124,41 @@ impl DiagnosticEngine {
         None
     }
 
+    /// Build the typed call findings that may claim resolver backstops.
+    fn module_call_findings_for_resolution(
+        &self,
+        parsed: &ParsedFile,
+        base_path: &std::path::Path,
+    ) -> Vec<carina_core::validation::ModuleCallFinding> {
+        let signatures = carina_core::module_resolver::load_resolved_module_signatures(
+            parsed,
+            base_path,
+            &self.provider_context,
+        );
+        let binding_use_report = carina_core::validation::check_bare_binding_uses(
+            parsed,
+            &carina_core::validation::ValidationTypeContext::new(
+                parsed,
+                &self.schemas,
+                &self.provider_context,
+                &signatures,
+            ),
+        );
+        let bindings =
+            BindingIndex::from_parsed_with_module_signatures(parsed, &self.schemas, &signatures);
+        carina_core::validation::check_module_calls(carina_core::validation::ModuleCallCheckInput {
+            authored: parsed,
+            semantic: Some(parsed),
+            base_dir: Some(base_path),
+            imported_signatures: &signatures,
+            provider_context: &self.provider_context,
+            schemas: &self.schemas,
+            binding_use_report: &binding_use_report,
+            bindings: &bindings,
+            reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
+        })
+    }
+
     /// Run a directory-scoped parse with the current editor buffer substituted
     /// for its on-disk copy, so diagnostics that need cross-file context
     /// (upstream-state exports, for-iterable bindings) update on keystrokes.
@@ -1151,6 +1186,7 @@ impl DiagnosticEngine {
                 &self.provider_context,
                 &overrides,
             )?;
+        let covered_findings = self.module_call_findings_for_resolution(&result.parsed, base_path);
         // Module expansion is a no-op for configs without `module_call`.
         // Failures retain the authored parse for source-level checks; only the
         // successful outcome can replace it with the expanded graph.
@@ -1159,6 +1195,7 @@ impl DiagnosticEngine {
             base_path,
             &self.provider_context,
             &self.schemas,
+            &covered_findings,
         );
         let module_resolution = match module_resolution {
             carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {

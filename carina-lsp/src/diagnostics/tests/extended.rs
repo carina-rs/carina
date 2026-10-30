@@ -6207,6 +6207,7 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
         fixture.path(),
         &engine.provider_context,
         &engine.schemas,
+        &[],
     );
     let residuals = match report {
         carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {

@@ -783,9 +783,6 @@ impl DiagnosticEngine {
             diagnostics.extend(render_module_call_findings(doc, diagnostic_file, &findings));
             if let Some(base_path) = base_path {
                 for error in residual_errors {
-                    if error.is_covered_by(&findings) {
-                        continue;
-                    }
                     diagnostics.extend(self.module_resolver_error_diagnostics(
                         doc,
                         parsed,

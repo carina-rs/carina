@@ -380,6 +380,67 @@ fn module_call_failures_have_exact_cli_lsp_error_parity_across_directory_files()
 }
 
 #[test]
+fn mixed_module_call_and_export_reference_errors_are_each_reported_once() {
+    let fixture = tempfile::tempdir().expect("mixed reference-error fixture");
+    let module = fixture.path().join("modules/inner");
+    std::fs::create_dir_all(&module).expect("create inner module");
+    std::fs::write(
+        fixture.path().join("values.crn"),
+        r#"provider test {}
+let source = test.r.Source {
+  name = "source"
+  count = 7
+}
+"#,
+    )
+    .expect("write sibling values");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let inner = use { source = "./modules/inner" }
+
+inner { value = source.count }
+
+exports {
+  bad: Int = source.name
+}
+"#,
+    )
+    .expect("write root call and export");
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments { value: String }\n",
+    )
+    .expect("write module signature");
+
+    let schemas = module_call_parity_schemas();
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    let call_error = "argument 'value': cannot assign Int to 'value': expected String, got Int (from source.count)";
+    let export_error = "export 'bad': type mismatch for 'source.name': expected Int, got String";
+
+    assert_eq!(
+        cli_messages_count(&cli, call_error),
+        1,
+        "CLI must not repeat the located module-call error in the residual block: {cli:#?}",
+    );
+    assert_eq!(
+        cli_messages_count(&cli, export_error),
+        1,
+        "CLI must retain the uncovered export error exactly once: {cli:#?}",
+    );
+    assert_eq!(
+        lsp_messages_count(&lsp, call_error),
+        1,
+        "LSP must retain the located module-call error exactly once: {lsp:#?}",
+    );
+    assert_eq!(
+        lsp_messages_count(&lsp, export_error),
+        1,
+        "LSP must retain the uncovered export error exactly once: {lsp:#?}",
+    );
+}
+
+#[test]
 fn unannotated_forwarded_module_output_mismatch_has_cli_lsp_error_parity() {
     let fixture = tempfile::tempdir().expect("forwarded-output parity fixture");
     let outer = fixture.path().join("outer");

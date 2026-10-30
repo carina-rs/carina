@@ -3260,6 +3260,25 @@ impl ExpansionBoundaryReferenceErrors {
         self.errors.iter()
     }
 
+    pub(crate) fn without_covered_module_calls(
+        self,
+        findings: &[ModuleCallFinding],
+    ) -> Option<Self> {
+        let errors = self
+            .errors
+            .into_iter()
+            .filter(|error| match error {
+                ExpansionBoundaryReferenceError::ModuleCall(error) => !findings
+                    .iter()
+                    .any(|finding| finding.message().covers_reference_type(error)),
+                ExpansionBoundaryReferenceError::Attribute(_message)
+                | ExpansionBoundaryReferenceError::Export(_message)
+                | ExpansionBoundaryReferenceError::Function(_message) => true,
+            })
+            .collect::<Vec<_>>();
+        (!errors.is_empty()).then_some(Self { errors })
+    }
+
     #[cfg(test)]
     pub(crate) fn function_for_test(message: &str) -> Self {
         Self {

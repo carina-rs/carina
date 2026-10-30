@@ -449,16 +449,12 @@ fn extend_module_call_errors(
     );
 }
 
-fn extend_uncovered_module_resolution_errors(
+fn extend_module_resolution_errors(
     errors: &mut Vec<AppError>,
     residuals: &[carina_core::module_resolver::ResidualModuleResolutionError],
-    findings: &[carina_core::validation::ModuleCallFinding],
     base_dir: &Path,
 ) {
     for residual in residuals {
-        if residual.is_covered_by_module_call_findings(findings) {
-            continue;
-        }
         let message = if residual.is_constraint() {
             residual.display_relative_to(base_dir)
         } else {
@@ -721,6 +717,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         base_dir,
         &enriched_context,
         ctx.schemas(),
+        &authored_module_call_findings,
     );
     match module_resolution {
         module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
@@ -738,10 +735,8 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
                 authored_module_call_findings,
                 constraint_findings,
             ]);
-            let has_uncovered_residual = residuals
-                .iter()
-                .any(|residual| !residual.is_covered_by_module_call_findings(&findings));
-            extend_module_call_errors(&mut errors, findings.clone());
+            let has_uncovered_residual = !residuals.is_empty();
+            extend_module_call_errors(&mut errors, findings);
             if has_uncovered_residual {
                 errors.extend(validate_module_attribute_refs_after_expansion_failure(
                     ctx,
@@ -749,15 +744,13 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
                     &enriched_context,
                 ));
             }
-            extend_uncovered_module_resolution_errors(&mut errors, &residuals, &findings, base_dir);
+            extend_module_resolution_errors(&mut errors, &residuals, base_dir);
             return Err(errors);
         }
         module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors: residuals } => {
             let findings = authored_module_call_findings;
-            let has_uncovered_residual = residuals
-                .iter()
-                .any(|residual| !residual.is_covered_by_module_call_findings(&findings));
-            extend_module_call_errors(&mut errors, findings.clone());
+            let has_uncovered_residual = !residuals.is_empty();
+            extend_module_call_errors(&mut errors, findings);
             if has_uncovered_residual {
                 errors.extend(validate_module_attribute_refs_after_expansion_failure(
                     ctx,
@@ -765,7 +758,7 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
                     &enriched_context,
                 ));
             }
-            extend_uncovered_module_resolution_errors(&mut errors, &residuals, &findings, base_dir);
+            extend_module_resolution_errors(&mut errors, &residuals, base_dir);
             return Err(errors);
         }
     }

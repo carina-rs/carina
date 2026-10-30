@@ -98,8 +98,10 @@ pub enum ResidualModuleResolutionDiagnostic<'a> {
 }
 
 impl ResidualModuleResolutionError {
-    fn new(error: ModuleError) -> Self {
-        Self(Box::new(error))
+    fn new(error: ModuleError, findings: &[crate::validation::ModuleCallFinding]) -> Option<Self> {
+        let error = without_covered_reference_type_members(error, findings)?;
+        let residual = Self(Box::new(error));
+        (!residual.is_covered_by(findings)).then_some(residual)
     }
 
     pub fn call_source(&self) -> ModuleErrorCallSource<'_> {
@@ -173,9 +175,17 @@ impl ResidualModuleResolutionError {
                 line: _line,
                 message: _message,
             } => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
-            ModuleError::ReferenceType(_joined) => {
-                Some(ResidualModuleResolutionDiagnostic::ModuleCall)
-            }
+            ModuleError::ReferenceType(errors) => errors
+                .iter()
+                .any(|error| match error {
+                    crate::validation::ExpansionBoundaryReferenceError::ModuleCall(_error) => true,
+                    crate::validation::ExpansionBoundaryReferenceError::Attribute(_message)
+                    | crate::validation::ExpansionBoundaryReferenceError::Export(_message)
+                    | crate::validation::ExpansionBoundaryReferenceError::Function(_message) => {
+                        false
+                    }
+                })
+                .then_some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::UnknownArgument {
                 module: _module,
                 argument: _argument,
@@ -183,7 +193,7 @@ impl ResidualModuleResolutionError {
         }
     }
 
-    pub fn is_covered_by(&self, findings: &[crate::validation::ModuleCallFinding]) -> bool {
+    fn is_covered_by(&self, findings: &[crate::validation::ModuleCallFinding]) -> bool {
         let root_cause = self.0.root_cause();
         match root_cause {
             ModuleError::MissingArgument { module, argument } => findings.iter().any(|finding| {
@@ -210,21 +220,7 @@ impl ResidualModuleResolutionError {
                 self.finding_owns_error(finding)
                     && finding.message().covers_bare_handle_argument(argument)
             }),
-            ModuleError::ReferenceType(errors) => {
-                let mut errors = errors.iter().peekable();
-                errors.peek().is_some() && errors.all(|error| match error {
-                    crate::validation::ExpansionBoundaryReferenceError::ModuleCall(error) => {
-                        findings
-                            .iter()
-                            .any(|finding| finding.message().covers_reference_type(error))
-                    }
-                    crate::validation::ExpansionBoundaryReferenceError::Attribute(_message)
-                    | crate::validation::ExpansionBoundaryReferenceError::Export(_message)
-                    | crate::validation::ExpansionBoundaryReferenceError::Function(_message) => {
-                        true
-                    }
-                })
-            }
+            ModuleError::ReferenceType(_errors) => false,
             ModuleError::UnknownArgument { module, argument } => findings.iter().any(|finding| {
                 self.finding_owns_error(finding)
                     && finding.message().covers_unknown_argument(module, argument)
@@ -307,29 +303,6 @@ impl ResidualModuleResolutionError {
         }
     }
 
-    pub fn is_covered_by_module_call_findings(
-        &self,
-        findings: &[crate::validation::ModuleCallFinding],
-    ) -> bool {
-        if let ModuleError::ReferenceType(errors) = self.0.root_cause() {
-            let mut errors = errors.iter().peekable();
-            return errors.peek().is_some()
-                && errors.all(|error| match error {
-                    crate::validation::ExpansionBoundaryReferenceError::ModuleCall(error) => {
-                        findings
-                            .iter()
-                            .any(|finding| finding.message().covers_reference_type(error))
-                    }
-                    crate::validation::ExpansionBoundaryReferenceError::Attribute(_message)
-                    | crate::validation::ExpansionBoundaryReferenceError::Export(_message)
-                    | crate::validation::ExpansionBoundaryReferenceError::Function(_message) => {
-                        false
-                    }
-                });
-        }
-        self.is_covered_by(findings)
-    }
-
     fn finding_owns_error(&self, finding: &crate::validation::ModuleCallFinding) -> bool {
         if let Some(failing_call) = self.0.failing_call() {
             return finding
@@ -346,6 +319,72 @@ impl ResidualModuleResolutionError {
                 .is_some_and(|root| calls.contains(root)),
             ModuleErrorCallSource::Unavailable => false,
         })
+    }
+}
+
+fn without_covered_reference_type_members(
+    error: ModuleError,
+    findings: &[crate::validation::ModuleCallFinding],
+) -> Option<ModuleError> {
+    match error {
+        ModuleError::OwnedByCalls { calls, error } => {
+            without_covered_reference_type_members(*error, findings).map(|error| {
+                ModuleError::OwnedByCalls {
+                    calls,
+                    error: Box::new(error),
+                }
+            })
+        }
+        ModuleError::AtCall { call, error } => {
+            without_covered_reference_type_members(*error, findings).map(|error| {
+                ModuleError::AtCall {
+                    call,
+                    error: Box::new(error),
+                }
+            })
+        }
+        ModuleError::ReferenceType(errors) => errors
+            .without_covered_module_calls(findings)
+            .map(ModuleError::ReferenceType),
+        error @ (ModuleError::NotFound(_)
+        | ModuleError::CircularImport(_)
+        | ModuleError::MissingArgument {
+            module: _,
+            argument: _,
+        }
+        | ModuleError::InvalidArgumentType {
+            module: _,
+            argument: _,
+            mismatch: _,
+        }
+        | ModuleError::BareStructuralHandleArgument {
+            module: _,
+            argument: _,
+            source_path: _,
+            line: _,
+            message: _,
+        }
+        | ModuleError::ArgumentValueAccess {
+            module: _,
+            source_path: _,
+            line: _,
+            message: _,
+        }
+        | ModuleError::Io(_)
+        | ModuleError::Parse(_)
+        | ModuleError::ParseInFile { path: _, error: _ }
+        | ModuleError::UnknownArgument {
+            module: _,
+            argument: _,
+        }
+        | ModuleError::UnknownModule(_)
+        | ModuleError::ProviderInModule
+        | ModuleError::StateBlockInModule
+        | ModuleError::BackendInModule
+        | ModuleError::UpstreamStateInModule
+        | ModuleError::ExportsInModule
+        | ModuleError::Constraint(_)
+        | ModuleError::NotADirectory { path: _ }) => Some(error),
     }
 }
 
@@ -391,27 +430,30 @@ mod diagnostic_status_tests {
         let schemas = SchemaRegistry::new();
         let parsed = crate::config_loader::parse_directory(fixture.path(), &config)
             .expect("parse directory fixture");
-        let result = resolve_modules_with_diagnostics(&parsed, fixture.path(), &config, &schemas);
+        let result =
+            resolve_modules_with_diagnostics(&parsed, fixture.path(), &config, &schemas, &[]);
 
-        let graph = match result {
-            ModuleResolutionDiagnosticResult::Expanded { graph } => Some(graph),
+        match result {
+            ModuleResolutionDiagnosticResult::Expanded { graph } => panic!(
+                "constraint failure unexpectedly published a graph with {} compositions",
+                graph.compositions.len()
+            ),
             ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors } => {
                 assert_eq!(findings.len(), 1);
+                assert!(
+                    findings[0]
+                        .message()
+                        .to_string()
+                        .contains("name is too long"),
+                    "unexpected constraint finding: {}",
+                    findings[0].message()
+                );
                 assert!(errors.is_empty());
-                None
             }
             ModuleResolutionDiagnosticResult::Unowned { errors } => {
                 panic!("unexpected residual errors: {}", errors.len())
             }
-        };
-        assert!(
-            graph.is_none(),
-            "only the Expanded variant may make a graph reachable"
-        );
-        assert!(
-            parsed.compositions.is_empty(),
-            "the authored input is immutable"
-        );
+        }
     }
 
     #[test]
@@ -469,10 +511,8 @@ mod diagnostic_status_tests {
             argument: "required".to_string(),
         }
         .with_failing_call(parsed.module_calls[0].id().clone());
-        let residual = ResidualModuleResolutionError::new(error);
-
         assert!(
-            !residual.is_covered_by(&[]),
+            ResidualModuleResolutionError::new(error, &[]).is_some(),
             "a resolver error cannot be hidden before a concrete finding covers it",
         );
         let unrelated = ModuleError::MissingArgument {
@@ -480,13 +520,17 @@ mod diagnostic_status_tests {
             argument: "different".to_string(),
         }
         .with_failing_call(parsed.module_calls[0].id().clone());
-        let unrelated_residual = ResidualModuleResolutionError::new(unrelated);
         assert!(
-            !unrelated_residual.is_covered_by(&findings),
+            ResidualModuleResolutionError::new(unrelated, &findings).is_some(),
             "a finding for another argument must not claim this resolver error",
         );
+        let covered = ModuleError::MissingArgument {
+            module: "child".to_string(),
+            argument: "required".to_string(),
+        }
+        .with_failing_call(parsed.module_calls[0].id().clone());
         assert!(
-            residual.is_covered_by(&findings),
+            ResidualModuleResolutionError::new(covered, &findings).is_none(),
             "the exact call-owner finding must cover the resolver backstop",
         );
     }
@@ -1109,11 +1153,16 @@ pub(crate) fn resolve_upstream_modules_with_config<E: crate::parser::ExportParam
 
 /// Resolve modules while retaining the expander's own per-call constraint
 /// outcomes and source locations for editor diagnostics.
+///
+/// `covered_findings` are typed source diagnostics the caller will publish.
+/// Residuals returned from this seam have those call-owned errors removed,
+/// including individual covered members of a mixed reference-type failure.
 pub fn resolve_modules_with_diagnostics<E: crate::parser::ExportParamLike + Clone>(
     parsed: &crate::parser::File<E>,
     base_dir: &Path,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
+    covered_findings: &[crate::validation::ModuleCallFinding],
 ) -> ModuleResolutionDiagnosticResult<E> {
     let mut graph = parsed.clone();
     let mut resolver = ModuleResolver::with_constraint_reports(base_dir, config, schemas);
@@ -1136,13 +1185,14 @@ pub fn resolve_modules_with_diagnostics<E: crate::parser::ExportParamLike + Clon
             constraint_reports: &constraint_reports,
         },
     );
+    let resolution_failed = !errors.is_empty();
     let errors = errors
         .into_iter()
-        .map(ResidualModuleResolutionError::new)
+        .filter_map(|error| ResidualModuleResolutionError::new(error, covered_findings))
         .collect::<Vec<_>>();
     if !findings.is_empty() {
         ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors }
-    } else if errors.is_empty() {
+    } else if !resolution_failed {
         ModuleResolutionDiagnosticResult::Expanded {
             graph: Box::new(graph),
         }
@@ -1261,20 +1311,26 @@ mod type_resolution_policy_tests {
     }
 
     #[test]
-    fn non_call_reference_error_is_not_classified_by_its_rendered_prefix() {
-        let error = ResidualModuleResolutionError::new(ModuleError::ReferenceType(
-            crate::validation::ExpansionBoundaryReferenceErrors::function_for_test(
-                "module call 'is only user-authored diagnostic text'",
+    fn non_call_reference_error_is_retained_without_module_call_routing() {
+        let error = ResidualModuleResolutionError::new(
+            ModuleError::ReferenceType(
+                crate::validation::ExpansionBoundaryReferenceErrors::function_for_test(
+                    "module call 'is only user-authored diagnostic text'",
+                ),
             ),
-        ));
+            &[],
+        )
+        .expect("a non-call reference error remains residual");
 
         assert!(
-            error.is_covered_by(&[]),
-            "coverage must use a typed error variant rather than a rendered string prefix",
+            error.diagnostic().is_none(),
+            "typed routing must not classify user-authored text as a module-call error",
         );
         assert!(
-            !error.is_covered_by_module_call_findings(&[]),
-            "CLI module-call coverage must retain non-call reference failures",
+            error
+                .display_relative_to(std::path::Path::new("."))
+                .contains("module call 'is only user-authored diagnostic text'"),
+            "the uncovered non-call reference error must remain renderable",
         );
     }
 }
