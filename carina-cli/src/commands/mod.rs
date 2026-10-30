@@ -594,13 +594,15 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     // config was parsed up in `load_configuration_with_config` with
     // the bootstrap `ProviderCustomTypes::Unloaded` context — schemas had
     // not been collected yet, so the parser-side loaded-state gate
-    // could not fire there. This post-parse walk re-applies the same
+    // could not fire there. This post-parse resolver re-applies the same
     // predicate against the now-enriched context, closing the
     // standalone-module-validate path so a typo or renamed-then-
     // removed type cannot ride into apply. The recursive module-call checker
     // below runs this same typed resolver over every imported module.
     let mut root_type_resolution_findings = Vec::new();
-    for diagnostic in carina_core::validation::resolve_file_type_exprs(parsed, &enriched_context) {
+    let type_resolution =
+        carina_core::validation::resolve_file_type_exprs_report(parsed, &enriched_context, None);
+    for diagnostic in type_resolution.into_diagnostics() {
         match carina_core::validation::ModuleCallFinding::try_from_type_resolution(diagnostic) {
             Ok(finding) => root_type_resolution_findings.push(finding),
             Err(diagnostic) => errors.push(AppError::TypeResolution(Box::new(diagnostic))),
@@ -887,7 +889,6 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
                 carina_core::validation::ExpandedModuleCallCheckInput::References {
                     compositions: &parsed.compositions,
                     bindings: &bindings,
-                    constraint_reports: None,
                 },
             ),
         );

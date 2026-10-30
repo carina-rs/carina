@@ -535,9 +535,15 @@ impl CompositionCall {
     /// User-facing call label. Anonymous calls deliberately hide their
     /// content-derived synthetic instance identifier.
     pub fn display_label(&self) -> String {
-        self.binding
-            .clone()
-            .unwrap_or_else(|| format!("{} (anonymous call)", self.module_name))
+        match self.id.expansion() {
+            crate::parser::CallExpansion::Direct => self
+                .binding
+                .clone()
+                .unwrap_or_else(|| format!("{} (anonymous call)", self.module_name)),
+            crate::parser::CallExpansion::Expanded(_expansion_key) => {
+                format!("{} (anonymous call)", self.module_name)
+            }
+        }
     }
 }
 

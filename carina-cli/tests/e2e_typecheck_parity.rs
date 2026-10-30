@@ -290,6 +290,83 @@ fn module_call_parity_schemas() -> SchemaRegistry {
     )
 }
 
+fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &SchemaRegistry) {
+    let context = carina_core::parser::ProviderContext {
+        decryptor: None,
+        custom_types: carina_core::provider::provider_custom_types_from_factories(Arc::new(
+            factories_for(schemas),
+        )),
+        resource_types: carina_core::parser::ProviderContext::resource_types_from_schema_registry(
+            schemas,
+        ),
+    };
+    let directory = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
+        base_dir,
+        &context,
+        &HashMap::new(),
+    )
+    .expect("the fixture directory must parse before module expansion");
+    let signatures = carina_core::module_resolver::load_resolved_module_signatures(
+        &directory.parsed,
+        base_dir,
+        &context,
+    );
+    let binding_use_report = carina_core::validation::check_bare_binding_uses(
+        &directory.parsed,
+        &carina_core::validation::ValidationTypeContext::new(
+            &directory.parsed,
+            schemas,
+            &context,
+            &signatures,
+        ),
+    );
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_module_signatures(
+        &directory.parsed,
+        schemas,
+        &signatures,
+    );
+    let covered_findings = carina_core::validation::check_module_calls(
+        carina_core::validation::ModuleCallCheckInput {
+            authored: &directory.parsed,
+            semantic: Some(&directory.parsed),
+            base_dir: Some(base_dir),
+            imported_signatures: &signatures,
+            provider_context: &context,
+            schemas,
+            binding_use_report: &binding_use_report,
+            bindings: &bindings,
+            reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
+        },
+    );
+    match carina_core::module_resolver::resolve_modules_with_diagnostics(
+        &directory.parsed,
+        base_dir,
+        &context,
+        schemas,
+        &covered_findings,
+    ) {
+        carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
+            assert!(
+                !graph.compositions.is_empty(),
+                "the expansion proof must include a composition"
+            );
+        }
+        carina_core::module_resolver::ModuleResolutionDiagnosticResult::ConstraintFailed {
+            findings,
+            errors,
+        } => panic!(
+            "fixture must reach expanded diagnostics; constraint findings={findings:#?}, residual count={}",
+            errors.len(),
+        ),
+        carina_core::module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors } => {
+            panic!(
+                "fixture must reach expanded diagnostics; residual count={}",
+                errors.len()
+            )
+        }
+    }
+}
+
 #[test]
 fn module_call_failures_have_exact_cli_lsp_error_parity_across_directory_files() {
     let cases = [
@@ -377,6 +454,143 @@ fn module_call_failures_have_exact_cli_lsp_error_parity_across_directory_files()
             case.name,
         );
     }
+}
+
+#[test]
+fn nested_module_bare_binding_reference_mismatch_has_exact_cli_lsp_parity() {
+    let fixture = tempfile::tempdir().expect("nested binding-reference parity fixture");
+    let outer = fixture.path().join("modules/outer");
+    let producer = fixture.path().join("modules/producer");
+    let inner = fixture.path().join("modules/inner");
+    std::fs::create_dir_all(&outer).expect("create outer module");
+    std::fs::create_dir_all(&producer).expect("create producer module");
+    std::fs::create_dir_all(&inner).expect("create inner module");
+    std::fs::write(
+        fixture.path().join("imports.crn"),
+        "let outer = use { source = \"./modules/outer\" }\n",
+    )
+    .expect("write root import");
+    std::fs::write(fixture.path().join("calls.crn"), "outer {}\n").expect("write root call");
+    std::fs::write(
+        outer.join("imports.crn"),
+        r#"let producer = use { source = "../producer" }
+let inner = use { source = "../inner" }
+"#,
+    )
+    .expect("write nested imports");
+    let nested_call = r#"let produced = producer { value = 7 }
+let forwarded = produced.forwarded
+inner { value = forwarded }
+"#;
+    std::fs::write(outer.join("calls.crn"), nested_call).expect("write nested call");
+    std::fs::write(
+        outer.join("attributes.crn"),
+        "attributes { loaded: Bool = true }\n",
+    )
+    .expect("write outer attribute");
+    std::fs::write(producer.join("arguments.crn"), "arguments { value: Int }\n")
+        .expect("write producer arguments");
+    std::fs::write(
+        producer.join("attributes.crn"),
+        "attributes { forwarded = value }\n",
+    )
+    .expect("write producer attribute");
+    std::fs::write(inner.join("arguments.crn"), "arguments { value: String }\n")
+        .expect("write inner arguments");
+
+    let schemas = SchemaRegistry::new();
+    assert_module_resolution_expands(&outer, &schemas);
+    let cli = cli_diagnostics_at(factories_for(&schemas), &outer);
+    let lsp = lsp_diagnostics(
+        &engine_with_schemas(schemas),
+        &fixture,
+        "modules/outer/calls.crn",
+    );
+    let message = "module call 'inner (anonymous call)': argument 'value': cannot assign Int to 'value': expected String, got Int (from produced.forwarded)";
+    let expected = canonical_error_multiset([message.to_string()]);
+
+    assert_eq!(cli_located_error_multiset(&cli), expected, "CLI={cli:#?}");
+    assert_eq!(lsp_error_multiset(&lsp), expected, "LSP={lsp:#?}");
+    let diagnostic = lsp
+        .iter()
+        .find(|diagnostic| diagnostic.message == message)
+        .unwrap_or_else(|| panic!("missing nested binding mismatch: {lsp:#?}"));
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+    );
+    assert_eq!(
+        diagnostic.range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(2, "inner { value = ".len() as u32),
+            tower_lsp::lsp_types::Position::new(
+                2,
+                ("inner { value = ".len() + "forwarded".len()) as u32,
+            ),
+        ),
+        "the typed binding mismatch must underline the bare value use",
+    );
+}
+
+#[test]
+fn for_expanded_root_bare_binding_reference_mismatch_has_exact_cli_lsp_parity() {
+    let fixture = tempfile::tempdir().expect("expanded binding-reference parity fixture");
+    let producer = fixture.path().join("modules/producer");
+    let inner = fixture.path().join("modules/inner");
+    std::fs::create_dir_all(&producer).expect("create producer module");
+    std::fs::create_dir_all(&inner).expect("create inner module");
+    std::fs::write(
+        fixture.path().join("imports.crn"),
+        r#"let producer = use { source = "./modules/producer" }
+let inner = use { source = "./modules/inner" }
+"#,
+    )
+    .expect("write root imports");
+    std::fs::write(producer.join("arguments.crn"), "arguments { value: Int }\n")
+        .expect("write producer arguments");
+    std::fs::write(
+        producer.join("attributes.crn"),
+        "attributes { forwarded = value }\n",
+    )
+    .expect("write producer attribute");
+    let calls = r#"let produced = producer { value = 7 }
+let forwarded = produced.forwarded
+for item in ["one"] {
+  inner { value = forwarded }
+}
+"#;
+    std::fs::write(fixture.path().join("calls.crn"), calls).expect("write expanded call");
+    std::fs::write(inner.join("arguments.crn"), "arguments { value: String }\n")
+        .expect("write inner arguments");
+
+    let schemas = SchemaRegistry::new();
+    assert_module_resolution_expands(fixture.path(), &schemas);
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "calls.crn");
+    let message = "module call 'inner (anonymous call)': argument 'value': cannot assign Int to 'value': expected String, got Int (from produced.forwarded)";
+    let expected = canonical_error_multiset([message.to_string()]);
+
+    assert_eq!(cli_located_error_multiset(&cli), expected, "CLI={cli:#?}");
+    assert_eq!(lsp_error_multiset(&lsp), expected, "LSP={lsp:#?}");
+    let diagnostic = lsp
+        .iter()
+        .find(|diagnostic| diagnostic.message == message)
+        .unwrap_or_else(|| panic!("missing expanded binding mismatch: {lsp:#?}"));
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+    );
+    assert_eq!(
+        diagnostic.range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(3, "  inner { value = ".len() as u32),
+            tower_lsp::lsp_types::Position::new(
+                3,
+                ("  inner { value = ".len() + "forwarded".len()) as u32,
+            ),
+        ),
+        "the expanded typed mismatch must keep the authored bare-use range",
+    );
 }
 
 #[test]
@@ -765,6 +979,36 @@ fn standalone_module_type_resolution_keeps_cli_location_and_lsp_range() {
     .expect("write module attributes");
 
     let schemas = module_call_parity_schemas();
+    let strict_context = carina_core::parser::ProviderContext {
+        decryptor: None,
+        custom_types: carina_core::provider::provider_custom_types_from_factories(Arc::new(
+            factories_for(&schemas),
+        )),
+        resource_types: carina_core::parser::ProviderContext::resource_types_from_schema_registry(
+            &schemas,
+        ),
+    };
+    let directory_failure =
+        match carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
+            &module,
+            &strict_context,
+            &HashMap::new(),
+        ) {
+            Ok(_result) => panic!("the enriched directory parse must reject NoSuchType"),
+            Err(failure) => failure,
+        };
+    assert_eq!(
+        directory_failure.source_file(),
+        Some(module.join("arguments.crn").as_path()),
+    );
+    assert!(directory_failure.parse_error().is_some_and(|error| {
+        matches!(
+            error,
+            carina_core::parser::ParseError::InvalidExpression { line, message }
+                if *line == 2 && message == "unknown custom type 'NoSuchType'"
+        )
+    }));
+
     let cli = cli_diagnostics_at(factories_for(&schemas), &module);
     let lsp = lsp_diagnostics(
         &engine_with_schemas(schemas),
@@ -772,6 +1016,17 @@ fn standalone_module_type_resolution_keeps_cli_location_and_lsp_range() {
         "module/arguments.crn",
     );
     let message = "argument 'x': unknown custom type 'NoSuchType'";
+    let expected = canonical_error_multiset([message.to_string()]);
+    assert_eq!(
+        cli_located_error_multiset(&cli),
+        expected,
+        "CLI must replace the parser backstop with one contextual error: {cli:#?}",
+    );
+    assert_eq!(
+        lsp_error_multiset(&lsp),
+        expected,
+        "LSP must replace the parser backstop with the same contextual ERROR: {lsp:#?}",
+    );
     let cli_diagnostic = cli
         .iter()
         .find(|diagnostic| diagnostic.contains(message))
@@ -780,6 +1035,10 @@ fn standalone_module_type_resolution_keeps_cli_location_and_lsp_range() {
         .iter()
         .find(|diagnostic| diagnostic.message == message)
         .unwrap_or_else(|| panic!("missing LSP type-resolution diagnostic: {lsp:#?}"));
+    assert_eq!(
+        lsp_diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+    );
 
     assert!(
         cli_diagnostic.contains("module/arguments.crn at line 2\n"),

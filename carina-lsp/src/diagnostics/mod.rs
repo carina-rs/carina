@@ -273,6 +273,7 @@ impl DiagnosticEngine {
         // keystrokes.
         let merged_attempt =
             base_path.map(|base| self.parse_merged_with_buffer(doc, current_file_name, base));
+        let mut failed_directory_type_resolution = None;
         let directory_error_emitted = if let (Some(Err(error)), Some(current_file_path)) =
             (merged_attempt.as_ref(), current_file_path)
             && error
@@ -284,22 +285,27 @@ impl DiagnosticEngine {
             // therefore more authoritative than the buffer-only parse (which
             // may have treated a sibling name as an enum identifier). One
             // exception is an unresolved declaration type: the bootstrap AST
-            // retains that declaration and the typed walker below can attach
+            // retains that declaration and the typed resolver below can attach
             // its context and exact token span. In that case the typed finding
             // covers this coarse parser backstop.
-            let covered_by_typed_resolution = self.provider_context.custom_types_loaded()
-                && doc.parsed().is_some_and(|parsed| {
-                    let mut parsed = parsed.clone();
-                    carina_core::validation::resolve_file_type_exprs(
-                        &mut parsed,
-                        &self.provider_context,
-                    )
-                    .iter()
-                    .any(|finding| finding.covers_parser_error(current_file_path, parse_error))
-                });
+            let type_resolution = doc.parsed().map(|parsed| {
+                let mut parsed = parsed.clone();
+                carina_core::validation::resolve_file_type_exprs_report(
+                    &mut parsed,
+                    &self.provider_context,
+                    Some(carina_core::validation::TypeResolutionParserError::new(
+                        current_file_path,
+                        parse_error,
+                    )),
+                )
+            });
+            let covered_by_typed_resolution = type_resolution
+                .as_ref()
+                .is_some_and(|report| report.covered_parser_error());
             if !covered_by_typed_resolution {
                 diagnostics.push(parse_error_to_diagnostic(parse_error));
             }
+            failed_directory_type_resolution = type_resolution;
             true
         } else {
             false
@@ -428,7 +434,7 @@ impl DiagnosticEngine {
 
         // carina#3239: surface unknown bare custom-type names in
         // `arguments` / `attributes` / `exports` declarations as
-        // editor diagnostics. Two paths feed the walker:
+        // editor diagnostics. Two paths feed the resolver:
         //
         // 1. The directory-merged parse (`merged`) — when present,
         //    it carries every sibling `.crn`'s declarations so an
@@ -445,14 +451,15 @@ impl DiagnosticEngine {
         //    while this fallback still handles shapes found only in the
         //    bootstrap AST. The buffer-only parse uses the bootstrap context
         //    (`ProviderCustomTypes::Unloaded`), so it always succeeds and
-        //    `doc.parsed()` is `Some`, letting the walker still run
+        //    `doc.parsed()` is `Some`, letting the resolver still run
         //    against the user's in-flight edits.
         //
         // Both paths walk the same declaration set when the edited file owns
         // it. The merged path is preferred; on failure, the buffer fallback's
-        // parser metadata retains the authored type-token span. The earlier
-        // directory-error path recognizes this same typed finding and omits
-        // its coarser line-wide backstop, avoiding a duplicate diagnostic.
+        // parser metadata retains the authored type-token span. The core
+        // resolution report above decides whether this typed finding covers
+        // the coarser directory parser backstop, avoiding a frontend-specific
+        // duplicate decision.
         // Gate on the custom-type load state so the orphaned-file fallback
         // does not report unresolved declarations in files outside any known
         // project root, where no provider catalog is authoritative.
@@ -460,20 +467,27 @@ impl DiagnosticEngine {
             let custom_type_findings = match merged {
                 Some(m) => {
                     let mut parsed = m.clone();
-                    carina_core::validation::resolve_file_type_exprs(
+                    carina_core::validation::resolve_file_type_exprs_report(
                         &mut parsed,
                         &self.provider_context,
+                        None,
                     )
+                    .into_diagnostics()
                 }
-                None => current_parsed
-                    .map(|p| {
-                        let mut parsed = p.clone();
-                        carina_core::validation::resolve_file_type_exprs(
-                            &mut parsed,
-                            &self.provider_context,
-                        )
-                    })
-                    .unwrap_or_default(),
+                None => match failed_directory_type_resolution.take() {
+                    Some(report) => report.into_diagnostics(),
+                    None => current_parsed
+                        .map(|p| {
+                            let mut parsed = p.clone();
+                            carina_core::validation::resolve_file_type_exprs_report(
+                                &mut parsed,
+                                &self.provider_context,
+                                None,
+                            )
+                            .into_diagnostics()
+                        })
+                        .unwrap_or_default(),
+                },
             };
             for finding in custom_type_findings {
                 let range = match finding.source_location() {
@@ -771,7 +785,6 @@ impl DiagnosticEngine {
                 carina_core::validation::ExpandedModuleCallCheckInput::References {
                     compositions,
                     bindings: &binding_index,
-                    constraint_reports: None,
                 },
             );
             let findings = carina_core::validation::merge_module_call_findings([

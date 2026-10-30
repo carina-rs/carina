@@ -5465,7 +5465,6 @@ let first = unrelated { }
         carina_core::validation::ExpandedModuleCallCheckInput::References {
             compositions: &binding_input.compositions,
             bindings: &bindings,
-            constraint_reports: None,
         },
     );
     let diagnostics = render_module_call_findings(&doc, doc.source_file(), &findings);

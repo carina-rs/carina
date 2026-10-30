@@ -3903,6 +3903,98 @@ child { values = [vpc] }
 }
 
 #[test]
+fn authored_and_expanded_binding_findings_merge_by_typed_identity() {
+    use crate::parser::ArgumentParameter;
+    use crate::schema::AttributeSchema;
+
+    let parsed = crate::parser::parse_file(
+        r#"let source = mock.counter { count = 7 }
+let forwarded = source.count
+let child_module = use { source = "./child" }
+let child = child_module { value = forwarded }
+"#,
+        std::path::Path::new("calls.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("binding-reference fixture must parse");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("counter")
+            .attribute(AttributeSchema::optional("count", AttributeType::int()).build())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let signatures = HashMap::from([(
+        "child_module".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "value".to_string(),
+                type_expr: TypeExpr::String,
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+    let report = check_bare_binding_uses(
+        &parsed,
+        &ValidationTypeContext::new(&parsed, &schemas, &ProviderContext::default(), &signatures),
+    );
+    assert_eq!(report.findings().len(), 1, "unexpected report: {report:#?}");
+    assert!(matches!(
+        report.findings()[0].error,
+        BindingResolutionError::ReferenceType(_)
+    ));
+    let bindings = BindingIndex::from_parsed_with_module_signatures(&parsed, &schemas, &signatures);
+    let authored = check_module_calls(ModuleCallCheckInput {
+        authored: &parsed,
+        semantic: Some(&parsed),
+        base_dir: None,
+        imported_signatures: &signatures,
+        provider_context: &ProviderContext::default(),
+        schemas: &schemas,
+        binding_use_report: &report,
+        bindings: &bindings,
+        reference_checks: ModuleCallReferenceChecks::Enabled,
+    });
+    let expanded = check_expanded_module_calls(ExpandedModuleCallCheckInput::BindingUses {
+        binding_use_report: &report,
+        compositions: &[],
+    });
+    assert_eq!(
+        authored.len(),
+        1,
+        "unexpected authored findings: {authored:#?}"
+    );
+    assert_eq!(
+        expanded.len(),
+        1,
+        "unexpected expanded findings: {expanded:#?}"
+    );
+    assert_ne!(
+        authored[0].message().to_string(),
+        expanded[0].message().to_string(),
+        "the fixture must exercise display-label-independent identity",
+    );
+
+    let expected_anchor = ModuleCallFindingAnchor {
+        source_file: report.findings()[0].use_site.source_file.clone(),
+        span: report.findings()[0].use_site.span,
+    };
+    assert_eq!(authored[0].anchor(), &expected_anchor);
+    assert_eq!(expanded[0].anchor(), &expected_anchor);
+    let merged = merge_module_call_findings([authored, expanded]);
+    assert_eq!(
+        merged.len(),
+        1,
+        "one call/argument/typed error must survive both passes only once: {merged:#?}",
+    );
+}
+
+#[test]
 fn check_module_calls_defers_compatible_binding_refs_to_binding_use_authority() {
     use crate::parser::ArgumentParameter;
 
@@ -7149,8 +7241,8 @@ fn value_contains_unresolved_ref_unwraps_secret() {
 }
 
 // ---------------------------------------------------------------------------
-// carina#3239: post-parse argument-side unknown-custom-type walker.
-// These cover the validator unit; the end-to-end CLI / LSP wiring is
+// carina#3239: live module-boundary type resolution.
+// These cover the core resolver; the end-to-end CLI / LSP wiring is
 // exercised by `carina-cli/tests/validate_unknown_custom_type_e2e.rs`.
 // ---------------------------------------------------------------------------
 
@@ -7159,7 +7251,7 @@ fn enriched_context_with_iam_policy_arn() -> ProviderContext {
 }
 
 #[test]
-fn validate_argument_custom_types_rejects_unknown_in_arguments() {
+fn resolve_file_type_exprs_rejects_unknown_in_arguments() {
     use crate::parser::{ArgumentParameter, TypeExpr};
 
     let mut parsed = empty_parsed();
@@ -7171,10 +7263,10 @@ fn validate_argument_custom_types_rejects_unknown_in_arguments() {
         validations: Vec::new(),
     });
 
-    let findings = validate_argument_custom_types(&parsed, &enriched_context_with_iam_policy_arn());
+    let findings = resolve_file_type_exprs(&mut parsed, &enriched_context_with_iam_policy_arn());
 
     assert_eq!(findings.len(), 1, "expected one finding, got {findings:?}");
-    let only = &findings[0];
+    let only = findings[0].to_string();
     assert!(
         only.contains("argument 'bad_arg'")
             && only.contains("unknown custom type")
@@ -7184,7 +7276,43 @@ fn validate_argument_custom_types_rejects_unknown_in_arguments() {
 }
 
 #[test]
-fn validate_argument_custom_types_accepts_registered_bare_identity() {
+fn file_type_resolution_report_owns_matching_parser_error_coverage() {
+    let source_file = std::path::Path::new("arguments.crn");
+    let mut parsed = crate::parser::parse_file(
+        "arguments {\n  bad_arg: TotallyMadeUpType\n}\n",
+        source_file,
+        &ProviderContext::default(),
+    )
+    .expect("bootstrap parsing must retain the unresolved declaration");
+    let parser_error = crate::parser::ParseError::InvalidExpression {
+        line: 2,
+        message: "unknown custom type 'TotallyMadeUpType'".to_string(),
+    };
+
+    let bootstrap_report = resolve_file_type_exprs_report(
+        &mut parsed,
+        &ProviderContext::default(),
+        Some(TypeResolutionParserError::new(source_file, &parser_error)),
+    );
+    assert!(bootstrap_report.diagnostics().is_empty());
+    assert!(!bootstrap_report.covered_parser_error());
+
+    let report = resolve_file_type_exprs_report(
+        &mut parsed,
+        &enriched_context_with_iam_policy_arn(),
+        Some(TypeResolutionParserError::new(source_file, &parser_error)),
+    );
+
+    assert_eq!(report.diagnostics().len(), 1);
+    assert!(report.covered_parser_error());
+    assert_eq!(
+        report.diagnostics()[0].to_string(),
+        "argument 'bad_arg': unknown custom type 'TotallyMadeUpType'",
+    );
+}
+
+#[test]
+fn resolve_file_type_exprs_accepts_registered_bare_identity() {
     use crate::parser::{ArgumentParameter, TypeExpr};
 
     let mut parsed = empty_parsed();
@@ -7192,7 +7320,7 @@ fn validate_argument_custom_types_accepts_registered_bare_identity() {
         name: "policy".to_string(),
         // The fixture registers `IamPolicyArn` as a bare-identity
         // validator; this is the round-trip "name a registered custom
-        // type and have it pass" path that proves the walker isn't
+        // type and have it pass" path that proves the resolver isn't
         // over-firing.
         type_expr: TypeExpr::Simple("iam_policy_arn".to_string()),
         default: None,
@@ -7200,15 +7328,19 @@ fn validate_argument_custom_types_accepts_registered_bare_identity() {
         validations: Vec::new(),
     });
 
-    let findings = validate_argument_custom_types(&parsed, &enriched_context_with_iam_policy_arn());
+    let findings = resolve_file_type_exprs(&mut parsed, &enriched_context_with_iam_policy_arn());
     assert!(
         findings.is_empty(),
-        "registered bare custom type must pass the walker; got: {findings:?}"
+        "registered bare custom type must pass the resolver; got: {findings:?}"
     );
+    assert!(matches!(
+        &parsed.arguments[0].type_expr,
+        TypeExpr::SchemaType { owned: _ }
+    ));
 }
 
 #[test]
-fn validate_argument_custom_types_walks_into_list_map_union_struct() {
+fn resolve_file_type_exprs_walks_into_list_map_union_struct() {
     use crate::parser::{ArgumentParameter, TypeExpr};
 
     let mut parsed = empty_parsed();
@@ -7260,19 +7392,23 @@ fn validate_argument_custom_types_walks_into_list_map_union_struct() {
         validations: Vec::new(),
     });
 
-    let findings = validate_argument_custom_types(&parsed, &enriched_context_with_iam_policy_arn());
+    let findings = resolve_file_type_exprs(&mut parsed, &enriched_context_with_iam_policy_arn());
 
-    let joined = findings.join("\n");
+    let joined = findings
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
     for expected in ["UnknownA", "UnknownB", "UnknownC", "UnknownD", "UnknownE"] {
         assert!(
             joined.contains(expected),
-            "walker must descend into List/Map/Union/Struct and surface {expected}; got: {joined}"
+            "resolver must descend into List/Map/Union/Struct and surface {expected}; got: {joined}"
         );
     }
 }
 
 #[test]
-fn validate_argument_custom_types_is_independent_of_custom_type_load_state() {
+fn resolve_file_type_exprs_defers_unknown_bare_types_until_the_catalog_is_loaded() {
     use crate::parser::{ArgumentParameter, TypeExpr};
 
     let mut parsed = empty_parsed();
@@ -7284,23 +7420,21 @@ fn validate_argument_custom_types_is_independent_of_custom_type_load_state() {
         validations: Vec::new(),
     });
 
-    // Bootstrap context — custom types default to `Unloaded`. The
-    // walker delegates to the owner-preserving bare-type resolver; on an
-    // empty identity set the only accepted names are the
-    // BUILTIN_BARE_CUSTOM_TYPES set, so an unknown name still produces a
-    // finding even with the parser gate inactive. This pins
-    // that the walker is *independent* of the load state — only the
-    // parser is gated; the post-parse walker always reports. Callers
-    // that need the bootstrap-context exemption (e.g. LSP orphaned-file
-    // diagnostics) must withhold the call themselves.
+    // Bootstrap parsing has no authoritative provider catalog, so the live
+    // resolver must retain the provisional simple type without diagnosing it.
     let ctx = ProviderContext::default();
     assert!(!ctx.custom_types_loaded());
     assert!(ctx.known_custom_types().is_empty());
-    let findings = validate_argument_custom_types(&parsed, &ctx);
+    let findings = resolve_file_type_exprs(&mut parsed, &ctx);
+    assert!(findings.is_empty());
+
+    // Once schemas have loaded, the same declaration becomes an actionable
+    // unknown custom type.
+    let findings = resolve_file_type_exprs(&mut parsed, &enriched_context_with_iam_policy_arn());
     assert_eq!(
         findings.len(),
         1,
-        "walker always reports unknowns; gating is the caller's choice"
+        "the enriched catalog must reject the deferred unknown type"
     );
 }
 
