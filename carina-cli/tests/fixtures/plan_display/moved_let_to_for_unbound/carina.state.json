@@ -1,0 +1,35 @@
+{
+  "version": 18,
+  "exports_version": 1,
+  "serial": 1,
+  "lineage": "test-moved-let-to-for-unbound",
+  "carina_version": "0.7.1",
+  "resources": [
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "old_vpc",
+      "provider": "awscc",
+      "current": {
+        "kind": "applied",
+        "identifier": "vpc-old-unbound",
+        "attributes": {
+          "cidr_block": "10.0.0.0/16"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": { "kind": "leaf" }
+        }
+      },
+      "binding": "old_vpc",
+      "dependency_bindings": []
+    }
+  ],
+  "exports": {}
+}

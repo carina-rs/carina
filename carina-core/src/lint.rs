@@ -1915,10 +1915,7 @@ tags = {
         ParsedFile {
             uses: uses
                 .into_iter()
-                .map(|(alias, path)| UseStatement {
-                    alias: alias.to_string(),
-                    path: path.to_string(),
-                })
+                .map(|(alias, path)| UseStatement::dummy(path.to_string(), alias.to_string()))
                 .collect(),
             module_calls: calls
                 .into_iter()

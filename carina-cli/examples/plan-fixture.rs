@@ -208,6 +208,7 @@ fn main() -> ExitCode {
             eprintln!("TUI error: {}", e);
             return ExitCode::from(1);
         }
+        fp.moved_hints.eprint();
         return ExitCode::SUCCESS;
     }
 
@@ -241,6 +242,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     }
+    fp.moved_hints.eprint();
 
     if let Some(rendered_inline_image) = rendered_inline_image
         && let Err(error) = write_inline_image(rendered_inline_image, std::io::stdout().lock())

@@ -26,6 +26,313 @@ fn saved_plan_validation_ready_constructor_is_unit_typed() {
     assert!(matches!(origin, ValidationReadyOrigin::SavedPlanArtifact));
 }
 
+fn missing_identifier_plan_error(identity: &str) -> carina_core::plan::PlanError {
+    carina_core::plan::PlanError::new(
+        ResourceId::with_identity("test.thing", test_identity(identity)),
+        carina_core::plan::PlanErrorKind::MissingProviderIdentifier,
+    )
+}
+
+#[test]
+fn non_empty_plan_errors_reject_empty_and_preserve_order() {
+    assert!(NonEmptyPlanErrors::try_from(Vec::new()).is_err());
+
+    let first = missing_identifier_plan_error("first");
+    let second = missing_identifier_plan_error("second");
+    let errors = NonEmptyPlanErrors::try_from(vec![first.clone(), second.clone()])
+        .expect("two errors are non-empty");
+
+    assert_eq!(errors.as_slice(), &[first, second]);
+}
+
+#[tokio::test]
+async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
+    let context = WiringContext::new_for_test(Vec::new(), &[]);
+    let expanded_resources = ExpandedCanonicalResources {
+        resources: canonical_unresolved(Vec::new(), context.schemas()),
+    };
+    let expansion = PostExpansionPlanView {
+        data: PostExpansionPlanData {
+            expanded_resources,
+            sorted_resources: Vec::new(),
+            addressed: AddressedState {
+                managed_current: HashMap::new(),
+                orphans: Orphans::new(),
+                saved_attrs: crate::empty_lifted_saved_attrs(),
+                prev_explicit: HashMap::new(),
+                moved_pairs: Vec::new(),
+            },
+            data_source_values: DataSourceValues::empty(),
+            wait_aliases: Vec::new(),
+            residual_deferred_for: Vec::new(),
+            deferred_create_targets: Vec::new(),
+        },
+        children: AbsentChildrenSettled,
+    }
+    .into_plan_settled();
+    let provider = carina_core::provider::ProviderRouter::new();
+    let state_file = None;
+    let state_block_claims = StateBlockClaims::default();
+    let resolved_state_block_targets = ResolvedStateBlockTargets::default();
+    let expected = missing_identifier_plan_error("diagnostic");
+    let preparation_errors =
+        NonEmptyPlanErrors::try_from(vec![expected.clone()]).expect("one error is non-empty");
+
+    let outcome = build_post_expansion_plan::<PlanMode, _>(PostExpansionPlanInput {
+        context: &context,
+        expansion,
+        environment: PostExpansionPlanEnvironment {
+            data_sources: &[],
+            provider: &provider,
+            normalizer: &provider,
+            provider_configs: &[],
+            remote_bindings: &HashMap::new(),
+            state_file: &state_file,
+            state_block_claims: &state_block_claims,
+            resolved_state_block_targets: &resolved_state_block_targets,
+            preparation_errors: Some(preparation_errors),
+        },
+    })
+    .await
+    .expect("typed preparation diagnostics should produce an outcome");
+
+    let PostExpansionOutcome::Diagnostics(diagnostics) = outcome else {
+        panic!("non-empty preparation diagnostics must not produce a plan")
+    };
+    let errors = diagnostics.errors().clone();
+    let artifacts = diagnostics.into_artifacts();
+    assert_eq!(errors.as_slice(), &[expected]);
+    assert_eq!(artifacts.plan.errors(), errors.as_slice());
+}
+
+struct RawEnumStateFactory;
+
+impl ProviderFactory for RawEnumStateFactory {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    fn display_name(&self) -> &str {
+        "raw enum state test provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> ProviderResult<()> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(RawEnumStateProvider)))
+        })
+    }
+
+    fn create_normalizer(
+        &self,
+        _binding: Option<&str>,
+        _config: &ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async {
+            Ok(Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>)
+        })
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let mode = AttributeType::enum_(
+            carina_core::schema::enum_identity("Mode", Some("test.thing")),
+            Some(vec!["Allow".to_string()]),
+            vec![("Allow".to_string(), "allow".to_string())],
+            None,
+            None,
+        );
+        vec![
+            ResourceSchema::new("thing")
+                .attribute(AttributeSchema::required("mode", mode).build())
+                .validate()
+                .expect("raw enum test schema is valid"),
+        ]
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .expect("raw enum test provider schema must be valid")
+    }
+}
+
+struct RawEnumStateProvider;
+
+impl Provider for RawEnumStateProvider {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        identifier: &AppliedIdentifier,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
+        let id = id.clone();
+        let identifier = identifier.clone();
+        Box::pin(async move {
+            Ok(ReadOutcome::found(
+                AppliedState::new(
+                    id,
+                    identifier.to_string(),
+                    HashMap::from([(
+                        "mode".to_string(),
+                        Value::Concrete(ConcreteValue::String("Allow".into())),
+                    )]),
+                )
+                .expect("raw enum test identifier is non-empty"),
+            ))
+        })
+    }
+
+    fn read_data_source(
+        &self,
+        _resource: &carina_core::provider::ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { panic!("raw enum test must not read a data source") })
+    }
+
+    fn create(
+        &self,
+        _id: &ResourceId,
+        _request: CreateRequest,
+        _attempt: carina_core::provider::CreateAttempt,
+    ) -> BoxFuture<'_, Result<CreateOutcome, carina_core::provider::CreateFailure>> {
+        Box::pin(async { panic!("raw enum test must not create") })
+    }
+
+    fn resume_create(
+        &self,
+        _request: carina_core::provider::ResumeCreateRequest,
+    ) -> BoxFuture<
+        '_,
+        Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
+    > {
+        Box::pin(async { panic!("raw enum test must not resume create") })
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &AppliedIdentifier,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+        Box::pin(async { panic!("raw enum test must not update") })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &AppliedIdentifier,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { panic!("raw enum test must not delete") })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+
+fn raw_enum_state_file() -> StateFile {
+    let mut row =
+        carina_state::state::ResourceState::try_applied("thing", "item", "test", "provider-id")
+            .expect("raw enum test identifier is non-empty")
+            .with_attribute("mode", serde_json::json!("Allow"));
+    row.binding = Some("item".to_string());
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(row)
+        .expect("raw enum test state row is unique");
+    state
+}
+
+#[tokio::test]
+async fn plan_lifts_raw_api_enum_prior_state_on_live_and_cached_paths() {
+    let parsed = parse(
+        r#"
+provider test {}
+
+let item = test.thing {
+  mode = test.thing.Mode.allow
+}
+"#,
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("parse raw enum plan fixture");
+    let provider_configs = resolved_provider_configs(&parsed);
+
+    for refresh in [true, false] {
+        let wiring = ValidatedWiring::from_factories_for_test(
+            vec![Box::new(RawEnumStateFactory)],
+            provider_configs.as_provider_configs(),
+        );
+        let canonical_resources = canonical_pair(
+            &parsed,
+            parsed.resources.clone(), // allow: direct — plan-time reconciliation
+            wiring.context().schemas(),
+        );
+        let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+        let state_file = Some(raw_enum_state_file());
+        let planned = create_plan_from_parsed_with_upstream_with_ctx(
+            validated,
+            &provider_configs,
+            &state_file,
+            refresh,
+            ProgressSink::Human,
+            &HashMap::new(),
+            &StateBlockClaims::default(),
+            &ResolvedStateBlockTargets::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("refresh={refresh} plan failed: {error}"));
+        let planned = planned.resources();
+
+        assert!(
+            planned.plan.effects().is_empty(),
+            "refresh={refresh} produced a phantom enum diff: {:#?}",
+            planned.plan.effects(),
+        );
+        let id = ResourceId::with_provider_identity("test", "thing", "item", None);
+        let Current::Present(prior) = &planned.managed_current[&id] else {
+            panic!("refresh={refresh} prior state is not present")
+        };
+        assert!(
+            matches!(
+                prior.state().attributes.get("mode"),
+                Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+                    if value.api_value() == "Allow"
+            ),
+            "refresh={refresh} did not lift raw enum state: {:?}",
+            prior.state().attributes.get("mode"),
+        );
+    }
+}
+
 #[test]
 fn data_source_reads_select_only_the_owning_identical_anonymous_call() {
     let tmp = tempfile::tempdir().expect("temporary project");
@@ -7567,11 +7874,10 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
     assert_eq!(state.identifier.as_deref(), Some("route-123"));
 }
 
-// Smoke test for the module/provider wrappers: empty input exercises
-// each wrapper and pins the `Vec<AppError>` return type. A regression
-// back to `Result` fails to compile here.
+// Smoke test for the provider/composition wrappers and the typed module-call
+// checker on empty input.
 #[test]
-fn module_and_provider_wrappers_return_vec_app_error() {
+fn module_checker_and_provider_wrappers_accept_empty_input() {
     let ctx = WiringContext::new_for_test(vec![], &[]);
     let parsed = ParsedFile::default();
     let provider_ctx = carina_core::parser::ProviderContext::default();
@@ -7589,13 +7895,25 @@ fn module_and_provider_wrappers_return_vec_app_error() {
             &module_signatures,
         ),
     );
-    let errors = validate_module_calls_with_imported(
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_module_signatures(
         &parsed,
+        ctx.schemas(),
         &module_signatures,
-        &provider_ctx,
-        &binding_use_report,
     );
-    assert!(errors.is_empty(), "module_calls: got {errors:?}");
+    let findings = carina_core::validation::check_module_calls(
+        carina_core::validation::ModuleCallCheckInput {
+            authored: &parsed,
+            semantic: Some(&parsed),
+            base_dir: Some(std::path::Path::new(".")),
+            imported_signatures: &module_signatures,
+            provider_context: &provider_ctx,
+            schemas: ctx.schemas(),
+            binding_use_report: &binding_use_report,
+            bindings: &bindings,
+            reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
+        },
+    );
+    assert!(findings.is_empty(), "module_calls: got {findings:?}");
 
     let errors = validate_composition_ref_types_with_ctx(&ctx, &parsed);
     assert!(errors.is_empty(), "composition_ref_types: got {errors:?}");
@@ -10274,7 +10592,7 @@ mod resolved_value_constraint_gate {
 
     fn into_plan_errors(error: PlanPreparationError) -> Vec<carina_core::plan::PlanError> {
         match error {
-            PlanPreparationError::Plan(errors) => errors,
+            PlanPreparationError::Plan(errors) => errors.into_vec(),
             PlanPreparationError::Provider(error) => {
                 panic!("test normalizer unexpectedly failed: {error}")
             }

@@ -31,7 +31,8 @@ use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 use crate::commands::shared::state_writeback::{ApplyStateSave, build_state_after_apply};
 use crate::fixture_read_outcome;
 use crate::wiring::{
-    CanonicalResourcePair, OverrideAwareResources, resolve_config_block_names_for_test,
+    CanonicalResourcePair, OverrideAwareBuildMode, OverrideAwareResources,
+    resolve_config_block_names_for_test,
 };
 
 fn validate_with_test_factories(
@@ -1656,9 +1657,9 @@ inner { x = a }
     .expect_err("apply bootstrap reload must retain the reference-type gate");
     let message = crate::error::format_error_with_source_chain(&error);
     assert!(
-        message.contains("Type mismatch: expected Int, got String (from a)")
-            && message.contains("outer/main.crn")
-            && message.contains("line 3"),
+        message.contains("Reference type validation failed")
+            && message.contains("module call 'inner'")
+            && message.contains("expected Int, got String (from a)"),
         "{message}"
     );
 }
@@ -1739,7 +1740,7 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
             unresolved,
         )
         .expect_err("apply bootstrap reload must reject module-output type mismatch");
-        let message = error.to_string();
+        let message = crate::error::format_error_with_source_chain(&error);
         assert!(message.contains("module call 'y'"), "{message}");
         assert!(message.contains("expected Int"), "{message}");
         assert!(message.contains("got String"), "{message}");
@@ -8487,7 +8488,54 @@ mod apply_deferred_for_parity {
     use carina_core::data_source_value::DataSourceValues;
     use carina_core::parser::{ProviderContext, parse_file};
     use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+    };
     use std::collections::HashMap;
+
+    fn comparison_schemas() -> SchemaRegistry {
+        let certificate = ResourceSchema::new("acm.Certificate")
+            .attribute(
+                AttributeSchema::optional("domain_name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "domain_validation_options",
+                    AttributeType::list(AttributeType::struct_(
+                        "DomainValidation",
+                        vec![
+                            StructField::provider_populated(
+                                "resource_record",
+                                AttributeType::struct_(
+                                    "ResourceRecord",
+                                    vec![
+                                        StructField::provider_populated(
+                                            "name",
+                                            AttributeType::string(),
+                                        )
+                                        .build(),
+                                        StructField::provider_populated(
+                                            "value",
+                                            AttributeType::string(),
+                                        )
+                                        .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("comparison schema must be valid");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("aws", certificate);
+        schemas
+    }
 
     fn dvo_state(parsed: &carina_core::parser::ParsedFile) -> HashMap<ResourceId, State> {
         let cert = parsed
@@ -8510,6 +8558,10 @@ mod apply_deferred_for_parity {
             Value::Concrete(ConcreteValue::Map(rr)),
         );
         let mut attrs = HashMap::new();
+        attrs.insert(
+            "domain_name".to_string(),
+            Value::Concrete(ConcreteValue::String("r.example.com".into())),
+        );
         attrs.insert(
             "domain_validation_options".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -8553,6 +8605,7 @@ mod apply_deferred_for_parity {
         .expect("parse");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = dvo_state(&parsed);
+        let schemas = comparison_schemas();
 
         // This is the exact function `run_apply_locked` calls
         // post-refresh (carina#3132 PR-2). Reaching it through the
@@ -8562,9 +8615,8 @@ mod apply_deferred_for_parity {
             &sorted,
             &crate::managed_current_from_states(states),
             &DataSourceValues::empty(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &carina_core::provider::RawSavedAttrs::default()
-                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &schemas,
+            &carina_core::provider::RawSavedAttrs::default().lift(&schemas),
             &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],

@@ -5,6 +5,7 @@ pub mod error;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod fixture_plan;
 pub mod kms;
+pub mod moved_hint;
 pub mod plan_image;
 pub mod plan_summary;
 pub mod signal;

@@ -9,12 +9,14 @@ interface Props {
   title?: string;
   description?: string;
   showSidebar?: boolean;
+  showFooter?: boolean;
 }
 
 const {
   title = 'Carina',
   description = 'A strongly typed infrastructure management tool written in Rust.',
   showSidebar = true,
+  showFooter = true,
 } = Astro.props;
 ---
 <html lang="en">
@@ -27,7 +29,7 @@ const {
         <slot />
       </main>
     </div>
-    <Footer />
+    {showFooter && <Footer />}
   </body>
 </html>
 

@@ -44,6 +44,45 @@ fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
     })
 }
 
+fn render_module_call_findings(
+    doc: &Document,
+    current_file: &Path,
+    findings: &[carina_core::validation::ModuleCallFinding],
+) -> Vec<Diagnostic> {
+    findings
+        .iter()
+        .flat_map(|finding| {
+            let mut spans = Vec::new();
+            if finding.anchor().source_file.path() == current_file {
+                spans.push(finding.anchor().span);
+            } else {
+                for owner in finding.owners() {
+                    if owner.root.source_file().path() == current_file
+                        && !spans.contains(&owner.root.span())
+                    {
+                        spans.push(owner.root.span());
+                    }
+                }
+            }
+            spans.into_iter().filter_map(|span| {
+                let range = parser_span_range(doc, span)?;
+                let severity = DiagnosticSeverity::ERROR;
+                let message = finding.message().to_string();
+                if let Some(type_error) = finding.message().type_error()
+                    && let Some(mut diagnostic) =
+                        build_enum_diagnostic_from_error(type_error, Some(range))
+                {
+                    diagnostic.severity = Some(severity);
+                    diagnostic.message = message;
+                    Some(diagnostic)
+                } else {
+                    Some(carina_diagnostic_range(range, severity, message))
+                }
+            })
+        })
+        .collect()
+}
+
 #[derive(Default)]
 pub(super) struct ProviderValidationDeduplicator {
     suspended_inputs: Mutex<HashSet<(String, SuspendedValidationId)>>,
@@ -99,23 +138,6 @@ pub(crate) fn carina_diagnostic(
         message,
         ..Default::default()
     }
-}
-
-fn deduplicate_identical_diagnostics(diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
-    let mut seen = HashSet::new();
-    diagnostics
-        .into_iter()
-        .filter(|diagnostic| {
-            seen.insert((
-                diagnostic.range.start.line,
-                diagnostic.range.start.character,
-                diagnostic.range.end.line,
-                diagnostic.range.end.character,
-                format!("{:?}", diagnostic.severity),
-                diagnostic.message.clone(),
-            ))
-        })
-        .collect()
 }
 
 /// Create a `Diagnostic` with an arbitrary `Range` and the standard "carina" source.
@@ -267,6 +289,7 @@ impl DiagnosticEngine {
         // keystrokes.
         let merged_attempt =
             base_path.map(|base| self.parse_merged_with_buffer(doc, current_file_name, base));
+        let mut failed_directory_type_resolution = None;
         let directory_error_emitted = if let (Some(Err(error)), Some(current_file_path)) =
             (merged_attempt.as_ref(), current_file_path)
             && error
@@ -276,8 +299,29 @@ impl DiagnosticEngine {
         {
             // The directory parse has the classified sibling bindings and is
             // therefore more authoritative than the buffer-only parse (which
-            // may have treated a sibling name as an enum identifier).
-            diagnostics.push(parse_error_to_diagnostic(parse_error));
+            // may have treated a sibling name as an enum identifier). One
+            // exception is an unresolved declaration type: the bootstrap AST
+            // retains that declaration and the typed resolver below can attach
+            // its context and exact token span. In that case the typed finding
+            // covers this coarse parser backstop.
+            let type_resolution = doc.parsed().map(|parsed| {
+                let mut parsed = parsed.clone();
+                carina_core::validation::resolve_file_type_exprs_report(
+                    &mut parsed,
+                    &self.provider_context,
+                    Some(carina_core::validation::TypeResolutionParserError::new(
+                        current_file_path,
+                        parse_error,
+                    )),
+                )
+            });
+            let covered_by_typed_resolution = type_resolution
+                .as_ref()
+                .is_some_and(|report| report.covered_parser_error());
+            if !covered_by_typed_resolution {
+                diagnostics.push(parse_error_to_diagnostic(parse_error));
+            }
+            failed_directory_type_resolution = type_resolution;
             true
         } else {
             false
@@ -406,7 +450,7 @@ impl DiagnosticEngine {
 
         // carina#3239: surface unknown bare custom-type names in
         // `arguments` / `attributes` / `exports` declarations as
-        // editor diagnostics. Two paths feed the walker:
+        // editor diagnostics. Two paths feed the resolver:
         //
         // 1. The directory-merged parse (`merged`) — when present,
         //    it carries every sibling `.crn`'s declarations so an
@@ -416,70 +460,66 @@ impl DiagnosticEngine {
         // 2. The buffer-only parse (`doc.parsed()`) — load-bearing
         //    fallback when the merged parse failed. The merged parse
         //    uses the enriched `ProviderCustomTypes::Loaded` context, so the
-        //    parser's strict gate raises `ParseError::InvalidExpression`
+        //    parser's strict gate raises `ParseError::UnresolvedDeclarationType`
         //    on the very unknown-type-name shape we want to report.
         //    `parse_merged_with_buffer` returns that directory error; the
         //    owner-aware path above surfaces errors from the current file,
         //    while this fallback still handles shapes found only in the
         //    bootstrap AST. The buffer-only parse uses the bootstrap context
         //    (`ProviderCustomTypes::Unloaded`), so it always succeeds and
-        //    `doc.parsed()` is `Some`, letting the walker still run
+        //    `doc.parsed()` is `Some`, letting the resolver still run
         //    against the user's in-flight edits.
         //
-        // Both paths walk the same `arguments` set when the edited
-        // file is the one declaring them, so the merged path is the
-        // strict preference and the fallback only fires on its
-        // failure — no double-report.
-        //
-        // Position note: the diagnostic uses `Range::default()`
-        // (line 0). The AST parameter structs do not carry a source
-        // span, so threading a precise location requires a wider
-        // change (extend `ArgumentParameter` / `AttributeParameter`
-        // / `ParsedExportParam` with a `line: usize` field and update
-        // every constructor). The CLI emits the same message without
-        // a span — we accept the same trade-off here so the LSP
-        // reaches CLI parity in this PR; precise spans can land as a
-        // follow-up.
-        // Gate on the custom-type load state. The walker itself is unconditional
-        // by design (the carina-core helper "always reports unknowns;
-        // gating is the caller's choice"); the orphaned-file
-        // fallback context turns this flag off so its diagnostics
-        // don't over-fire for `arguments {}` blocks in files outside
-        // any known project root.
+        // Both paths walk the same declaration set when the edited file owns
+        // it. The merged path is preferred; on failure, the buffer fallback's
+        // parser metadata retains the authored type-token span. The core
+        // resolution report above decides whether this typed finding covers
+        // the coarser directory parser backstop, avoiding a frontend-specific
+        // duplicate decision.
+        // Gate on the custom-type load state so the orphaned-file fallback
+        // does not report unresolved declarations in files outside any known
+        // project root, where no provider catalog is authoritative.
         if self.provider_context.custom_types_loaded() {
             let custom_type_findings = match merged {
                 Some(m) => {
                     let mut parsed = m.clone();
-                    let mut findings = carina_core::validation::resolve_file_type_exprs(
+                    carina_core::validation::resolve_file_type_exprs_report(
                         &mut parsed,
                         &self.provider_context,
-                    );
-                    findings.extend(carina_core::validation::validate_argument_custom_types(
-                        &parsed,
-                        &self.provider_context,
-                    ));
-                    findings
+                        None,
+                    )
+                    .into_diagnostics()
                 }
-                None => current_parsed
-                    .map(|p| {
-                        let mut parsed = p.clone();
-                        let mut findings = carina_core::validation::resolve_file_type_exprs(
-                            &mut parsed,
-                            &self.provider_context,
-                        );
-                        findings.extend(carina_core::validation::validate_argument_custom_types(
-                            &parsed,
-                            &self.provider_context,
-                        ));
-                        findings
-                    })
-                    .unwrap_or_default(),
+                None => match failed_directory_type_resolution.take() {
+                    Some(report) => report.into_diagnostics(),
+                    None => current_parsed
+                        .map(|p| {
+                            let mut parsed = p.clone();
+                            carina_core::validation::resolve_file_type_exprs_report(
+                                &mut parsed,
+                                &self.provider_context,
+                                None,
+                            )
+                            .into_diagnostics()
+                        })
+                        .unwrap_or_default(),
+                },
             };
-            for msg in custom_type_findings {
+            for finding in custom_type_findings {
+                let range = match finding.source_location() {
+                    Some(source)
+                        if current_file_path
+                            .is_none_or(|current| current == source.source_file().path()) =>
+                    {
+                        parser_span_range(doc, source.span()).unwrap_or_default()
+                    }
+                    Some(_source) => continue,
+                    None => tower_lsp::lsp_types::Range::default(),
+                };
                 diagnostics.push(carina_diagnostic_range(
-                    tower_lsp::lsp_types::Range::default(),
+                    range,
                     tower_lsp::lsp_types::DiagnosticSeverity::ERROR,
-                    msg,
+                    finding.to_string(),
                 ));
             }
         }
@@ -640,7 +680,7 @@ impl DiagnosticEngine {
                 .uses()
                 .filter(|use_site| {
                     use_site.path.segments().len() == 1
-                        || binding_use_report.findings().iter().any(|finding| {
+                        || binding_use_report.resource_findings().any(|finding| {
                             finding.use_site.source_file == use_site.source_file
                                 && finding.use_site.span == use_site.span
                                 && finding.use_site.name == use_site.name
@@ -666,7 +706,7 @@ impl DiagnosticEngine {
                 })
                 .collect::<HashSet<_>>();
             let diagnostic_file = current_file_path.unwrap_or_else(|| doc.source_file());
-            for finding in binding_use_report.findings() {
+            for finding in binding_use_report.resource_findings() {
                 if finding.use_site.source_file.path() != diagnostic_file {
                     continue;
                 }
@@ -698,31 +738,80 @@ impl DiagnosticEngine {
             let export_value_bindings =
                 carina_core::binding_index::ResolvedBindings::for_validation(binding_input);
             diagnostics.extend(self.check_user_function_ref_types(doc, parsed, &binding_index));
-            let mut module_call_diagnostics = Vec::new();
+            let expanded_compositions = match merged_result.as_ref() {
+                Some(result) => match &result.module_resolution {
+                    checks::MergedModuleResolution::Expanded => {
+                        Some(result.directory.parsed.compositions.as_slice())
+                    }
+                    checks::MergedModuleResolution::ConstraintFailed {
+                        findings: _findings,
+                        errors: _errors,
+                    } => None,
+                    checks::MergedModuleResolution::Unowned { errors: _errors } => None,
+                },
+                None => None,
+            };
+            let resolver_constraint_findings = match merged_result.as_ref() {
+                Some(result) => match &result.module_resolution {
+                    checks::MergedModuleResolution::Expanded => Vec::new(),
+                    checks::MergedModuleResolution::ConstraintFailed {
+                        findings,
+                        errors: _errors,
+                    } => findings.clone(),
+                    checks::MergedModuleResolution::Unowned { errors: _errors } => Vec::new(),
+                },
+                None => Vec::new(),
+            };
+            let residual_errors: &[carina_core::module_resolver::ResidualModuleResolutionError] =
+                match merged_result.as_ref() {
+                    Some(result) => match &result.module_resolution {
+                        checks::MergedModuleResolution::Expanded => &[],
+                        checks::MergedModuleResolution::ConstraintFailed {
+                            findings: _findings,
+                            errors,
+                        } => errors.as_slice(),
+                        checks::MergedModuleResolution::Unowned { errors } => errors.as_slice(),
+                    },
+                    None => &[],
+                };
+            let authored_findings = carina_core::validation::check_module_calls(
+                carina_core::validation::ModuleCallCheckInput {
+                    authored: parsed,
+                    semantic: merged,
+                    base_dir: base_path,
+                    imported_signatures: &module_signatures,
+                    provider_context: &self.provider_context,
+                    schemas: &self.schemas,
+                    binding_use_report: &binding_use_report,
+                    bindings: &binding_index,
+                    reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
+                },
+            );
+            let compositions = expanded_compositions.unwrap_or(&[]);
+            let expanded_binding_findings = match expanded_compositions {
+                Some(compositions) => carina_core::validation::check_expanded_module_calls(
+                    carina_core::validation::ExpandedModuleCallCheckInput::BindingUses {
+                        binding_use_report: &binding_use_report,
+                        compositions,
+                    },
+                ),
+                None => Vec::new(),
+            };
+            let expanded_reference_findings = carina_core::validation::check_expanded_module_calls(
+                carina_core::validation::ExpandedModuleCallCheckInput::References {
+                    compositions,
+                    bindings: &binding_index,
+                },
+            );
+            let findings = carina_core::validation::merge_module_call_findings([
+                authored_findings,
+                expanded_binding_findings,
+                expanded_reference_findings,
+                resolver_constraint_findings,
+            ]);
+            diagnostics.extend(render_module_call_findings(doc, diagnostic_file, &findings));
             if let Some(base_path) = base_path {
-                module_call_diagnostics.extend(self.check_module_calls(
-                    parsed,
-                    &semantic_view,
-                    &module_signatures,
-                    &inference_bindings,
-                    &binding_use_report,
-                ));
-                let constraint_diagnostics = current_file_path
-                    .zip(merged_result.as_ref())
-                    .map(|(current_file_path, result)| {
-                        self.module_constraint_diagnostics(
-                            current_file_path,
-                            &result.module_constraint_reports,
-                        )
-                    })
-                    .unwrap_or_default();
-                let has_source_owned_constraint_diagnostic = !constraint_diagnostics.is_empty();
-                module_call_diagnostics.extend(constraint_diagnostics);
-                if !has_source_owned_constraint_diagnostic
-                    && let Some(error) = merged_result
-                        .as_ref()
-                        .and_then(|result| result.module_error.as_ref())
-                {
+                for error in residual_errors {
                     diagnostics.extend(self.module_resolver_error_diagnostics(
                         doc,
                         parsed,
@@ -732,29 +821,6 @@ impl DiagnosticEngine {
                     ));
                 }
             }
-            let expansion_succeeded = merged_result
-                .as_ref()
-                .is_some_and(|result| result.module_error.is_none());
-            // Successful expansion supplies inferred types for unannotated
-            // forwarded outputs. Declared module outputs were already checked
-            // by the mandatory graph pass; both branches use BindingIndex's
-            // single TypeInSchema relation.
-            if let (Some(_), Some(expanded), true) = (base_path, merged, expansion_succeeded) {
-                module_call_diagnostics.extend(self.check_composition_ref_types(
-                    parsed,
-                    &semantic_view,
-                    &expanded.compositions,
-                    &binding_index,
-                ));
-            } else {
-                module_call_diagnostics.extend(self.check_module_call_ref_types(
-                    parsed,
-                    &semantic_view,
-                    &module_signatures,
-                    &binding_index,
-                ));
-            }
-            diagnostics.extend(deduplicate_identical_diagnostics(module_call_diagnostics));
             // The document AST intentionally preserves function calls for
             // source-oriented checks. Build a parallel, same-order view with
             // locally resolvable calls evaluated so schema diagnostics see
@@ -2081,6 +2147,27 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             DiagnosticSeverity::ERROR,
             message.clone(),
         ),
+        ParseError::UnresolvedDeclarationType {
+            token,
+            line: _line,
+            message,
+        } => {
+            let span = token.span();
+            carina_diagnostic_range(
+                Range::new(
+                    Position::new(
+                        span.start_line().saturating_sub(1) as u32,
+                        span.start_column().saturating_sub(1) as u32,
+                    ),
+                    Position::new(
+                        span.end_line().saturating_sub(1) as u32,
+                        span.end_column().saturating_sub(1) as u32,
+                    ),
+                ),
+                DiagnosticSeverity::ERROR,
+                message.clone(),
+            )
+        }
         ParseError::UnknownFunction { name, line, column } => carina_diagnostic(
             (*line as u32).saturating_sub(1),
             (*column as u32).saturating_sub(1),

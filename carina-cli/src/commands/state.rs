@@ -50,6 +50,7 @@ use crate::commands::shared::progress::{
     ProgressBackend, ProgressSink, RefreshPhase, emit_newline_on_interrupt,
 };
 use crate::commands::shared::state_writeback::SkippedExports;
+use crate::commands::state_output::{StateShowCurrentKind, StateShowDocument, StateShowResource};
 use crate::cursor::CursorReveal;
 use crate::error::AppError;
 use crate::wiring::{
@@ -591,10 +592,13 @@ async fn load_state_file(
     path: Option<&Path>,
     state_url: Option<&str>,
     provider_context: &ProviderContext,
-) -> Result<StateFile, AppError> {
+) -> Result<Option<StateFile>, AppError> {
     if let Some(raw) = state_url {
         let url = StateUrl::parse(raw).map_err(AppError::Backend)?;
-        return load_state_from_url(&url).await.map_err(AppError::Backend);
+        return load_state_from_url(&url)
+            .await
+            .map(Some)
+            .map_err(AppError::Backend);
     }
 
     let default_path = PathBuf::from(".");
@@ -617,10 +621,15 @@ async fn load_state_file(
     )
     .await?;
 
-    let state_file = backend.read_state().await.map_err(AppError::Backend)?;
-    state_file
-        .map(|loaded| loaded.into_state())
-        .ok_or_else(|| AppError::Config("No state file found.".to_string()))
+    backend
+        .read_state()
+        .await
+        .map(|state| state.map(|loaded| loaded.into_state()))
+        .map_err(AppError::Backend)
+}
+
+fn require_state_file(state: Option<StateFile>) -> Result<StateFile, AppError> {
+    state.ok_or_else(|| AppError::Config("No state file found.".to_string()))
 }
 
 /// Find a resource by binding name first, then fall back to resource
@@ -759,7 +768,7 @@ async fn run_state_list(
     state_url: Option<&str>,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let state = load_state_file(path, state_url, provider_context).await?;
+    let state = require_state_file(load_state_file(path, state_url, provider_context).await?)?;
 
     if state.resources().is_empty() {
         println!("No resources in state.");
@@ -795,8 +804,11 @@ fn format_state_lookup(
 ) -> Result<String, AppError> {
     // (1) Longest-binding-prefix match against resources.
     if let Some((rs, attribute)) = resolve_resource_address(state, query) {
+        if json_output {
+            return format_state_lookup_json(state, rs, attribute);
+        }
         let current = current_for_state_command(state, rs);
-        return format_resource_value(rs, &current, attribute, json_output);
+        return format_resource_value(rs, &current, attribute, false);
     }
 
     // (2) Nothing matched — report the full query so the operator
@@ -851,6 +863,46 @@ fn resolve_resource_address<'a>(
         Some(&query[matched.len() + 1..])
     };
     Some((rs, attribute))
+}
+
+fn format_state_lookup_json(
+    state: &StateFile,
+    row: &ResourceState,
+    attribute: Option<&str>,
+) -> Result<String, AppError> {
+    let resource = StateShowResource::from_row(row)
+        .map_err(|error| AppError::Config(format!("Failed to render state JSON: {error}")))?;
+
+    let value = match attribute {
+        None => serde_json::to_value(&resource)
+            .expect("the public state resource type must always serialize"),
+        Some(attribute) if resource.current.kind == StateShowCurrentKind::CreateInFlight => {
+            let current = current_for_state_command(state, row);
+            let StateCommandCurrent::CreateInFlight(pending) = StateCommandCurrent::from(&current)
+            else {
+                unreachable!("public and internal current kinds must agree")
+            };
+            let display_name = row.binding.as_deref().unwrap_or(row.identity.as_str());
+            return Err(AppError::Config(format!(
+                "Cannot look up attribute '{attribute}' on resource '{display_name}': {}.",
+                create_in_flight_status(pending)
+            )));
+        }
+        Some(attribute) => resource
+            .current
+            .attributes
+            .get(attribute)
+            .cloned()
+            .ok_or_else(|| {
+                let display_name = row.binding.as_deref().unwrap_or(row.identity.as_str());
+                AppError::Config(format!(
+                    "Attribute '{attribute}' not found on resource '{display_name}'."
+                ))
+            })?,
+    };
+
+    serde_json::to_string_pretty(&value)
+        .map_err(|error| AppError::Config(format!("Failed to serialize state JSON: {error}")))
 }
 
 /// Candidate addresses for a resource, paired with `is_binding` so the
@@ -965,7 +1017,7 @@ async fn run_state_lookup(
     json_output: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let state = load_state_file(path, state_url, provider_context).await?;
+    let state = require_state_file(load_state_file(path, state_url, provider_context).await?)?;
     let output = format_state_lookup(&state, query, json_output)?;
     println!("{}", output);
     Ok(())
@@ -1080,9 +1132,22 @@ async fn run_state_show(
 ) -> Result<(), AppError> {
     let state = load_state_file(path, state_url, provider_context).await?;
 
+    let Some(state) = state else {
+        if json {
+            let document = StateShowDocument::absent();
+            let json = serde_json::to_string_pretty(&document)
+                .map_err(|error| format!("Failed to serialize state JSON: {error}"))?;
+            println!("{json}");
+            return Ok(());
+        }
+        return Err(AppError::Config("No state file found.".to_string()));
+    };
+
     if json {
-        let json_str = serde_json::to_string_pretty(&state)
-            .map_err(|e| format!("Failed to serialize state: {}", e))?;
+        let document = StateShowDocument::from_state(&state)
+            .map_err(|error| format!("Failed to render state JSON: {error}"))?;
+        let json_str = serde_json::to_string_pretty(&document)
+            .map_err(|error| format!("Failed to serialize state JSON: {error}"))?;
         println!("{}", json_str);
         return Ok(());
     }
@@ -1557,13 +1622,7 @@ pub(crate) async fn run_state_refresh_locked(
     }
     let mut prepared_expansion = addressed_expansion.seal(data_source_values);
     let crate::wiring::ExpandedRefreshState {
-        canonical_resources: _,
         sorted_resources: resorted,
-        new_child_ids: _,
-        refreshable_child_ids: _,
-        residual_deferred_for: _,
-        deferred_create_targets: _,
-        printed_warnings: _,
     } = validated_config
         .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
             provider: &provider,
@@ -2603,7 +2662,7 @@ mod tests {
     use carina_core::parser::parse_file;
     use carina_core::parser::{CompareOp, ValidateExpr};
     use carina_core::provider::{
-        BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
+        BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest, Sent,
         UpdateRequest,
     };
     use carina_core::resource::{
@@ -4157,23 +4216,43 @@ mod tests {
             Current::from_state(
                 State::existing(
                     source.id.clone(),
-                    HashMap::from([(
-                        "items".to_string(),
-                        Value::Concrete(ConcreteValue::List(vec![string_value("widget-1")])),
-                    )]),
+                    HashMap::from([
+                        ("name".to_string(), string_value("source")),
+                        (
+                            "items".to_string(),
+                            Value::Concrete(ConcreteValue::List(vec![string_value("widget-1")])),
+                        ),
+                    ]),
                 )
                 .with_identifier("source-id"),
             ),
         )]);
+
+        let source_schema = ResourceSchema::new("service.Source")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "items",
+                    AttributeType::list(AttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("source schema fixture must be valid");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("aws", source_schema.clone());
 
         let preview = crate::wiring::expand_same_config_deferred_for(
             &parsed,
             &sorted_resources,
             &current_states,
             &carina_core::data_source_value::DataSourceValues::empty(),
-            &SchemaRegistry::new(),
-            &carina_core::provider::RawSavedAttrs::default()
-                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &schemas,
+            &carina_core::provider::RawSavedAttrs::default().lift(&schemas),
             &HashMap::new(),
             &HashMap::new(),
             &[],
@@ -4218,7 +4297,6 @@ mod tests {
         ))
         .validate()
         .expect("schema fixture must be valid");
-        let mut schemas = SchemaRegistry::new();
         schemas.insert("aws", widget_schema.clone());
 
         let desired_ids = sorted_resources
@@ -4260,11 +4338,14 @@ mod tests {
             parsed,
             Vec::new(),
             &[],
-            [("aws".to_string(), widget_schema)],
+            [
+                ("aws".to_string(), source_schema),
+                ("aws".to_string(), widget_schema),
+            ],
         );
         let comparison_provider =
             crate::wiring::test_comparison_provider_router(&preview.sorted_resources);
-        let expanded = validated_config
+        validated_config
             .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
                 provider: &provider,
                 comparison_provider: &comparison_provider,
@@ -4284,7 +4365,6 @@ mod tests {
             orphans,
             ..
         } = addressed.into_parts();
-        assert_eq!(expanded.new_child_ids, HashSet::from([child.id.clone()]));
         assert!(
             !current_states.contains_key(&child.id),
             "expansion must not duplicate an orphan-owned child into current states"
@@ -4569,6 +4649,94 @@ mod tests {
         assert!(
             err.contains("Attribute 'subnet_id' not found on resource 'abandoned'"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn lookup_json_resource_matches_state_show_json_row_after_anonymous_resource() {
+        let anonymous =
+            ResourceState::try_applied("test.resource", "anonymous-first", "mock", "anonymous-id")
+                .expect("fixture identifier must be non-empty")
+                .with_attribute("name", json!("anonymous"));
+
+        let mut target =
+            ResourceState::try_applied("test.resource", "target-resource", "mock", "target-id")
+                .expect("fixture identifier must be non-empty")
+                .with_attribute("name", json!("target"));
+        target.binding = Some("target".to_string());
+
+        let trailing =
+            ResourceState::try_applied("test.resource", "trailing-resource", "mock", "trailing-id")
+                .expect("fixture identifier must be non-empty")
+                .with_attribute("name", json!("trailing"));
+
+        let mut state = StateFile::new();
+        for row in [anonymous, target, trailing] {
+            state
+                .upsert_resource(row)
+                .expect("test state setup must be valid");
+        }
+        assert!(state.resources()[0].binding.is_none());
+
+        let document =
+            StateShowDocument::from_state(&state).expect("state show JSON document must render");
+        let shown_target = document
+            .resources
+            .iter()
+            .find(|resource| resource.binding.as_deref() == Some("target"))
+            .expect("target row must be present in state show JSON");
+        let shown_target =
+            serde_json::to_value(shown_target).expect("state show resource must serialize");
+
+        let lookup_target = format_state_lookup(&state, "target", true)
+            .expect("state lookup JSON must render the target");
+        let lookup_target: serde_json::Value =
+            serde_json::from_str(&lookup_target).expect("state lookup must emit valid JSON");
+
+        assert_eq!(lookup_target, shown_target);
+    }
+
+    #[test]
+    fn lookup_json_in_flight_resource_returns_public_row_and_rejects_attributes() {
+        let id =
+            ResourceId::with_provider_identity("mock", "test.resource", "pending-resource", None);
+        let resource = ResolvedResource::new(Resource::from_id(id.clone()));
+        let pending = crate::fixture_in_flight_create(
+            &id,
+            "resume-token",
+            Some("pending-id"),
+            Sent::AllRequestAttributes,
+        );
+        let mut row = ResourceState::from_in_flight(
+            &resource,
+            &pending,
+            None,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        )
+        .expect("in-flight fixture must be encodable");
+        row.binding = Some("pending".to_string());
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(row)
+            .expect("in-flight fixture must be valid");
+
+        let output = format_state_lookup(&state, "pending", true).unwrap();
+        let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["binding"], "pending");
+        assert_eq!(output["current"]["kind"], "create_in_flight");
+        assert_eq!(output["current"]["identifier"], "pending-id");
+        assert_eq!(output["current"]["attributes"], json!({}));
+
+        let error = format_state_lookup(&state, "pending.name", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "Cannot look up attribute 'name' on resource 'pending': create in flight since"
+            ),
+            "unexpected error: {error}"
         );
     }
 

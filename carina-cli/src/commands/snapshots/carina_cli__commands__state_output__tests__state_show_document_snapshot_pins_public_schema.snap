@@ -1,0 +1,106 @@
+---
+source: carina-cli/src/commands/state_output.rs
+expression: "serde_json::to_string_pretty(&document).expect(\"document must serialize\")"
+---
+{
+  "schema_version": 1,
+  "state": "present",
+  "resources": [
+    {
+      "binding": "bound",
+      "identity": "bound-resource",
+      "provider": "mock",
+      "resource_type": "test.resource",
+      "protected": true,
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-applied-id",
+        "attributes": {
+          "count": 3,
+          "enabled": true,
+          "items": [
+            "a",
+            2,
+            false
+          ],
+          "metadata": {
+            "a": 1,
+            "b": 2
+          },
+          "name": "bound",
+          "oidc_config": {
+            "client_secret": {
+              "redacted": true
+            },
+            "issuer": "https://issuer.example.com"
+          },
+          "secret": {
+            "redacted": true
+          },
+          "write_only": {
+            "redacted": true
+          }
+        }
+      },
+      "deposed": [
+        {
+          "identifier": "mock-deposed-id"
+        }
+      ]
+    },
+    {
+      "binding": "pending",
+      "identity": "pending-resource",
+      "provider": "mock",
+      "resource_type": "test.resource",
+      "protected": false,
+      "current": {
+        "kind": "create_in_flight",
+        "identifier": "mock-pending-id",
+        "attributes": {}
+      },
+      "deposed": []
+    },
+    {
+      "binding": "unknown",
+      "identity": "unknown-resource",
+      "provider": "mock",
+      "resource_type": "test.resource",
+      "protected": false,
+      "current": {
+        "kind": "create_outcome_unknown",
+        "identifier": null,
+        "attributes": {}
+      },
+      "deposed": []
+    },
+    {
+      "binding": null,
+      "identity": "anonymous-resource",
+      "provider": "mock",
+      "resource_type": "test.resource",
+      "protected": false,
+      "current": {
+        "kind": "missing_identifier",
+        "identifier": null,
+        "attributes": {
+          "reason": "legacy"
+        }
+      },
+      "deposed": []
+    },
+    {
+      "binding": null,
+      "identity": "empty-resource",
+      "provider": "mock",
+      "resource_type": "test.resource",
+      "protected": false,
+      "current": {
+        "kind": "none",
+        "identifier": null,
+        "attributes": {}
+      },
+      "deposed": []
+    }
+  ]
+}
