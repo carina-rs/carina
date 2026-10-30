@@ -1024,6 +1024,42 @@ impl DiagnosticEngine {
                             ),
                         ));
                     }
+
+                    if let ResourceRef::Resource(resource) | ResourceRef::Deferred { resource, .. } =
+                        rref
+                        && let Err(errors) = carina_core::resource::resolve_ignore_changes(
+                            resource,
+                            &validated_schema,
+                        )
+                    {
+                        let position = self
+                            .find_attribute_position(doc, "ignore_changes", scope)
+                            .or_else(|| {
+                                self.find_resource_type_position(
+                                    doc,
+                                    provider,
+                                    &resource_id.resource_type,
+                                )
+                            });
+                        if let Some((line, col)) = position {
+                            for error in errors {
+                                diagnostics.push(carina_diagnostic_range(
+                                    Range {
+                                        start: Position {
+                                            line,
+                                            character: col,
+                                        },
+                                        end: Position {
+                                            line,
+                                            character: col + "ignore_changes".len() as u32,
+                                        },
+                                    },
+                                    DiagnosticSeverity::ERROR,
+                                    format!("{}: {}", resource_id, error),
+                                ));
+                            }
+                        }
+                    }
                 }
                 if let Some(validated_schema) = validated_schema {
                     let schema = validated_schema.as_schema();

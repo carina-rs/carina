@@ -238,7 +238,7 @@ awscc.ec2.IpamPool {
 
 ### Directives
 
-A `directives` block inside a resource carries Carina-side instructions (`depends_on`, `create_before_destroy`, `prevent_destroy`, `force_delete`, `provider`). It is never sent to the provider. See [Directives blocks](/getting-started/core-concepts/#directives-blocks) for the full list.
+A `directives` block inside a resource carries Carina-side instructions (`depends_on`, `create_before_destroy`, `prevent_destroy`, `force_delete`, `provider`, `ignore_changes`). It is never sent to the provider. See the [directives reference](/reference/dsl/directives/) for the full list and the `ignore_changes` path rules.
 
 ```crn
 awscc.s3.Bucket {

@@ -96,7 +96,8 @@ impl PlanChangeSummary {
             deferred_effects: plan_summary.deferred,
             export_changes: export_changes.to_vec(),
             residual_deferred_for: residual_deferred_for.to_vec(),
-            has_plan_effects: !plan.effects().is_empty(),
+            has_plan_effects: !plan.effects().is_empty()
+                || !plan.ignored_change_summaries().is_empty(),
         }
     }
 

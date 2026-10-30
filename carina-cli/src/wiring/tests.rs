@@ -4792,7 +4792,8 @@ fn bucket_resource(name: &str) -> Resource {
 }
 
 fn resolved_desired_ids(resources: &[Resource]) -> ResolvedDesiredIds {
-    ResolvedDesiredIds::from_resources(resources).expect("test desired identities must be resolved")
+    ResolvedDesiredIds::from_resources(resources, &SchemaRegistry::new())
+        .expect("test desired identities must be resolved")
 }
 
 fn bucket_state_file(names: &[&str]) -> carina_state::state::StateFile {

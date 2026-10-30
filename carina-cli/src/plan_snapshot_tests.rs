@@ -139,6 +139,32 @@ fn snapshot_depends_on() {
 }
 
 #[test]
+fn snapshot_ignore_changes_readable_drift() {
+    let fp = build_plan_from_fixture_name("ignore_changes_readable");
+    assert_eq!(fp.plan.ignored_change_summaries().len(), 2);
+    assert!(
+        fp.plan
+            .ignored_change_summaries()
+            .iter()
+            .all(|summary| summary.count() == 1)
+    );
+
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    assert_eq!(output.matches("# 1 ignored attribute(s) differ").count(), 2);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn snapshot_postfix_access() {
     let (plan, schemas, _moved) = build_plan_from_fixture("postfix_access");
     let output = strip_ansi(&format_plan(
