@@ -10349,7 +10349,10 @@ mod resolved_value_constraint_gate {
                             name.to_string(),
                             carina_core::resource::LiveCompositionArgument::from_value(
                                 value,
-                                carina_core::parser::TypeExpr::String,
+                                carina_core::validation::resolve_consumer_static_type_for_signature(
+                                    &carina_core::parser::TypeExpr::String,
+                                    &carina_core::parser::ProviderContext::default(),
+                                ),
                                 carina_core::parser::ArgumentOrigin::Defaulted,
                             ),
                         )

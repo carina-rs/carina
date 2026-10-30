@@ -2365,7 +2365,7 @@ fn upstream_state_dot_completion_detail_distinguishes_static_type_states() {
     assert_eq!(detail("known"), "export from upstream_state `up`: String",);
     assert_eq!(
         detail("unnameable"),
-        "export from upstream_state `up`: awscc.ec2.VpcId (declared type unavailable in consumer)",
+        "export from upstream_state `up`: awscc.ec2.VpcId (declared type unavailable in consumer: unknown custom type 'awscc.ec2.VpcId')",
     );
     assert_eq!(
         detail("not_inferable"),

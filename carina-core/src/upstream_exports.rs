@@ -32,13 +32,6 @@ pub enum UpstreamExportType {
 }
 
 impl UpstreamExportType {
-    pub fn known(&self) -> Option<&TypeExpr> {
-        match self {
-            Self::Static(static_type) => static_type.known(),
-            Self::InferenceNotRun => None,
-        }
-    }
-
     pub fn declared_known(&self) -> Option<&TypeExpr> {
         match self {
             Self::Static(static_type) => static_type.declared_known(),
@@ -1165,6 +1158,21 @@ mod tests {
         ProviderContext::default()
     }
 
+    fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType {
+        crate::validation::resolve_consumer_static_type_for_signature(&type_expr, &ctx())
+    }
+
+    fn consumer_inferred_type(
+        type_expr: TypeExpr,
+    ) -> crate::static_type::ConsumerInferredStaticType {
+        match consumer_type(type_expr) {
+            StaticType::Known(resolved) => StaticType::Known(resolved),
+            StaticType::Unchecked(reason) => StaticType::Unchecked(
+                crate::static_type::ConsumerInferredUncheckedReason::UnnameableInConsumer(reason),
+            ),
+        }
+    }
+
     fn upstream(binding: &str, source: &str) -> UpstreamState {
         UpstreamState {
             binding: binding.to_string(),
@@ -1187,7 +1195,7 @@ mod tests {
 
     fn declared_entry(type_expr: TypeExpr) -> UpstreamExportEntry {
         UpstreamExportEntry {
-            static_type: UpstreamExportType::Static(ExportStaticType::Declared(StaticType::Known(
+            static_type: UpstreamExportType::Static(ExportStaticType::Declared(consumer_type(
                 type_expr,
             ))),
             value: None,
@@ -4003,8 +4011,8 @@ mod tests {
             .expect("region should be inferred");
         assert_eq!(
             region_entry.static_type,
-            UpstreamExportType::Static(ExportStaticType::Inferred(StaticType::Known(
-                TypeExpr::String
+            UpstreamExportType::Static(ExportStaticType::Inferred(consumer_inferred_type(
+                TypeExpr::String,
             )))
         );
     }
@@ -4061,7 +4069,7 @@ mod tests {
         assert!(errors.is_empty(), "unexpected resolve errors: {errors:?}");
         assert_eq!(
             exports["ups"]["out"].static_type,
-            UpstreamExportType::Static(ExportStaticType::Inferred(StaticType::Known(
+            UpstreamExportType::Static(ExportStaticType::Inferred(consumer_inferred_type(
                 TypeExpr::List(Box::new(TypeExpr::SchemaType { owned })),
             )))
         );

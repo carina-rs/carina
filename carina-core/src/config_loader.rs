@@ -1616,11 +1616,18 @@ mod tests {
         .unwrap();
         cleanup(&dir);
         assert_eq!(loaded.parsed.export_params.len(), 1);
-        let failures =
-            crate::validation::inference::attached_inference_failures(&loaded.parsed.export_params)
-                .collect::<Vec<_>>();
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].name, "zone_id");
+        assert!(matches!(
+            &loaded.parsed.export_params[0],
+            crate::parser::InferredExportParam {
+                name,
+                static_type: crate::static_type::ExportStaticType::Inferred(
+                    crate::static_type::StaticType::Unchecked(
+                        crate::static_type::InferredUncheckedReason::InferenceFailed(_)
+                    )
+                ),
+                ..
+            } if name == "zone_id"
+        ));
     }
 
     #[test]

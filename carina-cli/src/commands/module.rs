@@ -30,7 +30,7 @@ pub fn run_module_command(
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     match command {
-        ModuleCommands::Info { path, tui } => run_module_info(&path, tui),
+        ModuleCommands::Info { path, tui } => run_module_info(&path, tui, provider_context),
         ModuleCommands::List { path } => run_module_list(&path, provider_context),
     }
 }
@@ -59,7 +59,11 @@ pub fn format_module_list(imports: &[carina_core::parser::UseStatement]) -> Stri
     out
 }
 
-fn run_module_info(path: &Path, tui: bool) -> Result<(), AppError> {
+fn run_module_info(
+    path: &Path,
+    tui: bool,
+    provider_context: &ProviderContext,
+) -> Result<(), AppError> {
     if path.is_file() {
         return Err(AppError::Config(format!(
             "expected directory, got file: {}",
@@ -72,8 +76,11 @@ fn run_module_info(path: &Path, tui: bool) -> Result<(), AppError> {
     let module_name = module_resolver::derive_module_name(path);
 
     // Build and display the file signature (module or root config)
-    let signature =
-        carina_core::module::FileSignature::from_parsed_file_with_name(&parsed, &module_name);
+    let signature = carina_core::module::FileSignature::from_parsed_file_with_name(
+        &parsed,
+        &module_name,
+        provider_context,
+    );
 
     if tui {
         carina_tui::run_module_info(&signature)

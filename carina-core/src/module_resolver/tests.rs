@@ -27,6 +27,13 @@ fn known(type_expr: TypeExpr) -> TypeExpr {
     type_expr
 }
 
+fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType {
+    crate::validation::resolve_consumer_static_type_for_signature(
+        &type_expr,
+        &ProviderContext::default(),
+    )
+}
+
 fn resolve_modules(parsed: &mut ParsedFile, base_dir: &std::path::Path) -> Result<(), ModuleError> {
     super::resolve_modules(parsed, base_dir)
 }
@@ -1172,8 +1179,8 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
             .signature
             .arguments
             .get("region")
-            .map(|argument| argument.declared_type()),
-        Some(&crate::static_type::StaticType::Known(TypeExpr::String)),
+            .and_then(|argument| argument.declared_type().known()),
+        Some(&TypeExpr::String),
         "the declared sink type must travel with the argument value",
     );
 
@@ -1575,7 +1582,7 @@ thing { name = 'after-edit' }
                 "role_name".to_string(),
                 vec![],
             ),
-            TypeExpr::String,
+            consumer_type(TypeExpr::String),
             ArgumentOrigin::Defaulted,
         ),
     );
@@ -3220,7 +3227,7 @@ let root = outer { outer_port = producer.port }
                     Value::Deferred(DeferredValue::BindingRef {
                         binding: "outer_port".to_string(),
                     }),
-                    TypeExpr::String,
+                    consumer_type(TypeExpr::String),
                     ArgumentOrigin::Defaulted,
                 ),
             )]),
@@ -7199,8 +7206,9 @@ fn resolved_module_signature_groups_all_owners_of_a_dotted_annotation() {
     assert!(
         matches!(
             resolved,
-            crate::static_type::StaticType::Known(TypeExpr::List(inner))
-                if matches!(inner.as_ref(), TypeExpr::SchemaType { .. })
+            crate::static_type::StaticType::Known(resolved)
+                if matches!(resolved.type_expr(), TypeExpr::List(inner)
+                    if matches!(inner.as_ref(), TypeExpr::SchemaType { .. }))
         ),
         "module signatures must not retain DottedUnresolved for a known shared identity: {resolved:?}"
     );

@@ -21,8 +21,8 @@ use std::path::{Component, Path, PathBuf};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::parser::{TypeExpr, ValidateExpr};
-use crate::static_type::{ConsumerStaticType, StaticType};
+use crate::parser::ValidateExpr;
+use crate::static_type::ConsumerStaticType;
 
 use super::{AccessPath, DeferredValue, ResolvedResourceId, StructuralOperand, Value};
 
@@ -111,8 +111,8 @@ impl LiveCompositionAttribute {
     /// Every other `Value` shape is multi-source (literal,
     /// interpolation, function call, etc.) and lifts into
     /// classified as derived.
-    pub fn from_value(value: Value, declared_type: Option<TypeExpr>) -> Self {
-        Self::from_value_with_static_type(value, declared_type.map(StaticType::Known))
+    pub fn from_value(value: Value, declared_type: Option<ConsumerStaticType>) -> Self {
+        Self::from_value_with_static_type(value, declared_type)
     }
 
     pub fn from_value_with_static_type(
@@ -273,10 +273,10 @@ impl LiveCompositionArgument {
 
     pub fn from_value(
         value: Value,
-        declared_type: TypeExpr,
+        declared_type: ConsumerStaticType,
         origin: crate::parser::ArgumentOrigin,
     ) -> Self {
-        Self::from_value_with_static_type(value, StaticType::Known(declared_type), origin)
+        Self::from_value_with_static_type(value, declared_type, origin)
     }
 
     pub fn from_value_with_static_type(
@@ -503,7 +503,7 @@ pub struct LiveCompositionSignature {
     /// Module-output values classified by how they are produced
     /// (#3294): forwarded values are single-hop aliases and derived values are
     /// multi-source expressions. Each entry also carries its optional declared
-    /// [`TypeExpr`] for validation.
+    /// [`crate::parser::TypeExpr`] for validation.
     pub attributes: IndexMap<String, LiveCompositionAttribute>,
     /// Constraints deferred until all referenced argument values are known.
     pub pending_constraints: Vec<PendingModuleConstraint>,
@@ -1389,8 +1389,15 @@ impl<'a> Iterator for CompositionRuntimeAttributes<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{CompareOp, ValidateExpr};
+    use crate::parser::{CompareOp, TypeExpr, ValidateExpr};
     use crate::resource::{ConcreteValue, ResourceId};
+
+    fn resolved_type(type_expr: TypeExpr) -> ConsumerStaticType {
+        crate::validation::resolve_consumer_static_type_for_signature(
+            &type_expr,
+            &crate::parser::ProviderContext::default(),
+        )
+    }
 
     #[test]
     fn equality_compares_call_path_identity_but_ignores_call_display() {
@@ -1535,14 +1542,16 @@ mod tests {
             Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("svc", "endpoint"),
             }),
-            Some(declared.clone()),
+            Some(resolved_type(declared.clone())),
         );
 
         let rewritten = attr.with_value(Value::Concrete(ConcreteValue::String("x".into())));
 
         assert_eq!(
-            rewritten.declared_type(),
-            Some(&crate::static_type::StaticType::Known(declared))
+            rewritten
+                .declared_type()
+                .and_then(|static_type| static_type.known()),
+            Some(&declared)
         );
     }
 
@@ -1571,16 +1580,13 @@ mod tests {
             Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("vpc", "vpc_id"),
             }),
-            declared.clone(),
+            resolved_type(declared.clone()),
             crate::parser::ArgumentOrigin::Defaulted,
         );
 
         let rewritten = argument.with_value(Value::Concrete(ConcreteValue::String("x".into())));
 
-        assert_eq!(
-            rewritten.declared_type(),
-            &crate::static_type::StaticType::Known(declared)
-        );
+        assert_eq!(rewritten.declared_type().known(), Some(&declared));
     }
 
     #[test]
@@ -1623,7 +1629,7 @@ mod tests {
                         Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                             ConcreteValue::String("plaintext-secret".into()),
                         )))),
-                        TypeExpr::String,
+                        resolved_type(TypeExpr::String),
                         crate::parser::ArgumentOrigin::Defaulted,
                     ),
                 )]),

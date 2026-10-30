@@ -503,9 +503,13 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     }
 
     if !skip_resource_validation {
-        carina_core::validation::inference::retry_unchecked_export_inference(parsed, ctx.schemas());
+        let schema_checked_exports =
+            carina_core::validation::inference::retry_unchecked_export_inference(
+                parsed,
+                ctx.schemas(),
+            );
         errors.extend(
-            carina_core::validation::inference::attached_inference_failures(&parsed.export_params)
+            carina_core::validation::inference::attached_inference_failures(schema_checked_exports)
                 .map(|failure| {
                     AppError::Validation(
                         carina_core::validation::inference::format_inference_error(
@@ -1475,9 +1479,11 @@ child { values = [source] }
             carina_core::module_resolver::ResolvedModuleSignature {
                 arguments: vec![ArgumentParameter {
                     name: "values".to_string(),
-                    static_type: carina_core::static_type::StaticType::Known(TypeExpr::List(
-                        Box::new(TypeExpr::String),
-                    )),
+                    static_type:
+                        carina_core::validation::resolve_consumer_static_type_for_signature(
+                            &TypeExpr::List(Box::new(TypeExpr::String)),
+                            &ProviderContext::default(),
+                        ),
                     default: None,
                     description: None,
                     validations: Vec::new(),

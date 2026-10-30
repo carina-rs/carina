@@ -14,6 +14,10 @@ fn local_type(type_expr: TypeExpr) -> TypeExpr {
     type_expr
 }
 
+fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType {
+    resolve_consumer_static_type_for_signature(&type_expr, &ProviderContext::default())
+}
+
 fn module_arguments(
     values: impl IntoIterator<Item = (String, Value)>,
 ) -> HashMap<String, ModuleArgument> {
@@ -3599,9 +3603,7 @@ fn check_module_calls_rejects_custom_type() {
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "managed_policy_arns".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::List(Box::new(
-                    iam_policy_arn_type_expr(),
-                ))),
+                static_type: consumer_type(TypeExpr::List(Box::new(iam_policy_arn_type_expr()))),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -3639,7 +3641,7 @@ fn check_module_calls_rejects_literal_union_mismatch() {
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "environment".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::Union(vec![
+                static_type: consumer_type(TypeExpr::Union(vec![
                     TypeExpr::StringLiteral("dev".to_string()),
                     TypeExpr::StringLiteral("stg".to_string()),
                     TypeExpr::StringLiteral("prod".to_string()),
@@ -3683,7 +3685,7 @@ fn check_module_calls_reports_parameter_type_resolution_errors() {
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "value".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::DottedUnresolved(
+                static_type: consumer_type(TypeExpr::DottedUnresolved(
                     crate::parser::ResourceTypePath::new("aws", "missing.Type"),
                 )),
                 default: None,
@@ -3838,7 +3840,7 @@ let inst = m { n = 'abc' }
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "n".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::Int),
+                static_type: consumer_type(TypeExpr::Int),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -3877,7 +3879,7 @@ child {}
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "count".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::Int),
+                static_type: consumer_type(TypeExpr::Int),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -3946,7 +3948,7 @@ for item in ["first", "second"] {
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "count".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::Int),
+                static_type: consumer_type(TypeExpr::Int),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -3989,9 +3991,7 @@ child { values = [vpc] }
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "values".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::List(Box::new(
-                    TypeExpr::String,
-                ))),
+                static_type: consumer_type(TypeExpr::List(Box::new(TypeExpr::String))),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -4036,9 +4036,7 @@ child { values = [vpc] }
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "values".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::List(Box::new(
-                    TypeExpr::String,
-                ))),
+                static_type: consumer_type(TypeExpr::List(Box::new(TypeExpr::String))),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -4091,7 +4089,7 @@ let child = child_module { value = forwarded }
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "value".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::String),
+                static_type: consumer_type(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -4169,7 +4167,7 @@ fn check_module_calls_defers_compatible_binding_refs_to_binding_use_authority() 
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "name".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::String),
+                static_type: consumer_type(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -4242,7 +4240,7 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "mode".to_string(),
-                static_type: crate::static_type::StaticType::Known(schema_type.clone()),
+                static_type: consumer_type(schema_type.clone()),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -4528,7 +4526,7 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
         "security_group_id".to_string(),
         LiveCompositionAttribute::from_value(
             Value::Concrete(ConcreteValue::String("sg-123".into())),
-            Some(schema_type("ec2.SecurityGroup")),
+            Some(consumer_type(schema_type("ec2.SecurityGroup"))),
         ),
     );
     let mut consumer = make_composition("consumer", &[]);
@@ -4536,7 +4534,7 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
         "vpc_id".to_string(),
         LiveCompositionArgument::from_value(
             Value::resource_ref("inner".to_string(), "security_group_id".to_string(), vec![]),
-            schema_type("ec2.Vpc"),
+            consumer_type(schema_type("ec2.Vpc")),
             ArgumentOrigin::Defaulted,
         ),
     );
@@ -4584,7 +4582,7 @@ fn composition_ref_error_dedup_uses_the_full_call_path() {
         "group_id".to_string(),
         LiveCompositionAttribute::from_value(
             Value::Concrete(ConcreteValue::String("sg-123".into())),
-            Some(schema_type("ec2.SecurityGroup")),
+            Some(consumer_type(schema_type("ec2.SecurityGroup"))),
         ),
     );
 
@@ -4599,7 +4597,7 @@ fn composition_ref_error_dedup_uses_the_full_call_path() {
             "vpc_id".to_string(),
             LiveCompositionArgument::from_value(
                 Value::resource_ref("source", "group_id", vec![]),
-                schema_type("ec2.Vpc"),
+                consumer_type(schema_type("ec2.Vpc")),
                 ArgumentOrigin::Defaulted,
             ),
         );
@@ -4635,7 +4633,7 @@ fn post_expansion_composition_attribute_typo_is_reported_once() {
         "x".to_string(),
         LiveCompositionAttribute::from_value(
             Value::resource_ref("inner".to_string(), "typo".to_string(), vec![]),
-            Some(TypeExpr::String),
+            Some(consumer_type(TypeExpr::String)),
         ),
     );
     let mut parsed = empty_parsed();
@@ -4676,7 +4674,7 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
             "group_id".to_string(),
             LiveCompositionAttribute::from_value(
                 Value::Concrete(ConcreteValue::String("sg-123".into())),
-                Some(schema_type("ec2.SecurityGroup")),
+                Some(consumer_type(schema_type("ec2.SecurityGroup"))),
             ),
         );
         parsed.compositions.push(source);
@@ -4686,7 +4684,7 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
             "bad".to_string(),
             LiveCompositionAttribute::from_value(
                 Value::resource_ref(source_binding, "group_id".to_string(), vec![]),
-                Some(schema_type("ec2.Vpc")),
+                Some(consumer_type(schema_type("ec2.Vpc"))),
             ),
         );
         parsed.compositions.push(consumer);
@@ -4725,7 +4723,7 @@ fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
             "group_id".to_string(),
             LiveCompositionAttribute::from_value(
                 Value::Concrete(ConcreteValue::String("sg-123".into())),
-                Some(security_group_id.clone()),
+                Some(consumer_type(security_group_id.clone())),
             ),
         );
         parsed.compositions.push(source);
@@ -4739,7 +4737,7 @@ fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
                     Value::resource_ref(source_binding.clone(), "group_id".to_string(), vec![]),
                     Value::resource_ref(source_binding, "nonexistent_attr".to_string(), vec![]),
                 ])),
-                Some(TypeExpr::List(Box::new(TypeExpr::Bool))),
+                Some(consumer_type(TypeExpr::List(Box::new(TypeExpr::Bool)))),
             ),
         );
         parsed.compositions.push(consumer);
@@ -4790,7 +4788,7 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
         "group_id".to_string(),
         LiveCompositionAttribute::from_value(
             Value::Concrete(ConcreteValue::String("sg-123".into())),
-            Some(schema_type("ec2.SecurityGroup")),
+            Some(consumer_type(schema_type("ec2.SecurityGroup"))),
         ),
     );
     let synthetic_instance = "needs_0101081440007054";
@@ -4801,7 +4799,7 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
         "vpc_id".to_string(),
         LiveCompositionArgument::from_value(
             Value::resource_ref("source".to_string(), "group_id".to_string(), vec![]),
-            schema_type("ec2.Vpc"),
+            consumer_type(schema_type("ec2.Vpc")),
             ArgumentOrigin::Defaulted,
         ),
     );
@@ -4886,14 +4884,12 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "subnet_ids".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::List(Box::new(
-                    TypeExpr::SchemaType {
-                        owned: crate::parser::OwnedTypeIdentity::provider(
-                            "aws",
-                            TypeIdentity::from_schema_type("aws", "ec2.Subnet", "Id"),
-                        ),
-                    },
-                ))),
+                static_type: consumer_type(TypeExpr::List(Box::new(TypeExpr::SchemaType {
+                    owned: crate::parser::OwnedTypeIdentity::provider(
+                        "aws",
+                        TypeIdentity::from_schema_type("aws", "ec2.Subnet", "Id"),
+                    ),
+                }))),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -4956,7 +4952,7 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
         crate::module_resolver::ResolvedModuleSignature {
             arguments: vec![ArgumentParameter {
                 name: "number".to_string(),
-                static_type: crate::static_type::StaticType::Known(TypeExpr::Float),
+                static_type: consumer_type(TypeExpr::Float),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -7740,7 +7736,7 @@ fn consumer_export_resolution_retains_a_multi_owner_identity() {
         panic!("typed export must retain its known declaration")
     };
     assert!(
-        matches!(&resolved, TypeExpr::List(inner) if matches!(inner.as_ref(), TypeExpr::SchemaType { .. })),
+        matches!(resolved.type_expr(), TypeExpr::List(inner) if matches!(inner.as_ref(), TypeExpr::SchemaType { .. })),
         "a known multi-owner identity must remain known: {resolved:?}"
     );
 }

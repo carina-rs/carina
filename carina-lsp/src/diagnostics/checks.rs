@@ -2289,9 +2289,9 @@ impl DiagnosticEngine {
         // `merged`) won't anchor in this buffer and are skipped here —
         // the buffer that owns the export will surface them on its
         // own pass.
-        for inference_error in
-            carina_core::validation::inference::attached_inference_failures(&inferred_export_params)
-        {
+        for inference_error in carina_core::validation::inference::attached_inference_failures(
+            inferred_export_params.checked_exports(),
+        ) {
             if let Some((line, col)) = self.find_exports_param_position(doc, inference_error.name) {
                 diagnostics.push(carina_diagnostic(
                     line,
@@ -2309,7 +2309,7 @@ impl DiagnosticEngine {
             carina_core::binding_index::BindingIndex::from_parsed(inference_input, &self.schemas);
         if let Err(ref_errors) =
             carina_core::validation::validate_export_param_ref_types_with_bindings(
-                &inferred_export_params,
+                inferred_export_params.parameters(),
                 &export_bindings,
             )
         {

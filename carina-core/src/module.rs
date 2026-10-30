@@ -8,7 +8,7 @@ use crate::parser::{
     ResourceTypePath, TypeExpr, display_double_quoted_literal_part, display_string_literal,
 };
 use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
-use crate::static_type::{ConsumerStaticType, StaticType, consumer_static_type_label};
+use crate::static_type::{ConsumerStaticType, consumer_static_type_label};
 
 /// Dependency between resources
 #[derive(Debug, Clone)]
@@ -765,11 +765,15 @@ impl FileSignature {
     /// Create from a parsed file
     /// For directory-based modules (files with top-level arguments/attributes blocks),
     /// the module name is derived from the directory name or file name.
-    pub fn from_parsed_file<E>(parsed: &crate::parser::File<E>, file_name: &str) -> Self {
+    pub fn from_parsed_file<E>(
+        parsed: &crate::parser::File<E>,
+        file_name: &str,
+        config: &crate::parser::ProviderContext,
+    ) -> Self {
         // Check for directory-based module (has top-level arguments or attribute_params)
         if !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty() {
             return FileSignature::Module(ModuleSignature::from_directory_module(
-                parsed, file_name,
+                parsed, file_name, config,
             ));
         }
 
@@ -782,12 +786,14 @@ impl FileSignature {
     pub fn from_parsed_file_with_name<E>(
         parsed: &crate::parser::File<E>,
         module_name: &str,
+        config: &crate::parser::ProviderContext,
     ) -> Self {
         // Check for directory-based module (has top-level arguments or attribute_params)
         if !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty() {
             return FileSignature::Module(ModuleSignature::from_directory_module(
                 parsed,
                 module_name,
+                config,
             ));
         }
 
@@ -824,8 +830,9 @@ impl ModuleSignature {
     /// dependency-graph construction. Lowercase-tail dotted paths are treated
     /// as resource refs here so argument references can create dependency
     /// edges; PascalCase-tail dotted custom types are kept unresolved because
-    /// they are string-valued, not resource targets. Authoritative resolution
-    /// and unknown-type rejection happens in `validation::resolve_file_type_exprs`.
+    /// they are string-valued, not resource targets. This normalization never
+    /// feeds consumer proof construction; consumer types resolve the original
+    /// parser expression against the supplied provider context.
     fn signature_type_expr(type_expr: &TypeExpr) -> TypeExpr {
         match type_expr {
             TypeExpr::DottedUnresolved(path)
@@ -881,14 +888,21 @@ impl ModuleSignature {
     }
 
     /// Build a module signature from a directory-based module (ParsedFile with top-level arguments/attributes)
-    pub fn from_directory_module<E>(parsed: &crate::parser::File<E>, module_name: &str) -> Self {
+    pub fn from_directory_module<E>(
+        parsed: &crate::parser::File<E>,
+        module_name: &str,
+        config: &crate::parser::ProviderContext,
+    ) -> Self {
         // Build requires (typed inputs)
         let requires: Vec<TypedArgument> = parsed
             .arguments
             .iter()
             .map(|input| TypedArgument {
                 name: input.name.clone(),
-                static_type: StaticType::Known(Self::signature_type_expr(&input.static_type)),
+                static_type: crate::validation::resolve_consumer_static_type_for_signature(
+                    &input.static_type,
+                    config,
+                ),
                 required: input.default.is_none(),
                 default: input.default.as_ref().map(format_value),
                 description: input.description.clone(),
@@ -969,10 +983,11 @@ impl ModuleSignature {
 
                 TypedAttributeParam {
                     name: attr_param.name.clone(),
-                    static_type: attr_param
-                        .static_type
-                        .as_ref()
-                        .map(|type_expr| StaticType::Known(Self::signature_type_expr(type_expr))),
+                    static_type: attr_param.static_type.as_ref().map(|type_expr| {
+                        crate::validation::resolve_consumer_static_type_for_signature(
+                            type_expr, config,
+                        )
+                    }),
                     source_binding,
                 }
             })
@@ -1606,7 +1621,11 @@ mod tests {
         "#;
 
         let parsed = parse(input, &ProviderContext::default()).unwrap();
-        let signature = ModuleSignature::from_directory_module(&parsed, "web_tier");
+        let signature = ModuleSignature::from_directory_module(
+            &parsed,
+            "web_tier",
+            &ProviderContext::default(),
+        );
         let display = signature.display_with_color(false);
 
         // Check sections are present
@@ -1634,7 +1653,11 @@ mod tests {
             &ProviderContext::default(),
         )
         .expect("module fixture must parse");
-        let signature = ModuleSignature::from_directory_module(&parsed, "unnameable");
+        let signature = ModuleSignature::from_directory_module(
+            &parsed,
+            "unnameable",
+            &ProviderContext::default(),
+        );
         let display = signature.display_with_color(false);
 
         assert!(
@@ -1676,7 +1699,11 @@ mod tests {
         "#;
 
         let parsed = parse(input, &ProviderContext::default()).unwrap();
-        let signature = ModuleSignature::from_directory_module(&parsed, "web_tier");
+        let signature = ModuleSignature::from_directory_module(
+            &parsed,
+            "web_tier",
+            &ProviderContext::default(),
+        );
         let display = signature.display_with_color(false);
 
         // Simple form has no description line
@@ -1815,12 +1842,17 @@ mod tests {
 
         let parsed = parse(input, &ProviderContext::default()).unwrap();
 
+        let mut config = ProviderContext::default();
+        config
+            .resource_types
+            .insert(("aws".to_string(), "vpc".to_string()));
+
         // Verify parsed file has top-level inputs and outputs
         assert_eq!(parsed.arguments.len(), 2);
         assert_eq!(parsed.attribute_params.len(), 1);
 
         // Create signature from directory-based module
-        let signature = ModuleSignature::from_directory_module(&parsed, "web_tier");
+        let signature = ModuleSignature::from_directory_module(&parsed, "web_tier", &config);
 
         // Check module name
         assert_eq!(signature.name, "web_tier");
@@ -1829,8 +1861,9 @@ mod tests {
         assert_eq!(signature.requires.len(), 2);
         assert_eq!(signature.requires[0].name, "vpc");
         assert!(matches!(
-            signature.requires[0].static_type,
-            crate::static_type::StaticType::Known(TypeExpr::Ref(_))
+            &signature.requires[0].static_type,
+            crate::static_type::StaticType::Known(resolved)
+                if matches!(resolved.type_expr(), TypeExpr::Ref(_))
         ));
 
         // Check creates
@@ -1861,7 +1894,8 @@ mod tests {
         "#;
 
         let parsed = parse(input, &ProviderContext::default()).unwrap();
-        let signature = FileSignature::from_parsed_file(&parsed, "web_tier");
+        let signature =
+            FileSignature::from_parsed_file(&parsed, "web_tier", &ProviderContext::default());
 
         // Should be detected as a Module, not a RootConfig
         assert!(matches!(signature, FileSignature::Module(_)));
@@ -1890,7 +1924,8 @@ mod tests {
         "#;
 
         let parsed = parse(input, &ProviderContext::default()).unwrap();
-        let signature = FileSignature::from_parsed_file(&parsed, "main");
+        let signature =
+            FileSignature::from_parsed_file(&parsed, "main", &ProviderContext::default());
 
         // Should be detected as a RootConfig
         assert!(matches!(signature, FileSignature::RootConfig(_)));

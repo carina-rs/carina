@@ -490,8 +490,9 @@ mod diagnostic_status_tests {
             crate::module_resolver::ResolvedModuleSignature {
                 arguments: vec![crate::parser::ArgumentParameter {
                     name: "required".to_string(),
-                    static_type: crate::static_type::StaticType::Known(
-                        crate::parser::TypeExpr::String,
+                    static_type: crate::validation::resolve_consumer_static_type_for_signature(
+                        &crate::parser::TypeExpr::String,
+                        &ProviderContext::default(),
                     ),
                     default: None,
                     description: None,

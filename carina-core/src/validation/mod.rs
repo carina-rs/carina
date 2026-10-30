@@ -25,8 +25,9 @@ use crate::schema::{
     Shape, TypeError, TypeIdentity,
 };
 use crate::static_type::{
-    ConsumerExportStaticType, ConsumerInferredUncheckedReason, ConsumerStaticType,
-    ExportStaticType, StaticType, StaticTypeResolutionError, UnnameableInConsumer,
+    ConsumerExportStaticType, ConsumerInferredUncheckedReason, ConsumerResolvedType,
+    ConsumerStaticType, ExportStaticType, StaticType, StaticTypeResolutionError,
+    UnnameableInConsumer,
 };
 
 /// Lift a module-boundary [`TypeExpr`] into the schema type system.
@@ -2554,7 +2555,7 @@ pub fn validate_composition_ref_types_with_bindings(
             let mut reference_position = 0;
             let declared_sink = attribute
                 .declared_type()
-                .and_then(StaticType::known)
+                .and_then(|static_type| static_type.known())
                 .map(RefSink::TypeExpr);
             visit_refs_with_sink(
                 &value,
@@ -3254,7 +3255,7 @@ pub fn validate_consumer_attribute_param_ref_types_with_bindings(
     let mut errors = Vec::new();
     for param in attribute_params {
         let expected_type = match &param.static_type {
-            Some(StaticType::Known(type_expr)) => Some(type_expr),
+            Some(StaticType::Known(resolved)) => Some(resolved.type_expr()),
             Some(StaticType::Unchecked(_reason)) => None,
             None => None,
         };
@@ -4289,7 +4290,7 @@ pub(crate) fn resolve_consumer_static_type(
     config: &ProviderContext,
 ) -> ConsumerStaticType {
     match resolve_type_expr(type_expr, config) {
-        Ok(resolved) => StaticType::Known(resolved),
+        Ok(resolved) => StaticType::Known(ConsumerResolvedType::new(resolved)),
         Err(resolution_error) => StaticType::Unchecked(UnnameableInConsumer {
             original: type_expr.clone(),
             resolution_error,
@@ -4329,7 +4330,7 @@ pub fn resolve_export_static_type_for_consumer(
         }
         ExportStaticType::Inferred(StaticType::Known(type_expr)) => {
             let resolved = match resolve_type_expr(&type_expr, config) {
-                Ok(type_expr) => StaticType::Known(type_expr),
+                Ok(type_expr) => StaticType::Known(ConsumerResolvedType::new(type_expr)),
                 Err(resolution_error) => StaticType::Unchecked(
                     ConsumerInferredUncheckedReason::UnnameableInConsumer(UnnameableInConsumer {
                         original: type_expr,
@@ -5455,9 +5456,10 @@ impl ModuleCallChecker<'_> {
             }
 
             let parameter_resolution = match &parameter.static_type {
-                StaticType::Known(parameter_type) => {
-                    resolve_parameter_type_for_check(parameter_type, self.provider_context)
-                }
+                StaticType::Known(parameter_type) => resolve_parameter_type_for_check(
+                    parameter_type.type_expr(),
+                    self.provider_context,
+                ),
                 StaticType::Unchecked(reason) => {
                     if self.provider_context.custom_types_loaded() {
                         Err(reason.resolution_error.clone())

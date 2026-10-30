@@ -656,17 +656,15 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
     let inferred_exports =
         carina_core::validation::inference::infer_export_params(&parsed, &schemas);
     let bindings = carina_core::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let mut diagnostics =
-        carina_core::validation::inference::attached_inference_failures(&inferred_exports)
-            .map(|failure| {
-                carina_core::validation::inference::format_inference_error(
-                    failure.name,
-                    failure.error,
-                )
-            })
-            .collect::<Vec<_>>();
+    let mut diagnostics = carina_core::validation::inference::attached_inference_failures(
+        inferred_exports.checked_exports(),
+    )
+    .map(|failure| {
+        carina_core::validation::inference::format_inference_error(failure.name, failure.error)
+    })
+    .collect::<Vec<_>>();
     if let Err(message) = carina_core::validation::validate_export_param_ref_types_with_bindings(
-        &inferred_exports,
+        inferred_exports.parameters(),
         &bindings,
     ) {
         diagnostics.extend(message.lines().map(str::to_owned));

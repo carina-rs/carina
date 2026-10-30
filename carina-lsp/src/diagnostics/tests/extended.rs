@@ -5414,6 +5414,13 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
         }
     }
 
+    fn consumer_type(type_expr: TypeExpr) -> carina_core::static_type::ConsumerStaticType {
+        carina_core::validation::resolve_consumer_static_type_for_signature(
+            &type_expr,
+            &carina_core::parser::ProviderContext::default(),
+        )
+    }
+
     fn composition(binding: &'static str, call_binding: &str) -> LiveComposition {
         let source_file = std::path::PathBuf::from(format!("/{call_binding}.crn"));
         let parsed = carina_core::parser::parse_file(
@@ -5462,7 +5469,7 @@ let first = unrelated { }
         "sg".to_string(),
         LiveCompositionAttribute::from_value(
             Value::Concrete(ConcreteValue::String("sg-123".into())),
-            Some(schema_type("ec2.SecurityGroup")),
+            Some(consumer_type(schema_type("ec2.SecurityGroup"))),
         ),
     );
     let mut consumer = composition("consumer", "missing-consumer-call");
@@ -5470,7 +5477,7 @@ let first = unrelated { }
         "vpc_id".to_string(),
         LiveCompositionArgument::from_value(
             Value::resource_ref("source", "missing", vec![]),
-            schema_type("ec2.Vpc"),
+            consumer_type(schema_type("ec2.Vpc")),
             ArgumentOrigin::Defaulted,
         ),
     );

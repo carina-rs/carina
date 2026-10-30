@@ -12,7 +12,7 @@ use carina_core::resource::EnumValueResolver;
 use carina_core::schema::{AttributeType, Shape, TypeIdentity, TypeInSchema};
 use carina_core::static_type::{
     ConsumerExportStaticType, ConsumerInferredUncheckedReason, InferenceError, NotInferableReason,
-    StaticType,
+    StaticType, UnnameableInConsumer,
 };
 use carina_core::upstream_exports::{UpstreamExportEntry, UpstreamExportType};
 
@@ -26,8 +26,8 @@ const UPSTREAM_SOURCE_MAX_ITEMS: usize = 100;
 #[derive(Clone, Copy)]
 enum UpstreamCompletionStaticType<'a> {
     Known(&'a TypeExpr),
-    DeclaredUnnameable(&'a TypeExpr),
-    InferredUnnameable(&'a TypeExpr),
+    DeclaredUnnameable(&'a UnnameableInConsumer),
+    InferredUnnameable(&'a UnnameableInConsumer),
     NotInferable(&'a NotInferableReason),
     InferenceFailed(&'a InferenceError),
     InferenceNotRun,
@@ -78,17 +78,17 @@ impl StructuralTypeForCompletion<TypeExpr> {
 fn structural_type_for_completion(entry: &UpstreamExportEntry) -> UpstreamCompletionStaticType<'_> {
     match &entry.static_type {
         UpstreamExportType::Static(ConsumerExportStaticType::Declared(StaticType::Known(
-            type_expr,
+            resolved,
         )))
         | UpstreamExportType::Static(ConsumerExportStaticType::Inferred(StaticType::Known(
-            type_expr,
-        ))) => UpstreamCompletionStaticType::Known(type_expr),
+            resolved,
+        ))) => UpstreamCompletionStaticType::Known(resolved.type_expr()),
         UpstreamExportType::Static(ConsumerExportStaticType::Declared(StaticType::Unchecked(
             reason,
-        ))) => UpstreamCompletionStaticType::DeclaredUnnameable(&reason.original),
+        ))) => UpstreamCompletionStaticType::DeclaredUnnameable(reason),
         UpstreamExportType::Static(ConsumerExportStaticType::Inferred(StaticType::Unchecked(
             ConsumerInferredUncheckedReason::UnnameableInConsumer(reason),
-        ))) => UpstreamCompletionStaticType::InferredUnnameable(&reason.original),
+        ))) => UpstreamCompletionStaticType::InferredUnnameable(reason),
         UpstreamExportType::Static(ConsumerExportStaticType::Inferred(StaticType::Unchecked(
             ConsumerInferredUncheckedReason::NotInferable(reason),
         ))) => UpstreamCompletionStaticType::NotInferable(reason),
@@ -103,8 +103,8 @@ impl<'a> UpstreamCompletionStaticType<'a> {
     fn structural_type(self) -> Option<StructuralTypeForCompletion<&'a TypeExpr>> {
         match self {
             Self::Known(type_expr) => Some(StructuralTypeForCompletion::Known(type_expr)),
-            Self::DeclaredUnnameable(type_expr) | Self::InferredUnnameable(type_expr) => {
-                Some(StructuralTypeForCompletion::Unnameable(type_expr))
+            Self::DeclaredUnnameable(reason) | Self::InferredUnnameable(reason) => {
+                Some(StructuralTypeForCompletion::Unnameable(&reason.original))
             }
             Self::NotInferable(_reason) => None,
             Self::InferenceFailed(_error) => None,
@@ -123,7 +123,7 @@ impl<'a> UpstreamCompletionStaticType<'a> {
             Self::Known(type_expr) => {
                 type_expr_source_is_assignable_to(type_expr, target, target_defs)
             }
-            Self::DeclaredUnnameable(_type_expr) | Self::InferredUnnameable(_type_expr) => true,
+            Self::DeclaredUnnameable(_reason) | Self::InferredUnnameable(_reason) => true,
             Self::NotInferable(_reason) => false,
             Self::InferenceFailed(_error) => false,
             Self::InferenceNotRun => false,
@@ -135,13 +135,15 @@ impl<'a> UpstreamCompletionStaticType<'a> {
             Self::Known(type_expr) => {
                 format!("export from upstream_state `{binding}`: {type_expr}")
             }
-            Self::DeclaredUnnameable(type_expr) => format!(
-                "export from upstream_state `{binding}`: {type_expr} \
-                 (declared type unavailable in consumer)"
+            Self::DeclaredUnnameable(reason) => format!(
+                "export from upstream_state `{binding}`: {} \
+                 (declared type unavailable in consumer: {})",
+                reason.original, reason.resolution_error,
             ),
-            Self::InferredUnnameable(type_expr) => format!(
-                "export from upstream_state `{binding}`: {type_expr} \
-                 (inferred type unavailable in consumer)"
+            Self::InferredUnnameable(reason) => format!(
+                "export from upstream_state `{binding}`: {} \
+                 (inferred type unavailable in consumer: {})",
+                reason.original, reason.resolution_error,
             ),
             Self::NotInferable(reason) => {
                 format!("export from upstream_state `{binding}` (type not inferable: {reason})")
@@ -164,13 +166,15 @@ impl<'a> UpstreamCompletionStaticType<'a> {
                 "export from upstream_state `{binding}` ({})",
                 format_type(type_expr)
             ),
-            Self::DeclaredUnnameable(type_expr) => format!(
-                "export from upstream_state `{binding}` ({type_expr}; \
-                 declared type unavailable in consumer)"
+            Self::DeclaredUnnameable(reason) => format!(
+                "export from upstream_state `{binding}` ({}; \
+                 declared type unavailable in consumer: {})",
+                reason.original, reason.resolution_error,
             ),
-            Self::InferredUnnameable(type_expr) => format!(
-                "export from upstream_state `{binding}` ({type_expr}; \
-                 inferred type unavailable in consumer)"
+            Self::InferredUnnameable(reason) => format!(
+                "export from upstream_state `{binding}` ({}; \
+                 inferred type unavailable in consumer: {})",
+                reason.original, reason.resolution_error,
             ),
             Self::NotInferable(reason) => {
                 format!("export from upstream_state `{binding}` (type not inferable: {reason})")
@@ -2500,6 +2504,43 @@ fn collect_named_provider_instance_bindings(
 #[cfg(test)]
 mod return_type_fits_tests {
     use super::*;
+
+    fn unnameable_reason() -> UnnameableInConsumer {
+        UnnameableInConsumer {
+            original: TypeExpr::DottedUnresolved(carina_core::parser::ResourceTypePath::new(
+                "awscc",
+                "ec2.VpcId",
+            )),
+            resolution_error:
+                carina_core::static_type::StaticTypeResolutionError::UnknownCustomType {
+                    name: "awscc.ec2.VpcId".to_string(),
+                },
+        }
+    }
+
+    #[test]
+    fn unnameable_completion_details_include_resolution_error() {
+        let reason = unnameable_reason();
+        let declared = UpstreamCompletionStaticType::DeclaredUnnameable(&reason);
+        let inferred = UpstreamCompletionStaticType::InferredUnnameable(&reason);
+
+        assert_eq!(
+            declared.dot_detail("up"),
+            "export from upstream_state `up`: awscc.ec2.VpcId (declared type unavailable in consumer: unknown custom type 'awscc.ec2.VpcId')",
+        );
+        assert_eq!(
+            inferred.dot_detail("up"),
+            "export from upstream_state `up`: awscc.ec2.VpcId (inferred type unavailable in consumer: unknown custom type 'awscc.ec2.VpcId')",
+        );
+        assert_eq!(
+            declared.reference_detail("up", ToString::to_string),
+            "export from upstream_state `up` (awscc.ec2.VpcId; declared type unavailable in consumer: unknown custom type 'awscc.ec2.VpcId')",
+        );
+        assert_eq!(
+            inferred.reference_detail("up", ToString::to_string),
+            "export from upstream_state `up` (awscc.ec2.VpcId; inferred type unavailable in consumer: unknown custom type 'awscc.ec2.VpcId')",
+        );
+    }
 
     #[test]
     fn ref_member_is_skipped_when_string_sibling_fits() {

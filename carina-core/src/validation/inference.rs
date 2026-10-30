@@ -226,6 +226,15 @@ pub fn infer_type_from_value(
     infer_type_from_value_with_visiting(value, bindings, schemas, &mut visiting)
 }
 
+fn heterogeneous_collection_error(first: &TypeExpr, next: &TypeExpr) -> InferenceError {
+    InferenceError::HeterogeneousCollection {
+        reason: format!(
+            "collection element types disagree: `{}` vs `{}`",
+            first, next
+        ),
+    }
+}
+
 /// Infer only from the value's own shape and builtin metadata.
 ///
 /// This explicitly has no binding/schema authority: references therefore
@@ -250,10 +259,7 @@ pub(crate) fn infer_type_from_value_without_bindings(
         for value in values {
             let next = infer_type_from_value_without_bindings(value)?;
             if next != element {
-                return Err(InferenceError::UnknownType {
-                    reason: "collection elements have different types".to_string(),
-                }
-                .into());
+                return Err(heterogeneous_collection_error(&element, &next).into());
             }
         }
         Ok(wrap(Box::new(element)))
@@ -541,13 +547,7 @@ where
     for next in iter {
         let next_type = infer_type_from_value_with_visiting(next, bindings, schemas, visiting)?;
         if next_type != first {
-            return Err(InferenceError::HeterogeneousCollection {
-                reason: format!(
-                    "collection element types disagree: `{}` vs `{}`",
-                    first, next_type
-                ),
-            }
-            .into());
+            return Err(heterogeneous_collection_error(&first, &next_type).into());
         }
     }
     Ok(wrap(Box::new(first)))
@@ -941,7 +941,7 @@ pub fn apply_inference(
     parsed: crate::parser::ParsedFile,
     schemas: &SchemaRegistry,
 ) -> crate::parser::InferredFile {
-    let inferred_exports = infer_export_params(&parsed, schemas);
+    let inferred_exports = infer_export_params(&parsed, schemas).into_parameters();
     // Single phase-axis surface (carina#3126): only `export_params`
     // changes phase; every other field moves through `map_export_params`
     // so a new `File<E>` field cannot be silently dropped on the
@@ -955,12 +955,33 @@ pub fn apply_inference(
 /// non-export field; consumers that only need the export-side typecheck
 /// (LSP diagnostics, in particular) should use this instead to avoid
 /// the per-keystroke deep-clone.
+#[derive(Debug, Clone)]
+pub struct SchemaCheckedExportParams {
+    parameters: Vec<crate::parser::InferredExportParam>,
+}
+
+impl SchemaCheckedExportParams {
+    pub fn parameters(&self) -> &[crate::parser::InferredExportParam] {
+        &self.parameters
+    }
+
+    pub fn checked_exports(&self) -> SchemaCheckedExports<'_> {
+        SchemaCheckedExports {
+            parameters: &self.parameters,
+        }
+    }
+
+    fn into_parameters(self) -> Vec<crate::parser::InferredExportParam> {
+        self.parameters
+    }
+}
+
 pub fn infer_export_params(
     parsed: &crate::parser::ParsedFile,
     schemas: &SchemaRegistry,
-) -> Vec<crate::parser::InferredExportParam> {
+) -> SchemaCheckedExportParams {
     let bindings = bindings_from_parsed(parsed);
-    parsed
+    let parameters = parsed
         .export_params
         .iter()
         .map(|parameter| {
@@ -984,7 +1005,8 @@ pub fn infer_export_params(
                 value: parameter.value.clone(),
             }
         })
-        .collect()
+        .collect();
+    SchemaCheckedExportParams { parameters }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -993,10 +1015,16 @@ pub struct AttachedInferenceFailure<'a> {
     pub error: &'a InferenceError,
 }
 
-pub fn attached_inference_failures(
-    parameters: &[crate::parser::InferredExportParam],
-) -> impl Iterator<Item = AttachedInferenceFailure<'_>> {
-    parameters
+#[derive(Debug, Clone, Copy)]
+pub struct SchemaCheckedExports<'a> {
+    parameters: &'a [crate::parser::InferredExportParam],
+}
+
+pub fn attached_inference_failures<'a>(
+    checked: SchemaCheckedExports<'a>,
+) -> impl Iterator<Item = AttachedInferenceFailure<'a>> + 'a {
+    checked
+        .parameters
         .iter()
         .filter_map(|parameter| match &parameter.static_type {
             ExportStaticType::Declared(_type_expr) => None,
@@ -1016,10 +1044,10 @@ pub fn attached_inference_failures(
 /// Retry inferred exports whose original reason was not having enough schema
 /// authority. A newly reportable failure replaces that reason; successful or
 /// still-deferred probes retain the original provenance.
-pub fn retry_unchecked_export_inference(
-    parsed: &mut crate::parser::InferredFile,
+pub fn retry_unchecked_export_inference<'a>(
+    parsed: &'a mut crate::parser::InferredFile,
     schemas: &SchemaRegistry,
-) {
+) -> SchemaCheckedExports<'a> {
     let bindings = bindings_from_parsed(parsed);
 
     for parameter in &mut parsed.export_params {
@@ -1055,6 +1083,10 @@ pub fn retry_unchecked_export_inference(
                 ));
             }
         }
+    }
+
+    SchemaCheckedExports {
+        parameters: &parsed.export_params,
     }
 }
 
@@ -1198,20 +1230,38 @@ mod tests {
 
     #[test]
     fn list_with_mixed_types_fails() {
-        let r = infer_type_from_value(
-            &Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("a".into())),
-                Value::Concrete(ConcreteValue::Int(1)),
-            ])),
-            &InferenceBindings::new(),
-            &SchemaRegistry::new(),
-        );
+        let value = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("a".into())),
+            Value::Concrete(ConcreteValue::Int(1)),
+        ]));
+        let r = infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new());
         assert!(matches!(
             r,
             Err(InferenceIssue::Failed(
                 InferenceError::HeterogeneousCollection { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn mixed_collection_without_bindings_matches_main_inference_error() {
+        let value = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("a".into())),
+            Value::Concrete(ConcreteValue::Int(1)),
+        ]));
+        let without_bindings = infer_type_from_value_without_bindings(&value);
+        let with_bindings =
+            infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new());
+
+        assert_eq!(without_bindings, with_bindings);
+        assert_eq!(
+            without_bindings,
+            Err(InferenceIssue::Failed(
+                InferenceError::HeterogeneousCollection {
+                    reason: "collection element types disagree: `String` vs `Int`".to_string(),
+                }
+            ))
+        );
     }
 
     #[test]
@@ -1992,16 +2042,15 @@ mod tests {
             ))
         );
 
-        retry_unchecked_export_inference(&mut inferred, &schemas_with_vpc());
+        let schema_checked = retry_unchecked_export_inference(&mut inferred, &schemas_with_vpc());
+        let failures = attached_inference_failures(schema_checked)
+            .map(|failure| (failure.name.to_string(), failure.error.clone()))
+            .collect::<Vec<_>>();
 
         assert!(matches!(
-            &inferred.export_params[0].static_type,
-            ExportStaticType::Inferred(StaticType::Unchecked(
-                InferredUncheckedReason::InferenceFailed(InferenceError::UnknownAttribute {
-                    binding,
-                    attribute,
-                })
-            )) if binding == "main" && attribute == "vpc_i"
+            failures.as_slice(),
+            [(name, InferenceError::UnknownAttribute { binding, attribute })]
+                if name == "vpc_id" && binding == "main" && attribute == "vpc_i"
         ));
     }
 
@@ -2028,7 +2077,8 @@ mod tests {
             ));
 
         let mut inferred = apply_inference(parsed, &SchemaRegistry::new());
-        retry_unchecked_export_inference(&mut inferred, &schemas_with_vpc());
+        let schema_checked = retry_unchecked_export_inference(&mut inferred, &schemas_with_vpc());
+        assert_eq!(attached_inference_failures(schema_checked).count(), 0);
 
         assert_eq!(
             inferred.export_params[0].static_type,

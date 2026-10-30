@@ -689,7 +689,10 @@ fn deserialize_saved_provider_configs(
 fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
     LiveCompositionArgument::from_value(
         value,
-        carina_core::parser::TypeExpr::String,
+        carina_core::validation::resolve_consumer_static_type_for_signature(
+            &carina_core::parser::TypeExpr::String,
+            &carina_core::parser::ProviderContext::default(),
+        ),
         carina_core::parser::ArgumentOrigin::Defaulted,
     )
 }

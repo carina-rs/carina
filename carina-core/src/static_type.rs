@@ -4,8 +4,8 @@ use crate::parser::TypeExpr;
 use crate::resource::PathSegment;
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum StaticType<R> {
-    Known(TypeExpr),
+pub enum StaticType<R, K = TypeExpr> {
+    Known(K),
     Unchecked(R),
 }
 
@@ -13,6 +13,41 @@ impl<R> StaticType<R> {
     pub fn known(&self) -> Option<&TypeExpr> {
         match self {
             Self::Known(type_expr) => Some(type_expr),
+            Self::Unchecked(_reason) => None,
+        }
+    }
+}
+
+/// A type expression that successfully passed consumer-side resolution.
+///
+/// The private field prevents parser-phase [`TypeExpr`] values from being
+/// relabeled as consumer-resolved by downstream crates. Consumer resolution
+/// returns this proof as the `Known` payload of [`ConsumerStaticType`].
+///
+/// ```compile_fail
+/// use carina_core::parser::TypeExpr;
+/// use carina_core::static_type::{ConsumerResolvedType, ConsumerStaticType, StaticType};
+///
+/// let _forged: ConsumerStaticType =
+///     StaticType::Known(ConsumerResolvedType(TypeExpr::String));
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConsumerResolvedType(TypeExpr);
+
+impl ConsumerResolvedType {
+    pub(crate) fn new(type_expr: TypeExpr) -> Self {
+        Self(type_expr)
+    }
+
+    pub fn type_expr(&self) -> &TypeExpr {
+        &self.0
+    }
+}
+
+impl<R> StaticType<R, ConsumerResolvedType> {
+    pub fn known(&self) -> Option<&TypeExpr> {
+        match self {
+            Self::Known(resolved) => Some(resolved.type_expr()),
             Self::Unchecked(_reason) => None,
         }
     }
@@ -34,14 +69,14 @@ pub struct UnnameableInConsumer {
 
 /// Parser/local declarations carry [`TypeExpr`] directly; only consumer
 /// resolution outputs can carry [`ConsumerStaticType`] and its unchecked state.
-pub type ConsumerStaticType = StaticType<UnnameableInConsumer>;
+pub type ConsumerStaticType = StaticType<UnnameableInConsumer, ConsumerResolvedType>;
 
 /// User-facing label for a declared type. An unchecked consumer boundary is
 /// still displayed with its authored declaration; unchecked controls type
 /// enforcement, not whether the declaration remains visible.
 pub fn consumer_static_type_label(static_type: &ConsumerStaticType) -> &TypeExpr {
     match static_type {
-        StaticType::Known(type_expr) => type_expr,
+        StaticType::Known(resolved) => resolved.type_expr(),
         StaticType::Unchecked(reason) => &reason.original,
     }
 }
@@ -124,7 +159,8 @@ impl From<InferredUncheckedReason> for ConsumerInferredUncheckedReason {
     }
 }
 
-pub type ConsumerInferredStaticType = StaticType<ConsumerInferredUncheckedReason>;
+pub type ConsumerInferredStaticType =
+    StaticType<ConsumerInferredUncheckedReason, ConsumerResolvedType>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExportStaticType {
@@ -173,7 +209,7 @@ impl ConsumerExportStaticType {
 
     pub fn declared_known(&self) -> Option<&TypeExpr> {
         match self {
-            Self::Declared(StaticType::Known(type_expr)) => Some(type_expr),
+            Self::Declared(StaticType::Known(resolved)) => Some(resolved.type_expr()),
             Self::Declared(StaticType::Unchecked(_reason)) => None,
             Self::Inferred(StaticType::Known(_type_expr)) => None,
             Self::Inferred(StaticType::Unchecked(

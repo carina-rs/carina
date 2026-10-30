@@ -745,8 +745,9 @@ impl<'a> BindingIndex<'a> {
                     };
 
                     match attribute.declared_type() {
-                        Some(crate::static_type::StaticType::Known(type_expr)) => {
-                            let Some(declared) = crate::validation::lift_type_expr(type_expr)
+                        Some(crate::static_type::StaticType::Known(resolved)) => {
+                            let Some(declared) =
+                                crate::validation::lift_type_expr(resolved.type_expr())
                             else {
                                 visiting.remove(&key);
                                 return RefType::Unchecked;
@@ -2409,6 +2410,30 @@ mod tests {
         AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, TypeInSchema,
     };
 
+    fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType {
+        crate::validation::resolve_consumer_static_type_for_signature(
+            &type_expr,
+            &crate::parser::ProviderContext::default(),
+        )
+    }
+
+    fn consumer_inferred_type(
+        type_expr: TypeExpr,
+    ) -> crate::static_type::ConsumerInferredStaticType {
+        match consumer_type(type_expr) {
+            crate::static_type::StaticType::Known(resolved) => {
+                crate::static_type::StaticType::Known(resolved)
+            }
+            crate::static_type::StaticType::Unchecked(reason) => {
+                crate::static_type::StaticType::Unchecked(
+                    crate::static_type::ConsumerInferredUncheckedReason::UnnameableInConsumer(
+                        reason,
+                    ),
+                )
+            }
+        }
+    }
+
     fn vpc_schema() -> ResourceSchema {
         ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
@@ -2537,8 +2562,8 @@ let existing = read aws.ec2.Vpc {
             crate::module_resolver::ResolvedModuleSignature {
                 arguments: Vec::new(),
                 attributes: indexmap::indexmap! {
-                    "count".to_string() => Some(crate::static_type::StaticType::Known(TypeExpr::Int)),
-                    "name".to_string() => Some(crate::static_type::StaticType::Known(TypeExpr::String)),
+                    "count".to_string() => Some(consumer_type(TypeExpr::Int)),
+                    "name".to_string() => Some(consumer_type(TypeExpr::String)),
                 },
                 requires: Vec::new(),
             },
@@ -2934,7 +2959,7 @@ let vpc = aws.ec2.Vpc {
                     "value".to_string(),
                     LiveCompositionAttribute::from_value(
                         Value::resource_ref("source".to_string(), "value", vec![]),
-                        Some(declaration.clone()),
+                        Some(consumer_type(declaration.clone())),
                     ),
                 );
                 parsed.compositions.push(middle);
@@ -3095,16 +3120,16 @@ let vpc = aws.ec2.Vpc {
                 "vpc".to_string(),
                 crate::upstream_exports::UpstreamExportEntry {
                     static_type: crate::upstream_exports::UpstreamExportType::Static(
-                        crate::static_type::ConsumerExportStaticType::Declared(
-                            crate::static_type::StaticType::Known(TypeExpr::SchemaType {
+                        crate::static_type::ConsumerExportStaticType::Declared(consumer_type(
+                            TypeExpr::SchemaType {
                                 owned: crate::parser::OwnedTypeIdentity::provider(
                                     "aws",
                                     crate::schema::TypeIdentity::from_schema_type(
                                         "aws", "ec2.Vpc", "Id",
                                     ),
                                 ),
-                            }),
-                        ),
+                            },
+                        )),
                     ),
                     value: None,
                 },
@@ -3142,7 +3167,7 @@ let vpc = aws.ec2.Vpc {
                 crate::upstream_exports::UpstreamExportEntry {
                     static_type: crate::upstream_exports::UpstreamExportType::Static(
                         crate::static_type::ConsumerExportStaticType::Inferred(
-                            crate::static_type::StaticType::Known(TypeExpr::String),
+                            consumer_inferred_type(TypeExpr::String),
                         ),
                     ),
                     value: None,
