@@ -13,7 +13,7 @@ use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, PendingReRead, ResolvedResourceId, Resource,
     ResourceId, ResourceIdentity, UnknownReason, Value, ValueString,
 };
-use crate::schema::{ResourceSchema, SchemaRegistry};
+use crate::schema::{ResourceSchema, SchemaRegistry, ValidatedResourceSchema};
 use crate::validation::is_string_compatible_type;
 use crate::value::CanonicalizedProviderConfigs;
 
@@ -1157,19 +1157,19 @@ pub struct AnonymousIdBindingStateInfo {
     /// The resource name stored in state. Let-bound resources are usually
     /// named by their binding (`private_rtb`, `inst.x`).
     pub name: String,
-    /// Canonical attribute values from state, keyed by DSL attribute name
-    /// (the state JSON attribute key).
-    pub attribute_values: HashMap<String, String>,
+    /// Persisted attribute values keyed by DSL attribute name (the state JSON
+    /// attribute key). The consuming create-only schema canonicalizes them.
+    pub attribute_values: HashMap<String, Value>,
 }
 
 fn state_entry_matches_binding_scope(binding: &str, state_name: &str) -> bool {
     binding.contains('.') || !state_name.contains('.')
 }
 
-fn resolve_deferred_create_only_value_string(
+fn resolve_deferred_create_only_value(
     value: &Value,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
-) -> Option<String> {
+) -> Option<Value> {
     let Value::Deferred(DeferredValue::ResourceRef { path }) = value else {
         return None;
     };
@@ -1187,30 +1187,73 @@ fn resolve_deferred_create_only_value_string(
     entry.attribute_values.get(path.attribute()).cloned()
 }
 
-fn canonical_or_resolved_create_only_value_string(
+fn canonical_or_resolved_create_only_value(
     value: &Value,
     schema: &ResourceSchema,
     attribute: &str,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
-) -> Option<String> {
-    if let Some(resolved) = resolve_deferred_create_only_value_string(value, find_state_by_binding)
-    {
-        return Some(resolved);
+) -> Result<Option<Value>, crate::schema::TypeError> {
+    if let Some(resolved) = resolve_deferred_create_only_value(value, find_state_by_binding) {
+        let canonical = crate::value::canonicalize_state_attribute_value_with_schema(
+            resolved, schema, attribute,
+        );
+        return Ok(canonical_create_only_value_string(&canonical).map(|_| canonical));
     }
     let canonical = crate::value::canonicalize_desired_attribute_value_with_schema(
         value.clone(),
         schema,
         attribute,
-    )
-    .ok()?;
-    canonical_create_only_value_string(&canonical)
+    )?;
+    Ok(canonical_create_only_value_string(&canonical).map(|_| canonical))
+}
+
+#[derive(Clone, PartialEq)]
+struct ResolvedCreateOnlyValue {
+    canonical: String,
+    value: Option<Value>,
+}
+
+impl ResolvedCreateOnlyValue {
+    fn from_value(value: Value) -> Option<Self> {
+        Some(Self {
+            canonical: canonical_create_only_value_string(&value)?,
+            value: Some(value),
+        })
+    }
+
+    #[cfg(test)]
+    fn from_comparison_string(canonical: String) -> Self {
+        Self {
+            canonical,
+            value: None,
+        }
+    }
+
+    fn semantically_equal(&self, other: &Self, schema: &ResourceSchema, attribute: &str) -> bool {
+        match (&self.value, &other.value) {
+            (Some(left), Some(right)) => {
+                schema
+                    .attributes
+                    .get(attribute)
+                    .is_some_and(|attribute_schema| {
+                        crate::differ::type_aware_equal(
+                            left,
+                            right,
+                            Some(&attribute_schema.attr_type),
+                            &schema.defs,
+                        )
+                    })
+            }
+            _ => self.canonical == other.canonical,
+        }
+    }
 }
 
 /// Whether one configured desired create-only value can be compared yet.
 #[derive(Clone, PartialEq)]
 enum CreateOnlyValue {
-    Resolved(String),
-    Unresolved,
+    Resolved(ResolvedCreateOnlyValue),
+    Unresolved(Option<crate::schema::TypeError>),
 }
 
 /// Canonical create-only values selected by a resource schema.
@@ -1227,8 +1270,8 @@ pub struct CreateOnlyValues {
 
 impl CreateOnlyValues {
     /// Extract the canonical create-only values configured on a resource.
-    pub fn of(
-        resource: &Resource,
+    pub fn of<S>(
+        resource: &Resource<S>,
         schema: &ResourceSchema,
         find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     ) -> Self {
@@ -1237,13 +1280,19 @@ impl CreateOnlyValues {
             .into_iter()
             .filter_map(|attribute| {
                 resource.get_attr(attribute).map(|value| {
-                    let value = canonical_or_resolved_create_only_value_string(
+                    let value = match canonical_or_resolved_create_only_value(
                         value,
                         schema,
                         attribute,
                         find_state_by_binding,
-                    )
-                    .map_or(CreateOnlyValue::Unresolved, CreateOnlyValue::Resolved);
+                    ) {
+                        Ok(Some(value)) => CreateOnlyValue::Resolved(
+                            ResolvedCreateOnlyValue::from_value(value)
+                                .expect("resolved create-only values are comparison-safe"),
+                        ),
+                        Ok(None) => CreateOnlyValue::Unresolved(None),
+                        Err(error) => CreateOnlyValue::Unresolved(Some(error)),
+                    };
                     (attribute.to_string(), value)
                 })
             })
@@ -1251,25 +1300,48 @@ impl CreateOnlyValues {
         Self { values }
     }
 
-    /// Select resolved create-only values from canonical persisted state
-    /// attributes. Missing state attributes remain absent from the typed set.
-    pub fn from_canonical_state_attributes(
-        create_only_attributes: &[String],
-        attributes: &HashMap<String, String>,
+    /// Canonicalize and select create-only values from raw persisted state.
+    /// Missing or non-comparable state attributes remain absent.
+    pub fn from_state_attributes(
+        schema: &ValidatedResourceSchema,
+        attributes: &HashMap<String, Value>,
     ) -> Self {
-        let values = create_only_attributes
-            .iter()
+        let mut canonical = attributes.clone();
+        crate::value::canonicalize_state_attribute_map_with_schema(&mut canonical, schema);
+        let values = schema
+            .as_schema()
+            .create_only_attributes()
+            .into_iter()
             .filter_map(|attribute| {
-                attributes
+                canonical
                     .get(attribute)
                     .cloned()
-                    .map(|value| (attribute.clone(), CreateOnlyValue::Resolved(value)))
+                    .and_then(ResolvedCreateOnlyValue::from_value)
+                    .map(|value| (attribute.to_string(), CreateOnlyValue::Resolved(value)))
             })
             .collect();
         Self { values }
     }
 
-    fn has_configured_values(&self) -> bool {
+    #[cfg(test)]
+    fn from_comparison_strings(attributes: HashMap<String, String>) -> Self {
+        Self {
+            values: attributes
+                .into_iter()
+                .map(|(attribute, value)| {
+                    (
+                        attribute,
+                        CreateOnlyValue::Resolved(ResolvedCreateOnlyValue::from_comparison_string(
+                            value,
+                        )),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether at least one create-only attribute was configured.
+    pub fn has_configured_values(&self) -> bool {
         !self.values.is_empty()
     }
 
@@ -1279,13 +1351,18 @@ impl CreateOnlyValues {
             .any(|value| matches!(value, CreateOnlyValue::Resolved(_)))
     }
 
-    fn all_configured_values_resolved(&self) -> bool {
+    /// Whether every configured create-only attribute has a comparable value.
+    pub fn all_configured_values_resolved(&self) -> bool {
         self.values
             .values()
             .all(|value| matches!(value, CreateOnlyValue::Resolved(_)))
     }
 
-    fn match_counts(&self, state_values: &CreateOnlyValues) -> (usize, usize) {
+    fn match_counts(
+        &self,
+        state_values: &CreateOnlyValues,
+        schema: &ResourceSchema,
+    ) -> (usize, usize) {
         let mut matched = 0;
         let mut mismatched = 0;
         for (attribute, desired_value) in &self.values {
@@ -1294,7 +1371,7 @@ impl CreateOnlyValues {
             };
             if let Some(CreateOnlyValue::Resolved(state_value)) = state_values.values.get(attribute)
             {
-                if state_value == desired_value {
+                if desired_value.semantically_equal(state_value, schema, attribute) {
                     matched += 1;
                 } else {
                     mismatched += 1;
@@ -1304,10 +1381,18 @@ impl CreateOnlyValues {
         (matched, mismatched)
     }
 
-    fn all_match(&self, state_values: &CreateOnlyValues) -> bool {
-        self.values
-            .iter()
-            .all(|(attribute, value)| state_values.values.get(attribute) == Some(value))
+    /// Compare every configured desired value with canonical persisted state
+    /// using the resource schema's type-aware equality rules.
+    pub fn all_match(&self, state_values: &CreateOnlyValues, schema: &ResourceSchema) -> bool {
+        self.values.iter().all(|(attribute, desired)| {
+            let CreateOnlyValue::Resolved(desired) = desired else {
+                return false;
+            };
+            let Some(CreateOnlyValue::Resolved(state)) = state_values.values.get(attribute) else {
+                return false;
+            };
+            desired.semantically_equal(state, schema, attribute)
+        })
     }
 }
 
@@ -1489,7 +1574,8 @@ pub fn reconcile_anonymous_identifiers(
                 continue;
             }
 
-            let (matched, mismatched) = resource_co_values.match_counts(&entry.create_only_values);
+            let (matched, mismatched) =
+                resource_co_values.match_counts(&entry.create_only_values, schema);
 
             if matched > 0 && mismatched == 0 {
                 full_matches.push(entry);
@@ -1550,8 +1636,9 @@ pub fn reconcile_anonymous_identifiers(
 ///    Ambiguous matches are skipped without a fallback.
 /// 4. For resources with no configured create-only attributes, or with a
 ///    fully resolved create-only set that matches zero state rows, fall back
-///    to SimHash Hamming-distance matching. This uses the same SimHash that
-///    `compute_anonymous_identifiers` would have produced. A partially
+///    to SimHash Hamming-distance matching among rows that do not explicitly
+///    contradict any desired create-only value. This uses the same SimHash
+///    that `compute_anonymous_identifiers` would have produced. A partially
 ///    unresolved desired set does not fall back because its identity inputs
 ///    are not known well enough to select a prior row safely.
 ///
@@ -1627,6 +1714,11 @@ pub fn detect_anonymous_to_named_renames(
             let candidates = state_entries
                 .candidates()
                 .filter(|entry| !used_in_dsl.contains(&entry.name))
+                .filter(|entry| {
+                    let (_matched, mismatched) =
+                        resource_co_values.match_counts(&entry.create_only_values, schema);
+                    mismatched == 0
+                })
                 .filter_map(|entry| match extract_hash_from_identifier(&entry.name) {
                     Some(AnonymousHashSuffix::SimHash(hash)) => Some((entry, hash)),
                     _ => None,
@@ -1648,7 +1740,7 @@ pub fn detect_anonymous_to_named_renames(
                 if extract_hash_from_identifier(&entry.name).is_none() {
                     continue;
                 }
-                let all_match = resource_co_values.all_match(&entry.create_only_values);
+                let all_match = resource_co_values.all_match(&entry.create_only_values, schema);
                 if all_match {
                     matches.push(entry);
                 }

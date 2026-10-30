@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use carina_core::effect::{Effect, EffectGeneration};
-use carina_core::identifier::canonical_create_only_value_string;
+use carina_core::identifier::CreateOnlyValues;
 use carina_core::plan::Plan;
 use carina_core::resource::{Current, ResolvedResource, ResolvedResourceId, ResourceId, Value};
-use carina_core::schema::{EffectiveAttribute, SchemaRegistry};
+use carina_core::schema::{SchemaRegistry, ValidatedResourceSchema};
 use colored::Colorize;
 
 /// One plan-time suggestion. Rendering belongs to this typed value rather
@@ -341,12 +341,8 @@ struct DestroyCandidate<'a> {
 
 struct CreateCandidate<'schema> {
     id: ResolvedResourceId,
-    create_only_values: Vec<CreateOnlyValue<'schema>>,
-}
-
-struct CreateOnlyValue<'schema> {
-    attribute: EffectiveAttribute<'schema>,
-    desired: String,
+    schema: &'schema ValidatedResourceSchema,
+    create_only_values: CreateOnlyValues,
 }
 
 enum GraphNode {
@@ -368,28 +364,19 @@ fn create_candidate<'schema, S>(
     schemas: &'schema SchemaRegistry,
 ) -> Option<CreateCandidate<'schema>> {
     let schema = schemas.get_for(created.as_resource())?.schema();
-    let create_only_attributes = schema.as_schema().create_only_attributes();
-    if create_only_attributes.is_empty() {
-        return None;
-    }
-
-    let mut create_only_values = Vec::new();
-    for attribute in create_only_attributes {
-        let Some(desired_value) = created.get_attr(attribute) else {
-            continue;
-        };
-        let desired_value = canonical_create_only_value_string(desired_value)?;
-        create_only_values.push(CreateOnlyValue {
-            attribute: schema.effective_attribute(attribute)?,
-            desired: desired_value,
+    let create_only_values =
+        CreateOnlyValues::of(created.as_resource(), schema.as_schema(), &|_binding| {
+            Vec::new()
         });
-    }
-    if create_only_values.is_empty() {
+    if !create_only_values.has_configured_values()
+        || !create_only_values.all_configured_values_resolved()
+    {
         return None;
     }
 
     Some(CreateCandidate {
         id: created.resolved_id(),
+        schema,
         create_only_values,
     })
 }
@@ -406,21 +393,11 @@ fn resources_match(destroyed: &DestroyCandidate<'_>, created: &CreateCandidate<'
         return false;
     }
 
-    for create_only in &created.create_only_values {
-        let Some(prior_value) = destroyed
-            .attributes
-            .get(create_only.attribute.name())
-            .cloned()
-            .map(|value| create_only.attribute.canonicalize_state(value))
-            .and_then(|value| canonical_create_only_value_string(&value))
-        else {
-            return false;
-        };
-        if create_only.desired != prior_value {
-            return false;
-        }
-    }
-    true
+    let prior_values =
+        CreateOnlyValues::from_state_attributes(created.schema, destroyed.attributes);
+    created
+        .create_only_values
+        .all_match(&prior_values, created.schema.as_schema())
 }
 
 fn render_address(id: &ResolvedResourceId) -> String {

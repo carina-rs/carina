@@ -152,8 +152,21 @@ impl ProviderFactory for RawEnumStateFactory {
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let mode = AttributeType::enum_(
             carina_core::schema::enum_identity("Mode", Some("test.thing")),
-            Some(vec!["Allow".to_string()]),
-            vec![("Allow".to_string(), "allow".to_string())],
+            Some(vec!["Allow".to_string(), "Deny".to_string()]),
+            vec![
+                ("Allow".to_string(), "allow".to_string()),
+                ("Deny".to_string(), "deny".to_string()),
+            ],
+            None,
+            None,
+        );
+        let collection_mode = AttributeType::enum_(
+            carina_core::schema::enum_identity("Mode", Some("test.collection.Identity")),
+            Some(vec!["Allow".to_string(), "Deny".to_string()]),
+            vec![
+                ("Allow".to_string(), "allow".to_string()),
+                ("Deny".to_string(), "deny".to_string()),
+            ],
             None,
             None,
         );
@@ -171,6 +184,17 @@ impl ProviderFactory for RawEnumStateFactory {
                 )
                 .validate()
                 .expect("raw enum test schema is valid"),
+            ResourceSchema::new("collection.Identity")
+                .attribute(
+                    AttributeSchema::optional(
+                        "modes",
+                        AttributeType::unordered_list(collection_mode),
+                    )
+                    .create_only()
+                    .build(),
+                )
+                .validate()
+                .expect("collection enum test schema is valid"),
         ]
     }
 }
@@ -417,6 +441,100 @@ async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() 
     assert_eq!(effects.len(), 1, "expected a pure move plan: {effects:#?}");
     let Effect::Move { from, to } = &effects[0] else {
         panic!("expected enum/int anonymous rename to be a move: {effects:#?}")
+    };
+    assert_eq!(from.identity_str(), ANONYMOUS_NAME);
+    assert_eq!(to.identity_str(), "typed");
+}
+
+#[tokio::test]
+async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_state() {
+    use carina_core::config_loader::load_configuration_with_config;
+
+    const ANONYMOUS_NAME: &str = "test_collection_identity_22222222";
+
+    let project = tempfile::tempdir().expect("create temporary project");
+    std::fs::write(project.path().join("providers.crn"), "provider test {}\n")
+        .expect("write provider fixture");
+    std::fs::write(
+        project.path().join("main.crn"),
+        "backend local { path = \"carina.state.json\" }\n",
+    )
+    .expect("write backend fixture");
+    std::fs::write(
+        project.path().join("resource.crn"),
+        r#"let typed = test.collection.Identity {
+  modes = [
+    test.collection.Identity.Mode.allow,
+    test.collection.Identity.Mode.deny,
+  ]
+}
+"#,
+    )
+    .expect("write unordered enum resource fixture");
+
+    let loaded = load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load multi-file fixture");
+    let parsed = loaded.parsed;
+    let provider_configs = resolved_provider_configs(&parsed);
+    let wiring = ValidatedWiring::from_factories_for_test(
+        vec![Box::new(RawEnumStateFactory)],
+        provider_configs.as_provider_configs(),
+    );
+    let canonical_resources = canonical_pair(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        wiring.context().schemas(),
+    );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+
+    let mut row = carina_state::state::ResourceState::try_applied(
+        "collection.Identity",
+        ANONYMOUS_NAME,
+        "test",
+        "provider-id",
+    )
+    .expect("collection state identifier is non-empty")
+    .with_attribute("modes", serde_json::json!(["Deny", "Allow"]));
+    row.binding = None;
+    let mut persisted = StateFile::new();
+    persisted
+        .upsert_resource(row)
+        .expect("unordered anonymous state row is unique");
+    let state_path = project.path().join("carina.state.json");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
+    )
+    .expect("write real state fixture");
+    let state_file = Some(
+        carina_state::state::check_and_migrate(
+            &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+        )
+        .expect("decode real state fixture")
+        .into_state(),
+    );
+
+    let planned = create_plan_from_parsed_with_upstream_with_ctx(
+        validated,
+        &provider_configs,
+        &state_file,
+        false,
+        ProgressSink::Human,
+        &HashMap::new(),
+        &StateBlockClaims::default(),
+        &ResolvedStateBlockTargets::default(),
+    )
+    .await
+    .expect("build unordered enum rename plan");
+    let effects = planned.resources().plan.effects();
+
+    assert_eq!(effects.len(), 1, "expected a pure move plan: {effects:#?}");
+    let Effect::Move { from, to } = &effects[0] else {
+        panic!("expected unordered enum anonymous rename to be a move: {effects:#?}")
     };
     assert_eq!(from.identity_str(), ANONYMOUS_NAME);
     assert_eq!(to.identity_str(), "typed");

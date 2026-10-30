@@ -13,8 +13,7 @@ use indexmap::IndexMap;
 impl FromIterator<(String, String)> for CreateOnlyValues {
     fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
         let attributes = iter.into_iter().collect::<HashMap<_, _>>();
-        let create_only_attributes = attributes.keys().cloned().collect::<Vec<_>>();
-        Self::from_canonical_state_attributes(&create_only_attributes, &attributes)
+        Self::from_comparison_strings(attributes)
     }
 }
 
@@ -2617,7 +2616,12 @@ fn binding_state_entry(
             name: name.to_string(),
             attribute_values: attrs
                 .iter()
-                .map(|(attr, value)| ((*attr).to_string(), (*value).to_string()))
+                .map(|(attr, value)| {
+                    (
+                        (*attr).to_string(),
+                        Value::Concrete(ConcreteValue::String((*value).to_string().into())),
+                    )
+                })
                 .collect(),
         },
     )
@@ -5023,6 +5027,87 @@ fn test_detect_rename_matches_enum_and_int_create_only_attrs() {
 }
 
 #[test]
+fn test_detect_rename_matches_mixed_canonical_and_identifier_enums_in_list_and_map() {
+    let domain = eip_domain_type("awscc");
+    let validated_schema = ResourceSchema::new("ec2.Eip")
+        .attribute(
+            AttributeSchema::optional("domains", AttributeType::list(domain.clone()))
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("domain_by_name", AttributeType::map(domain))
+                .create_only()
+                .build(),
+        )
+        .validate()
+        .expect("nested enum schema fixture must be valid");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", validated_schema.clone());
+
+    let canonical = Value::Concrete(ConcreteValue::CanonicalEnum(canonical_eip_domain(
+        "aws",
+        "aws.ec2.Eip.Domain.vpc",
+    )));
+    let identifier = Value::Concrete(ConcreteValue::enum_identifier(
+        "awscc.ec2.Eip.Domain.standard".to_string(),
+    ));
+    let mut resource = Resource::with_provider("awscc", "ec2.Eip", "typed", None);
+    resource.binding = Some("typed".to_string());
+    resource.set_attr(
+        "domains".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![
+            canonical.clone(),
+            identifier.clone(),
+        ])),
+    );
+    resource.set_attr(
+        "domain_by_name".to_string(),
+        Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
+            "canonical".to_string() => canonical,
+            "identifier".to_string() => identifier,
+        })),
+    );
+
+    let persisted_attributes = HashMap::from([
+        (
+            "domains".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("vpc".into())),
+                Value::Concrete(ConcreteValue::String("standard".into())),
+            ])),
+        ),
+        (
+            "domain_by_name".to_string(),
+            Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
+                "canonical".to_string() => Value::Concrete(ConcreteValue::String("vpc".into())),
+                "identifier".to_string() => Value::Concrete(ConcreteValue::String("standard".into())),
+            })),
+        ),
+    ]);
+    let state_entries = vec![AnonymousIdStateInfo {
+        provider_instance: None,
+        name: "awscc_ec2_eip_11111111".to_string(),
+        create_only_values: CreateOnlyValues::from_state_attributes(
+            &validated_schema,
+            &persisted_attributes,
+        ),
+    }];
+
+    let renames = detect_anonymous_to_named_renames_for_test(
+        &[resource],
+        &schemas,
+        &|_provider, _resource_type| state_entries.clone(),
+        &[],
+        &|_provider| Vec::new(),
+    );
+
+    assert_eq!(renames.len(), 1);
+    assert_eq!(renames[0].0.identity_str(), "awscc_ec2_eip_11111111");
+    assert_eq!(renames[0].1.identity_str(), "typed");
+}
+
+#[test]
 fn test_detect_rename_skips_ambiguous_resolved_create_only_matches() {
     let schemas = subnet_route_table_association_registry();
     let mut resource =
@@ -5165,6 +5250,94 @@ fn test_detect_rename_falls_back_to_simhash_when_state_lacks_create_only_attr() 
 }
 
 #[test]
+fn test_detect_rename_simhash_fallback_rejects_explicit_create_only_mismatches() {
+    let providers: Vec<ProviderConfig> = Vec::new();
+    let identity_fn = |_provider: &str| Vec::new();
+    let mut legacy_schemas = SchemaRegistry::new();
+    legacy_schemas.insert(
+        "awscc",
+        ResourceSchema::new("ec2.Eip")
+            .attribute(AttributeSchema::optional("allocation_id", AttributeType::string()).build())
+            .validate()
+            .expect("legacy schema fixture must be valid"),
+    );
+
+    let mut anonymous = Resource::pending_with_provider("awscc", "ec2.Eip", None);
+    anonymous.set_attr(
+        "allocation_id".to_string(),
+        Value::Concrete(ConcreteValue::String("eip-c".into())),
+    );
+    let mut anonymous_resources = vec![anonymous];
+    compute_anonymous_identifiers_for_test(
+        &mut anonymous_resources,
+        &providers,
+        &legacy_schemas,
+        &identity_fn,
+    )
+    .expect("legacy anonymous SimHash must compute");
+    let exact_simhash_name = anonymous_resources[0]
+        .id
+        .identity_str()
+        .expect("legacy anonymous identity must resolve")
+        .to_string();
+    assert!(matches!(
+        extract_hash_from_identifier(&exact_simhash_name),
+        Some(AnonymousHashSuffix::SimHash(_))
+    ));
+
+    let mut nearby_chars = exact_simhash_name.chars().collect::<Vec<_>>();
+    let last = nearby_chars.last_mut().expect("SimHash name is non-empty");
+    *last = if *last == '0' { '1' } else { '0' };
+    let nearby_simhash_name = nearby_chars.into_iter().collect::<String>();
+
+    let mut named = anonymous_resources.remove(0);
+    named.id = ResourceId::with_provider_identity("awscc", "ec2.Eip", "eip", None);
+    named.binding = Some("eip".to_string());
+
+    let mut current_schemas = SchemaRegistry::new();
+    current_schemas.insert(
+        "awscc",
+        ResourceSchema::new("ec2.Eip")
+            .attribute(
+                AttributeSchema::optional("allocation_id", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .expect("current schema fixture must be valid"),
+    );
+    let state_entries = vec![
+        AnonymousIdStateInfo {
+            provider_instance: None,
+            name: exact_simhash_name,
+            create_only_values: [("allocation_id".to_string(), "eip-a".to_string())]
+                .into_iter()
+                .collect(),
+        },
+        AnonymousIdStateInfo {
+            provider_instance: None,
+            name: nearby_simhash_name,
+            create_only_values: [("allocation_id".to_string(), "eip-b".to_string())]
+                .into_iter()
+                .collect(),
+        },
+    ];
+
+    let renames = detect_anonymous_to_named_renames_for_test(
+        &[named],
+        &current_schemas,
+        &|_provider, _resource_type| state_entries.clone(),
+        &providers,
+        &identity_fn,
+    );
+
+    assert!(
+        renames.is_empty(),
+        "SimHash fallback must not override explicit create-only mismatches: {renames:?}",
+    );
+}
+
+#[test]
 fn test_detect_rename_does_not_match_unresolvable_create_only_ref() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -5183,6 +5356,62 @@ fn test_detect_rename_does_not_match_unresolvable_create_only_ref() {
         &schemas,
         &|_provider, _resource_type| state_entries.clone(),
         &|_binding| Vec::new(),
+        &[],
+        &|_provider| Vec::new(),
+    );
+
+    assert!(renames.is_empty());
+}
+
+#[test]
+fn test_detect_rename_invalid_enum_is_typed_unresolved_and_does_not_rename() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        ResourceSchema::new("ec2.Eip")
+            .attribute(
+                AttributeSchema::optional("domain", eip_domain_type("awscc"))
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .expect("enum schema fixture must be valid"),
+    );
+    let mut resource = Resource::with_provider("awscc", "ec2.Eip", "eip", None);
+    resource.binding = Some("eip".to_string());
+    resource.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::enum_identifier(
+            "awscc.ec2.Eip.Domain.invalid".to_string(),
+        )),
+    );
+
+    let schema = schemas
+        .get_for(&resource)
+        .expect("resource schema exists")
+        .schema();
+    let create_only_values =
+        CreateOnlyValues::of(&resource, schema.as_schema(), &|_binding| Vec::new());
+    let Some(CreateOnlyValue::Unresolved(Some(error))) = create_only_values.values.get("domain")
+    else {
+        panic!("invalid enum must retain its typed canonicalization error")
+    };
+    assert!(matches!(
+        error,
+        crate::schema::TypeError::InvalidEnumVariant { .. }
+    ));
+
+    let state_entries = vec![AnonymousIdStateInfo {
+        provider_instance: None,
+        name: "awscc_ec2_eip_11111111".to_string(),
+        create_only_values: [("domain".to_string(), "vpc".to_string())]
+            .into_iter()
+            .collect(),
+    }];
+    let renames = detect_anonymous_to_named_renames_for_test(
+        &[resource],
+        &schemas,
+        &|_provider, _resource_type| state_entries.clone(),
         &[],
         &|_provider| Vec::new(),
     );

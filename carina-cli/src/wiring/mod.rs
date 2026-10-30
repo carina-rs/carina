@@ -2472,7 +2472,6 @@ impl AnonymousReconciliationStateView {
             .iter()
             .map(|(from, to)| (from.as_inner().clone(), to.clone()))
             .collect::<HashMap<_, _>>();
-        let mut create_only_by_type = HashMap::<(String, String), Vec<String>>::new();
         for state_resource in state_file.resources() {
             let state_row_id = resolved_state_row_id(
                 state_resource,
@@ -2483,45 +2482,28 @@ impl AnonymousReconciliationStateView {
                 .cloned()
                 .unwrap_or_else(|| state_row_id.clone());
             let has_persisted_attributes = state_resource.persisted_attributes().is_some();
-            let attribute_values = match state_resource.persisted_attributes() {
-                Some(persisted) => persisted
-                    .to_values()
-                    .into_iter()
-                    .filter_map(|(attribute, value)| {
-                        identifier::canonical_create_only_value_string(&value)
-                            .map(|value| (attribute, value))
-                    })
-                    .collect::<HashMap<_, _>>(),
-                None => HashMap::new(),
-            };
+            let attribute_values = state_resource
+                .persisted_attributes()
+                .map(|persisted| persisted.to_values())
+                .unwrap_or_default();
             let type_key = (
                 projected_id.provider().to_string(),
                 projected_id.resource_type().to_string(),
             );
-            let create_only_attributes = create_only_by_type
-                .entry(type_key.clone())
-                .or_insert_with(|| {
-                    ctx.schemas()
-                        .get(
-                            projected_id.provider(),
-                            projected_id.resource_type(),
-                            carina_core::schema::SchemaKind::Resource,
-                        )
-                        .map(|schema| {
-                            schema
-                                .schema()
-                                .as_schema()
-                                .create_only_attributes()
-                                .into_iter()
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                });
-            let create_only_values = identifier::CreateOnlyValues::from_canonical_state_attributes(
-                create_only_attributes,
-                &attribute_values,
-            );
+            let create_only_values = ctx
+                .schemas()
+                .get(
+                    projected_id.provider(),
+                    projected_id.resource_type(),
+                    carina_core::schema::SchemaKind::Resource,
+                )
+                .map(|schema| {
+                    identifier::CreateOnlyValues::from_state_attributes(
+                        schema.schema(),
+                        &attribute_values,
+                    )
+                })
+                .unwrap_or_default();
             let projected_name = projected_id.identity_str().to_string();
             origins_by_projected_name
                 .entry(type_key.clone())
@@ -2544,13 +2526,13 @@ impl AnonymousReconciliationStateView {
                     provider_instance: projected_id.provider_instance().map(str::to_string),
                     create_only_values,
                 });
-            if let Some(binding) = &state_resource.binding {
-                let projected = projected_target.is_some();
-                let effective_binding = if projected {
-                    projected_name.clone()
-                } else {
-                    binding.clone()
-                };
+            let projected = projected_target.is_some();
+            let effective_binding = if projected {
+                Some(projected_name.clone())
+            } else {
+                state_resource.binding.clone()
+            };
+            if let Some(effective_binding) = effective_binding {
                 by_binding.entry(effective_binding).or_default().push(
                     AnonymousIdBindingViewEntry {
                         value: AnonymousIdBindingStateInfo {
@@ -2657,6 +2639,46 @@ fn detect_anonymous_to_named_moves_with_ctx(
     ))
 }
 
+fn detect_anonymous_to_named_moves_to_fixed_point(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    providers: &[ProviderConfig],
+    state_file: &StateFile,
+    initial_moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
+    claims: &StateBlockClaims,
+) -> Result<Vec<ResolvedMove>, AppError> {
+    let mut projected_pairs = initial_moved_pairs.to_vec();
+    let mut detected = Vec::new();
+    let mut iterations = 0;
+
+    loop {
+        let state_view = AnonymousReconciliationStateView::new(ctx, state_file, &projected_pairs);
+        let pass = detect_anonymous_to_named_moves_with_ctx(
+            ctx,
+            resources,
+            providers,
+            &state_view,
+            claims,
+        )?;
+        if pass.is_empty() {
+            break;
+        }
+        if iterations >= resources.len() {
+            return Err(AppError::Config(
+                "anonymous-to-named rename detection did not converge".to_string(),
+            ));
+        }
+        iterations += 1;
+        projected_pairs.extend(
+            pass.iter()
+                .map(|resolved_move| (resolved_move.from().clone(), resolved_move.to().clone())),
+        );
+        detected.extend(pass);
+    }
+
+    Ok(detected)
+}
+
 pub(crate) struct LateAnonymousIdentityInputs<'a> {
     pub resources: &'a mut OverrideAwareResources,
     pub addressed: &'a mut AddressedState,
@@ -2694,17 +2716,32 @@ pub(crate) fn reconcile_late_anonymous_identities(
         return Err(error);
     }
 
-    let moves = inputs.state_file.map_or_else(Vec::new, |state_file| {
+    let mut moves = Vec::new();
+    if let Some(state_file) = inputs.state_file {
         let state_view =
             AnonymousReconciliationStateView::new(ctx, state_file, &inputs.addressed.moved_pairs);
-        reconcile_anonymous_identifiers_with_ctx(
+        moves = reconcile_anonymous_identifiers_with_ctx(
             ctx,
             inputs.resources.resources(),
             inputs.data_sources,
             &state_view,
             inputs.state_block_claims,
-        )
-    });
+        );
+        let mut projected_pairs = inputs.addressed.moved_pairs.clone();
+        projected_pairs.extend(
+            moves
+                .iter()
+                .map(|resolved_move| (resolved_move.from().clone(), resolved_move.to().clone())),
+        );
+        moves.extend(detect_anonymous_to_named_moves_to_fixed_point(
+            ctx,
+            inputs.resources.resources(),
+            inputs.providers,
+            state_file,
+            &projected_pairs,
+            inputs.state_block_claims,
+        )?);
+    }
 
     let unavailable_schema_errors = validation::validate_anonymous_resource_schemas(
         inputs.resources.resources(),
@@ -4375,13 +4412,12 @@ impl<'state> DeferredForExpansionPrelude<'state> {
                 .iter()
                 .map(|resolved_move| (resolved_move.from().clone(), resolved_move.to().clone()))
                 .collect::<Vec<_>>();
-            let state_view =
-                AnonymousReconciliationStateView::new(ctx, state_file, &projected_pairs);
-            moves.extend(detect_anonymous_to_named_moves_with_ctx(
+            moves.extend(detect_anonymous_to_named_moves_to_fixed_point(
                 ctx,
                 &self.sorted_resources,
                 providers,
-                &state_view,
+                state_file,
+                &projected_pairs,
                 claims,
             )?);
             moves
