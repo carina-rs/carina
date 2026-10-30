@@ -1658,12 +1658,13 @@ fn from_provider_state_aligns_reordered_nested_and_provider_added_list_elements(
     )
     .with_identifier("listener-id");
 
+    let accepted = AcceptedRequest::create_for_test();
     let row = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&resource),
         &provider_state,
         None,
         None,
-        RowBasis::Imported,
+        RowBasis::Applied(&accepted),
         None,
     )
     .unwrap();
@@ -1707,6 +1708,97 @@ fn from_provider_state_aligns_reordered_nested_and_provider_added_list_elements(
     };
     assert_explicit_struct_keys(&nested_rules[0], &["port"]);
     assert_explicit_struct_keys(&nested_rules[1], &["port", "description"]);
+}
+
+#[test]
+fn state_writeback_uses_explicit_basis_per_sent_top_level_attribute() {
+    let desired_rules = vec![list_rule(80, Some("authored"))];
+    let resource = Resource::with_provider("mock", "listener.Listener", "listener", None)
+        .with_attribute(
+            "description",
+            Value::Concrete(ConcreteValue::String("before".into())),
+        )
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(desired_rules.clone())),
+        );
+    let prior_provider = State::existing(
+        resource.id.clone(),
+        HashMap::from([
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String("before".into())),
+            ),
+            (
+                "rules".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![
+                    desired_rules[0].clone(),
+                    list_rule(443, Some("server-default")),
+                ])),
+            ),
+        ]),
+    )
+    .with_identifier("listener-id");
+    let prior = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&resource),
+        &prior_provider,
+        None,
+        None,
+        RowBasis::Applied(&AcceptedRequest::create_for_test()),
+        None,
+    )
+    .expect("create writeback records the server default");
+
+    let updated = Resource::with_provider("mock", "listener.Listener", "listener", None)
+        .with_attribute(
+            "description",
+            Value::Concrete(ConcreteValue::String("after".into())),
+        )
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(desired_rules.clone())),
+        );
+    let updated_provider = State::existing(
+        updated.id.clone(),
+        HashMap::from([
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String("after".into())),
+            ),
+            (
+                "rules".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![
+                    desired_rules[0].clone(),
+                    list_rule(443, Some("server-default")),
+                    list_rule(22, Some("out-of-band")),
+                ])),
+            ),
+        ]),
+    )
+    .with_identifier("listener-id");
+    let update = AcceptedRequest::update_for_test(&["description"], &[]);
+    let row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&updated),
+        &updated_provider,
+        Some(&prior),
+        None,
+        RowBasis::Applied(&update),
+        None,
+    )
+    .expect("update writeback");
+
+    let ExplicitFields::Struct { children } = &row.explicit else {
+        panic!("expected resource-root Struct");
+    };
+    let ExplicitFields::ListElements { elements } = &children["rules"] else {
+        panic!("expected aligned rules ListElements");
+    };
+    assert_eq!(elements[1], ExplicitFields::Unrecorded);
+    assert_eq!(
+        elements[2],
+        ExplicitFields::Leaf,
+        "the unmatched element belongs to an unsent list attribute"
+    );
 }
 
 #[test]
@@ -1882,6 +1974,44 @@ fn test_from_provider_state_carry_prior_without_prior_seeds_from_desired() {
             children: HashMap::from([("name".to_string(), ExplicitFields::Leaf)])
         }
     );
+}
+
+#[test]
+fn carried_without_existing_row_uses_read_basis_for_unmatched_list_elements() {
+    let resource = Resource::with_provider("mock", "listener.Listener", "listener", None)
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(vec![list_rule(80, Some("authored"))])),
+        );
+    let provider_state = State::existing(
+        resource.id.clone(),
+        HashMap::from([(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                list_rule(80, Some("authored")),
+                list_rule(22, Some("out-of-band")),
+            ])),
+        )]),
+    )
+    .with_identifier("listener-id");
+
+    let row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resolved(&resource),
+        &provider_state,
+        None,
+        None,
+        RowBasis::Carried,
+        None,
+    )
+    .expect("carried row without prior state");
+
+    let ExplicitFields::Struct { children } = &row.explicit else {
+        panic!("expected resource-root Struct");
+    };
+    let ExplicitFields::ListElements { elements } = &children["rules"] else {
+        panic!("expected aligned rules ListElements");
+    };
+    assert_eq!(elements[1], ExplicitFields::Leaf);
 }
 
 #[test]
@@ -7909,12 +8039,13 @@ fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_wri
         Diff::NoChange(_)
     ));
 
+    let accepted = AcceptedRequest::update_for_test(&["rules"], &[]);
     let rewritten = ResourceState::from_provider_state_for_resource_and_schema(
         &resolved(&desired),
         &current,
         Some(row),
         None,
-        RowBasis::Imported,
+        RowBasis::Applied(&accepted),
         None,
     )
     .unwrap();

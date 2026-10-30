@@ -634,6 +634,101 @@ impl std::error::Error for FlattenedWireCause {}
 
 pub type ProviderResult<T> = Result<T, ProviderError>;
 
+/// Top-level desired attributes proven to have been sent by one provider
+/// operation.
+///
+/// Construction is restricted to checked create requests, executed update
+/// patches, and validated create typestate. Consumers can test membership but
+/// cannot relabel an arbitrary string collection as send evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentAttributes {
+    attributes: BTreeSet<String>,
+    #[cfg(any(test, feature = "test-utils"))]
+    all_for_test: bool,
+}
+
+impl SentAttributes {
+    pub(crate) fn from_resource<S>(resource: &Resource<S>) -> Self {
+        Self::only(resource.attributes.keys().cloned().collect())
+    }
+
+    pub(crate) fn only(attributes: BTreeSet<String>) -> Self {
+        Self {
+            attributes,
+            #[cfg(any(test, feature = "test-utils"))]
+            all_for_test: false,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn all_for_test() -> Self {
+        Self {
+            attributes: BTreeSet::new(),
+            all_for_test: true,
+        }
+    }
+
+    fn from_update_patch(patch: &UpdatePatch) -> Self {
+        Self::only(
+            patch
+                .ops
+                .iter()
+                .filter_map(|op| op.sent_value().map(|_| op.key().to_string()))
+                .collect(),
+        )
+    }
+
+    fn from_create_sent<S>(sent: &Sent, resource: &Resource<S>) -> Self {
+        match sent {
+            Sent::AllRequestAttributes => Self::from_resource(resource),
+            Sent::Only(attributes) => Self::only(attributes.clone()),
+        }
+    }
+
+    /// Whether this operation sent `attribute` with a desired value.
+    pub fn contains(&self, attribute: &str) -> bool {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.all_for_test {
+            return true;
+        }
+        self.attributes.contains(attribute)
+    }
+}
+
+/// Desired values paired with the send evidence from the same provider
+/// operation.
+///
+/// Keeping these together prevents state writeback from combining checked
+/// [`SentAttributes`] with an unrelated authored resource whose values may
+/// still contain unresolved expressions.
+#[derive(Debug, Clone)]
+pub struct SentDesiredAttributes<'a> {
+    attributes: Vec<(&'a String, &'a Value)>,
+    sent: SentAttributes,
+}
+
+impl<'a> SentDesiredAttributes<'a> {
+    pub(crate) fn new(
+        attributes: impl IntoIterator<Item = (&'a String, &'a Value)>,
+        sent: SentAttributes,
+    ) -> Self {
+        Self {
+            attributes: attributes.into_iter().collect(),
+            sent,
+        }
+    }
+
+    /// Provider-ready desired values retained by the accepted operation.
+    pub fn values(&self) -> impl Iterator<Item = (&String, &Value)> {
+        self.attributes.iter().map(|(key, value)| (*key, *value))
+    }
+
+    /// Whether this operation sent `attribute` with a desired value.
+    pub fn contains(&self, attribute: &str) -> bool {
+        self.sent.contains(attribute)
+    }
+}
+
 /// Per-operation request record for [`Provider::create`].
 ///
 /// Mirrors `create-request` in `wit/types.wit`.
@@ -660,6 +755,10 @@ impl CreateRequest {
     /// Full desired state after provider-boundary checks.
     pub fn resource(&self) -> &ProviderReadyResource {
         &self.resource
+    }
+
+    pub(crate) fn sent_attributes(&self) -> SentAttributes {
+        SentAttributes::from_resource(self.resource.as_resource())
     }
 }
 
@@ -824,6 +923,12 @@ impl PatchOp {
             | Self::Reassert { value, .. } => Some(value),
             Self::Remove { .. } => None,
         }
+    }
+}
+
+impl UpdatePatch {
+    pub(crate) fn sent_attributes(&self) -> SentAttributes {
+        SentAttributes::from_update_patch(self)
     }
 }
 
@@ -1984,6 +2089,17 @@ impl FreshPendingCreate {
         &self.sent
     }
 
+    /// Desired values and send evidence retained by this fresh continuation.
+    pub fn sent_desired_attributes_for<'a, S>(
+        &self,
+        resource: &'a Resource<S>,
+    ) -> SentDesiredAttributes<'a> {
+        SentDesiredAttributes::new(
+            resource.attributes.iter(),
+            SentAttributes::from_create_sent(&self.sent, resource),
+        )
+    }
+
     pub fn poll_after_secs(&self) -> u32 {
         self.poll_after_secs
     }
@@ -2264,6 +2380,18 @@ pub enum SentRecord {
     Persisted(PendingEnvelope),
 }
 
+impl SentRecord {
+    /// Recover attribute send evidence while it is still retained in request
+    /// form. Persisted continuations intentionally omit ordinary observable
+    /// attribute names, so they cannot claim a sent desired basis.
+    fn sent_attributes_for<S>(&self, resource: &Resource<S>) -> Option<SentAttributes> {
+        match self {
+            Self::Request(sent) => Some(SentAttributes::from_create_sent(sent, resource)),
+            Self::Persisted(_envelope) => None,
+        }
+    }
+}
+
 /// What carina-core knows about a create for which the provider reported an
 /// identifier.
 #[derive(Debug)]
@@ -2362,6 +2490,19 @@ impl ObservedCreate {
 
     pub fn sent(&self) -> &SentRecord {
         &self.sent
+    }
+
+    /// Resolved desired values and send evidence retained by the accepted
+    /// create observation.
+    pub fn sent_desired_attributes_for<'a, S>(
+        &'a self,
+        fallback_resource: &'a Resource<S>,
+    ) -> Option<SentDesiredAttributes<'a>> {
+        let sent = self.sent.sent_attributes_for(fallback_resource)?;
+        Some(match self.resolved_desired_attributes.as_ref() {
+            Some(attributes) => SentDesiredAttributes::new(attributes.values().iter(), sent),
+            None => SentDesiredAttributes::new(fallback_resource.attributes.iter(), sent),
+        })
     }
 
     pub(crate) fn with_resolved_desired_attributes(

@@ -4,6 +4,6 @@ expression: output
 ---
 Execution Plan:
 
-  -> awscc.ec2.Vpc _b[0] (moved from: old_vpc)
+  -> awscc.ec2.Vpc awscc_ec2_vpc_0bc2a2bb (moved from: old_vpc)  (for [0] at main.crn:6)
 
 Plan: 0 to add, 0 to change, 0 to destroy, 1 to move.

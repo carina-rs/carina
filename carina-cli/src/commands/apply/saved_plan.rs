@@ -1233,6 +1233,7 @@ mod tests {
         contents.plan.add(Effect::Move {
             from: ResolvedResourceId::new(from.clone()),
             to: ResolvedResourceId::new(to.clone()),
+            origin: None,
         });
         contents.current_states.push(CurrentStateEntry::Managed {
             id: to,

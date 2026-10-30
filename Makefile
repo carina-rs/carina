@@ -32,6 +32,26 @@ plan-anonymous-old-identity-name-override:
 	$(PLAN_FIXTURE) anonymous_old_identity_name_override
 plan-anonymous-old-identity-update:
 	$(PLAN_FIXTURE) anonymous_old_identity_update
+plan-anonymous-loop-insert-before:
+	$(PLAN_FIXTURE) anonymous_loop_insert_before
+plan-anonymous-loop-reorder:
+	$(PLAN_FIXTURE) anonymous_loop_reorder
+plan-anonymous-loop-delete-earlier:
+	$(PLAN_FIXTURE) anonymous_loop_delete_earlier
+plan-anonymous-loop-sibling-files:
+	$(PLAN_FIXTURE) anonymous_loop_sibling_files
+plan-anonymous-loop-same-tail:
+	$(PLAN_FIXTURE) anonymous_loop_same_tail
+plan-anonymous-if-legacy:
+	$(PLAN_FIXTURE) anonymous_if_legacy
+plan-anonymous-loop-deferred-map:
+	$(PLAN_FIXTURE) anonymous_loop_deferred_map
+plan-anonymous-loop-module-call:
+	$(PLAN_FIXTURE) anonymous_loop_module_call
+plan-anonymous-loop-claimed-legacy:
+	$(PLAN_FIXTURE) anonymous_loop_claimed_legacy
+plan-anonymous-loop-new-id-exists:
+	$(PLAN_FIXTURE) anonymous_loop_new_id_exists
 plan-replace-with-non-forcing-diffs:
 	$(PLAN_FIXTURE) replace_with_non_forcing_diffs
 plan-delete:
@@ -400,6 +420,8 @@ plan-provider-prefix:
 	$(PLAN_FIXTURE) provider_prefix
 plan-module-anonymous-resource:
 	$(PLAN_FIXTURE) module_anonymous_resource
+plan-server-added-list-elements-changed:
+	$(PLAN_FIXTURE) server_added_list_elements_changed
 plan-server-default-struct-leaf:
 	$(PLAN_FIXTURE) server_default_struct_leaf
 plan-multi-instance-create:
@@ -409,6 +431,11 @@ plan-multi-instance-module:
 .PHONY: plan-image plan-all-create plan-no-changes plan-empty-explicit-children-no-changes plan-no-changes-enum plan-dynamic-enum-az-no-diff plan-route53-hosted-zone-name-strip-suffix-no-diff plan-mixed plan-image-module-cascade plan-image-reference-layout plan-image-anonymous plan-delete plan-deposed-delete plan-deposed-delete-update-dependency plan-delete-list-of-maps plan-compact plan-import-deferred-interpolation \
         plan-map-diff plan-replace-create-only plan-anonymous-create-only-rekey \
         plan-anonymous-old-identity-name-override plan-anonymous-old-identity-update \
+        plan-anonymous-loop-insert-before plan-anonymous-loop-reorder \
+        plan-anonymous-loop-delete-earlier plan-anonymous-loop-sibling-files \
+        plan-anonymous-loop-same-tail plan-anonymous-if-legacy \
+        plan-anonymous-loop-deferred-map plan-anonymous-loop-module-call \
+        plan-anonymous-loop-claimed-legacy plan-anonymous-loop-new-id-exists \
         plan-replace-with-non-forcing-diffs \
         plan-list-diff-added-struct plan-list-diff-removed-struct \
         plan-list-diff-modified-with-unchanged \
@@ -438,7 +465,7 @@ plan-multi-instance-module:
         plan-list-struct-child-gutter plan-list-diff-added-struct-child-gutter \
         plan-destroy-list-struct-child-gutter \
         plan-pretty-long-string-list plan-pretty-short-string-list plan-provider-prefix \
-        plan-module-anonymous-resource plan-server-default-struct-leaf \
+        plan-module-anonymous-resource plan-server-added-list-elements-changed plan-server-default-struct-leaf \
         plan-multi-instance-create plan-multi-instance-module \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui \
         plan-moved-with-changes-tui plan-moved-pure-tui plan-fixtures

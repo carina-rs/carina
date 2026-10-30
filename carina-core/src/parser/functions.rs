@@ -19,6 +19,7 @@ pub(super) fn parse_fn_def(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     warnings: &mut Vec<ParseWarning>,
+    preprocessed_file: &super::PreprocessedFile,
 ) -> Result<UserFunction, ParseError> {
     let mut inner = pair.into_inner();
     let name = next_pair(&mut inner, "function name", "fn_def")?
@@ -42,7 +43,12 @@ pub(super) fn parse_fn_def(
                 for remaining in param_inner {
                     match remaining.as_rule() {
                         Rule::type_expr => {
-                            param_type = Some(parse_type_expr(remaining, ctx.config, warnings)?);
+                            param_type = Some(parse_type_expr(
+                                remaining,
+                                ctx.config,
+                                warnings,
+                                Some(preprocessed_file),
+                            )?);
                         }
                         _ => {
                             // This is the default expression
@@ -76,7 +82,7 @@ pub(super) fn parse_fn_def(
 
     // Parse optional return type annotation (: type_expr)
     let (return_type, body_pair) = if next_token.as_rule() == Rule::type_expr {
-        let rt = parse_type_expr(next_token, ctx.config, warnings)?;
+        let rt = parse_type_expr(next_token, ctx.config, warnings, Some(preprocessed_file))?;
         let bp = next_pair(&mut inner, "fn_body", "fn_def")?;
         (Some(rt), bp)
     } else {

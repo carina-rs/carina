@@ -1,0 +1,10 @@
+moved {
+  from = mock.test.resource 'old'
+  to = mock.test.resource '_for0[0]'
+}
+
+for name in ['one'] {
+  mock.test.resource {
+    name = name
+  }
+}

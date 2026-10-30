@@ -1,6 +1,7 @@
 use super::*;
 use carina_core::binding_index::LivePreApplyInputs;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
+use carina_core::effect::{Effect, UnresolvedSavedEffect};
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
     PatchOp, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
@@ -357,6 +358,167 @@ fn record_with_builtin_mock_schemas(contents: PlanFileContents) -> PlanFile {
         contents,
         &mock_schema_registry(carina_provider_mock::builtin_schemas()),
     )
+}
+
+#[test]
+fn plan_format_29_round_trip_preserves_loop_provenance_and_deferred_targets() {
+    let parsed = carina_core::parser::parse_file(
+        r#"
+let orgs = upstream_state { source = "../orgs" }
+
+for name in ["one"] {
+    mock.test.resource { name = name }
+}
+
+let bound_items = for account_id in orgs.accounts {
+    mock.test.resource { name = account_id }
+}
+
+for account_id in orgs.accounts {
+    mock.test.resource { name = account_id }
+}
+"#,
+        Path::new("main.crn"),
+        &ProviderContext::default(),
+    )
+    .expect("parse saved-plan loop provenance fixture");
+
+    let mut resource = parsed
+        .resources
+        .into_iter()
+        .next()
+        .expect("concrete anonymous-loop resource");
+    resource.id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "mock_test_resource_96081a11",
+        None,
+    );
+    let origin = resource
+        .loop_provenance
+        .display_origin()
+        .expect("concrete loop provenance")
+        .clone();
+
+    let mut deferred = parsed.deferred_for_expressions.into_iter();
+    let bound = deferred.next().expect("bound deferred loop");
+    let unbound = deferred.next().expect("unbound deferred loop");
+    assert!(matches!(
+        &bound.target,
+        carina_core::parser::DeferredForTarget::Bound { binding }
+            if binding == "bound_items"
+    ));
+    assert!(matches!(
+        &unbound.target,
+        carina_core::parser::DeferredForTarget::Unbound { .. }
+    ));
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resolved(resource.clone())));
+    plan.add(Effect::Move {
+        from: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "legacy",
+            None,
+        )),
+        to: carina_core::resource::ResolvedResourceId::new(resource.id.clone()),
+        origin: Some(origin.clone()),
+    });
+    plan.add(Effect::DeferredCreate {
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "bound_pending",
+            None,
+        )),
+        template: Box::new(bound),
+    });
+    plan.add(Effect::DeferredCreate {
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "unbound_pending",
+            None,
+        )),
+        template: Box::new(unbound),
+    });
+
+    let plan_file = record_with_builtin_mock_schemas(PlanFileContents {
+        version: 29,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-30T00:00:00Z".to_string(),
+        source_path: "infra".to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: saved_provider_configs(vec![ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        }]),
+        backend_config: None,
+        plan,
+        sorted_resources: vec![resource.clone()],
+        unresolved_resources: vec![resource],
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
+        current_states: Vec::new(),
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    });
+
+    let encoded = serde_json::to_value(&plan_file).expect("serialize format-29 plan");
+    assert_eq!(encoded["version"], serde_json::json!(29));
+    let decoded: PlanFile =
+        serde_json::from_value(encoded).expect("deserialize format-29 saved plan");
+    let decoded = decoded.into_contents();
+
+    assert_eq!(decoded.version, 29);
+    assert_eq!(
+        decoded.sorted_resources[0]
+            .loop_provenance
+            .display_origin()
+            .expect("resource origin after round-trip")
+            .display_suffix(),
+        origin.display_suffix(),
+    );
+    let move_origin = decoded
+        .plan
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            UnresolvedSavedEffect::Move { origin, .. } => origin.as_ref(),
+            _ => None,
+        })
+        .expect("Move origin after round-trip");
+    assert_eq!(move_origin.display_suffix(), origin.display_suffix());
+
+    let targets = decoded
+        .plan
+        .effects()
+        .iter()
+        .filter_map(|effect| match effect {
+            UnresolvedSavedEffect::DeferredCreate { template, .. } => Some(&template.target),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(targets.iter().any(|target| matches!(
+        target,
+        carina_core::parser::DeferredForTarget::Bound { binding }
+            if binding == "bound_items"
+    )));
+    assert!(targets.iter().any(|target| matches!(
+        target,
+        carina_core::parser::DeferredForTarget::Unbound { .. }
+    )));
 }
 
 async fn run_saved_plan_schema_fingerprint_case(
@@ -743,6 +905,7 @@ fn saved_plan_import_rehydration_respects_current_provider_instance() {
     )];
     parsed.state_blocks = vec![carina_core::parser::StateBlock::Import {
         to: carina_core::parser::StateBlockAddress::new("mock", "test.resource", "example"),
+        to_span: None,
         id: string_value("provider-id"),
     }];
 
@@ -1620,9 +1783,9 @@ inner { x = a }
     .expect_err("apply bootstrap reload must retain the reference-type gate");
     let message = crate::error::format_error_with_source_chain(&error);
     assert!(
-        message.contains("Type mismatch: expected Int, got String (from a)")
-            && message.contains("outer/main.crn")
-            && message.contains("line 3"),
+        message.contains("Reference type validation failed")
+            && message.contains("module call 'inner'")
+            && message.contains("expected Int, got String (from a)"),
         "{message}"
     );
 }
@@ -1703,7 +1866,7 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
             unresolved,
         )
         .expect_err("apply bootstrap reload must reject module-output type mismatch");
-        let message = error.to_string();
+        let message = crate::error::format_error_with_source_chain(&error);
         assert!(message.contains("module call 'y'"), "{message}");
         assert!(message.contains("expected Int"), "{message}");
         assert!(message.contains("got String"), "{message}");
@@ -7204,6 +7367,7 @@ fn move_plus_update_keeps_post_update_attributes() {
     plan.add(Effect::Move {
         from: carina_core::resource::ResolvedResourceId::new(from_id),
         to: carina_core::resource::ResolvedResourceId::new(new_id.clone()),
+        origin: None,
     });
 
     let saved = build_state_after_apply(
@@ -7294,6 +7458,7 @@ fn move_alone_carries_attributes_via_managed_current() {
     plan.add(Effect::Move {
         from: carina_core::resource::ResolvedResourceId::new(from_id),
         to: carina_core::resource::ResolvedResourceId::new(new_id.clone()),
+        origin: None,
     });
 
     let saved = build_state_after_apply(
@@ -7352,6 +7517,7 @@ fn move_with_absent_from_is_no_op() {
     plan.add(Effect::Move {
         from: carina_core::resource::ResolvedResourceId::new(from_id.clone()),
         to: carina_core::resource::ResolvedResourceId::new(to_id.clone()),
+        origin: None,
     });
 
     let saved = build_state_after_apply(
@@ -7479,6 +7645,7 @@ fn move_from_overlapping_desired_resource_errors() {
     plan.add(Effect::Move {
         from: carina_core::resource::ResolvedResourceId::new(id.clone()),
         to: carina_core::resource::ResolvedResourceId::new(to_id),
+        origin: None,
     });
 
     let result = build_state_after_apply(
@@ -7604,6 +7771,7 @@ fn self_move_overlapping_desired_resource_errors() {
     plan.add(Effect::Move {
         from: carina_core::resource::ResolvedResourceId::new(id.clone()),
         to: carina_core::resource::ResolvedResourceId::new(id.clone()),
+        origin: None,
     });
 
     let result = build_state_after_apply(
@@ -8560,30 +8728,45 @@ mod apply_deferred_for_parity {
     /// `DeferredForExpansion`, not a silent parity bug
     /// (MEMORY "unit-test path ≠ apply path"). Parity twin of
     /// `wiring::tests::...::moved_target_child_is_excluded_from_refreshable_set`.
-    #[test]
-    fn apply_moved_target_child_excluded_from_refreshable_set() {
+    fn assert_apply_moved_target_child_excluded_from_refreshable_set(loop_target: &str) {
         let src = r#"
             let cert = aws.acm.Certificate {
                 domain_name       = "r.example.com"
                 validation_method = "DNS"
             }
 
-            for (_, opt) in cert.domain_validation_options {
+            LOOP_TARGETfor (_, opt) in cert.domain_validation_options {
                 aws.route53.RecordSet {
                     name             = opt.resource_record.name
                     type             = "CNAME"
                     resource_records = [opt.resource_record.value]
                 }
             }
-        "#;
+        "#
+        .replacen("LOOP_TARGET", loop_target, 1);
         let parsed = parse_file(
-            src,
+            &src,
             std::path::Path::new("apply_deferred_for.crn"),
             &ProviderContext::default(),
         )
         .expect("parse");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = dvo_state(&parsed);
+        let mut schemas = carina_core::schema::SchemaRegistry::new();
+        schemas.insert(
+            "aws",
+            carina_core::schema::ResourceSchema::new("route53.RecordSet")
+                .attribute(
+                    carina_core::schema::AttributeSchema::optional(
+                        "name",
+                        carina_core::schema::AttributeType::string(),
+                    )
+                    .create_only()
+                    .build(),
+                )
+                .validate()
+                .expect("record-set schema fixture must be valid"),
+        );
 
         // No moved targets: the expanded child is refreshable.
         let baseline = crate::wiring::expand_same_config_deferred_for(
@@ -8591,9 +8774,8 @@ mod apply_deferred_for_parity {
             &sorted,
             &crate::managed_current_from_states(states.clone()),
             &DataSourceValues::empty(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &carina_core::provider::RawSavedAttrs::default()
-                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &schemas,
+            &carina_core::provider::RawSavedAttrs::default().lift(&schemas),
             &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -8612,6 +8794,17 @@ mod apply_deferred_for_parity {
             baseline.refreshable_child_ids.contains(&child_id),
             "apply: a non-moved expanded child must still be refreshed"
         );
+        let child = baseline
+            .sorted_resources
+            .iter()
+            .find(|resource| resource.id == child_id)
+            .expect("expanded child remains in the sorted resources");
+        if loop_target.is_empty() {
+            assert!(child.binding.is_none());
+            assert!(child.loop_provenance.display_origin().is_some());
+        } else {
+            assert_eq!(child.binding.as_deref(), Some("records[0]"));
+        }
 
         // Declare it a `moved` `to`: it must drop out of the refreshable
         // set so `run_apply_locked` does not clobber the migrated state.
@@ -8622,9 +8815,8 @@ mod apply_deferred_for_parity {
             &sorted,
             &crate::managed_current_from_states(states),
             &DataSourceValues::empty(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &carina_core::provider::RawSavedAttrs::default()
-                .lift(&carina_core::schema::SchemaRegistry::new()),
+            &schemas,
+            &carina_core::provider::RawSavedAttrs::default().lift(&schemas),
             &HashMap::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
@@ -8643,16 +8835,29 @@ mod apply_deferred_for_parity {
              refreshable_child_ids (carina#3141 parity with plan path)"
         );
     }
+
+    #[test]
+    fn apply_moved_target_child_excluded_from_refreshable_set() {
+        assert_apply_moved_target_child_excluded_from_refreshable_set("let records = ");
+    }
+
+    #[test]
+    fn apply_unbound_moved_target_child_excluded_from_refreshable_set() {
+        assert_apply_moved_target_child_excluded_from_refreshable_set("");
+    }
 }
 
 #[cfg(test)]
 mod saved_plan_version_tests {
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 26 persists exact
-    //! provider artifact identities (carina#4045); version 25 persists total
-    //! data-source outcomes (carina#3993); version 24 removed the wait target
-    //! schema kind (carina#3916), and version 23 added the mandatory provider
-    //! schema fingerprint snapshot (carina#3983).
+    //! `carina plan` is the supported migration. Version 31 persists authored
+    //! ignore paths; version 30 was reserved for provider protocol v13 and was
+    //! never emitted. Version 29 persists anonymous loop provenance, typed
+    //! deferred targets, and Move origins (carina#4109).
+    //! Version 26 persists exact provider artifact identities (carina#4045);
+    //! version 25 persists total data-source outcomes (carina#3993); version 24
+    //! removed the wait target schema kind (carina#3916), and version 23 added
+    //! the mandatory provider schema fingerprint snapshot (carina#3983).
 
     use std::path::Path;
 
@@ -8661,6 +8866,51 @@ mod saved_plan_version_tests {
     use super::{
         ApplyTarget, PlanFileHeader, saved_plan_replan_project_dir, saved_provider_configs,
     };
+
+    #[tokio::test]
+    async fn format_28_saved_plan_is_rejected_before_deferred_payload_decode() {
+        let user_dirs = carina_core::TestUserDirs::new();
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("format-28.plan.json");
+        let old_plan = serde_json::json!({
+            "version": 28,
+            "timestamp": "2026-10-29T00:00:00Z",
+            "source_path": "infra",
+            "plan": {
+                "effects": [{
+                    "DeferredCreate": {
+                        "template": {
+                            "binding_name": "legacy-format-28-payload"
+                        }
+                    }
+                }]
+            }
+        });
+        std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap())
+            .expect("write format-28 plan");
+
+        let error = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(1).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .expect_err("format 28 must be rejected before its old deferred payload is decoded");
+
+        let crate::error::AppError::UnsupportedPlanVersion {
+            found, expected, ..
+        } = error
+        else {
+            panic!("expected typed unsupported plan version error")
+        };
+        assert_eq!(found, 28);
+        assert_eq!(expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
+    }
 
     #[tokio::test]
     async fn version_25_plan_is_rejected_after_provider_artifacts_become_mandatory() {

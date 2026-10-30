@@ -21,7 +21,7 @@ use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, RawEnumIdentifier, Resource,
     ResourceId, ResourceIdentity, UnknownReason, Value,
 };
-use crate::schema::TypeIdentity;
+use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
 
 fn resolve_modules(parsed: &mut ParsedFile, base_dir: &std::path::Path) -> Result<(), ModuleError> {
     super::resolve_modules(parsed, base_dir)
@@ -56,6 +56,304 @@ fn module_arguments(
         .into_iter()
         .map(|(name, value)| (name, ModuleArgument::new(value)))
         .collect()
+}
+
+fn resolve_anonymous_loop_module_fixture(module_body: &str, root_body: &str) -> ParsedFile {
+    let root = tempfile::tempdir().expect("temporary module fixture");
+    let module_dir = root.path().join("modules/network");
+    fs::create_dir_all(&module_dir).expect("create module directory");
+    fs::write(module_dir.join("main.crn"), module_body).expect("write module body");
+    let root_file = root.path().join("main.crn");
+    fs::write(&root_file, root_body).expect("write root body");
+
+    let mut parsed = crate::parser::parse_file(root_body, &root_file, &ProviderContext::default())
+        .expect("root fixture parses");
+    resolve_modules(&mut parsed, root.path()).expect("module fixture expands");
+    parsed
+}
+
+fn loop_module_identity_registry() -> crate::schema::SchemaRegistry {
+    let mut registry = crate::schema::SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.Leaf")
+            .attribute(
+                AttributeSchema::optional("identity_input", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .expect("loop module schema is valid"),
+    );
+    registry
+}
+
+#[test]
+fn identical_loop_generated_module_calls_emit_one_complete_loop_rewrite() {
+    let module =
+        "arguments { label: String }\nlet leaf = mock.test.Leaf { identity_input = label }\n";
+    let root = "let network = use { source = './modules/network' }\n\
+                for label in ['same', 'same', 'other'] {\n  network { label = label }\n}\n";
+    let mut parsed = resolve_anonymous_loop_module_fixture(module, root);
+
+    let error = crate::identifier::compute_anonymous_identifiers_for_test(
+        &mut parsed.resources,
+        &[],
+        &crate::schema::SchemaRegistry::new(),
+        &|_| Vec::new(),
+    )
+    .expect_err("identical anonymous module prefixes must not silently share rows");
+    let rendered = error.to_string();
+
+    assert_eq!(
+        rendered.matches("Anonymous resources produced by").count(),
+        1,
+        "one authored loop must produce one error: {rendered}",
+    );
+    assert!(
+        rendered.contains("let network_2 = for label in ['same', 'same', 'other']"),
+        "the module use binding must remain available inside the rewritten loop: {rendered}",
+    );
+    for index in 0..3 {
+        assert!(
+            rendered.contains(&format!("from = mock.test.Leaf '_for0[{index}].leaf'")),
+            "missing legacy inner-row move for element {index}: {rendered}",
+        );
+        assert!(
+            rendered.contains(&format!("to = mock.test.Leaf 'network_2[{index}].leaf'")),
+            "missing bound inner-row move for element {index}: {rendered}",
+        );
+    }
+}
+
+#[test]
+fn loop_generated_module_calls_do_not_hide_module_internal_collisions() {
+    let module = "arguments { label: String }\n\
+                  mock.test.Leaf { identity_input = 'inner' }\n\
+                  mock.test.Leaf { identity_input = 'inner' }\n";
+    let root = "let network = use { source = './modules/network' }\n\
+                for label in ['same', 'same'] { network { label = label } }\n";
+    let mut parsed = resolve_anonymous_loop_module_fixture(module, root);
+
+    let error = crate::identifier::compute_anonymous_identifiers_for_test(
+        &mut parsed.resources,
+        &[],
+        &loop_module_identity_registry(),
+        &|_| Vec::new(),
+    )
+    .expect_err("binding the outer loop cannot repair a collision inside the module");
+    let rendered = error.to_string();
+
+    assert_eq!(
+        rendered.matches("Anonymous resources produced by").count(),
+        1,
+        "the outer loop still needs one complete rewrite: {rendered}",
+    );
+    assert!(
+        rendered.contains("Anonymous resource identifier collision"),
+        "the independent module-internal collision was hidden: {rendered}",
+    );
+}
+
+#[test]
+fn identical_module_prefixes_from_distinct_loop_sources_are_typed_errors() {
+    let module =
+        "arguments { label: String }\nlet leaf = mock.test.Leaf { identity_input = label }\n";
+    let root = "let network = use { source = './modules/network' }\n\
+                for label in ['same'] { network { label = label } }\n\
+                for label in ['same'] { network { label = label } }\n";
+    let mut parsed = resolve_anonymous_loop_module_fixture(module, root);
+
+    let error = crate::identifier::compute_anonymous_identifiers_for_test(
+        &mut parsed.resources,
+        &[],
+        &crate::schema::SchemaRegistry::new(),
+        &|_| Vec::new(),
+    )
+    .expect_err("distinct loop sources cannot share an anonymous module prefix");
+
+    assert!(
+        matches!(
+            error,
+            crate::identifier::AnonymousIdentityError::Collision(_)
+        ),
+        "cross-source sharing must use a typed plain collision: {error:?}",
+    );
+}
+
+#[test]
+fn identical_plain_anonymous_module_calls_are_typed_errors() {
+    let module =
+        "arguments { label: String }\nlet leaf = mock.test.Leaf { identity_input = label }\n";
+    let root = "let network = use { source = './modules/network' }\n\
+                network { label = 'same' }\n\
+                network { label = 'same' }\n";
+    let mut parsed = resolve_anonymous_loop_module_fixture(module, root);
+
+    let error = crate::identifier::compute_anonymous_identifiers_for_test(
+        &mut parsed.resources,
+        &[],
+        &crate::schema::SchemaRegistry::new(),
+        &|_| Vec::new(),
+    )
+    .expect_err("plain anonymous calls cannot silently share an instance prefix");
+
+    assert!(
+        matches!(
+            error,
+            crate::identifier::AnonymousIdentityError::Collision(_)
+        ),
+        "plain-call sharing must use a typed collision: {error:?}",
+    );
+}
+
+#[test]
+fn loop_inside_module_is_reported_once_across_instances_with_local_name_scope() {
+    let module = "arguments { label: String }\n\
+                  for value in ['same', 'same'] {\n  mock.test.Leaf { identity_input = value }\n}\n";
+    let root = "let leaf = mock.test.Root { value = 'reserved only at root' }\n\
+                let network = use { source = './modules/network' }\n\
+                let first = network { label = 'first' }\n\
+                let second = network { label = 'second' }\n";
+    let mut parsed = resolve_anonymous_loop_module_fixture(module, root);
+
+    let error = crate::identifier::compute_anonymous_identifiers_for_test(
+        &mut parsed.resources,
+        &[],
+        &loop_module_identity_registry(),
+        &|_| Vec::new(),
+    )
+    .expect_err("each expanded instance contains the same unsafe authored loop");
+    let rendered = error.to_string();
+
+    assert_eq!(
+        rendered.matches("Anonymous resources produced by").count(),
+        1,
+        "the authored module loop must be reported once: {rendered}",
+    );
+    assert!(
+        rendered.contains("let leaf = for value in ['same', 'same']"),
+        "a root binding must not reserve a module-local suggestion: {rendered}",
+    );
+    assert!(!rendered.contains("let leaf_2 = for"));
+    for instance in ["first", "second"] {
+        for index in 0..2 {
+            assert!(
+                rendered.contains(&format!(
+                    "from = mock.test.Leaf '{instance}._for0[{index}]'"
+                )),
+                "missing legacy move for {instance}[{index}]: {rendered}",
+            );
+            assert!(
+                rendered.contains(&format!("to = mock.test.Leaf '{instance}.leaf[{index}]'")),
+                "missing current-prefix move for {instance}[{index}]: {rendered}",
+            );
+        }
+    }
+}
+
+#[test]
+fn nested_unbound_module_loop_migrates_composed_legacy_address() {
+    let root = tempfile::tempdir().expect("temporary configuration root");
+    let module_dir = root.path().join("modules/network");
+    fs::create_dir_all(&module_dir).expect("create module directory");
+    fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  label: String\n}\n\n\
+         for inner in ['inner'] {\n  mock.test.resource { name = inner }\n}\n",
+    )
+    .expect("write module fixture");
+    let root_source = "let network = use { source = './modules/network' }\n\n\
+                       for outer in ['outer'] {\n  network { label = outer }\n}\n";
+    let root_file = root.path().join("main.crn");
+    fs::write(&root_file, root_source).expect("write root fixture");
+
+    let mut parsed =
+        crate::parser::parse_file(root_source, &root_file, &ProviderContext::default())
+            .expect("root fixture parses");
+    resolve_modules(&mut parsed, root.path()).expect("nested loop module expands");
+    assert_eq!(
+        parsed.resources.len(), // allow: direct — fixture test inspection
+        1,
+        "fixture emits one inner resource"
+    );
+    assert_eq!(
+        parsed.resources[0]
+            .loop_provenance
+            .display_origin()
+            .expect("inner loop origin")
+            .file(),
+        "modules/network/main.crn",
+        "loop origin labels must be relative to the configuration root",
+    );
+
+    let mut registry = crate::schema::SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .expect("resource schema is valid"),
+    );
+    crate::identifier::compute_anonymous_identifiers_for_test(
+        &mut parsed.resources,
+        &[],
+        &registry,
+        &|_| Vec::new(),
+    )
+    .expect("compute anonymous identity");
+
+    let identity = parsed.resources[0]
+        .id
+        .identity()
+        .expect("computed resource identity");
+    let candidates = parsed.resources[0]
+        .loop_provenance
+        .legacy_candidates(identity)
+        .into_iter()
+        .map(|candidate| candidate.exact_state_name().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate == "_for0[0]._for0[0]"),
+        "nested loop expansion must retain the recursively composed legacy address: {candidates:?}",
+    );
+
+    let claims = crate::identifier::StateBlockClaims::empty();
+    let state_entry = crate::identifier::AnonymousIdStateInfo {
+        name: "_for0[0]._for0[0]".to_string(),
+        provider_instance: None,
+        create_only_values: HashMap::from([("name".to_string(), "inner".to_string())]),
+    };
+    let moves = crate::identifier::detect_legacy_loop_address_moves(
+        &parsed.resources,
+        &registry,
+        &|provider, resource_type| {
+            claims.screen_entries(provider, resource_type, [state_entry.clone()], |entry| {
+                entry.name.as_str()
+            })
+        },
+        &claims,
+        &[],
+    );
+    assert_eq!(
+        moves.len(),
+        1,
+        "the nested legacy row must migrate exactly once"
+    );
+    assert_eq!(moves[0].from().identity_str(), "_for0[0]._for0[0]");
+    assert_eq!(
+        moves[0].to().identity_str(),
+        parsed.resources[0]
+            .id
+            .identity_str()
+            .expect("resolved destination"),
+    );
 }
 
 #[test]
@@ -121,6 +419,7 @@ fn create_test_module() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -265,6 +564,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -456,6 +756,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -567,9 +868,11 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
                 instance: current_prefix.clone(),
                 module_source: None,
                 module_directory: None,
+                loop_origin: None,
             }),
         )),
         default_tag_keys: Default::default(),
+        loop_provenance: Default::default(),
         quoted_string_attrs: std::collections::HashSet::new(),
     }];
 
@@ -616,6 +919,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 default_tag_keys: Default::default(),
+                loop_provenance: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
             },
             Resource {
@@ -635,6 +939,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 default_tag_keys: Default::default(),
+                loop_provenance: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
             },
         ],
@@ -778,6 +1083,7 @@ fn create_module_with_attributes() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -2152,6 +2458,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         });
         m.wait_bindings.push(WaitBinding {
@@ -2449,6 +2756,7 @@ fn create_module_with_interpolation() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         }],
         variables: IndexMap::new(),
@@ -3212,6 +3520,7 @@ let root = outer { outer_port = producer.port }
         instance: "inner".to_string(),
         module_source: None,
         module_directory: None,
+        loop_origin: None,
         id: inner_id.clone(),
     };
     let inner = LiveComposition {
@@ -5949,7 +6258,7 @@ m { foo = 'x' }
 /// the PR-A → PR-B boundary.
 #[test]
 fn test_expand_module_call_propagates_deferred_for_expressions() {
-    use crate::parser::{DeferredForExpression, ForBinding};
+    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
 
     let module = {
         let mut m = create_module_with_intra_refs();
@@ -5968,6 +6277,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
+            loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         });
         m.deferred_for_expressions.push(DeferredForExpression {
@@ -5976,7 +6286,9 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             header: "for _, opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.RecordSet".to_string(),
             attributes: vec![],
-            binding_name: "_domain_validation_options".to_string(),
+            target: DeferredForTarget::Bound {
+                binding: "_domain_validation_options".to_string(),
+            },
             iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
             binding: ForBinding::Map("_".to_string(), "opt".to_string()),
             template_resource: Resource {
@@ -6004,6 +6316,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 default_tag_keys: Default::default(),
+                loop_provenance: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
             },
         });
@@ -6049,7 +6362,8 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     // `binding_name` is the generated-resource address prefix →
     // prefixed unconditionally (mirrors `Resource.binding`).
     assert_eq!(
-        d.binding_name, "r._domain_validation_options",
+        d.target.bound_binding(),
+        Some("r._domain_validation_options"),
         "PR-B must instance-prefix binding_name"
     );
     // `cert` is a module-internal `let cert` binding → prefixed
@@ -6095,7 +6409,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
 
 #[test]
 fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
-    use crate::parser::{DeferredForExpression, ForBinding};
+    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
 
     let mut module = create_test_module_with_anonymous_resource();
     module.resources.clear();
@@ -6105,7 +6419,9 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
         header: "for _, account in accounts.items".to_string(),
         resource_type: "awscc.sso.Assignment".to_string(),
         attributes: Vec::new(),
-        binding_name: "assignments".to_string(),
+        target: DeferredForTarget::Bound {
+            binding: "assignments".to_string(),
+        },
         iterable: Value::resource_ref("accounts", "items", Vec::new()),
         binding: ForBinding::Map("_".to_string(), "account".to_string()),
         template_resource: Resource::pending_with_provider("awscc", "sso.Assignment", None),
@@ -6153,7 +6469,7 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
 /// CI while silently breaking caller-passed iterables.
 #[test]
 fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
-    use crate::parser::{DeferredForExpression, ForBinding};
+    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
 
     let module = {
         let mut m = create_module_with_intra_refs();
@@ -6166,7 +6482,9 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
             header: "for _, a in accounts.list".to_string(),
             resource_type: "awscc.sso.Assignment".to_string(),
             attributes: vec![],
-            binding_name: "_list".to_string(),
+            target: DeferredForTarget::Bound {
+                binding: "_list".to_string(),
+            },
             iterable: Value::resource_ref("accounts", "list", Vec::new()),
             binding: ForBinding::Map("_".to_string(), "a".to_string()),
             template_resource: Resource {
@@ -6179,6 +6497,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 default_tag_keys: Default::default(),
+                loop_provenance: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
             },
         });
@@ -6203,7 +6522,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
     let expanded = resolver.expand_module_call(&call, "prod").unwrap();
     let d = &expanded.deferred_for_expressions[0];
     // `binding_name` is a synthesized address prefix → always prefixed.
-    assert_eq!(d.binding_name, "prod._list");
+    assert_eq!(d.target.bound_binding(), Some("prod._list"));
     // `accounts` is NOT module-internal → must stay UNPREFIXED
     // (caller-collision guard). A regression to unconditional
     // prefixing would make this `prod.accounts` and fail here.
@@ -6299,10 +6618,17 @@ let r = registry {
             .contains("r.cert.domain_validation_options")
     );
     // carina#3126 PR-B: through the full resolve_modules pipeline the
-    // deferred-for's binding-name fields are instance-prefixed (call
-    // binding is `r`), so the loop resolves against the prefixed
-    // module `cert` and its generated resources are instance-scoped.
-    assert_eq!(d.binding_name, "r._domain_validation_options");
+    // deferred-for's iterable resolves against the prefixed module `cert`.
+    // carina#4109: because this loop has no `let` binding, its generated
+    // resources stay anonymous; only the migration-only legacy base receives
+    // the module-instance prefix.
+    let crate::parser::DeferredForTarget::Unbound { template } = &d.target else {
+        panic!("unbound module loop must remain an unbound deferred target")
+    };
+    assert_eq!(
+        template.legacy_base().exact_state_name(),
+        "r._domain_validation_options"
+    );
     assert_eq!(
         d.root_bindings(),
         std::collections::BTreeSet::from(["r.cert".to_string()])

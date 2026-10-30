@@ -7,7 +7,7 @@ use super::ProviderContext;
 use super::Rule;
 use super::ast::{ParsedFile, ParserBindingMetadata, UpstreamState, UserFunction, WaitBinding};
 use super::blocks::attributes::{
-    parse_arguments_block, parse_attributes_block, parse_exports_block,
+    ParsedArgumentsBlock, parse_arguments_block, parse_attributes_block, parse_exports_block,
 };
 use super::blocks::backend::parse_backend_block;
 use super::blocks::module_call::parse_module_call;
@@ -19,7 +19,7 @@ use super::error::{
     ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
     WarningKind,
 };
-use super::expressions::for_expr::{extract_for_iterable_name, parse_for_expr};
+use super::expressions::for_expr::{LoopParseTarget, extract_for_iterable_name, parse_for_expr};
 use super::expressions::if_expr::parse_if_expr;
 use super::expressions::pipe::{parse_coalesce_expr, parse_coalesce_expr_with_mode};
 use super::functions::parse_fn_def;
@@ -30,7 +30,7 @@ use super::resolve::{
 use crate::eval_value::{
     EvalValue, EvalValueError, ParsedSinkValue, StructuralHandle, StructuralHandleMetadata,
 };
-use crate::resource::{DataSource, Resource, Value};
+use crate::resource::{DataSource, LegacyLoopAddress, LoopKind, Resource, Value};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -517,7 +517,7 @@ fn resolve_top_level_user_functions(
                     }
 
                     let mut warnings = Vec::new();
-                    match parse_fn_def(statement, &ctx, &mut warnings) {
+                    match parse_fn_def(statement, &ctx, &mut warnings, &preprocessed_file) {
                         Ok(mut function) => {
                             function.body.source_file = path.map(Path::to_path_buf);
                             ctx.insert_user_function(name.clone(), function.clone());
@@ -644,6 +644,7 @@ fn parse_with_seeded_bindings_inner(
     let mut uses = Vec::new();
     let mut module_calls = Vec::new();
     let mut arguments = Vec::new();
+    let mut argument_type_sources = Vec::new();
     let mut attribute_params = Vec::new();
     let mut export_params = Vec::new();
     let mut backend = None;
@@ -673,7 +674,7 @@ fn parse_with_seeded_bindings_inner(
                                 // lexical binding inside `ctx` as it is parsed, so a
                                 // later argument's default expression can reference
                                 // earlier arguments (#2393).
-                                let parsed_arguments = {
+                                let parsed_arguments_block = {
                                     let warnings = std::mem::take(&mut ctx.warnings);
                                     let mut warnings = warnings;
                                     let result = parse_arguments_block(
@@ -687,7 +688,12 @@ fn parse_with_seeded_bindings_inner(
                                     ctx.warnings = warnings;
                                     result?
                                 };
-                                arguments.extend(parsed_arguments);
+                                let ParsedArgumentsBlock {
+                                    parameters,
+                                    type_sources,
+                                } = parsed_arguments_block;
+                                arguments.extend(parameters);
+                                argument_type_sources.extend(type_sources);
                             }
                             Rule::attributes_block => {
                                 let parsed_attribute_params = {
@@ -722,13 +728,17 @@ fn parse_with_seeded_bindings_inner(
                                 export_params.extend(parsed_export_params);
                             }
                             Rule::import_state_block => {
-                                state_blocks.push(parse_import_state_block(stmt, &ctx)?);
+                                state_blocks.push(parse_import_state_block(
+                                    stmt,
+                                    &ctx,
+                                    &preprocessed_file,
+                                )?);
                             }
                             Rule::removed_block => {
                                 state_blocks.push(parse_removed_block(stmt)?);
                             }
                             Rule::moved_block => {
-                                state_blocks.push(parse_moved_block(stmt)?);
+                                state_blocks.push(parse_moved_block(stmt, &preprocessed_file)?);
                             }
                             Rule::require_statement => {
                                 requires.push(parse_require_statement(
@@ -742,6 +752,15 @@ fn parse_with_seeded_bindings_inner(
                                 let iterable_name =
                                     extract_for_iterable_name(&stmt, anon_for_counter);
                                 anon_for_counter += 1;
+                                let source = preprocessed_file.loop_source(
+                                    &stmt,
+                                    LoopKind::For,
+                                    source_file,
+                                );
+                                let target = LoopParseTarget::unbound(
+                                    source,
+                                    LegacyLoopAddress::new(iterable_name),
+                                );
                                 let (
                                     expanded_resources,
                                     expanded_data_sources,
@@ -749,7 +768,7 @@ fn parse_with_seeded_bindings_inner(
                                 ) = parse_for_expr(
                                     stmt,
                                     &mut ctx,
-                                    &iterable_name,
+                                    target,
                                     &preprocessed_file,
                                     source_file,
                                 )?;
@@ -758,8 +777,14 @@ fn parse_with_seeded_bindings_inner(
                                 module_calls.extend(expanded_module_calls);
                             }
                             Rule::if_expr => {
-                                let binding_name = format!("_if{}", anon_if_counter);
+                                let legacy_name = format!("_if{}", anon_if_counter);
                                 anon_if_counter += 1;
+                                let source =
+                                    preprocessed_file.loop_source(&stmt, LoopKind::If, source_file);
+                                let target = LoopParseTarget::unbound(
+                                    source,
+                                    LegacyLoopAddress::new(legacy_name),
+                                );
                                 let (
                                     _value,
                                     expanded_resources,
@@ -770,7 +795,7 @@ fn parse_with_seeded_bindings_inner(
                                 ) = parse_if_expr(
                                     stmt,
                                     &mut ctx,
-                                    &binding_name,
+                                    target,
                                     &preprocessed_file,
                                     source_file,
                                 )?;
@@ -782,7 +807,8 @@ fn parse_with_seeded_bindings_inner(
                                 let user_fn = {
                                     let warnings = std::mem::take(&mut ctx.warnings);
                                     let mut warnings = warnings;
-                                    let result = parse_fn_def(stmt, &ctx, &mut warnings);
+                                    let result =
+                                        parse_fn_def(stmt, &ctx, &mut warnings, &preprocessed_file);
                                     ctx.warnings = warnings;
                                     result?
                                 };
@@ -1020,6 +1046,9 @@ fn parse_with_seeded_bindings_inner(
     for check in ctx.pending_function_type_checks.borrow().iter().cloned() {
         parser_binding_metadata.insert_pending_function_type_check(check);
     }
+    for (name, span) in argument_type_sources {
+        parser_binding_metadata.insert_argument_type_source(name, source_file.to_path_buf(), span);
+    }
     let seeded_bindings = ctx.seeded_bindings.clone();
     let mut variables = IndexMap::new();
     for (name, binding) in std::mem::take(&mut ctx.bindings) {
@@ -1083,6 +1112,8 @@ fn parse_with_seeded_bindings_inner(
     parsed.parser_binding_metadata = parser_binding_metadata;
     parsed.warnings = ctx.warnings;
     parsed.deferred_for_expressions = ctx.deferred_for_expressions;
+    let binding_scope = crate::binding_index::BindingNameSet::from_parsed(&parsed);
+    parsed.set_loop_binding_scope(binding_scope.iter_names().map(str::to_string).collect());
     // The parser never synthesizes composition resources, so its default
     // expansion trace remains empty until module expansion (#3306).
     Ok(parsed)

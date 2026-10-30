@@ -1,0 +1,12 @@
+{
+  "version": 5,
+  "serial": 1,
+  "lineage": "anonymous-loop-deferred-map-upstream",
+  "carina_version": "0.1.0",
+  "resources": [],
+  "exports": {
+    "accounts": {
+      "alpha": "111111111111"
+    }
+  }
+}

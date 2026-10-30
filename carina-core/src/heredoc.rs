@@ -39,6 +39,20 @@ pub(crate) struct OriginalPosition {
 }
 
 impl PreprocessResult {
+    /// Return the exact authored text corresponding to a byte range in the
+    /// heredoc-preprocessed source.
+    pub(crate) fn original_slice(&self, preprocessed_range: std::ops::Range<usize>) -> &str {
+        assert!(
+            preprocessed_range.start <= preprocessed_range.end
+                && preprocessed_range.end <= self.source.len(),
+            "preprocessed range must be within the transformed source"
+        );
+        let start = self.original_byte(preprocessed_range.start);
+        let end = self.original_byte(preprocessed_range.end);
+        let original = self.original_source.as_deref().unwrap_or(&self.source);
+        &original[start..end]
+    }
+
     pub(crate) fn original_position(&self, preprocessed_byte: usize) -> OriginalPosition {
         assert!(
             preprocessed_byte <= self.source.len(),

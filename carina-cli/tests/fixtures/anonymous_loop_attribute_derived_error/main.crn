@@ -1,0 +1,5 @@
+for name in ['alpha', 'beta'] {
+  mock.test.Thing {
+    name = name
+  }
+}

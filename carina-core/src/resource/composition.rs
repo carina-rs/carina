@@ -515,6 +515,9 @@ pub struct CompositionCall {
     pub instance: String,
     pub module_source: Option<String>,
     pub module_directory: Option<PathBuf>,
+    /// Validation-only origin when an unbound loop produced this call.
+    #[doc(hidden)]
+    pub loop_origin: Option<Box<super::LoopElementOrigin>>,
 }
 
 impl PartialEq for CompositionCall {
@@ -532,12 +535,42 @@ impl std::hash::Hash for CompositionCall {
 }
 
 impl CompositionCall {
+    #[cfg(test)]
+    pub(crate) fn set_loop_origin(&mut self, origin: Option<super::LoopElementOrigin>) {
+        self.loop_origin = origin.map(Box::new);
+    }
+
+    pub(crate) fn loop_origin(&self) -> Option<&super::LoopElementOrigin> {
+        self.loop_origin.as_deref()
+    }
+
     /// User-facing call label. Anonymous calls deliberately hide their
     /// content-derived synthetic instance identifier.
     pub fn display_label(&self) -> String {
-        self.binding
-            .clone()
-            .unwrap_or_else(|| format!("{} (anonymous call)", self.module_name))
+        match self.id.expansion() {
+            crate::parser::CallExpansion::Direct => self
+                .binding
+                .clone()
+                .unwrap_or_else(|| format!("{} (anonymous call)", self.module_name)),
+            crate::parser::CallExpansion::Expanded(_expansion_key) => {
+                format!("{} (anonymous call)", self.module_name)
+            }
+        }
+    }
+
+    /// Project an authored parser call onto this display authority. Fields
+    /// unrelated to labels are intentionally empty and never escape this call.
+    pub(crate) fn display_label_for_module_call(call: &crate::parser::ModuleCall) -> String {
+        Self {
+            id: call.id().clone(),
+            module_name: call.module_name.clone(),
+            binding: call.binding_name.clone(),
+            instance: String::new(),
+            module_source: None,
+            module_directory: None,
+            loop_origin: None,
+        }
+        .display_label()
     }
 }
 
@@ -606,6 +639,7 @@ impl Default for CompositionCallPath {
             instance: "test_call".to_string(),
             module_source: None,
             module_directory: None,
+            loop_origin: None,
         })
     }
 }
@@ -1364,6 +1398,7 @@ mod tests {
                 instance: binding.to_string(),
                 module_source: Some(format!("../{binding}")),
                 module_directory: None,
+                loop_origin: None,
             })
         };
         let left = LiveComposition {
@@ -1665,6 +1700,7 @@ mod tests {
             instance: "module".to_string(),
             module_source: Some("./module".to_string()),
             module_directory: None,
+            loop_origin: None,
         });
         let mut source_identities = CompositionSourceIdentityResolver::new(source_root.path())
             .expect("create composition source identity resolver");
@@ -1727,6 +1763,7 @@ mod tests {
             instance: "module".to_string(),
             module_source: Some("./module".to_string()),
             module_directory: None,
+            loop_origin: None,
         });
         let mut source_identities = CompositionSourceIdentityResolver::new(source_root.path())
             .expect("create composition source identity resolver");

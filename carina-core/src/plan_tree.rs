@@ -61,13 +61,6 @@ pub fn deferred_summary_for_plan<S>(plan: &Plan<S>) -> DeferredSummaryForPlan {
     DeferredSummaryForPlan { entries }
 }
 
-pub fn is_synthetic_deferred_binding(binding_name: &str) -> bool {
-    binding_name
-        .rsplit('.')
-        .next()
-        .is_none_or(|segment| segment.is_empty() || segment.starts_with('_'))
-}
-
 pub fn deferred_for_source<S>(template: &crate::parser::DeferredForExpression<S>) -> String {
     crate::value::format_value(&template.iterable)
 }
@@ -94,10 +87,11 @@ pub fn deferred_for_display_name<S>(
 ) -> String {
     let upstream_binding = template.binding_description();
     let note = format!("(N records after {upstream_binding} {verb})");
-    if is_synthetic_deferred_binding(&template.binding_name) {
-        note
-    } else {
-        format!("{}[*] {note}", template.binding_name)
+    match &template.target {
+        crate::parser::DeferredForTarget::Bound { binding } => {
+            format!("{binding}[*] {note}")
+        }
+        crate::parser::DeferredForTarget::Unbound { .. } => note,
     }
 }
 
@@ -259,7 +253,7 @@ where
                 Effect::DeferredCreate { id, template, .. } => {
                     let fallback = id.to_string();
                     binding_to_effect.insert(fallback.clone(), idx);
-                    binding_to_effect.insert(template.binding_name.clone(), idx);
+                    binding_to_effect.insert(template.target.scheduler_key().to_string(), idx);
                     effect_bindings.insert(idx, fallback);
                     effect_types.insert(idx, "deferred_for".to_string());
                     effect_deps.insert(idx, template.root_bindings().into_iter().collect());
@@ -268,7 +262,8 @@ where
                 Effect::DeferredReplace(payload) => {
                     let fallback = payload.id.to_string();
                     binding_to_effect.insert(fallback.clone(), idx);
-                    binding_to_effect.insert(payload.template.binding_name.clone(), idx);
+                    binding_to_effect
+                        .insert(payload.template.target.scheduler_key().to_string(), idx);
                     for delete in payload.deletes.iter() {
                         if let Some(binding) = &delete.binding {
                             binding_to_effect.insert(binding.clone(), idx);
@@ -599,7 +594,9 @@ mod tests {
             header: "for x in (up.items ?? fallback.items)".to_string(),
             resource_type: "test.Child".to_string(),
             attributes: Vec::new(),
-            binding_name: "children".to_string(),
+            target: crate::parser::DeferredForTarget::Bound {
+                binding: "children".to_string(),
+            },
             iterable: Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(Value::resource_ref("up", "items", Vec::new())),
                 default: Box::new(Value::resource_ref("fallback", "items", Vec::new())),
@@ -891,7 +888,9 @@ mod tests {
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.Record".to_string(),
             attributes: Vec::new(),
-            binding_name: "validation_records".to_string(),
+            target: crate::parser::DeferredForTarget::Bound {
+                binding: "validation_records".to_string(),
+            },
             iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
             binding: ForBinding::Simple("opt".to_string()),
             template_resource,
@@ -965,7 +964,9 @@ mod tests {
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.Record".to_string(),
             attributes: Vec::new(),
-            binding_name: "validation_records".to_string(),
+            target: crate::parser::DeferredForTarget::Bound {
+                binding: "validation_records".to_string(),
+            },
             iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
             binding: ForBinding::Simple("opt".to_string()),
             template_resource,
@@ -1032,12 +1033,5 @@ mod tests {
 
         let (_roots, dependents) = build_single_parent_tree(&plan, &graph);
         assert_eq!(dependents.get(&0), Some(&vec![1]));
-    }
-
-    #[test]
-    fn empty_deferred_binding_is_synthetic() {
-        assert!(is_synthetic_deferred_binding(""));
-        assert!(is_synthetic_deferred_binding("module._records"));
-        assert!(!is_synthetic_deferred_binding("validation_records"));
     }
 }

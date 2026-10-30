@@ -115,7 +115,7 @@ use crate::provider::{
     AppliedIdentifier, CreateFailure, CreateFailureKind, CreateOutcome, CreateRequest,
     InFlightCreate, ObservedCreate, PartialReadDiagnostic, PatchOp, Provider, ProviderError,
     ProviderNormalizer, ProviderReadyDataSource, ResumeCreateRequest, ResumeFailure,
-    ResumeFailureKind, ResumeOutcome, UpdateRequest,
+    ResumeFailureKind, ResumeOutcome, SentAttributes, SentDesiredAttributes, UpdateRequest,
 };
 use crate::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart, ModuleSource,
@@ -281,6 +281,7 @@ pub async fn dispatch_resume_create<P: Provider + ?Sized>(
 #[derive(Debug, Clone, PartialEq)]
 pub struct AcceptedRequest {
     kind: AcceptedRequestKind,
+    sent_attributes: SentAttributes,
     /// Provider-ready desired attributes accepted for this operation. This is
     /// kept separate from the plan-time authored resource so state writeback
     /// masks secrets against the value shape actually sent to the provider.
@@ -298,10 +299,11 @@ pub enum AcceptedRequestKind {
 }
 
 impl AcceptedRequest {
-    /// Record a successful create from the checked executor path.
-    pub(crate) fn create() -> Self {
+    /// Record a successful create from the checked request that was dispatched.
+    pub fn from_create_request(request: &CreateRequest) -> Self {
         Self {
             kind: AcceptedRequestKind::Create,
+            sent_attributes: request.sent_attributes(),
             resolved_desired_attributes: None,
         }
     }
@@ -310,6 +312,7 @@ impl AcceptedRequest {
         request: &UpdateRequest,
         resolved_desired_attributes: SecretPreservingAttributes,
     ) -> Self {
+        let sent_attributes = request.patch().sent_attributes();
         let mut sent = BTreeSet::new();
         let mut removed = BTreeSet::new();
         for op in &request.patch().ops {
@@ -326,6 +329,7 @@ impl AcceptedRequest {
         }
         Self {
             kind: AcceptedRequestKind::Update { sent, removed },
+            sent_attributes,
             resolved_desired_attributes: Some(resolved_desired_attributes),
         }
     }
@@ -342,7 +346,11 @@ impl AcceptedRequest {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn create_for_test() -> Self {
-        Self::create()
+        Self {
+            kind: AcceptedRequestKind::Create,
+            sent_attributes: SentAttributes::all_for_test(),
+            resolved_desired_attributes: None,
+        }
     }
 
     /// Construct update provenance for fixtures and state-boundary tests.
@@ -354,12 +362,38 @@ impl AcceptedRequest {
                 sent: sent.iter().map(|key| (*key).to_string()).collect(),
                 removed: removed.iter().map(|key| (*key).to_string()).collect(),
             },
+            sent_attributes: SentAttributes::only(
+                sent.iter().map(|key| (*key).to_string()).collect(),
+            ),
             resolved_desired_attributes: None,
         }
     }
 
     pub fn kind(&self) -> &AcceptedRequestKind {
         &self.kind
+    }
+
+    pub fn sent_attributes(&self) -> &SentAttributes {
+        &self.sent_attributes
+    }
+
+    /// Return the desired values and sent-attribute membership proven by this
+    /// accepted request. Production executor paths retain resolved values;
+    /// provider-ready bootstrap and test paths may use the supplied resource
+    /// as their already-resolved fallback.
+    pub fn sent_desired_attributes<'a, S>(
+        &'a self,
+        fallback_resource: &'a Resource<S>,
+    ) -> SentDesiredAttributes<'a> {
+        match self.resolved_desired_attributes.as_ref() {
+            Some(attributes) => {
+                SentDesiredAttributes::new(attributes.values().iter(), self.sent_attributes.clone())
+            }
+            None => SentDesiredAttributes::new(
+                fallback_resource.attributes.iter(),
+                self.sent_attributes.clone(),
+            ),
+        }
     }
 
     pub fn resolved_desired_attributes(&self) -> Option<&SecretPreservingAttributes> {
@@ -372,10 +406,11 @@ impl AcceptedRequest {
 /// state before it is persisted.
 pub fn complete_create_for_writeback(
     outcome: CreateOutcome,
+    request: AcceptedRequest,
 ) -> (State, AcceptedRequest, Option<PartialReadDiagnostic>) {
     let diagnostic = outcome.diagnostic().cloned();
     let state = outcome.into_state_for_writeback();
-    (state, AcceptedRequest::create(), diagnostic)
+    (state, request, diagnostic)
 }
 
 /// Provenance-preserving result of one effect. State writeback must classify
@@ -1200,7 +1235,7 @@ pub async fn execute_saved_plan(
     execute_runtime_plan(provider, input.into(), observer, shutdown).await
 }
 
-async fn execute_runtime_plan<S: Clone>(
+async fn execute_runtime_plan<S: Clone + crate::resource::AnonymousIdentityModuleSource>(
     provider: &dyn Provider,
     mut input: RuntimeExecutionInput<'_, S>,
     observer: &dyn ExecutionObserver<S>,
