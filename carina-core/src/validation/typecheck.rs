@@ -3,7 +3,10 @@
 use std::fmt;
 
 use crate::ValueDescription;
-use crate::parser::{ProviderContext, TypeExpr, validate_custom_type, validate_schema_custom_type};
+use crate::parser::{
+    LoadedProviderContext, ProviderContext, TypeExpr, validate_custom_type,
+    validate_schema_custom_type_with_context,
+};
 use crate::resource::{ConcreteValue, DeferredValue, Value};
 
 /// Static authority available while checking deferred computed values.
@@ -16,6 +19,55 @@ pub enum TypecheckInference<'a> {
         schemas: &'a crate::schema::SchemaRegistry,
     },
     Unavailable,
+}
+
+/// Provider authority available to internal value-checking pipelines.
+///
+/// Construction is crate-private: loaded paths retain the opaque production
+/// witness, while explicitly providerless paths use a recursive checker that
+/// never invokes the provider custom-type resolver.
+#[derive(Clone, Copy)]
+pub(crate) enum TypecheckProviderContext<'a> {
+    Loaded(&'a LoadedProviderContext),
+    Providerless(&'a ProviderContext),
+}
+
+impl<'a> TypecheckProviderContext<'a> {
+    pub(crate) fn loaded(config: &'a LoadedProviderContext) -> Self {
+        Self::Loaded(config)
+    }
+
+    pub(crate) fn providerless(config: &'a ProviderContext) -> Self {
+        Self::Providerless(config)
+    }
+
+    pub(crate) fn as_provider_context(self) -> &'a ProviderContext {
+        match self {
+            Self::Loaded(config) => config.as_provider_context(),
+            Self::Providerless(config) => config,
+        }
+    }
+
+    pub(crate) fn loaded_context(self) -> Option<&'a LoadedProviderContext> {
+        match self {
+            Self::Loaded(config) => Some(config),
+            Self::Providerless(_) => None,
+        }
+    }
+
+    pub(crate) fn check(
+        self,
+        expected: &TypeExpr,
+        value: &Value,
+        inference: TypecheckInference<'_>,
+    ) -> Result<(), TypeExprValueError> {
+        match self {
+            Self::Loaded(config) => check_type_expr_value(expected, value, config, inference),
+            Self::Providerless(config) => {
+                check_type_expr_value_providerless(expected, value, config, inference)
+            }
+        }
+    }
 }
 
 /// One step from the checked value's root to the mismatched leaf.
@@ -47,7 +99,7 @@ pub enum TypeExprValueError {
         field: String,
     },
     InvalidAccess {
-        message: String,
+        error: crate::static_type::InferenceError,
     },
     CustomTypeValidation {
         path: Vec<TypeExprValuePathSegment>,
@@ -116,7 +168,7 @@ impl fmt::Display for TypeExprValueError {
                 write_path(f, path)?;
                 write!(f, "expected struct, unknown field '{field}'.")
             }
-            Self::InvalidAccess { message } => f.write_str(message),
+            Self::InvalidAccess { error } => error.fmt(f),
             Self::CustomTypeValidation {
                 path,
                 expected,
@@ -130,25 +182,91 @@ impl fmt::Display for TypeExprValueError {
     }
 }
 
-/// Check a value against a declared type.
+/// Check a value against a declared type with loaded provider custom types.
 ///
 /// Unresolved values defer until the binding/reference validation or
 /// evaluation phase that has their types.
 pub fn check_type_expr_value(
     expected: &TypeExpr,
     value: &Value,
+    config: &LoadedProviderContext,
+    inference: TypecheckInference<'_>,
+) -> Result<(), TypeExprValueError> {
+    check_type_expr_value_inner_with_mode(
+        expected,
+        value,
+        config.as_provider_context(),
+        inference,
+        ProviderCustomTypeValidation::Loaded,
+    )
+}
+
+/// Check a value without loaded providers.
+///
+/// Structural checks and provider-independent leaves run normally. A
+/// provider-owned custom-type leaf is accepted only after its scalar shape is
+/// checked; the provider resolver is never called.
+pub fn check_type_expr_value_providerless(
+    expected: &TypeExpr,
+    value: &Value,
     config: &ProviderContext,
     inference: TypecheckInference<'_>,
 ) -> Result<(), TypeExprValueError> {
-    if matches!(expected, TypeExpr::Unknown) {
-        return Ok(());
-    }
+    check_type_expr_value_inner_with_mode(
+        expected,
+        value,
+        config,
+        inference,
+        ProviderCustomTypeValidation::Providerless,
+    )
+}
 
+#[derive(Clone, Copy)]
+enum ProviderCustomTypeValidation {
+    Loaded,
+    Providerless,
+}
+
+/// Raw parser seam retaining main's historical unloaded-context behaviour.
+/// Public validation callers must use a witness-carrying entry point above.
+fn check_type_expr_value_inner(
+    expected: &TypeExpr,
+    value: &Value,
+    config: &ProviderContext,
+    inference: TypecheckInference<'_>,
+) -> Result<(), TypeExprValueError> {
+    check_type_expr_value_inner_with_mode(
+        expected,
+        value,
+        config,
+        inference,
+        ProviderCustomTypeValidation::Loaded,
+    )
+}
+
+fn check_type_expr_value_inner_with_mode(
+    expected: &TypeExpr,
+    value: &Value,
+    config: &ProviderContext,
+    inference: TypecheckInference<'_>,
+    provider_custom_types: ProviderCustomTypeValidation,
+) -> Result<(), TypeExprValueError> {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { .. }) => match expected {
             TypeExpr::StringLiteral(_) => return Err(mismatch(expected, value)),
             TypeExpr::Union(_) => {}
-            _ => return Ok(()),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. } => return Ok(()),
         },
         Value::Deferred(
             DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
@@ -168,19 +286,42 @@ pub fn check_type_expr_value(
             return match inferred {
                 Ok(actual) if inferred_type_fits(expected, &actual) => Ok(()),
                 Ok(_) => Err(mismatch(expected, value)),
-                Err(error @ super::inference::InferenceError::InvalidAccess { .. })
-                | Err(error @ super::inference::InferenceError::UnknownAttribute { .. }) => {
-                    Err(TypeExprValueError::InvalidAccess {
-                        message: error.to_string(),
-                    })
-                }
-                Err(_) => Ok(()),
+                Err(crate::static_type::InferenceIssue::Failed(
+                    error @ super::inference::InferenceError::InvalidAccess { .. },
+                ))
+                | Err(crate::static_type::InferenceIssue::Failed(
+                    error @ super::inference::InferenceError::UnknownAttribute { .. },
+                )) => Err(TypeExprValueError::InvalidAccess { error }),
+                Err(crate::static_type::InferenceIssue::Failed(
+                    super::inference::InferenceError::UnknownType { .. }
+                    | super::inference::InferenceError::HeterogeneousCollection { .. }
+                    | super::inference::InferenceError::IncompatibleCoalesceTypes { .. }
+                    | super::inference::InferenceError::UnknownBinding { .. }
+                    | super::inference::InferenceError::CyclicVirtualBinding { .. },
+                ))
+                | Err(crate::static_type::InferenceIssue::NotInferable(
+                    crate::static_type::NotInferableReason::MissingValue
+                    | crate::static_type::NotInferableReason::NonInferableBinding { .. }
+                    | crate::static_type::NotInferableReason::SchemaUnavailable { .. },
+                )) => Ok(()),
             };
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => return Ok(()),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            check_type_expr_value(expected, value, config, inference)?;
-            return check_type_expr_value(expected, default, config, inference);
+            check_type_expr_value_inner_with_mode(
+                expected,
+                value,
+                config,
+                inference,
+                provider_custom_types,
+            )?;
+            return check_type_expr_value_inner_with_mode(
+                expected,
+                default,
+                config,
+                inference,
+                provider_custom_types,
+            );
         }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             return if accepts_interpolation(expected) {
@@ -190,8 +331,14 @@ pub fn check_type_expr_value(
             };
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            return check_type_expr_value(expected, inner, config, inference)
-                .map_err(|_| mismatch(expected, value));
+            return check_type_expr_value_inner_with_mode(
+                expected,
+                inner,
+                config,
+                inference,
+                provider_custom_types,
+            )
+            .map_err(|_| mismatch(expected, value));
         }
         Value::Concrete(_) => {}
     }
@@ -244,18 +391,28 @@ pub fn check_type_expr_value(
         TypeExpr::List(inner) => match value {
             Value::Concrete(ConcreteValue::List(items)) => {
                 for (index, item) in items.iter().enumerate() {
-                    check_type_expr_value(inner, item, config, inference).map_err(|error| {
-                        error.prepend(TypeExprValuePathSegment::ListIndex(index))
-                    })?;
+                    check_type_expr_value_inner_with_mode(
+                        inner,
+                        item,
+                        config,
+                        inference,
+                        provider_custom_types,
+                    )
+                    .map_err(|error| error.prepend(TypeExprValuePathSegment::ListIndex(index)))?;
                 }
                 Ok(())
             }
             Value::Concrete(ConcreteValue::StringList(items)) => {
                 for (index, item) in items.iter().enumerate() {
                     let item = Value::Concrete(ConcreteValue::String(item.clone()));
-                    check_type_expr_value(inner, &item, config, inference).map_err(|error| {
-                        error.prepend(TypeExprValuePathSegment::ListIndex(index))
-                    })?;
+                    check_type_expr_value_inner_with_mode(
+                        inner,
+                        &item,
+                        config,
+                        inference,
+                        provider_custom_types,
+                    )
+                    .map_err(|error| error.prepend(TypeExprValuePathSegment::ListIndex(index)))?;
                 }
                 Ok(())
             }
@@ -264,7 +421,14 @@ pub fn check_type_expr_value(
         TypeExpr::Map(inner) => match value {
             Value::Concrete(ConcreteValue::Map(entries)) => {
                 for (key, item) in entries {
-                    check_type_expr_value(inner, item, config, inference).map_err(|error| {
+                    check_type_expr_value_inner_with_mode(
+                        inner,
+                        item,
+                        config,
+                        inference,
+                        provider_custom_types,
+                    )
+                    .map_err(|error| {
                         error.prepend(TypeExprValuePathSegment::MapKey(key.clone()))
                     })?;
                 }
@@ -297,8 +461,14 @@ pub fn check_type_expr_value(
             ) => {
                 let identity = owned.identity();
                 if identified_scalar_shape_is_supported(identity, value, config, true) {
-                    validate_schema_custom_type(owned, value, config)
-                        .map_err(|error| custom_type_validation_mismatch(expected, value, error))
+                    match provider_custom_types {
+                        ProviderCustomTypeValidation::Loaded => {
+                            validate_schema_custom_type_with_context(owned, value, config).map_err(
+                                |error| custom_type_validation_mismatch(expected, value, error),
+                            )
+                        }
+                        ProviderCustomTypeValidation::Providerless => Ok(()),
+                    }
                 } else {
                     Err(mismatch(expected, value))
                 }
@@ -330,9 +500,16 @@ pub fn check_type_expr_value(
                             field: field.clone(),
                         });
                     };
-                    check_type_expr_value(field_type, field_value, config, inference).map_err(
-                        |error| error.prepend(TypeExprValuePathSegment::StructField(field.clone())),
-                    )?;
+                    check_type_expr_value_inner_with_mode(
+                        field_type,
+                        field_value,
+                        config,
+                        inference,
+                        provider_custom_types,
+                    )
+                    .map_err(|error| {
+                        error.prepend(TypeExprValuePathSegment::StructField(field.clone()))
+                    })?;
                 }
                 Ok(())
             }
@@ -343,17 +520,34 @@ pub fn check_type_expr_value(
             _ => Err(mismatch(expected, value)),
         },
         TypeExpr::Union(members) => {
-            if members
-                .iter()
-                .any(|member| check_type_expr_value(member, value, config, inference).is_ok())
-            {
+            if members.iter().any(|member| {
+                check_type_expr_value_inner_with_mode(
+                    member,
+                    value,
+                    config,
+                    inference,
+                    provider_custom_types,
+                )
+                .is_ok()
+            }) {
                 Ok(())
             } else {
                 Err(mismatch(expected, value))
             }
         }
-        TypeExpr::Unknown => Ok(()),
     }
+}
+
+/// Internal parser seam. Parser-produced bootstrap types defer before this
+/// function; public validation and resolver APIs must use one of the witness-
+/// carrying entry points above.
+pub(crate) fn check_type_expr_value_with_context(
+    expected: &TypeExpr,
+    value: &Value,
+    config: &ProviderContext,
+    inference: TypecheckInference<'_>,
+) -> Result<(), TypeExprValueError> {
+    check_type_expr_value_inner(expected, value, config, inference)
 }
 
 fn mismatch(expected: &TypeExpr, value: &Value) -> TypeExprValueError {
@@ -468,7 +662,7 @@ fn is_qualified_enum_identifier(identifier: &str) -> bool {
 }
 
 fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
-    if expected == actual || matches!(expected, TypeExpr::Unknown) {
+    if expected == actual {
         return true;
     }
     match (expected, actual) {
@@ -486,7 +680,95 @@ fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
             .any(|member| inferred_type_fits(member, actual)),
         (TypeExpr::List(expected), TypeExpr::List(actual))
         | (TypeExpr::Map(expected), TypeExpr::Map(actual)) => inferred_type_fits(expected, actual),
-        _ => false,
+        (
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        )
+        | (
+            TypeExpr::Float,
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        )
+        | (
+            TypeExpr::SchemaType { .. },
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        )
+        | (
+            TypeExpr::List(_),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        )
+        | (
+            TypeExpr::Map(_),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_),
+        ) => false,
     }
 }
 
@@ -501,7 +783,7 @@ mod tests {
     use crate::schema::TypeIdentity;
 
     fn check(expected: &TypeExpr, value: &Value) -> Result<(), TypeExprValueError> {
-        check_type_expr_value(
+        check_type_expr_value_inner(
             expected,
             value,
             &ProviderContext::default(),
@@ -522,7 +804,7 @@ mod tests {
         value: &Value,
         config: &ProviderContext,
     ) -> Result<(), TypeExprValueError> {
-        check_type_expr_value(expected, value, config, TypecheckInference::Unavailable)
+        check_type_expr_value_inner(expected, value, config, TypecheckInference::Unavailable)
     }
 
     #[test]
@@ -648,8 +930,104 @@ mod tests {
                 TypeExpr::StringLiteral("dev".to_string()),
                 TypeExpr::StringLiteral("prod".to_string()),
             ]),
-            TypeExpr::Unknown,
         ]
+    }
+
+    #[test]
+    fn providerless_non_builtin_simple_matches_unloaded_context() {
+        let expected = TypeExpr::Simple("account_id".to_string());
+        let value = string("account-123");
+        let config = ProviderContext::default();
+
+        let unloaded = check_type_expr_value_inner(
+            &expected,
+            &value,
+            &config,
+            TypecheckInference::Unavailable,
+        );
+        let providerless = check_type_expr_value_providerless(
+            &expected,
+            &value,
+            &config,
+            TypecheckInference::Unavailable,
+        );
+
+        assert_eq!(providerless, unloaded);
+        assert!(
+            providerless.is_err(),
+            "unknown bare type must not be skipped"
+        );
+    }
+
+    fn account_id_schema_type() -> TypeExpr {
+        TypeExpr::SchemaType {
+            owned: crate::parser::OwnedTypeIdentity::provider(
+                "mock",
+                TypeIdentity::bare("AccountId"),
+            ),
+        }
+    }
+
+    fn providerless_check(expected: &TypeExpr, value: &Value) -> Result<(), TypeExprValueError> {
+        TypecheckProviderContext::providerless(&ProviderContext::default()).check(
+            expected,
+            value,
+            TypecheckInference::Unavailable,
+        )
+    }
+
+    #[test]
+    fn providerless_list_with_provider_leaf_still_rejects_non_list_shape() {
+        let expected = TypeExpr::List(Box::new(TypeExpr::Simple("account_id".to_string())));
+
+        let result = providerless_check(&expected, &string("account-123"));
+
+        assert!(
+            matches!(result, Err(TypeExprValueError::Mismatch { .. })),
+            "the list shape must be checked before the unavailable provider leaf: {result:?}"
+        );
+    }
+
+    #[test]
+    fn providerless_struct_with_provider_leaf_still_rejects_builtin_sibling() {
+        let expected = TypeExpr::Struct {
+            fields: vec![
+                ("name".to_string(), TypeExpr::String),
+                ("id".to_string(), account_id_schema_type()),
+            ],
+        };
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("name".to_string(), Value::Concrete(ConcreteValue::Int(7))),
+            ("id".to_string(), string("account-123")),
+        ])));
+
+        let result = providerless_check(&expected, &value);
+
+        assert!(
+            matches!(result, Err(TypeExprValueError::Mismatch { .. })),
+            "the built-in sibling must be checked before the unavailable provider leaf: {result:?}"
+        );
+    }
+
+    #[test]
+    fn providerless_correct_structure_accepts_uncheckable_provider_leaf() {
+        let expected = TypeExpr::Struct {
+            fields: vec![
+                ("name".to_string(), TypeExpr::String),
+                ("id".to_string(), account_id_schema_type()),
+            ],
+        };
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("name".to_string(), string("production")),
+            ("id".to_string(), string("account-123")),
+        ])));
+
+        let result = providerless_check(&expected, &value);
+
+        assert!(
+            matches!(result, Ok(())),
+            "the provider leaf must be skipped after structural checks pass: {result:?}"
+        );
     }
 
     #[test]
@@ -780,7 +1158,6 @@ mod tests {
                 ),
             },
             TypeExpr::Struct { fields: Vec::new() },
-            TypeExpr::Unknown,
         ] {
             assert!(
                 check(&expected, &resource_ref).is_ok(),

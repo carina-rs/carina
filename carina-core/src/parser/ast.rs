@@ -2,9 +2,8 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 //!
-//! `TypeExpr::Unknown` is one of several "not determined yet" forms.
-//! `notes/specs/2026-10-29-unknown-forms-current-state.md` explains each form,
-//! which stage produces and consumes it, and how validation treats it.
+//! Static-type states that cannot be represented by a sound [`TypeExpr`] live
+//! in [`crate::static_type`] rather than as a sentinel variant here.
 
 use super::display_string_literal;
 use super::error::{ParseWarning, WarningKind};
@@ -20,6 +19,7 @@ use crate::resource::{
     ResourceIdentity, SavedModuleSource, StructuralOperand, StructuralOperandRef,
     UnboundLoopTemplate, UnknownReason, Value,
 };
+use crate::static_type::{ConsumerStaticType, ExportStaticType};
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -639,53 +639,9 @@ pub enum TypeExpr {
     /// additions (`String | Int`, nullable types via `T | none`) drop
     /// in without another structural change. See carina-rs/carina#2611.
     Union(Vec<TypeExpr>),
-    /// Sentinel used when no sound static type is available.
-    ///
-    /// Export type inference in `infer_export_params` produces this for both
-    /// non-inferable exports and failed inferences. Failures are reported
-    /// separately with the export's index, while non-inferable values retain
-    /// this sentinel for later existence-only validation.
-    /// `resolve_file_type_exprs_or_unknown` also produces it when upstream
-    /// export discovery encounters a type the consumer's provider context
-    /// cannot name. Deferred-iterable validation uses `List(Unknown)` /
-    /// `Map(Unknown)` as an element-type placeholder.
-    ///
-    /// Consumers treat it as "do not type-check": value type checking accepts
-    /// any value when `Unknown` is expected, `inferred_type_fits` treats it as
-    /// a wildcard in the expected position, and export-reference validation
-    /// checks existence without comparing types. It does not satisfy a
-    /// concrete expectation when it is the inferred actual type. Accessing
-    /// `.` or `[]` on an unknown base is still an inference error. See #2360
-    /// stage 2. #4093 tracks removing this variant.
-    Unknown,
 }
 
 impl TypeExpr {
-    /// Project away the [`TypeExpr::Unknown`] sentinel: returns
-    /// `Some(self)` for any concrete type, `None` for `Unknown`. Used
-    /// when a downstream consumer has no use for sentinel-bearing
-    /// entries (plan display, upstream-export forwarding) and prefers
-    /// the legacy "no static type" `None` shape.
-    pub fn into_known(self) -> Option<TypeExpr> {
-        match self {
-            TypeExpr::Unknown => None,
-            TypeExpr::String
-            | TypeExpr::Bool
-            | TypeExpr::Int
-            | TypeExpr::Float
-            | TypeExpr::Duration
-            | TypeExpr::Simple(_)
-            | TypeExpr::List(_)
-            | TypeExpr::Map(_)
-            | TypeExpr::Ref(_)
-            | TypeExpr::DottedUnresolved(_)
-            | TypeExpr::SchemaType { .. }
-            | TypeExpr::Struct { .. }
-            | TypeExpr::StringLiteral(_)
-            | TypeExpr::Union(_) => Some(self),
-        }
-    }
-
     /// True when this `TypeExpr` represents a string-shaped value at
     /// runtime: bare `String`, a `Simple` named identity (typically a
     /// string-base custom like `AwsAccountId`), or a `SchemaType`
@@ -744,7 +700,6 @@ impl std::fmt::Display for TypeExpr {
                 }
                 Ok(())
             }
-            TypeExpr::Unknown => write!(f, "<unknown>"),
         }
     }
 }
@@ -764,15 +719,17 @@ mod type_expr_display_tests {
 
 /// Argument parameter definition (in `arguments { ... }` block)
 #[derive(Debug, Clone)]
-pub struct ArgumentParameter {
+pub struct ArgumentParameter<T = TypeExpr> {
     pub name: String,
-    pub type_expr: TypeExpr,
+    pub static_type: T,
     pub default: Option<Value>,
     /// Optional description (from block form)
     pub description: Option<String>,
     /// Optional validation blocks (from block form). Multiple blocks are allowed.
     pub validations: Vec<ValidationBlock>,
 }
+
+pub type ConsumerArgumentParameter = ArgumentParameter<ConsumerStaticType>;
 
 /// A validate block: `validation { condition = <expr> error_message = "..." }`
 #[derive(Debug, Clone)]
@@ -914,9 +871,9 @@ impl RequireBlock {
 
 /// Attribute parameter definition (in `attributes { ... }` block)
 #[derive(Debug, Clone)]
-pub struct AttributeParameter {
+pub struct AttributeParameter<T = TypeExpr> {
     pub name: String,
-    pub type_expr: Option<TypeExpr>,
+    pub static_type: Option<T>,
     pub value: Option<Value>,
     source: DeclarationSource,
 }
@@ -931,7 +888,7 @@ impl AttributeParameter {
     ) -> Self {
         Self {
             name,
-            type_expr,
+            static_type: type_expr,
             value,
             source: DeclarationSource::authored(source_span, source_file),
         }
@@ -957,17 +914,30 @@ impl AttributeParameter {
     }
 }
 
+impl<T> AttributeParameter<T> {
+    pub(crate) fn map_type_expr<U>(self, map: impl FnOnce(T) -> U) -> AttributeParameter<U> {
+        AttributeParameter {
+            name: self.name,
+            static_type: self.static_type.map(map),
+            value: self.value,
+            source: self.source,
+        }
+    }
+}
+
+pub type ConsumerAttributeParameter = AttributeParameter<ConsumerStaticType>;
+
 /// An export parameter in an `exports { }` block, as produced by the
 /// parser before any inference runs.
 ///
-/// `type_expr` is `Option<TypeExpr>` here because the user may have
+/// `static_type` is optional here because the user may have
 /// omitted the annotation. The loader then runs `apply_inference`
 /// (#2360 stage 2) to resolve the effective type and emits
 /// [`InferredExportParam`] downstream.
 #[derive(Debug, Clone)]
 pub struct ParsedExportParam {
     pub name: String,
-    pub type_expr: Option<TypeExpr>,
+    pub static_type: Option<TypeExpr>,
     pub value: Option<Value>,
     source: DeclarationSource,
 }
@@ -982,7 +952,7 @@ impl ParsedExportParam {
     ) -> Self {
         Self {
             name,
-            type_expr,
+            static_type: type_expr,
             value,
             source: DeclarationSource::authored(source_span, source_file),
         }
@@ -1012,17 +982,17 @@ impl PartialEq for ParsedExportParam {
     fn eq(&self, other: &Self) -> bool {
         let Self {
             name,
-            type_expr,
+            static_type,
             value,
             source: _,
         } = self;
         let Self {
             name: other_name,
-            type_expr: other_type_expr,
+            static_type: other_static_type,
             value: other_value,
             source: _,
         } = other;
-        name == other_name && type_expr == other_type_expr && value == other_value
+        name == other_name && static_type == other_static_type && value == other_value
     }
 }
 
@@ -1045,16 +1015,9 @@ pub trait ExportParamLike {
     /// export boundary can return the same parser/inference shape wrapped in
     /// a checked type instead of maintaining parallel representations.
     fn set_value(&mut self, value: Option<Value>);
-    /// The export's declared type, when one is available.
-    ///
-    /// The parser phase carries `Option<TypeExpr>` (the user may have
-    /// omitted the annotation, inference fills it later); the post-
-    /// inference phase carries a bare `TypeExpr` and the impl returns
-    /// `Some(&type_expr)` unconditionally. Carina#3239's argument-side
-    /// custom-type walk uses this so it can validate both phases through
-    /// the same trait.
     fn type_expr_opt(&self) -> Option<&TypeExpr>;
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr>;
+    fn inference_failed(&self) -> bool;
 }
 
 impl ExportParamLike for ParsedExportParam {
@@ -1068,10 +1031,13 @@ impl ExportParamLike for ParsedExportParam {
         self.value = value;
     }
     fn type_expr_opt(&self) -> Option<&TypeExpr> {
-        self.type_expr.as_ref()
+        self.static_type.as_ref()
     }
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr> {
-        self.type_expr.as_mut()
+        self.static_type.as_mut()
+    }
+    fn inference_failed(&self) -> bool {
+        false
     }
 }
 
@@ -2587,17 +2553,12 @@ pub struct WaitBinding {
 
 /// An export parameter as seen post-inference (#2360 stage 2).
 ///
-/// `type_expr` is bare `TypeExpr` because every export carries a
-/// definitive type by construction: the loader runs `apply_inference`
-/// after parse + resolve, which fills in either the user's annotation,
-/// the rhs-inferred type, or the [`TypeExpr::Unknown`] sentinel for
-/// failed or deferred inference (paired with an entry in
-/// `LoadedConfig.inference_errors` when inference produced a reportable
-/// failure).
+/// `static_type` retains whether the effective type came from an annotation or
+/// rhs inference, plus any typed reason why checking is unavailable.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InferredExportParam {
     pub name: String,
-    pub type_expr: TypeExpr,
+    pub static_type: ExportStaticType,
     pub value: Option<Value>,
 }
 
@@ -2612,10 +2573,24 @@ impl ExportParamLike for InferredExportParam {
         self.value = value;
     }
     fn type_expr_opt(&self) -> Option<&TypeExpr> {
-        Some(&self.type_expr)
+        self.static_type.known()
     }
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr> {
-        Some(&mut self.type_expr)
+        match &mut self.static_type {
+            ExportStaticType::Declared(type_expr) => Some(type_expr),
+            ExportStaticType::Inferred(crate::static_type::StaticType::Known(type_expr)) => {
+                Some(type_expr)
+            }
+            ExportStaticType::Inferred(crate::static_type::StaticType::Unchecked(_reason)) => None,
+        }
+    }
+    fn inference_failed(&self) -> bool {
+        matches!(
+            self.static_type,
+            ExportStaticType::Inferred(crate::static_type::StaticType::Unchecked(
+                crate::static_type::InferredUncheckedReason::InferenceFailed(_)
+            ))
+        )
     }
 }
 
@@ -2623,9 +2598,9 @@ impl ExportParamLike for InferredExportParam {
 ///
 /// Two phases share this struct via aliases (see [`ParsedFile`] and
 /// [`InferredFile`]): the parser produces `File<ParsedExportParam>`
-/// where `type_expr` is `Option<TypeExpr>`; the loader runs
-/// `apply_inference` and yields `File<InferredExportParam>` where every
-/// export's `type_expr` is bare. Every other field is identical between
+/// where `static_type` is an optional [`TypeExpr`]; the loader runs `apply_inference` and
+/// yields `File<InferredExportParam>` where every export carries its origin
+/// and unchecked reason. Every other field is identical between
 /// phases. See `notes/specs/2026-05-03-typeexpr-stage2-design.md`.
 ///
 /// Bare-binding provenance is read-only outside the parser pipeline in
@@ -2697,11 +2672,10 @@ pub struct File<E> {
     pub expansion_trace: crate::resource::ExpansionTrace,
 }
 
-/// Parse-phase file: exports retain their `Option<TypeExpr>` shape.
+/// Parse-phase file: exports retain their optional annotation shape.
 pub type ParsedFile = File<ParsedExportParam>;
 
-/// Post-inference file: every export carries a bare [`TypeExpr`]
-/// (possibly [`TypeExpr::Unknown`] for inference failures).
+/// Post-inference file: every export carries origin and unchecked provenance.
 pub type InferredFile = File<InferredExportParam>;
 
 impl<E> Default for File<E> {
@@ -3693,7 +3667,7 @@ mod substitute_placeholder_tests {
 
         parsed.arguments.push(ArgumentParameter {
             name: "argument_name".to_string(),
-            type_expr: TypeExpr::String,
+            static_type: TypeExpr::String,
             default: None,
             description: None,
             validations: Vec::new(),

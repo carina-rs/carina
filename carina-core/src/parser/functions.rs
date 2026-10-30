@@ -544,7 +544,27 @@ pub fn validate_custom_type(
 
 /// Validate an authored provider schema annotation against every owner that
 /// declares its semantic identity.
+///
+/// ```compile_fail
+/// use carina_core::parser::{
+///     OwnedTypeIdentity, ProviderContext, validate_schema_custom_type,
+/// };
+/// use carina_core::resource::{ConcreteValue, Value};
+/// use carina_core::schema::TypeIdentity;
+///
+/// let owned = OwnedTypeIdentity::provider("test", TypeIdentity::bare("Id"));
+/// let value = Value::Concrete(ConcreteValue::String("id".into()));
+/// let _ = validate_schema_custom_type(&owned, &value, &ProviderContext::default());
+/// ```
 pub fn validate_schema_custom_type(
+    owned: &crate::parser::OwnedTypeIdentity,
+    value: &Value,
+    config: &crate::parser::LoadedProviderContext,
+) -> Result<(), crate::parser::CustomTypeValidationError> {
+    validate_schema_custom_type_with_context(owned, value, config)
+}
+
+pub(crate) fn validate_schema_custom_type_with_context(
     owned: &crate::parser::OwnedTypeIdentity,
     value: &Value,
     config: &ProviderContext,
@@ -590,7 +610,7 @@ fn check_fn_arg_type(
             Ok(None) => {
                 return Ok(FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded);
             }
-            Err(message) => return Err(ParseError::UserFunctionError(message)),
+            Err(error) => return Err(ParseError::UserFunctionError(error.to_string())),
         };
 
     if let Some(handle) = argument.handle() {
@@ -611,7 +631,7 @@ fn check_fn_arg_type(
     let value = argument.value().expect("non-handle function argument");
     let type_expr = resolved_type.as_type_expr();
 
-    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value(
+    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value_with_context(
         &type_expr,
         value,
         ctx.config,
@@ -746,7 +766,7 @@ fn check_fn_return_type(
     value: &Value,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
-    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value(
+    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value_with_context(
         type_expr,
         value,
         config,

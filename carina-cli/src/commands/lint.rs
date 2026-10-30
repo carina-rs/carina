@@ -73,6 +73,11 @@ pub fn run_lint(
 
     let (providers, provider_factory_error) =
         ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
+    let loaded_provider_context = if provider_factory_error.is_none() {
+        providers.loaded_provider_context()
+    } else {
+        None
+    };
     let provider_factory_error = provider_factory_error.map(|error| error.to_string());
     let schemas = providers.schemas();
 
@@ -87,13 +92,22 @@ pub fn run_lint(
     // is more useful than aborting lint entirely. Full schema-backed
     // suggestions return once the blocking finding is fixed.
     if module_boundary_findings.is_empty() {
-        module_resolver::resolve_modules_with_config(
-            &mut parsed,
-            base_dir,
-            provider_context,
-            schemas,
-        )
-        .map_err(|e| {
+        let resolution = if let Some(loaded_provider_context) = loaded_provider_context {
+            module_resolver::resolve_modules_with_config(
+                &mut parsed,
+                base_dir,
+                loaded_provider_context,
+                schemas,
+            )
+        } else {
+            module_resolver::resolve_modules_with_providerless_config(
+                &mut parsed,
+                base_dir,
+                provider_context,
+                schemas,
+            )
+        };
+        resolution.map_err(|e| {
             format!(
                 "Module resolution error: {}",
                 e.display_relative_to(base_dir)

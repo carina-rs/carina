@@ -5243,11 +5243,102 @@ pub fn find_factory<'a>(
         .map(|f| f.as_ref())
 }
 
-/// Collect all resource schemas from the given factories into a [`SchemaRegistry`].
+/// A schema registry constructed from a completed provider-factory load.
 ///
-/// Each schema is inserted under the factory's `name()` plus `schema.kind`,
-/// so a given `(provider, resource_type)` pair may have both a `Managed`
-/// and a `DataSource` entry registered side by side.
+/// The private field and absence of `Default`/raw-registry conversions prevent
+/// bootstrap registries from being relabeled as provider-loaded. Supplemental
+/// schemas (for example, the built-in mock provider) are admitted only while
+/// this proof is minted from the loaded factory collection.
+#[derive(Debug, Clone)]
+pub struct ProviderLoadedSchemaRegistry {
+    schemas: std::sync::Arc<SchemaRegistry>,
+}
+
+impl ProviderLoadedSchemaRegistry {
+    fn from_registry(schemas: SchemaRegistry) -> Self {
+        Self {
+            schemas: std::sync::Arc::new(schemas),
+        }
+    }
+
+    /// Borrow the provider-loaded registry.
+    pub fn schemas(&self) -> &SchemaRegistry {
+        &self.schemas
+    }
+
+    /// Share the exact registry carried by this proof with read-only consumers.
+    pub fn schemas_arc(&self) -> std::sync::Arc<SchemaRegistry> {
+        std::sync::Arc::clone(&self.schemas)
+    }
+
+    /// Erase the provider-loaded proof for consumers that need only a registry.
+    pub fn into_registry(self) -> SchemaRegistry {
+        std::sync::Arc::try_unwrap(self.schemas).unwrap_or_else(|shared| shared.as_ref().clone())
+    }
+
+    /// Construct provider-loaded schema evidence for cross-crate fixtures.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(schemas: SchemaRegistry) -> Self {
+        Self::from_registry(schemas)
+    }
+}
+
+/// Provider factories and both proofs minted from one captured load.
+///
+/// Production consumers retain this bundle so schema evidence and the loaded
+/// custom-type context cannot be supplied from separate construction paths.
+pub struct LoadedProviderSnapshot {
+    factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>>,
+    schemas: ProviderLoadedSchemaRegistry,
+    provider_context: crate::parser::LoadedProviderContext,
+}
+
+impl LoadedProviderSnapshot {
+    pub fn factories(&self) -> &[Box<dyn ProviderFactory>] {
+        &self.factories
+    }
+
+    pub fn factories_arc(&self) -> std::sync::Arc<Vec<Box<dyn ProviderFactory>>> {
+        std::sync::Arc::clone(&self.factories)
+    }
+
+    pub fn schemas(&self) -> &ProviderLoadedSchemaRegistry {
+        &self.schemas
+    }
+
+    pub fn schema_registry(&self) -> &SchemaRegistry {
+        self.schemas.schemas()
+    }
+
+    pub fn provider_context(&self) -> &crate::parser::LoadedProviderContext {
+        &self.provider_context
+    }
+
+    /// Build a deliberately synthetic loaded snapshot for cross-crate tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(
+        schemas: SchemaRegistry,
+        factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>>,
+    ) -> Self {
+        let provider_context =
+            crate::parser::LoadedProviderContext::new(crate::parser::ProviderContext {
+                decryptor: None,
+                custom_types: provider_custom_types_from_factories(std::sync::Arc::clone(
+                    &factories,
+                )),
+                resource_types: crate::parser::ProviderContext::resource_types_from_schema_registry(
+                    &schemas,
+                ),
+            });
+        Self {
+            factories,
+            schemas: ProviderLoadedSchemaRegistry::from_registry(schemas),
+            provider_context,
+        }
+    }
+}
+
+/// Collect all resource schemas from the given factories into a [`SchemaRegistry`].
 pub fn collect_schemas(factories: &[Box<dyn ProviderFactory>]) -> SchemaRegistry {
     let mut registry = SchemaRegistry::new();
     for factory in factories {
@@ -5719,6 +5810,25 @@ struct OwnerCustomTypeIndex {
     declarations: BTreeMap<TypeIdentity, Vec<AttributeType>>,
 }
 
+struct ProviderFactorySchemaSnapshot {
+    name: String,
+    schemas: Vec<ValidatedResourceSchema>,
+    config: ValidatedConfigSchema,
+}
+
+fn capture_provider_factory_schema_snapshot(
+    factories: &[Box<dyn ProviderFactory>],
+) -> Vec<ProviderFactorySchemaSnapshot> {
+    factories
+        .iter()
+        .map(|factory| ProviderFactorySchemaSnapshot {
+            name: factory.name().to_string(),
+            schemas: factory.schemas(),
+            config: factory.provider_config_attribute_types(),
+        })
+        .collect()
+}
+
 pub(crate) trait ProviderFactorySource: Send + Sync {
     fn as_factories(&self) -> &[Box<dyn ProviderFactory>];
 }
@@ -5748,7 +5858,12 @@ where
     F: ProviderFactorySource,
 {
     pub(crate) fn new(factories: F) -> Self {
-        let index = build_owner_custom_type_index(factories.as_factories());
+        let snapshot = capture_provider_factory_schema_snapshot(factories.as_factories());
+        let index = build_owner_custom_type_index(&snapshot);
+        Self { factories, index }
+    }
+
+    fn with_index(factories: F, index: BTreeMap<String, OwnerCustomTypeIndex>) -> Self {
         Self { factories, index }
     }
 
@@ -5856,20 +5971,20 @@ where
 }
 
 fn build_owner_custom_type_index(
-    factories: &[Box<dyn ProviderFactory>],
+    snapshot: &[ProviderFactorySchemaSnapshot],
 ) -> BTreeMap<String, OwnerCustomTypeIndex> {
-    factories
+    snapshot
         .iter()
         .enumerate()
         .map(|(factory_index, factory)| {
-            let schemas = factory.schemas();
-            let config = factory.provider_config_attribute_types();
             let mut declarations = BTreeMap::<TypeIdentity, Vec<AttributeType>>::new();
-            for (identity, declaration) in identified_types_from_witnesses(&schemas, &config) {
+            for (identity, declaration) in
+                identified_types_from_witnesses(&factory.schemas, &factory.config)
+            {
                 declarations.entry(identity).or_default().push(declaration);
             }
             (
-                factory.name().to_string(),
+                factory.name.clone(),
                 OwnerCustomTypeIndex {
                     factory_index,
                     declarations,
@@ -5887,6 +6002,45 @@ pub fn provider_custom_types_from_factories(
 ) -> crate::parser::ProviderCustomTypes {
     let resolver = FactoryCustomTypeResolver::new(factories);
     crate::parser::ProviderCustomTypes::from_source(resolver)
+}
+
+/// Capture provider schemas once and mint the loaded context and schema proof
+/// shared by validation, planning, apply, state writeback, and the LSP.
+///
+/// Returning one retained bundle makes it impossible for production callers
+/// to pair proofs produced by different provider/schema snapshots.
+pub fn loaded_provider_snapshot_from_factories(
+    factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>>,
+    supplemental_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
+) -> LoadedProviderSnapshot {
+    let snapshot = capture_provider_factory_schema_snapshot(&factories);
+    let mut schemas = SchemaRegistry::new();
+    for (provider, schema) in supplemental_schemas {
+        schemas.insert(provider, schema);
+    }
+    for factory in &snapshot {
+        for schema in &factory.schemas {
+            schemas.insert(&factory.name, schema.clone());
+        }
+    }
+    let custom_types =
+        crate::parser::ProviderCustomTypes::from_source(FactoryCustomTypeResolver::with_index(
+            std::sync::Arc::clone(&factories),
+            build_owner_custom_type_index(&snapshot),
+        ));
+    let provider_context =
+        crate::parser::LoadedProviderContext::new(crate::parser::ProviderContext {
+            decryptor: None,
+            custom_types,
+            resource_types: crate::parser::ProviderContext::resource_types_from_schema_registry(
+                &schemas,
+            ),
+        });
+    LoadedProviderSnapshot {
+        factories,
+        schemas: ProviderLoadedSchemaRegistry::from_registry(schemas),
+        provider_context,
+    }
 }
 
 fn validate_custom_type_annotation(
@@ -6500,6 +6654,89 @@ mod tests {
             &Value::Concrete(ConcreteValue::String("https://example.test".into())),
         )
         .expect("the same factory source must drive recognition and resolution");
+    }
+
+    struct SnapshotCountingFactory {
+        schema_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ProviderFactory for SnapshotCountingFactory {
+        fn name(&self) -> &str {
+            "snapshot"
+        }
+
+        fn display_name(&self) -> &str {
+            "snapshot fixture"
+        }
+
+        fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+            self.schema_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![
+                ResourceSchema::new("test.Item")
+                    .attribute(
+                        crate::schema::AttributeSchema::optional(
+                            "identifier",
+                            AttributeType::refined_string(
+                                Some(TypeIdentity::new(Some("test"), ["item"], "Identifier")),
+                                None,
+                                None,
+                                None,
+                            ),
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .expect("snapshot fixture schema must validate"),
+            ]
+        }
+
+        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+            ValidatedConfigSchema::default()
+        }
+
+        fn validate_config(
+            &self,
+            _attributes: &CanonicalProviderConfigAttributes,
+        ) -> ProviderResult<()> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "test".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &crate::executor::ProviderReadyConfig,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            Box::pin(async { Err(ProviderError::internal("not used")) })
+        }
+    }
+
+    #[test]
+    fn loaded_provider_snapshot_mints_both_proofs_from_one_schema_capture() {
+        let schema_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>> =
+            std::sync::Arc::new(vec![Box::new(SnapshotCountingFactory {
+                schema_calls: std::sync::Arc::clone(&schema_calls),
+            })]);
+
+        let snapshot = loaded_provider_snapshot_from_factories(factories, std::iter::empty());
+
+        assert_eq!(
+            schema_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "schema evidence and the custom-type index must share one capture"
+        );
+        assert_eq!(snapshot.schema_registry().len(), 1);
+        assert!(snapshot.provider_context().known_custom_types().contains(
+            &crate::parser::OwnedTypeIdentity::provider(
+                "snapshot",
+                TypeIdentity::new(Some("test"), ["item"], "Identifier"),
+            )
+        ));
     }
 
     #[test]

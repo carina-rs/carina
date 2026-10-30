@@ -14,7 +14,7 @@ use carina_core::executor::{
     AcceptedRequest, Applied, ExecutionCheckpointSink, ExecutionEvent, ExecutionObserver,
     ExecutionOutcome, LiveExecutionInput, ProviderCheckInputs,
 };
-use carina_core::parser::{ParsedFile, ProviderConfig, ProviderContext};
+use carina_core::parser::{LoadedProviderContext, ParsedFile, ProviderConfig, ProviderContext};
 use carina_core::plan::Plan;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, NoopNormalizer, ProviderError, ProviderResult,
@@ -57,6 +57,10 @@ use std::sync::Mutex;
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+fn loaded_provider_context() -> LoadedProviderContext {
+    LoadedProviderContext::empty_for_test()
 }
 
 #[test]
@@ -107,7 +111,7 @@ test.Target { resource_type = VPC }
     );
 
     let error = providers
-        .validate_evaluated_config(loaded.parsed, fixture.path(), true, &[], &[])
+        .validate_evaluated_config(loaded.parsed, fixture.path(), true, &[])
         .expect_err("skip_resource_validation must not mint ValidationReady for a pending slot");
     let rendered = crate::error::format_error_with_source_chain(&error);
     assert!(
@@ -226,9 +230,21 @@ fn checked_exports(
     carina_core::validation::check_export_values_pre_apply(
         params,
         &carina_core::binding_index::ResolvedBindings::default(),
-        &ProviderContext::default(),
+        &loaded_provider_context(),
     )
     .expect("test exports must pass the secret boundary")
+}
+
+fn fixture_unchecked_export_static_type() -> carina_core::static_type::ExportStaticType {
+    carina_core::static_type::ExportStaticType::Inferred(
+        carina_core::static_type::StaticType::Unchecked(
+            carina_core::static_type::InferredUncheckedReason::NotInferable(
+                carina_core::static_type::NotInferableReason::SchemaUnavailable {
+                    binding: "test fixture".to_string(),
+                },
+            ),
+        ),
+    )
 }
 
 fn saved_provider_configs(
@@ -2135,10 +2151,10 @@ async fn lock_released_on_write_state_failure() {
                 export_params: &checked_exports(&[]),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -2285,10 +2301,10 @@ async fn finalize_apply_uses_write_state_locked() {
                 export_params: &checked_exports(&[]),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -2415,7 +2431,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[], &[])
+        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
         .unwrap();
     let result = run_state_refresh_locked(
         validated_config,
@@ -2465,7 +2481,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[], &[])
+        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
         .unwrap();
 
     let result = run_state_refresh_locked(
@@ -2534,7 +2550,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[], &[])
+        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
         .unwrap();
 
     let result = run_state_refresh_locked(
@@ -2632,10 +2648,10 @@ async fn finalize_apply_without_lock_uses_write_state() {
                 export_params: &checked_exports(&[]),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: state_lock.as_ref(),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -2660,7 +2676,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
 
 #[tokio::test]
 async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -2698,7 +2714,7 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
     };
     let export_params = vec![InferredExportParam {
         name: "answer".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("lookup", "answer"),
         })),
@@ -2718,10 +2734,10 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
                 export_params: &checked_exports(&export_params),
                 data_source_values: &data_source_values,
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -4442,7 +4458,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
         &carina_core::schema::SchemaRegistry::new(),
         &[],
         &std::collections::HashMap::new(),
-        &ProviderContext::default(),
+        &loaded_provider_context(),
     )
     .await;
 
@@ -4459,7 +4475,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
 
 #[tokio::test]
 async fn persist_exports_only_writes_state_with_new_exports() {
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::InferredExportParam;
     use carina_core::resource::{ConcreteValue, Value};
 
     let captured = Arc::new(Mutex::new(None));
@@ -4470,7 +4486,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
 
     let export_params = vec![InferredExportParam {
         name: "account_id".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Concrete(ConcreteValue::String(
             "123456789012".into(),
         ))),
@@ -4487,7 +4503,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
         &carina_core::schema::SchemaRegistry::new(),
         &[],
         &std::collections::HashMap::new(),
-        &ProviderContext::default(),
+        &loaded_provider_context(),
     )
     .await;
 
@@ -4507,7 +4523,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
 
 #[tokio::test]
 async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -4519,7 +4535,7 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
     state_in.insert_export_json_for_test("role_arn", serde_json::json!("prior-arn"));
     let export_params = vec![InferredExportParam {
         name: "role_arn".to_string(),
-        type_expr: TypeExpr::Unknown,
+        static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("role", "web_acl_arn"),
         })),
@@ -4536,7 +4552,7 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
         &carina_core::schema::SchemaRegistry::new(),
         &[],
         &HashMap::new(),
-        &ProviderContext::default(),
+        &loaded_provider_context(),
     )
     .await;
 
@@ -4612,10 +4628,10 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
                 export_params: &checked_exports(&[]),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &[],
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -4679,7 +4695,6 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
             export_resolution_inputs: None,
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -4704,7 +4719,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
 
 #[tokio::test]
 async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved() {
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -4751,14 +4766,14 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     let export_params = vec![
         InferredExportParam {
             name: "ax".to_string(),
-            type_expr: TypeExpr::Unknown,
+            static_type: fixture_unchecked_export_static_type(),
             value: Some(Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("a", "id"),
             })),
         },
         InferredExportParam {
             name: "bx".to_string(),
-            type_expr: TypeExpr::Unknown,
+            static_type: fixture_unchecked_export_static_type(),
             value: Some(Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("b", "id"),
             })),
@@ -4776,10 +4791,10 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
                 export_params: &checked_exports(&export_params),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &export_resources,
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -4867,7 +4882,9 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
     };
     let export_params = vec![InferredExportParam {
         name: "broken".to_string(),
-        type_expr: TypeExpr::Float,
+        static_type: carina_core::static_type::ExportStaticType::Inferred(
+            carina_core::static_type::StaticType::Known(TypeExpr::Float),
+        ),
         value: Some(Value::Concrete(ConcreteValue::Float(f64::NAN))),
     }];
 
@@ -4882,10 +4899,10 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
                 export_params: &checked_exports(&export_params),
                 data_source_values: &DataSourceValues::empty(),
                 resources: &export_resources,
+                provider_context: &loaded_provider_context(),
             }),
             backend: &backend,
             lock: StateLockRef::Held(&lock),
-            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },

@@ -36,7 +36,6 @@ fn share_provider_attrs_resolves_default_tags() {
         &mut config.parsed,
         &fixture,
         true,
-        &config.inference_errors,
         &config.duplicate_declarations,
     )
     .expect("validate_and_resolve must succeed");
