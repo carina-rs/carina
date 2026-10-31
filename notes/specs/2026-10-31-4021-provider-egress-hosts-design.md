@@ -327,6 +327,28 @@ plus an equal declaration with the same source (see Types).
   minted from the signer verified at each load (Types), so a repin
   automatically revalidates the `carina-rs-signed` records.
 
+### D8. `file://` consent binds path and declaration, not `sha256` (chosen)
+
+D5 binds an explicit consent to source, `sha256` and declaration. For
+`file://` sources the resolver never compares the installed bytes with the
+lock's `sha256` (a rebuild changes it, and each init rewrites it).
+
+Options considered:
+
+- **Enforce the `sha256`.** Every local rebuild would then need
+  `carina init` before `plan`, even though it never prompts.
+- **Bind the consent to the canonical path and the declaration** and keep
+  the recorded `sha256` informational.
+
+The second was chosen. For `file://` sources:
+
+- A rebuild with an unchanged declaration loads without `carina init`.
+- A rebuild with a changed declaration cannot create runtime instances
+  until `carina init` shows the diff and asks.
+
+Lock-controlled sources keep the full binding, because the resolver already
+refuses bytes whose `sha256` differs from the lock.
+
 ## Types
 
 The aim is that a request permission can only be built from:
@@ -494,9 +516,10 @@ Entries that have no egress record:
   resolver already refuses bytes whose `sha256` differs from the lock, so
   `decl.sha256` equals the locked `sha256`.
 - For `file://` sources, the resolver does not compare today (the sha is
-  refreshed by each init, and load uses whatever bytes are on disk). This
-  design keeps that: for a `file://` source, consent binds the canonical
-  path and the declaration, and the recorded `sha256` is informational.
+  refreshed by each init, and load uses whatever bytes are on disk). The
+  maintainer chose to keep that (D8): for a `file://` source, consent binds
+  the canonical path and the declaration, and the recorded `sha256` is
+  informational.
   - A rebuild with an unchanged declaration loads without `carina init`.
   - A rebuild whose section differs from the lock is refused at
     runtime-instance creation until `carina init` shows the diff and asks.
