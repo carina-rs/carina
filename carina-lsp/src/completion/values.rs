@@ -2191,7 +2191,7 @@ fn resolve_upstream_export_keys(
 ) -> Option<carina_core::upstream_exports::UpstreamExportEntries> {
     let base = base_path?;
     let upstream = carina_core::parser::UpstreamState {
-        binding: binding.to_string(),
+        binding: carina_core::resource::RelativeBindingName::new(binding),
         source: std::path::PathBuf::from(source),
     };
     let (mut exports, _errors) =
@@ -2267,7 +2267,7 @@ fn infer_for_binding_type(
         .entry(iterable.binding.clone())
         .or_insert_with(|| {
             let upstream = carina_core::parser::UpstreamState {
-                binding: iterable.binding.clone(),
+                binding: carina_core::resource::RelativeBindingName::new(iterable.binding.clone()),
                 source: std::path::PathBuf::from(source),
             };
             let (mut resolved, _errors) =

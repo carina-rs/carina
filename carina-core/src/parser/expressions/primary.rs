@@ -5,7 +5,9 @@
 //! partial-application handling), variable references with field/index
 //! access chains, and value-position `if` expressions.
 
-use crate::eval_value::{EvalValue, StructuralHandleMetadata};
+use crate::eval_value::{
+    AuthoredEvalValue as EvalValue, AuthoredStructuralHandleMetadata as StructuralHandleMetadata,
+};
 use crate::parser::context::{ExpressionMode, ParseBindingRef};
 use crate::parser::expressions::if_expr::parse_if_value_expr_with_mode;
 use crate::parser::expressions::string_literal::parse_string_value;
@@ -16,7 +18,8 @@ use crate::parser::{
     parse_expression_eval_with_mode,
 };
 use crate::resource::{
-    AccessMissPolicy, AccessPath, ConcreteValue, DeferredValue, PathSegment, Subscript, Value,
+    AccessMissPolicy, AuthoredAccessPath as AccessPath, AuthoredConcreteValue as ConcreteValue,
+    AuthoredDeferredValue as DeferredValue, AuthoredValue as Value, PathSegment, Subscript,
     ValuePathSegmentResult, ValueString, apply_value_path_segment,
 };
 use indexmap::IndexMap;
@@ -130,13 +133,16 @@ pub(crate) fn apply_postfix_path_segment(
             let binding = handle.canonical_binding_name();
             if let PathSegment::Subscript { index } = &step {
                 let binding = match index {
-                    Subscript::Int { index } => format!("{binding}[{index}]"),
-                    Subscript::Str { key } => {
-                        crate::utils::map_key_address(binding, key.expose_plaintext())
-                    }
+                    Subscript::Int { index } => ValueString::plain(format!("{binding}[{index}]")),
+                    Subscript::Str { key } => ValueString::derived_from(
+                        crate::utils::map_key_address(binding, key.expose_plaintext()),
+                        [key],
+                    ),
                 };
                 return Ok(EvalValue::from_value(Value::Deferred(
-                    DeferredValue::BindingRef { binding },
+                    DeferredValue::BindingRef {
+                        binding: crate::resource::RelativeBindingName::new(binding),
+                    },
                 )));
             }
             handle.access_base_value()
@@ -278,7 +284,13 @@ fn parse_namespaced_id_value(
             })
             .collect();
         segments.extend(trailing_segments);
-        let path = AccessPath::with_segments(parts[0].to_string(), parts[1].to_string(), segments);
+        let path = AccessPath::with_segments_at_source(
+            parts[0].to_string(),
+            parts[1].to_string(),
+            segments,
+            ctx.source_file(),
+            line,
+        );
         EvalValue::from_value(Value::Deferred(DeferredValue::ResourceRef { path }))
     };
 
@@ -296,10 +308,12 @@ fn parse_namespaced_id_value(
                 })
                 .collect();
             segments.extend(trailing_segments);
-            let path = AccessPath::with_segments(
+            let path = AccessPath::with_segments_at_source(
                 handle.canonical_binding_name().to_string(),
                 parts[1].to_string(),
                 segments,
+                ctx.source_file(),
+                line,
             );
             return Ok(EvalValue::from_value(Value::Deferred(
                 DeferredValue::ResourceRef { path },
@@ -821,7 +835,7 @@ pub(crate) fn parse_primary_eval_with_mode(
                     ) {
                         return Ok(EvalValue::from_value(Value::Deferred(
                             DeferredValue::BindingRef {
-                                binding: binding_name.into_plaintext(),
+                                binding: crate::resource::RelativeBindingName::new(binding_name),
                             },
                         )));
                     }
@@ -838,14 +852,14 @@ pub(crate) fn parse_primary_eval_with_mode(
                         }
                         ParseBindingRef::Structural(_) | ParseBindingRef::Unbound => Ok(
                             EvalValue::from_value(Value::Deferred(DeferredValue::BindingRef {
-                                binding: binding_name.into_plaintext(),
+                                binding: crate::resource::RelativeBindingName::new(binding_name),
                             })),
                         ),
                     }
                 } else {
                     let attribute_name = field_names.remove(0);
                     let path = AccessPath::with_fields_and_subscripts(
-                        binding_name.clone(),
+                        binding_name,
                         attribute_name,
                         field_names,
                         subscripts,

@@ -67,11 +67,14 @@ pub(super) fn resolved_signature_with_policy<P: TypeResolutionPolicy>(
 }
 
 /// Load and resolve every module signature imported by `parsed`.
-pub fn load_resolved_module_signatures<E, D>(
-    parsed: &File<E, D>,
+pub fn load_resolved_module_signatures<E, B, D>(
+    parsed: &File<E, B, D>,
     base_dir: &Path,
     config: &ProviderContext,
-) -> ResolvedModuleSignatures {
+) -> ResolvedModuleSignatures
+where
+    B: crate::resource::BindingAddress,
+{
     parsed
         .uses
         .iter()

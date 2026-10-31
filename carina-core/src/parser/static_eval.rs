@@ -6,8 +6,12 @@
 
 use super::ProviderContext;
 use super::error::ParseError;
-use crate::eval_value::EvalValue;
-use crate::resource::{AccessMissPolicy, ConcreteValue, DeferredValue, InterpolationPart, Value};
+use crate::eval_value::AuthoredEvalValue as EvalValue;
+use crate::resource::{
+    AccessMissPolicy, AuthoredConcreteValue as ConcreteValue,
+    AuthoredDeferredValue as DeferredValue, AuthoredFunctionArgument as FunctionArgument,
+    AuthoredInterpolationPart as InterpolationPart, AuthoredValue as Value,
+};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +76,16 @@ fn classify_non_static_if_condition(
                     ))
                 })
         }
-        Value::Concrete(_) => IfConditionDependency::Static,
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        ) => IfConditionDependency::Static,
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred.values().into_iter().fold(
             IfConditionDependency::Static,
             |dependency, value| {
@@ -83,21 +96,29 @@ fn classify_non_static_if_condition(
                 ))
             },
         ),
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
-            args.iter()
-                .fold(IfConditionDependency::Static, |dependency, argument| {
-                    if argument.handle().is_some() {
-                        dependency
-                    } else {
-                        dependency.combine(classify_non_static_if_condition(
-                            argument.walker_value(),
-                            function_placeholders_static,
-                            visiting_functions,
-                        ))
-                    }
-                })
-        }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: _,
+            args,
+            source_line: _,
+        }) => args
+            .iter()
+            .fold(IfConditionDependency::Static, |dependency, argument| {
+                if argument.handle().is_some() {
+                    dependency
+                } else {
+                    dependency.combine(classify_non_static_if_condition(
+                        argument.walker_value(),
+                        function_placeholders_static,
+                        visiting_functions,
+                    ))
+                }
+            }),
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions: _,
+            args,
+            source_line: _,
+        }) => {
             let argument_dependency =
                 args.iter()
                     .fold(IfConditionDependency::Static, |dependency, argument| {
@@ -182,18 +203,37 @@ fn classify_non_static_if_condition(
             ))
         }
         Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument { .. },
+            crate::resource::UnknownReason::ModuleArgument {
+                name: _,
+                source_line: _,
+                diagnostic_name: _,
+            },
         )) => IfConditionDependency::ModuleDependent,
         Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::FnParam { .. }
-            | crate::resource::UnknownReason::FnLocal { .. },
+            crate::resource::UnknownReason::FnParam { name: _ }
+            | crate::resource::UnknownReason::FnLocal { name: _ },
         )) if function_placeholders_static => IfConditionDependency::Static,
         Value::Deferred(
-            DeferredValue::ResourceRef { .. }
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::Unavailable { .. }
-            | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+            DeferredValue::ResourceRef { path: _ }
+            | DeferredValue::BindingRef { binding: _ }
+            | DeferredValue::Unavailable {
+                name: _,
+                args: _,
+                reason: _,
+                source_line: _,
+            }
+            | DeferredValue::RedactedSecret { hash: _ }
+            | DeferredValue::Unknown(
+                crate::resource::UnknownReason::UpstreamExport { path: _ }
+                | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
+                | crate::resource::UnknownReason::ForKey
+                | crate::resource::UnknownReason::ForIndex
+                | crate::resource::UnknownReason::ForValue
+                | crate::resource::UnknownReason::FnParam { name: _ }
+                | crate::resource::UnknownReason::FnLocal { name: _ }
+                | crate::resource::UnknownReason::EmptyInterpolation
+                | crate::resource::UnknownReason::PendingReRead(_),
+            ),
         ) => IfConditionDependency::Runtime,
     }
 }
@@ -365,7 +405,7 @@ pub(crate) fn evaluate_static_value(
                 });
             }
             // Recursively evaluate any nested FunctionCall arguments
-            let evaluated_args: Result<Vec<crate::resource::FunctionArgument>, ParseError> = args
+            let evaluated_args: Result<Vec<FunctionArgument>, ParseError> = args
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| evaluate_static_value(value.clone(), config))
@@ -434,9 +474,9 @@ pub(crate) fn evaluate_static_value(
         }
         Value::Deferred(DeferredValue::Unavailable {
             name,
+            args: _,
             reason,
             source_line,
-            ..
         }) => Err(ParseError::InvalidExpression {
             line: source_line.get().unwrap_or(0),
             message: format!("{name}(): {reason}"),
@@ -453,11 +493,29 @@ pub(crate) fn evaluate_static_value(
         )
         | value @ Value::Deferred(
             DeferredValue::ModuleIf(_)
-            | DeferredValue::ResourceRef { .. }
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::Coalesce { .. }
-            | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+            | DeferredValue::ResourceRef { path: _ }
+            | DeferredValue::BindingRef { binding: _ }
+            | DeferredValue::Coalesce {
+                value: _,
+                default: _,
+            }
+            | DeferredValue::RedactedSecret { hash: _ }
+            | DeferredValue::Unknown(
+                crate::resource::UnknownReason::UpstreamExport { path: _ }
+                | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
+                | crate::resource::UnknownReason::ForKey
+                | crate::resource::UnknownReason::ForIndex
+                | crate::resource::UnknownReason::ForValue
+                | crate::resource::UnknownReason::FnParam { name: _ }
+                | crate::resource::UnknownReason::ModuleArgument {
+                    name: _,
+                    source_line: _,
+                    diagnostic_name: _,
+                }
+                | crate::resource::UnknownReason::FnLocal { name: _ }
+                | crate::resource::UnknownReason::EmptyInterpolation
+                | crate::resource::UnknownReason::PendingReRead(_),
+            ),
         ) => Ok(value),
     }
 }

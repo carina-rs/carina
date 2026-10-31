@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::resource::{Resource, Value};
+use crate::resource::{AbsoluteBindingAddress, BindingAddress, Resource, Value};
 
 /// Extract binding names that a resource depends on.
 ///
@@ -14,7 +14,7 @@ use crate::resource::{Resource, Value};
 ///
 /// Both sources are always merged because partial resolution can cause
 /// ResourceRef bindings to differ from the original direct dependencies.
-pub fn get_resource_dependencies<S>(resource: &Resource<S>) -> HashSet<String> {
+pub fn get_resource_dependencies<S, B: BindingAddress>(resource: &Resource<S, B>) -> HashSet<B> {
     let mut deps = HashSet::new();
     for value in resource.attributes.values() {
         collect_dependencies(value, &mut deps);
@@ -41,13 +41,15 @@ pub fn get_resource_dependencies<S>(resource: &Resource<S>) -> HashSet<String> {
 /// never carry `depends_on`. The collection therefore reduces to
 /// "attributes' ResourceRefs ∪ `dependency_bindings`", which is the
 /// same first-two-thirds of [`get_resource_dependencies`].
-pub fn get_composition_dependencies(virt: &crate::resource::LiveComposition) -> HashSet<String> {
+pub fn get_composition_dependencies(
+    virt: &crate::resource::LiveComposition,
+) -> HashSet<AbsoluteBindingAddress> {
     get_composition_runtime_dependencies(crate::resource::CompositionRuntimeRef::Live(virt))
 }
 
 pub(crate) fn get_composition_runtime_dependencies(
     composition: crate::resource::CompositionRuntimeRef<'_>,
-) -> HashSet<String> {
+) -> HashSet<AbsoluteBindingAddress> {
     let mut deps = HashSet::new();
     for (_name, value) in composition.attributes() {
         // The Forwarded/Derived split (#3294) is a typed
@@ -68,9 +70,9 @@ pub(crate) fn get_composition_runtime_dependencies(
 /// `dependency_bindings` ∪ `directives.depends_on`" — structurally the
 /// same union [`get_resource_dependencies`] computes for a managed
 /// resource.
-pub fn get_data_source_dependencies<S>(
-    data_source: &crate::resource::DataSource<S>,
-) -> HashSet<String> {
+pub fn get_data_source_dependencies<S, B: BindingAddress>(
+    data_source: &crate::resource::DataSource<S, B>,
+) -> HashSet<B> {
     let mut deps = HashSet::new();
     for value in data_source.attributes.values() {
         collect_dependencies(value, &mut deps);
@@ -91,12 +93,12 @@ pub fn get_data_source_dependencies<S>(
 /// resource depends on the named binding. The two parse to different
 /// `Value` variants since #2847 (`ResourceRef` vs. `BindingRef`), so
 /// the walker visits both forms here.
-pub(crate) fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
+pub(crate) fn collect_dependencies<B: BindingAddress>(value: &Value<B>, deps: &mut HashSet<B>) {
     value.visit_resource_refs(&mut |path| {
-        deps.insert(path.binding().to_string());
+        deps.insert(path.binding_address().clone());
     });
     value.visit_binding_refs(&mut |binding| {
-        deps.insert(binding.to_string());
+        deps.insert(binding.clone());
     });
 }
 
@@ -111,9 +113,9 @@ pub(crate) fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
 /// can compute the snapshot for any node kind ([`Resource`],
 /// [`DataSource`], [`LiveComposition`](crate::resource::LiveComposition))
 /// uniformly (carina#3181 / #3308).
-pub fn get_resource_value_ref_dependencies<S>(
-    resource: crate::parser::ResourceRef<'_, S>,
-) -> HashSet<String> {
+pub fn get_resource_value_ref_dependencies<S, B: BindingAddress>(
+    resource: crate::parser::ResourceRef<'_, S, B>,
+) -> HashSet<B> {
     let mut deps = HashSet::new();
     let attrs = resource.attributes();
     for value in attrs.values() {
@@ -133,15 +135,19 @@ pub fn get_resource_value_ref_dependencies<S>(
 ///
 /// Returns an error if a circular dependency is detected, with a message
 /// showing the cycle path (e.g., "Circular dependency detected: a -> b -> c -> a").
-pub fn sort_resources_by_dependencies(resources: &[Resource]) -> Result<Vec<Resource>, String> {
+pub fn sort_resources_by_dependencies<S: Clone, B: BindingAddress>(
+    resources: &[Resource<S, B>],
+) -> Result<Vec<Resource<S, B>>, String> {
     topological_sort(resources)
 }
 
 /// Internal topological sort for creation ordering.
-fn topological_sort(resources: &[Resource]) -> Result<Vec<Resource>, String> {
+fn topological_sort<S: Clone, B: BindingAddress>(
+    resources: &[Resource<S, B>],
+) -> Result<Vec<Resource<S, B>>, String> {
     // Build binding name to input index mapping. Graph membership is indexed
     // by declaration position so two anonymous resources cannot collapse.
-    let mut binding_to_index: HashMap<String, usize> = HashMap::new();
+    let mut binding_to_index: HashMap<B, usize> = HashMap::new();
     for (index, resource) in resources.iter().enumerate() {
         if let Some(ref binding_name) = resource.binding {
             binding_to_index.insert(binding_name.clone(), index);
@@ -153,20 +159,21 @@ fn topological_sort(resources: &[Resource]) -> Result<Vec<Resource>, String> {
     let mut visited: HashSet<usize> = HashSet::new();
     let mut visiting: Vec<usize> = Vec::new();
 
-    fn label(resource: &Resource) -> String {
+    fn label<S, B: BindingAddress>(resource: &Resource<S, B>) -> String {
         resource
             .binding
-            .clone()
+            .as_ref()
+            .map(ToString::to_string)
             .unwrap_or_else(|| resource.id.to_string())
     }
 
-    fn visit(
+    fn visit<S: Clone, B: BindingAddress>(
         index: usize,
-        resources: &[Resource],
-        binding_to_index: &HashMap<String, usize>,
+        resources: &[Resource<S, B>],
+        binding_to_index: &HashMap<B, usize>,
         visited: &mut HashSet<usize>,
         visiting: &mut Vec<usize>,
-        sorted: &mut Vec<Resource>,
+        sorted: &mut Vec<Resource<S, B>>,
     ) -> Result<(), String> {
         if visited.contains(&index) {
             return Ok(());
@@ -228,15 +235,21 @@ fn topological_sort(resources: &[Resource]) -> Result<Vec<Resource>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::Effect;
+    use crate::effect::{Effect, SchedulerKey};
     use crate::resource::{
-        ConcreteValue, DeferredValue, Resource, ResourceId, ResourceIdentity, Value,
+        AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
+        ExpandedDeferredValue as DeferredValue, ExpandedResource as Resource,
+        ExpandedValue as Value, RelativeBindingName, ResourceId, ResourceIdentity, RootScope,
     };
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
+    fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
+        RootScope::new().resolve(RelativeBindingName::new(binding))
+    }
+
     fn wait_effect_with_explicit_dependency(binding: Option<&str>) -> Effect {
         Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            identity: absolute_binding("cert_issued"),
             target_id: crate::wait::ManagedWaitTarget::new(
                 &crate::resource::ResolvedResource::new(Resource::new("acm.Certificate", "cert")),
             ),
@@ -248,17 +261,17 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: std::time::Duration::from_secs(60),
             interval: std::time::Duration::from_millis(1),
-            explicit_dependencies: binding.into_iter().map(String::from).collect(),
+            explicit_dependencies: binding.into_iter().map(absolute_binding).collect(),
         }
     }
 
     fn make_resource(binding: &'static str, deps: &[&str]) -> Resource {
         let mut r = Resource::new("test", binding);
-        r.binding = Some(binding.to_string());
+        r.binding = Some(absolute_binding(binding));
         for dep in deps {
             r.set_attr(
                 format!("ref_{}", dep),
-                Value::resource_ref(dep.to_string(), "id", vec![]),
+                Value::root_resource_ref(dep.to_string(), "id", vec![]),
             );
         }
         r
@@ -268,31 +281,34 @@ mod tests {
     fn test_get_resource_dependencies() {
         let resource = make_resource("a", &["b", "c"]);
         let deps = get_resource_dependencies(&resource);
-        assert!(deps.contains("b"));
-        assert!(deps.contains("c"));
+        assert!(deps.contains(&absolute_binding("b")));
+        assert!(deps.contains(&absolute_binding("c")));
         assert_eq!(deps.len(), 2);
     }
 
     #[test]
     fn test_get_composition_dependencies_collects_attrs_and_deps() {
-        use crate::resource::{LiveComposition, LiveCompositionSignature};
+        use crate::resource::{
+            ExpandedLiveComposition as LiveComposition,
+            ExpandedLiveCompositionSignature as LiveCompositionSignature,
+        };
         use indexmap::IndexMap;
         use std::collections::BTreeSet;
 
         // Build a composition whose attributes carry a ResourceRef and
         // whose `dependency_bindings` carries a separate entry.
         // Both must end up in the merged set.
-        let mut attributes: IndexMap<String, crate::resource::LiveCompositionAttribute> =
+        let mut attributes: IndexMap<String, crate::resource::ExpandedLiveCompositionAttribute> =
             IndexMap::new();
         attributes.insert(
             "role_arn".to_string(),
-            crate::resource::LiveCompositionAttribute::from_value(
-                Value::resource_ref("role".to_string(), "arn", vec![]),
+            crate::resource::ExpandedLiveCompositionAttribute::from_value(
+                Value::root_resource_ref("role".to_string(), "arn", vec![]),
                 None,
             ),
         );
         let mut dep_bindings = BTreeSet::new();
-        dep_bindings.insert("explicit_dep".to_string());
+        dep_bindings.insert(absolute_binding("explicit_dep"));
         let virt = LiveComposition {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual.module",
@@ -303,7 +319,7 @@ mod tests {
                 attributes,
                 pending_constraints: Vec::new(),
             },
-            binding: Some("v".to_string()),
+            binding: Some(absolute_binding("v")),
             dependency_bindings: dep_bindings,
             module_name: "m".to_string(),
             instance: "v".to_string(),
@@ -313,11 +329,11 @@ mod tests {
 
         let deps = get_composition_dependencies(&virt);
         assert!(
-            deps.contains("role"),
+            deps.contains(&absolute_binding("role")),
             "expected attribute ResourceRef binding `role`, got {deps:?}",
         );
         assert!(
-            deps.contains("explicit_dep"),
+            deps.contains(&absolute_binding("explicit_dep")),
             "expected pre-recorded dependency `explicit_dep`, got {deps:?}",
         );
         assert_eq!(deps.len(), 2);
@@ -327,7 +343,7 @@ mod tests {
     fn collect_dependencies_recurses_into_secret_inner_value() {
         // `Deferred(Secret(_))` is reachable after resolution wraps a value
         // (for example in parser/resolve.rs), so pin this walker arm directly.
-        let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::resource_ref(
+        let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::root_resource_ref(
             "role",
             "arn",
             vec![],
@@ -336,7 +352,12 @@ mod tests {
 
         collect_dependencies(&value, &mut deps);
 
-        assert_eq!(deps, HashSet::from(["role".to_string()]));
+        assert_eq!(
+            deps.into_iter()
+                .map(|binding| binding.to_string())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["role".to_string()]),
+        );
     }
 
     #[test]
@@ -348,7 +369,7 @@ mod tests {
                 name: crate::builtins::BuiltinFunction::split,
                 args: vec![
                     Value::Concrete(ConcreteValue::String("/".into())).into(),
-                    Value::resource_ref("role", "arn", vec![]).into(),
+                    Value::root_resource_ref("role", "arn", vec![]).into(),
                 ],
                 source_line: (0).into(),
             }),
@@ -363,7 +384,12 @@ mod tests {
 
         collect_dependencies(&value, &mut deps);
 
-        assert_eq!(deps, HashSet::from(["role".to_string()]));
+        assert_eq!(
+            deps.into_iter()
+                .map(|binding| binding.to_string())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["role".to_string()]),
+        );
     }
 
     // Closure-in-attribute regression test deleted: `Value::Closure` no
@@ -382,32 +408,34 @@ mod tests {
     /// already non-empty.
     #[test]
     fn test_dependency_bindings_merged_when_resourceref_partially_resolved() {
-        let mut resource = Resource::new("ec2.route", "my-route");
+        let mut resource: Resource = Resource::new("ec2.route", "my-route");
         // After partial resolution: transit_gateway_id resolved to a ResourceRef
         // pointing at "tgw" (the transitive target), not "tgw_attach" (the direct dep)
         resource.set_attr(
             "transit_gateway_id".to_string(),
-            Value::resource_ref("tgw", "id", vec![]),
+            Value::root_resource_ref("tgw", "id", vec![]),
         );
         // route_table_id resolved to a ResourceRef pointing at "rt"
         resource.set_attr(
             "route_table_id".to_string(),
-            Value::resource_ref("rt", "route_table_id", vec![]),
+            Value::root_resource_ref("rt", "route_table_id", vec![]),
         );
         // dependency_bindings was saved before resolution with the CORRECT deps
-        resource.dependency_bindings =
-            std::collections::BTreeSet::from(["rt".to_string(), "tgw_attach".to_string()]);
+        resource.dependency_bindings = std::collections::BTreeSet::from([
+            absolute_binding("rt"),
+            absolute_binding("tgw_attach"),
+        ]);
 
         let deps = get_resource_dependencies(&resource);
         // Must include "tgw_attach" from dependency_bindings
         assert!(
-            deps.contains("tgw_attach"),
+            deps.contains(&absolute_binding("tgw_attach")),
             "Expected deps to contain 'tgw_attach' but got: {:?}",
             deps
         );
         // Must also include "rt" and "tgw"
-        assert!(deps.contains("rt"));
-        assert!(deps.contains("tgw"));
+        assert!(deps.contains(&absolute_binding("rt")));
+        assert!(deps.contains(&absolute_binding("tgw")));
     }
 
     #[test]
@@ -425,18 +453,26 @@ mod tests {
 
         // Even if b comes first in the input, a should come first in the output
         let sorted = sort_resources_by_dependencies(&[b, a]).unwrap();
-        let binding_order: Vec<_> = sorted.iter().filter_map(|r| r.binding.as_deref()).collect();
+        let binding_order: Vec<_> = sorted
+            .iter()
+            .filter_map(|resource| {
+                resource
+                    .binding
+                    .as_ref()
+                    .map(AbsoluteBindingAddress::as_str)
+            })
+            .collect();
         assert_eq!(binding_order, vec!["a", "b"]);
     }
 
     #[test]
     fn pending_anonymous_resources_of_the_same_type_survive_in_declaration_order() {
-        let mut alpha = Resource::pending("test.resource");
+        let mut alpha: Resource = Resource::pending("test.resource");
         alpha.set_attr(
             "name",
             Value::Concrete(ConcreteValue::String("alpha".into())),
         );
-        let mut beta = Resource::pending("test.resource");
+        let mut beta: Resource = Resource::pending("test.resource");
         beta.set_attr(
             "name",
             Value::Concrete(ConcreteValue::String("beta".into())),
@@ -450,12 +486,12 @@ mod tests {
     #[test]
     fn wait_blocking_bindings_include_target_before_explicit_dependencies() {
         let effect = wait_effect_with_explicit_dependency(Some("other_failed"));
-        let blocking_bindings = effect.blocking_bindings();
-
-        assert_eq!(blocking_bindings.first(), Some(&"cert".to_string()));
         assert_eq!(
-            blocking_bindings.into_iter().collect::<HashSet<_>>(),
-            HashSet::from(["cert".to_string(), "other_failed".to_string()])
+            effect.blocking_keys(),
+            vec![
+                SchedulerKey::Resource(ResourceIdentity::new("cert")),
+                SchedulerKey::Binding(absolute_binding("other_failed")),
+            ]
         );
     }
 
@@ -532,9 +568,12 @@ mod tests {
         let creation_order: Vec<String> = sorted
             .iter()
             .map(|r| {
-                r.binding.clone().unwrap_or_else(|| {
-                    format!("{}:{}", r.id.resource_type, r.id.identity_display())
-                })
+                r.binding
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| {
+                        format!("{}:{}", r.id.resource_type, r.id.identity_display())
+                    })
             })
             .collect();
 
@@ -616,9 +655,12 @@ mod tests {
         let creation_order: Vec<String> = sorted
             .iter()
             .map(|r| {
-                r.binding.clone().unwrap_or_else(|| {
-                    format!("{}:{}", r.id.resource_type, r.id.identity_display())
-                })
+                r.binding
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| {
+                        format!("{}:{}", r.id.resource_type, r.id.identity_display())
+                    })
             })
             .collect();
 
@@ -642,12 +684,12 @@ mod tests {
 
     #[test]
     fn directives_depends_on_is_unioned_into_resource_dependencies() {
-        let mut bucket = Resource::new("s3.Bucket", "bucket");
-        bucket.directives.depends_on = vec!["role".to_string()];
+        let mut bucket: Resource = Resource::new("s3.Bucket", "bucket");
+        bucket.directives.depends_on = vec![absolute_binding("role")];
 
         let deps = get_resource_dependencies(&bucket);
         assert!(
-            deps.contains("role"),
+            deps.contains(&absolute_binding("role")),
             "expected directives.depends_on entry to surface in get_resource_dependencies, got {:?}",
             deps
         );
@@ -655,15 +697,21 @@ mod tests {
 
     #[test]
     fn directives_depends_on_unions_with_value_refs() {
-        let mut bucket = Resource::new("s3.Bucket", "bucket");
+        let mut bucket: Resource = Resource::new("s3.Bucket", "bucket");
         bucket.set_attr(
             "encryption_key".to_string(),
-            Value::resource_ref("key", "arn", vec![]),
+            Value::root_resource_ref("key", "arn", vec![]),
         );
-        bucket.directives.depends_on = vec!["role".to_string()];
+        bucket.directives.depends_on = vec![absolute_binding("role")];
 
         let deps = get_resource_dependencies(&bucket);
-        assert!(deps.contains("key"), "value-ref dep missing");
-        assert!(deps.contains("role"), "directives.depends_on dep missing");
+        assert!(
+            deps.contains(&absolute_binding("key")),
+            "value-ref dep missing"
+        );
+        assert!(
+            deps.contains(&absolute_binding("role")),
+            "directives.depends_on dep missing"
+        );
     }
 }

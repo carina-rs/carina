@@ -1995,10 +1995,18 @@ pub fn protocol_to_resource_id(id: &protocol::ResourceId) -> ResourceId {
 
 /// Encode directives that have already been resolved for a provider boundary.
 pub fn directives_to_protocol(directives: &ProviderDirectives) -> protocol::Directives {
+    let ProviderDirectives {
+        force_delete,
+        create_before_destroy,
+        prevent_destroy,
+        // Protection provenance is host policy metadata. WIT v13 transports
+        // only the three effective booleans.
+        prevent_destroy_source: _prevent_destroy_source,
+    } = directives;
     protocol::Directives {
-        force_delete: directives.force_delete(),
-        create_before_destroy: directives.create_before_destroy(),
-        prevent_destroy: directives.prevent_destroy(),
+        force_delete: *force_delete,
+        create_before_destroy: *create_before_destroy,
+        prevent_destroy: *prevent_destroy,
     }
 }
 
@@ -2724,7 +2732,7 @@ mod tests {
     #[test]
     fn schema_default_prevent_destroy_is_true_in_provider_protocol_resources() {
         let schema = ResourceSchema::new("test.Widget").default_prevent_destroy();
-        let resource = Resource::with_provider(
+        let resource: Resource = Resource::with_provider(
             "test",
             "test.Widget",
             ResourceIdentity::from("example"),
@@ -2901,9 +2909,10 @@ mod tests {
             RedactedSecretHash::from_encoded_digest(&digest).expect("fixture digest must be valid");
         let non_wire = [
             Value::Concrete(ConcreteValue::enum_identifier("test.Mode.enabled")),
-            Value::resource_ref("source", "value", Vec::new()),
+            crate::resource::AuthoredValue::resource_ref("source", "value", Vec::new())
+                .resolve_root(&crate::resource::RootScope::new()),
             Value::Deferred(DeferredValue::BindingRef {
-                binding: "source".to_string(),
+                binding: crate::resource::RootScope::new().resolve("source".into()),
             }),
             Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(Value::Deferred(DeferredValue::Unknown(

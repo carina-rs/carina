@@ -21,7 +21,7 @@ use crate::config_loader::{find_crn_files_in_dir, parse_directory};
 use crate::parser::{
     LoadedProviderContext, ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState,
 };
-use crate::resource::{DeferredValue, Subscript, Value};
+use crate::resource::{BindingAddress, DeferredValue, Subscript, Value};
 use crate::schema::suggest_similar_name;
 use crate::static_type::ConsumerExportStaticType;
 #[cfg(test)]
@@ -186,9 +186,9 @@ impl UpstreamRefDiagnostic for UpstreamFieldError {
 ///
 /// An empty directory (no `.crn` files) is treated as "exports nothing"
 /// rather than a parse failure; the user may be mid-setup.
-pub fn resolve_upstream_exports(
+pub fn resolve_upstream_exports<B: crate::resource::BindingAddress>(
     base_dir: &Path,
-    upstream_states: &[UpstreamState],
+    upstream_states: &[UpstreamState<B>],
     config: &LoadedProviderContext,
 ) -> (UpstreamExports, Vec<UpstreamResolveError>) {
     resolve_upstream_exports_with_schemas(base_dir, upstream_states, config, None)
@@ -196,9 +196,9 @@ pub fn resolve_upstream_exports(
 
 /// Bootstrap/discovery variant of [`resolve_upstream_exports`]. Module value
 /// checks are limited to provider-independent types.
-pub fn resolve_upstream_exports_providerless(
+pub fn resolve_upstream_exports_providerless<B: crate::resource::BindingAddress>(
     base_dir: &Path,
-    upstream_states: &[UpstreamState],
+    upstream_states: &[UpstreamState<B>],
     config: &ProviderContext,
 ) -> (UpstreamExports, Vec<UpstreamResolveError>) {
     resolve_upstream_exports_providerless_with_schemas(base_dir, upstream_states, config, None)
@@ -211,9 +211,9 @@ pub fn resolve_upstream_exports_providerless(
 /// callers (CLI validate, LSP diagnostics, LSP completion) thread the
 /// real schema registry so unannotated exports become typed before
 /// downstream type-checks see them.
-pub fn resolve_upstream_exports_with_schemas(
+pub fn resolve_upstream_exports_with_schemas<B: crate::resource::BindingAddress>(
     base_dir: &Path,
-    upstream_states: &[UpstreamState],
+    upstream_states: &[UpstreamState<B>],
     config: &LoadedProviderContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
 ) -> (UpstreamExports, Vec<UpstreamResolveError>) {
@@ -227,9 +227,9 @@ pub fn resolve_upstream_exports_with_schemas(
 
 /// Bootstrap/discovery variant of
 /// [`resolve_upstream_exports_with_schemas`].
-pub fn resolve_upstream_exports_providerless_with_schemas(
+pub fn resolve_upstream_exports_providerless_with_schemas<B: crate::resource::BindingAddress>(
     base_dir: &Path,
-    upstream_states: &[UpstreamState],
+    upstream_states: &[UpstreamState<B>],
     config: &ProviderContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
 ) -> (UpstreamExports, Vec<UpstreamResolveError>) {
@@ -241,9 +241,9 @@ pub fn resolve_upstream_exports_providerless_with_schemas(
     )
 }
 
-fn resolve_upstream_exports_with_context(
+fn resolve_upstream_exports_with_context<B: crate::resource::BindingAddress>(
     base_dir: &Path,
-    upstream_states: &[UpstreamState],
+    upstream_states: &[UpstreamState<B>],
     provider_context: crate::validation::typecheck::TypecheckProviderContext<'_>,
     schemas: Option<&crate::schema::SchemaRegistry>,
 ) -> (UpstreamExports, Vec<UpstreamResolveError>) {
@@ -256,11 +256,12 @@ fn resolve_upstream_exports_with_context(
             continue;
         }
         if matches!(find_crn_files_in_dir(&source_abs), Ok(files) if files.is_empty()) {
-            out.insert(us.binding.clone(), HashMap::new());
+            out.insert(us.binding.to_string(), HashMap::new());
             continue;
         }
         match parse_directory(&source_abs, config) {
-            Ok(mut parsed) => {
+            Ok(parsed) => {
+                let mut parsed = parsed.into_parsed();
                 // Normalize every consumer-visible declaration before module
                 // expansion and export inference. Inference compares the
                 // structural TypeExpr values it receives, so leaving one
@@ -301,7 +302,7 @@ fn resolve_upstream_exports_with_context(
                     Ok(parsed) => parsed,
                     Err(reason) => {
                         errors.push(UpstreamResolveError {
-                            binding: us.binding.clone(),
+                            binding: us.binding.to_string(),
                             source: us.source.clone(),
                             reason: reason.to_string(),
                         });
@@ -363,11 +364,11 @@ fn resolve_upstream_exports_with_context(
                         })
                         .collect(),
                 };
-                out.insert(us.binding.clone(), entries);
+                out.insert(us.binding.to_string(), entries);
             }
             Err(reason) => {
                 errors.push(UpstreamResolveError {
-                    binding: us.binding.clone(),
+                    binding: us.binding.to_string(),
                     source: us.source.clone(),
                     reason,
                 });
@@ -381,10 +382,11 @@ fn resolve_upstream_exports_with_context(
 /// `for-body` prefix when the resource is a deferred-for template.
 /// Three checks emit the same string; centralized here so a future
 /// tweak to the wording lands in one place.
-fn resource_attr_location<D: crate::parser::DeferredForPhaseTraversal>(
-    rref: ResourceRef<'_, crate::resource::ModuleSource, D>,
-    attr_name: &str,
-) -> String {
+fn resource_attr_location<S, B, D>(rref: ResourceRef<'_, S, B, D>, attr_name: &str) -> String
+where
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<B>,
+{
     match rref.context() {
         ResourceContext::Direct => format!("{} attribute `{}`", rref.id(), attr_name),
         ResourceContext::Deferred(d) => {
@@ -402,11 +404,11 @@ fn resource_attr_location<D: crate::parser::DeferredForPhaseTraversal>(
 /// user-facing diagnostic location. Parser-side deferred resource bodies are
 /// matched explicitly; iterable expressions are handled separately because
 /// they have their own shape semantics.
-fn for_each_project_value<E, D, F>(parsed: &crate::parser::File<E, D>, mut f: F)
+fn for_each_project_value<E, D, F>(parsed: &crate::parser::File<E, E::Binding, D>, mut f: F)
 where
     E: crate::parser::ExportParamLike,
-    D: crate::parser::DeferredForPhaseTraversal,
-    F: FnMut(&Value, &str),
+    D: crate::parser::DeferredForPhaseTraversal<E::Binding>,
+    F: FnMut(&Value<E::Binding>, &str),
 {
     for rref in parsed.iter_all_resources() {
         for (attr_name, value) in rref.attributes().iter() {
@@ -419,7 +421,11 @@ where
         }
     }
     for call in &parsed.module_calls {
-        let caller = call.binding_name.as_deref().unwrap_or(&call.module_name);
+        let caller = call
+            .binding_name
+            .as_ref()
+            .map(BindingAddress::as_str)
+            .unwrap_or(&call.module_name);
         for (arg_name, value) in call.arguments() {
             f(
                 value.walker_value(),
@@ -438,9 +444,9 @@ where
 /// do about unresolved upstreams.
 pub fn check_upstream_state_field_references<
     E: crate::parser::ExportParamLike,
-    D: crate::parser::DeferredForPhaseTraversal,
+    D: crate::parser::DeferredForPhaseTraversal<E::Binding>,
 >(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<E, E::Binding, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamFieldError> {
     check_upstream_state_field_references_inner(parsed, exports, true)
@@ -453,9 +459,9 @@ pub fn check_upstream_state_field_references<
 /// run this check in isolation.
 pub fn check_upstream_state_untyped_field_references<
     E: crate::parser::ExportParamLike,
-    D: crate::parser::DeferredForPhaseTraversal,
+    D: crate::parser::DeferredForPhaseTraversal<E::Binding>,
 >(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<E, E::Binding, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamFieldError> {
     check_upstream_state_field_references_inner(parsed, exports, false)
@@ -463,9 +469,9 @@ pub fn check_upstream_state_untyped_field_references<
 
 fn check_upstream_state_field_references_inner<
     E: crate::parser::ExportParamLike,
-    D: crate::parser::DeferredForPhaseTraversal,
+    D: crate::parser::DeferredForPhaseTraversal<E::Binding>,
 >(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<E, E::Binding, D>,
     exports: &UpstreamExports,
     include_typed_consumers: bool,
 ) -> Vec<UpstreamFieldError> {
@@ -482,7 +488,7 @@ fn check_upstream_state_field_references_inner<
     // borrow it holds is released before we push deferred-iterable
     // errors directly below.
     {
-        let mut check = |value: &Value, location: &str| {
+        let mut check = |value: &Value<E::Binding>, location: &str| {
             value.visit_resource_refs_with_usage(&mut |path, usage| {
                 if usage == crate::resource::ResourceRefUsage::CoalesceValue {
                     return;
@@ -699,11 +705,18 @@ impl UpstreamRefDiagnostic for UpstreamForIterableShapeError {
 /// Both flag `(ForBinding × shape)` mismatches; this one fires at
 /// validate time off the upstream's *declared* type, the parser-side
 /// one fires at expansion time off the *resolved* `Value`.
-pub fn check_upstream_state_for_iterable_shapes<E, D: crate::parser::DeferredForPhaseTraversal>(
-    parsed: &crate::parser::File<E, D>,
+pub fn check_upstream_state_for_iterable_shapes<E, D>(
+    parsed: &crate::parser::File<E, E::Binding, D>,
     exports: &UpstreamExports,
-) -> Vec<UpstreamForIterableShapeError> {
-    fn visit_possible_iterables(value: &Value, f: &mut impl FnMut(&crate::resource::AccessPath)) {
+) -> Vec<UpstreamForIterableShapeError>
+where
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal<E::Binding>,
+{
+    fn visit_possible_iterables<B: BindingAddress>(
+        value: &Value<B>,
+        f: &mut impl FnMut(&crate::resource::AccessPath<B>),
+    ) {
         match value {
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
                 deferred
@@ -913,9 +926,9 @@ impl UpstreamRefDiagnostic for UpstreamAttributeAccessShapeError {
 /// shape" before apply.
 pub fn check_upstream_state_attribute_access_shapes<
     E: crate::parser::ExportParamLike,
-    D: crate::parser::DeferredForPhaseTraversal,
+    D: crate::parser::DeferredForPhaseTraversal<E::Binding>,
 >(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<E, E::Binding, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
     check_upstream_state_attribute_access_shapes_inner(parsed, exports, true)
@@ -930,9 +943,9 @@ pub fn check_upstream_state_attribute_access_shapes<
 /// diagnostics without reporting a struct-field typo twice.
 pub fn check_upstream_state_attribute_access_shape_fallbacks<
     E: crate::parser::ExportParamLike,
-    D: crate::parser::DeferredForPhaseTraversal,
+    D: crate::parser::DeferredForPhaseTraversal<E::Binding>,
 >(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<E, E::Binding, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
     check_upstream_state_attribute_access_shapes_inner(parsed, exports, false)
@@ -940,9 +953,9 @@ pub fn check_upstream_state_attribute_access_shape_fallbacks<
 
 fn check_upstream_state_attribute_access_shapes_inner<
     E: crate::parser::ExportParamLike,
-    D: crate::parser::DeferredForPhaseTraversal,
+    D: crate::parser::DeferredForPhaseTraversal<E::Binding>,
 >(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<E, E::Binding, D>,
     exports: &UpstreamExports,
     include_resolver_struct_errors: bool,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
@@ -978,8 +991,8 @@ fn check_upstream_state_attribute_access_shapes_inner<
 /// Walk a Value tree, find every `ResourceRef` with a non-empty
 /// `field_path`, and check the path against the upstream's declared
 /// `TypeExpr`.
-fn visit_attribute_access(
-    value: &Value,
+fn visit_attribute_access<B: BindingAddress>(
+    value: &Value<B>,
     exports: &UpstreamExports,
     location: &str,
     include_resolver_struct_errors: bool,
@@ -1123,9 +1136,9 @@ impl UpstreamRefDiagnostic for UpstreamSubscriptShapeError {
 ///   — in that case the field-walk diagnostic is enough.
 pub fn check_upstream_state_subscript_shapes<
     E: crate::parser::ExportParamLike,
-    D: crate::parser::DeferredForPhaseTraversal,
+    D: crate::parser::DeferredForPhaseTraversal<E::Binding>,
 >(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<E, E::Binding, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamSubscriptShapeError> {
     let mut errors: Vec<UpstreamSubscriptShapeError> = Vec::new();
@@ -1153,8 +1166,8 @@ pub fn check_upstream_state_subscript_shapes<
 /// Walk a Value tree, find every `ResourceRef` with a non-empty
 /// `subscripts` chain, and check each subscript's kind against the
 /// upstream's declared `TypeExpr` at that depth.
-fn visit_subscript_access(
-    value: &Value,
+fn visit_subscript_access<B: BindingAddress>(
+    value: &Value<B>,
     exports: &UpstreamExports,
     location: &str,
     errors: &mut Vec<UpstreamSubscriptShapeError>,
@@ -1267,7 +1280,7 @@ mod tests {
 
     fn upstream(binding: &str, source: &str) -> UpstreamState {
         UpstreamState {
-            binding: binding.to_string(),
+            binding: binding.into(),
             source: PathBuf::from(source),
         }
     }
@@ -1275,7 +1288,9 @@ mod tests {
     fn parse_project(source: &str) -> ParsedFile {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("main.crn"), source).unwrap();
-        parse_directory(tmp.path(), &ctx()).expect("parse_directory")
+        parse_directory(tmp.path(), &ctx())
+            .expect("parse_directory")
+            .into_parsed()
     }
 
     fn inference_not_run_entry() -> UpstreamExportEntry {
@@ -2041,7 +2056,9 @@ mod tests {
             provider_name, source
         );
         fs::write(tmp.path().join("main.crn"), full).unwrap();
-        parse_directory(tmp.path(), &ctx()).expect("parse_directory")
+        parse_directory(tmp.path(), &ctx())
+            .expect("parse_directory")
+            .into_parsed()
     }
 
     /// Preserve the historical positional-walker coverage while exercising

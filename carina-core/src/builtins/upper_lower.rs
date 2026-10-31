@@ -1,6 +1,6 @@
 //! `upper(string)` and `lower(string)` built-in functions
 
-use crate::resource::{ConcreteValue, Value, ValueString};
+use crate::resource::{BindingAddress, ConcreteValue, Value, ValueString};
 
 use super::value_type_name;
 
@@ -13,7 +13,7 @@ use super::value_type_name;
 /// ```text
 /// upper("hello")  // => "HELLO"
 /// ```
-pub(crate) fn builtin_upper(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_upper<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
     if args.len() != 1 {
         return Err(format!(
             "upper() expects 1 argument (string), got {}",
@@ -41,7 +41,7 @@ pub(crate) fn builtin_upper(args: &[Value]) -> Result<Value, String> {
 /// ```text
 /// lower("HELLO")  // => "hello"
 /// ```
-pub(crate) fn builtin_lower(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_lower<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
     if args.len() != 1 {
         return Err(format!(
             "lower() expects 1 argument (string), got {}",
@@ -63,7 +63,7 @@ pub(crate) fn builtin_lower(args: &[Value]) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::{ConcreteValue, Value};
+    use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
 
     #[test]
     fn upper_basic() {
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn lower_wrong_arg_count() {
-        let result = evaluate_builtin("lower", &[]);
+        let result: Result<Value, String> = evaluate_builtin("lower", &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 1 argument"));
     }

@@ -23,7 +23,7 @@ use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -103,18 +103,25 @@ impl ProviderFactory for ForTestFactory {
 }
 
 fn cert_schema() -> ResourceSchema {
+    let resource_record = AttributeType::struct_(
+        "ResourceRecord",
+        vec![
+            StructField::optional("name", AttributeType::string()).build(),
+            StructField::optional("value", AttributeType::string()).build(),
+        ],
+    );
+    let validation_option = AttributeType::struct_(
+        "DomainValidationOption",
+        vec![StructField::optional("resource_record", resource_record).build()],
+    );
     ResourceSchema::new("acm.Certificate")
         .attribute(AttributeSchema::optional("domain_name", AttributeType::string()).build())
         .attribute(AttributeSchema::optional("validation_method", AttributeType::string()).build())
         // Provider-read/computed collection that the `for` iterates.
-        // Element type is immaterial here — the loop is deferred at
-        // parse time because `cert.domain_validation_options` is an
-        // unresolved provider-computed reference, not because of the
-        // element schema.
         .attribute(
             AttributeSchema::optional(
                 "domain_validation_options",
-                AttributeType::list(AttributeType::string()),
+                AttributeType::list(validation_option),
             )
             .build(),
         )
@@ -254,7 +261,7 @@ fn registry_like_fixture() -> TempDir {
         ),
         (
             "records.crn",
-            r#"for _, opt in cert.domain_validation_options {
+            r#"for (_, opt) in cert.domain_validation_options {
     aws.route53.RecordSet {
         hosted_zone_id   = "Z123"
         name             = opt.resource_record.name

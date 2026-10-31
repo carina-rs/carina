@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::deps::{collect_dependencies, sort_resources_by_dependencies};
 use crate::parser::{File, ResourceRef};
+use crate::resource::BindingAddress;
 
 /// Severity of a depends_on diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,9 +76,11 @@ impl DependsOnDiagnostic {
 ///
 /// `LiveComposition` carries no directives — [`ResourceRef::directives`]
 /// is `None` for that arm, treated here as an empty `depends_on` list.
-fn depends_on_of<'a, D: crate::parser::DeferredForPhaseTraversal>(
-    rref: ResourceRef<'a, crate::resource::ModuleSource, D>,
-) -> &'a [String] {
+fn depends_on_of<'a, B, D>(rref: ResourceRef<'a, crate::resource::ModuleSource, B, D>) -> &'a [B]
+where
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<B>,
+{
     rref.directives()
         .map_or(&[][..], |d| d.depends_on.as_slice())
 }
@@ -85,9 +88,11 @@ fn depends_on_of<'a, D: crate::parser::DeferredForPhaseTraversal>(
 /// Run all depends_on checks against a parsed file. Returns the full
 /// list of diagnostics (errors + warnings); callers decide how to surface
 /// them.
-pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
-    parsed: &File<E, D>,
-) -> Vec<DependsOnDiagnostic> {
+pub fn validate_depends_on<E, B, D>(parsed: &File<E, B, D>) -> Vec<DependsOnDiagnostic>
+where
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<B>,
+{
     // Common-case fast path: the vast majority of resources will have
     // no `depends_on` set, and the checks below allocate per-resource.
     // Walk top-level + for-body template resources so loops are covered
@@ -101,10 +106,11 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
 
     let mut diags = Vec::new();
 
-    let bindings_by_name: HashMap<&str, ResourceRef<'_, crate::resource::ModuleSource, D>> = parsed
-        .iter_all_resources()
-        .filter_map(|rref| rref.binding().map(|n| (n, rref)))
-        .collect();
+    let bindings_by_name: HashMap<&str, ResourceRef<'_, crate::resource::ModuleSource, B, D>> =
+        parsed
+            .iter_all_resources()
+            .filter_map(|rref| rref.binding().map(|n| (n, rref)))
+            .collect();
     let upstream_names: HashSet<&str> = parsed
         .upstream_states
         .iter()
@@ -122,104 +128,108 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
         .map(|argument| argument.name.as_str())
         .collect();
 
-    let mut check_resource = |binding: Option<&str>,
-                              attributes: &indexmap::IndexMap<String, crate::resource::Value>,
-                              dependency_bindings: &std::collections::BTreeSet<String>,
-                              depends_on: &[String]| {
-        if depends_on.is_empty() {
-            return;
-        }
-        // `self_name` is only needed for self-reference detection; an
-        // anonymous resource cannot self-reference (no name to point
-        // back to), so an unbound resource just gets the other checks.
-        let self_name = binding.unwrap_or("(anonymous)");
+    let mut check_resource =
+        |binding: Option<&str>,
+         attributes: &indexmap::IndexMap<String, crate::resource::Value<B>>,
+         dependency_bindings: &std::collections::BTreeSet<B>,
+         depends_on: &[B]| {
+            if depends_on.is_empty() {
+                return;
+            }
+            // `self_name` is only needed for self-reference detection; an
+            // anonymous resource cannot self-reference (no name to point
+            // back to), so an unbound resource just gets the other checks.
+            let self_name = binding.unwrap_or("(anonymous)");
 
-        let mut value_ref_deps: HashSet<String> = HashSet::new();
-        for value in attributes.values() {
-            collect_dependencies(value, &mut value_ref_deps);
-        }
-        for name in dependency_bindings {
-            value_ref_deps.insert(name.clone());
-        }
+            let mut value_ref_deps: HashSet<B> = HashSet::new();
+            for value in attributes.values() {
+                collect_dependencies(value, &mut value_ref_deps);
+            }
+            for name in dependency_bindings {
+                value_ref_deps.insert(name.clone());
+            }
 
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut duplicate_warned: HashSet<&str> = HashSet::new();
-        for dep_name in depends_on {
-            if !seen.insert(dep_name.as_str()) {
-                if duplicate_warned.insert(dep_name.as_str()) {
-                    diags.push(
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut duplicate_warned: HashSet<&str> = HashSet::new();
+            for dep_name in depends_on {
+                if !seen.insert(dep_name.as_str()) {
+                    if duplicate_warned.insert(dep_name.as_str()) {
+                        diags.push(
                         DependsOnDiagnostic::warning(format!(
                             "directives.depends_on on '{}': binding '{}' is listed multiple times",
                             self_name, dep_name
                         ))
-                        .at_element(self_name, dep_name),
+                        .at_element(self_name, dep_name.as_str()),
                     );
-                }
-                continue;
-            }
-
-            if dep_name == self_name {
-                diags.push(
-                    DependsOnDiagnostic::error(format!(
-                        "directives.depends_on on '{}': self-reference is not allowed \
-                         (binding '{}' depends on itself)",
-                        self_name, dep_name
-                    ))
-                    .at_element(self_name, dep_name),
-                );
-                continue;
-            }
-
-            if upstream_names.contains(dep_name.as_str()) {
-                diags.push(
-                    DependsOnDiagnostic::error(format!(
-                        "directives.depends_on on '{}': upstream_state binding '{}' \
-                         is not a valid depends_on target",
-                        self_name, dep_name
-                    ))
-                    .at_element(self_name, dep_name),
-                );
-                continue;
-            }
-
-            let Some(target) = bindings_by_name.get(dep_name.as_str()) else {
-                if module_parameter_names.contains(dep_name.as_str()) {
+                    }
                     continue;
                 }
-                diags.push(
+
+                if dep_name.as_str() == self_name {
+                    diags.push(
+                        DependsOnDiagnostic::error(format!(
+                            "directives.depends_on on '{}': self-reference is not allowed \
+                         (binding '{}' depends on itself)",
+                            self_name, dep_name
+                        ))
+                        .at_element(self_name, dep_name.as_str()),
+                    );
+                    continue;
+                }
+
+                if upstream_names.contains(dep_name.as_str()) {
+                    diags.push(
+                        DependsOnDiagnostic::error(format!(
+                            "directives.depends_on on '{}': upstream_state binding '{}' \
+                         is not a valid depends_on target",
+                            self_name, dep_name
+                        ))
+                        .at_element(self_name, dep_name.as_str()),
+                    );
+                    continue;
+                }
+
+                let Some(target) = bindings_by_name.get(dep_name.as_str()) else {
+                    if module_parameter_names.contains(dep_name.as_str()) {
+                        continue;
+                    }
+                    diags.push(
                     DependsOnDiagnostic::error(format!(
                         "directives.depends_on on '{}': binding '{}' is not declared in this scope",
                         self_name, dep_name
                     ))
-                    .at_element(self_name, dep_name),
+                    .at_element(self_name, dep_name.as_str()),
                 );
-                continue;
-            };
+                    continue;
+                };
 
-            if matches!(target, ResourceRef::DataSource(_)) {
-                diags.push(
-                    DependsOnDiagnostic::error(format!(
-                        "directives.depends_on on '{}': data sources cannot be \
+                if matches!(target, ResourceRef::DataSource(_)) {
+                    diags.push(
+                        DependsOnDiagnostic::error(format!(
+                            "directives.depends_on on '{}': data sources cannot be \
                          depends_on targets (binding '{}')",
-                        self_name, dep_name
-                    ))
-                    .at_element(self_name, dep_name),
-                );
-                continue;
-            }
+                            self_name, dep_name
+                        ))
+                        .at_element(self_name, dep_name.as_str()),
+                    );
+                    continue;
+                }
 
-            if value_ref_deps.contains(dep_name.as_str()) {
-                diags.push(
-                    DependsOnDiagnostic::warning(format!(
-                        "directives.depends_on on '{}': edge to '{}' is redundant; \
+                if value_ref_deps
+                    .iter()
+                    .any(|dependency| dependency.as_str() == dep_name.as_str())
+                {
+                    diags.push(
+                        DependsOnDiagnostic::warning(format!(
+                            "directives.depends_on on '{}': edge to '{}' is redundant; \
                          '{}' is already referenced by value",
-                        self_name, dep_name, dep_name
-                    ))
-                    .at_element(self_name, dep_name),
-                );
+                            self_name, dep_name, dep_name
+                        ))
+                        .at_element(self_name, dep_name.as_str()),
+                    );
+                }
             }
-        }
-    };
+        };
 
     for resource in parsed.iter_all_resources() {
         let attributes = resource.attributes();

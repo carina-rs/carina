@@ -8,8 +8,9 @@ use crate::parser::{
     ArgumentParameter, CompareOp, ModuleCallId, RequireBlock, ValidateExpr, display_string_literal,
 };
 use crate::resource::{
-    AccessMissPolicy, ConcreteValue, DeferredValue, LiveComposition, ModuleConstraintId,
-    PendingModuleConstraint, ResourceId, Value, apply_value_path_segment,
+    AbsoluteBindingAddress, AccessMissPolicy, BindingAddress, ConcreteValue, DeferredValue,
+    LiveComposition, ModuleConstraintId, PendingModuleConstraint, RelativeBindingName, ResourceId,
+    Value, apply_value_path_segment,
 };
 
 use super::ModuleError;
@@ -168,23 +169,26 @@ pub enum ModuleConstraintKind {
 /// and apply re-evaluate the subset that was pending during expansion and was
 /// retained on the composition. Both paths enter the same evaluator.
 #[derive(Clone, Copy)]
-pub enum ModuleConstraints<'a> {
+pub enum ModuleConstraints<'a, B: BindingAddress = RelativeBindingName> {
     Declarations {
-        arguments: &'a [ArgumentParameter],
-        requires: &'a [RequireBlock],
+        arguments: &'a [ArgumentParameter<crate::parser::TypeExpr, B>],
+        requires: &'a [RequireBlock<B>],
     },
-    Pending(&'a [PendingModuleConstraint]),
+    Pending(&'a [PendingModuleConstraint<B>]),
 }
 
-impl<'a> ModuleConstraints<'a> {
-    pub fn declarations(arguments: &'a [ArgumentParameter], requires: &'a [RequireBlock]) -> Self {
+impl<'a, B: BindingAddress> ModuleConstraints<'a, B> {
+    pub fn declarations(
+        arguments: &'a [ArgumentParameter<crate::parser::TypeExpr, B>],
+        requires: &'a [RequireBlock<B>],
+    ) -> Self {
         Self::Declarations {
             arguments,
             requires,
         }
     }
 
-    pub fn pending(constraints: &'a [PendingModuleConstraint]) -> Self {
+    pub fn pending(constraints: &'a [PendingModuleConstraint<B>]) -> Self {
         Self::Pending(constraints)
     }
 }
@@ -192,16 +196,16 @@ impl<'a> ModuleConstraints<'a> {
 /// One authored module constraint together with its evaluation at the current
 /// resolution boundary.
 #[derive(Debug, Clone, PartialEq)]
-pub struct EvaluatedModuleConstraint {
-    constraint: PendingModuleConstraint,
+pub struct EvaluatedModuleConstraint<B: BindingAddress = RelativeBindingName> {
+    constraint: PendingModuleConstraint<B>,
     kind: ModuleConstraintKind,
     arguments: Vec<String>,
     actuals: Vec<(String, String)>,
     evaluation: ConstraintEvaluation,
 }
 
-impl EvaluatedModuleConstraint {
-    pub fn constraint(&self) -> &PendingModuleConstraint {
+impl<B: BindingAddress> EvaluatedModuleConstraint<B> {
+    pub fn constraint(&self) -> &PendingModuleConstraint<B> {
         &self.constraint
     }
 
@@ -221,7 +225,7 @@ impl EvaluatedModuleConstraint {
         &self.evaluation
     }
 
-    pub fn into_constraint(self) -> PendingModuleConstraint {
+    pub fn into_constraint(self) -> PendingModuleConstraint<B> {
         self.constraint
     }
 
@@ -279,10 +283,10 @@ impl EvaluatedModuleConstraint {
 /// Collect and evaluate every module constraint using the language's single
 /// scoping rule: an argument-local `validation` sees only its own argument;
 /// a module-level `require` sees every argument.
-pub fn evaluate_module_constraints(
-    constraints: ModuleConstraints<'_>,
-    argument_values: &HashMap<String, Value>,
-) -> Vec<EvaluatedModuleConstraint> {
+pub fn evaluate_module_constraints<B: BindingAddress>(
+    constraints: ModuleConstraints<'_, B>,
+    argument_values: &HashMap<String, Value<B>>,
+) -> Vec<EvaluatedModuleConstraint<B>> {
     let definitions = match constraints {
         ModuleConstraints::Declarations {
             arguments,
@@ -415,9 +419,9 @@ pub fn evaluate_module_constraints(
 /// expression branch may accidentally turn an unresolved value into an
 /// evaluation error. Concrete collections are ordinary expression values, so
 /// functions such as `length()` do not need a variable-only escape hatch.
-pub fn evaluate_constraint(
-    expr: &ValidateExpr,
-    arguments: &HashMap<String, Value>,
+pub fn evaluate_constraint<B: BindingAddress>(
+    expr: &ValidateExpr<B>,
+    arguments: &HashMap<String, Value<B>>,
     message: impl Into<String>,
 ) -> ConstraintEvaluation {
     match evaluate_constraint_inner(expr, arguments, message.into()) {
@@ -426,9 +430,9 @@ pub fn evaluate_constraint(
     }
 }
 
-fn evaluate_constraint_inner(
-    expr: &ValidateExpr,
-    arguments: &HashMap<String, Value>,
+fn evaluate_constraint_inner<B: BindingAddress>(
+    expr: &ValidateExpr<B>,
+    arguments: &HashMap<String, Value<B>>,
     message: String,
 ) -> Result<ConstraintEvaluation, String> {
     let referenced = referenced_constraint_arguments(expr);
@@ -456,8 +460,8 @@ fn evaluate_constraint_inner(
 }
 
 /// Return the variables referenced by an expression in stable name order.
-pub fn referenced_constraint_arguments(expr: &ValidateExpr) -> Vec<String> {
-    fn collect(expr: &ValidateExpr, names: &mut BTreeSet<String>) {
+pub fn referenced_constraint_arguments<B: BindingAddress>(expr: &ValidateExpr<B>) -> Vec<String> {
+    fn collect<B: BindingAddress>(expr: &ValidateExpr<B>, names: &mut BTreeSet<String>) {
         match expr {
             ValidateExpr::Var(name) => {
                 names.insert(name.clone());
@@ -647,10 +651,10 @@ fn evaluate_pending_constraint_views<'a>(
 }
 
 fn resolve_bound_constraint_values(
-    expression: &ValidateExpr,
+    expression: &ValidateExpr<AbsoluteBindingAddress>,
     bindings: &ResolvedBindings,
     errors: &mut HashMap<String, String>,
-) -> ValidateExpr {
+) -> ValidateExpr<AbsoluteBindingAddress> {
     match expression {
         ValidateExpr::BoundArgument {
             argument,
@@ -712,8 +716,8 @@ fn resolve_bound_constraint_values(
     }
 }
 
-fn raw_constraint_arguments(expression: &ValidateExpr) -> BTreeSet<String> {
-    fn collect(expression: &ValidateExpr, out: &mut BTreeSet<String>) {
+fn raw_constraint_arguments<B: BindingAddress>(expression: &ValidateExpr<B>) -> BTreeSet<String> {
+    fn collect<B: BindingAddress>(expression: &ValidateExpr<B>, out: &mut BTreeSet<String>) {
         match expression {
             ValidateExpr::Var(argument) | ValidateExpr::Access { argument, .. } => {
                 out.insert(argument.clone());
@@ -746,9 +750,9 @@ fn raw_constraint_arguments(expression: &ValidateExpr) -> BTreeSet<String> {
     out
 }
 
-fn constraint_actuals(
+fn constraint_actuals<B: BindingAddress>(
     arguments: &[String],
-    values: &HashMap<String, Value>,
+    values: &HashMap<String, Value<B>>,
 ) -> Vec<(String, String)> {
     arguments
         .iter()
@@ -762,13 +766,13 @@ fn constraint_actuals(
         .collect()
 }
 
-fn constraint_actuals_for_expression(
-    expression: &ValidateExpr,
+fn constraint_actuals_for_expression<B: BindingAddress>(
+    expression: &ValidateExpr<B>,
     arguments: &[String],
-    values: &HashMap<String, Value>,
+    values: &HashMap<String, Value<B>>,
 ) -> Vec<(String, String)> {
-    fn collect(
-        expression: &ValidateExpr,
+    fn collect<B: BindingAddress>(
+        expression: &ValidateExpr<B>,
         actuals: &mut std::collections::BTreeMap<String, String>,
     ) {
         match expression {
@@ -817,7 +821,7 @@ fn constraint_actuals_for_expression(
     }
 }
 
-fn format_constraint_actual(value: &Value) -> String {
+fn format_constraint_actual<B: BindingAddress>(value: &Value<B>) -> String {
     match value {
         Value::Concrete(ConcreteValue::String(value)) => value
             .diagnostic_literal()
@@ -859,7 +863,7 @@ fn format_constraint_actual(value: &Value) -> String {
     }
 }
 
-fn is_recursively_concrete(value: &Value) -> bool {
+fn is_recursively_concrete<B: BindingAddress>(value: &Value<B>) -> bool {
     match value {
         Value::Concrete(ConcreteValue::List(items)) => items.iter().all(is_recursively_concrete),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().all(is_recursively_concrete),
@@ -870,12 +874,12 @@ fn is_recursively_concrete(value: &Value) -> bool {
 }
 
 #[derive(Clone)]
-enum EvalValue {
-    Value(Value),
+enum EvalValue<B: BindingAddress> {
+    Value(Value<B>),
     Null,
 }
 
-impl EvalValue {
+impl<B: BindingAddress> EvalValue<B> {
     fn kind_name(&self) -> &'static str {
         match self {
             Self::Null => "null",
@@ -923,7 +927,10 @@ impl EvalValue {
     }
 }
 
-fn eval_expr(expr: &ValidateExpr, arguments: &HashMap<String, Value>) -> Result<EvalValue, String> {
+fn eval_expr<B: BindingAddress>(
+    expr: &ValidateExpr<B>,
+    arguments: &HashMap<String, Value<B>>,
+) -> Result<EvalValue<B>, String> {
     match expr {
         ValidateExpr::Bool(value) => Ok(value_from(ConcreteValue::Bool(*value))),
         ValidateExpr::Int(value) => Ok(value_from(ConcreteValue::Int(*value))),
@@ -998,10 +1005,10 @@ fn eval_expr(expr: &ValidateExpr, arguments: &HashMap<String, Value>) -> Result<
     }
 }
 
-fn apply_constraint_path(
-    mut value: Value,
+fn apply_constraint_path<B: BindingAddress>(
+    mut value: Value<B>,
     path: &[crate::resource::PathSegment],
-) -> Result<Value, String> {
+) -> Result<Value<B>, String> {
     for step in path {
         value = apply_value_path_segment(value, step.clone(), 0, AccessMissPolicy::Error)
             .and_then(crate::resource::ValuePathSegmentResult::into_value)
@@ -1010,9 +1017,9 @@ fn apply_constraint_path(
     Ok(value)
 }
 
-fn constraint_inputs_are_concrete(
-    expr: &ValidateExpr,
-    arguments: &HashMap<String, Value>,
+fn constraint_inputs_are_concrete<B: BindingAddress>(
+    expr: &ValidateExpr<B>,
+    arguments: &HashMap<String, Value<B>>,
 ) -> Result<bool, String> {
     match expr {
         ValidateExpr::Var(name) => arguments
@@ -1050,18 +1057,22 @@ fn constraint_inputs_are_concrete(
     }
 }
 
-fn value_from(value: ConcreteValue) -> EvalValue {
+fn value_from<B: BindingAddress>(value: ConcreteValue<B>) -> EvalValue<B> {
     EvalValue::Value(Value::Concrete(value))
 }
 
-fn value_for_evaluation(value: &Value) -> EvalValue {
+fn value_for_evaluation<B: BindingAddress>(value: &Value<B>) -> EvalValue<B> {
     match value {
         Value::Deferred(DeferredValue::Secret(inner)) => value_for_evaluation(inner),
         other => EvalValue::Value(other.clone()),
     }
 }
 
-fn compare_values(left: &EvalValue, op: &CompareOp, right: &EvalValue) -> Result<bool, String> {
+fn compare_values<B: BindingAddress>(
+    left: &EvalValue<B>,
+    op: &CompareOp,
+    right: &EvalValue<B>,
+) -> Result<bool, String> {
     match (left, right) {
         (EvalValue::Null, EvalValue::Null) => return Ok(matches!(op, CompareOp::Eq)),
         (EvalValue::Null, _) | (_, EvalValue::Null) => {
@@ -1145,11 +1156,11 @@ fn compare_equality<T: PartialEq>(
     }
 }
 
-fn eval_function(
+fn eval_function<B: BindingAddress>(
     name: &str,
-    args: &[ValidateExpr],
-    arguments: &HashMap<String, Value>,
-) -> Result<EvalValue, String> {
+    args: &[ValidateExpr<B>],
+    arguments: &HashMap<String, Value<B>>,
+) -> Result<EvalValue<B>, String> {
     match name {
         "len" | "length" => {
             if args.len() != 1 {
@@ -1280,7 +1291,7 @@ mod tests {
 
     #[test]
     fn referenced_deferred_value_is_pending_without_debug_rendering() {
-        let expression = ValidateExpr::Compare {
+        let expression: ValidateExpr = ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::Var("port".to_string())),
             op: CompareOp::Gt,
             rhs: Box::new(ValidateExpr::Int(0)),
@@ -1369,7 +1380,7 @@ mod tests {
 
     #[test]
     fn violation_contains_sorted_secret_masked_actuals() {
-        let expression = ValidateExpr::Compare {
+        let expression: ValidateExpr = ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::Var("password".to_string())),
             op: CompareOp::Eq,
             rhs: Box::new(ValidateExpr::String("expected".to_string())),
@@ -1433,7 +1444,7 @@ mod tests {
     fn argument_validation_cannot_reference_a_sibling_argument() {
         use crate::parser::{TypeExpr, ValidationBlock};
 
-        let declarations = vec![
+        let declarations: Vec<ArgumentParameter> = vec![
             ArgumentParameter {
                 name: "x".to_string(),
                 static_type: TypeExpr::Int,
@@ -1480,7 +1491,7 @@ mod tests {
         use crate::parser::{TypeExpr, ValidationBlock};
         use crate::plan::PlanErrorKind;
 
-        let declarations = vec![ArgumentParameter {
+        let declarations: Vec<ArgumentParameter> = vec![ArgumentParameter {
             name: "name".to_string(),
             static_type: TypeExpr::String,
             default: None,

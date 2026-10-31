@@ -7,8 +7,17 @@ use super::context::{ParseContext, next_pair};
 use super::error::{ParseError, ParseWarning};
 use super::types::parse_type_expr;
 use super::{ProviderContext, Rule, is_static_eval, parse_expression};
-use crate::eval_value::{BareStructuralHandle, EvalValue, StructuralHandleKind};
-use crate::resource::{ConcreteValue, DeferredValue, FunctionArgument, UnknownReason, Value};
+use crate::eval_value::{
+    AuthoredEvalValue as EvalValue, BareStructuralHandle, StructuralHandleKind,
+};
+use crate::resource::{
+    AbsoluteBindingAddress, AuthoredConcreteValue as ConcreteValue,
+    AuthoredDeferredValue as DeferredValue, AuthoredFunctionArgument as FunctionArgument,
+    AuthoredUnknownReason as UnknownReason, AuthoredValue as Value, BindingAddress,
+    ConcreteValue as GenericConcreteValue, DeferredValue as GenericDeferredValue,
+    FunctionArgument as GenericFunctionArgument, UnknownReason as GenericUnknownReason,
+    Value as GenericValue,
+};
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -377,58 +386,80 @@ fn function_argument_awaits_module_substitution(argument: &FunctionArgument) -> 
         || argument.value().is_some_and(contains_module_argument)
 }
 
-pub(super) fn contains_module_argument(value: &Value) -> bool {
+pub(super) fn contains_module_argument<B: crate::resource::BindingAddress>(
+    value: &GenericValue<B>,
+) -> bool {
+    contains_module_argument_matching(value, &mut |_| true)
+}
+
+pub(crate) fn contains_module_argument_matching<B: crate::resource::BindingAddress>(
+    value: &GenericValue<B>,
+    predicate: &mut impl FnMut(&str) -> bool,
+) -> bool {
     match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            deferred.values().into_iter().any(contains_module_argument)
+        GenericValue::Deferred(GenericDeferredValue::ModuleIf(deferred)) => deferred
+            .values()
+            .into_iter()
+            .any(|value| contains_module_argument_matching(value, predicate)),
+        GenericValue::Deferred(GenericDeferredValue::Unknown(
+            GenericUnknownReason::ModuleArgument { name, .. },
+        )) => predicate(name),
+        GenericValue::Concrete(GenericConcreteValue::List(items)) => {
+            items
+                .iter()
+                .any(|item| contains_module_argument_matching(item, predicate))
         }
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { .. })) => true,
-        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_module_argument),
-        Value::Concrete(ConcreteValue::Map(entries)) => {
-            entries.values().any(contains_module_argument)
+        GenericValue::Concrete(GenericConcreteValue::Map(entries)) => {
+            entries
+                .values()
+                .any(|entry| contains_module_argument_matching(entry, predicate))
         }
-        Value::Deferred(
-            DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
+        GenericValue::Deferred(
+            GenericDeferredValue::FunctionCall { args, .. }
+            | GenericDeferredValue::Unavailable { args, .. }
+            | GenericDeferredValue::ResolvedFunctionCall { args, .. },
         ) => args.iter().any(|argument| {
-            argument.pending_parameter().is_some()
+            argument.pending_parameter().is_some_and(&mut *predicate)
                 || argument
                     .value()
-                    .is_some_and(contains_module_argument)
+                    .is_some_and(|value| contains_module_argument_matching(value, predicate))
                 || argument.handle().is_some_and(|handle| {
                     matches!(handle.kind(), StructuralHandleKind::ModuleParameter)
+                        && predicate(handle.canonical_binding().as_str())
                 })
         }),
-        Value::Deferred(DeferredValue::Access(access)) => {
-            contains_module_argument(access.base())
+        GenericValue::Deferred(GenericDeferredValue::Access(access)) => {
+            contains_module_argument_matching(access.base(), predicate)
         }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
-            matches!(part, crate::resource::InterpolationPart::Expr(value) if contains_module_argument(value))
+        GenericValue::Deferred(GenericDeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
+            matches!(part, crate::resource::InterpolationPart::Expr(value) if contains_module_argument_matching(value, predicate))
         }),
-        Value::Deferred(DeferredValue::Secret(inner)) => contains_module_argument(inner),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            contains_module_argument(value) || contains_module_argument(default)
+        GenericValue::Deferred(GenericDeferredValue::Secret(inner)) => {
+            contains_module_argument_matching(inner, predicate)
         }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            contains_module_argument(expression.lhs())
-                || contains_module_argument(expression.rhs())
+        GenericValue::Deferred(GenericDeferredValue::IntegerArithmetic(expression)) => {
+            contains_module_argument_matching(expression.lhs(), predicate)
+                || contains_module_argument_matching(expression.rhs(), predicate)
         }
-        Value::Deferred(
-            DeferredValue::ResourceRef { .. }
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+        GenericValue::Deferred(GenericDeferredValue::Coalesce { value, default }) => {
+            contains_module_argument_matching(value, predicate)
+                || contains_module_argument_matching(default, predicate)
+        }
+        GenericValue::Deferred(
+            GenericDeferredValue::ResourceRef { .. }
+            | GenericDeferredValue::BindingRef { .. }
+            | GenericDeferredValue::RedactedSecret { .. }
+            | GenericDeferredValue::Unknown(_),
         )
-        | Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
+        | GenericValue::Concrete(
+            GenericConcreteValue::String(_)
+            | GenericConcreteValue::EnumIdentifier(_)
+            | GenericConcreteValue::CanonicalEnum(_)
+            | GenericConcreteValue::Int(_)
+            | GenericConcreteValue::Float(_)
+            | GenericConcreteValue::Bool(_)
+            | GenericConcreteValue::Duration(_)
+            | GenericConcreteValue::StringList(_),
         ) => false,
     }
 }
@@ -439,7 +470,10 @@ pub(super) fn contains_module_argument(value: &Value) -> bool {
 pub(crate) fn custom_type_lookup_for_schema<'resolver, 'schema>(
     resolver: &'resolver dyn crate::parser::CustomTypeResolver,
     schema: crate::schema::OwnerBoundResourceSchema<'schema>,
-) -> impl Fn(&crate::schema::AttributeType, &Value) -> Result<(), crate::schema::TypeError>
+) -> impl Fn(
+    &crate::schema::AttributeType,
+    &crate::resource::Value,
+) -> Result<(), crate::schema::TypeError>
 + use<'resolver, 'schema> {
     let owner = schema.owner();
     move |declared_type, value| {
@@ -458,8 +492,11 @@ pub(crate) fn custom_type_lookup_for_schema<'resolver, 'schema>(
 /// for that config. No provider-name comparison or owner lookup is involved.
 pub fn custom_type_lookup_for_factory<'a>(
     factory: &'a dyn crate::provider::ProviderFactory,
-) -> impl Fn(&crate::schema::AttributeType, &Value) -> Result<(), crate::schema::TypeError> + use<'a>
-{
+) -> impl Fn(
+    &crate::schema::AttributeType,
+    &crate::resource::Value,
+) -> Result<(), crate::schema::TypeError>
++ use<'a> {
     move |declared_type, value| {
         validate_identified_declaration(declared_type, |declaration| {
             crate::provider::validate_custom_type_declaration_with_factory(
@@ -493,60 +530,62 @@ fn validate_identified_declaration(
 /// Bare built-in identities use the kind-aware built-in registry. Provider
 /// identities must already have resolved schema owners and route through those
 /// factories, even if their descriptive identity collides with a built-in.
-pub fn validate_custom_type(
+pub fn validate_custom_type<B: BindingAddress>(
     identity: &TypeIdentity,
-    value: &Value,
+    value: &GenericValue<B>,
     _config: &ProviderContext,
 ) -> crate::provider::ProviderResult<()> {
     match value {
-        Value::Deferred(DeferredValue::ResourceRef { .. }) => return Ok(()),
-        Value::Deferred(
-            DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
+        GenericValue::Deferred(GenericDeferredValue::ResourceRef { .. }) => return Ok(()),
+        GenericValue::Deferred(
+            GenericDeferredValue::FunctionCall { .. }
+            | GenericDeferredValue::ResolvedFunctionCall { .. },
         ) => return Ok(()),
-        Value::Deferred(DeferredValue::Access(_access)) => return Ok(()),
-        Value::Deferred(DeferredValue::Interpolation(_parts)) => return Ok(()),
-        Value::Deferred(DeferredValue::Unknown(_reason)) => return Ok(()),
-        Value::Concrete(_concrete) => {}
-        Value::Deferred(_deferred) => {}
+        GenericValue::Deferred(GenericDeferredValue::Access(_access)) => return Ok(()),
+        GenericValue::Deferred(GenericDeferredValue::Interpolation(_parts)) => return Ok(()),
+        GenericValue::Deferred(GenericDeferredValue::Unknown(_reason)) => return Ok(()),
+        GenericValue::Concrete(_concrete) => {}
+        GenericValue::Deferred(_deferred) => {}
     }
 
     use crate::schema::RefinedScalarKind;
 
     let builtin_kind = match value {
-        Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_)) => {
-            Some(RefinedScalarKind::String)
-        }
-        Value::Concrete(ConcreteValue::Int(_)) => {
+        GenericValue::Concrete(
+            GenericConcreteValue::String(_) | GenericConcreteValue::EnumIdentifier(_),
+        ) => Some(RefinedScalarKind::String),
+        GenericValue::Concrete(GenericConcreteValue::Int(_)) => {
             if crate::schema::builtin_validator(RefinedScalarKind::Int, identity).is_some() {
                 Some(RefinedScalarKind::Int)
             } else {
                 Some(RefinedScalarKind::Float)
             }
         }
-        Value::Concrete(ConcreteValue::Float(_)) => Some(RefinedScalarKind::Float),
-        Value::Concrete(
-            ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::List(_)
-            | ConcreteValue::StringList(_)
-            | ConcreteValue::Map(_),
+        GenericValue::Concrete(GenericConcreteValue::Float(_)) => Some(RefinedScalarKind::Float),
+        GenericValue::Concrete(
+            GenericConcreteValue::CanonicalEnum(_)
+            | GenericConcreteValue::Bool(_)
+            | GenericConcreteValue::Duration(_)
+            | GenericConcreteValue::List(_)
+            | GenericConcreteValue::StringList(_)
+            | GenericConcreteValue::Map(_),
         )
-        | Value::Deferred(_) => None,
+        | GenericValue::Deferred(_) => None,
     };
     if let Some(kind) = builtin_kind
         && let Some(validator) = crate::schema::builtin_validator(kind, identity)
     {
-        let identifier_text;
         let validation_value = match value {
-            Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
-                identifier_text =
-                    Value::Concrete(ConcreteValue::String(raw.as_str().to_string().into()));
-                &identifier_text
+            GenericValue::Concrete(GenericConcreteValue::EnumIdentifier(raw)) => {
+                GenericValue::Concrete(GenericConcreteValue::String(
+                    raw.as_str().to_string().into(),
+                ))
             }
-            _ => value,
+            _ => value.clone(),
         };
-        return validator(validation_value).map_err(|error| {
+        let validation_value = concrete_validation_value(&validation_value)
+            .expect("identified scalar validation receives a concrete scalar");
+        return validator(&validation_value).map_err(|error| {
             crate::provider::ProviderError::invalid_input_caused_by(
                 "Custom type validation failed",
                 error,
@@ -573,35 +612,190 @@ pub fn validate_custom_type(
 /// let value = Value::Concrete(ConcreteValue::String("id".into()));
 /// let _ = validate_schema_custom_type(&owned, &value, &ProviderContext::default());
 /// ```
-pub fn validate_schema_custom_type(
+pub fn validate_schema_custom_type<B: BindingAddress>(
     owned: &crate::parser::OwnedTypeIdentity,
-    value: &Value,
+    value: &GenericValue<B>,
     config: &crate::parser::LoadedProviderContext,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
     validate_schema_custom_type_with_context(owned, value, config)
 }
 
-pub(crate) fn validate_schema_custom_type_with_context(
+pub(crate) fn validate_schema_custom_type_with_context<B: BindingAddress>(
     owned: &crate::parser::OwnedTypeIdentity,
-    value: &Value,
+    value: &GenericValue<B>,
     config: &ProviderContext,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
     match value {
-        Value::Deferred(
-            DeferredValue::ResourceRef { .. }
-            | DeferredValue::FunctionCall { .. }
-            | DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::Access(_)
-            | DeferredValue::Interpolation(_)
-            | DeferredValue::Secret(_)
-            | DeferredValue::Unknown(_),
+        GenericValue::Deferred(
+            GenericDeferredValue::ModuleIf(_)
+            | GenericDeferredValue::ResourceRef { path: _ }
+            | GenericDeferredValue::FunctionCall {
+                name: _,
+                args: _,
+                source_line: _,
+            }
+            | GenericDeferredValue::ResolvedFunctionCall {
+                function: _,
+                functions: _,
+                args: _,
+                source_line: _,
+            }
+            | GenericDeferredValue::Access(_)
+            | GenericDeferredValue::IntegerArithmetic(_)
+            | GenericDeferredValue::Interpolation(_)
+            | GenericDeferredValue::Secret(_)
+            | GenericDeferredValue::Unknown(
+                crate::resource::UnknownReason::UpstreamExport { path: _ }
+                | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
+                | crate::resource::UnknownReason::ForKey
+                | crate::resource::UnknownReason::ForIndex
+                | crate::resource::UnknownReason::ForValue
+                | crate::resource::UnknownReason::FnParam { name: _ }
+                | crate::resource::UnknownReason::ModuleArgument {
+                    name: _,
+                    source_line: _,
+                    diagnostic_name: _,
+                }
+                | crate::resource::UnknownReason::FnLocal { name: _ }
+                | crate::resource::UnknownReason::EmptyInterpolation
+                | crate::resource::UnknownReason::PendingReRead(_),
+            ),
         ) => return Ok(()),
-        Value::Concrete(_) | Value::Deferred(_) => {}
+        GenericValue::Concrete(
+            GenericConcreteValue::String(_)
+            | GenericConcreteValue::EnumIdentifier(_)
+            | GenericConcreteValue::CanonicalEnum(_)
+            | GenericConcreteValue::Int(_)
+            | GenericConcreteValue::Float(_)
+            | GenericConcreteValue::Bool(_)
+            | GenericConcreteValue::Duration(_)
+            | GenericConcreteValue::List(_)
+            | GenericConcreteValue::StringList(_)
+            | GenericConcreteValue::Map(_),
+        )
+        | GenericValue::Deferred(
+            GenericDeferredValue::BindingRef { binding: _ }
+            | GenericDeferredValue::Coalesce {
+                value: _,
+                default: _,
+            }
+            | GenericDeferredValue::Unavailable {
+                name: _,
+                args: _,
+                reason: _,
+                source_line: _,
+            }
+            | GenericDeferredValue::RedactedSecret { hash: _ },
+        ) => {}
     }
+    let Some(value) = concrete_validation_value(value) else {
+        return Ok(());
+    };
     config.custom_type_resolver().validate(
         crate::parser::CustomTypeValidationTarget::Annotation(owned),
-        value,
+        &value,
     )
+}
+
+/// Project values that contain no binding-bearing deferred node into the
+/// runtime value shape required by provider validators. References are not
+/// resolved here; they remain deferred until a scope resolver has authority.
+fn concrete_validation_value<B: BindingAddress>(
+    value: &GenericValue<B>,
+) -> Option<GenericValue<AbsoluteBindingAddress>> {
+    Some(match value {
+        GenericValue::Concrete(GenericConcreteValue::String(value)) => {
+            GenericValue::Concrete(GenericConcreteValue::String(value.clone()))
+        }
+        GenericValue::Concrete(GenericConcreteValue::EnumIdentifier(value)) => {
+            GenericValue::Concrete(GenericConcreteValue::EnumIdentifier(value.clone()))
+        }
+        GenericValue::Concrete(GenericConcreteValue::CanonicalEnum(value)) => {
+            GenericValue::Concrete(GenericConcreteValue::CanonicalEnum(value.clone()))
+        }
+        GenericValue::Concrete(GenericConcreteValue::Int(value)) => {
+            GenericValue::Concrete(GenericConcreteValue::Int(*value))
+        }
+        GenericValue::Concrete(GenericConcreteValue::Float(value)) => {
+            GenericValue::Concrete(GenericConcreteValue::Float(*value))
+        }
+        GenericValue::Concrete(GenericConcreteValue::Bool(value)) => {
+            GenericValue::Concrete(GenericConcreteValue::Bool(*value))
+        }
+        GenericValue::Concrete(GenericConcreteValue::Duration(value)) => {
+            GenericValue::Concrete(GenericConcreteValue::Duration(*value))
+        }
+        GenericValue::Concrete(GenericConcreteValue::StringList(values)) => {
+            GenericValue::Concrete(GenericConcreteValue::StringList(values.clone()))
+        }
+        GenericValue::Concrete(GenericConcreteValue::List(values)) => {
+            GenericValue::Concrete(GenericConcreteValue::List(
+                values
+                    .iter()
+                    .map(concrete_validation_value)
+                    .collect::<Option<Vec<_>>>()?,
+            ))
+        }
+        GenericValue::Concrete(GenericConcreteValue::Map(values)) => {
+            GenericValue::Concrete(GenericConcreteValue::Map(
+                values
+                    .iter()
+                    .map(|(name, value)| Some((name.clone(), concrete_validation_value(value)?)))
+                    .collect::<Option<IndexMap<_, _>>>()?,
+            ))
+        }
+        GenericValue::Deferred(GenericDeferredValue::Secret(inner)) => GenericValue::Deferred(
+            GenericDeferredValue::Secret(Box::new(concrete_validation_value(inner)?)),
+        ),
+        GenericValue::Deferred(GenericDeferredValue::RedactedSecret { hash }) => {
+            GenericValue::Deferred(GenericDeferredValue::RedactedSecret { hash: hash.clone() })
+        }
+        GenericValue::Deferred(
+            GenericDeferredValue::ModuleIf(_)
+            | GenericDeferredValue::ResourceRef { path: _ }
+            | GenericDeferredValue::BindingRef { binding: _ }
+            | GenericDeferredValue::Coalesce {
+                value: _,
+                default: _,
+            }
+            | GenericDeferredValue::IntegerArithmetic(_)
+            | GenericDeferredValue::Interpolation(_)
+            | GenericDeferredValue::FunctionCall {
+                name: _,
+                args: _,
+                source_line: _,
+            }
+            | GenericDeferredValue::Unavailable {
+                name: _,
+                args: _,
+                reason: _,
+                source_line: _,
+            }
+            | GenericDeferredValue::ResolvedFunctionCall {
+                function: _,
+                functions: _,
+                args: _,
+                source_line: _,
+            }
+            | GenericDeferredValue::Access(_)
+            | GenericDeferredValue::Unknown(
+                crate::resource::UnknownReason::UpstreamExport { path: _ }
+                | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
+                | crate::resource::UnknownReason::ForKey
+                | crate::resource::UnknownReason::ForIndex
+                | crate::resource::UnknownReason::ForValue
+                | crate::resource::UnknownReason::FnParam { name: _ }
+                | crate::resource::UnknownReason::ModuleArgument {
+                    name: _,
+                    source_line: _,
+                    diagnostic_name: _,
+                }
+                | crate::resource::UnknownReason::FnLocal { name: _ }
+                | crate::resource::UnknownReason::EmptyInterpolation
+                | crate::resource::UnknownReason::PendingReRead(_),
+            ),
+        ) => return None,
+    })
 }
 
 /// Check that a function argument matches the declared parameter type.
@@ -872,27 +1066,31 @@ fn locate_function_body_error(func: &UserFunction, error: ParseError) -> ParseEr
     }
 }
 
-pub fn contains_function_call(value: &Value) -> bool {
+pub fn contains_function_call<B: BindingAddress>(value: &GenericValue<B>) -> bool {
     match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+        GenericValue::Deferred(GenericDeferredValue::ModuleIf(deferred)) => {
             deferred.values().into_iter().any(contains_function_call)
         }
-        Value::Deferred(
-            DeferredValue::FunctionCall { .. }
-            | DeferredValue::ResolvedFunctionCall { .. },
+        GenericValue::Deferred(
+            GenericDeferredValue::FunctionCall { .. }
+            | GenericDeferredValue::ResolvedFunctionCall { .. },
         ) => true,
-        Value::Deferred(DeferredValue::Access(access)) => {
+        GenericValue::Deferred(GenericDeferredValue::Access(access)) => {
             contains_function_call(access.base())
         }
-        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_function_call),
-        Value::Concrete(ConcreteValue::Map(entries)) => {
+        GenericValue::Concrete(GenericConcreteValue::List(items)) => {
+            items.iter().any(contains_function_call)
+        }
+        GenericValue::Concrete(GenericConcreteValue::Map(entries)) => {
             entries.values().any(contains_function_call)
         }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
+        GenericValue::Deferred(GenericDeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
             matches!(part, crate::resource::InterpolationPart::Expr(value) if contains_function_call(value))
         }),
-        Value::Deferred(DeferredValue::Secret(inner)) => contains_function_call(inner),
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+        GenericValue::Deferred(GenericDeferredValue::Secret(inner)) => {
+            contains_function_call(inner)
+        }
+        GenericValue::Deferred(GenericDeferredValue::IntegerArithmetic(expression)) => {
             contains_function_call(expression.lhs()) || contains_function_call(expression.rhs())
         }
         _ => false,
@@ -905,12 +1103,12 @@ enum FunctionSubstitutionPosition {
     AccessBase,
 }
 
-fn substituted_function_argument(
+fn substituted_function_argument<B: BindingAddress>(
     name: &str,
-    argument: &FunctionArgument,
+    argument: &GenericFunctionArgument<B>,
     position: FunctionSubstitutionPosition,
     source_line: usize,
-) -> Result<Value, ParseError> {
+) -> Result<GenericValue<B>, ParseError> {
     if let Some(value) = argument.value() {
         return Ok(value.clone());
     }
@@ -926,16 +1124,16 @@ fn substituted_function_argument(
     }
 }
 
-fn substitute_function_call_argument(
-    argument: &FunctionArgument,
-    substitutions: &HashMap<String, FunctionArgument>,
+fn substitute_function_call_argument<B: BindingAddress>(
+    argument: &GenericFunctionArgument<B>,
+    substitutions: &HashMap<String, GenericFunctionArgument<B>>,
     source_line: usize,
-) -> Result<FunctionArgument, ParseError> {
+) -> Result<GenericFunctionArgument<B>, ParseError> {
     let Some(value) = argument.value() else {
         return Ok(argument.clone());
     };
-    if let Value::Deferred(DeferredValue::Unknown(
-        UnknownReason::FnParam { name } | UnknownReason::FnLocal { name },
+    if let GenericValue::Deferred(GenericDeferredValue::Unknown(
+        GenericUnknownReason::FnParam { name } | GenericUnknownReason::FnLocal { name },
     )) = value
         && let Some(substitution) = substitutions.get(name)
     {
@@ -954,11 +1152,11 @@ fn substitute_function_call_argument(
 /// Recursively substitute function parameter placeholders with actual values.
 /// A handle is legal only while it is the access base of `param.field` or a
 /// typed argument to another deferred function call.
-fn substitute_fn_params(
-    value: &Value,
-    substitutions: &HashMap<String, FunctionArgument>,
+pub(crate) fn substitute_fn_params<B: BindingAddress>(
+    value: &GenericValue<B>,
+    substitutions: &HashMap<String, GenericFunctionArgument<B>>,
     source_line: usize,
-) -> Result<Value, ParseError> {
+) -> Result<GenericValue<B>, ParseError> {
     substitute_fn_params_with_position(
         value,
         substitutions,
@@ -967,28 +1165,28 @@ fn substitute_fn_params(
     )
 }
 
-fn substitute_fn_params_with_position(
-    value: &Value,
-    substitutions: &HashMap<String, FunctionArgument>,
+fn substitute_fn_params_with_position<B: BindingAddress>(
+    value: &GenericValue<B>,
+    substitutions: &HashMap<String, GenericFunctionArgument<B>>,
     source_line: usize,
     position: FunctionSubstitutionPosition,
-) -> Result<Value, ParseError> {
+) -> Result<GenericValue<B>, ParseError> {
     Ok(match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+        GenericValue::Deferred(GenericDeferredValue::ModuleIf(deferred)) => {
             let deferred = deferred
                 .try_map(|value| substitute_fn_params(value, substitutions, source_line))?;
-            Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred)))
+            GenericValue::Deferred(GenericDeferredValue::ModuleIf(Box::new(deferred)))
         }
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::FnParam { name }))
-        | Value::Deferred(DeferredValue::Unknown(UnknownReason::FnLocal { name })) => {
-            match substitutions.get(name) {
-                Some(argument) => {
-                    substituted_function_argument(name, argument, position, source_line)?
-                }
-                None => value.clone(),
-            }
-        }
-        Value::Deferred(DeferredValue::ResourceRef { path })
+        GenericValue::Deferred(GenericDeferredValue::Unknown(GenericUnknownReason::FnParam {
+            name,
+        }))
+        | GenericValue::Deferred(GenericDeferredValue::Unknown(GenericUnknownReason::FnLocal {
+            name,
+        })) => match substitutions.get(name) {
+            Some(argument) => substituted_function_argument(name, argument, position, source_line)?,
+            None => value.clone(),
+        },
+        GenericValue::Deferred(GenericDeferredValue::ResourceRef { path })
             if substitutions.contains_key(path.binding()) =>
         {
             let Some(base) = substitutions.get(path.binding()) else {
@@ -1022,28 +1220,32 @@ fn substitute_fn_params_with_position(
             }
             substituted
         }
-        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
-            items
-                .iter()
-                .map(|v| substitute_fn_params(v, substitutions, source_line))
-                .collect::<Result<_, _>>()?,
-        )),
-        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
-            map.iter()
-                .map(|(k, v)| {
-                    Ok((
-                        k.clone(),
-                        substitute_fn_params(v, substitutions, source_line)?,
-                    ))
-                })
-                .collect::<Result<_, ParseError>>()?,
-        )),
-        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+        GenericValue::Concrete(GenericConcreteValue::List(items)) => {
+            GenericValue::Concrete(GenericConcreteValue::List(
+                items
+                    .iter()
+                    .map(|v| substitute_fn_params(v, substitutions, source_line))
+                    .collect::<Result<_, _>>()?,
+            ))
+        }
+        GenericValue::Concrete(GenericConcreteValue::Map(map)) => {
+            GenericValue::Concrete(GenericConcreteValue::Map(
+                map.iter()
+                    .map(|(k, v)| {
+                        Ok((
+                            k.clone(),
+                            substitute_fn_params(v, substitutions, source_line)?,
+                        ))
+                    })
+                    .collect::<Result<_, ParseError>>()?,
+            ))
+        }
+        GenericValue::Deferred(GenericDeferredValue::ResolvedFunctionCall {
             function,
             functions,
             args,
             source_line: call_line,
-        }) => Value::Deferred(DeferredValue::ResolvedFunctionCall {
+        }) => GenericValue::Deferred(GenericDeferredValue::ResolvedFunctionCall {
             function: function.clone(),
             functions: functions.clone(),
             args: args
@@ -1058,11 +1260,11 @@ fn substitute_fn_params_with_position(
                 .collect::<Result<_, _>>()?,
             source_line: *call_line,
         }),
-        Value::Deferred(DeferredValue::FunctionCall {
+        GenericValue::Deferred(GenericDeferredValue::FunctionCall {
             name,
             args,
             source_line: call_line,
-        }) => Value::Deferred(DeferredValue::FunctionCall {
+        }) => GenericValue::Deferred(GenericDeferredValue::FunctionCall {
             name: *name,
             args: args
                 .iter()
@@ -1076,12 +1278,12 @@ fn substitute_fn_params_with_position(
                 .collect::<Result<_, _>>()?,
             source_line: *call_line,
         }),
-        Value::Deferred(DeferredValue::Unavailable {
+        GenericValue::Deferred(GenericDeferredValue::Unavailable {
             name,
             args,
             reason,
             source_line: call_line,
-        }) => Value::Deferred(DeferredValue::Unavailable {
+        }) => GenericValue::Deferred(GenericDeferredValue::Unavailable {
             name: *name,
             args: args
                 .iter()
@@ -1096,7 +1298,7 @@ fn substitute_fn_params_with_position(
             reason: reason.clone(),
             source_line: *call_line,
         }),
-        Value::Deferred(DeferredValue::Access(access)) => access
+        GenericValue::Deferred(GenericDeferredValue::Access(access)) => access
             .rebuild_with_base(
                 substitute_fn_params_with_position(
                     access.base(),
@@ -1110,8 +1312,8 @@ fn substitute_fn_params_with_position(
                 line: access.source_line(),
                 message: error.to_string(),
             })?,
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            Value::Deferred(DeferredValue::Interpolation(
+        GenericValue::Deferred(GenericDeferredValue::Interpolation(parts)) => {
+            GenericValue::Deferred(GenericDeferredValue::Interpolation(
                 parts
                     .iter()
                     .map(|p| match p {
@@ -1124,16 +1326,18 @@ fn substitute_fn_params_with_position(
                     .collect::<Result<_, _>>()?,
             ))
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            Box::new(substitute_fn_params(inner, substitutions, source_line)?),
-        )),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            Value::Deferred(DeferredValue::Coalesce {
+        GenericValue::Deferred(GenericDeferredValue::Secret(inner)) => {
+            GenericValue::Deferred(GenericDeferredValue::Secret(Box::new(
+                substitute_fn_params(inner, substitutions, source_line)?,
+            )))
+        }
+        GenericValue::Deferred(GenericDeferredValue::Coalesce { value, default }) => {
+            GenericValue::Deferred(GenericDeferredValue::Coalesce {
                 value: Box::new(substitute_fn_params(value, substitutions, source_line)?),
                 default: Box::new(substitute_fn_params(default, substitutions, source_line)?),
             })
         }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+        GenericValue::Deferred(GenericDeferredValue::IntegerArithmetic(expression)) => {
             let lhs = substitute_fn_params(expression.lhs(), substitutions, source_line)?;
             let rhs = substitute_fn_params(expression.rhs(), substitutions, source_line)?;
             let span = expression.operator_span();
@@ -1141,28 +1345,30 @@ fn substitute_fn_params_with_position(
                 .evaluate_with_operands(lhs, rhs)
                 .map_err(|error| ParseError::integer_arithmetic(span, source_line, error))?
         }
-        Value::Deferred(DeferredValue::Unknown(_))
-        | Value::Deferred(DeferredValue::ResourceRef { .. })
-        | Value::Deferred(DeferredValue::BindingRef { .. })
-        | Value::Deferred(DeferredValue::RedactedSecret { .. })
-        | Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
+        GenericValue::Deferred(GenericDeferredValue::Unknown(_))
+        | GenericValue::Deferred(GenericDeferredValue::ResourceRef { .. })
+        | GenericValue::Deferred(GenericDeferredValue::BindingRef { .. })
+        | GenericValue::Deferred(GenericDeferredValue::RedactedSecret { .. })
+        | GenericValue::Concrete(
+            GenericConcreteValue::String(_)
+            | GenericConcreteValue::EnumIdentifier(_)
+            | GenericConcreteValue::CanonicalEnum(_)
+            | GenericConcreteValue::Int(_)
+            | GenericConcreteValue::Float(_)
+            | GenericConcreteValue::Bool(_)
+            | GenericConcreteValue::Duration(_)
+            | GenericConcreteValue::StringList(_),
         ) => value.clone(),
     })
 }
 
 /// Try to evaluate a value (resolve function calls including user-defined ones).
-pub(crate) fn function_argument_as_eval(argument: &FunctionArgument) -> EvalValue {
+pub(crate) fn function_argument_as_eval<B: BindingAddress>(
+    argument: &GenericFunctionArgument<B>,
+) -> crate::eval_value::EvalValue<B> {
     match argument.handle() {
-        Some(handle) => EvalValue::structural_handle(handle.clone()),
-        None => EvalValue::from_value(argument.walker_value().clone()),
+        Some(handle) => crate::eval_value::EvalValue::structural_handle(handle.clone()),
+        None => crate::eval_value::EvalValue::from_value(argument.walker_value().clone()),
     }
 }
 

@@ -18,7 +18,7 @@ pub(in crate::parser) fn parse_import_state_block(
 ) -> Result<StateBlock, ParseError> {
     let mut to: Option<StateBlockAddress> = None;
     let mut to_span: Option<SourceSpan> = None;
-    let mut id: Option<crate::resource::Value> = None;
+    let mut id: Option<crate::resource::AuthoredValue> = None;
 
     for attr in pair.into_inner() {
         if attr.as_rule() == Rule::import_state_attr {

@@ -19,17 +19,21 @@ mod types;
 mod util;
 
 pub use crate::eval_value::StructuralHandleKind;
+pub use crate::resource::RelativeBindingName;
 pub use ast::{
     ArgumentOrigin, ArgumentParameter, AttributeParameter, AttributePath, AttributePathSegment,
-    AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingName,
-    BindingScopeId, BindingUseOwner, CallExpansion, ConsumerArgumentParameter,
-    ConsumerAttributeParameter, DeferredForBody, DeferredForExpansionError, DeferredForExpression,
-    DeferredForPhaseTraversal, DeferredForSite, DeferredForTarget, ExpansionKey, ExportParamLike,
-    ExportParameter, File, FnParam, InferredExportParam, InferredFile, ModuleArgument, ModuleCall,
-    ModuleCallDiagnosticSource, ModuleCallId, ModuleResolvedFile, ModuleResolvedInferredFile,
-    ModuleResolvedParsedFile, MovedAddresses, ParsedBindingUses, ParsedDeferredForExpression,
-    ParsedDeferredForPhase, ParsedExportParam, ParsedFile, ParserBindingMetadata, PendingValueSlot,
-    ProviderConfig, RequireBlock, ResolvedDeferredForExpressions, ResolvedDeferredForPhase,
+    AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingScopeId,
+    BindingUseOwner, CallExpansion, ConsumerArgumentParameter, ConsumerAttributeParameter,
+    DeferredForBody, DeferredForExpansionError, DeferredForExpression, DeferredForPhaseTraversal,
+    DeferredForSite, DeferredForTarget, ExpandedBackendConfig, ExpandedDeferredForExpression,
+    ExpandedInferredExportParam, ExpandedInferredFile, ExpandedParsedExportParam,
+    ExpandedParsedFile, ExpandedProviderConfig, ExpandedStateBlock, ExpandedUpstreamState,
+    ExpansionKey, ExportParamLike, ExportParameter, File, FnParam, InferredExportParam,
+    InferredFile, ModuleArgument, ModuleCall, ModuleCallDiagnosticSource, ModuleCallId,
+    ModuleResolvedFile, ModuleResolvedInferredFile, ModuleResolvedParsedFile, MovedAddresses,
+    ParsedBindingUses, ParsedDeferredForExpression, ParsedDeferredForPhase, ParsedExportParam,
+    ParsedFile, ParserBindingMetadata, PendingValueSlot, ProviderConfig, RequireBlock,
+    ResolveExportBindingPhase, ResolvedDeferredForExpressions, ResolvedDeferredForPhase,
     ResourceAddress, ResourceContext, ResourceMut, ResourceRef, ResourceTypePath,
     SavedDeferredForExpression, ShapeMismatch, SourceFileId, SourceSpan, StateBlock,
     StateBlockAddress, TypeExpr, UntilPredicateAst, UpstreamState, UseStatement, UserFunction,
@@ -78,15 +82,16 @@ pub use functions::{
     validate_schema_custom_type,
 };
 pub(crate) use functions::{
-    custom_type_lookup_for_schema, evaluate_resolved_user_function, function_argument_as_eval,
-    validate_schema_custom_type_with_context,
+    contains_module_argument_matching, custom_type_lookup_for_schema, function_argument_as_eval,
+    substitute_fn_params, validate_schema_custom_type_with_context,
 };
 pub use resolve::{
     ProviderConfigInvariantError, ProviderConfigResolutionError, ResolvedProviderConfig,
     ResolvedProviderConfigs, SavedProviderConfigs, check_identifier_scope,
     check_provider_instance_routing, collect_known_bindings_merged, finalize_provider_configs,
-    resolve_provider_attributes_with_remote, resolve_provider_unresolved_attributes,
-    resolve_resource_refs, resolve_resource_refs_with_config,
+    resolve_expanded_provider_unresolved_attributes, resolve_provider_attributes_with_remote,
+    resolve_provider_unresolved_attributes, resolve_resource_refs,
+    resolve_resource_refs_with_config,
 };
 pub(crate) use resolve::{
     collect_seed_bindings_from_parts, reject_cyclic_let_bindings_in_variables,

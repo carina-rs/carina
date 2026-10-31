@@ -122,6 +122,18 @@ impl BackendLock {
         }
     }
 
+    /// Expanded-config counterpart of [`BackendLock::for_config`].
+    pub fn for_expanded_config(
+        backend_config: Option<&carina_core::parser::ExpandedBackendConfig>,
+    ) -> BackendResult<Self> {
+        match backend_config {
+            Some(cfg) => BackendConfig::try_from(cfg)
+                .map(|config| Self::from_config(&config))
+                .map_err(BackendError::from),
+            None => Ok(Self::local_default()),
+        }
+    }
+
     /// Path to the lock file under `base_dir` (project root).
     pub fn lock_path(base_dir: &Path) -> PathBuf {
         base_dir.join(LOCK_FILE)
@@ -205,11 +217,12 @@ impl BackendLock {
                 Ok((key.clone(), value))
             })
             .collect::<BackendResult<_>>()?;
-        let raw = carina_core::parser::BackendConfig {
-            backend_type: self.backend_type.clone(),
-            attributes,
-            attribute_spans: Default::default(),
-        };
+        let raw: carina_core::parser::BackendConfig<carina_core::resource::RelativeBindingName> =
+            carina_core::parser::BackendConfig {
+                backend_type: self.backend_type.clone(),
+                attributes,
+                attribute_spans: Default::default(),
+            };
         BackendConfig::try_from(&raw).map_err(BackendError::from)
     }
 

@@ -763,24 +763,27 @@ mod tests {
 
     #[test]
     fn test_backend_config_resolves_parser_context() {
-        use carina_core::resource::{ConcreteValue, Value};
-
-        let provider_context = carina_core::parser::BackendConfig {
-            backend_type: "s3".to_string(),
-            attributes: [
-                (
-                    "bucket".to_string(),
-                    Value::Concrete(ConcreteValue::String("my-bucket".into())),
-                ),
-                (
-                    "key".to_string(),
-                    Value::Concrete(ConcreteValue::String("state.json".into())),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-            attribute_spans: Default::default(),
+        use carina_core::resource::{
+            AuthoredConcreteValue as ConcreteValue, AuthoredValue as Value, RelativeBindingName,
         };
+
+        let provider_context: carina_core::parser::BackendConfig<RelativeBindingName> =
+            carina_core::parser::BackendConfig {
+                backend_type: "s3".to_string(),
+                attributes: [
+                    (
+                        "bucket".to_string(),
+                        Value::Concrete(ConcreteValue::String("my-bucket".into())),
+                    ),
+                    (
+                        "key".to_string(),
+                        Value::Concrete(ConcreteValue::String("state.json".into())),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                attribute_spans: Default::default(),
+            };
 
         let state_config = BackendConfig::try_from(&provider_context).unwrap();
         let BackendConfig::S3(settings) = state_config else {

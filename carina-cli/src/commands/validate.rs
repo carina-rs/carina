@@ -9,7 +9,7 @@ use carina_core::config_loader::{
 };
 use carina_core::lint::find_duplicate_attrs;
 use carina_core::parser::{ProviderContext, ResourceRef, UpstreamState};
-use carina_core::resource::ResourceId;
+use carina_core::resource::{BindingAddress, ResourceId};
 
 use crate::error::AppError;
 use crate::wiring::ProviderLoad;
@@ -128,7 +128,7 @@ pub fn validated_resource_ids_with_factories(
 /// never be mistaken for a resolvable resource id, and a not-yet-named
 /// resource can never silently render as a trailing-dot string
 /// (carina#3121). `Display` is the *only* place an entry becomes text.
-enum ValidatedEntry<'a> {
+enum ValidatedEntry<'a, B: BindingAddress> {
     /// A direct resource whose identity is already assigned — the common
     /// case, renders exactly as its [`ResourceId`].
     Resolved(&'a ResourceId),
@@ -148,14 +148,14 @@ enum ValidatedEntry<'a> {
     /// repeated twice).
     DeferredLoop {
         resource_type: String,
-        target: &'a carina_core::parser::DeferredForTarget,
+        target: &'a carina_core::parser::DeferredForTarget<B>,
         header: &'a str,
         file: Option<&'a str>,
         line: usize,
     },
 }
 
-impl std::fmt::Display for ValidatedEntry<'_> {
+impl<B: BindingAddress> std::fmt::Display for ValidatedEntry<'_, B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ValidatedEntry::Resolved(id) => write!(f, "{id}"),
@@ -205,7 +205,7 @@ impl std::fmt::Display for ValidatedEntry<'_> {
 /// contain `[?]`.
 fn validated_entries<E>(
     parsed: &carina_core::parser::ModuleResolvedFile<E>,
-) -> Vec<ValidatedEntry<'_>> {
+) -> Vec<ValidatedEntry<'_, carina_core::resource::AbsoluteBindingAddress>> {
     parsed
         .iter_all_resources()
         // Every call now has a composition so its typed boundary survives
@@ -448,7 +448,7 @@ mod tests {
         parsed: carina_core::parser::ParsedFile,
     ) -> carina_core::parser::ModuleResolvedParsedFile {
         carina_core::module_resolver::resolve_modules_providerless(
-            parsed,
+            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
             std::path::Path::new("."),
         )
         .expect("test fixture crosses module resolution")
@@ -820,7 +820,7 @@ let observed_names = roles.names
         )
         .expect("fixture parses");
         let parsed = carina_core::module_resolver::resolve_modules_providerless(
-            parsed,
+            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
             std::path::Path::new("."),
         )
         .expect("cross the deferred-body resolution seam");
@@ -894,24 +894,29 @@ let observed_names = roles.names
     #[test]
     fn validation_listing_excludes_unbound_compositions() {
         use carina_core::parser::ParsedFile;
-        use carina_core::resource::{LiveComposition, LiveCompositionSignature, ResourceId};
-
-        let composition = |instance: &'static str, binding: Option<&str>| LiveComposition {
-            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "_virtual", instance,
-            )),
-            signature: LiveCompositionSignature {
-                arguments: indexmap::IndexMap::new(),
-                attributes: indexmap::IndexMap::new(),
-                pending_constraints: Vec::new(),
-            },
-            binding: binding.map(str::to_string),
-            dependency_bindings: Default::default(),
-            module_name: "example".to_string(),
-            instance: instance.to_string(),
-            call_path: crate::test_composition_call_path(),
-            quoted_string_attrs: Default::default(),
+        use carina_core::resource::{
+            AuthoredLiveComposition, LiveCompositionSignature, RelativeBindingName, ResourceId,
         };
+
+        let composition =
+            |instance: &'static str, binding: Option<&str>| -> AuthoredLiveComposition {
+                AuthoredLiveComposition {
+                    id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                        "_virtual", instance,
+                    )),
+                    signature: LiveCompositionSignature {
+                        arguments: indexmap::IndexMap::new(),
+                        attributes: indexmap::IndexMap::new(),
+                        pending_constraints: Vec::new(),
+                    },
+                    binding: binding.map(RelativeBindingName::new),
+                    dependency_bindings: Default::default(),
+                    module_name: "example".to_string(),
+                    instance: instance.to_string(),
+                    call_path: crate::test_authored_composition_call_path(),
+                    quoted_string_attrs: Default::default(),
+                }
+            };
         let mut parsed = ParsedFile::default();
         parsed
             .compositions
@@ -931,7 +936,7 @@ let observed_names = roles.names
 
     fn upstream(binding: &str, source: &str) -> UpstreamState {
         UpstreamState {
-            binding: binding.to_string(),
+            binding: carina_core::resource::RelativeBindingName::new(binding),
             source: std::path::PathBuf::from(source),
         }
     }

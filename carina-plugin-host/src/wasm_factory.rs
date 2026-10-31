@@ -6822,7 +6822,7 @@ mod tests {
     use super::*;
     use carina_core::provider::SentRecord;
     use carina_core::resource::{
-        AccessPath, ConcreteValue, Current, DeferredValue, InterpolationPart, UnknownReason,
+        ConcreteValue, Current, DeferredValue, InterpolationPart, UnknownReason,
     };
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -6919,9 +6919,23 @@ mod tests {
         Value::Concrete(ConcreteValue::String(value.to_string().into()))
     }
 
+    fn root_resource_ref(binding: &str, attribute: &str) -> Value {
+        carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
+            .resolve_root_for_test()
+    }
+
+    fn root_access_path(
+        binding: &str,
+        attribute: &str,
+        fields: Vec<String>,
+    ) -> carina_core::resource::ExpandedAccessPath {
+        carina_core::resource::AuthoredAccessPath::with_fields(binding, attribute, fields)
+            .resolve_root_for_test()
+    }
+
     fn boundary_resource() -> (ResourceId, wit_types::ResourceId, wit_types::CreateRequest) {
         let id = ResourceId::with_provider_identity("mock", "test.Resource", "main", None);
-        let mut resource = Resource::from_id(id.clone());
+        let mut resource: Resource = Resource::from_id(id.clone());
         resource.set_attr("name", test_string_value("example"));
         let wit_id = wasm_convert::core_to_wit_resource_id(&id);
         let wit_request = wit_types::CreateRequest {
@@ -7939,13 +7953,13 @@ mod tests {
 
     #[test]
     fn stripped_attributes_expose_exact_deferred_names_by_resource_position() {
-        let mut first = Resource::new("test.t", "first");
+        let mut first: Resource = Resource::new("test.t", "first");
         first.set_attr("known", test_string_value("known"));
         first.set_attr(
             "pending",
             Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
         );
-        first.set_attr("peer", Value::resource_ref("peer", "identifier", vec![]));
+        first.set_attr("peer", root_resource_ref("peer", "identifier"));
         let mut second = Resource::new("test.t", "second");
         second.set_attr("known", test_string_value("known"));
         let mut third = Resource::new("test.t", "third");
@@ -7971,14 +7985,14 @@ mod tests {
 
     #[tokio::test]
     async fn wasm_serializable_resources_restores_original_attribute_order() {
-        let mut resource = Resource::new("test.t", "n");
+        let mut resource: Resource = Resource::new("test.t", "n");
         resource.set_attr("before", test_string_value("before"));
         resource.set_attr(
             "pending",
             Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
         );
         resource.set_attr("middle", test_string_value("middle"));
-        resource.set_attr("peer", Value::resource_ref("peer", "identifier", vec![]));
+        resource.set_attr("peer", root_resource_ref("peer", "identifier"));
         resource.set_attr("after", test_string_value("after"));
         let mut resources = vec![resource];
         let original_attributes = resources[0].attributes.clone();
@@ -8021,13 +8035,13 @@ mod tests {
     #[tokio::test]
     async fn wasm_serializable_resources_restores_duplicate_resource_ids_by_position() {
         let first_hidden = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex));
-        let second_hidden = Value::resource_ref("peer", "identifier", vec![]);
+        let second_hidden = root_resource_ref("peer", "identifier");
 
-        let mut first = Resource::new("test.t", "shared");
+        let mut first: Resource = Resource::new("test.t", "shared");
         first.set_attr("visible", test_string_value("first"));
         first.set_attr("hidden", first_hidden.clone());
 
-        let mut second = Resource::new("test.t", "shared");
+        let mut second: Resource = Resource::new("test.t", "shared");
         second.set_attr("visible", test_string_value("second"));
         second.set_attr("hidden", second_hidden.clone());
 
@@ -8064,15 +8078,15 @@ mod tests {
 
     #[tokio::test]
     async fn wasm_serializable_resources_strips_values_in_nested_wrappers() {
-        let upstream_path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+        let upstream_path = root_access_path("network", "vpc", vec!["vpc_id".into()]);
         let unknown = || {
             Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
                 path: upstream_path.clone(),
             }))
         };
-        let resource_ref = || Value::resource_ref("admins", "group_id", vec![]);
+        let resource_ref = || root_resource_ref("admins", "group_id");
 
-        let mut resource = Resource::new("test.t", "n");
+        let mut resource: Resource = Resource::new("test.t", "n");
         resource.set_attr("stable", test_string_value("visible"));
         resource.set_attr(
             "unknown_list",
@@ -8160,9 +8174,9 @@ mod tests {
 
     #[tokio::test]
     async fn wasm_serializable_resources_restores_attributes_on_error() {
-        let mut resource = Resource::new("test.t", "n");
+        let mut resource: Resource = Resource::new("test.t", "n");
         resource.set_attr("stable", test_string_value("visible"));
-        resource.set_attr("peer", Value::resource_ref("peer", "identifier", vec![]));
+        resource.set_attr("peer", root_resource_ref("peer", "identifier"));
         resource.set_attr(
             "pending",
             Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
@@ -8444,9 +8458,9 @@ mod tests {
         );
 
         let normalizer = WasmProviderNormalizer { instance };
-        let mut resources = vec![carina_core::resource::ProviderResource::from(
-            Resource::with_provider("mock", "test.resource", "after-boundary-error", None),
-        )];
+        let resource: Resource =
+            Resource::with_provider("mock", "test.resource", "after-boundary-error", None);
+        let mut resources = vec![carina_core::resource::ProviderResource::from(resource)];
         normalizer
             .normalize_desired(&mut resources)
             .await
@@ -8469,8 +8483,8 @@ mod tests {
     fn malformed_normalized_state_output_is_atomic() {
         use wit_types::PersistedValue as WitValue;
 
-        let first_id = Resource::with_provider("mock", "test.resource", "first", None).id;
-        let second_id = Resource::with_provider("mock", "test.resource", "second", None).id;
+        let first_id = ResourceId::with_provider_identity("mock", "test.resource", "first", None);
+        let second_id = ResourceId::with_provider_identity("mock", "test.resource", "second", None);
         let original_value = Value::Concrete(carina_core::resource::ConcreteValue::String(
             "original".into(),
         ));
@@ -8526,7 +8540,7 @@ mod tests {
         use argon2::Argon2;
         use wit_types::PersistedValue as WitValue;
 
-        let id = Resource::with_provider("mock", "test.resource", "legacy", None).id;
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "legacy", None);
         let material = b"\"wire-legacy\"";
         let salt = b"carina:mock.test.resource:legacy:comment";
         let mut output = [0_u8; 32];
@@ -8573,7 +8587,7 @@ mod tests {
 
     #[test]
     fn invalid_state_key_error_names_the_operation_once() {
-        let id = Resource::with_provider("mock", "test.resource", "only", None).id;
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "only", None);
         let expected = HashMap::from([("expected".to_string(), id)]);
 
         let error = validate_wit_state_result_keys("normalize_state", &expected, Vec::new())
@@ -8585,7 +8599,7 @@ mod tests {
 
     #[test]
     fn single_state_result_rejects_more_than_one_entry() {
-        let id = Resource::with_provider("mock", "test.resource", "only", None).id;
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "only", None);
         let state = wit_types::PersistedState {
             identifier: None,
             attributes: Vec::new(),

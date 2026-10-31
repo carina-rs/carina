@@ -57,7 +57,9 @@ impl DestroyCancellationFixture {
             let mut resource =
                 ResourceState::try_applied("test.resource", identity, "mock", "mock-id")
                     .expect("fixture identifier is non-empty");
-            resource.binding = Some(name.to_string());
+            resource.binding = Some(carina_core::resource::absolute_binding_address_for_test(
+                name,
+            ));
             resource.set_persisted_attribute("name".to_string(), serde_json::json!(name));
             state
                 .upsert_resource(resource)
@@ -85,7 +87,9 @@ impl DestroyCancellationFixture {
             let mut resource =
                 ResourceState::try_applied("test.resource", identity, "mock", "mock-id")
                     .expect("fixture identifier is non-empty");
-            resource.binding = Some(name.to_string());
+            resource.binding = Some(carina_core::resource::absolute_binding_address_for_test(
+                name,
+            ));
             resource.set_persisted_attribute("name".to_string(), serde_json::json!(name));
             state
                 .upsert_resource(resource)

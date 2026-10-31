@@ -2,6 +2,22 @@ use super::*;
 use crate::explicit::ExplicitFields;
 use crate::parser::SourceSpan;
 
+type Value = ExpandedValue;
+type ConcreteValue = ExpandedConcreteValue;
+type DeferredValue = ExpandedDeferredValue;
+type UnknownReason = ExpandedUnknownReason;
+type AccessPath = ExpandedAccessPath;
+type InterpolationPart = ExpandedInterpolationPart;
+type Resource = ExpandedResource<ModuleSource>;
+type DataSource = ExpandedDataSource<ModuleSource>;
+type Directives = ExpandedDirectives;
+type ResolvedResource = super::ResolvedResource<ModuleSource>;
+type ResolvedDataSource = super::ResolvedDataSource<ModuleSource>;
+
+fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
+    RootScope::new().resolve(RelativeBindingName::new(binding))
+}
+
 fn merge_with_saved(
     desired: &Value,
     saved: SavedValueViews<'_>,
@@ -183,7 +199,7 @@ fn deferred_access_serde_round_trips() {
     let original = apply_postfix_access(
         Value::Deferred(DeferredValue::FunctionCall {
             name: crate::builtins::BuiltinFunction::lookup,
-            args: vec![Value::resource_ref("source", "values", vec![]).into()],
+            args: vec![Value::root_resource_ref("source", "values", vec![]).into()],
             source_line: (0).into(),
         }),
         PathSegment::Subscript {
@@ -351,12 +367,12 @@ fn value_serde_round_trip() {
             ),
             ("num".to_string(), Value::Concrete(ConcreteValue::Int(10))),
         ]))),
-        Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
+        Value::root_resource_ref("vpc".to_string(), "id".to_string(), vec![]),
         Value::Concrete(ConcreteValue::String("dedicated".into())),
         Value::Concrete(ConcreteValue::String("InstanceTenancy.dedicated".into())),
         Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("prefix-".into()),
-            InterpolationPart::Expr(Value::resource_ref(
+            InterpolationPart::Expr(Value::root_resource_ref(
                 "vpc".to_string(),
                 "id".to_string(),
                 vec![],
@@ -839,13 +855,13 @@ fn prevent_destroy_resolution_reports_source_and_fails_safe_for_expressions() {
 #[test]
 fn directives_depends_on_defaults_to_empty() {
     let d = Directives::default();
-    assert_eq!(d.depends_on, Vec::<String>::new());
+    assert!(d.depends_on.is_empty());
 }
 
 #[test]
 fn directives_depends_on_round_trips_serde() {
     let d = Directives {
-        depends_on: vec!["role".to_string(), "key".to_string()],
+        depends_on: vec![absolute_binding("role"), absolute_binding("key")],
         ..Directives::default()
     };
     let json = serde_json::to_string(&d).unwrap();
@@ -875,7 +891,7 @@ fn directives_depends_on_deserialises_from_legacy_json_without_field() {
         "prevent_destroy": {"kind": "unspecified"}
     }"#;
     let d: Directives = serde_json::from_str(without_depends_on).unwrap();
-    assert_eq!(d.depends_on, Vec::<String>::new());
+    assert!(d.depends_on.is_empty());
 }
 
 #[test]
@@ -2592,15 +2608,16 @@ fn unavailable_canonical_hash_matches_function_call_and_ignores_diagnostics() {
 
 #[test]
 fn resource_typed_binding_field() {
-    let resource = Resource::new("s3.Bucket", "my-bucket").with_binding("my_bucket");
-    assert_eq!(resource.binding, Some("my_bucket".to_string()));
+    let resource: AuthoredResource =
+        AuthoredResource::new("s3.Bucket", "my-bucket").with_binding("my_bucket");
+    assert_eq!(resource.binding.as_deref(), Some("my_bucket"));
     // binding should NOT be in attributes
     assert!(!resource.attributes.contains_key("_binding"));
 }
 
 #[test]
 fn resource_typed_dependency_bindings_field() {
-    let resource = Resource::new("ec2.Subnet", "my-subnet")
+    let resource: AuthoredResource = AuthoredResource::new("ec2.Subnet", "my-subnet")
         .with_dependency_bindings(["vpc".to_string()].into_iter().collect());
     assert!(resource.dependency_bindings.contains("vpc"));
     assert_eq!(resource.dependency_bindings.len(), 1);
@@ -2612,9 +2629,9 @@ fn resource_typed_dependency_bindings_field() {
 /// entry (#2228).
 #[test]
 fn resource_dependency_bindings_dedup_on_duplicate_insert() {
-    let mut resource = Resource::new("ec2.Subnet", "my-subnet");
-    resource.dependency_bindings.insert("vpc".to_string());
-    resource.dependency_bindings.insert("vpc".to_string());
+    let mut resource: AuthoredResource = AuthoredResource::new("ec2.Subnet", "my-subnet");
+    resource.dependency_bindings.insert("vpc".into());
+    resource.dependency_bindings.insert("vpc".into());
     assert_eq!(resource.dependency_bindings.len(), 1);
     assert!(resource.dependency_bindings.contains("vpc"));
 }
@@ -2623,13 +2640,15 @@ fn resource_dependency_bindings_dedup_on_duplicate_insert() {
 /// order (#2228).
 #[test]
 fn resource_dependency_bindings_iteration_is_sorted() {
-    let mut resource = Resource::new("ec2.Route", "my-route");
-    resource.dependency_bindings.insert("rt".to_string());
-    resource
+    let mut resource: AuthoredResource = AuthoredResource::new("ec2.Route", "my-route");
+    resource.dependency_bindings.insert("rt".into());
+    resource.dependency_bindings.insert("tgw_attach".into());
+    resource.dependency_bindings.insert("vpc".into());
+    let order: Vec<&str> = resource
         .dependency_bindings
-        .insert("tgw_attach".to_string());
-    resource.dependency_bindings.insert("vpc".to_string());
-    let order: Vec<&String> = resource.dependency_bindings.iter().collect();
+        .iter()
+        .map(AsRef::as_ref)
+        .collect();
     assert_eq!(order, vec!["rt", "tgw_attach", "vpc"]);
 }
 
@@ -2638,8 +2657,8 @@ fn resource_dependency_bindings_iteration_is_sorted() {
 #[test]
 fn state_dependency_bindings_dedup_on_duplicate_insert() {
     let mut state = State::not_found(ResourceId::with_identity("ec2.Subnet", "my-subnet"));
-    state.dependency_bindings.insert("vpc".to_string());
-    state.dependency_bindings.insert("vpc".to_string());
+    state.dependency_bindings.insert(absolute_binding("vpc"));
+    state.dependency_bindings.insert(absolute_binding("vpc"));
     assert_eq!(state.dependency_bindings.len(), 1);
 }
 
@@ -2659,7 +2678,7 @@ fn resource_attributes_use_value_type() {
         )
         .with_attribute(
             "vpc_id",
-            Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
+            Value::root_resource_ref("vpc".to_string(), "id".to_string(), vec![]),
         );
     assert!(matches!(
         resource.get_attr("name"),
@@ -2701,7 +2720,7 @@ fn resource_module_source_typed_field() {
         CompositionCallPath::direct(CompositionCall {
             id: crate::parser::ModuleCallId::test_dummy_in("web.crn"),
             module_name: "web_tier".to_string(),
-            binding: Some("web".to_string()),
+            binding: Some(absolute_binding("web")),
             instance: "web".to_string(),
             module_source: Some("./web".to_string()),
             module_directory: None,
@@ -2816,9 +2835,11 @@ fn deserialized_unbound_loop_template_still_rejects_read_without_a_source_span()
         &crate::parser::ProviderContext::default(),
     )
     .expect("deferred loop parses");
-    let parsed =
-        crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-            .expect("deferred fixture crosses the module-resolution seam");
+    let parsed = crate::module_resolver::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        std::path::Path::new("."),
+    )
+    .expect("deferred fixture crosses the module-resolution seam");
     let crate::parser::DeferredForTarget::Unbound { template } =
         &parsed.deferred_for_expressions()[0].target
     else {
@@ -2890,7 +2911,7 @@ fn saved_nested_module_source_preserves_live_anonymous_scope() {
     let call = CompositionCall {
         id: crate::parser::ModuleCallId::test_dummy_in("nested.crn"),
         module_name: "outer".to_string(),
-        binding: Some("outer".to_string()),
+        binding: Some(absolute_binding("outer")),
         instance: "outer".to_string(),
         module_source: Some("./outer".to_string()),
         module_directory: None,
@@ -2912,7 +2933,7 @@ fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_
     let call = CompositionCall {
         id: crate::parser::ModuleCallId::test_dummy_in("live.crn"),
         module_name: "fixture".to_string(),
-        binding: Some("instance".to_string()),
+        binding: Some(absolute_binding("instance")),
         instance: "instance".to_string(),
         module_source: Some("./fixture".to_string()),
         module_directory: None,
@@ -2986,7 +3007,7 @@ fn access_path_subscripts_render_with_escapes() {
     use crate::resource::{AccessPath, Subscript};
 
     // Integer subscript renders as `[N]`.
-    let int_path = AccessPath::with_fields_and_subscripts(
+    let int_path = AccessPath::root_with_fields_and_subscripts(
         "orgs",
         "accounts",
         Vec::new(),
@@ -2995,7 +3016,7 @@ fn access_path_subscripts_render_with_escapes() {
     assert_eq!(int_path.to_dot_string(), "orgs.accounts[0]");
 
     // The canonical encoder can retain a double quote inside single quotes.
-    let str_path = AccessPath::with_fields_and_subscripts(
+    let str_path = AccessPath::root_with_fields_and_subscripts(
         "orgs",
         "accounts",
         Vec::new(),
@@ -3008,7 +3029,7 @@ fn access_path_subscripts_render_with_escapes() {
 fn string_subscript_display_uses_canonical_literal() {
     use crate::resource::{AccessPath, Subscript};
 
-    let path = AccessPath::with_fields_and_subscripts(
+    let path = AccessPath::root_with_fields_and_subscripts(
         "resource",
         "tags",
         Vec::new(),
@@ -3020,7 +3041,7 @@ fn string_subscript_display_uses_canonical_literal() {
 
 #[test]
 fn access_path_new() {
-    let path = AccessPath::new("vpc", "id");
+    let path = AccessPath::root("vpc", "id");
     assert_eq!(path.binding(), "vpc");
     assert_eq!(path.attribute(), "id");
     assert!(path.leading_field_path().is_empty());
@@ -3029,7 +3050,7 @@ fn access_path_new() {
 
 #[test]
 fn access_path_with_fields() {
-    let path = AccessPath::with_fields("web", "network", vec!["vpc_id".to_string()]);
+    let path = AccessPath::root_with_fields("web", "network", vec!["vpc_id".to_string()]);
     assert_eq!(path.binding(), "web");
     assert_eq!(path.attribute(), "network");
     assert_eq!(path.leading_field_path(), ["vpc_id".to_string()]);
@@ -3038,7 +3059,7 @@ fn access_path_with_fields() {
 
 #[test]
 fn resource_ref_serde_roundtrip() {
-    let value = Value::resource_ref("vpc", "id", vec![]);
+    let value = Value::root_resource_ref("vpc", "id", vec![]);
     let json = serde_json::to_string(&value).unwrap();
     let deserialized: Value = serde_json::from_str(&json).unwrap();
     assert_eq!(value, deserialized);
@@ -3047,9 +3068,9 @@ fn resource_ref_serde_roundtrip() {
 #[test]
 fn coalesce_serde_roundtrip_preserves_both_operands() {
     let value = Value::Deferred(DeferredValue::Coalesce {
-        value: Box::new(Value::resource_ref("up", "accounts", vec![])),
+        value: Box::new(Value::root_resource_ref("up", "accounts", vec![])),
         default: Box::new(Value::Concrete(ConcreteValue::List(vec![
-            Value::resource_ref("fallback", "accounts", vec![]),
+            Value::root_resource_ref("fallback", "accounts", vec![]),
         ]))),
     });
     let json = serde_json::to_string(&value).unwrap();
@@ -3059,7 +3080,7 @@ fn coalesce_serde_roundtrip_preserves_both_operands() {
 
 #[test]
 fn resource_ref_serde_with_field_path() {
-    let value = Value::resource_ref("web", "network", vec!["vpc_id".to_string()]);
+    let value = Value::root_resource_ref("web", "network", vec!["vpc_id".to_string()]);
     let json = serde_json::to_string(&value).unwrap();
     let deserialized: Value = serde_json::from_str(&json).unwrap();
     assert_eq!(value, deserialized);
@@ -3067,7 +3088,7 @@ fn resource_ref_serde_with_field_path() {
 
 #[test]
 fn value_ref_helpers() {
-    let value = Value::resource_ref("vpc", "vpc_id", vec!["nested".to_string()]);
+    let value = Value::root_resource_ref("vpc", "vpc_id", vec!["nested".to_string()]);
     assert_eq!(value.ref_binding(), Some("vpc"));
     assert_eq!(value.ref_attribute(), Some("vpc_id"));
     assert_eq!(
@@ -3091,28 +3112,28 @@ fn value_ref_helpers() {
 #[test]
 fn visit_resource_refs_collects_from_all_nested_variants() {
     let value = Value::Concrete(ConcreteValue::List(vec![
-        Value::resource_ref("a", "id", vec![]),
+        Value::root_resource_ref("a", "id", vec![]),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "k".to_string(),
-            Value::resource_ref("b", "id", vec![]),
+            Value::root_resource_ref("b", "id", vec![]),
         )]))),
         Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("x".into()),
-            InterpolationPart::Expr(Value::resource_ref("c", "id", vec![])),
+            InterpolationPart::Expr(Value::root_resource_ref("c", "id", vec![])),
         ])),
         Value::Deferred(DeferredValue::FunctionCall {
             name: crate::builtins::BuiltinFunction::join,
-            args: vec![Value::resource_ref("d", "id", vec![]).into()],
+            args: vec![Value::root_resource_ref("d", "id", vec![]).into()],
             source_line: (0).into(),
         }),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::resource_ref(
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::root_resource_ref(
             "e",
             "id",
             vec![],
         )))),
         Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("f", "id", vec![])),
-            default: Box::new(Value::resource_ref("g", "id", vec![])),
+            value: Box::new(Value::root_resource_ref("f", "id", vec![])),
+            default: Box::new(Value::root_resource_ref("g", "id", vec![])),
         }),
         Value::Concrete(ConcreteValue::String("plain".into())),
     ]));
@@ -3128,10 +3149,10 @@ fn visit_resource_refs_collects_from_all_nested_variants() {
 #[test]
 fn resource_ref_usage_marks_only_the_coalesce_value_optional() {
     let value = Value::Deferred(DeferredValue::Coalesce {
-        value: Box::new(Value::resource_ref("optional", "id", vec![])),
+        value: Box::new(Value::root_resource_ref("optional", "id", vec![])),
         default: Box::new(Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("nested_optional", "id", vec![])),
-            default: Box::new(Value::resource_ref("required", "id", vec![])),
+            value: Box::new(Value::root_resource_ref("nested_optional", "id", vec![])),
+            default: Box::new(Value::root_resource_ref("required", "id", vec![])),
         })),
     });
     let mut collected = Vec::new();
@@ -3156,25 +3177,25 @@ fn resource_ref_usage_marks_only_the_coalesce_value_optional() {
 fn visit_binding_refs_collects_from_all_nested_variants() {
     let value = Value::Concrete(ConcreteValue::List(vec![
         Value::Deferred(DeferredValue::BindingRef {
-            binding: "a".to_string(),
+            binding: absolute_binding("a"),
         }),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "k".to_string(),
             Value::Deferred(DeferredValue::BindingRef {
-                binding: "b".to_string(),
+                binding: absolute_binding("b"),
             }),
         )]))),
         Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("x".into()),
             InterpolationPart::Expr(Value::Deferred(DeferredValue::BindingRef {
-                binding: "c".to_string(),
+                binding: absolute_binding("c"),
             })),
         ])),
         Value::Deferred(DeferredValue::FunctionCall {
             name: crate::builtins::BuiltinFunction::join,
             args: vec![
                 Value::Deferred(DeferredValue::BindingRef {
-                    binding: "d".to_string(),
+                    binding: absolute_binding("d"),
                 })
                 .into(),
             ],
@@ -3182,15 +3203,15 @@ fn visit_binding_refs_collects_from_all_nested_variants() {
         }),
         Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
             DeferredValue::BindingRef {
-                binding: "e".to_string(),
+                binding: absolute_binding("e"),
             },
         )))),
         Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(Value::Deferred(DeferredValue::BindingRef {
-                binding: "f".to_string(),
+                binding: absolute_binding("f"),
             })),
             default: Box::new(Value::Deferred(DeferredValue::BindingRef {
-                binding: "g".to_string(),
+                binding: absolute_binding("g"),
             })),
         }),
     ]));
@@ -3227,7 +3248,7 @@ fn canonicalize_leaves_simple_values_alone() {
         Value::Concrete(ConcreteValue::Int(1)),
         Value::Concrete(ConcreteValue::Float(1.5)),
         Value::Concrete(ConcreteValue::Bool(true)),
-        Value::resource_ref("vpc", "id", vec![]),
+        Value::root_resource_ref("vpc", "id", vec![]),
     ] {
         assert_eq!(v.clone().canonicalize(), v);
     }
@@ -3286,7 +3307,7 @@ fn canonicalize_merges_adjacent_literals() {
     let v = Value::Deferred(DeferredValue::Interpolation(vec![
         InterpolationPart::Literal("a".into()),
         InterpolationPart::Literal("b".into()),
-        InterpolationPart::Expr(Value::resource_ref("vpc", "id", vec![])),
+        InterpolationPart::Expr(Value::root_resource_ref("vpc", "id", vec![])),
         InterpolationPart::Literal("c".into()),
         InterpolationPart::Literal("d".into()),
     ]));
@@ -3294,7 +3315,7 @@ fn canonicalize_merges_adjacent_literals() {
         v.canonicalize(),
         Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("ab".into()),
-            InterpolationPart::Expr(Value::resource_ref("vpc", "id", vec![])),
+            InterpolationPart::Expr(Value::root_resource_ref("vpc", "id", vec![])),
             InterpolationPart::Literal("cd".into()),
         ]))
     );
@@ -3318,7 +3339,7 @@ fn canonicalize_folds_simple_expr_into_literal_then_merges() {
 fn canonicalize_keeps_resource_ref_expr_in_interpolation() {
     let parts = vec![
         InterpolationPart::Literal("prefix-".into()),
-        InterpolationPart::Expr(Value::resource_ref("vpc", "id", vec![])),
+        InterpolationPart::Expr(Value::root_resource_ref("vpc", "id", vec![])),
     ];
     let v = Value::Deferred(DeferredValue::Interpolation(parts.clone()));
     assert_eq!(
@@ -3440,7 +3461,7 @@ fn canonicalize_is_idempotent() {
         // ResourceRef-bearing Interpolation stays as Interpolation.
         Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("a".into()),
-            InterpolationPart::Expr(Value::resource_ref("x", "y", vec![])),
+            InterpolationPart::Expr(Value::root_resource_ref("x", "y", vec![])),
             InterpolationPart::Literal("b".into()),
         ])),
         // Nested Interpolation inside an Expr.
@@ -3491,7 +3512,7 @@ fn unknown_never_equals_unknown() {
     // anything (including itself). Without this, the differ would
     // suppress real diffs between two attributes that both happen to
     // be "unresolved upstream" of the same binding.
-    let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+    let path = AccessPath::root_with_fields("network", "vpc", vec!["vpc_id".into()]);
     let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
         path: path.clone(),
     }));
@@ -3532,7 +3553,7 @@ fn unknown_hash_is_deterministic_per_path() {
         v.hash_into(&mut h);
         h.finish()
     }
-    let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+    let path = AccessPath::root_with_fields("network", "vpc", vec!["vpc_id".into()]);
     let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
         path: path.clone(),
     }));
@@ -3554,8 +3575,8 @@ fn unknown_hash_differs_per_path() {
         v.hash_into(&mut h);
         h.finish()
     }
-    let p1 = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    let p2 = AccessPath::with_fields("network", "vpc", vec!["cidr_block".into()]);
+    let p1 = AccessPath::root_with_fields("network", "vpc", vec!["vpc_id".into()]);
+    let p2 = AccessPath::root_with_fields("network", "vpc", vec!["cidr_block".into()]);
     let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
         path: p1,
     }));
@@ -3580,7 +3601,7 @@ fn unknown_round_trips_through_saved_plan_serde() {
     // Residual deferred-for templates in saved plans need the typed reason in
     // order to substitute their loop key/value at apply time. Runtime
     // provider/state conversion still rejects Unknown through value_to_json.
-    let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+    let path = AccessPath::root_with_fields("network", "vpc", vec!["vpc_id".into()]);
     let value = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
         path: path.clone(),
     }));
@@ -3606,14 +3627,14 @@ fn deserializing_reference_rooted_access_canonicalizes_the_reference() {
     let decoded: Value = serde_json::from_value(encoded).expect("valid deferred access encoding");
     assert_eq!(
         decoded,
-        Value::resource_ref("roles[0]", "identifier", vec![]),
+        Value::root_resource_ref("roles[0]", "identifier", vec![]),
         "deserialization must enter through the same canonical constructor"
     );
 }
 
 #[test]
 fn upstream_unknown_wire_tags_remain_stable() {
-    let path = AccessPath::new("network", "vpc_id");
+    let path = AccessPath::root("network", "vpc_id");
     let export = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
         path: path.clone(),
     }));
@@ -3628,7 +3649,7 @@ fn upstream_unknown_wire_tags_remain_stable() {
     }
 
     let all_exports = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamAllExports {
-        binding: "network".into(),
+        binding: absolute_binding("network"),
     }));
     let all_exports_json = r#"{"Unknown":{"UpstreamBareRef":{"binding":"network"}}}"#;
     assert_eq!(
@@ -3637,7 +3658,7 @@ fn upstream_unknown_wire_tags_remain_stable() {
     );
     match serde_json::from_str::<Value>(all_exports_json).unwrap() {
         Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamAllExports { binding })) => {
-            assert_eq!(binding, "network")
+            assert_eq!(binding.as_str(), "network")
         }
         other => panic!("expected UpstreamAllExports, got {other:?}"),
     }
@@ -3730,12 +3751,12 @@ fn as_concrete_returns_projection_for_concrete_variants() {
 fn as_deferred_returns_projection_for_deferred_variants() {
     let cases: Vec<(Value, &'static str)> = vec![
         (
-            Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
+            Value::root_resource_ref("vpc".to_string(), "id".to_string(), vec![]),
             "ResourceRef",
         ),
         (
             Value::Deferred(DeferredValue::BindingRef {
-                binding: "bootstrap".to_string(),
+                binding: absolute_binding("bootstrap"),
             }),
             "BindingRef",
         ),
@@ -3860,7 +3881,7 @@ mod navigate_value_path_tests {
     fn one_level_field() {
         // root = { k = "v" }, path = _.k  → "v"
         let root = map(&[("k", s("v"))]);
-        let path = AccessPath::new("o", "k");
+        let path = AccessPath::root("o", "k");
         assert_eq!(navigate_value_path(&root, &path), Some(s("v")));
     }
 
@@ -3869,7 +3890,7 @@ mod navigate_value_path_tests {
         // root = { resource_record = { name = "n1" } }
         // path = _.resource_record.name  → "n1"
         let root = map(&[("resource_record", map(&[("name", s("n1"))]))]);
-        let path = AccessPath::with_fields("opt", "resource_record", vec!["name".into()]);
+        let path = AccessPath::root_with_fields("opt", "resource_record", vec!["name".into()]);
         assert_eq!(navigate_value_path(&root, &path), Some(s("n1")));
     }
 
@@ -3880,7 +3901,7 @@ mod navigate_value_path_tests {
             "vals",
             Value::Concrete(ConcreteValue::List(vec![s("a"), s("b")])),
         )]);
-        let path = AccessPath::with_fields_and_subscripts(
+        let path = AccessPath::root_with_fields_and_subscripts(
             "o",
             "vals",
             vec![],
@@ -3893,7 +3914,7 @@ mod navigate_value_path_tests {
     fn map_str_subscript() {
         // root = { tags = { Name = "x" } }, path = _.tags["Name"]  → "x"
         let root = map(&[("tags", map(&[("Name", s("x"))]))]);
-        let path = AccessPath::with_fields_and_subscripts(
+        let path = AccessPath::root_with_fields_and_subscripts(
             "o",
             "tags",
             vec![],
@@ -3905,7 +3926,7 @@ mod navigate_value_path_tests {
     #[test]
     fn missing_field_is_none() {
         let root = map(&[("k", s("v"))]);
-        let path = AccessPath::new("o", "absent");
+        let path = AccessPath::root("o", "absent");
         assert_eq!(navigate_value_path(&root, &path), None);
     }
 
@@ -3914,14 +3935,14 @@ mod navigate_value_path_tests {
         // root is a scalar string — `.k` is meaningless → None (the
         // Site B "not a resource" guard's correct domain).
         let root = s("scalar");
-        let path = AccessPath::new("o", "k");
+        let path = AccessPath::root("o", "k");
         assert_eq!(navigate_value_path(&root, &path), None);
     }
 
     #[test]
     fn out_of_range_index_is_none() {
         let root = map(&[("vals", Value::Concrete(ConcreteValue::List(vec![s("a")])))]);
-        let path = AccessPath::with_fields_and_subscripts(
+        let path = AccessPath::root_with_fields_and_subscripts(
             "o",
             "vals",
             vec![],
@@ -3936,7 +3957,7 @@ mod navigate_value_path_tests {
             "nested",
             Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
         )]);
-        let path = AccessPath::with_fields("o", "nested", vec!["name".into()]);
+        let path = AccessPath::root_with_fields("o", "nested", vec!["name".into()]);
 
         assert_eq!(navigate_value_path(&root, &path), None);
     }
@@ -3949,7 +3970,7 @@ mod navigate_value_path_tests {
             "tok",
             Value::Deferred(DeferredValue::Secret(Box::new(s("s")))),
         )]);
-        let path = AccessPath::new("o", "tok");
+        let path = AccessPath::root("o", "tok");
         assert_eq!(
             navigate_value_path(&root, &path),
             Some(Value::Deferred(DeferredValue::Secret(Box::new(s("s")))))
@@ -3965,7 +3986,7 @@ mod navigate_value_path_tests {
             "rr",
             Value::Deferred(DeferredValue::Secret(Box::new(inner))),
         )]);
-        let path = AccessPath::with_fields("o", "rr", vec!["name".into()]);
+        let path = AccessPath::root_with_fields("o", "rr", vec!["name".into()]);
         assert_eq!(
             navigate_value_path(&root, &path),
             Some(Value::Deferred(DeferredValue::Secret(Box::new(s("n")))))

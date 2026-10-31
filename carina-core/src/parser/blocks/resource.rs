@@ -5,7 +5,10 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
-use crate::eval_value::{EvalValue, ParsedSinkValue, StructuralHandleKind};
+use crate::eval_value::{
+    AuthoredEvalValue as EvalValue, AuthoredParsedSinkValue as ParsedSinkValue,
+    StructuralHandleKind,
+};
 use crate::parser::Rule;
 use crate::parser::context::{
     ExpressionMode, ParseContext, extract_key_string, first_inner, next_pair,
@@ -17,8 +20,11 @@ use crate::parser::error::{
 use crate::parser::util::expression_is_plain_string_literal;
 use crate::parser::{parse_expression, parse_expression_eval, parse_expression_in_sink};
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, LoopElementOrigin, LoopProvenance,
-    ParsedIgnorePath, ParsedIgnorePathSegment, Resource, ResourceId, ResourceIdentity, Value,
+    AuthoredConcreteValue as ConcreteValue, AuthoredDataSource as DataSource,
+    AuthoredDeferredValue as DeferredValue, AuthoredDirectives as Directives,
+    AuthoredResource as Resource, AuthoredValue as Value, DiagnosticSourceLocations,
+    LoopElementOrigin, LoopProvenance, ParsedIgnorePath, ParsedIgnorePathSegment, ResourceId,
+    ResourceIdentity,
 };
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -109,7 +115,7 @@ pub(crate) fn parse_resource_for_target(
                 ResourceIdentity::new(binding.clone()),
                 directives.provider_instance.clone(),
             ),
-            Some(binding),
+            Some(crate::resource::RelativeBindingName::new(binding)),
             LoopProvenance::default(),
         ),
     };
@@ -416,7 +422,7 @@ pub(crate) fn parse_read_resource_expr(
         id,
         attributes: attributes.into_iter().collect(),
         directives,
-        binding: Some(binding_name.to_string()),
+        binding: Some(crate::resource::RelativeBindingName::new(binding_name)),
         dependency_bindings: BTreeSet::new(),
         module_source: None,
         quoted_string_attrs,
@@ -491,6 +497,7 @@ fn parse_directives(
                     });
                 }
                 let mut names = Vec::new();
+                let mut source_lines = Vec::new();
                 for element in list.into_inner() {
                     let element_line = element.line_col().0;
                     let eval = parse_expression_eval(element, ctx)?;
@@ -500,8 +507,14 @@ fn parse_directives(
                         element_line,
                         BindingNameUse::Dependency,
                     )?);
+                    source_lines.push(element_line);
                 }
-                directives.depends_on = names;
+                directives.depends_on = names
+                    .into_iter()
+                    .map(crate::resource::RelativeBindingName::new)
+                    .collect();
+                directives.depends_on_diagnostic_sources =
+                    DiagnosticSourceLocations::authored(ctx.source_file(), source_lines);
             }
             "provider" => {
                 let eval = parse_expression_eval(value_pair, ctx)?;
@@ -691,8 +704,10 @@ fn eval_as_binding_name(
                 "directives.provider: module parameter '{name}' cannot be used as a provider instance"
             ),
         }),
-        EvalValue::User(Value::Deferred(DeferredValue::BindingRef { binding })) => Ok(binding),
-        EvalValue::ProvisionalReference { binding } => Ok(binding),
+        EvalValue::User(Value::Deferred(DeferredValue::BindingRef { binding })) => {
+            Ok(binding.into_string())
+        }
+        EvalValue::ProvisionalReference { binding } => Ok(binding.into_string()),
         EvalValue::User(Value::Concrete(ConcreteValue::EnumIdentifier(name))) => {
             Ok(name.to_string())
         }

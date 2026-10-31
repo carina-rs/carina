@@ -9,9 +9,9 @@ use thiserror::Error;
 
 use crate::parser::{display_double_quoted_literal_part, display_string_literal};
 use crate::resource::{
-    CanonicalEnumValue, ConcreteValue, DeferredValue, InterpolationPart, RedactedSecretHash,
-    UnavailableCoalescePolicy, UnavailableSecretPolicy, UnknownReason, Value,
-    find_unavailable_evaluation,
+    AbsoluteBindingAddress, BindingAddress, CanonicalEnumValue, ConcreteValue, DeferredValue,
+    InterpolationPart, RedactedSecretHash, UnavailableCoalescePolicy, UnavailableSecretPolicy,
+    UnknownReason, Value, find_unavailable_evaluation,
 };
 use crate::schema::{AttrTypeKind, AttributeType, TypeIdentity};
 use crate::utils::is_identifier_safe;
@@ -66,7 +66,7 @@ pub enum SerializationError {
     /// detection before crossing a serialization boundary.
     #[error("cannot serialize at {context}: value is not yet known ({reason})")]
     UnknownNotAllowed {
-        reason: UnknownReason,
+        reason: Box<UnknownReason>,
         context: SerializationContext,
     },
     /// A non-finite float (`NaN`, `±∞`) reached JSON serialization.
@@ -269,7 +269,7 @@ impl std::fmt::Display for crate::resource::PendingReRead {
 }
 
 /// Render an `UnknownReason` to its plan-display string.
-pub fn render_unknown(reason: &UnknownReason) -> String {
+pub fn render_unknown<B: BindingAddress>(reason: &UnknownReason<B>) -> String {
     match reason {
         UnknownReason::UpstreamExport { path } => {
             format!("(known after upstream apply: {})", path.to_dot_string())
@@ -794,7 +794,7 @@ fn value_to_json_inner(
                 // pass before reaching any serialization boundary. Report
                 // through the same channel as `ResourceRef` so the same
                 // diagnostic path covers both producer kinds.
-                path: binding.clone(),
+                path: binding.to_string(),
                 context: ctx,
             })
         }
@@ -842,7 +842,7 @@ fn value_to_json_inner(
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
+                reason: Box::new(reason.clone()),
                 context: ctx,
             })
         }
@@ -1229,7 +1229,7 @@ fn canonical_enum_from_payload(
 }
 
 /// Format a `Value` for display
-pub fn format_value(value: &Value) -> String {
+pub fn format_value<B: BindingAddress>(value: &Value<B>) -> String {
     format_value_with_key(value, None)
 }
 
@@ -1356,7 +1356,7 @@ impl PrettyValue {
 }
 
 /// Render a value together with semantic span metadata.
-pub fn render_value(value: &Value) -> RenderedValue {
+pub fn render_value<B: BindingAddress>(value: &Value<B>) -> RenderedValue {
     let mut sink = SpanSink::default();
     format_value_into(value, &mut sink).expect("SpanSink writes are infallible");
     sink.rendered
@@ -1383,7 +1383,7 @@ fn render_persisted_json(value: PersistedView<'_>) -> RenderedValue {
 /// placeholders while the value tree is still available. No rendered text is
 /// inspected to identify the placeholder.
 pub(crate) fn render_value_with_upstream_deferred_label(
-    value: &Value,
+    value: &Value<impl BindingAddress>,
     upstream_binding: &str,
     verb: &str,
 ) -> RenderedValue {
@@ -1424,7 +1424,7 @@ pub(crate) fn render_string_text(text: &str) -> RenderedValue {
 
 /// Format a `Value` for user-visible messages where DSL literal quotes
 /// around bare strings get in the way.
-pub fn format_value_user_facing(value: &Value) -> String {
+pub fn format_value_user_facing<B: BindingAddress>(value: &Value<B>) -> String {
     match value {
         Value::Concrete(ConcreteValue::String(value)) => value.expose_plaintext().to_string(),
         _ => format_value(value),
@@ -1432,7 +1432,7 @@ pub fn format_value_user_facing(value: &Value) -> String {
 }
 
 /// Format a `Value` for display, with an optional key for context
-pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
+pub fn format_value_with_key<B: BindingAddress>(value: &Value<B>, _key: Option<&str>) -> String {
     let mut sink = StringSink::default();
     // `StringSink::write_token` never returns Err (it has no overflow
     // budget), so the `Result` here is structurally `Ok(())`. Treat the
@@ -1578,7 +1578,10 @@ pub fn render_duration(d: std::time::Duration) -> String {
 /// truth for plan-display value formatting; sinks downstream of this
 /// function decide whether to materialise a `String` or just count
 /// bytes (#2434).
-pub(crate) fn format_value_into(value: &Value, sink: &mut dyn FormatSink) -> Result<(), Overflow> {
+pub(crate) fn format_value_into<B: BindingAddress>(
+    value: &Value<B>,
+    sink: &mut dyn FormatSink,
+) -> Result<(), Overflow> {
     format_value_into_context(value, sink, FormatContext::default())
 }
 
@@ -1587,8 +1590,8 @@ struct FormatContext<'a> {
     upstream_deferred_label: Option<(&'a str, &'a str)>,
 }
 
-fn format_value_into_context(
-    value: &Value,
+fn format_value_into_context<B: BindingAddress>(
+    value: &Value<B>,
     sink: &mut dyn FormatSink,
     context: FormatContext<'_>,
 ) -> Result<(), Overflow> {
@@ -1673,7 +1676,7 @@ fn format_value_into_context(
             sink.write_token(ValueSpanKind::Reference, &path.to_dot_string())
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            sink.write_token(ValueSpanKind::Reference, binding)
+            sink.write_token(ValueSpanKind::Reference, binding.as_str())
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             let parenthesize_left = matches!(
@@ -1758,8 +1761,8 @@ fn format_value_into_context(
     }
 }
 
-fn format_integer_arithmetic(
-    expression: &crate::integer_arithmetic::ValidatedIntegerExpr,
+fn format_integer_arithmetic<B: BindingAddress>(
+    expression: &crate::integer_arithmetic::ValidatedIntegerExpr<B>,
     sink: &mut dyn FormatSink,
     context: FormatContext<'_>,
 ) -> Result<(), Overflow> {
@@ -1771,8 +1774,8 @@ fn format_integer_arithmetic(
     format_integer_operand(expression.rhs(), expression.op(), true, sink, context)
 }
 
-fn format_integer_operand(
-    value: &Value,
+fn format_integer_operand<B: BindingAddress>(
+    value: &Value<B>,
     parent_op: crate::integer_arithmetic::IntegerOp,
     right_operand: bool,
     sink: &mut dyn FormatSink,
@@ -1860,8 +1863,8 @@ fn format_decoded_persisted_json_into(
     }
 }
 
-fn write_unknown(
-    reason: &UnknownReason,
+fn write_unknown<B: BindingAddress>(
+    reason: &UnknownReason<B>,
     sink: &mut dyn FormatSink,
     context: FormatContext<'_>,
 ) -> Result<(), Overflow> {
@@ -1885,7 +1888,7 @@ fn write_upstream_deferred_label(
     )
 }
 
-fn is_upstream_deferred_reason(reason: &UnknownReason) -> bool {
+fn is_upstream_deferred_reason<B: BindingAddress>(reason: &UnknownReason<B>) -> bool {
     matches!(
         reason,
         UnknownReason::UpstreamExport { .. }
@@ -1896,7 +1899,7 @@ fn is_upstream_deferred_reason(reason: &UnknownReason) -> bool {
     )
 }
 
-pub(crate) fn is_upstream_deferred_marker_value(value: &Value) -> bool {
+pub(crate) fn is_upstream_deferred_marker_value<B: BindingAddress>(value: &Value<B>) -> bool {
     match value {
         Value::Deferred(DeferredValue::Unknown(reason)) => is_upstream_deferred_reason(reason),
         Value::Deferred(DeferredValue::Access(access)) => {
@@ -1912,8 +1915,13 @@ pub(crate) fn is_upstream_deferred_marker_value(value: &Value) -> bool {
 /// The semantic placeholder remains `Unknown(ForValue)`; the binding name is
 /// display-only parser metadata on `AccessExpr`, so no obsolete unknown reason
 /// or independently navigable path representation is reintroduced.
-fn deferred_for_access_display_path(access: &crate::resource::AccessExpr) -> Option<String> {
-    fn append_steps(access: &crate::resource::AccessExpr, output: &mut String) -> bool {
+fn deferred_for_access_display_path<B: BindingAddress>(
+    access: &crate::resource::AccessExpr<B>,
+) -> Option<String> {
+    fn append_steps<B: BindingAddress>(
+        access: &crate::resource::AccessExpr<B>,
+        output: &mut String,
+    ) -> bool {
         let rooted_at_for_value = match access.base() {
             Value::Deferred(DeferredValue::Access(inner)) => append_steps(inner, output),
             Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)) => true,
@@ -1933,7 +1941,9 @@ fn deferred_for_access_display_path(access: &crate::resource::AccessExpr) -> Opt
 /// Function calls and all other expression nodes intentionally stop the
 /// search: `unknown.field` is still unknown, while `split(unknown)[0]`
 /// remains a useful expression in diagnostics and plans.
-pub(crate) fn access_chain_unknown_root(value: &Value) -> Option<&UnknownReason> {
+pub(crate) fn access_chain_unknown_root<B: BindingAddress>(
+    value: &Value<B>,
+) -> Option<&UnknownReason<B>> {
     match value {
         Value::Deferred(DeferredValue::Access(access)) => access_chain_unknown_root(access.base()),
         Value::Deferred(DeferredValue::Unknown(reason)) => Some(reason),
@@ -1943,7 +1953,7 @@ pub(crate) fn access_chain_unknown_root(value: &Value) -> Option<&UnknownReason>
 }
 
 /// Check if a Value contains any Secret values at any nesting depth.
-pub fn contains_secret(value: &Value) -> bool {
+pub fn contains_secret<B: BindingAddress>(value: &Value<B>) -> bool {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             deferred.values().into_iter().any(contains_secret)
@@ -1993,7 +2003,7 @@ pub fn contains_secret(value: &Value) -> bool {
 /// authorizes hashing provider plaintext, while a
 /// [`DeferredValue::RedactedSecret`] is only historical hash evidence and
 /// must not be treated as a new desired secret.
-pub fn contains_unredacted_secret(value: &Value) -> bool {
+pub fn contains_unredacted_secret<B: BindingAddress>(value: &Value<B>) -> bool {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             deferred
@@ -2525,7 +2535,7 @@ fn canonical_secret_template(value: &Value) -> Result<serde_json::Value, Seriali
             serde_json::to_value(path).expect("AccessPath is serializable"),
         ),
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            tagged("binding_ref", JsonValue::String(binding.clone()))
+            tagged("binding_ref", JsonValue::String(binding.to_string()))
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => tagged(
             "coalesce",
@@ -2622,7 +2632,7 @@ fn canonical_secret_template(value: &Value) -> Result<serde_json::Value, Seriali
 }
 
 /// Return whether a value tree contains a saved-plan secret placeholder.
-pub fn contains_redacted_secret(value: &Value) -> bool {
+pub fn contains_redacted_secret<B: BindingAddress>(value: &Value<B>) -> bool {
     match value {
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => true,
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -2659,7 +2669,7 @@ fn attributes_contain_redacted_secret<'a>(values: impl Iterator<Item = &'a Value
 }
 
 fn deferred_template_contains_redacted_secret<S>(
-    template: &crate::parser::DeferredForExpression<S>,
+    template: &crate::parser::DeferredForExpression<S, AbsoluteBindingAddress>,
 ) -> bool {
     let crate::parser::DeferredForExpression {
         file: _file,
@@ -3676,7 +3686,7 @@ pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationErro
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
+                reason: Box::new(reason.clone()),
                 context: SerializationContext::SecretRedaction,
             })
         }
@@ -4109,8 +4119,14 @@ pub fn rehydrate_state_secrets_from_plaintext(
 }
 
 fn redact_deferred_template(
-    template: &crate::parser::DeferredForExpression,
-) -> Result<crate::parser::DeferredForExpression, SerializationError> {
+    template: &crate::parser::DeferredForExpression<
+        crate::resource::ModuleSource,
+        AbsoluteBindingAddress,
+    >,
+) -> Result<
+    crate::parser::DeferredForExpression<crate::resource::ModuleSource, AbsoluteBindingAddress>,
+    SerializationError,
+> {
     let mut redacted = template.clone();
     redacted.iterable = redact_secrets_only(&template.iterable)?;
     redacted.template_resource.attributes = template
@@ -4375,7 +4391,7 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
     resources: &HashMap<crate::resource::ResourceId, crate::resource::Resource>,
     data_sources: &HashMap<crate::resource::ResourceId, crate::resource::DataSource>,
     import_identifiers: &HashMap<crate::resource::ResourceId, Value>,
-    deferred_templates: &crate::parser::ResolvedDeferredForExpressions,
+    deferred_templates: &crate::parser::ResolvedDeferredForExpressions<AbsoluteBindingAddress>,
 ) -> Result<crate::plan::Plan<S>, SecretRehydrationSiteError> {
     use crate::effect::{DeferredReplacePayload, Effect};
 
@@ -4479,9 +4495,12 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
 }
 
 fn rehydrate_deferred_template<S: Clone, T>(
-    saved: &crate::parser::DeferredForExpression<S>,
-    candidates: &[crate::parser::DeferredForExpression<T>],
-) -> Result<crate::parser::DeferredForExpression<S>, SecretRehydrationSiteError> {
+    saved: &crate::parser::DeferredForExpression<S, AbsoluteBindingAddress>,
+    candidates: &[crate::parser::DeferredForExpression<T, AbsoluteBindingAddress>],
+) -> Result<
+    crate::parser::DeferredForExpression<S, AbsoluteBindingAddress>,
+    SecretRehydrationSiteError,
+> {
     let has_placeholder = deferred_template_contains_redacted_secret(saved);
     if !has_placeholder {
         return Ok(saved.clone());
@@ -5143,7 +5162,6 @@ pub(crate) enum CanonicalizationPurpose<'a> {
     Desired(DesiredValueSource),
     ProviderConfig { provider_name: &'a str },
     State,
-    WaitRhs,
 }
 
 impl<'a> CanonicalizationPurpose<'a> {
@@ -5164,13 +5182,13 @@ impl<'a> CanonicalizationPurpose<'a> {
     pub(crate) fn provider_config_name(self) -> Option<&'a str> {
         match self {
             Self::ProviderConfig { provider_name } => Some(provider_name),
-            Self::Desired(_) | Self::State | Self::WaitRhs => None,
+            Self::Desired(_) | Self::State => None,
         }
     }
 
     pub(crate) fn accepts_enum_string(self, enumerated: bool) -> bool {
         match self {
-            Self::Desired(DesiredValueSource::AuthoredDsl) | Self::WaitRhs => !enumerated,
+            Self::Desired(DesiredValueSource::AuthoredDsl) => !enumerated,
             Self::Desired(DesiredValueSource::ProviderOutput)
             | Self::ProviderConfig { .. }
             | Self::State => true,
@@ -5180,9 +5198,7 @@ impl<'a> CanonicalizationPurpose<'a> {
     pub(crate) fn validates_struct_assignments(self) -> bool {
         matches!(
             self,
-            Self::Desired(DesiredValueSource::AuthoredDsl)
-                | Self::ProviderConfig { .. }
-                | Self::WaitRhs
+            Self::Desired(DesiredValueSource::AuthoredDsl) | Self::ProviderConfig { .. }
         )
     }
 
@@ -5194,11 +5210,11 @@ impl<'a> CanonicalizationPurpose<'a> {
 trait CanonicalizationErrorPolicy: Copy {
     type Error;
 
-    fn canonicalization_failed(
+    fn canonicalization_failed<B: BindingAddress>(
         self,
-        original: Value,
+        original: Value<B>,
         source: crate::schema::TypeError,
-    ) -> Result<Value, Self::Error>;
+    ) -> Result<Value<B>, Self::Error>;
 
     fn mask_secret(self, error: Self::Error) -> Self::Error;
 
@@ -5219,11 +5235,11 @@ struct RejectEnumResolutionErrors;
 impl CanonicalizationErrorPolicy for RejectEnumResolutionErrors {
     type Error = crate::schema::TypeError;
 
-    fn canonicalization_failed(
+    fn canonicalization_failed<B: BindingAddress>(
         self,
-        _original: Value,
+        _original: Value<B>,
         source: crate::schema::TypeError,
-    ) -> Result<Value, Self::Error> {
+    ) -> Result<Value<B>, Self::Error> {
         Err(source)
     }
 
@@ -5277,11 +5293,11 @@ struct PreserveEnumResolutionErrors;
 impl CanonicalizationErrorPolicy for PreserveEnumResolutionErrors {
     type Error = Infallible;
 
-    fn canonicalization_failed(
+    fn canonicalization_failed<B: BindingAddress>(
         self,
-        original: Value,
+        original: Value<B>,
         _source: crate::schema::TypeError,
-    ) -> Result<Value, Self::Error> {
+    ) -> Result<Value<B>, Self::Error> {
         Ok(original)
     }
 
@@ -5466,28 +5482,33 @@ pub(crate) fn canonicalize_state_with_type_and_ancestry(
 
 /// Resolve typed wait-RHS enum syntax without reclassifying quoted strings or
 /// applying unrelated structural rewrites.
-pub(crate) fn canonicalize_wait_rhs_with_type(
-    value: Value,
+pub(crate) fn canonicalize_wait_rhs_with_type<B: BindingAddress>(
+    value: Value<B>,
     effective_type: &crate::schema::EffectiveType<'_>,
-) -> Value {
-    unwrap_infallible(canonicalize_with_type_for_purpose(
-        value,
-        effective_type.as_type(),
-        effective_type.defs(),
-        effective_type.ancestry(),
-        CanonicalizationPurpose::WaitRhs,
-        PreserveEnumResolutionErrors,
-    ))
+) -> Value<B> {
+    match value {
+        Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
+            let resolver = crate::resource::EnumValueResolver::with_defs(
+                effective_type.as_type(),
+                effective_type.defs(),
+            );
+            resolver.resolve_raw(&raw).map_or_else(
+                |_| Value::Concrete(ConcreteValue::EnumIdentifier(raw)),
+                |canonical| Value::Concrete(ConcreteValue::CanonicalEnum(canonical)),
+            )
+        }
+        other => other,
+    }
 }
 
-fn canonicalize_with_type_for_purpose<P: CanonicalizationErrorPolicy>(
-    value: Value,
+fn canonicalize_with_type_for_purpose<B: BindingAddress, P: CanonicalizationErrorPolicy>(
+    value: Value<B>,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
-) -> Result<Value, P::Error> {
+) -> Result<Value<B>, P::Error> {
     let mut visited_refs = Vec::new();
     let unwrapped = peel_custom(
         attr_type
@@ -5519,13 +5540,13 @@ fn canonicalize_with_type_for_purpose<P: CanonicalizationErrorPolicy>(
 /// Consume a successful fit witness without re-validating any selected Union
 /// member or re-resolving any enum. The value and witness have identical tree
 /// shapes by construction.
-fn canonicalize_with_fit<P: CanonicalizationErrorPolicy>(
-    value: Value,
+fn canonicalize_with_fit<B: BindingAddress, P: CanonicalizationErrorPolicy>(
+    value: Value<B>,
     fit: crate::schema::Fit<'_>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
-) -> Result<Value, P::Error> {
+) -> Result<Value<B>, P::Error> {
     if purpose.canonicalizes_full_shape() && is_string_or_list_of_strings(fit.attr, defs) {
         return Ok(canonicalize_to_string_list(value));
     }
@@ -5654,10 +5675,10 @@ fn canonicalize_with_fit<P: CanonicalizationErrorPolicy>(
     }
 }
 
-fn collect_canonicalized_map<P: CanonicalizationErrorPolicy>(
-    entries: Vec<(String, String, Value)>,
+fn collect_canonicalized_map<B: BindingAddress, P: CanonicalizationErrorPolicy>(
+    entries: Vec<(String, String, Value<B>)>,
     error_policy: P,
-) -> Result<IndexMap<String, Value>, P::Error> {
+) -> Result<IndexMap<String, Value<B>>, P::Error> {
     let mut seen = BTreeSet::new();
     let collision = entries.iter().find_map(|(original_key, canonical_key, _)| {
         (!seen.insert(canonical_key.clone())).then(|| (original_key.clone(), canonical_key.clone()))
@@ -5677,7 +5698,9 @@ fn collect_canonicalized_map<P: CanonicalizationErrorPolicy>(
         .collect())
 }
 
-fn canonical_map_key_text(value: Value) -> Result<String, crate::schema::TypeError> {
+fn canonical_map_key_text<B: BindingAddress>(
+    value: Value<B>,
+) -> Result<String, crate::schema::TypeError> {
     match value {
         Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
             Ok(canonical.api_value().to_string())
@@ -5760,13 +5783,13 @@ fn type_contains_enum(
     walk(attr_type, defs, &mut std::collections::HashSet::new())
 }
 
-fn finish_no_fit<P: CanonicalizationErrorPolicy>(
-    value: Value,
+fn finish_no_fit<B: BindingAddress, P: CanonicalizationErrorPolicy>(
+    value: Value<B>,
     expected: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
-) -> Result<Value, P::Error> {
+) -> Result<Value<B>, P::Error> {
     if purpose.rejects_unrecognized_enum_text() && type_contains_enum(expected, defs) {
         let source = crate::schema::TypeError::TypeMismatch {
             expected: expected.type_name(),
@@ -5782,15 +5805,15 @@ fn finish_no_fit<P: CanonicalizationErrorPolicy>(
 /// not fit at all. Union acceptance never comes from this path. Provider output
 /// alone follows the closest failure shape so invalid enum text fails closed;
 /// persisted state retains its established forward-compatible lenience.
-fn canonicalize_without_fit<'a, P: CanonicalizationErrorPolicy>(
-    value: Value,
+fn canonicalize_without_fit<'a, B: BindingAddress, P: CanonicalizationErrorPolicy>(
+    value: Value<B>,
     unwrapped: &'a AttributeType,
     defs: &'a std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
     visited_refs: &mut Vec<&'a str>,
-) -> Result<Value, P::Error> {
+) -> Result<Value<B>, P::Error> {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
         return canonicalize_without_fit(
             *inner,
@@ -5925,7 +5948,7 @@ fn canonicalize_without_fit<'a, P: CanonicalizationErrorPolicy>(
             let canonicalized = map
                 .into_iter()
                 .map(|(key, value)| {
-                    let lifted_key = crate::schema::lift_map_key(key_type, &key, defs);
+                    let lifted_key: Value<B> = crate::schema::lift_map_key(key_type, &key, defs);
                     let canonical_key_value = canonicalize_with_type_for_purpose(
                         lifted_key,
                         key_type,
@@ -5939,7 +5962,7 @@ fn canonicalize_without_fit<'a, P: CanonicalizationErrorPolicy>(
                         Ok(canonical_key) => canonical_key,
                         Err(source) => error_policy
                             .canonicalization_failed(
-                                Value::Concrete(ConcreteValue::String(key.clone().into())),
+                                Value::<B>::Concrete(ConcreteValue::String(key.clone().into())),
                                 source,
                             )
                             .map(|_| key.clone())
@@ -6112,12 +6135,14 @@ struct EnumIdentifierOccurrence<'a> {
     inside_secret: bool,
 }
 
-fn first_enum_identifier(value: &Value) -> Option<EnumIdentifierOccurrence<'_>> {
+fn first_enum_identifier<B: BindingAddress>(
+    value: &Value<B>,
+) -> Option<EnumIdentifierOccurrence<'_>> {
     first_enum_identifier_inner(value, false)
 }
 
-fn first_enum_identifier_inner(
-    value: &Value,
+fn first_enum_identifier_inner<B: BindingAddress>(
+    value: &Value<B>,
     inside_secret: bool,
 ) -> Option<EnumIdentifierOccurrence<'_>> {
     match value {
@@ -6170,7 +6195,7 @@ fn first_enum_identifier_inner(
 
 /// Body of state and desired canonicalization for the
 /// `string_or_list_of_strings` case.
-fn canonicalize_to_string_list(value: Value) -> Value {
+fn canonicalize_to_string_list<B: BindingAddress>(value: Value<B>) -> Value<B> {
     match value {
         Value::Concrete(ConcreteValue::StringList(items)) => {
             Value::Concrete(ConcreteValue::StringList(items))
@@ -6272,7 +6297,9 @@ fn mask_enum_identifier_error_for_secret(
     }
 }
 
-fn unresolved_enum_identifier_type_error_in(value: &Value) -> Option<crate::schema::TypeError> {
+fn unresolved_enum_identifier_type_error_in<B: BindingAddress>(
+    value: &Value<B>,
+) -> Option<crate::schema::TypeError> {
     let occurrence = first_enum_identifier(value)?;
     Some(mask_enum_identifier_error_for_secret(
         unresolved_enum_identifier_type_error(occurrence.raw),
@@ -6428,28 +6455,28 @@ type ProviderConfigSchemaFn<'a> = dyn Fn(&str) -> Option<crate::schema::Validate
 /// `ProviderConfig` slices, so callers cannot skip provider config enum
 /// canonicalization at the hash seam.
 #[derive(Debug, Clone)]
-pub struct CanonicalizedProviderConfigs {
-    providers: Vec<crate::parser::ProviderConfig>,
+pub struct CanonicalizedProviderConfigs<B: BindingAddress = crate::resource::RelativeBindingName> {
+    providers: Vec<crate::parser::ProviderConfig<B>>,
 }
 
-impl CanonicalizedProviderConfigs {
-    pub fn as_slice(&self) -> &[crate::parser::ProviderConfig] {
+impl<B: BindingAddress> CanonicalizedProviderConfigs<B> {
+    pub fn as_slice(&self) -> &[crate::parser::ProviderConfig<B>] {
         &self.providers
     }
 
     #[cfg(test)]
-    pub(crate) fn from_configs_for_test(providers: Vec<crate::parser::ProviderConfig>) -> Self {
+    pub(crate) fn from_configs_for_test(providers: Vec<crate::parser::ProviderConfig<B>>) -> Self {
         Self { providers }
     }
 }
 
-pub(crate) fn canonicalize_provider_config_with_type_and_ancestry(
+pub(crate) fn canonicalize_provider_config_with_type_and_ancestry<B: BindingAddress>(
     provider_name: &str,
-    value: Value,
+    value: Value<B>,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
-) -> Result<Value, crate::schema::TypeError> {
+) -> Result<Value<B>, crate::schema::TypeError> {
     let canonical = canonicalize_with_type_for_purpose(
         value,
         attr_type,
@@ -6496,11 +6523,11 @@ impl ProviderConfigCanonicalizationError {
 /// Canonicalize one provider configuration attribute map using its
 /// host-declared types. Typed canonicalization is total; the only explicit
 /// identifier check is therefore for attributes without a declared type.
-pub(crate) fn canonicalize_provider_config_attributes_with_types(
+pub(crate) fn canonicalize_provider_config_attributes_with_types<B: BindingAddress>(
     provider_name: &str,
-    attributes: &IndexMap<String, Value>,
+    attributes: &IndexMap<String, Value<B>>,
     attr_types: &BTreeMap<String, AttributeType>,
-) -> Result<IndexMap<String, Value>, ProviderConfigCanonicalizationError> {
+) -> Result<IndexMap<String, Value<B>>, ProviderConfigCanonicalizationError> {
     let mut canonical = IndexMap::with_capacity(attributes.len());
     for (attribute, value) in attributes {
         let value = match attr_types.get(attribute) {
@@ -6535,10 +6562,10 @@ pub(crate) fn canonicalize_provider_config_attributes_with_types(
 /// Walk every provider config's attributes, canonicalizing enum-typed leaves
 /// such as provider identity `region` before those values feed durable
 /// identity hashing.
-pub fn canonicalize_provider_configs_with_schemas(
-    providers: &[crate::parser::ProviderConfig],
+pub fn canonicalize_provider_configs_with_schemas<B: BindingAddress>(
+    providers: &[crate::parser::ProviderConfig<B>],
     provider_config_schema_fn: &ProviderConfigSchemaFn<'_>,
-) -> Result<CanonicalizedProviderConfigs, ProviderConfigCanonicalizationError> {
+) -> Result<CanonicalizedProviderConfigs<B>, ProviderConfigCanonicalizationError> {
     let mut providers = providers.to_vec();
     for provider in providers.iter_mut() {
         let config_schema = provider_config_schema_fn(&provider.name).unwrap_or_default();
@@ -6624,9 +6651,21 @@ pub fn canonicalize_states_with_schemas(
 mod tests {
     use super::*;
 
+    type Value = crate::resource::ExpandedValue;
+    type ConcreteValue = crate::resource::ExpandedConcreteValue;
+    type DeferredValue = crate::resource::ExpandedDeferredValue;
+    type UnknownReason = crate::resource::ExpandedUnknownReason;
+    type InterpolationPart = crate::resource::ExpandedInterpolationPart;
+
+    fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+        crate::resource::RootScope::new()
+            .resolve(crate::resource::RelativeBindingName::new(binding))
+    }
+
     fn resolved_deferred_templates(
-        expressions: impl IntoIterator<Item = crate::parser::DeferredForExpression>,
-    ) -> crate::parser::ResolvedDeferredForExpressions {
+        expressions: impl IntoIterator<Item = crate::parser::ExpandedDeferredForExpression>,
+    ) -> crate::parser::ResolvedDeferredForExpressions<crate::resource::AbsoluteBindingAddress>
+    {
         crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test(expressions)
     }
 
@@ -6945,8 +6984,8 @@ mod tests {
 
     #[test]
     fn render_unknown_upstream_export() {
-        use crate::resource::AccessPath;
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
+        use crate::resource::ExpandedAccessPath as AccessPath;
+        let path = AccessPath::root_with_fields("network", "vpc", vec!["vpc_id".to_string()]);
         let r = UnknownReason::UpstreamExport { path };
         assert_eq!(
             render_unknown(&r),
@@ -6956,8 +6995,8 @@ mod tests {
 
     #[test]
     fn render_unknown_upstream_export_with_subscript() {
-        use crate::resource::{AccessPath, Subscript};
-        let path = AccessPath::with_fields_and_subscripts(
+        use crate::resource::{ExpandedAccessPath as AccessPath, Subscript};
+        let path = AccessPath::root_with_fields_and_subscripts(
             "network",
             "accounts",
             Vec::new(),
@@ -6972,8 +7011,8 @@ mod tests {
 
     #[test]
     fn render_unknown_upstream_export_with_string_subscript() {
-        use crate::resource::{AccessPath, Subscript};
-        let path = AccessPath::with_fields_and_subscripts(
+        use crate::resource::{ExpandedAccessPath as AccessPath, Subscript};
+        let path = AccessPath::root_with_fields_and_subscripts(
             "vpc",
             "tags",
             Vec::new(),
@@ -7045,8 +7084,8 @@ mod tests {
     /// the diagnostic.
     #[test]
     fn unknown_reason_display_wording() {
-        use crate::resource::AccessPath;
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+        use crate::resource::ExpandedAccessPath as AccessPath;
+        let path = AccessPath::root_with_fields("network", "vpc", vec!["vpc_id".into()]);
         assert_eq!(
             format!("{}", UnknownReason::UpstreamExport { path }),
             "upstream value network.vpc.vpc_id"
@@ -7176,7 +7215,7 @@ mod tests {
         // serialization is a resolver bug — surface as a structured
         // `UnresolvedResourceRef` Err instead of the legacy
         // `"${vpc.id}"` debug-string fallback.
-        let v = Value::resource_ref("vpc", "id", vec![]);
+        let v = Value::root_resource_ref("vpc", "id", vec![]);
         let err = value_to_json(&v).unwrap_err();
         assert!(
             matches!(
@@ -7193,7 +7232,7 @@ mod tests {
     #[test]
     fn test_value_to_json_coalesce_returns_err() {
         let value = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("up", "optional", vec![])),
+            value: Box::new(Value::root_resource_ref("up", "optional", vec![])),
             default: Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))),
         });
         let error = value_to_json(&value).unwrap_err();
@@ -7208,7 +7247,7 @@ mod tests {
     #[test]
     fn format_value_renders_residual_coalesce() {
         let value = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("up", "optional", vec![])),
+            value: Box::new(Value::root_resource_ref("up", "optional", vec![])),
             default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
         });
         assert_eq!(format_value(&value), "up.optional ?? []");
@@ -7217,8 +7256,8 @@ mod tests {
     #[test]
     fn format_value_parenthesizes_a_coalesce_used_as_the_left_operand() {
         let inner = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("r", "comment", vec![])),
-            default: Box::new(Value::resource_ref("r", "parent", vec![])),
+            value: Box::new(Value::root_resource_ref("r", "comment", vec![])),
+            default: Box::new(Value::root_resource_ref("r", "parent", vec![])),
         });
         let value = Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(inner),
@@ -7231,7 +7270,7 @@ mod tests {
     #[test]
     fn format_value_parenthesizes_a_coalesce_used_as_an_arithmetic_operand() {
         let coalesce = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("r", "count", vec![])),
+            value: Box::new(Value::root_resource_ref("r", "count", vec![])),
             default: Box::new(Value::Concrete(ConcreteValue::Int(0))),
         });
         let value = crate::integer_arithmetic::evaluate_integer_values(
@@ -7581,7 +7620,7 @@ mod tests {
         for value in [
             Value::Concrete(ConcreteValue::Bool(true)),
             Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
-            Value::resource_ref("vpc", "id", vec![]),
+            Value::root_resource_ref("vpc", "id", vec![]),
         ] {
             assert_eq!(format_value_user_facing(&value), format_value(&value));
         }
@@ -7815,7 +7854,8 @@ mod tests {
             .validate()
             .expect("schema fixture must be valid"),
         );
-        let mut resource = crate::resource::Resource::with_provider("aws", "ec2.Eip", "eip", None);
+        let mut resource: crate::resource::Resource =
+            crate::resource::Resource::with_provider("aws", "ec2.Eip", "eip", None);
         resource.set_attr(
             "domain",
             Value::Concrete(ConcreteValue::enum_identifier("aws.ec2.Eip.Domain.vpc")),
@@ -7900,7 +7940,7 @@ mod tests {
         );
 
         let canonicalize = |text: &str| {
-            let mut resource = crate::resource::Resource::with_provider(
+            let mut resource: crate::resource::Resource = crate::resource::Resource::with_provider(
                 "aws",
                 "route53.RecordSet",
                 "record",
@@ -8544,7 +8584,7 @@ mod tests {
         ]);
         let value = Value::Concrete(ConcreteValue::List(vec![
             Value::Deferred(DeferredValue::BindingRef {
-                binding: "later".to_string(),
+                binding: absolute_binding("later"),
             }),
             Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                 "kind".to_string(),
@@ -8610,7 +8650,7 @@ mod tests {
             .validate()
             .expect("schema fixture must be valid"),
         );
-        let mut resource =
+        let mut resource: crate::resource::Resource =
             crate::resource::Resource::with_provider("test", "widget", "example", None);
         resource.set_attr(
             "mode",
@@ -8652,7 +8692,7 @@ mod tests {
             .validate()
             .expect("schema fixture must be valid"),
         );
-        let mut resource =
+        let mut resource: crate::resource::Resource =
             crate::resource::Resource::with_provider("test", "widget", "secret", None);
         resource.set_attr(
             "mode",
@@ -8712,10 +8752,10 @@ mod tests {
         }];
 
         for registry in registries {
-            let mut resources = vec![
+            let resource: crate::resource::Resource =
                 crate::resource::Resource::with_provider("test", "widget", "secret", None)
-                    .with_attribute("unknown", secret()),
-            ];
+                    .with_attribute("unknown", secret());
+            let mut resources = vec![resource];
             let error = canonicalize_resources_with_schemas(&mut resources, &registry)
                 .expect_err("an unresolved secret enum must fail without a declared attribute");
             let display = error.to_string();
@@ -8825,7 +8865,7 @@ mod tests {
         ];
 
         for (attribute, value) in cases {
-            let mut resource =
+            let mut resource: crate::resource::Resource =
                 crate::resource::Resource::with_provider("test", "widget", attribute, None);
             resource.set_attr(attribute, value);
             let mut resources = vec![resource];
@@ -8860,7 +8900,7 @@ mod tests {
         use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 
         let raw = || Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.allow"));
-        let runtime_ref = || Value::resource_ref("source", "suffix", Vec::new());
+        let runtime_ref = || Value::root_resource_ref("source", "suffix", Vec::new());
         let runtime = [
             Value::Deferred(DeferredValue::FunctionCall {
                 name: crate::builtins::BuiltinFunction::join,
@@ -8902,7 +8942,7 @@ mod tests {
             .expect("schema fixture must be valid"),
         );
         let source = crate::resource::Resource::with_provider("test", "source", "source", None)
-            .with_binding("source")
+            .with_root_binding("source")
             .with_attribute(
                 "suffix",
                 Value::Concrete(ConcreteValue::String("-suffix".into())),
@@ -8920,7 +8960,7 @@ mod tests {
         });
 
         for (runtime, static_value) in runtime.into_iter().zip(static_values) {
-            let mut resource =
+            let mut resource: crate::resource::Resource =
                 crate::resource::Resource::with_provider("test", "widget", "example", None);
             resource.set_attr("value", runtime);
             let mut resources = vec![resource];
@@ -9194,7 +9234,7 @@ mod tests {
 
     #[test]
     fn test_format_value_resource_ref() {
-        let v = Value::resource_ref("vpc", "id", vec![]);
+        let v = Value::root_resource_ref("vpc", "id", vec![]);
         assert_eq!(format_value(&v), "vpc.id");
     }
 
@@ -9257,8 +9297,10 @@ mod tests {
     /// `Value::Concrete(ConcreteValue::String)` sentinel from #2367.
     #[test]
     fn test_format_value_unresolved_upstream() {
-        use crate::resource::{AccessPath, UnknownReason};
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
+        use crate::resource::{
+            ExpandedAccessPath as AccessPath, ExpandedUnknownReason as UnknownReason,
+        };
+        let path = AccessPath::root_with_fields("network", "vpc", vec!["vpc_id".to_string()]);
         let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
             path,
         }));
@@ -9282,9 +9324,11 @@ mod tests {
             matches!(
                 err,
                 SerializationError::UnknownNotAllowed {
-                    reason: UnknownReason::ForKey,
-                    context: SerializationContext::ValueToJson,
+                    ref reason,
+                    context,
                 }
+                    if matches!(reason.as_ref(), UnknownReason::ForKey)
+                        && context == SerializationContext::ValueToJson
             ),
             "expected UnknownNotAllowed/ForKey/ValueToJson, got: {err:?}"
         );
@@ -9300,9 +9344,11 @@ mod tests {
             matches!(
                 err,
                 SerializationError::UnknownNotAllowed {
-                    reason: UnknownReason::PendingReRead(_),
-                    context: SerializationContext::ValueToJson,
+                    ref reason,
+                    context,
                 }
+                    if matches!(reason.as_ref(), UnknownReason::PendingReRead(_))
+                        && context == SerializationContext::ValueToJson
             ),
             "expected UnknownNotAllowed/PendingReRead/ValueToJson, got: {err:?}"
         );
@@ -9316,9 +9362,11 @@ mod tests {
             matches!(
                 err,
                 SerializationError::UnknownNotAllowed {
-                    reason: UnknownReason::ForKey,
-                    context: SerializationContext::SecretRedaction,
+                    ref reason,
+                    context,
                 }
+                    if matches!(reason.as_ref(), UnknownReason::ForKey)
+                        && context == SerializationContext::SecretRedaction
             ),
             "expected UnknownNotAllowed/ForKey/SecretRedaction, got: {err:?}"
         );
@@ -9326,13 +9374,13 @@ mod tests {
 
     #[test]
     fn test_format_value_resource_ref_with_field_path() {
-        let v = Value::resource_ref("web", "network", vec!["vpc_id".to_string()]);
+        let v = Value::root_resource_ref("web", "network", vec!["vpc_id".to_string()]);
         assert_eq!(format_value(&v), "web.network.vpc_id");
     }
 
     #[test]
     fn test_value_to_json_resource_ref_with_field_path_returns_err() {
-        let v = Value::resource_ref(
+        let v = Value::root_resource_ref(
             "web",
             "output",
             vec!["network".to_string(), "vpc_id".to_string()],
@@ -9600,7 +9648,7 @@ mod tests {
 
     #[test]
     fn unresolved_secret_with_null_provider_value_returns_an_error() {
-        let desired = Value::Deferred(DeferredValue::Secret(Box::new(Value::resource_ref(
+        let desired = Value::Deferred(DeferredValue::Secret(Box::new(Value::root_resource_ref(
             "upstream",
             "value",
             Vec::new(),
@@ -9615,7 +9663,7 @@ mod tests {
     #[test]
     fn non_structural_expression_containing_secret_masks_whole_observed_value() {
         let desired = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("resource", "comment", Vec::new())),
+            value: Box::new(Value::root_resource_ref("resource", "comment", Vec::new())),
             default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                 Value::Concrete(ConcreteValue::String("fallback-secret".into())),
             )))),
@@ -9716,11 +9764,9 @@ mod tests {
             .expect("nested marker-shaped plaintext can be hashed");
         assert_eq!(refreshed.as_json(), previous.as_json());
 
-        let unresolved = Value::Deferred(DeferredValue::Secret(Box::new(Value::resource_ref(
-            "upstream",
-            "value",
-            Vec::new(),
-        ))));
+        let unresolved = Value::Deferred(DeferredValue::Secret(Box::new(
+            Value::root_resource_ref("upstream", "value", Vec::new()),
+        )));
         let merged = merge_secrets_into_provider_json(&unresolved, &provider, Some(&previous))
             .expect("provider material with a nested marker-shaped string can be hashed");
         assert_eq!(merged.as_json(), previous.as_json());
@@ -9820,7 +9866,7 @@ mod tests {
             DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("DEFPLAIN-".into()),
                 InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
-                    path: crate::resource::AccessPath::new("r", "identifier"),
+                    path: crate::resource::ExpandedAccessPath::root("r", "identifier"),
                 })),
                 InterpolationPart::Literal("-TAIL".into()),
             ]),
@@ -9843,7 +9889,7 @@ mod tests {
             DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("CHANGED-".into()),
                 InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
-                    path: crate::resource::AccessPath::new("r", "identifier"),
+                    path: crate::resource::ExpandedAccessPath::root("r", "identifier"),
                 })),
                 InterpolationPart::Literal("-TAIL".into()),
             ]),
@@ -9881,14 +9927,14 @@ mod tests {
 
     fn deferred_interpolation_hash_material(secret: &str) -> Value {
         Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Expr(Value::resource_ref("origin", "identifier", vec![])),
+            InterpolationPart::Expr(Value::root_resource_ref("origin", "identifier", vec![])),
             InterpolationPart::Literal(format!("-{secret}").into()),
         ]))
     }
 
     fn deferred_coalesce_hash_material(default: Value) -> Value {
         Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("origin", "comment", vec![])),
+            value: Box::new(Value::root_resource_ref("origin", "comment", vec![])),
             default: Box::new(default),
         })
     }
@@ -9941,7 +9987,7 @@ mod tests {
             upper_with_secret_hash_material(Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
                     UnknownReason::UpstreamExport {
-                        path: crate::resource::AccessPath::new("upstream", "identifier"),
+                        path: crate::resource::ExpandedAccessPath::root("upstream", "identifier"),
                     },
                 ))),
                 InterpolationPart::Literal("-same-secret".into()),
@@ -10047,7 +10093,11 @@ mod tests {
             (
                 deferred_interpolation_hash_material("planned-secret"),
                 Value::Deferred(DeferredValue::Interpolation(vec![
-                    InterpolationPart::Expr(Value::resource_ref("origin", "identifier", vec![])),
+                    InterpolationPart::Expr(Value::root_resource_ref(
+                        "origin",
+                        "identifier",
+                        vec![],
+                    )),
                     InterpolationPart::Literal("-".into()),
                     InterpolationPart::Expr(Value::Deferred(DeferredValue::Secret(Box::new(
                         unavailable_env_evaluation(),
@@ -10263,7 +10313,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("RESOLVED_REFERENCE_SECRET".into())),
             ))))
             .expect("redact resolved reference secret");
-        let reference = Value::resource_ref("producer", "comment", vec![]);
+        let reference = Value::root_resource_ref("producer", "comment", vec![]);
 
         let resource = crate::resource::Resource::new("mock.test.resource", "consumer")
             .with_attribute(
@@ -10331,7 +10381,7 @@ mod tests {
     fn saved_plan_redaction_preserves_canonical_update_from_without_secrets() {
         use crate::effect::Effect;
         use crate::plan::Plan;
-        use crate::resource::{ResolvedResource, Resource, ResourceId, State};
+        use crate::resource::{ExpandedResource as Resource, ResolvedResource, ResourceId, State};
 
         let id = ResourceId::with_identity("mock.test.resource", "canonical");
         let canonical_from = State::existing(
@@ -10539,7 +10589,7 @@ mod tests {
     fn fail_closed_mask_promotes_plaintext_for_non_structural_secret_shape() {
         let plaintext = Value::Concrete(ConcreteValue::String("selected-secret".into()));
         let shape = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("producer", "comment", vec![])),
+            value: Box::new(Value::root_resource_ref("producer", "comment", vec![])),
             default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                 Value::Concrete(ConcreteValue::String("fallback".into())),
             )))),
@@ -10588,7 +10638,7 @@ mod tests {
             (
                 "selected".to_string(),
                 Value::Deferred(DeferredValue::Coalesce {
-                    value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+                    value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
                     default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                         Value::Concrete(ConcreteValue::String("fallback".into())),
                     )))),
@@ -10632,7 +10682,7 @@ mod tests {
     fn resolved_public_branch_overrides_unselected_authored_secret_fallback() {
         let applied = Value::Concrete(ConcreteValue::String("selected-public".into()));
         let authored = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+            value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
             default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                 Value::Concrete(ConcreteValue::String("fallback".into())),
             )))),
@@ -10650,7 +10700,7 @@ mod tests {
         let public = Value::Concrete(ConcreteValue::String("selected-public".into()));
         let plain = Value::Concrete(ConcreteValue::String("plain".into()));
         let authored_coalesce = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+            value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
             default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                 Value::Concrete(ConcreteValue::String("fallback".into())),
             )))),
@@ -10678,7 +10728,7 @@ mod tests {
         ]));
         let authored = Value::Concrete(ConcreteValue::List(vec![
             Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+                value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
                 default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                     Value::Concrete(ConcreteValue::String("fallback".into())),
                 )))),
@@ -10702,7 +10752,7 @@ mod tests {
             (
                 "selected".to_string(),
                 Value::Deferred(DeferredValue::Coalesce {
-                    value: Box::new(Value::resource_ref("producer", "missing", vec![])),
+                    value: Box::new(Value::root_resource_ref("producer", "missing", vec![])),
                     default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                         Value::Concrete(ConcreteValue::String("fallback".into())),
                     )))),
@@ -10737,7 +10787,7 @@ mod tests {
 
     #[test]
     fn unprojectable_authored_secret_fails_closed_at_the_child_only() {
-        let unresolved = Value::resource_ref("runtime", "value", vec![]);
+        let unresolved = Value::root_resource_ref("runtime", "value", vec![]);
         let plain = Value::Concrete(ConcreteValue::String("plain".into()));
         let applied = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             ("unresolved".to_string(), unresolved.clone()),
@@ -10747,7 +10797,7 @@ mod tests {
             (
                 "unresolved".to_string(),
                 Value::Deferred(DeferredValue::Coalesce {
-                    value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+                    value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
                     default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                         Value::Concrete(ConcreteValue::String("fallback".into())),
                     )))),
@@ -10788,8 +10838,11 @@ mod tests {
         // block (which lands as a `Value::Secret` in the composition's
         // attribute map) must be redacted before serialization, the
         // same way managed-resource attributes are redacted.
-        use crate::resource::LiveCompositionAttribute;
-        use crate::resource::{LiveComposition, LiveCompositionSignature, ResourceId};
+        use crate::resource::ExpandedLiveCompositionAttribute as LiveCompositionAttribute;
+        use crate::resource::{
+            ExpandedLiveComposition as LiveComposition,
+            ExpandedLiveCompositionSignature as LiveCompositionSignature, ResourceId,
+        };
         use std::collections::{BTreeSet, HashSet};
         let mut attrs: indexmap::IndexMap<String, LiveCompositionAttribute> =
             indexmap::IndexMap::new();
@@ -10819,7 +10872,7 @@ mod tests {
                 attributes: attrs,
                 pending_constraints: Vec::new(),
             },
-            binding: Some("module_instance".to_string()),
+            binding: Some(absolute_binding("module_instance")),
             dependency_bindings: BTreeSet::new(),
             module_name: "m".to_string(),
             instance: "module_instance".to_string(),
@@ -10856,7 +10909,10 @@ mod tests {
 
         // The rest of the LiveComposition (id, binding, etc.) is
         // preserved verbatim.
-        assert_eq!(redacted.binding.as_deref(), Some("module_instance"));
+        assert_eq!(
+            redacted.binding.as_ref().map(|binding| binding.as_str()),
+            Some("module_instance")
+        );
         assert_eq!(redacted.id.resource_type, "_virtual");
     }
 
@@ -10964,7 +11020,7 @@ mod tests {
             Value::Concrete(ConcreteValue::Bool(true)),
             Value::Concrete(ConcreteValue::Int(42)),
             Value::Concrete(ConcreteValue::enum_identifier("test.Mode.enabled")),
-            Value::resource_ref("server", "id", Vec::new()),
+            Value::root_resource_ref("server", "id", Vec::new()),
         ]));
 
         let rendered = render_value(&value);
@@ -10996,7 +11052,7 @@ mod tests {
         let value = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("prefix ".into()),
             InterpolationPart::Expr(Value::Deferred(DeferredValue::BindingRef {
-                binding: "cert".to_string(),
+                binding: absolute_binding("cert"),
             })),
             InterpolationPart::Literal(".example".into()),
         ]));
@@ -11034,7 +11090,7 @@ mod tests {
         );
 
         let binding = render_value(&Value::Deferred(DeferredValue::BindingRef {
-            binding: "x".to_string(),
+            binding: absolute_binding("x"),
         }));
         assert_eq!(
             binding
@@ -11051,7 +11107,7 @@ mod tests {
                 args: vec![
                     Value::Concrete(ConcreteValue::String("/".into())).into(),
                     Value::Deferred(DeferredValue::BindingRef {
-                        binding: "x".to_string(),
+                        binding: absolute_binding("x"),
                     })
                     .into(),
                 ],
@@ -11790,9 +11846,9 @@ mod tests {
     #[test]
     fn render_value_pretty_scalar_variants_match_format_value() {
         // Lock the "scalar fallthrough" contract.
-        use crate::resource::AccessPath;
+        use crate::resource::ExpandedAccessPath as AccessPath;
 
-        let path = AccessPath::new("vpc", "id");
+        let path = AccessPath::root("vpc", "id");
         let cases = vec![
             Value::Concrete(ConcreteValue::String("hello".into())),
             Value::Concrete(ConcreteValue::Int(42)),
@@ -12631,7 +12687,7 @@ mod tests {
     }
 
     fn make_resource(attrs: Vec<(&str, Value)>) -> crate::resource::Resource {
-        use crate::resource::{Resource, ResourceId};
+        use crate::resource::{ExpandedResource as Resource, ResourceId};
         use std::collections::{BTreeSet, HashMap, HashSet};
         let mut attributes = IndexMap::new();
         for (k, v) in attrs {
@@ -12643,7 +12699,7 @@ mod tests {
             directives: Default::default(),
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
-            binding: Some("p1".to_string()),
+            binding: Some(absolute_binding("p1")),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
@@ -12745,7 +12801,7 @@ mod tests {
 
     #[test]
     fn canonicalize_data_sources_with_schemas_rewrites_authored_inputs() {
-        use crate::resource::DataSource;
+        use crate::resource::ExpandedDataSource as DataSource;
         use crate::schema::{
             AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, enum_identity,
         };
@@ -12769,7 +12825,8 @@ mod tests {
             .validate()
             .expect("schema fixture must be valid"),
         );
-        let mut data_source = DataSource::with_provider("awscc", "example.Widget", "widget", None);
+        let mut data_source: DataSource =
+            DataSource::with_provider("awscc", "example.Widget", "widget", None);
         data_source.set_attr(
             "subject",
             Value::Concrete(ConcreteValue::String("repo:foo:*".into())),
@@ -12977,7 +13034,7 @@ mod tests {
     #[test]
     fn canonicalize_pipeline_dynamic_az_enum_state_api_spelling_has_no_diff() {
         use crate::differ::{Diff, diff_test};
-        use crate::resource::{Resource, ResourceId, State};
+        use crate::resource::{ExpandedResource as Resource, ResourceId, State};
         use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
         use std::collections::HashMap;
 
@@ -13178,7 +13235,7 @@ mod tests {
     fn format_value_interpolation_escapes_literal_parts() {
         let value = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("say \"hello\"".into()),
-            InterpolationPart::Expr(Value::resource_ref("server", "name", Vec::new())),
+            InterpolationPart::Expr(Value::root_resource_ref("server", "name", Vec::new())),
         ]));
 
         assert_eq!(format_value(&value), "\"say \\\"hello\\\"${server.name}\"");
@@ -13250,8 +13307,11 @@ mod tests {
         use crate::resource::{
             AccessPath, DeferredValue, InterpolationPart, ResourceId, UnknownReason, Value,
         };
-        let path =
-            AccessPath::with_fields("management_route53", "apex_zone_id", Vec::<String>::new());
+        let path = AccessPath::root_with_fields(
+            "management_route53",
+            "apex_zone_id",
+            Vec::<String>::new(),
+        );
         let identifier = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
                 UnknownReason::UpstreamExport { path },
@@ -13290,7 +13350,10 @@ mod tests {
     #[test]
     fn redact_secrets_in_effect_walks_import_identifier_interpolation() {
         use crate::effect::Effect;
-        use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, ResourceId, Value};
+        use crate::resource::{
+            ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
+            ExpandedInterpolationPart as InterpolationPart, ExpandedValue as Value, ResourceId,
+        };
         let secret_inner = Value::Concrete(ConcreteValue::String("super-secret".into()));
         let identifier = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Secret(Box::new(
@@ -13316,7 +13379,10 @@ mod tests {
                 );
                 // The redactor emits a typed placeholder for the secret leaf.
                 fn walk(v: &Value) -> bool {
-                    use crate::resource::{DeferredValue, InterpolationPart, Value};
+                    use crate::resource::{
+                        ExpandedDeferredValue as DeferredValue,
+                        ExpandedInterpolationPart as InterpolationPart, ExpandedValue as Value,
+                    };
                     match v {
                         Value::Deferred(DeferredValue::RedactedSecret { .. }) => true,
                         Value::Deferred(DeferredValue::Interpolation(parts)) => {
@@ -13340,7 +13406,7 @@ mod tests {
     #[test]
     fn redact_secrets_in_deferred_create_redacts_and_rehydrates_template() {
         use crate::effect::Effect;
-        use crate::parser::{DeferredForExpression, ForBinding};
+        use crate::parser::{ExpandedDeferredForExpression as DeferredForExpression, ForBinding};
         use crate::plan::Plan;
         use crate::resource::{
             DeferredValue, PathSegment, Resource, ResourceId, UnknownReason, Value,
@@ -13385,9 +13451,9 @@ mod tests {
                     ("comment".to_string(), secret),
                 ],
                 target: crate::parser::DeferredForTarget::Bound {
-                    binding: "validation_records".to_string(),
+                    binding: absolute_binding("validation_records"),
                 },
-                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                iterable: Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
@@ -13456,8 +13522,10 @@ mod tests {
     #[test]
     fn deferred_template_redaction_uses_template_resource_as_single_projection() {
         use crate::effect::Effect;
-        use crate::parser::{DeferredForExpression, ForBinding};
-        use crate::resource::{DeferredValue, Resource, ResourceId};
+        use crate::parser::{ExpandedDeferredForExpression as DeferredForExpression, ForBinding};
+        use crate::resource::{
+            ExpandedDeferredValue as DeferredValue, ExpandedResource as Resource, ResourceId,
+        };
 
         let secret = |plaintext: &str| {
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
@@ -13478,9 +13546,9 @@ mod tests {
                 resource_type: "aws.route53.RecordSet".to_string(),
                 attributes: vec![("comment".to_string(), secret("stale-projection"))],
                 target: crate::parser::DeferredForTarget::Bound {
-                    binding: "records".to_string(),
+                    binding: absolute_binding("records"),
                 },
-                iterable: Value::resource_ref("cert", "options", Vec::new()),
+                iterable: Value::root_resource_ref("cert", "options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
@@ -13522,8 +13590,8 @@ mod tests {
     #[test]
     fn deferred_template_preserves_display_only_projection_and_noops_without_placeholders() {
         use crate::effect::Effect;
-        use crate::parser::{DeferredForExpression, ForBinding};
-        use crate::resource::{Resource, ResourceId};
+        use crate::parser::{ExpandedDeferredForExpression as DeferredForExpression, ForBinding};
+        use crate::resource::{ExpandedResource as Resource, ResourceId};
 
         let canonical = Value::Concrete(ConcreteValue::String("canonical".into()));
         let display_only = Value::Concrete(ConcreteValue::String("display-only".into()));
@@ -13539,9 +13607,9 @@ mod tests {
                 ("identifier".to_string(), display_only.clone()),
             ],
             target: crate::parser::DeferredForTarget::Bound {
-                binding: "children".to_string(),
+                binding: absolute_binding("children"),
             },
-            iterable: Value::resource_ref("parent", "children", Vec::new()),
+            iterable: Value::root_resource_ref("parent", "children", Vec::new()),
             binding: ForBinding::Simple("child".to_string()),
             template_resource,
         };
@@ -13606,13 +13674,14 @@ mod tests {
         use crate::effect::ChangedCreateOnly;
         use crate::plan::{ReplacementDelete, ReplacementGroup};
         use crate::resource::{
-            Directives, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
+            ExpandedDirectives as Directives, ExpandedResource as Resource, ResolvedResource,
+            ResolvedResourceId, ResourceId,
         };
         use std::collections::HashSet;
 
         let id = ResourceId::with_identity("aws.s3.Bucket", "bucket");
         let mut create = Resource::new("aws.s3.Bucket", "bucket");
-        create.binding = Some("bucket".to_string());
+        create.binding = Some(absolute_binding("bucket"));
 
         let mut plan = crate::plan::Plan::new();
         plan.add_replacement(ReplacementGroup {
@@ -13621,7 +13690,7 @@ mod tests {
                 id: ResolvedResourceId::new(id.clone()),
                 identifier: crate::effect::fixture_applied_identifier("bucket-old"),
                 directives: Directives::default(),
-                binding: Some("bucket".to_string()),
+                binding: Some(absolute_binding("bucket")),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
             },
@@ -13639,7 +13708,7 @@ mod tests {
 
     #[test]
     fn redact_secrets_in_plan_preserves_replace_display() {
-        use crate::resource::{ConcreteValue, Value};
+        use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
         use std::collections::HashMap;
 
         let plan = replacement_plan_with_previous_attributes(
@@ -13681,7 +13750,10 @@ mod tests {
 
     #[test]
     fn redact_secrets_in_plan_redacts_secret_in_previous_attributes() {
-        use crate::resource::{ConcreteValue, DeferredValue, Value};
+        use crate::resource::{
+            ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
+            ExpandedValue as Value,
+        };
         use std::collections::HashMap;
 
         let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(

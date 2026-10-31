@@ -456,7 +456,7 @@ pub struct LiveExecutionInput<'a> {
     pub normalizer: &'a dyn ProviderNormalizer,
     /// Provider configs whose default_tags participate in desired-side
     /// normalization before provider patch construction.
-    pub provider_configs: &'a [ProviderConfig],
+    pub provider_configs: &'a [ProviderConfig<crate::resource::AbsoluteBindingAddress>],
     /// Provider factories used for provider-defined custom type validation at
     /// the apply boundary. Enum resolution uses the schema registry below and
     /// never delegates spelling conversion to a factory.
@@ -487,7 +487,7 @@ pub struct SavedExecutionInput<'a> {
     pub managed_current: HashMap<ResourceId, Current>,
     pub data_source_values: crate::data_source_value::ExecutableDataSourceValues<SavedModuleSource>,
     pub normalizer: &'a dyn ProviderNormalizer,
-    pub provider_configs: &'a [ProviderConfig],
+    pub provider_configs: &'a [ProviderConfig<crate::resource::AbsoluteBindingAddress>],
     pub factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     pub schemas: &'a crate::schema::SchemaRegistry,
     pub parallelism: NonZeroUsize,
@@ -542,7 +542,7 @@ pub(super) struct RuntimeExecutionInput<'a, S = ModuleSource> {
     pub(super) managed_current: HashMap<ResourceId, Current>,
     pub(super) data_source_values: crate::data_source_value::ExecutableDataSourceValues<S>,
     pub(super) normalizer: &'a dyn ProviderNormalizer,
-    pub(super) provider_configs: &'a [ProviderConfig],
+    pub(super) provider_configs: &'a [ProviderConfig<crate::resource::AbsoluteBindingAddress>],
     pub(super) factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     pub(super) schemas: &'a crate::schema::SchemaRegistry,
     pub(super) parallelism: NonZeroUsize,
@@ -771,7 +771,7 @@ pub fn unresolved_data_source_inputs<S>(
             let mut bindings = Vec::new();
             let mut unknowns = Vec::new();
             value.visit_resource_refs(&mut |path| paths.push(path.clone()));
-            value.visit_binding_refs(&mut |binding| bindings.push(binding.to_string()));
+            value.visit_binding_refs(&mut |binding| bindings.push(binding.clone()));
             visit_unknowns(value, &mut |reason| unknowns.push(reason.clone()));
             (!paths.is_empty() || !bindings.is_empty() || !unknowns.is_empty()).then(|| {
                 UnresolvedDataSourceInput {

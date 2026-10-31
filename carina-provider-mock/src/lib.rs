@@ -92,8 +92,8 @@ impl std::error::Error for MockStateValueDecodeError {
 /// `provider mock {}` whose provider factory was not loaded. A sourced mock
 /// always belongs to the plugin path, including when that plugin failed to
 /// load.
-pub fn uses_builtin_provider<'a>(
-    provider_configs: impl IntoIterator<Item = &'a ProviderConfig>,
+pub fn uses_builtin_provider<'a, B: carina_core::resource::BindingAddress + 'a>(
+    provider_configs: impl IntoIterator<Item = &'a ProviderConfig<B>>,
     provider_is_loaded: impl FnOnce(&str) -> bool,
 ) -> bool {
     let mut provider_configs = provider_configs.into_iter().peekable();
@@ -2079,7 +2079,9 @@ mod tests {
 
     #[test]
     fn builtin_provider_selection_is_shared_by_implicit_and_explicit_mock_paths() {
-        assert!(uses_builtin_provider(&[], |_| {
+        assert!(uses_builtin_provider::<
+            carina_core::resource::RelativeBindingName,
+        >(std::iter::empty::<&ProviderConfig>(), |_| {
             panic!("the implicit fallback does not depend on loaded factories")
         }));
 
@@ -2629,8 +2631,9 @@ mod tests {
             partial_create: None,
             partial_update: None,
         };
-        let mut resources =
-            vec![Resource::with_provider("mock", "test.resource", "normalize-me", None).into()];
+        let resource: Resource =
+            Resource::with_provider("mock", "test.resource", "normalize-me", None);
+        let mut resources = vec![carina_core::resource::ProviderResource::from(resource)];
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();

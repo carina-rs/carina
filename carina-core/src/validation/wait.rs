@@ -19,6 +19,7 @@
 //! error surfaces via the regular parser diagnostic path.
 
 use crate::parser::{File, ResourceRef};
+use crate::resource::BindingAddress;
 use crate::schema::{SchemaKind, SchemaRegistry};
 use crate::wait::predicate::resolve_wait_predicate;
 
@@ -46,8 +47,12 @@ pub struct WaitDiagnostic {
 
 /// Run all wait diagnostics against a parsed file + schema registry.
 /// Returns the full list of errors; callers decide how to surface them.
-pub fn validate_wait_bindings<E, D>(
-    parsed: &File<E, D>,
+pub fn validate_wait_bindings<
+    E,
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<B>,
+>(
+    parsed: &File<E, B, D>,
     schemas: &SchemaRegistry,
 ) -> Vec<WaitDiagnostic> {
     if parsed.wait_bindings.is_empty() {
@@ -131,16 +136,13 @@ pub fn validate_wait_bindings<E, D>(
             continue;
         };
         if let Err(error) = resolve_wait_predicate(
-            &wb.until_predicate.lhs_segments,
+            &wb.until_predicate.root,
+            &wb.until_predicate.attribute_segments,
             wb.until_predicate.rhs.clone(),
             Some(schema.schema()),
         ) {
-            let attribute = wb
-                .until_predicate
-                .lhs_segments
-                .get(1..)
-                .filter(|segments| !segments.is_empty())
-                .map(|segments| segments.join("."));
+            let attribute = (!wb.until_predicate.attribute_segments.is_empty())
+                .then(|| wb.until_predicate.attribute_segments.join("."));
             out.push(WaitDiagnostic {
                 message: format!("wait `{}`: {error}", wb.binding),
                 binding_name: wb.binding.as_str().to_string(),

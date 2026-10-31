@@ -5,7 +5,9 @@
 
 use super::ProviderContext;
 use super::Rule;
-use super::ast::{ParsedFile, ParserBindingMetadata, UpstreamState, UserFunction, WaitBinding};
+use super::ast::{
+    ParsedFile, ParserBindingMetadata, TypeExpr, UpstreamState, UserFunction, WaitBinding,
+};
 use super::blocks::attributes::{
     ParsedArgumentsBlock, parse_arguments_block, parse_attributes_block, parse_exports_block,
 };
@@ -28,9 +30,14 @@ use super::resolve::{
     finalize_provider_configs, resolve_provider_unresolved_attributes, resolve_resource_refs,
 };
 use crate::eval_value::{
-    EvalValue, EvalValueError, ParsedSinkValue, StructuralHandle, StructuralHandleMetadata,
+    AuthoredEvalValue as EvalValue, AuthoredParsedSinkValue as ParsedSinkValue,
+    AuthoredStructuralHandle as StructuralHandle,
+    AuthoredStructuralHandleMetadata as StructuralHandleMetadata, EvalValueError,
 };
-use crate::resource::{DataSource, LegacyLoopAddress, LoopKind, Resource, Value};
+use crate::resource::{
+    AuthoredDataSource as DataSource, AuthoredResource as Resource, AuthoredValue as Value,
+    LegacyLoopAddress, LoopKind,
+};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -48,7 +55,9 @@ pub(crate) enum SeedKind<'a> {
         value: &'a Value,
         structural_handles: Option<&'a StructuralHandleMetadata>,
     },
-    ModuleParameter,
+    ModuleParameter {
+        declared_type: Option<&'a TypeExpr>,
+    },
     TypedStructural(&'a StructuralHandle),
     Provisional,
     StructuralAlias(&'a StructuralHandle),
@@ -116,10 +125,10 @@ impl<'a> BindingSeed<'a> {
         }
     }
 
-    pub(crate) fn module_parameter(name: &'a str) -> Self {
+    pub(crate) fn module_parameter(name: &'a str, declared_type: Option<&'a TypeExpr>) -> Self {
         Self {
             name,
-            kind: SeedKind::ModuleParameter,
+            kind: SeedKind::ModuleParameter { declared_type },
         }
     }
 
@@ -812,7 +821,10 @@ fn parse_with_seeded_bindings_inner(
                                 };
                                 let fn_name = user_fn.name.clone();
                                 // Check for shadowing builtins
-                                if crate::builtins::evaluate_builtin(&fn_name, &[]).is_ok()
+                                if crate::builtins::evaluate_builtin::<
+                                    crate::resource::RelativeBindingName,
+                                >(&fn_name, &[])
+                                .is_ok()
                                     || crate::builtins::builtin_functions()
                                         .iter()
                                         .any(|f| f.name == fn_name)
@@ -931,7 +943,10 @@ fn parse_with_seeded_bindings_inner(
                                 if !expanded_module_calls.is_empty() {
                                     for mut call in expanded_module_calls {
                                         if call.binding_name.is_none() {
-                                            call.binding_name = Some(name.clone());
+                                            call.binding_name =
+                                                Some(crate::resource::RelativeBindingName::new(
+                                                    name.clone(),
+                                                ));
                                         }
                                         module_calls.push(call);
                                     }
@@ -1107,7 +1122,11 @@ fn parse_with_seeded_bindings_inner(
     parsed.upstream_states = upstream_states;
     parsed.wait_bindings = wait_bindings;
     parsed.requires = requires;
-    parsed.structural_bindings = ctx.structural_bindings;
+    parsed.structural_bindings = ctx
+        .structural_bindings
+        .into_iter()
+        .map(crate::resource::RelativeBindingName::new)
+        .collect();
     parsed.parser_binding_metadata = parser_binding_metadata;
     parsed.warnings = warnings;
     *parsed.parsed_deferred_for_expressions_mut() = ctx.parsed_deferred_for_expressions;
@@ -1205,8 +1224,8 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
                     EvalValue::computed(value.clone(), structural_handles.cloned()),
                 );
             }
-            SeedKind::ModuleParameter => {
-                ctx.set_variable(
+            SeedKind::ModuleParameter { declared_type } => {
+                ctx.set_argument_variable(
                     seed.name().to_string(),
                     Value::Deferred(crate::resource::DeferredValue::Unknown(
                         crate::resource::UnknownReason::ModuleArgument {
@@ -1215,6 +1234,7 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
                             diagnostic_name: None,
                         },
                     )),
+                    declared_type.cloned(),
                 );
             }
             SeedKind::TypedStructural(handle) => {

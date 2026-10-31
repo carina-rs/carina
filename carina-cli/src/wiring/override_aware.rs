@@ -10,8 +10,8 @@ use carina_core::effect::deps::UnresolvedResource;
 use carina_core::name_override::{
     ApplyDecision, NameOverride, NameOverrideSource, should_apply_override,
 };
-use carina_core::parser::ModuleResolvedFile;
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, Value};
+use carina_core::parser::{ExpandedDeferredForExpression, ModuleResolvedFile};
+use carina_core::resource::{AbsoluteBindingAddress, ConcreteValue, Resource, ResourceId, Value};
 use carina_core::schema::{BlockNameConflict, SchemaRegistry};
 
 use super::ProjectedStateRead;
@@ -92,7 +92,7 @@ pub enum CanonicalResourceIdentityError {
 }
 
 impl<E> CanonicalResourcePair<E> {
-    fn new(parsed: ModuleResolvedFile<E>, unresolved: Vec<Resource>) -> Self {
+    pub(super) fn new(parsed: ModuleResolvedFile<E>, unresolved: Vec<Resource>) -> Self {
         Self {
             parsed,
             unresolved,
@@ -110,7 +110,6 @@ impl<E> CanonicalResourcePair<E> {
     pub(super) fn into_parts(self) -> (ModuleResolvedFile<E>, Vec<Resource>) {
         (self.parsed, self.unresolved)
     }
-
     pub(super) fn resolve_block_names(
         _access: &super::ValidationPipelineAccess,
         parsed: ModuleResolvedFile<E>,
@@ -154,7 +153,7 @@ impl<E> CanonicalResourcePair<E> {
     pub fn canonicalize_and_compute_anonymous_identifiers(
         &mut self,
         registry: &carina_core::schema::SchemaRegistry,
-        providers: &[carina_core::parser::ProviderConfig],
+        providers: &[carina_core::parser::ProviderConfig<AbsoluteBindingAddress>],
         factories: &[Box<dyn carina_core::provider::ProviderFactory>],
         conflict_policy: carina_core::identifier::AnonymousIdentityConflictPolicy,
     ) -> Result<(), CanonicalResourceIdentityError> {
@@ -233,10 +232,13 @@ impl<E> CanonicalResourcePair<E> {
         &mut self,
         find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
         claims: &carina_core::identifier::StateBlockClaims,
-    ) {
+    ) where
+        E: carina_core::parser::ExportParamLike<
+                Binding = carina_core::resource::AbsoluteBindingAddress,
+            >,
+    {
         carina_core::module_resolver::reconcile_anonymous_module_instances(
-            &mut self.parsed.resources,
-            &mut self.parsed.compositions,
+            &mut self.parsed,
             find_state_names_by_type,
             claims,
         );
@@ -255,7 +257,7 @@ impl<E> CanonicalResourcePair<E> {
         carina_core::parser::DeferredForExpansionError,
     >
     where
-        F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice,
+        F: FnMut(&ExpandedDeferredForExpression) -> DeferredForExpansionChoice,
     {
         let (selected, retained) = self
             .parsed
@@ -280,7 +282,7 @@ impl<E> CanonicalResourcePair<E> {
     /// evaluated resources and data sources.
     pub async fn prepare_desired_side_for_plan(
         &mut self,
-        provider_configs: &[carina_core::parser::ProviderConfig],
+        provider_configs: &[carina_core::parser::ProviderConfig<AbsoluteBindingAddress>],
         normalizer: &dyn carina_core::provider::ProviderNormalizer,
         schemas: &carina_core::schema::SchemaRegistry,
     ) -> carina_core::provider::ProviderResult<()> {
@@ -514,10 +516,10 @@ impl OverrideAwareResources {
         &self,
         binding_sources: &OverrideAwareResources,
     ) -> Vec<Resource> {
-        let mut by_binding: HashMap<&str, &Resource> = HashMap::new();
-        let mut duplicate_bindings: HashSet<&str> = HashSet::new();
+        let mut by_binding: HashMap<&AbsoluteBindingAddress, &Resource> = HashMap::new();
+        let mut duplicate_bindings: HashSet<&AbsoluteBindingAddress> = HashSet::new();
         for source in binding_sources.unresolved_resources() {
-            let Some(binding) = source.binding.as_deref() else {
+            let Some(binding) = source.binding.as_ref() else {
                 continue;
             };
             if by_binding.insert(binding, source).is_some() {
@@ -529,7 +531,7 @@ impl OverrideAwareResources {
             .iter()
             .zip(self.paired_unresolved_resources())
             .map(|(resource, fallback)| {
-                let Some(binding) = resource.binding.as_deref() else {
+                let Some(binding) = resource.binding.as_ref() else {
                     return fallback;
                 };
                 if duplicate_bindings.contains(binding) {
@@ -717,20 +719,24 @@ mod tests {
     use carina_core::binding_index::WaitAliasSpec;
     use carina_core::resource::{AccessPath, DeferredValue, PlanInputCurrent};
 
+    fn absolute_binding(name: impl Into<String>) -> carina_core::resource::AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(name)
+    }
+
     fn string(value: impl Into<String>) -> Value {
         Value::Concrete(ConcreteValue::String(value.into().into()))
     }
 
     fn resource(binding: &'static str, name: Value) -> Resource {
         let mut resource = Resource::new("mock.thing", binding);
-        resource.binding = Some(binding.to_string());
+        resource.binding = Some(absolute_binding(binding));
         resource.attributes.insert("name".to_string(), name);
         resource
     }
 
     fn resource_ref(binding: &str, attribute: &str) -> Value {
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new(binding, attribute),
+            path: AccessPath::new(binding, attribute).resolve_root_for_test(),
         })
     }
 
@@ -757,13 +763,8 @@ mod tests {
         let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let wait_aliases: Vec<WaitAliasSpec> = Vec::new();
 
-        let mut parsed = carina_core::parser::ParsedFile::default();
+        let mut parsed = carina_core::parser::ModuleResolvedParsedFile::default();
         parsed.resources = resources.clone();
-        let parsed = carina_core::module_resolver::resolve_modules_providerless(
-            parsed,
-            std::path::Path::new("."),
-        )
-        .expect("test fixture crosses module resolution");
         let canonical = CanonicalResourcePair::new(parsed, resources);
         let state = ProjectedStateRead::for_test_name_overrides(overrides);
         OverrideAwareResources::build_pair_with_stability(
@@ -788,7 +789,9 @@ mod tests {
         resources
             .resources()
             .iter()
-            .find(|resource| resource.binding.as_deref() == Some(binding))
+            .find(|resource| {
+                resource.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
+            })
             .and_then(|resource| resource.attributes.get("name"))
             .and_then(|value| concrete_string(value).map(ToOwned::to_owned))
     }

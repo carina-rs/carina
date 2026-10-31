@@ -1,0 +1,1413 @@
+{
+  "version": 35,
+  "carina_version": "0.9.0",
+  "timestamp": "2026-10-31T10:49:11.791567+00:00",
+  "source_path": "carina-cli/tests/fixtures/module_binding_wire_compat",
+  "state_lineage": "3ece2d76-0686-41a1-a096-960716c688de",
+  "state_serial": 4,
+  "provider_configs": [
+    {
+      "name": "mock",
+      "attributes": {}
+    }
+  ],
+  "backend_config": {
+    "backend_type": "local",
+    "attributes": {
+      "path": {
+        "String": "carina.state.json"
+      }
+    }
+  },
+  "plan": {
+    "effects": [
+      {
+        "Read": {
+          "resource": {
+            "id": {
+              "provider": "mock",
+              "resource_type": "iam.Roles",
+              "identity": "direct.lookup"
+            },
+            "attributes": {
+              "name_regex": {
+                "String": "direct"
+              }
+            },
+            "directives": {
+              "force_delete": false,
+              "create_before_destroy": false,
+              "prevent_destroy": {
+                "kind": "unspecified"
+              }
+            },
+            "binding": "direct.lookup",
+            "dependency_bindings": [],
+            "module_source": {
+              "Module": {
+                "name": "app_module",
+                "instance": "direct"
+              }
+            }
+          }
+        }
+      },
+      {
+        "Read": {
+          "resource": {
+            "id": {
+              "provider": "mock",
+              "resource_type": "iam.Roles",
+              "identity": "looped[0].lookup"
+            },
+            "attributes": {
+              "name_regex": {
+                "String": "loop"
+              }
+            },
+            "directives": {
+              "force_delete": false,
+              "create_before_destroy": false,
+              "prevent_destroy": {
+                "kind": "unspecified"
+              }
+            },
+            "binding": "looped[0].lookup",
+            "dependency_bindings": [],
+            "module_source": {
+              "Module": {
+                "name": "app_module",
+                "instance": "looped[0]"
+              }
+            }
+          }
+        }
+      },
+      {
+        "Update": {
+          "from": {
+            "id": {
+              "provider": "mock",
+              "resource_type": "test.resource",
+              "identity": "direct.consumer"
+            },
+            "identifier": "mock-id",
+            "attributes": {
+              "identifier": {
+                "String": "direct-consumer-id"
+              },
+              "comment": {
+                "RedactedSecret": {
+                  "hash": "$argon2id$v=19$m=19456,t=2,p=1$W2wwmJ/Vmlf1Y83aP7THBA$5H91MmSDROpz3ujyBLyxXg8rUldJaeKTwKM2V3mY9Z8"
+                }
+              },
+              "name": {
+                "String": "direct-consumer"
+              }
+            },
+            "exists": true,
+            "dependency_bindings": [
+              "direct.seed",
+              "root"
+            ]
+          },
+          "identifier": "mock-id",
+          "to": {
+            "id": {
+              "provider": "mock",
+              "resource_type": "test.resource",
+              "identity": "direct.consumer"
+            },
+            "attributes": {
+              "name": {
+                "String": "direct-consumer"
+              },
+              "comment": {
+                "String": "direct-updated"
+              }
+            },
+            "directives": {
+              "force_delete": false,
+              "create_before_destroy": false,
+              "prevent_destroy": {
+                "kind": "unspecified"
+              },
+              "depends_on": [
+                "direct.seed",
+                "root"
+              ]
+            },
+            "prefixes": {},
+            "binding": "direct.consumer",
+            "dependency_bindings": [],
+            "module_source": {
+              "Module": {
+                "name": "app_module",
+                "instance": "direct"
+              }
+            }
+          },
+          "changed_attributes": [
+            "comment"
+          ]
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.after_ready"
+          },
+          "attributes": {
+            "name": {
+              "String": "direct-after"
+            },
+            "comment": {
+              "String": "direct-consumer-id"
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "prefixes": {},
+          "binding": "direct.after_ready",
+          "dependency_bindings": [
+            "direct.consumer_ready"
+          ],
+          "module_source": {
+            "Module": {
+              "name": "app_module",
+              "instance": "direct"
+            }
+          }
+        }
+      },
+      {
+        "Update": {
+          "from": {
+            "id": {
+              "provider": "mock",
+              "resource_type": "test.resource",
+              "identity": "looped[0].consumer"
+            },
+            "identifier": "mock-id",
+            "attributes": {
+              "identifier": {
+                "String": "loop-consumer-id"
+              },
+              "name": {
+                "String": "loop-consumer"
+              },
+              "comment": {
+                "RedactedSecret": {
+                  "hash": "$argon2id$v=19$m=19456,t=2,p=1$vhDBSL7GJeUFxfWmzRpt0g$+RdamqybSNQWQtSCZAdJJXW73fXGYS45uYF3xNg7lK0"
+                }
+              }
+            },
+            "exists": true,
+            "dependency_bindings": [
+              "looped[0].seed",
+              "root"
+            ]
+          },
+          "identifier": "mock-id",
+          "to": {
+            "id": {
+              "provider": "mock",
+              "resource_type": "test.resource",
+              "identity": "looped[0].consumer"
+            },
+            "attributes": {
+              "name": {
+                "String": "loop-consumer"
+              },
+              "comment": {
+                "String": "loop-updated"
+              }
+            },
+            "directives": {
+              "force_delete": false,
+              "create_before_destroy": false,
+              "prevent_destroy": {
+                "kind": "unspecified"
+              },
+              "depends_on": [
+                "looped[0].seed",
+                "root"
+              ]
+            },
+            "prefixes": {},
+            "binding": "looped[0].consumer",
+            "dependency_bindings": [],
+            "module_source": {
+              "Module": {
+                "name": "app_module",
+                "instance": "looped[0]"
+              }
+            }
+          },
+          "changed_attributes": [
+            "comment"
+          ]
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].after_ready"
+          },
+          "attributes": {
+            "name": {
+              "String": "loop-after"
+            },
+            "comment": {
+              "String": "loop-consumer-id"
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "prefixes": {},
+          "binding": "looped[0].after_ready",
+          "dependency_bindings": [
+            "looped[0].consumer_ready"
+          ],
+          "module_source": {
+            "Module": {
+              "name": "app_module",
+              "instance": "looped[0]"
+            }
+          }
+        }
+      },
+      {
+        "Delete": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.nested.leaf"
+          },
+          "identifier": "mock-id",
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            },
+            "depends_on": [
+              "direct.consumer"
+            ]
+          },
+          "binding": "direct.nested.leaf",
+          "dependencies": [
+            "direct.consumer"
+          ],
+          "explicit_dependencies": [
+            "direct.consumer"
+          ]
+        }
+      },
+      {
+        "Delete": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].nested.leaf"
+          },
+          "identifier": "mock-id",
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            },
+            "depends_on": [
+              "looped[0].consumer"
+            ]
+          },
+          "binding": "looped[0].nested.leaf",
+          "dependencies": [
+            "looped[0].consumer"
+          ],
+          "explicit_dependencies": [
+            "looped[0].consumer"
+          ]
+        }
+      },
+      {
+        "Wait": {
+          "identity": "direct.consumer_ready",
+          "target_id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.consumer"
+          },
+          "until": {
+            "kind": "equals",
+            "attr": {
+              "segments": [
+                "identifier"
+              ]
+            },
+            "value": {
+              "String": "${label}-consumer-id"
+            }
+          },
+          "until_surface": "consumer.identifier == \"${label}-consumer-id\"",
+          "timeout": 60,
+          "interval": 5,
+          "explicit_dependencies": [
+            "direct.seed"
+          ]
+        }
+      },
+      {
+        "Wait": {
+          "identity": "looped[0].consumer_ready",
+          "target_id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].consumer"
+          },
+          "until": {
+            "kind": "equals",
+            "attr": {
+              "segments": [
+                "identifier"
+              ]
+            },
+            "value": {
+              "String": "${label}-consumer-id"
+            }
+          },
+          "until_surface": "consumer.identifier == \"${label}-consumer-id\"",
+          "timeout": 60,
+          "interval": 5,
+          "explicit_dependencies": [
+            "looped[0].seed"
+          ]
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "root"
+      },
+      "attributes": {
+        "name": {
+          "String": "root"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "root",
+      "dependency_bindings": [],
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.seed"
+      },
+      "attributes": {
+        "name": {
+          "String": "direct-seed"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "direct.seed",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.consumer"
+      },
+      "attributes": {
+        "name": {
+          "String": "direct-consumer"
+        },
+        "comment": {
+          "String": "direct-updated"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "depends_on": [
+          "direct.seed",
+          "root"
+        ]
+      },
+      "prefixes": {},
+      "binding": "direct.consumer",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.after_ready"
+      },
+      "attributes": {
+        "name": {
+          "String": "direct-after"
+        },
+        "comment": {
+          "String": "direct-consumer-id"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "direct.after_ready",
+      "dependency_bindings": [
+        "direct.consumer_ready"
+      ],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].seed"
+      },
+      "attributes": {
+        "name": {
+          "String": "loop-seed"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "looped[0].seed",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].consumer"
+      },
+      "attributes": {
+        "name": {
+          "String": "loop-consumer"
+        },
+        "comment": {
+          "String": "loop-updated"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "depends_on": [
+          "looped[0].seed",
+          "root"
+        ]
+      },
+      "prefixes": {},
+      "binding": "looped[0].consumer",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].after_ready"
+      },
+      "attributes": {
+        "name": {
+          "String": "loop-after"
+        },
+        "comment": {
+          "String": "loop-consumer-id"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "looped[0].after_ready",
+      "dependency_bindings": [
+        "looped[0].consumer_ready"
+      ],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]"
+        }
+      }
+    }
+  ],
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "root"
+      },
+      "attributes": {
+        "name": {
+          "String": "root"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "root",
+      "dependency_bindings": [],
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.seed"
+      },
+      "attributes": {
+        "name": {
+          "String": "direct-seed"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "direct.seed",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.consumer"
+      },
+      "attributes": {
+        "name": {
+          "String": "direct-consumer"
+        },
+        "comment": {
+          "String": "direct-updated"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "depends_on": [
+          "direct.seed",
+          "root"
+        ]
+      },
+      "prefixes": {},
+      "binding": "direct.consumer",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.after_ready"
+      },
+      "attributes": {
+        "name": {
+          "String": "direct-after"
+        },
+        "comment": {
+          "ResourceRef": {
+            "path": {
+              "binding": "direct.consumer_ready",
+              "attribute": "identifier"
+            }
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "direct.after_ready",
+      "dependency_bindings": [
+        "direct.consumer_ready"
+      ],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].seed"
+      },
+      "attributes": {
+        "name": {
+          "String": "loop-seed"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "looped[0].seed",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].consumer"
+      },
+      "attributes": {
+        "name": {
+          "String": "loop-consumer"
+        },
+        "comment": {
+          "String": "loop-updated"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "depends_on": [
+          "looped[0].seed",
+          "root"
+        ]
+      },
+      "prefixes": {},
+      "binding": "looped[0].consumer",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].after_ready"
+      },
+      "attributes": {
+        "name": {
+          "String": "loop-after"
+        },
+        "comment": {
+          "ResourceRef": {
+            "path": {
+              "binding": "looped[0].consumer_ready",
+              "attribute": "identifier"
+            }
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "looped[0].after_ready",
+      "dependency_bindings": [
+        "looped[0].consumer_ready"
+      ],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]"
+        }
+      }
+    }
+  ],
+  "compositions": [
+    {
+      "id": {
+        "provider": "",
+        "resource_type": "_virtual",
+        "identity": "direct"
+      },
+      "arguments": {
+        "label": {
+          "String": "direct"
+        },
+        "upstream": {
+          "BindingRef": {
+            "binding": "root"
+          }
+        }
+      },
+      "attributes": {},
+      "pending_constraints": [],
+      "binding": "direct",
+      "dependency_bindings": [],
+      "module_name": "app_module",
+      "instance": "direct",
+      "origin_id": {
+        "root": {
+          "source_file": {
+            "location": "source_root_relative",
+            "path": "main.crn"
+          },
+          "call_span": {
+            "start_byte": 117,
+            "end_byte": 171,
+            "start_line": 9,
+            "start_column": 14,
+            "end_line": 12,
+            "end_column": 2
+          },
+          "expansion": {
+            "kind": "direct"
+          }
+        },
+        "descendants": []
+      }
+    },
+    {
+      "id": {
+        "provider": "",
+        "resource_type": "_virtual",
+        "identity": "looped[0]"
+      },
+      "arguments": {
+        "label": {
+          "String": "loop"
+        },
+        "upstream": {
+          "BindingRef": {
+            "binding": "root"
+          }
+        }
+      },
+      "attributes": {},
+      "pending_constraints": [],
+      "binding": "looped[0]",
+      "dependency_bindings": [],
+      "module_name": "app_module",
+      "instance": "looped[0]",
+      "origin_id": {
+        "root": {
+          "source_file": {
+            "location": "source_root_relative",
+            "path": "main.crn"
+          },
+          "call_span": {
+            "start_byte": 212,
+            "end_byte": 269,
+            "start_line": 15,
+            "start_column": 3,
+            "end_line": 18,
+            "end_column": 4
+          },
+          "expansion": {
+            "kind": "expanded",
+            "key": "looped[0]"
+          }
+        },
+        "descendants": []
+      }
+    }
+  ],
+  "data_sources": [
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "iam.Roles",
+        "identity": "direct.lookup"
+      },
+      "attributes": {
+        "name_regex": {
+          "String": "direct"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "binding": "direct.lookup",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "iam.Roles",
+        "identity": "looped[0].lookup"
+      },
+      "attributes": {
+        "name_regex": {
+          "String": "loop"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "binding": "looped[0].lookup",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]"
+        }
+      }
+    }
+  ],
+  "data_source_origins": [
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "iam.Roles",
+        "identity": "direct.lookup"
+      },
+      "attributes": {
+        "name_regex": {
+          "String": "direct"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "binding": "direct.lookup",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "iam.Roles",
+        "identity": "looped[0].lookup"
+      },
+      "attributes": {
+        "name_regex": {
+          "String": "loop"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "binding": "looped[0].lookup",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]"
+        }
+      }
+    }
+  ],
+  "data_source_values": [
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "iam.Roles",
+        "identity": "direct.lookup"
+      },
+      "value": {
+        "kind": "read",
+        "value": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "iam.Roles",
+            "identity": "direct.lookup"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "iam.Roles",
+        "identity": "looped[0].lookup"
+      },
+      "value": {
+        "kind": "read",
+        "value": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "iam.Roles",
+            "identity": "looped[0].lookup"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].nested.leaf"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].nested.leaf"
+          },
+          "identifier": "mock-id",
+          "attributes": {
+            "identifier": {
+              "String": "loop-nested-id"
+            },
+            "name": {
+              "String": "loop-nested"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": [
+            "looped[0].consumer"
+          ]
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.consumer"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.consumer"
+          },
+          "identifier": "mock-id",
+          "attributes": {
+            "comment": {
+              "RedactedSecret": {
+                "hash": "$argon2id$v=19$m=19456,t=2,p=1$W2wwmJ/Vmlf1Y83aP7THBA$5H91MmSDROpz3ujyBLyxXg8rUldJaeKTwKM2V3mY9Z8"
+              }
+            },
+            "name": {
+              "String": "direct-consumer"
+            },
+            "identifier": {
+              "String": "direct-consumer-id"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": [
+            "direct.seed",
+            "root"
+          ]
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].consumer"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].consumer"
+          },
+          "identifier": "mock-id",
+          "attributes": {
+            "name": {
+              "String": "loop-consumer"
+            },
+            "comment": {
+              "RedactedSecret": {
+                "hash": "$argon2id$v=19$m=19456,t=2,p=1$vhDBSL7GJeUFxfWmzRpt0g$+RdamqybSNQWQtSCZAdJJXW73fXGYS45uYF3xNg7lK0"
+              }
+            },
+            "identifier": {
+              "String": "loop-consumer-id"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": [
+            "looped[0].seed",
+            "root"
+          ]
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].after_ready"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].after_ready"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].seed"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].seed"
+          },
+          "identifier": "mock-id",
+          "attributes": {
+            "identifier": {
+              "String": "loop-seed-id"
+            },
+            "name": {
+              "String": "loop-seed"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "root"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "root"
+          },
+          "identifier": "mock-id",
+          "attributes": {
+            "identifier": {
+              "String": "root-id"
+            },
+            "name": {
+              "String": "root"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.after_ready"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.after_ready"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.seed"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.seed"
+          },
+          "identifier": "mock-id",
+          "attributes": {
+            "name": {
+              "String": "direct-seed"
+            },
+            "identifier": {
+              "String": "direct-seed-id"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.nested.leaf"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.nested.leaf"
+          },
+          "identifier": "mock-id",
+          "attributes": {
+            "name": {
+              "String": "direct-nested"
+            },
+            "identifier": {
+              "String": "direct-nested-id"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": [
+            "direct.consumer"
+          ]
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [
+    {
+      "binding": "direct.consumer_ready",
+      "target": "direct.consumer"
+    },
+    {
+      "binding": "looped[0].consumer_ready",
+      "target": "looped[0].consumer"
+    }
+  ],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "mock": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "test.resource",
+            "fingerprint": {
+              "present": "ebe39904297c3428437d065e907bda92d239cdf7cc469f33ebf16503dace865c"
+            }
+          },
+          {
+            "kind": "data_source",
+            "resource_type": "iam.Roles",
+            "fingerprint": {
+              "present": "7e4c0cd4c98f7ced2cf325fefe56203597382a097fbd24c96d9bccc6aa663786"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {
+    "mock": {
+      "kind": "built_in"
+    }
+  },
+  "provider_scopes": [
+    {
+      "instance": {
+        "provider": "mock",
+        "provider_instance": null
+      },
+      "scope": {
+        "kind": "unavailable"
+      }
+    }
+  ]
+}

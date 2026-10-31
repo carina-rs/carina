@@ -7,11 +7,14 @@ use super::ast::{ExportParamLike, File, ParsedFile, ProviderConfig};
 use super::entry::BindingSeed;
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
-use crate::eval_value::EvalValue;
+use crate::eval_value::AuthoredEvalValue as EvalValue;
 use crate::resource::{
-    AccessMissPolicy, ConcreteValue, DataSource, DeferredValue, DiagnosticSourceLine,
-    InterpolationPart, Resource, UnavailableCoalescePolicy, UnavailableReason,
-    UnavailableSecretPolicy, Value, find_unavailable_evaluation,
+    AbsoluteBindingAddress, AccessMissPolicy, AuthoredConcreteValue as ConcreteValue,
+    AuthoredDataSource as DataSource, AuthoredDeferredValue as DeferredValue,
+    AuthoredFunctionArgument as FunctionArgument, AuthoredInterpolationPart as InterpolationPart,
+    AuthoredResource as Resource, AuthoredValue as Value, BindingAddress, DiagnosticSourceLine,
+    RelativeBindingName, UnavailableCoalescePolicy, UnavailableReason, UnavailableSecretPolicy,
+    Value as RuntimeValue, find_unavailable_evaluation,
 };
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -30,11 +33,11 @@ use thiserror::Error;
 /// only when no block of the requested provider kind is declared.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedProviderConfig {
-    config: ProviderConfig,
+    config: ProviderConfig<AbsoluteBindingAddress>,
 }
 
 impl ResolvedProviderConfig {
-    fn from_resolved(config: ProviderConfig) -> Self {
+    fn from_resolved(config: ProviderConfig<AbsoluteBindingAddress>) -> Self {
         Self { config }
     }
 
@@ -57,7 +60,7 @@ impl ResolvedProviderConfig {
         &self.config.name
     }
 
-    pub fn attributes(&self) -> &IndexMap<String, Value> {
+    pub fn attributes(&self) -> &IndexMap<String, RuntimeValue> {
         &self.config.attributes
     }
 
@@ -76,7 +79,7 @@ impl ResolvedProviderConfig {
     /// Borrow the serializable parser representation for metadata consumers.
     ///
     /// Provider-construction APIs intentionally do not accept this raw type.
-    pub fn as_provider_config(&self) -> &ProviderConfig {
+    pub fn as_provider_config(&self) -> &ProviderConfig<AbsoluteBindingAddress> {
         &self.config
     }
 }
@@ -98,11 +101,13 @@ impl ResolvedProviderConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedProviderConfigs {
     configs: Vec<ResolvedProviderConfig>,
-    provider_configs: Vec<ProviderConfig>,
+    provider_configs: Vec<ProviderConfig<AbsoluteBindingAddress>>,
 }
 
 impl ResolvedProviderConfigs {
-    fn from_resolved(configs: Vec<ProviderConfig>) -> Result<Self, ProviderConfigInvariantError> {
+    fn from_resolved(
+        configs: Vec<ProviderConfig<AbsoluteBindingAddress>>,
+    ) -> Result<Self, ProviderConfigInvariantError> {
         validate_resolved_provider_configs(&configs)?;
         let resolved = configs
             .iter()
@@ -117,7 +122,7 @@ impl ResolvedProviderConfigs {
 
     #[cfg(test)]
     pub(crate) fn from_test_configs(
-        configs: Vec<ProviderConfig>,
+        configs: Vec<ProviderConfig<AbsoluteBindingAddress>>,
     ) -> Result<Self, ProviderConfigInvariantError> {
         Self::from_resolved(configs)
     }
@@ -149,7 +154,7 @@ impl ResolvedProviderConfigs {
 
     /// Borrow the resolved serializable shape used by saved plans and
     /// metadata-only consumers.
-    pub fn as_provider_configs(&self) -> &[ProviderConfig] {
+    pub fn as_provider_configs(&self) -> &[ProviderConfig<AbsoluteBindingAddress>] {
         &self.provider_configs
     }
 }
@@ -162,7 +167,7 @@ impl ResolvedProviderConfigs {
 /// revalidates every construction-time attribute.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct SavedProviderConfigs(Vec<ProviderConfig>);
+pub struct SavedProviderConfigs(Vec<ProviderConfig<AbsoluteBindingAddress>>);
 
 #[derive(Clone, Copy)]
 enum ProviderConfigSection {
@@ -176,9 +181,9 @@ const PROVIDER_CONFIG_SECTIONS: [ProviderConfigSection; 2] = [
 ];
 
 fn provider_config_section(
-    config: &ProviderConfig,
+    config: &ProviderConfig<AbsoluteBindingAddress>,
     section: ProviderConfigSection,
-) -> &IndexMap<String, Value> {
+) -> &IndexMap<String, RuntimeValue> {
     match section {
         ProviderConfigSection::Attribute => &config.attributes,
         ProviderConfigSection::DefaultTag => &config.default_tags,
@@ -186,9 +191,9 @@ fn provider_config_section(
 }
 
 fn provider_config_section_mut(
-    config: &mut ProviderConfig,
+    config: &mut ProviderConfig<AbsoluteBindingAddress>,
     section: ProviderConfigSection,
-) -> &mut IndexMap<String, Value> {
+) -> &mut IndexMap<String, RuntimeValue> {
     match section {
         ProviderConfigSection::Attribute => &mut config.attributes,
         ProviderConfigSection::DefaultTag => &mut config.default_tags,
@@ -196,7 +201,7 @@ fn provider_config_section_mut(
 }
 
 fn provider_config_secret_location(
-    config: &ProviderConfig,
+    config: &ProviderConfig<AbsoluteBindingAddress>,
     section: ProviderConfigSection,
     key: &str,
 ) -> String {
@@ -212,7 +217,7 @@ fn provider_config_secret_location(
 
 impl SavedProviderConfigs {
     /// Borrow the serialized provider configuration projection.
-    pub fn as_provider_configs(&self) -> &[ProviderConfig] {
+    pub fn as_provider_configs(&self) -> &[ProviderConfig<AbsoluteBindingAddress>] {
         &self.0
     }
 
@@ -328,13 +333,13 @@ impl TryFrom<SavedProviderConfigs> for ResolvedProviderConfigs {
 mod saved_provider_config_secret_tests {
     use super::*;
 
-    fn secret(value: &str) -> Value {
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String(value.into()),
-        ))))
+    fn secret(value: &str) -> RuntimeValue {
+        RuntimeValue::Deferred(crate::resource::ExpandedDeferredValue::Secret(Box::new(
+            RuntimeValue::Concrete(crate::resource::ExpandedConcreteValue::String(value.into())),
+        )))
     }
 
-    fn provider(token: &str) -> ProviderConfig {
+    fn provider(token: &str) -> ProviderConfig<AbsoluteBindingAddress> {
         ProviderConfig {
             name: "mock".to_string(),
             attributes: IndexMap::from([("token".to_string(), secret(token))]),
@@ -347,9 +352,11 @@ mod saved_provider_config_secret_tests {
         }
     }
 
-    fn placeholder_hash(value: &Value) -> &crate::resource::RedactedSecretHash {
+    fn placeholder_hash(value: &RuntimeValue) -> &crate::resource::RedactedSecretHash {
         match value {
-            Value::Deferred(DeferredValue::RedactedSecret { hash }) => hash,
+            RuntimeValue::Deferred(crate::resource::ExpandedDeferredValue::RedactedSecret {
+                hash,
+            }) => hash,
             other => panic!("expected saved-plan secret placeholder, got {other:?}"),
         }
     }
@@ -395,7 +402,7 @@ mod saved_provider_config_secret_tests {
 }
 
 fn validate_resolved_provider_configs(
-    configs: &[ProviderConfig],
+    configs: &[ProviderConfig<AbsoluteBindingAddress>],
 ) -> Result<(), ProviderConfigInvariantError> {
     for config in configs {
         for (attribute, value) in &config.attributes {
@@ -445,9 +452,9 @@ pub enum ProviderConfigResolutionError {
 trait PreApplyResourceMut {
     fn id(&self) -> &crate::resource::ResourceId;
     fn attributes(&self) -> &IndexMap<String, Value>;
-    fn dependency_bindings(&self) -> &BTreeSet<String>;
+    fn dependency_bindings(&self) -> &BTreeSet<crate::resource::RelativeBindingName>;
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value>;
-    fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<String>;
+    fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<crate::resource::RelativeBindingName>;
 }
 
 impl PreApplyResourceMut for Resource {
@@ -457,13 +464,13 @@ impl PreApplyResourceMut for Resource {
     fn attributes(&self) -> &IndexMap<String, Value> {
         &self.attributes
     }
-    fn dependency_bindings(&self) -> &BTreeSet<String> {
+    fn dependency_bindings(&self) -> &BTreeSet<crate::resource::RelativeBindingName> {
         &self.dependency_bindings
     }
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.attributes
     }
-    fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<String> {
+    fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<crate::resource::RelativeBindingName> {
         &mut self.dependency_bindings
     }
 }
@@ -475,13 +482,13 @@ impl PreApplyResourceMut for DataSource {
     fn attributes(&self) -> &IndexMap<String, Value> {
         &self.attributes
     }
-    fn dependency_bindings(&self) -> &BTreeSet<String> {
+    fn dependency_bindings(&self) -> &BTreeSet<crate::resource::RelativeBindingName> {
         &self.dependency_bindings
     }
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.attributes
     }
-    fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<String> {
+    fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<crate::resource::RelativeBindingName> {
         &mut self.dependency_bindings
     }
 }
@@ -517,7 +524,9 @@ pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> 
 /// the merged directory parse triggers user-fn evaluation here, even when
 /// the per-file parse couldn't evaluate it because the `fn` declaration
 /// lived in a sibling `.crn` (#2444).
-pub fn resolve_resource_refs_with_config<E: ExportParamLike>(
+pub fn resolve_resource_refs_with_config<
+    E: ExportParamLike<Binding = crate::resource::RelativeBindingName>,
+>(
     parsed: &mut File<E>,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
@@ -588,7 +597,9 @@ pub(crate) fn resolve_resource_refs_for_diagnostics(
     resolve_resource_refs_with_policy(parsed, config, false, true)
 }
 
-fn resolve_resource_refs_with_policy<E: ExportParamLike>(
+fn resolve_resource_refs_with_policy<
+    E: ExportParamLike<Binding = crate::resource::RelativeBindingName>,
+>(
     parsed: &mut File<E>,
     config: &ProviderContext,
     defer_unknown_functions: bool,
@@ -618,7 +629,8 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
         // the trait's read accessors. The previous shared helper took
         // `&dyn ResourceLike`; with that trait gone, the equivalent is
         // a one-line attribute walk + dependency_bindings copy.
-        let mut deps: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut deps: std::collections::HashSet<RelativeBindingName> =
+            std::collections::HashSet::new();
         for value in resource.attributes().values() {
             crate::deps::collect_dependencies(value, &mut deps);
         }
@@ -651,14 +663,14 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // The actual attribute values will be resolved after module expansion.
     for call in &parsed.module_calls {
         if let Some(ref name) = call.binding_name {
-            binding_map.entry(name.clone()).or_default();
+            binding_map.entry(name.to_string()).or_default();
         }
     }
 
     // Register upstream_state bindings so ResourceRefs to them are not rejected.
     // The actual attribute values will be resolved at plan time when the state file is loaded.
     for us in &parsed.upstream_states {
-        binding_map.entry(us.binding.clone()).or_default();
+        binding_map.entry(us.binding.to_string()).or_default();
     }
 
     // Register `wait` bindings the same way: downstream `<wait>.<attr>`
@@ -910,10 +922,10 @@ pub fn collect_known_bindings_merged<E>(parsed: &File<E>) -> std::collections::H
 #[cfg(test)]
 pub(crate) fn collect_seed_bindings_merged(parsed: &ParsedFile) -> Vec<BindingSeed<'_>> {
     let structural = parsed.structural_binding_names();
-    let module_parameters: HashSet<&str> = parsed
+    let module_parameters: HashMap<&str, &super::ast::TypeExpr> = parsed
         .arguments
         .iter()
-        .map(|argument| argument.name.as_str())
+        .map(|argument| (argument.name.as_str(), &argument.static_type))
         .collect();
 
     collect_seed_bindings_from_parts(
@@ -926,23 +938,29 @@ pub(crate) fn collect_seed_bindings_merged(parsed: &ParsedFile) -> Vec<BindingSe
 
 pub(crate) fn collect_seed_bindings_from_parts<'a>(
     structural: &HashSet<&'a str>,
-    module_parameters: &HashSet<&'a str>,
+    module_parameters: &HashMap<&'a str, &'a super::ast::TypeExpr>,
     variables: &'a IndexMap<String, Value>,
     metadata: &'a super::ast::ParserBindingMetadata,
 ) -> Vec<BindingSeed<'a>> {
     let mut names: Vec<&'a str> = structural.iter().copied().collect();
+    names.extend(module_parameters.keys().copied());
     names.extend(variables.keys().map(String::as_str));
-    names.extend(metadata.structural_handles().keys().map(String::as_str));
+    names.extend(
+        metadata
+            .structural_handles()
+            .keys()
+            .map(BindingAddress::as_str),
+    );
     names.sort_unstable();
     names.dedup();
 
     names
         .into_iter()
         .map(|name| {
-            if module_parameters.contains(name) {
+            if let Some(declared_type) = module_parameters.get(name) {
                 match metadata.structural_handles().get(name) {
                     Some(handle) => BindingSeed::typed_structural(name, handle),
-                    None => BindingSeed::module_parameter(name),
+                    None => BindingSeed::module_parameter(name, Some(*declared_type)),
                 }
             } else if let Some(handle) = metadata.structural_aliases().get(name) {
                 BindingSeed::structural_alias(name, handle)
@@ -953,7 +971,7 @@ pub(crate) fn collect_seed_bindings_from_parts<'a>(
                 // contain an `if` binding whose provisional condition made
                 // us inspect a structural branch. Once the fixed point has a
                 // real value for that binding, the classified value wins.
-                match metadata.value_structural_handles(name) {
+                match metadata.value_structural_handles_by_name(name) {
                     Some(structural_handles) => {
                         BindingSeed::value_with_structural_handles(name, value, structural_handles)
                     }
@@ -1159,7 +1177,11 @@ fn push_root(
 /// **This is the canonical entry point for "is this identifier in
 /// scope?" checks.** Follow the #2104 rule: any new semantic check in
 /// that family gets added *here*, not as a new sibling function.
-pub fn check_identifier_scope<E: ExportParamLike>(parsed: &File<E>) -> Vec<ParseError> {
+pub fn check_identifier_scope<
+    E: ExportParamLike<Binding = crate::resource::RelativeBindingName>,
+>(
+    parsed: &File<E>,
+) -> Vec<ParseError> {
     let known = collect_known_bindings_merged(parsed);
     let mut errors = Vec::new();
     accumulate_undefined_reference_errors(parsed, &known, &mut errors);
@@ -1263,7 +1285,7 @@ pub fn check_provider_instance_routing<E>(parsed: &File<E>) -> Vec<ParseError> {
 }
 
 fn accumulate_undefined_reference_errors(
-    parsed: &File<impl ExportParamLike>,
+    parsed: &File<impl ExportParamLike<Binding = crate::resource::RelativeBindingName>>,
     known: &std::collections::HashSet<&str>,
     errors: &mut Vec<ParseError>,
 ) {
@@ -1332,7 +1354,11 @@ fn accumulate_deferred_iterable_errors(
             if known.contains(root.as_str()) {
                 continue;
             }
-            errors.push(undefined_identifier_error(known, root, deferred.line));
+            errors.push(undefined_identifier_error(
+                known,
+                root.as_str().to_string(),
+                deferred.line,
+            ));
         }
     }
 }
@@ -1473,7 +1499,6 @@ fn resolve_value_with_config(
             Ok(Value::Concrete(ConcreteValue::Map(resolved)))
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            use crate::resource::InterpolationPart;
             let resolved: Result<Vec<InterpolationPart>, ParseError> = parts
                 .iter()
                 .map(|p| match p {
@@ -1544,7 +1569,7 @@ fn resolve_value_with_config(
             source_line,
         }) => {
             let authored_line = source_line.get();
-            let resolved_args: Result<Vec<crate::resource::FunctionArgument>, ParseError> = args
+            let resolved_args: Result<Vec<FunctionArgument>, ParseError> = args
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| {
@@ -1684,7 +1709,6 @@ fn resolve_function_calls_only(
     defer_unknown_functions: bool,
     preserve_failed_user_calls: bool,
 ) -> Result<Value, ParseError> {
-    use crate::resource::InterpolationPart;
     match value {
         Value::Deferred(
             DeferredValue::ModuleIf(_)
@@ -1787,7 +1811,7 @@ fn resolve_function_calls_only(
 /// `ParsedFile` or `InferredFile` — we only touch
 /// `provider.unresolved_attributes`, never `export_params`.
 pub fn resolve_provider_unresolved_attributes<E, D>(
-    parsed: &mut super::File<E, D>,
+    parsed: &mut super::File<E, crate::resource::RelativeBindingName, D>,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -1805,11 +1829,11 @@ pub fn resolve_provider_unresolved_attributes<E, D>(
     }
     for call in &parsed.module_calls {
         if let Some(ref name) = call.binding_name {
-            binding_map.entry(name.clone()).or_default();
+            binding_map.entry(name.to_string()).or_default();
         }
     }
     for us in &parsed.upstream_states {
-        binding_map.entry(us.binding.clone()).or_default();
+        binding_map.entry(us.binding.to_string()).or_default();
     }
     for wb in &parsed.wait_bindings {
         binding_map
@@ -1824,6 +1848,29 @@ pub fn resolve_provider_unresolved_attributes<E, D>(
         for (key, expr) in &provider.unresolved_attributes {
             let r = resolve_value_with_config(expr, &binding_map, &fn_ctx, false, false)?;
             resolved.insert(key.clone(), r);
+        }
+        provider.unresolved_attributes = resolved;
+    }
+    Ok(())
+}
+
+/// Expanded-phase counterpart of [`resolve_provider_unresolved_attributes`].
+///
+/// Module expansion has already converted every reference to an absolute
+/// address, so this pass resolves through the runtime binding view instead of
+/// projecting the file back into the parser phase.
+pub fn resolve_expanded_provider_unresolved_attributes<E, D>(
+    parsed: &mut super::File<E, AbsoluteBindingAddress, D>,
+    config: &ProviderContext,
+) -> Result<(), ParseError> {
+    let bindings = crate::binding_index::ResolvedBindings::for_expanded_validation(parsed);
+    for provider in &mut parsed.providers {
+        let mut resolved = IndexMap::new();
+        for (key, expression) in &provider.unresolved_attributes {
+            let value = crate::resolver::resolve_ref_value_with_config_diagnostic(
+                expression, &bindings, config,
+            )?;
+            resolved.insert(key.clone(), value);
         }
         provider.unresolved_attributes = resolved;
     }
@@ -1850,15 +1897,13 @@ pub fn resolve_provider_unresolved_attributes<E, D>(
 /// lower-level parser resolution passes and never receive
 /// [`ResolvedProviderConfigs`].
 pub fn resolve_provider_attributes_with_remote<E, D>(
-    parsed: &super::File<E, D>,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    parsed: &super::File<E, AbsoluteBindingAddress, D>,
+    remote_bindings: &HashMap<String, HashMap<String, crate::resource::Value>>,
     config: &ProviderContext,
 ) -> Result<ResolvedProviderConfigs, ProviderConfigResolutionError> {
-    let mut binding_map = HashMap::new();
     let mut bindings = crate::binding_index::ResolvedBindings::default();
     for rref in parsed.iter_top_level_resources() {
         if let Some(binding_name) = rref.binding() {
-            binding_map.insert(binding_name.to_string(), rref.resolved_attributes());
             bindings.set_with_completeness(
                 binding_name,
                 rref.resolved_attributes(),
@@ -1868,7 +1913,6 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
         }
     }
     for (binding, attrs) in remote_bindings {
-        binding_map.insert(binding.clone(), attrs.clone());
         bindings.set_with_completeness(
             binding,
             attrs.clone(),
@@ -1876,26 +1920,15 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
             crate::binding_index::BindingCompleteness::Complete,
         );
     }
-    for upstream in &parsed.upstream_states {
-        binding_map.entry(upstream.binding.clone()).or_default();
-    }
-    let mut fn_ctx = super::ParseContext::new(config);
-    fn_ctx.replace_user_functions(parsed.user_functions.clone());
-
     let mut providers = Vec::with_capacity(parsed.providers.len());
     for provider in &parsed.providers {
         let mut provider = provider.clone();
         for section in [&mut provider.attributes, &mut provider.default_tags] {
             let mut resolved = IndexMap::new();
             for (key, expr) in section.iter() {
-                let parser_resolved =
-                    resolve_value_with_config(expr, &binding_map, &fn_ctx, false, false)?;
-                let value = crate::resolver::resolve_ref_value_with_config(
-                    &parser_resolved,
-                    &bindings,
-                    config,
-                )
-                .map_err(|message| ParseError::InvalidExpression { line: 0, message })?;
+                let value = crate::resolver::resolve_ref_value_with_config_diagnostic(
+                    expr, &bindings, config,
+                )?;
                 resolved.insert(key.clone(), value);
             }
             *section = resolved;
@@ -1917,11 +1950,13 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
 ///
 /// Errors when a resolved value has the wrong shape (e.g.
 /// `default_tags = "string"`).
-pub fn finalize_provider_configs<E, D>(parsed: &mut super::File<E, D>) -> Result<(), ParseError> {
+pub fn finalize_provider_configs<E, B: BindingAddress, D>(
+    parsed: &mut super::File<E, B, D>,
+) -> Result<(), ParseError> {
     for provider in parsed.providers.iter_mut() {
         if let Some(value) = provider.unresolved_attributes.shift_remove("default_tags") {
             match value {
-                Value::Concrete(ConcreteValue::Map(tags)) => {
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(tags)) => {
                     provider.default_tags = tags;
                 }
                 other => {
@@ -2152,10 +2187,11 @@ mod seed_precedence_tests {
             .expect("cluster seed missing");
 
         match cluster_seed.kind() {
-            SeedKind::TypedStructural(_)
-            | SeedKind::Provisional
-            | SeedKind::StructuralAlias(_)
-            | SeedKind::ModuleParameter => {}
+            SeedKind::TypedStructural(_) | SeedKind::Provisional | SeedKind::StructuralAlias(_) => {
+            }
+            SeedKind::ModuleParameter {
+                declared_type: _declared_type,
+            } => {}
             SeedKind::Value { value, .. } => {
                 panic!("structural binding `cluster` must seed as Structural, not Value({value:?})")
             }
@@ -2186,12 +2222,12 @@ mod seed_precedence_tests {
                     "Value seed must carry the actual literal"
                 );
             }
-            SeedKind::TypedStructural(_)
-            | SeedKind::Provisional
-            | SeedKind::StructuralAlias(_)
-            | SeedKind::ModuleParameter => {
+            SeedKind::TypedStructural(_) | SeedKind::Provisional | SeedKind::StructuralAlias(_) => {
                 panic!("plain value let must seed as Value, not a non-value seed")
             }
+            SeedKind::ModuleParameter {
+                declared_type: _declared_type,
+            } => panic!("plain value let must seed as Value, not a module-parameter seed"),
         }
     }
 
@@ -2235,15 +2271,19 @@ for item in source.arn {
             template.attributes.get("comment"),
             Some(Value::Deferred(DeferredValue::Secret(_)))
         ));
-        let parsed =
-            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-                .expect("deferred fixture crosses the module-resolution seam");
+        let parsed = crate::module_resolver::resolve_modules_providerless(
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+        )
+        .expect("deferred fixture crosses the module-resolution seam");
         assert!(matches!(
             parsed.deferred_for_expressions()[0]
                 .attributes
                 .iter()
                 .find_map(|(key, value)| (key == "comment").then_some(value)),
-            Some(Value::Deferred(DeferredValue::Secret(_)))
+            Some(crate::resource::ExpandedValue::Deferred(
+                crate::resource::ExpandedDeferredValue::Secret(_)
+            ))
         ));
     }
 }

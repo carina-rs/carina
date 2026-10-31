@@ -1,0 +1,6 @@
+# The test assigns this anonymous declaration the same post-identification
+# identity spelling as the unrelated let binding in bindings.crn.
+mock.test.replaceable {
+  name  = "anonymous"
+  shape = "new"
+}

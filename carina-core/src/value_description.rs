@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::parser::display_string_literal;
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, Value};
 
 /// Value-derived description used in type-mismatch diagnostics.
 ///
@@ -17,7 +17,7 @@ pub struct ValueDescription(String);
 
 impl ValueDescription {
     /// Describe `value` for a type-mismatch diagnostic.
-    pub fn of(value: &Value) -> Self {
+    pub fn of<B: BindingAddress>(value: &Value<B>) -> Self {
         Self(match value {
             Value::Deferred(DeferredValue::ModuleIf(_)) => "module conditional".to_string(),
             Value::Concrete(ConcreteValue::String(value)) => value
@@ -68,6 +68,9 @@ impl fmt::Display for ValueDescription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type Value = crate::resource::ExpandedValue;
+    type ConcreteValue = crate::resource::ExpandedConcreteValue;
 
     #[test]
     fn string_value_uses_canonical_carina_literal() {

@@ -364,7 +364,9 @@ mod tests {
         let deferred = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
                 UnknownReason::UpstreamAllExports {
-                    binding: "management_route53".into(),
+                    binding: carina_core::resource::absolute_binding_address_for_test(
+                        "management_route53",
+                    ),
                 },
             ))),
             InterpolationPart::Literal("|registry-dev.carina-rs.dev|NS".into()),

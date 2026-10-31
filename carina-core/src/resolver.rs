@@ -4,6 +4,8 @@
 //! from both the DSL definition and current infrastructure state.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::path::PathBuf;
 
 use indexmap::IndexMap;
 
@@ -12,10 +14,124 @@ use crate::integer_arithmetic::IntegerExpressionError;
 #[cfg(test)]
 use crate::resource::State;
 use crate::resource::{
-    AccessMissPolicy, ConcreteValue, DataSource, DeferredValue, InterpolationPart, LiveComposition,
-    PlanInputCurrent, Resource, ResourceId, Value, ValueAccessError, ValuePathSegmentResult,
-    apply_value_path_segment,
+    AbsoluteBindingAddress, AccessMissPolicy, ConcreteValue, DataSource, DeferredValue,
+    FunctionArgument, InterpolationPart, LiveComposition, PlanInputCurrent, Resource, ResourceId,
+    Value, ValueAccessError, ValuePathSegmentResult, apply_value_path_segment,
 };
+
+/// Internal resolver failure with optional authored source provenance.
+///
+/// Public resolver entry points keep their historical `String` error shape.
+/// Parser-facing seams can instead recover a typed [`crate::parser::ParseError`]
+/// so expanding authored values does not erase their diagnostic location.
+#[derive(Debug)]
+enum ResolveValueDiagnostic {
+    Runtime {
+        message: String,
+        line: Option<usize>,
+        path: Option<PathBuf>,
+    },
+    Parse(crate::parser::ParseError),
+}
+
+impl ResolveValueDiagnostic {
+    fn runtime(message: impl Into<String>) -> Self {
+        Self::Runtime {
+            message: message.into(),
+            line: None,
+            path: None,
+        }
+    }
+
+    fn at_source_line(self, source_line: crate::resource::DiagnosticSourceLine) -> Self {
+        match self {
+            Self::Runtime {
+                message,
+                line,
+                path,
+            } => Self::Runtime {
+                message,
+                line: line.or_else(|| source_line.get()),
+                path,
+            },
+            Self::Parse(error) => Self::Parse(error),
+        }
+    }
+
+    fn at_line(self, authored_line: usize) -> Self {
+        match self {
+            Self::Runtime {
+                message,
+                line,
+                path,
+            } => Self::Runtime {
+                message,
+                line: line.or(Some(authored_line)),
+                path,
+            },
+            Self::Parse(error) => Self::Parse(error),
+        }
+    }
+
+    fn in_file(self, source_file: Option<&std::path::Path>) -> Self {
+        let Some(source_file) = source_file else {
+            return self;
+        };
+        match self {
+            Self::Runtime {
+                message,
+                line,
+                path,
+            } => Self::Runtime {
+                message,
+                line,
+                path: path.or_else(|| Some(source_file.to_path_buf())),
+            },
+            Self::Parse(error) => Self::Parse(error.in_file(source_file)),
+        }
+    }
+
+    fn into_parse_error(self) -> crate::parser::ParseError {
+        match self {
+            Self::Runtime {
+                message,
+                line,
+                path,
+            } => {
+                let error = crate::parser::ParseError::InvalidExpression {
+                    line: line.unwrap_or(0),
+                    message,
+                };
+                match path {
+                    Some(path) => error.in_file(path),
+                    None => error,
+                }
+            }
+            Self::Parse(error) => error,
+        }
+    }
+}
+
+impl fmt::Display for ResolveValueDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Runtime { message, .. } => formatter.write_str(message),
+            Self::Parse(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl From<String> for ResolveValueDiagnostic {
+    fn from(message: String) -> Self {
+        Self::runtime(message)
+    }
+}
+
+impl From<crate::parser::ParseError> for ResolveValueDiagnostic {
+    fn from(error: crate::parser::ParseError) -> Self {
+        Self::Parse(error)
+    }
+}
 
 /// Resolve all ResourceRef values in resources using current state.
 ///
@@ -452,7 +568,7 @@ pub fn resolve_value_for_plan(
 /// If the referenced binding or attribute is not found, the value is returned as-is.
 /// Returns an error if a builtin function fails with fully-resolved arguments.
 pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<Value, String> {
-    resolve_ref_value_inner(value, bindings, None)
+    resolve_ref_value_inner(value, bindings, None).map_err(|error| error.to_string())
 }
 
 /// Three-state result used by null/missing coalescing. A missing value is not
@@ -469,7 +585,7 @@ pub fn resolve_ref_value_status(
     value: &Value,
     bindings: &ResolvedBindings,
 ) -> Result<ValueResolution, String> {
-    resolve_ref_value_status_inner(value, bindings, None, false)
+    resolve_ref_value_status_inner(value, bindings, None, false).map_err(|error| error.to_string())
 }
 
 /// Resolve a value using binding data and a provider-aware builtin context.
@@ -482,7 +598,18 @@ pub fn resolve_ref_value_with_config(
     bindings: &ResolvedBindings,
     config: &crate::parser::ProviderContext,
 ) -> Result<Value, String> {
+    resolve_ref_value_inner(value, bindings, Some(config)).map_err(|error| error.to_string())
+}
+
+/// Parser-facing counterpart of [`resolve_ref_value_with_config`] that keeps
+/// authored source provenance attached to evaluation failures.
+pub(crate) fn resolve_ref_value_with_config_diagnostic(
+    value: &Value,
+    bindings: &ResolvedBindings,
+    config: &crate::parser::ProviderContext,
+) -> Result<Value, crate::parser::ParseError> {
     resolve_ref_value_inner(value, bindings, Some(config))
+        .map_err(ResolveValueDiagnostic::into_parse_error)
 }
 
 /// Select the miss policy for a path-shaped reference. A missing source is not
@@ -510,11 +637,13 @@ fn resolve_ref_value_status_inner(
     bindings: &ResolvedBindings,
     config: Option<&crate::parser::ProviderContext>,
     allow_absent_default: bool,
-) -> Result<ValueResolution, String> {
+) -> Result<ValueResolution, ResolveValueDiagnostic> {
     match value {
-        Value::Deferred(DeferredValue::ModuleIf(_)) => {
-            Err("unresolved module-template conditional reached runtime resolver".to_string())
-        }
+        Value::Deferred(DeferredValue::ModuleIf(_)) => Err(
+            "unresolved module-template conditional reached runtime resolver"
+                .to_string()
+                .into(),
+        ),
         Value::Deferred(DeferredValue::Coalesce {
             value: left,
             default,
@@ -582,16 +711,18 @@ fn resolve_ref_value_status_inner(
                     Err(error) if missing_access(&error) => {
                         return Ok(ValueResolution::Unknown(value.clone()));
                     }
-                    Err(error) => return Err(error.format_for_path(&path.to_string())),
+                    Err(error) => {
+                        return Err(error.format_for_path(&path.to_string()).into());
+                    }
                 }
             }
             Ok(ValueResolution::Present(resolved))
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            let Some(attributes) = bindings.get(binding) else {
+            let Some(attributes) = bindings.get(binding.as_str()) else {
                 return Ok(ValueResolution::Unknown(value.clone()));
             };
-            if !bindings.binding_is_fully_definitive(binding) {
+            if !bindings.binding_is_fully_definitive(binding.as_str()) {
                 return Ok(ValueResolution::Unknown(value.clone()));
             }
             let mut keys = attributes.keys().collect::<Vec<_>>();
@@ -632,13 +763,21 @@ fn resolve_ref_value_status_inner(
                     ValuePathSegmentResult::Deferred(_) | ValuePathSegmentResult::DeferredMiss(_),
                 ) => Ok(ValueResolution::Unknown(value.clone())),
                 Err(error) if missing_access(&error) => Ok(ValueResolution::Absent),
-                Err(error) => Err(error.format_for_path(&crate::value::format_value(value))),
+                Err(error) => Err(error
+                    .format_for_path(&crate::value::format_value(value))
+                    .into()),
             }
         }
         Value::Deferred(DeferredValue::Unknown(_)) => Ok(ValueResolution::Unknown(value.clone())),
-        Value::Deferred(DeferredValue::Unavailable { name, reason, .. }) => {
-            Err(format!("{name}(): {reason}"))
-        }
+        Value::Deferred(DeferredValue::Unavailable {
+            name,
+            reason,
+            source_line,
+            ..
+        }) => Err(
+            ResolveValueDiagnostic::runtime(format!("{name}(): {reason}"))
+                .at_source_line(*source_line),
+        ),
         Value::Concrete(_)
         | Value::Deferred(
             DeferredValue::Interpolation(_)
@@ -664,7 +803,7 @@ fn resolve_required_value_status(
     value: &Value,
     bindings: &ResolvedBindings,
     config: Option<&crate::parser::ProviderContext>,
-) -> Result<ValueResolution, String> {
+) -> Result<ValueResolution, ResolveValueDiagnostic> {
     let resolved = resolve_ref_value_inner(value, bindings, config)?;
     if resolved.is_fully_resolved() {
         Ok(ValueResolution::Present(resolved))
@@ -673,15 +812,158 @@ fn resolve_required_value_status(
     }
 }
 
+fn evaluate_runtime_user_function(
+    function: &crate::parser::UserFunction<AbsoluteBindingAddress>,
+    args: &[FunctionArgument<AbsoluteBindingAddress>],
+    bindings: &ResolvedBindings,
+    config: Option<&crate::parser::ProviderContext>,
+    call_line: usize,
+) -> Result<Value, ResolveValueDiagnostic> {
+    let required = function
+        .params
+        .iter()
+        .filter(|parameter| parameter.default.is_none())
+        .count();
+    if args.len() < required || args.len() > function.params.len() {
+        return Err(ResolveValueDiagnostic::runtime(format!(
+            "function '{}' expects {}..={} argument(s), got {}",
+            function.name,
+            required,
+            function.params.len(),
+            args.len()
+        ))
+        .at_line(call_line));
+    }
+
+    let default_config = crate::parser::ProviderContext::default();
+    let provider_config = config.unwrap_or(&default_config);
+    let mut substitutions = HashMap::new();
+    for (index, parameter) in function.params.iter().enumerate() {
+        let argument = match args.get(index) {
+            Some(argument) => argument.clone(),
+            None => FunctionArgument::from_value(
+                parameter
+                    .default
+                    .clone()
+                    .expect("required function arguments were checked"),
+            ),
+        };
+        let argument =
+            argument.try_map_value(|value| resolve_ref_value_inner(value, bindings, config))?;
+        if let Some(expected) = &parameter.param_type {
+            let resolved_parameter =
+                crate::validation::resolve_parameter_type_for_check(expected, provider_config)
+                    .map_err(|message| {
+                        ResolveValueDiagnostic::runtime(format!(
+                            "function '{}': parameter '{}': {message}",
+                            function.name, parameter.name
+                        ))
+                        .at_line(call_line)
+                    })?;
+            if let (Some(resolved_parameter), Some(handle)) =
+                (resolved_parameter.as_ref(), argument.handle())
+            {
+                crate::validation::check_handle_sink(handle, resolved_parameter).map_err(
+                    |error| {
+                        ResolveValueDiagnostic::runtime(format!(
+                            "function '{}': parameter '{}': {error}",
+                            function.name, parameter.name
+                        ))
+                        .at_line(call_line)
+                    },
+                )?;
+            } else if argument.pending_parameter().is_none()
+                && let Some(value) = argument.value()
+            {
+                crate::validation::typecheck::check_type_expr_value_providerless(
+                    &resolved_parameter
+                        .map_or_else(|| expected.clone(), |resolved| resolved.as_type_expr()),
+                    value,
+                    provider_config,
+                    crate::validation::typecheck::TypecheckInference::Unavailable,
+                )
+                .map_err(|error| {
+                    ResolveValueDiagnostic::runtime(format!(
+                        "function '{}': parameter '{}': {error}",
+                        function.name, parameter.name
+                    ))
+                    .at_line(call_line)
+                })?;
+            }
+        }
+        substitutions.insert(parameter.name.clone(), argument);
+    }
+
+    for (name, expression, source_line) in &function.local_lets {
+        let substituted =
+            crate::parser::substitute_fn_params(expression, &substitutions, *source_line).map_err(
+                |error| {
+                    ResolveValueDiagnostic::from(error)
+                        .in_file(function.body.source_file.as_deref())
+                },
+            )?;
+        let resolved = resolve_ref_value_inner(&substituted, bindings, config)
+            .map_err(|error| error.in_file(function.body.source_file.as_deref()))?;
+        substitutions.insert(name.clone(), FunctionArgument::from_value(resolved));
+    }
+
+    let substituted = crate::parser::substitute_fn_params(
+        &function.body.value,
+        &substitutions,
+        function.body.source_line,
+    )
+    .map_err(|error| {
+        ResolveValueDiagnostic::from(error).in_file(function.body.source_file.as_deref())
+    })?;
+    let result = resolve_ref_value_inner(&substituted, bindings, config)
+        .map_err(|error| error.in_file(function.body.source_file.as_deref()))?;
+    if let Some(expected) = &function.return_type {
+        crate::validation::typecheck::check_type_expr_value_providerless(
+            expected,
+            &result,
+            provider_config,
+            crate::validation::typecheck::TypecheckInference::Unavailable,
+        )
+        .map_err(|error| {
+            ResolveValueDiagnostic::runtime(format!(
+                "function '{}': return value: {error}",
+                function.name
+            ))
+            .at_line(function.body.source_line)
+            .in_file(function.body.source_file.as_deref())
+        })?;
+    }
+
+    Ok(result)
+}
+
+pub(crate) fn evaluate_module_resolved_user_function(
+    function: &crate::parser::UserFunction<AbsoluteBindingAddress>,
+    arguments: &[FunctionArgument<AbsoluteBindingAddress>],
+    config: &crate::parser::ProviderContext,
+    call_line: usize,
+) -> Result<Value, crate::parser::ParseError> {
+    evaluate_runtime_user_function(
+        function,
+        arguments,
+        &ResolvedBindings::default(),
+        Some(config),
+        call_line,
+    )
+    .map_err(ResolveValueDiagnostic::into_parse_error)
+}
+
 fn resolve_ref_value_inner(
     value: &Value,
     bindings: &ResolvedBindings,
     config: Option<&crate::parser::ProviderContext>,
-) -> Result<Value, String> {
+) -> Result<Value, ResolveValueDiagnostic> {
     match value {
-        Value::Deferred(DeferredValue::ModuleIf(_)) => {
-            Err("unresolved module-template conditional reached runtime resolver".to_string())
-        }
+        Value::Deferred(DeferredValue::ModuleIf(_)) => Err(
+            "unresolved module-template conditional reached runtime resolver"
+                .to_string()
+                .into(),
+        ),
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             match resolve_ref_value_status_inner(value, bindings, config, false)? {
                 ValueResolution::Present(value) | ValueResolution::Unknown(value) => Ok(value),
@@ -711,7 +993,9 @@ fn resolve_ref_value_inner(
                             ValuePathSegmentResult::Deferred(_)
                             | ValuePathSegmentResult::DeferredMiss(_),
                         ) => return Ok(value.clone()),
-                        Err(error) => return Err(error.format_for_path(&path.to_string())),
+                        Err(error) => {
+                            return Err(error.format_for_path(&path.to_string()).into());
+                        }
                     }
                 }
 
@@ -727,17 +1011,18 @@ fn resolve_ref_value_inner(
                 .evaluate_with_operands(lhs, rhs)
                 .map_err(|error| {
                     let span = expression.operator_span();
-                    match (span.line(), span.column()) {
+                    let message = match (span.line(), span.column()) {
                         (Some(line), Some(column)) => {
                             format!("at line {line}, column {column}: {error}")
                         }
                         _ => error.to_string(),
-                    }
+                    };
+                    ResolveValueDiagnostic::runtime(message)
                 })
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => Ok(value.clone()),
         Value::Concrete(ConcreteValue::List(items)) => {
-            let resolved: Result<Vec<Value>, String> = items
+            let resolved: Result<Vec<Value>, ResolveValueDiagnostic> = items
                 .iter()
                 .map(|v| resolve_ref_value_inner(v, bindings, config))
                 .collect();
@@ -751,7 +1036,7 @@ fn resolve_ref_value_inner(
             Ok(Value::Concrete(ConcreteValue::Map(resolved)))
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            let resolved_parts: Result<Vec<InterpolationPart>, String> = parts
+            let resolved_parts: Result<Vec<InterpolationPart>, ResolveValueDiagnostic> = parts
                 .iter()
                 .map(|p| match p {
                     InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
@@ -768,7 +1053,10 @@ fn resolve_ref_value_inner(
             source_line,
         }) => {
             // First, resolve all arguments
-            let resolved_args: Result<Vec<crate::resource::FunctionArgument>, String> = args
+            let resolved_args: Result<
+                Vec<crate::resource::FunctionArgument>,
+                ResolveValueDiagnostic,
+            > = args
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| resolve_ref_value_inner(value, bindings, config))
@@ -802,10 +1090,14 @@ fn resolve_ref_value_inner(
                     None => crate::builtins::evaluate_builtin(name, &eval_args),
                 };
                 match evaluated {
-                    Ok(result) => result
-                        .into_value()
-                        .map_err(|error| format!("{name}(): {error}")),
-                    Err(e) => Err(format!("{}(): {}", name, e)),
+                    Ok(result) => result.into_value().map_err(|error| {
+                        ResolveValueDiagnostic::runtime(format!("{name}(): {error}"))
+                            .at_source_line(*source_line)
+                    }),
+                    Err(error) => Err(ResolveValueDiagnostic::runtime(format!(
+                        "{name}(): {error}"
+                    ))
+                    .at_source_line(*source_line)),
                 }
             } else {
                 // Keep as FunctionCall with partially resolved args
@@ -816,9 +1108,15 @@ fn resolve_ref_value_inner(
                 }))
             }
         }
-        Value::Deferred(DeferredValue::Unavailable { name, reason, .. }) => {
-            Err(format!("{name}(): {reason}"))
-        }
+        Value::Deferred(DeferredValue::Unavailable {
+            name,
+            reason,
+            source_line,
+            ..
+        }) => Err(
+            ResolveValueDiagnostic::runtime(format!("{name}(): {reason}"))
+                .at_source_line(*source_line),
+        ),
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,
@@ -846,14 +1144,13 @@ fn resolve_ref_value_inner(
 
             let default_config = crate::parser::ProviderContext::default();
             let config = config.unwrap_or(&default_config);
-            crate::parser::evaluate_resolved_user_function(
+            evaluate_runtime_user_function(
                 function,
-                functions,
                 &resolved_args,
-                config,
+                bindings,
+                Some(config),
                 source_line.get().unwrap_or(function.body.source_line),
             )
-            .map_err(|error| error.to_string())
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let access_expression = crate::value::format_value(value);
@@ -865,11 +1162,12 @@ fn resolve_ref_value_inner(
                 .rebuild_with_base(resolved_base, AccessMissPolicy::Error)
                 .map_err(|error| {
                     let message = error.format_for_path(&access_expression);
-                    if access.source_line() == 0 {
+                    let message = if access.source_line() == 0 {
                         message
                     } else {
                         format!("at line {}: {message}", access.source_line())
-                    }
+                    };
+                    ResolveValueDiagnostic::runtime(message)
                 })
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
@@ -902,13 +1200,22 @@ mod tests {
     use crate::resource::ResourceId;
     use std::collections::HashSet;
 
+    type Value = crate::resource::ExpandedValue;
+    type ConcreteValue = crate::resource::ExpandedConcreteValue;
+    type DeferredValue = crate::resource::ExpandedDeferredValue;
+
+    fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+        crate::resource::RootScope::new()
+            .resolve(crate::resource::RelativeBindingName::new(binding))
+    }
+
     fn make_resource(name: &str, binding: Option<&str>, attrs: Vec<(&str, Value)>) -> Resource {
         let mut r = Resource::new(
             "test.resource",
             crate::resource::ResourceIdentity::try_from(name.to_string()).unwrap(),
         );
         r.attributes = attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-        r.binding = binding.map(|b| b.to_string());
+        r.binding = binding.map(absolute_binding);
         r
     }
 
@@ -960,16 +1267,16 @@ mod tests {
 
         let expression = integer_expression(
             integer_expression(
-                Value::resource_ref("source", "seconds", vec![]),
+                Value::root_resource_ref("source", "seconds", vec![]),
                 IntegerOp::Add,
                 Value::Concrete(ConcreteValue::Int(30)),
             ),
             IntegerOp::Divide,
-            Value::resource_ref("config", "divisor", vec![]),
+            Value::root_resource_ref("config", "divisor", vec![]),
         );
         assert_eq!(
             expression.root_bindings(),
-            ["config".to_string(), "source".to_string()].into(),
+            [absolute_binding("config"), absolute_binding("source")].into(),
             "dependency discovery must recurse into both arithmetic operands",
         );
         let bindings = bindings_from(vec![
@@ -1005,7 +1312,7 @@ mod tests {
         let divide_by_deferred_zero = integer_expression(
             Value::Concrete(ConcreteValue::Int(100)),
             IntegerOp::Divide,
-            Value::resource_ref("source", "value", vec![]),
+            Value::root_resource_ref("source", "value", vec![]),
         );
         let zero = bindings_from(vec![(
             "source",
@@ -1017,7 +1324,7 @@ mod tests {
         );
 
         let overflow = integer_expression(
-            Value::resource_ref("source", "value", vec![]),
+            Value::root_resource_ref("source", "value", vec![]),
             IntegerOp::Divide,
             Value::Concrete(ConcreteValue::Int(-1)),
         );
@@ -1039,9 +1346,9 @@ mod tests {
         };
 
         let expression = ValidatedIntegerExpr::new(
-            Value::resource_ref("source", "value", vec![]),
+            Value::root_resource_ref("source", "value", vec![]),
             IntegerOp::Divide,
-            Value::resource_ref("source", "divisor", vec![]),
+            Value::root_resource_ref("source", "divisor", vec![]),
             IntegerOperatorSpan::synthetic(),
         )
         .expect("resource operands are valid deferred Ints");
@@ -1072,7 +1379,7 @@ mod tests {
             ConcreteValue::String("a".into()),
         )]));
         let expression = coalesce(
-            Value::resource_ref("up", "accounts", Vec::new()),
+            Value::root_resource_ref("up", "accounts", Vec::new()),
             default.clone(),
         );
 
@@ -1109,8 +1416,8 @@ mod tests {
 
     #[test]
     fn coalesce_groupings_propagate_absence_associatively() {
-        let first = Value::resource_ref("r", "comment", Vec::new());
-        let second = Value::resource_ref("r", "parent", Vec::new());
+        let first = Value::root_resource_ref("r", "comment", Vec::new());
+        let second = Value::root_resource_ref("r", "parent", Vec::new());
         let fallback = Value::Concrete(ConcreteValue::String("default".into()));
         let left_grouped = coalesce(coalesce(first.clone(), second.clone()), fallback.clone());
         let right_grouped = coalesce(first, coalesce(second, fallback.clone()));
@@ -1220,7 +1527,7 @@ mod tests {
     fn selected_coalesce_fallback_propagates_unavailable_builtin_error() {
         let missing = "CARINA_TEST_ISSUE_3974_SELECTED_FALLBACK_MISSING";
         let expression = coalesce(
-            Value::resource_ref("r", "comment", Vec::new()),
+            Value::root_resource_ref("r", "comment", Vec::new()),
             Value::Deferred(DeferredValue::Unavailable {
                 name: crate::builtins::BuiltinFunction::env,
                 args: vec![Value::Concrete(ConcreteValue::String(missing.into())).into()],
@@ -1311,7 +1618,7 @@ mod tests {
         );
 
         let changed = coalesce(
-            Value::resource_ref("up", "name", vec![]),
+            Value::root_resource_ref("up", "name", vec![]),
             Value::Concrete(ConcreteValue::String("fallback".into())),
         );
         assert_eq!(
@@ -1326,7 +1633,7 @@ mod tests {
         assert_eq!(
             resolve_ref_value_status(
                 &coalesce(
-                    Value::resource_ref("up", "removed", vec![]),
+                    Value::root_resource_ref("up", "removed", vec![]),
                     removed_default.clone(),
                 ),
                 &bindings,
@@ -1336,7 +1643,7 @@ mod tests {
         );
 
         let provisional = coalesce(
-            Value::resource_ref("up", "accounts", vec![]),
+            Value::root_resource_ref("up", "accounts", vec![]),
             Value::Concrete(ConcreteValue::List(Vec::new())),
         );
         assert_eq!(
@@ -1350,7 +1657,7 @@ mod tests {
         );
 
         let missing_refreshable = coalesce(
-            Value::resource_ref("up", "missing_output", vec![]),
+            Value::root_resource_ref("up", "missing_output", vec![]),
             Value::Concrete(ConcreteValue::String("fallback".into())),
         );
         assert_eq!(
@@ -1362,7 +1669,7 @@ mod tests {
         assert_eq!(
             resolve_ref_value_status(
                 &coalesce(
-                    Value::resource_ref("up", "stable", vec![]),
+                    Value::root_resource_ref("up", "stable", vec![]),
                     Value::Concrete(ConcreteValue::String("fallback".into())),
                 ),
                 &bindings,
@@ -1376,7 +1683,7 @@ mod tests {
         assert_eq!(
             resolve_ref_value_status(
                 &coalesce(
-                    Value::resource_ref("up", "unrelated_optional", vec![]),
+                    Value::root_resource_ref("up", "unrelated_optional", vec![]),
                     missing_default.clone(),
                 ),
                 &bindings,
@@ -1399,7 +1706,10 @@ mod tests {
         let producer = make_resource(
             "producer",
             Some("producer"),
-            vec![("parent_name", Value::resource_ref("source", "name", vec![]))],
+            vec![(
+                "parent_name",
+                Value::root_resource_ref("source", "name", vec![]),
+            )],
         );
         let source_state = State::existing(
             source.id.clone(),
@@ -1436,7 +1746,7 @@ mod tests {
         });
         let fallback = Value::Concrete(ConcreteValue::String("d".into()));
         let expression = coalesce(
-            Value::resource_ref("producer", "comment", vec![]),
+            Value::root_resource_ref("producer", "comment", vec![]),
             fallback.clone(),
         );
 
@@ -1458,7 +1768,7 @@ mod tests {
         bindings.record_applied(Some("producer"), &resolved, &state);
         let default = Value::Concrete(ConcreteValue::String("fallback".into()));
         let expression = coalesce(
-            Value::resource_ref("producer", "optional", vec![]),
+            Value::root_resource_ref("producer", "optional", vec![]),
             default.clone(),
         );
 
@@ -1483,7 +1793,7 @@ mod tests {
         );
         let expression = coalesce(
             Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::with_segments(
+                path: AccessPath::root_with_segments(
                     "up",
                     "accounts",
                     vec![PathSegment::Field {
@@ -1518,7 +1828,7 @@ mod tests {
             name: crate::builtins::BuiltinFunction::lookup,
             args: vec![
                 Value::Concrete(ConcreteValue::Map(choices)).into(),
-                Value::resource_ref("selector", "key", vec![]).into(),
+                Value::root_resource_ref("selector", "key", vec![]).into(),
                 Value::Concrete(ConcreteValue::Map(IndexMap::new())).into(),
             ],
             source_line: 1.into(),
@@ -1555,7 +1865,7 @@ mod tests {
     fn local_bare_binding_ref_stays_typed_during_general_resolution() {
         let bindings = bindings_from(vec![("vpc", vec![])]);
         let reference = Value::Deferred(DeferredValue::BindingRef {
-            binding: "vpc".to_string(),
+            binding: absolute_binding("vpc"),
         });
 
         assert_eq!(resolve_ref_value(&reference, &bindings), Ok(reference));
@@ -1626,7 +1936,7 @@ mod tests {
                 ])),
             )],
         )]);
-        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+        let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
             "orgs",
             "accounts",
             Vec::new(),
@@ -1670,7 +1980,7 @@ mod tests {
                 ])),
             )],
         )]);
-        let path = AccessPath::with_segments(
+        let path = AccessPath::root_with_segments(
             "cert",
             "list",
             vec![
@@ -1710,7 +2020,7 @@ mod tests {
             "orgs",
             vec![("accounts", Value::Concrete(ConcreteValue::Map(map)))],
         )]);
-        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+        let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
             "orgs",
             "accounts",
             Vec::new(),
@@ -1748,7 +2058,7 @@ mod tests {
                 )))),
             )],
         )]);
-        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+        let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
             "creds_binding",
             "creds",
             Vec::new(),
@@ -1784,7 +2094,7 @@ mod tests {
                 )))),
             )],
         )]);
-        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+        let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
             "secret_holder",
             "tokens",
             Vec::new(),
@@ -1821,7 +2131,7 @@ mod tests {
                 )))),
             )],
         )]);
-        let path = crate::resource::AccessPath::with_fields(
+        let path = crate::resource::AccessPath::root_with_fields(
             "creds_binding",
             "creds",
             vec!["db_pwd".to_string()],
@@ -1856,7 +2166,7 @@ mod tests {
                 )))),
             )],
         )]);
-        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+        let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
             "b",
             "creds",
             Vec::new(),
@@ -1890,7 +2200,7 @@ mod tests {
                 )))),
             )],
         )]);
-        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+        let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
             "h",
             "tokens",
             Vec::new(),
@@ -1922,7 +2232,7 @@ mod tests {
                 )))),
             )],
         )]);
-        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+        let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
             "h",
             "creds",
             Vec::new(),
@@ -1977,7 +2287,7 @@ mod tests {
         );
         let mut bindings = ResolvedBindings::default();
         bindings.set("h", attrs, BindingValueSource::Upstream);
-        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+        let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
             "h",
             "creds",
             Vec::new(),
@@ -2033,7 +2343,7 @@ mod tests {
         );
         let mut bindings = ResolvedBindings::default();
         bindings.set("h", attrs, BindingValueSource::Upstream);
-        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+        let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
             "h",
             "creds",
             vec!["missing".to_string()],
@@ -2071,7 +2381,7 @@ mod tests {
         );
         let mut bindings = ResolvedBindings::default();
         bindings.set("h", attrs, BindingValueSource::Upstream);
-        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+        let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
             "h",
             "creds",
             Vec::new(),
@@ -2100,7 +2410,7 @@ mod tests {
         let mut h_attrs: HashMap<String, Value> = HashMap::new();
         h_attrs.insert(
             "creds".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::resource_ref(
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::root_resource_ref(
                 "missing".to_string(),
                 "x".to_string(),
                 vec![],
@@ -2112,7 +2422,7 @@ mod tests {
             h_attrs,
             crate::binding_index::BindingValueSource::Local,
         );
-        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+        let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
             "h",
             "creds",
             Vec::new(),
@@ -2139,7 +2449,7 @@ mod tests {
                 )])),
             )],
         )]);
-        let path = crate::resource::AccessPath::with_fields_and_subscripts(
+        let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
             "orgs",
             "accounts",
             Vec::new(),
@@ -2160,7 +2470,7 @@ mod tests {
             )],
         )]);
 
-        let ref_value = Value::resource_ref("my_vpc".to_string(), "id".to_string(), vec![]);
+        let ref_value = Value::root_resource_ref("my_vpc".to_string(), "id".to_string(), vec![]);
 
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(
@@ -2181,7 +2491,7 @@ mod tests {
 
         let list = Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::String("static".into())),
-            Value::resource_ref("my_sg".to_string(), "id".to_string(), vec![]),
+            Value::root_resource_ref("my_sg".to_string(), "id".to_string(), vec![]),
         ]));
 
         let resolved = resolve_ref_value(&list, &bindings).unwrap();
@@ -2207,7 +2517,7 @@ mod tests {
         let map = Value::Concrete(ConcreteValue::Map(
             vec![(
                 "subnet_id".to_string(),
-                Value::resource_ref("my_subnet".to_string(), "id".to_string(), vec![]),
+                Value::root_resource_ref("my_subnet".to_string(), "id".to_string(), vec![]),
             )]
             .into_iter()
             .collect(),
@@ -2228,7 +2538,8 @@ mod tests {
     fn test_unresolved_ref_stays_as_is() {
         let bindings = ResolvedBindings::default();
 
-        let ref_value = Value::resource_ref("nonexistent".to_string(), "id".to_string(), vec![]);
+        let ref_value =
+            Value::root_resource_ref("nonexistent".to_string(), "id".to_string(), vec![]);
 
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(resolved, ref_value);
@@ -2246,7 +2557,7 @@ mod tests {
 
         let interp = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("subnet-".into()),
-            InterpolationPart::Expr(Value::resource_ref(
+            InterpolationPart::Expr(Value::root_resource_ref(
                 "my_vpc".to_string(),
                 "vpc_id".to_string(),
                 vec![],
@@ -2266,7 +2577,7 @@ mod tests {
 
         let interp = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("subnet-".into()),
-            InterpolationPart::Expr(Value::resource_ref(
+            InterpolationPart::Expr(Value::root_resource_ref(
                 "my_vpc".to_string(),
                 "vpc_id".to_string(),
                 vec![],
@@ -2316,7 +2627,7 @@ mod tests {
                 None,
                 vec![(
                     "vpc_id",
-                    Value::resource_ref("my_vpc".to_string(), "vpc_id".to_string(), vec![]),
+                    Value::root_resource_ref("my_vpc".to_string(), "vpc_id".to_string(), vec![]),
                 )],
             ),
         ];
@@ -2399,7 +2710,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("-".into())).into(),
                 Value::Concrete(ConcreteValue::List(vec![
                     Value::Concrete(ConcreteValue::String("prefix".into())),
-                    Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
+                    Value::root_resource_ref("vpc".to_string(), "id".to_string(), vec![]),
                 ]))
                 .into(),
             ],
@@ -2431,7 +2742,7 @@ mod tests {
                 name: crate::builtins::BuiltinFunction::split,
                 args: vec![
                     Value::Concrete(ConcreteValue::String(":".into())).into(),
-                    Value::resource_ref("queue", "arn", vec![]).into(),
+                    Value::root_resource_ref("queue", "arn", vec![]).into(),
                 ],
                 source_line: (0).into(),
             }),
@@ -2466,7 +2777,7 @@ mod tests {
                 name: crate::builtins::BuiltinFunction::split,
                 args: vec![
                     Value::Concrete(ConcreteValue::String(":".into())).into(),
-                    Value::resource_ref("queue", "arn", vec![]).into(),
+                    Value::root_resource_ref("queue", "arn", vec![]).into(),
                 ],
                 source_line: (0).into(),
             }),
@@ -2503,7 +2814,7 @@ mod tests {
                 name: crate::builtins::BuiltinFunction::split,
                 args: vec![
                     Value::Concrete(ConcreteValue::String("-".into())).into(),
-                    Value::resource_ref("q", "identifier", vec![]).into(),
+                    Value::root_resource_ref("q", "identifier", vec![]).into(),
                 ],
                 source_line: (0).into(),
             }),
@@ -2544,10 +2855,10 @@ mod tests {
             },
         };
         let resource_path = Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::with_segments("res", "tags", vec![step.clone()]),
+            path: AccessPath::root_with_segments("res", "tags", vec![step.clone()]),
         });
         let postfix_access = crate::resource::apply_postfix_access(
-            Value::resource_ref("res".to_string(), "tags".to_string(), vec![]),
+            Value::root_resource_ref("res".to_string(), "tags".to_string(), vec![]),
             step,
             0,
             AccessMissPolicy::Error,
@@ -2589,10 +2900,10 @@ mod tests {
             },
         };
         let resource_path = Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::with_segments("res", "tags", vec![step.clone()]),
+            path: AccessPath::root_with_segments("res", "tags", vec![step.clone()]),
         });
         let postfix_access = crate::resource::apply_postfix_access(
-            Value::resource_ref("res".to_string(), "tags".to_string(), vec![]),
+            Value::root_resource_ref("res".to_string(), "tags".to_string(), vec![]),
             step,
             0,
             AccessMissPolicy::Error,
@@ -2622,10 +2933,10 @@ mod tests {
             index: Subscript::Int { index: 1 },
         };
         let resource_path = Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::with_segments("res", "names", vec![step.clone()]),
+            path: AccessPath::root_with_segments("res", "names", vec![step.clone()]),
         });
         let postfix_access = crate::resource::apply_postfix_access(
-            Value::resource_ref("res".to_string(), "names".to_string(), vec![]),
+            Value::root_resource_ref("res".to_string(), "names".to_string(), vec![]),
             step,
             0,
             AccessMissPolicy::Error,
@@ -2651,7 +2962,7 @@ mod tests {
             )],
         )]);
         let value = Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::with_segments(
+            path: AccessPath::root_with_segments(
                 "q",
                 "identifier",
                 vec![PathSegment::Subscript {
@@ -2681,7 +2992,7 @@ mod tests {
             name: crate::builtins::BuiltinFunction::join,
             args: vec![
                 Value::Concrete(ConcreteValue::String("-".into())).into(),
-                Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
+                Value::Concrete(ConcreteValue::List(vec![Value::root_resource_ref(
                     "unknown".to_string(),
                     "id".to_string(),
                     vec![],
@@ -2712,7 +3023,7 @@ mod tests {
         )]);
 
         // web.network.vpc_id should resolve to "vpc-123"
-        let ref_value = Value::resource_ref(
+        let ref_value = Value::root_resource_ref(
             "web".to_string(),
             "network".to_string(),
             vec!["vpc_id".to_string()],
@@ -2743,7 +3054,7 @@ mod tests {
             vec![("output", Value::Concrete(ConcreteValue::Map(output_map)))],
         )]);
 
-        let ref_value = Value::resource_ref(
+        let ref_value = Value::root_resource_ref(
             "web".to_string(),
             "output".to_string(),
             vec!["network".to_string(), "vpc_id".to_string()],
@@ -2769,7 +3080,7 @@ mod tests {
         )]);
 
         // A local desired-side view may not contain provider-populated fields yet.
-        let ref_value = Value::resource_ref(
+        let ref_value = Value::root_resource_ref(
             "web".to_string(),
             "network".to_string(),
             vec!["nonexistent".to_string()],
@@ -2818,7 +3129,7 @@ mod tests {
             name: crate::builtins::BuiltinFunction::join,
             args: vec![
                 Value::Concrete(ConcreteValue::String("-".into())).into(),
-                Value::resource_ref("vpc".to_string(), "tags".to_string(), vec![]).into(),
+                Value::root_resource_ref("vpc".to_string(), "tags".to_string(), vec![]).into(),
             ],
             source_line: (0).into(),
         });
@@ -2884,7 +3195,7 @@ mod tests {
             vec![(
                 "vpc_id",
                 // network.vpc.vpc_id -> ResourceRef { binding: "network", attribute: "vpc", field_path: ["vpc_id"] }
-                Value::resource_ref(
+                Value::root_resource_ref(
                     "network".to_string(),
                     "vpc".to_string(),
                     vec!["vpc_id".to_string()],
@@ -2939,7 +3250,7 @@ mod tests {
                 "principal_arn",
                 // orgs.accounts["registry_dev"]
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: crate::resource::AccessPath::with_fields_and_subscripts(
+                    path: crate::resource::AccessPath::root_with_fields_and_subscripts(
                         "orgs",
                         "accounts",
                         Vec::new(),
@@ -2997,7 +3308,7 @@ mod tests {
             vec![(
                 "principal_arn",
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: crate::resource::AccessPath::with_fields_and_subscripts(
+                    path: crate::resource::AccessPath::root_with_fields_and_subscripts(
                         "orgs",
                         "accounts",
                         Vec::new(),
@@ -3063,7 +3374,7 @@ mod tests {
             vec![(
                 "principal_arn",
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: crate::resource::AccessPath::with_fields_and_subscripts(
+                    path: crate::resource::AccessPath::root_with_fields_and_subscripts(
                         "orgs",
                         "accounts",
                         Vec::new(),
@@ -3101,7 +3412,7 @@ mod tests {
             vec![(
                 "principal_arn",
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: crate::resource::AccessPath::with_fields_and_subscripts(
+                    path: crate::resource::AccessPath::root_with_fields_and_subscripts(
                         "orgs",
                         "accounts",
                         Vec::new(),
@@ -3154,7 +3465,7 @@ mod tests {
             vec![(
                 "az",
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: crate::resource::AccessPath::with_fields_and_subscripts(
+                    path: crate::resource::AccessPath::root_with_fields_and_subscripts(
                         "orgs",
                         "regions",
                         Vec::new(),
@@ -3205,7 +3516,7 @@ mod tests {
             vec![(
                 "az",
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: crate::resource::AccessPath::with_fields_and_subscripts(
+                    path: crate::resource::AccessPath::root_with_fields_and_subscripts(
                         "orgs",
                         "regions",
                         Vec::new(),
@@ -3238,7 +3549,7 @@ mod tests {
             None,
             vec![(
                 "vpc_id",
-                Value::resource_ref(
+                Value::root_resource_ref(
                     "network".to_string(),
                     "nonexistent".to_string(),
                     vec!["vpc_id".to_string()],
@@ -3276,7 +3587,7 @@ mod tests {
             None,
             vec![(
                 "vpc_id",
-                Value::resource_ref(
+                Value::root_resource_ref(
                     "network".to_string(),
                     "vpc".to_string(),
                     vec!["vpc_id".to_string()],
@@ -3310,7 +3621,7 @@ mod tests {
             None,
             vec![(
                 "vpc_id",
-                Value::resource_ref(
+                Value::root_resource_ref(
                     "network".to_string(),
                     "vpc".to_string(),
                     vec!["vpc_id".to_string()],
@@ -3350,7 +3661,7 @@ mod tests {
             vec![(
                 "raw",
                 Value::Deferred(DeferredValue::BindingRef {
-                    binding: "bootstrap".to_string(),
+                    binding: absolute_binding("bootstrap"),
                 }),
             )],
         )];
@@ -3364,7 +3675,7 @@ mod tests {
             Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamAllExports {
                 binding,
             }))) => {
-                assert_eq!(binding, "bootstrap");
+                assert_eq!(binding.as_str(), "bootstrap");
             }
             other => panic!(
                 "expected Value::Unknown(UpstreamAllExports), got {:?}",
@@ -3387,10 +3698,10 @@ mod tests {
                 "raws",
                 Value::Concrete(ConcreteValue::List(vec![
                     Value::Deferred(DeferredValue::BindingRef {
-                        binding: "bootstrap".to_string(),
+                        binding: absolute_binding("bootstrap"),
                     }),
                     Value::Deferred(DeferredValue::BindingRef {
-                        binding: "secondary".to_string(),
+                        binding: absolute_binding("secondary"),
                     }),
                 ])),
             )],
@@ -3429,7 +3740,7 @@ mod tests {
             None,
             vec![(
                 "vpc_id",
-                Value::resource_ref("main".to_string(), "vpc_id".to_string(), Vec::new()),
+                Value::root_resource_ref("main".to_string(), "vpc_id".to_string(), Vec::new()),
             )],
         )];
         let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -3453,8 +3764,12 @@ mod tests {
             vec![(
                 "security_group_ids",
                 Value::Concrete(ConcreteValue::List(vec![
-                    Value::resource_ref("network".to_string(), "public_sg".to_string(), Vec::new()),
-                    Value::resource_ref(
+                    Value::root_resource_ref(
+                        "network".to_string(),
+                        "public_sg".to_string(),
+                        Vec::new(),
+                    ),
+                    Value::root_resource_ref(
                         "network".to_string(),
                         "private_sg".to_string(),
                         Vec::new(),
@@ -3495,7 +3810,7 @@ mod tests {
             None,
             vec![(
                 "vpc_id",
-                Value::resource_ref(
+                Value::root_resource_ref(
                     "network".to_string(),
                     "vpc".to_string(),
                     vec!["vpc_id".to_string()],
@@ -3509,7 +3824,9 @@ mod tests {
             .unwrap();
 
         assert!(
-            resources[0].dependency_bindings.contains("network"),
+            resources[0]
+                .dependency_bindings
+                .contains(&absolute_binding("network")),
             "dependency_bindings must record the upstream binding even after stamping"
         );
     }
@@ -3519,7 +3836,7 @@ mod tests {
     /// render the raw dot-form when only the top level gets stamped.
     #[test]
     fn test_resolve_refs_for_plan_recurses_into_collections() {
-        let inner = Value::resource_ref(
+        let inner = Value::root_resource_ref(
             "network".to_string(),
             "vpc".to_string(),
             vec!["vpc_id".to_string()],
@@ -3570,11 +3887,11 @@ mod tests {
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[crate::binding_index::WaitAliasSpec {
-                binding: crate::parser::BindingName::new("cert_issued"),
-                target: crate::parser::BindingName::new("cert"),
+                binding: absolute_binding("cert_issued"),
+                target: absolute_binding("cert"),
             }],
         });
-        let path = crate::resource::AccessPath::new("cert_issued", "certificate_arn");
+        let path = crate::resource::AccessPath::root("cert_issued", "certificate_arn");
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(
@@ -3599,11 +3916,11 @@ mod tests {
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[crate::binding_index::WaitAliasSpec {
-                binding: crate::parser::BindingName::new("cert_issued"),
-                target: crate::parser::BindingName::new("nonexistent"),
+                binding: absolute_binding("cert_issued"),
+                target: absolute_binding("nonexistent"),
             }],
         });
-        let path = crate::resource::AccessPath::new("cert_issued", "certificate_arn");
+        let path = crate::resource::AccessPath::root("cert_issued", "certificate_arn");
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
         assert_eq!(

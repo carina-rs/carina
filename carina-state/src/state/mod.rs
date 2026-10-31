@@ -21,10 +21,12 @@ use carina_core::provider::{
 pub use carina_core::resource::DeposedKey;
 #[cfg(test)]
 use carina_core::resource::Resource;
+#[cfg(any(test, feature = "test-utils"))]
+use carina_core::resource::absolute_binding_address_for_test;
 use carina_core::resource::{
-    ConcreteValue, Current, DataSource, Directives, PartialReadMarker, PendingReRead,
-    PersistedDirectives, ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity, State,
-    Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, Directives, PartialReadMarker,
+    PendingReRead, PersistedDirectives, ResolvedResource, ResolvedResourceId, ResourceId,
+    ResourceIdentity, State, Value,
 };
 use carina_core::schema::{
     FieldName, ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys,
@@ -1502,6 +1504,19 @@ impl StateFile {
     /// without a `moved` block.
     fn canonicalize_addresses(&mut self) -> Result<(), BackendError> {
         use carina_core::utils::canonicalize_map_key_address;
+
+        fn canonicalize_binding(
+            binding: AbsoluteBindingAddress,
+        ) -> Result<AbsoluteBindingAddress, BackendError> {
+            let original = binding.as_str().to_string();
+            let canonical = carina_core::utils::canonicalize_map_key_address(&original);
+            serde_json::from_value(serde_json::Value::String(canonical)).map_err(|error| {
+                BackendError::InvalidState(format!(
+                    "cannot canonicalize persisted binding address {original:?}: {error}"
+                ))
+            })
+        }
+
         for r in &mut self.resources {
             r.identity =
                 ResourceIdentity::try_from(canonicalize_map_key_address(r.identity.as_str()))
@@ -1514,14 +1529,13 @@ impl StateFile {
                         ),
                         error,
                     })?;
-            if let Some(b) = r.binding.as_ref() {
-                r.binding = Some(canonicalize_map_key_address(b));
+            if let Some(binding) = r.binding.take() {
+                r.binding = Some(canonicalize_binding(binding)?);
             }
-            r.dependency_bindings = r
-                .dependency_bindings
-                .iter()
-                .map(|d| canonicalize_map_key_address(d))
-                .collect();
+            r.dependency_bindings = std::mem::take(&mut r.dependency_bindings)
+                .into_iter()
+                .map(canonicalize_binding)
+                .collect::<Result<_, _>>()?;
         }
         Ok(())
     }
@@ -2220,7 +2234,7 @@ pub struct DeposedInstance {
     /// Last known attributes of the old instance.
     attributes: PersistedAttributes,
     /// Binding dependencies inherited from the old row.
-    pub dependency_bindings: BTreeSet<String>,
+    pub dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
 }
 
 /// Attributes admitted to a deposed generation by a state-owned writeback
@@ -2258,7 +2272,7 @@ impl DeposedInstance {
         identifier: String,
         provider_instance: Option<String>,
         attributes: DeposedAttributes,
-        dependency_bindings: BTreeSet<String>,
+        dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
     ) -> Self {
         Self {
             key,
@@ -2284,7 +2298,10 @@ impl DeposedInstance {
             identifier,
             provider_instance,
             DeposedAttributes(persisted_attributes_from_test_json(attributes)),
-            dependency_bindings,
+            dependency_bindings
+                .into_iter()
+                .map(absolute_binding_address_for_test)
+                .collect(),
         )
     }
 
@@ -2451,7 +2468,7 @@ pub struct ResourceState {
     /// The binding name for this resource (from `let` bindings in DSL).
     /// Stored so orphan Delete effects can have tree structure.
     #[serde(default)]
-    pub binding: Option<String>,
+    pub binding: Option<AbsoluteBindingAddress>,
     /// Binding names of resources this resource depends on (via ResourceRef).
     /// Stored so orphan Delete effects can have tree structure.
     ///
@@ -2460,7 +2477,7 @@ pub struct ResourceState {
     /// (serde transparently coerces array → BTreeSet, deduping any
     /// duplicates and re-serializing in sorted order on next write).
     #[serde(default)]
-    pub dependency_bindings: BTreeSet<String>,
+    pub dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
 }
 
 /// Owned resource row proven not to contain a create continuation.
@@ -2496,7 +2513,7 @@ struct EncodedDeposedInstance {
     #[serde(default)]
     provider_instance: Option<String>,
     attributes: HashMap<String, serde_json::Value>,
-    dependency_bindings: BTreeSet<String>,
+    dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
 }
 
 #[derive(Deserialize)]
@@ -2519,9 +2536,9 @@ struct EncodedResourceState {
     #[serde(default)]
     explicit: ExplicitFields,
     #[serde(default)]
-    binding: Option<String>,
+    binding: Option<AbsoluteBindingAddress>,
     #[serde(default)]
-    dependency_bindings: BTreeSet<String>,
+    dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
 }
 
 impl<'de> Deserialize<'de> for ResourceState {
@@ -3804,7 +3821,7 @@ struct LegacyPersistedDirectives {
     #[serde(default)]
     prevent_destroy: bool,
     #[serde(default)]
-    depends_on: Vec<String>,
+    depends_on: Vec<AbsoluteBindingAddress>,
     #[serde(default)]
     provider_instance: Option<String>,
 }

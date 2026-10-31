@@ -14,7 +14,9 @@ use carina_core::executor::{
     AcceptedRequest, Applied, ExecutionCheckpointSink, ExecutionEvent, ExecutionObserver,
     ExecutionOutcome, LiveExecutionInput, ProviderCheckInputs,
 };
-use carina_core::parser::{LoadedProviderContext, ParsedFile, ProviderConfig, ProviderContext};
+use carina_core::parser::{
+    LoadedProviderContext, ParsedFile, ProviderConfig, ProviderContext, ResolveExportBindingPhase,
+};
 use carina_core::plan::Plan;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, NoopNormalizer, ProviderError, ProviderResult,
@@ -59,6 +61,10 @@ use std::sync::Mutex;
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+fn absolute_binding(name: impl Into<String>) -> carina_core::resource::AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(name)
 }
 
 fn loaded_provider_context() -> LoadedProviderContext {
@@ -205,7 +211,7 @@ fn record_test_plan(contents: PlanFileContents, providers: &[&str]) -> PlanFile 
             }) as Box<dyn ProviderFactory>
         })
         .collect();
-    let ctx = ValidatedConfig::from_factories_for_test(
+    let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
         (),
         factories,
         contents.provider_configs.as_provider_configs(),
@@ -244,9 +250,15 @@ fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
 
 fn checked_exports(
     params: &[carina_core::parser::InferredExportParam],
-) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam> {
+) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::ExpandedInferredExportParam>
+{
+    let params = params
+        .iter()
+        .cloned()
+        .map(|param| param.resolve_root_for_test())
+        .collect::<Vec<_>>();
     carina_core::validation::check_export_values_pre_apply(
-        params,
+        &params,
         &carina_core::binding_index::ResolvedBindings::default(),
         &loaded_provider_context(),
     )
@@ -270,6 +282,7 @@ fn saved_provider_configs(
 ) -> carina_core::parser::SavedProviderConfigs {
     let mut parsed = carina_core::parser::InferredFile::default();
     parsed.providers = configs;
+    let parsed = parsed.resolve_root_for_test();
     let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
         &parsed,
         &HashMap::new(),
@@ -1282,7 +1295,7 @@ fn test_detailed_exitcode_wait_only_no_changes() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
-        identity: "cert_issued".into(),
+        identity: carina_core::resource::absolute_binding_address_for_test("cert_issued"),
         target_id: ManagedWaitTarget::for_test(&resolved(Resource::new("acm.Certificate", "cert"))),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -1801,7 +1814,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
 
 #[tokio::test]
 async fn detect_drift_errors_when_resource_missing_from_planned_states() {
-    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
+    let resource: Resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
 
     // Provider returns a non-existing state (identifier is None since no planned state)
@@ -1835,7 +1848,7 @@ async fn detect_drift_errors_when_resource_missing_from_planned_states() {
 
 #[tokio::test]
 async fn detect_drift_returns_none_when_no_drift() {
-    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
+    let resource: Resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
     let identifier = "my-bucket";
 
@@ -1902,7 +1915,7 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
         .insert_provider_witness("aws", &witness)
         .expect("fixture owner has one validated witness");
 
-    let resource = Resource::with_provider("aws", "lambda.Permission", "invoke", None);
+    let resource: Resource = Resource::with_provider("aws", "lambda.Permission", "invoke", None);
     let id = resource.id.clone();
     let identifier = "permission-id";
     let planned = State::existing(
@@ -1958,7 +1971,7 @@ async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file
         .expect("secret is persistable")
         .as_json()
         .clone();
-    let resource = Resource::with_provider("mock", "test.resource", "r1", None)
+    let resource: Resource = Resource::with_provider("mock", "test.resource", "r1", None)
         .with_attribute("name", Value::Concrete(ConcreteValue::String("r1".into())))
         .with_attribute("password", secret);
     let id = resource.id.clone();
@@ -2022,7 +2035,7 @@ async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file
 
 #[tokio::test]
 async fn detect_drift_uses_identifier_carried_by_present_current() {
-    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
+    let resource: Resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
     let identifier =
         AppliedIdentifier::new("typed-provider-id").expect("fixture identifier is non-empty");
@@ -2051,7 +2064,7 @@ async fn detect_drift_uses_identifier_carried_by_present_current() {
 
 #[tokio::test]
 async fn detect_drift_returns_messages_when_drift_detected() {
-    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
+    let resource: Resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
     let identifier = "my-bucket";
 
@@ -2591,7 +2604,12 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
+        .validate_evaluated_config(
+            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+            true,
+            &[],
+        )
         .unwrap();
     let result = run_state_refresh_locked(
         validated_config,
@@ -2641,7 +2659,12 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
+        .validate_evaluated_config(
+            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+            true,
+            &[],
+        )
         .unwrap();
 
     let result = run_state_refresh_locked(
@@ -2710,7 +2733,12 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
+        .validate_evaluated_config(
+            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+            true,
+            &[],
+        )
         .unwrap();
 
     let result = run_state_refresh_locked(
@@ -2846,8 +2874,9 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
     let lock = LockInfo::for_test("apply");
 
     let data_source_id = ResourceId::with_provider_identity("mock", "test.lookup", "lookup", None);
-    let mut data_source = DataSource::with_provider("mock", "test.lookup", "lookup", None);
-    data_source.binding = Some("lookup".to_string());
+    let mut data_source: DataSource =
+        DataSource::with_provider("mock", "test.lookup", "lookup", None);
+    data_source.binding = Some(absolute_binding("lookup"));
     let data_sources = vec![data_source];
     let data_source_state = State::existing(
         data_source_id.clone(),
@@ -3271,12 +3300,11 @@ fn import_effect_preserves_resource_metadata_in_state() {
     // overwrite the ResourceState with a bare ResourceState::new(), stripping
     // directives, prefixes, desired_keys, binding, and dependency_bindings.
 
-    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None)
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-        )
-        .with_binding("my_vpc_binding");
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_attribute(
+        "cidr_block",
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+    );
+    resource.binding = Some(absolute_binding("my_vpc_binding"));
     resource.directives.force_delete = true;
     resource
         .prefixes
@@ -3348,7 +3376,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
     );
     assert_eq!(
         saved_resource.binding,
-        Some("my_vpc_binding".to_string()),
+        Some(absolute_binding("my_vpc_binding")),
         "binding should be preserved after import"
     );
     assert_eq!(
@@ -3841,7 +3869,7 @@ fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
     )
     .expect("bound deferred loop parses");
     let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        parsed,
+        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
         std::path::Path::new("."),
     )
     .expect("cross the deferred-body resolution seam");
@@ -3916,7 +3944,7 @@ fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
     )
     .expect("unbound deferred loop parses");
     let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        parsed,
+        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
         std::path::Path::new("."),
     )
     .expect("cross the deferred-body resolution seam");
@@ -3994,7 +4022,7 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
     let target_id = managed_target.resolved_id().as_inner().clone();
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
-        identity: "lookup_ready".into(),
+        identity: carina_core::resource::absolute_binding_address_for_test("lookup_ready"),
         target_id: ManagedWaitTarget::for_test(&managed_target),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -4066,8 +4094,8 @@ fn replace_saved_wait_target(plan_file: PlanFile, target: &ResourceId) -> PlanFi
 
 #[test]
 fn plan_file_validation_rejects_wait_target_present_only_in_data_sources() {
-    let data_source =
-        DataSource::with_provider("mock", "test.lookup", "lookup", None).with_binding("lookup");
+    let mut data_source = DataSource::with_provider("mock", "test.lookup", "lookup", None);
+    data_source.binding = Some(absolute_binding("lookup"));
     let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.data_sources.push(data_source.clone());
     contents.data_source_values.push(SavedDataSourceValue {
@@ -4119,8 +4147,8 @@ fn plan_file_validation_accepts_unchanged_managed_wait_target() {
 
 #[test]
 fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
-    let data_source =
-        DataSource::with_provider("mock", "iam.Roles", "roles", None).with_binding("roles");
+    let mut data_source = DataSource::with_provider("mock", "iam.Roles", "roles", None);
+    data_source.binding = Some(absolute_binding("roles"));
     let mut plan = Plan::new();
     plan.add(Effect::Read {
         resource: resolved_data_source(data_source.clone()),
@@ -4922,10 +4950,10 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     };
     let lock = LockInfo::for_test("apply");
 
-    let mut resource_a = Resource::with_provider("mock", "test.resource", "a", None);
-    resource_a.binding = Some("a".to_string());
-    let mut resource_b = Resource::with_provider("mock", "test.resource", "b", None);
-    resource_b.binding = Some("b".to_string());
+    let mut resource_a: Resource = Resource::with_provider("mock", "test.resource", "a", None);
+    resource_a.binding = Some(absolute_binding("a"));
+    let mut resource_b: Resource = Resource::with_provider("mock", "test.resource", "b", None);
+    resource_b.binding = Some(absolute_binding("b"));
     let sorted_resources = vec![resolved(resource_a.clone()), resolved(resource_b)];
     let export_resources = sorted_resources
         .iter()
@@ -5045,8 +5073,8 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
     };
     let lock = LockInfo::for_test("apply");
 
-    let mut resource = Resource::with_provider("mock", "test.resource", "created", None);
-    resource.binding = Some("created".to_string());
+    let mut resource: Resource = Resource::with_provider("mock", "test.resource", "created", None);
+    resource.binding = Some(absolute_binding("created"));
     let sorted_resources = vec![resolved(resource.clone())];
     let export_resources = vec![resource.clone()];
     let resource_id = resource.id.clone();

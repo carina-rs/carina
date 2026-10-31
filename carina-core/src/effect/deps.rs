@@ -1,9 +1,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::effect::{Effect, EffectInstanceKey, ScheduleEdge};
+use crate::effect::{Effect, EffectInstanceKey, ScheduleEdge, SchedulerKey};
 use crate::non_empty::NonEmptyVec;
 use crate::parser::ResourceRef;
-use crate::resource::{Resource, ResourceId, ResourceIdentity};
+use crate::resource::{AbsoluteBindingAddress, Resource, ResourceId, ResourceIdentity};
 
 #[derive(Debug, Clone)]
 pub struct UnresolvedResource<S = crate::resource::ModuleSource>(Resource<S>);
@@ -37,10 +37,10 @@ pub enum ScheduleInputs<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DestroyWaitAlias {
-    pub binding: String,
-    pub target_binding: String,
-    pub explicit_dependencies: HashSet<String>,
-    pub consumers: NonEmptyVec<String>,
+    pub binding: AbsoluteBindingAddress,
+    pub target_binding: AbsoluteBindingAddress,
+    pub explicit_dependencies: HashSet<AbsoluteBindingAddress>,
+    pub consumers: NonEmptyVec<ResourceIdentity>,
 }
 
 impl DestroyWaitAlias {
@@ -50,10 +50,10 @@ impl DestroyWaitAlias {
     /// consumers carries no scheduling information, so callers should
     /// drop it rather than treat the `None` as an error.
     pub fn new(
-        binding: String,
-        target_binding: String,
-        explicit_dependencies: HashSet<String>,
-        consumers: Vec<String>,
+        binding: AbsoluteBindingAddress,
+        target_binding: AbsoluteBindingAddress,
+        explicit_dependencies: HashSet<AbsoluteBindingAddress>,
+        consumers: Vec<ResourceIdentity>,
     ) -> Option<Self> {
         Some(Self {
             binding,
@@ -64,22 +64,22 @@ impl DestroyWaitAlias {
     }
 
     fn destroy_edges(&self) -> Vec<ScheduleEdge> {
-        let mut edges = vec![ScheduleEdge::BlockedBy(ResourceIdentity::new(
+        let mut edges = vec![ScheduleEdge::BlockedBy(SchedulerKey::Binding(
             self.target_binding.clone(),
         ))];
         edges.extend(
             self.explicit_dependencies
                 .iter()
-                .filter(|dependency| dependency.as_str() != self.target_binding)
+                .filter(|dependency| *dependency != &self.target_binding)
                 .cloned()
-                .map(ResourceIdentity::new)
+                .map(SchedulerKey::Binding)
                 .map(ScheduleEdge::BlockedBy),
         );
         edges.extend(
             self.consumers
                 .iter()
                 .cloned()
-                .map(ResourceIdentity::new)
+                .map(SchedulerKey::Resource)
                 .map(ScheduleEdge::DependsOn),
         );
         edges
@@ -337,47 +337,53 @@ impl IdentityTargets {
 }
 
 struct DependencyAnalyzer<'a> {
-    instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets>,
-    delete_blockers_by_identity: HashMap<ResourceIdentity, Vec<usize>>,
-    compositions_by_binding: HashMap<String, crate::resource::CompositionRuntimeRef<'a>>,
+    targets_by_key: HashMap<SchedulerKey, IdentityTargets>,
+    delete_blockers_by_key: HashMap<SchedulerKey, Vec<usize>>,
+    compositions_by_binding:
+        HashMap<AbsoluteBindingAddress, crate::resource::CompositionRuntimeRef<'a>>,
 }
 
 impl<'a> DependencyAnalyzer<'a> {
     fn new(
-        instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets>,
-        delete_blockers_by_identity: HashMap<ResourceIdentity, Vec<usize>>,
+        targets_by_key: HashMap<SchedulerKey, IdentityTargets>,
+        delete_blockers_by_key: HashMap<SchedulerKey, Vec<usize>>,
         compositions: impl IntoIterator<Item = crate::resource::CompositionRuntimeRef<'a>>,
     ) -> Self {
         let compositions_by_binding = compositions
             .into_iter()
             .filter_map(|composition| {
                 composition
-                    .binding()
-                    .map(|binding| (binding.to_string(), composition))
+                    .binding_address()
+                    .cloned()
+                    .map(|binding| (binding, composition))
             })
             .collect();
         Self {
-            instance_to_idx,
-            delete_blockers_by_identity,
+            targets_by_key,
+            delete_blockers_by_key,
             compositions_by_binding,
         }
     }
 
-    fn lookup_by_identity(&self, identity: &ResourceIdentity) -> Option<usize> {
-        self.instance_to_idx
-            .get(&EffectInstanceKey::current(identity.clone()))
+    fn lookup_by_key(&self, key: &SchedulerKey) -> Option<usize> {
+        self.targets_by_key
+            .get(key)
             .and_then(IdentityTargets::lookup)
     }
 
-    fn lookup_deletes_by_identity(&self, identity: &ResourceIdentity) -> Vec<usize> {
-        self.delete_blockers_by_identity
-            .get(identity)
-            .cloned()
-            .unwrap_or_default()
+    fn lookup_by_identity(&self, identity: &ResourceIdentity) -> Option<usize> {
+        self.lookup_by_key(&SchedulerKey::Resource(identity.clone()))
     }
 
-    fn lookup_by_string_ref(&self, binding: &str) -> Option<usize> {
-        self.lookup_by_identity(&ResourceIdentity::new(binding))
+    fn lookup_by_binding(&self, binding: &AbsoluteBindingAddress) -> Option<usize> {
+        self.lookup_by_key(&SchedulerKey::Binding(binding.clone()))
+    }
+
+    fn lookup_deletes_by_key(&self, key: &SchedulerKey) -> Vec<usize> {
+        self.delete_blockers_by_key
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn collect_from_schedule_edges<S, E: AsRef<Effect<S>>>(
@@ -389,8 +395,8 @@ impl<'a> DependencyAnalyzer<'a> {
     ) {
         for edge in edges {
             match edge {
-                ScheduleEdge::DependsOn(identity) => {
-                    if let Some(parent) = self.lookup_by_identity(&identity) {
+                ScheduleEdge::DependsOn(key) => {
+                    if let Some(parent) = self.lookup_by_key(&key) {
                         analysis.add_edge(self_idx, parent, ReadsSet::unknown());
                     }
                 }
@@ -406,21 +412,22 @@ impl<'a> DependencyAnalyzer<'a> {
                             });
                     }
                 }
-                ScheduleEdge::BlockedBy(identity) => {
+                ScheduleEdge::BlockedBy(key) => {
                     let is_delete_fanout_source = self_idx >= effects.len()
                         || matches!(effects[self_idx].as_ref(), Effect::Delete { .. });
                     if is_delete_fanout_source {
-                        for blocked_idx in self.lookup_deletes_by_identity(&identity) {
+                        for blocked_idx in self.lookup_deletes_by_key(&key) {
                             if blocked_idx != self_idx {
                                 analysis.add_edge(blocked_idx, self_idx, ReadsSet::unknown());
                             }
                         }
-                    } else if let Some(blocked_idx) = self.lookup_by_identity(&identity) {
+                    } else if let Some(blocked_idx) = self.lookup_by_key(&key) {
                         analysis.add_edge(blocked_idx, self_idx, ReadsSet::unknown());
                     }
                 }
-                ScheduleEdge::BlockedByIfDelete(identity) => {
-                    for blocked_idx in self.lookup_deletes_by_identity(&identity) {
+                ScheduleEdge::BlockedByIfDelete(binding) => {
+                    let key = SchedulerKey::Binding(binding);
+                    for blocked_idx in self.lookup_deletes_by_key(&key) {
                         if blocked_idx != self_idx
                             && blocked_idx < effects.len()
                             && matches!(effects[blocked_idx].as_ref(), Effect::Delete { .. })
@@ -435,7 +442,7 @@ impl<'a> DependencyAnalyzer<'a> {
 
     fn collect_from_resource_ref<S>(
         &self,
-        resource: ResourceRef<'_, S>,
+        resource: ResourceRef<'_, S, AbsoluteBindingAddress>,
         analysis: &mut DependencyAnalysis,
         child: usize,
     ) {
@@ -443,16 +450,16 @@ impl<'a> DependencyAnalyzer<'a> {
         let mut bindings_seen_in_values = HashSet::new();
         for value in attrs.values() {
             value.visit_resource_refs(&mut |path| {
-                bindings_seen_in_values.insert(path.binding().to_string());
+                bindings_seen_in_values.insert(path.binding_address().clone());
                 self.record_binding_edge(
-                    path.binding(),
+                    path.binding_address(),
                     ReadsSet::from_walker(KnownReads::from_walker(path)),
                     analysis,
                     child,
                 );
             });
             value.visit_binding_refs(&mut |binding| {
-                bindings_seen_in_values.insert(binding.to_string());
+                bindings_seen_in_values.insert(binding.clone());
                 self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
             });
         }
@@ -479,7 +486,7 @@ impl<'a> DependencyAnalyzer<'a> {
 
     fn record_binding_edge(
         &self,
-        binding: &str,
+        binding: &AbsoluteBindingAddress,
         reads: ReadsSet,
         analysis: &mut DependencyAnalysis,
         child: usize,
@@ -490,16 +497,16 @@ impl<'a> DependencyAnalyzer<'a> {
 
     fn record_binding_edge_inner(
         &self,
-        binding: &str,
+        binding: &AbsoluteBindingAddress,
         reads: ReadsSet,
         analysis: &mut DependencyAnalysis,
         child: usize,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<AbsoluteBindingAddress>,
     ) {
-        if !visited.insert(binding.to_string()) {
+        if !visited.insert(binding.clone()) {
             return;
         }
-        if let Some(parent) = self.lookup_by_string_ref(binding) {
+        if let Some(parent) = self.lookup_by_binding(binding) {
             analysis.add_edge(child, parent, reads);
             return;
         }
@@ -507,11 +514,11 @@ impl<'a> DependencyAnalyzer<'a> {
             return;
         };
         for inner in crate::deps::get_composition_runtime_dependencies(*composition) {
-            if self.compositions_by_binding.contains_key(inner.as_str())
-                || self.lookup_by_string_ref(inner.as_str()).is_some()
+            if self.compositions_by_binding.contains_key(&inner)
+                || self.lookup_by_binding(&inner).is_some()
             {
                 self.record_binding_edge_inner(
-                    inner.as_str(),
+                    &inner,
                     ReadsSet::unknown(),
                     analysis,
                     child,
@@ -604,66 +611,46 @@ where
     E: AsRef<Effect<S>>,
     F: Fn(&ResourceId) -> Option<&'a Resource<S>>,
 {
-    let mut instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets> = HashMap::new();
+    let mut targets_by_key: HashMap<SchedulerKey, IdentityTargets> = HashMap::new();
     let aliases = match inputs {
         ScheduleInputs::Apply => &[][..],
         ScheduleInputs::Destroy { aliases } => aliases,
     };
     for (idx, effect) in effects.iter().enumerate() {
         let effect = effect.as_ref();
-        match effect {
-            Effect::Delete { .. } => instance_to_idx
-                .entry(effect.instance_key())
-                .or_default()
-                .insert_delete(idx),
-            // A release changes only the authoring record in locked state. It
-            // neither produces provider-visible values nor represents a
-            // provider operation that consumers should wait for. When the
-            // same resource also updates, that Update remains the scheduling
-            // target regardless of effect order.
-            Effect::ReleaseListKeys { .. } => {}
-            Effect::Read { .. }
-            | Effect::Create(_)
-            | Effect::ResumeCreate { .. }
-            | Effect::Update { .. }
-            | Effect::Import { .. }
-            | Effect::Remove { .. }
-            | Effect::Move { .. }
-            | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
-            | Effect::DeferredReplace(_) => instance_to_idx
-                .entry(effect.instance_key())
-                .or_default()
-                .insert_preferred(idx),
+        for key in effect.scheduling_keys() {
+            let targets = targets_by_key.entry(key).or_default();
+            if matches!(effect, Effect::Delete { .. }) {
+                targets.insert_delete(idx);
+            } else {
+                targets.insert_preferred(idx);
+            }
         }
     }
     let alias_offset = effects.len();
     for (alias_idx, alias) in aliases.iter().enumerate() {
-        instance_to_idx
-            .entry(EffectInstanceKey::current(ResourceIdentity::new(
-                alias.binding.clone(),
-            )))
+        targets_by_key
+            .entry(SchedulerKey::Binding(alias.binding.clone()))
             .or_default()
             .insert_alias_preferred(alias_offset + alias_idx);
     }
 
-    let mut delete_blockers_by_identity: HashMap<ResourceIdentity, Vec<usize>> = HashMap::new();
-    for (key, targets) in &instance_to_idx {
+    let mut delete_blockers_by_key: HashMap<SchedulerKey, Vec<usize>> = HashMap::new();
+    for (key, targets) in &targets_by_key {
         let blockers = targets.lookup_delete_blockers();
         if !blockers.is_empty() {
-            delete_blockers_by_identity
-                .entry(key.identity().clone())
+            delete_blockers_by_key
+                .entry(key.clone())
                 .or_default()
                 .extend(blockers);
         }
     }
-    for blockers in delete_blockers_by_identity.values_mut() {
+    for blockers in delete_blockers_by_key.values_mut() {
         blockers.sort_unstable();
         blockers.dedup();
     }
 
-    let analyzer =
-        DependencyAnalyzer::new(instance_to_idx, delete_blockers_by_identity, compositions);
+    let analyzer = DependencyAnalyzer::new(targets_by_key, delete_blockers_by_key, compositions);
     let mut analysis = DependencyAnalysis::new(effects.len() + aliases.len());
     add_same_identity_replacement_order_edges(effects, &mut analysis);
 
@@ -768,7 +755,18 @@ pub fn relax_update_update_edges<S, E: AsRef<Effect<S>>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{ResolvedResource, ResolvedResourceId, ResourceIdentity, State, Value};
+    use crate::resource::{
+        AuthoredValue, ExpandedResource as Resource, ExpandedValue as Value, RelativeBindingName,
+        ResolvedResource, ResolvedResourceId, ResourceIdentity, RootScope, State,
+    };
+
+    fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
+        RootScope::new().resolve(RelativeBindingName::new(name))
+    }
+
+    fn root_resource_ref(binding: &str, attribute: &str) -> Value {
+        AuthoredValue::resource_ref(binding, attribute, Vec::new()).resolve_root(&RootScope::new())
+    }
 
     fn state_for(id: &ResourceId) -> State {
         State::existing(id.clone(), Default::default())
@@ -776,13 +774,10 @@ mod tests {
     }
 
     fn update_effect(binding: &'static str, refs: &[(&str, &str)], changed: &[&str]) -> Effect {
-        let mut resource = Resource::new("test", binding);
-        resource.binding = Some(binding.to_string());
+        let mut resource: Resource = Resource::new("test", binding);
+        resource.binding = Some(absolute_binding(binding));
         for (dep, attr) in refs {
-            resource.set_attr(
-                format!("{}_{}", dep, attr),
-                Value::resource_ref((*dep).to_string(), (*attr).to_string(), vec![]),
-            );
+            resource.set_attr(format!("{}_{}", dep, attr), root_resource_ref(dep, attr));
         }
         Effect::Update {
             identifier: crate::effect::fixture_applied_identifier(
@@ -795,8 +790,8 @@ mod tests {
     }
 
     fn create_effect(binding: &'static str) -> Effect {
-        let mut resource = Resource::new("test", binding);
-        resource.binding = Some(binding.to_string());
+        let mut resource: Resource = Resource::new("test", binding);
+        resource.binding = Some(absolute_binding(binding));
         Effect::Create(ResolvedResource::new(resource))
     }
 
@@ -810,10 +805,10 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(format!("{identity}-id")),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some(identity.to_string()),
+            binding: Some(absolute_binding(identity)),
             dependencies: dependencies
                 .iter()
-                .map(|dependency| (*dependency).to_string())
+                .map(|dependency| absolute_binding(dependency))
                 .collect(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: blocked_by_updates
@@ -833,28 +828,24 @@ mod tests {
         effect
     }
 
-    fn analyzer_from_instance_to_idx(
-        instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets>,
+    fn analyzer_from_targets(
+        targets_by_key: HashMap<SchedulerKey, IdentityTargets>,
     ) -> DependencyAnalyzer<'static> {
-        let mut delete_blockers_by_identity: HashMap<ResourceIdentity, Vec<usize>> = HashMap::new();
-        for (key, targets) in &instance_to_idx {
+        let mut delete_blockers_by_key: HashMap<SchedulerKey, Vec<usize>> = HashMap::new();
+        for (key, targets) in &targets_by_key {
             let blockers = targets.lookup_delete_blockers();
             if !blockers.is_empty() {
-                delete_blockers_by_identity
-                    .entry(key.identity().clone())
+                delete_blockers_by_key
+                    .entry(key.clone())
                     .or_default()
                     .extend(blockers);
             }
         }
-        for blockers in delete_blockers_by_identity.values_mut() {
+        for blockers in delete_blockers_by_key.values_mut() {
             blockers.sort_unstable();
             blockers.dedup();
         }
-        DependencyAnalyzer::new(
-            instance_to_idx,
-            delete_blockers_by_identity,
-            std::iter::empty(),
-        )
+        DependencyAnalyzer::new(targets_by_key, delete_blockers_by_key, std::iter::empty())
     }
 
     fn total_edges(deps: &HashMap<usize, HashSet<usize>>) -> usize {
@@ -863,8 +854,8 @@ mod tests {
 
     #[test]
     fn effect_identity_returns_let_binding_for_named_effect() {
-        let mut resource = Resource::new("test", "named");
-        resource.binding = Some("named".to_string());
+        let mut resource: Resource = Resource::new("test", "named");
+        resource.binding = Some(absolute_binding("named"));
         let effect = Effect::Create(ResolvedResource::new(resource));
 
         assert_eq!(effect.identity(), ResourceIdentity::new("named"));
@@ -882,8 +873,8 @@ mod tests {
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         };
-        let mut named_resource = Resource::new("test", "named");
-        named_resource.binding = Some("named".to_string());
+        let mut named_resource: Resource = Resource::new("test", "named");
+        named_resource.binding = Some(absolute_binding("named"));
         let named = Effect::Create(ResolvedResource::new(named_resource));
 
         assert_eq!(anonymous.identity(), ResourceIdentity::new("anon_1234"));
@@ -891,28 +882,20 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_index_keys_on_identity_not_string() {
-        let first = ResourceIdentity::new("first");
-        let second = ResourceIdentity::new("second");
-        let mut first_targets = IdentityTargets::default();
-        first_targets.insert_preferred(0);
-        let mut second_targets = IdentityTargets::default();
-        second_targets.insert_preferred(1);
-        let analyzer = analyzer_from_instance_to_idx(HashMap::from([
-            (
-                crate::effect::EffectInstanceKey::current(first.clone()),
-                first_targets,
-            ),
-            (
-                crate::effect::EffectInstanceKey::current(second.clone()),
-                second_targets,
-            ),
+    fn scheduler_index_keeps_equal_spelling_binding_and_identity_distinct() {
+        let identity = ResourceIdentity::new("same");
+        let binding = absolute_binding("same");
+        let mut identity_targets = IdentityTargets::default();
+        identity_targets.insert_preferred(0);
+        let mut binding_targets = IdentityTargets::default();
+        binding_targets.insert_preferred(1);
+        let analyzer = analyzer_from_targets(HashMap::from([
+            (SchedulerKey::Resource(identity.clone()), identity_targets),
+            (SchedulerKey::Binding(binding.clone()), binding_targets),
         ]));
 
-        assert_eq!(analyzer.lookup_by_identity(&first), Some(0));
-        assert_eq!(analyzer.lookup_by_identity(&second), Some(1));
-        assert_eq!(analyzer.lookup_by_string_ref("first"), Some(0));
-        assert_eq!(analyzer.lookup_by_string_ref("second"), Some(1));
+        assert_eq!(analyzer.lookup_by_identity(&identity), Some(0));
+        assert_eq!(analyzer.lookup_by_binding(&binding), Some(1));
     }
 
     #[test]
@@ -1081,47 +1064,45 @@ mod tests {
     }
 
     #[test]
-    fn blocked_by_if_delete_resolves_anonymous_delete_through_identity_index() {
-        let delete = Effect::Delete {
+    fn blocked_by_if_delete_resolves_bound_delete_through_binding_index() {
+        let delete: Effect = Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", "foo")),
             identifier: crate::effect::fixture_applied_identifier("foo-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
-            binding: None,
+            binding: Some(absolute_binding("foo")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         };
         let mut blocker_resource = Resource::new("test", "blocker");
-        blocker_resource.binding = Some("blocker".to_string());
+        blocker_resource.binding = Some(absolute_binding("blocker"));
         let blocker = Effect::Create(ResolvedResource::new(blocker_resource));
         let effects = vec![delete, blocker];
         let mut foo_targets = IdentityTargets::default();
         foo_targets.insert_delete(0);
-        let analyzer = analyzer_from_instance_to_idx(HashMap::from([(
-            crate::effect::EffectInstanceKey::current(ResourceIdentity::new("foo")),
+        let analyzer = analyzer_from_targets(HashMap::from([(
+            SchedulerKey::Binding(absolute_binding("foo")),
             foo_targets,
         )]));
         let mut analysis = DependencyAnalysis::new(effects.len());
 
         analyzer.collect_from_schedule_edges(
             &effects,
-            vec![ScheduleEdge::BlockedByIfDelete(ResourceIdentity::new(
-                "foo",
-            ))],
+            vec![ScheduleEdge::BlockedByIfDelete(absolute_binding("foo"))],
             &mut analysis,
             1,
         );
 
         assert!(
             analysis.into_deps_of()[&0].contains(&1),
-            "anonymous delete must wait for the effect that blocks its identity"
+            "bound delete must wait for the effect that blocks its binding"
         );
     }
 
     #[test]
-    fn string_ref_resolves_to_anonymous_delete_via_identity_match() {
-        let delete = Effect::Delete {
+    fn binding_ref_does_not_resolve_to_anonymous_delete_via_identity_match() {
+        let delete: Effect = Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", "foo")),
             identifier: crate::effect::fixture_applied_identifier("foo-id"),
             generation: crate::effect::EffectGeneration::Current,
@@ -1132,10 +1113,10 @@ mod tests {
             blocked_by_updates: HashSet::new(),
         };
         let mut consumer_resource = Resource::new("test", "consumer");
-        consumer_resource.binding = Some("consumer".to_string());
+        consumer_resource.binding = Some(absolute_binding("consumer"));
         consumer_resource
             .dependency_bindings
-            .insert("foo".to_string());
+            .insert(absolute_binding("foo"));
         let consumer = Effect::Create(ResolvedResource::new(consumer_resource));
 
         let deps = build_effect_dependency_analysis(
@@ -1148,8 +1129,8 @@ mod tests {
         .into_deps_of();
 
         assert!(
-            deps[&1].contains(&0),
-            "plain string refs resolve by exact ResourceIdentity match"
+            deps[&1].is_empty(),
+            "a typed binding dependency must not match an anonymous resource identity"
         );
     }
 
@@ -1162,7 +1143,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier("parent-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some("parent".to_string()),
+            binding: Some(absolute_binding("parent")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -1174,8 +1155,8 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier("child-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some("child".to_string()),
-            dependencies: HashSet::from(["parent".to_string()]),
+            binding: Some(absolute_binding("child")),
+            dependencies: HashSet::from([absolute_binding("parent")]),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         };
@@ -1200,7 +1181,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier("cert-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some("cert".to_string()),
+            binding: Some(absolute_binding("cert")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -1212,16 +1193,16 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier("listener-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some("listener".to_string()),
-            dependencies: HashSet::from(["cert_issued".to_string()]),
+            binding: Some(absolute_binding("listener")),
+            dependencies: HashSet::from([absolute_binding("cert_issued")]),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         };
         let wait = DestroyWaitAlias::new(
-            "cert_issued".to_string(),
-            "cert".to_string(),
+            absolute_binding("cert_issued"),
+            absolute_binding("cert"),
             HashSet::new(),
-            vec!["listener".to_string()],
+            vec![ResourceIdentity::new("listener")],
         )
         .expect("test alias has a consumer");
         let effects = vec![cert, listener];
@@ -1244,10 +1225,10 @@ mod tests {
         let cert = delete_effect("cert", &[], &[]);
         let listener = deposed_delete_effect("listener", &["cert_issued"]);
         let wait = DestroyWaitAlias::new(
-            "cert_issued".to_string(),
-            "cert".to_string(),
+            absolute_binding("cert_issued"),
+            absolute_binding("cert"),
             HashSet::new(),
-            vec!["listener".to_string()],
+            vec![ResourceIdentity::new("listener")],
         )
         .expect("test alias has a deposed consumer");
         let effects = vec![cert, listener];
@@ -1276,10 +1257,10 @@ mod tests {
         let cert = deposed_delete_effect("cert", &[]);
         let listener = delete_effect("listener", &["cert_issued"], &[]);
         let wait = DestroyWaitAlias::new(
-            "cert_issued".to_string(),
-            "cert".to_string(),
+            absolute_binding("cert_issued"),
+            absolute_binding("cert"),
             HashSet::new(),
-            vec!["listener".to_string()],
+            vec![ResourceIdentity::new("listener")],
         )
         .expect("test alias has a consumer");
         let effects = vec![cert, listener];
@@ -1302,7 +1283,15 @@ mod tests {
 
     #[test]
     fn destroy_wait_alias_rejects_empty_consumers() {
-        assert!(DestroyWaitAlias::new("w".into(), "t".into(), HashSet::new(), vec![]).is_none());
+        assert!(
+            DestroyWaitAlias::new(
+                absolute_binding("w"),
+                absolute_binding("t"),
+                HashSet::new(),
+                vec![],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1314,8 +1303,8 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier("listener-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some("listener".to_string()),
-            dependencies: HashSet::from(["missing_wait".to_string()]),
+            binding: Some(absolute_binding("listener")),
+            dependencies: HashSet::from([absolute_binding("missing_wait")]),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         };
@@ -1340,7 +1329,7 @@ mod tests {
                 crate::resource::DeposedKey::new_unique(),
             ),
             directives: Default::default(),
-            binding: Some("thing".to_string()),
+            binding: Some(absolute_binding("thing")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),

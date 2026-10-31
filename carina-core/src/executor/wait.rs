@@ -63,7 +63,7 @@ pub(super) fn effect_started_for_test<S>(effect: &Effect<S>) -> ExecutionEvent<'
 /// Borrowed, internally consistent view of one [`Effect::Wait`].
 pub(super) struct WaitEffectRef<'a, S> {
     effect: &'a Effect<S>,
-    identity: &'a crate::resource::ResourceIdentity,
+    identity: &'a crate::resource::AbsoluteBindingAddress,
     target: &'a ManagedWaitTarget,
     until: &'a WaitPredicate,
     timeout: Duration,
@@ -93,7 +93,7 @@ impl<'a, S> WaitEffectRef<'a, S> {
         })
     }
 
-    pub(super) fn identity(&self) -> &crate::resource::ResourceIdentity {
+    pub(super) fn identity(&self) -> &crate::resource::AbsoluteBindingAddress {
         self.identity
     }
 
@@ -847,7 +847,7 @@ mod tests {
 
     fn wait_effect(timeout: Duration, interval: Duration) -> Effect {
         Effect::Wait {
-            identity: crate::resource::ResourceIdentity::new("cert_issued"),
+            identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
             target_id: managed_wait_target(),
             until: equals_status("ISSUED"),
             until_surface: "cert.status == ISSUED".to_string(),
@@ -1507,7 +1507,8 @@ mod tests {
                 ),
                 (
                     "target".to_string(),
-                    Value::resource_ref("vpc", "id", vec![]),
+                    crate::resource::AuthoredValue::resource_ref("vpc", "id", vec![])
+                        .resolve_root(&crate::resource::RootScope::new()),
                 ),
             ]),
             elapsed: Duration::from_secs(1),
@@ -1605,7 +1606,7 @@ mod tests {
         let shutdown = crate::shutdown::ShutdownToken::running();
         let cleanup_loop = shutdown.cleanup_aware_loop();
         let effect: crate::effect::Effect = crate::effect::Effect::Wait {
-            identity: crate::resource::ResourceIdentity::new("cert_issued"),
+            identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
             target_id: managed_wait_target(),
             until: equals_status("ISSUED"),
             until_surface: "cert.status == ISSUED".to_string(),

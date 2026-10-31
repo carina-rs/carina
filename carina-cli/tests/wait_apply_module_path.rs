@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use carina_cli::wiring::{
     OverrideAwareBuildMode, OverrideAwareResources, PlanPreprocessor, ProviderLoad,
-    resolve_config_block_names_for_test,
+    resolve_expanded_config_block_names_for_test,
 };
 use carina_core::binding_index::ResolvedBindings;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
@@ -384,7 +384,9 @@ fn apply_path_propagates_module_wait_binding() {
         carina_core::parser::ResourceRef::Resource(dist),
     );
     assert!(
-        deps.contains("r.cert_issued"),
+        deps.contains(&carina_core::resource::absolute_binding_address_for_test(
+            "r.cert_issued",
+        )),
         "expanded Distribution must depend on the prefixed wait \
          binding `r.cert_issued`; deps were {deps:?}"
     );
@@ -423,7 +425,7 @@ fn apply_path_propagates_module_wait_binding() {
     let composition_r = parsed
         .compositions
         .iter()
-        .any(|r| r.binding.as_deref() == Some("r"));
+        .any(|r| r.binding.as_ref().map(|binding| binding.as_str()) == Some("r"));
     // This assertion encodes the hypothesis. If it FAILS showing
     // binding="r", we've found the apply-path root cause: the nested
     // ref binds to the composition module proxy, not the wait binding.
@@ -560,16 +562,12 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .expect("resolve_refs");
 
     let resource_origins = sorted_resources.clone();
-    let mut unresolved_for_plan = carina_core::parser::ParsedFile::default();
-    unresolved_for_plan.resources = resources_for_plan.clone();
-    let canonical_for_plan = carina_core::module_resolver::resolve_modules_providerless(
-        unresolved_for_plan.clone(),
-        &caller,
-    )
-    .expect("canonical plan fixture crosses module resolution");
-    let canonical_unresolved = resolve_config_block_names_for_test(
+    let mut canonical_for_plan = parsed.clone();
+    canonical_for_plan.resources = resources_for_plan.clone();
+    let unresolved_for_plan = canonical_for_plan.clone();
+    let canonical_unresolved = resolve_expanded_config_block_names_for_test(
         canonical_for_plan,
-        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved_for_plan),
+        unresolved_for_plan,
         ctx.schemas(),
     )
     .expect("block-name resolution");

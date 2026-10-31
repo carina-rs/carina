@@ -1210,7 +1210,9 @@ mod tests {
                 .expect("fixture provider identifier is non-empty"),
             generation: EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some("example".to_string()),
+            binding: Some(carina_core::resource::absolute_binding_address_for_test(
+                "example",
+            )),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::from(["missing-consumer".into()]),

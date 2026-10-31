@@ -1,5 +1,5 @@
 use carina_core::effect::Effect;
-use carina_core::parser::{DeferredForExpression, ResolvedDeferredForExpressions};
+use carina_core::parser::{ExpandedDeferredForExpression, ResolvedDeferredForExpressions};
 use carina_core::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan, PlanSummaryPart};
 
 use crate::commands::plan::{ExportChange, ReloadedPlanFile};
@@ -7,7 +7,7 @@ use crate::commands::shared::state_writeback::PersistedDirectiveChange;
 
 #[cfg(test)]
 pub(crate) fn resolved_deferred_for_for_test(
-    expressions: impl IntoIterator<Item = DeferredForExpression>,
+    expressions: impl IntoIterator<Item = ExpandedDeferredForExpression>,
 ) -> ResolvedDeferredForExpressions {
     ResolvedDeferredForExpressions::from_expressions_for_test(expressions)
 }
@@ -48,7 +48,7 @@ pub struct PlanChangeSummary {
     deferred_effects: Vec<DeferredSummaryEntry>,
     export_changes: Vec<ExportChange>,
     persisted_directive_changes: Vec<PersistedDirectiveChange>,
-    residual_deferred_for: Vec<DeferredForExpression>,
+    residual_deferred_for: Vec<ExpandedDeferredForExpression>,
     has_plan_effects: bool,
 }
 
@@ -62,7 +62,7 @@ impl PlanChangeSummary {
         Self::from_parts(
             plan,
             export_changes,
-            residual_deferred_for.as_slice().to_vec(),
+            residual_deferred_for.iter().cloned().collect(),
             persisted_directive_changes.to_vec(),
         )
     }
@@ -79,7 +79,7 @@ impl PlanChangeSummary {
     fn from_parts<S>(
         plan: &Plan<S>,
         export_changes: &[ExportChange],
-        residual_deferred_for: Vec<DeferredForExpression>,
+        residual_deferred_for: Vec<ExpandedDeferredForExpression>,
         persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Self {
         let plan_summary = plan.summary();
@@ -179,7 +179,7 @@ impl PlanChangeSummary {
         &self.persisted_directive_changes
     }
 
-    pub(crate) fn residual_deferred_for(&self) -> &[DeferredForExpression] {
+    pub(crate) fn residual_deferred_for(&self) -> &[ExpandedDeferredForExpression] {
         &self.residual_deferred_for
     }
 }
@@ -187,24 +187,29 @@ impl PlanChangeSummary {
 #[cfg(test)]
 mod tests {
     use carina_core::effect::Effect;
-    use carina_core::parser::{DeferredForExpression, ForBinding};
+    use carina_core::parser::{ExpandedDeferredForExpression, ForBinding};
     use carina_core::plan::Plan;
     use carina_core::resource::{ConcreteValue, DataSource, ResolvedDataSource, Resource, Value};
 
     use super::{PlanChangeSummary, resolved_deferred_for_for_test};
     use crate::commands::plan::ExportChange;
 
-    fn residual_deferred_for() -> DeferredForExpression {
-        DeferredForExpression {
+    fn residual_deferred_for() -> ExpandedDeferredForExpression {
+        ExpandedDeferredForExpression {
             file: None,
             line: 1,
             header: "for item in upstream.items".to_string(),
             resource_type: "test.Widget".to_string(),
             attributes: Vec::new(),
             target: carina_core::parser::DeferredForTarget::Bound {
-                binding: "widgets".to_string(),
+                binding: carina_core::resource::absolute_binding_address_for_test("widgets"),
             },
-            iterable: Value::resource_ref("upstream", "items", Vec::new()),
+            iterable: carina_core::resource::AuthoredValue::resource_ref(
+                "upstream",
+                "items",
+                Vec::new(),
+            )
+            .resolve_root_for_test(),
             binding: ForBinding::Simple("item".to_string()),
             template_resource: Resource::new("test.Widget", "widgets"),
         }

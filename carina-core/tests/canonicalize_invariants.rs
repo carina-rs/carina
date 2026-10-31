@@ -15,7 +15,10 @@
 //! asserts the invariants hold for every interpolation found.
 
 use carina_core::parser::parse_file_and_resolve;
-use carina_core::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
+use carina_core::resource::{
+    AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
+    AuthoredInterpolationPart as InterpolationPart, AuthoredValue as Value,
+};
 
 fn check_value(v: &Value, path: &str) {
     match v {

@@ -25,8 +25,12 @@ use crate::provider::{
     UpdateRequest, fixture_read_outcome, fixture_read_outcome_for_identifier,
 };
 use crate::resource::{
-    AccessPath, ConcreteValue, DataSource, DeferredValue, Directives, PathSegment,
-    ResolvedDataSource, ResolvedResource, Resource, ResourceIdentity, UnknownReason, Value,
+    AbsoluteBindingAddress, ExpandedAccessPath as AccessPath,
+    ExpandedConcreteValue as ConcreteValue, ExpandedDataSource as DataSource,
+    ExpandedDeferredValue as DeferredValue, ExpandedDirectives as Directives,
+    ExpandedResource as Resource, ExpandedUnknownReason as UnknownReason, ExpandedValue as Value,
+    PathSegment, RelativeBindingName, ResolvedDataSource, ResolvedResource, ResourceIdentity,
+    RootScope,
 };
 use crate::value::SerializationError;
 use parallel::build_dependency_levels;
@@ -41,6 +45,10 @@ use crate::shutdown::testing::{TestShutdownTrigger as ShutdownTrigger, shutdown_
 
 fn uncancelled_shutdown() -> ShutdownToken {
     ShutdownToken::running()
+}
+
+fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
+    RootScope::new().resolve(RelativeBindingName::new(binding))
 }
 
 #[test]
@@ -118,12 +126,12 @@ fn for_value_access(fields: &[&str]) -> Value {
     )
 }
 
-fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression {
+fn validation_deferred_for_expression() -> crate::parser::ExpandedDeferredForExpression {
     let mut template_resource = Resource::new("test", "validation_records");
-    template_resource.binding = Some("validation_records".to_string());
+    template_resource.binding = Some(absolute_binding("validation_records"));
     template_resource
         .dependency_bindings
-        .insert("cert".to_string());
+        .insert(absolute_binding("cert"));
     template_resource.set_attr("name", for_value_access(&["resource_record", "name"]));
     template_resource.set_attr("value", for_value_access(&["resource_record", "value"]));
 
@@ -138,16 +146,16 @@ fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression 
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
         target: crate::parser::DeferredForTarget::Bound {
-            binding: "validation_records".to_string(),
+            binding: absolute_binding("validation_records"),
         },
-        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        iterable: Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: crate::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
     }
 }
 
 fn anonymous_deferred_collision_fixture() -> (
-    crate::parser::DeferredForExpression,
+    crate::parser::ExpandedDeferredForExpression,
     ResolvedBindings,
     SchemaRegistry,
     Resource,
@@ -161,9 +169,11 @@ fn anonymous_deferred_collision_fixture() -> (
         &crate::parser::ProviderContext::default(),
     )
     .expect("unbound deferred loop parses");
-    let parsed =
-        crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-            .expect("deferred fixture crosses the module-resolution seam");
+    let parsed = crate::module_resolver::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        std::path::Path::new("."),
+    )
+    .expect("deferred fixture crosses the module-resolution seam");
     let template = parsed.deferred_for_expressions()[0].clone();
     let mut bindings = ResolvedBindings::default();
     bindings.set_with_completeness(
@@ -312,7 +322,7 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
                     )),
                     identifier: crate::effect::fixture_applied_identifier("validation-old"),
                     directives: Directives::default(),
-                    binding: Some("validation_records[0]".to_string()),
+                    binding: Some(absolute_binding("validation_records[0]")),
                     dependencies: HashSet::new(),
                     explicit_dependencies: HashSet::new(),
                     blocked_by_updates: HashSet::new(),
@@ -338,13 +348,13 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
     let mut wait_consumer = make_resource("wait_consumer", &["wait_ready"]);
     wait_consumer
         .dependency_bindings
-        .insert("wait_ready".to_string());
+        .insert(absolute_binding("wait_ready"));
     assert_matches_executor(
         "wait",
         vec![
             create_effect(wait_target.clone()),
             Effect::Wait {
-                identity: ResourceIdentity::new("wait_ready"),
+                identity: crate::resource::absolute_binding_address_for_test("wait_ready"),
                 target_id: managed_wait_target(wait_target.id.clone()),
                 until: WaitPredicate::equals(
                     AttrPath::single("status"),
@@ -904,7 +914,7 @@ fn resolved_resource_constructor_rejects_value_unknown() {
 #[test]
 fn resolved_resource_constructor_rejects_resource_ref() {
     let value = Value::Deferred(DeferredValue::ResourceRef {
-        path: AccessPath::new("cert", "domain_validation_options"),
+        path: AccessPath::root("cert", "domain_validation_options"),
     });
 
     let err = basic::resolved_resource(resource_with_attr(value))
@@ -1269,16 +1279,16 @@ fn make_resource(binding: &str, deps: &[&str]) -> Resource {
         "test",
         crate::resource::ResourceIdentity::try_from(binding.to_string()).unwrap(),
     );
-    r.binding = Some(binding.to_string());
+    r.binding = Some(absolute_binding(binding));
     for dep in deps {
         r.set_attr(
             format!("ref_{}", dep),
-            Value::resource_ref(dep.to_string(), "id".to_string(), vec![]),
+            Value::root_resource_ref(dep.to_string(), "id".to_string(), vec![]),
         );
     }
     // Save dependency bindings as metadata (normally done by resolver)
     if !deps.is_empty() {
-        r.dependency_bindings = deps.iter().map(|d| d.to_string()).collect();
+        r.dependency_bindings = deps.iter().map(|dep| absolute_binding(dep)).collect();
     }
     r
 }
@@ -1318,7 +1328,7 @@ fn empty_execution_result() -> ExecutionResult {
 
 fn provider_config_with_default_tags(
     tags: indexmap::IndexMap<String, Value>,
-) -> crate::parser::ProviderConfig {
+) -> crate::parser::ExpandedProviderConfig {
     crate::parser::ProviderConfig {
         name: "test".to_string(),
         attributes: indexmap::IndexMap::new(),
@@ -2398,7 +2408,7 @@ async fn create_before_destroy_outcome_unknown_records_replacement_create_state(
         identifier: crate::effect::fixture_applied_identifier("old-id"),
         generation: EffectGeneration::Current,
         directives,
-        binding: Some("source".to_string()),
+        binding: Some(absolute_binding("source")),
         dependencies: HashSet::new(),
         explicit_dependencies: HashSet::new(),
         blocked_by_updates: HashSet::new(),
@@ -2701,7 +2711,7 @@ async fn resume_resolution_failure_has_no_applied_entry() {
     let mut source = make_resource("source", &[]);
     source.set_attr(
         "unresolved",
-        Value::resource_ref("missing".to_string(), "id".to_string(), vec![]),
+        Value::root_resource_ref("missing".to_string(), "id".to_string(), vec![]),
     );
     let source_id = source.id.clone();
     let pending = persisted_create_for_executor(&source_id);
@@ -2889,7 +2899,7 @@ async fn invalid_secret_create_value_is_masked_and_never_reaches_provider() {
     let mut resource = make_resource("invalid-secret-create", &[]);
     resource.set_attr(
         "target",
-        Value::resource_ref("secret-source", "value", vec![]),
+        Value::root_resource_ref("secret-source", "value", vec![]),
     );
     let id = resource.id.clone();
     let unresolved = HashMap::from([(
@@ -3055,7 +3065,7 @@ async fn runtime_integer_arithmetic_failures_abort_before_dependent_provider_cal
             evaluate_integer_values(
                 Value::Concrete(ConcreteValue::Int(lhs)),
                 op,
-                Value::resource_ref("source", "value", vec![]),
+                Value::root_resource_ref("source", "value", vec![]),
                 IntegerOperatorSpan::synthetic(),
             )
             .expect("resource arithmetic is structurally valid"),
@@ -3499,8 +3509,13 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
     let producer = make_resource("producer", &[]);
     let producer_id = producer.id.clone();
     let mut consumer = make_resource("consumer", &[]);
-    consumer.set_attr("target", Value::resource_ref("producer", "value", vec![]));
-    consumer.dependency_bindings.insert("producer".to_string());
+    consumer.set_attr(
+        "target",
+        Value::root_resource_ref("producer", "value", vec![]),
+    );
+    consumer
+        .dependency_bindings
+        .insert(absolute_binding("producer"));
 
     provider.push_create(Ok(State::existing(
         producer_id.clone(),
@@ -3580,11 +3595,11 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
     let mut unresolved_consumer = make_resource("consumer-update", &[]);
     unresolved_consumer.set_attr(
         "target",
-        Value::resource_ref("producer-update", "value", vec![]),
+        Value::root_resource_ref("producer-update", "value", vec![]),
     );
     unresolved_consumer
         .dependency_bindings
-        .insert("producer-update".to_string());
+        .insert(absolute_binding("producer-update"));
     let mut planned_consumer = unresolved_consumer.clone();
     planned_consumer.set_attr(
         "target",
@@ -3679,7 +3694,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
 async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
     let provider = MockProvider::new();
     let mut cert = Resource::new("test", "cert-constraint");
-    cert.binding = Some("cert".to_string());
+    cert.binding = Some(absolute_binding("cert"));
     let cert_id = cert.id.clone();
     provider.push_create(Ok(State::existing(
         cert_id.clone(),
@@ -3756,10 +3771,10 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
     let upstream = make_resource("data-source-producer", &[]);
     let upstream_id = upstream.id.clone();
     let mut data_source = DataSource::with_provider("test", "Lookup", "lookup", None);
-    data_source.binding = Some("lookup".to_string());
+    data_source.binding = Some(absolute_binding("lookup"));
     data_source.attributes.insert(
         "filter".to_string(),
-        Value::resource_ref("data-source-producer", "value", vec![]),
+        Value::root_resource_ref("data-source-producer", "value", vec![]),
     );
     let data_source_id = data_source.id.clone();
 
@@ -3837,10 +3852,10 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
     let upstream = make_resource("plan-data-source-producer", &[]);
     let upstream_id = upstream.id.clone();
     let mut data_source = DataSource::with_provider("test", "Lookup", "plan-lookup", None);
-    data_source.binding = Some("plan-lookup".to_string());
+    data_source.binding = Some(absolute_binding("plan-lookup"));
     data_source.attributes.insert(
         "filter".to_string(),
-        Value::resource_ref("plan-data-source-producer", "value", vec![]),
+        Value::root_resource_ref("plan-data-source-producer", "value", vec![]),
     );
     let data_source_id = data_source.id.clone();
 
@@ -3950,7 +3965,7 @@ fn pending_module_composition(
             attributes: indexmap::IndexMap::new(),
             pending_constraints: constraints,
         },
-        binding: Some(instance.to_string()),
+        binding: Some(absolute_binding(instance)),
         dependency_bindings: std::collections::BTreeSet::new(),
         module_name: "checked_module".to_string(),
         instance: instance.to_string(),
@@ -4001,25 +4016,25 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
     let upstream = make_resource("module-data-source-producer", &[]);
     let upstream_id = upstream.id.clone();
     let mut data_source = DataSource::with_provider("test", "Lookup", "module-lookup", None);
-    data_source.binding = Some("module-lookup".to_string());
+    data_source.binding = Some(absolute_binding("module-lookup"));
     data_source.attributes.insert(
         "filter".to_string(),
-        Value::resource_ref("checked", "value", vec![]),
+        Value::root_resource_ref("checked", "value", vec![]),
     );
     let data_source_id = data_source.id.clone();
     let mut composition = pending_module_composition(
         "root.checked",
         vec![(
             "value",
-            Value::resource_ref("module-data-source-producer", "value", vec![]),
+            Value::root_resource_ref("module-data-source-producer", "value", vec![]),
         )],
         vec![module_not_bad_constraint("value")],
     );
-    composition.binding = Some("checked".to_string());
+    composition.binding = Some(absolute_binding("checked"));
     composition.signature.attributes.insert(
         "value".to_string(),
         LiveCompositionAttribute::from_value(
-            Value::resource_ref("module-data-source-producer", "value", vec![]),
+            Value::root_resource_ref("module-data-source-producer", "value", vec![]),
             None,
         ),
     );
@@ -4106,7 +4121,7 @@ fn mark_module_resource(resource: &mut Resource, instance: &str) {
         crate::resource::CompositionCallPath::direct(crate::resource::CompositionCall {
             id: crate::parser::ModuleCallId::test_dummy_in(format!("{instance}.crn")),
             module_name: "checked_module".to_string(),
-            binding: Some(instance.to_string()),
+            binding: Some(absolute_binding(instance)),
             instance: instance.to_string(),
             module_source: Some("./checked_module".to_string()),
             module_directory: None,
@@ -4123,11 +4138,11 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
     let mut consumer = make_resource("module-consumer", &[]);
     consumer.set_attr(
         "input",
-        Value::resource_ref("module-producer", "value", vec![]),
+        Value::root_resource_ref("module-producer", "value", vec![]),
     );
     consumer
         .dependency_bindings
-        .insert("module-producer".to_string());
+        .insert(absolute_binding("module-producer"));
     mark_module_resource(&mut consumer, "root.checked");
     let consumer_id = consumer.id.clone();
     let composition = pending_module_composition(
@@ -4135,11 +4150,11 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
         vec![
             (
                 "value",
-                Value::resource_ref("module-producer", "value", vec![]),
+                Value::root_resource_ref("module-producer", "value", vec![]),
             ),
             (
                 "other",
-                Value::resource_ref("module-producer", "other", vec![]),
+                Value::root_resource_ref("module-producer", "other", vec![]),
             ),
         ],
         vec![
@@ -4220,7 +4235,10 @@ async fn nested_forwarded_module_constraint_blocks_provider_dispatch() {
 
     let composition = pending_module_composition(
         "root.outer.inner",
-        vec![("value", Value::resource_ref("forwarded", "value", vec![]))],
+        vec![(
+            "value",
+            Value::root_resource_ref("forwarded", "value", vec![]),
+        )],
         vec![module_not_bad_constraint("value")],
     );
     let mut bindings = ResolvedBindings::default();
@@ -4273,7 +4291,7 @@ async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch(
         vec![("value", violating.clone())],
         vec![module_not_bad_constraint("value")],
     );
-    outer.binding = Some("outer_call".to_string());
+    outer.binding = Some(absolute_binding("outer_call"));
     outer.signature.attributes.insert(
         "forwarded".to_string(),
         LiveCompositionAttribute::from_value(violating, None),
@@ -4282,7 +4300,7 @@ async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch(
     let mut inner_resource = make_resource("nested-inner-consumer", &[]);
     inner_resource.set_attr(
         "input",
-        Value::resource_ref("outer_call", "forwarded", vec![]),
+        Value::root_resource_ref("outer_call", "forwarded", vec![]),
     );
     mark_module_resource(&mut inner_resource, "root.outer.inner");
     let resource_id = inner_resource.id.clone();
@@ -4345,7 +4363,7 @@ async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() 
         vec![("value", violating.clone())],
         vec![module_not_bad_constraint("value")],
     );
-    composition.binding = Some("exporter".to_string());
+    composition.binding = Some(absolute_binding("exporter"));
     composition.signature.attributes.insert(
         "forwarded".to_string(),
         LiveCompositionAttribute::from_value(violating, None),
@@ -4354,7 +4372,7 @@ async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() 
     let mut top_level = make_resource("top-level-consumer", &[]);
     top_level.set_attr(
         "input",
-        Value::resource_ref("exporter", "forwarded", vec![]),
+        Value::root_resource_ref("exporter", "forwarded", vec![]),
     );
     assert!(top_level.module_source.is_none());
     let resource_id = top_level.id.clone();
@@ -4465,14 +4483,16 @@ async fn module_constraint_rechecks_after_binding_changes_in_same_apply() {
     let updater = make_resource("source", &["first-module-consumer"]);
     let updater_id = updater.id.clone();
     let mut second = make_resource("second-module-consumer", &[]);
-    second.set_attr("input", Value::resource_ref("source", "value", vec![]));
-    second.dependency_bindings.insert("source".to_string());
+    second.set_attr("input", Value::root_resource_ref("source", "value", vec![]));
+    second
+        .dependency_bindings
+        .insert(absolute_binding("source"));
     mark_module_resource(&mut second, "root.checked");
     let second_id = second.id.clone();
 
     let composition = pending_module_composition(
         "root.checked",
-        vec![("value", Value::resource_ref("source", "value", vec![]))],
+        vec![("value", Value::root_resource_ref("source", "value", vec![]))],
         vec![module_not_bad_constraint("value")],
     );
     let mut bindings = ResolvedBindings::default();
@@ -4546,7 +4566,7 @@ async fn unresolved_instance_constraint_waits_for_terminal_sweep() {
         "root.checked",
         vec![(
             "value",
-            Value::resource_ref("not-published", "value", vec![]),
+            Value::root_resource_ref("not-published", "value", vec![]),
         )],
         vec![module_not_bad_constraint("value")],
     );
@@ -4598,7 +4618,7 @@ async fn unapplied_module_argument_reference_stays_pending_at_early_gate() {
         "root.checked",
         vec![(
             "value",
-            Value::resource_ref("future-producer", "value", vec![]),
+            Value::root_resource_ref("future-producer", "value", vec![]),
         )],
         vec![module_not_bad_constraint("value")],
     );
@@ -4659,7 +4679,10 @@ async fn terminal_module_constraint_sweep_rejects_unconsumed_violation() {
     let provider = MockProvider::new();
     let composition = pending_module_composition(
         "root.export_only",
-        vec![("value", Value::resource_ref("exported", "value", vec![]))],
+        vec![(
+            "value",
+            Value::root_resource_ref("exported", "value", vec![]),
+        )],
         vec![module_not_bad_constraint("value")],
     );
     let mut bindings = ResolvedBindings::default();
@@ -4710,7 +4733,10 @@ async fn terminal_module_constraint_sweep_rejects_still_pending_input() {
     let provider = MockProvider::new();
     let composition = pending_module_composition(
         "root.unused",
-        vec![("value", Value::resource_ref("missing", "value", vec![]))],
+        vec![(
+            "value",
+            Value::root_resource_ref("missing", "value", vec![]),
+        )],
         vec![module_not_bad_constraint("value")],
     );
     let plan = Plan::new();
@@ -4756,7 +4782,10 @@ async fn terminal_pending_constraint_is_silent_after_failed_and_skipped_effects(
     provider.push_create(Err(ProviderError::api_error("upstream create failed")));
     let composition = pending_module_composition(
         "root.unused",
-        vec![("value", Value::resource_ref("missing", "value", vec![]))],
+        vec![(
+            "value",
+            Value::root_resource_ref("missing", "value", vec![]),
+        )],
         vec![module_not_bad_constraint("value")],
     );
     let mut plan = Plan::new();
@@ -4806,7 +4835,10 @@ async fn terminal_pending_constraint_is_silent_after_failure_without_skips() {
     provider.push_create(Err(ProviderError::api_error("standalone create failed")));
     let composition = pending_module_composition(
         "root.unused",
-        vec![("value", Value::resource_ref("missing", "value", vec![]))],
+        vec![(
+            "value",
+            Value::root_resource_ref("missing", "value", vec![]),
+        )],
         vec![module_not_bad_constraint("value")],
     );
     let mut plan = Plan::new();
@@ -4865,12 +4897,15 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
     provider.push_read(Ok(pending_state.clone()));
     let composition = pending_module_composition(
         "root.unused",
-        vec![("value", Value::resource_ref("missing", "value", vec![]))],
+        vec![(
+            "value",
+            Value::root_resource_ref("missing", "value", vec![]),
+        )],
         vec![module_not_bad_constraint("value")],
     );
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("target_ready"),
+        identity: crate::resource::absolute_binding_address_for_test("target_ready"),
         target_id: managed_wait_target(target_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -5098,13 +5133,13 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
     let mut dist = make_resource("dist", &[]);
     dist.set_attr(
         "ref_cert_ready".to_string(),
-        Value::resource_ref("cert_ready".to_string(), "id".to_string(), vec![]),
+        Value::root_resource_ref("cert_ready".to_string(), "id".to_string(), vec![]),
     );
-    dist.dependency_bindings = ["cert_ready".to_string()].into_iter().collect();
+    dist.dependency_bindings = [absolute_binding("cert_ready")].into_iter().collect();
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_ready"),
+        identity: crate::resource::absolute_binding_address_for_test("cert_ready"),
         target_id: managed_wait_target(cert_id),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -5164,14 +5199,14 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
     let mut dist = make_resource("dist", &[]);
     dist.set_attr(
         "ref_cert_ready".to_string(),
-        Value::resource_ref("cert_ready".to_string(), "id".to_string(), vec![]),
+        Value::root_resource_ref("cert_ready".to_string(), "id".to_string(), vec![]),
     );
-    dist.dependency_bindings = ["cert_ready".to_string()].into_iter().collect();
+    dist.dependency_bindings = [absolute_binding("cert_ready")].into_iter().collect();
 
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_ready"),
+        identity: crate::resource::absolute_binding_address_for_test("cert_ready"),
         target_id: managed_wait_target(cert_id),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -5630,7 +5665,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
     );
     source.set_attr(
         "runtime",
-        Value::resource_ref("runtime-value", "value", vec![]),
+        Value::root_resource_ref("runtime-value", "value", vec![]),
     );
     let id = source.id.clone();
 
@@ -5791,14 +5826,14 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
     let producer_id = producer.id.clone();
 
     let mut authored = DataSource::with_provider("test", "Lookup", "origin-check", None);
-    authored.binding = Some("origin-check".to_string());
+    authored.binding = Some(absolute_binding("origin-check"));
     authored.set_attr(
         "marker",
         Value::Concrete(ConcreteValue::String("raw_dsl".into())),
     );
     authored.set_attr(
         "runtime",
-        Value::resource_ref("data-source-origin-producer", "value", vec![]),
+        Value::root_resource_ref("data-source-origin-producer", "value", vec![]),
     );
     let data_source_id = authored.id.clone();
 
@@ -5898,7 +5933,7 @@ async fn test_apply_reapplies_host_enum_canonicalization() {
     // `id.provider = "test"` so the per-resource factory lookup finds
     // `AliasFactory` (whose `name()` is `"test"`).
     let mut resource = Resource::with_provider("test", "sg", "a", None);
-    resource.binding = Some("a".to_string());
+    resource.binding = Some(absolute_binding("a"));
     // Authored parser shape: a typed namespaced DSL enum identifier.
     resource.set_attr(
         "ip_protocol",
@@ -5954,7 +5989,7 @@ async fn test_apply_reapplies_host_enum_canonicalization() {
 async fn test_apply_reapplies_host_enum_canonicalization_update_path() {
     let provider = MockProvider::new();
     let mut to_resource = Resource::with_provider("test", "sg", "a", None);
-    to_resource.binding = Some("a".to_string());
+    to_resource.binding = Some(absolute_binding("a"));
     to_resource.set_attr(
         "ip_protocol",
         Value::Concrete(ConcreteValue::enum_identifier(
@@ -6030,7 +6065,7 @@ async fn test_apply_reapplies_host_enum_canonicalization_update_path() {
 async fn test_apply_reapplies_canonicalize_stage() {
     let provider = MockProvider::new();
     let mut resource = Resource::with_provider("test", "sg", "a", None);
-    resource.binding = Some("a".to_string());
+    resource.binding = Some(absolute_binding("a"));
     resource.set_attr(
         "subject",
         Value::Concrete(ConcreteValue::String("repo:foo:*".into())),
@@ -6246,7 +6281,7 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
 async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
     let provider = MockProvider::new();
     let mut to_resource = Resource::with_provider("test", "a", "a", None);
-    to_resource.binding = Some("a".to_string());
+    to_resource.binding = Some(absolute_binding("a"));
     let rid = to_resource.id.clone();
 
     to_resource.set_attr(
@@ -6353,11 +6388,11 @@ async fn test_apply_effective_changed_includes_resource_ref_changed_during_resol
 
     let provider = MockProvider::new();
     let mut to_resource = Resource::with_provider("test", "a", "a", None);
-    to_resource.binding = Some("a".to_string());
+    to_resource.binding = Some(absolute_binding("a"));
     let rid = to_resource.id.clone();
     to_resource.set_attr(
         "description",
-        Value::resource_ref("dependency", "description", vec![]),
+        Value::root_resource_ref("dependency", "description", vec![]),
     );
 
     let mut from_attrs = HashMap::new();
@@ -6424,7 +6459,7 @@ async fn test_apply_effective_changed_includes_resource_ref_changed_during_resol
 async fn test_apply_effective_changed_includes_updatable_and_skips_create_only_write_only() {
     let provider = MockProvider::new();
     let mut to_resource = Resource::with_provider("test", "a", "a", None);
-    to_resource.binding = Some("a".to_string());
+    to_resource.binding = Some(absolute_binding("a"));
     let rid = to_resource.id.clone();
 
     to_resource.set_attr(
@@ -6499,7 +6534,7 @@ async fn test_apply_effective_changed_includes_updatable_and_skips_create_only_w
 async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
     let provider = MockProvider::new();
     let mut to_resource = Resource::with_provider("test", "a", "a", None);
-    to_resource.binding = Some("a".to_string());
+    to_resource.binding = Some(absolute_binding("a"));
     let rid = to_resource.id.clone();
 
     let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
@@ -6556,7 +6591,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
 async fn test_apply_effective_changed_skips_secret_shape_divergence() {
     let provider = MockProvider::new();
     let mut to_resource = Resource::with_provider("test", "a", "a", None);
-    to_resource.binding = Some("a".to_string());
+    to_resource.binding = Some(absolute_binding("a"));
     let rid = to_resource.id.clone();
 
     let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
@@ -6711,25 +6746,42 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
     .expect("reference alias source parses");
     crate::parser::resolve_resource_refs(&mut parsed)
         .expect("pre-apply reference resolution succeeds");
+    let parsed = parsed.resolve_root(&RootScope::new());
 
     let role = parsed
         .resources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("roles[0]"))
+        .find(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .map(AbsoluteBindingAddress::as_str)
+                == Some("roles[0]")
+        })
         .expect("for-expanded role")
         .clone();
     let consumer = parsed
         .resources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("consumer"))
+        .find(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .map(AbsoluteBindingAddress::as_str)
+                == Some("consumer")
+        })
         .expect("consumer")
         .clone();
     assert_eq!(
         consumer.get_attr("name"),
-        Some(&Value::resource_ref("roles[0]", "identifier", vec![])),
+        Some(&Value::root_resource_ref("roles[0]", "identifier", vec![])),
         "alias access must be canonical before apply"
     );
-    assert!(consumer.dependency_bindings.contains("roles[0]"));
+    assert!(
+        consumer
+            .dependency_bindings
+            .contains(&absolute_binding("roles[0]"))
+    );
 
     let mut role_attrs = HashMap::new();
     role_attrs.insert(
@@ -7363,11 +7415,11 @@ fn test_build_dependency_levels_transitive_ref_preserves_direct_dep() {
 
     // tgw_attach depends on tgw, vpc, subnet
     let mut tgw_attach = Resource::new("ec2.transit_gateway_attachment", "tgw_attach");
-    tgw_attach.binding = Some("tgw_attach".to_string());
+    tgw_attach.binding = Some(absolute_binding("tgw_attach"));
     tgw_attach.dependency_bindings = std::collections::BTreeSet::from([
-        "tgw".to_string(),
-        "vpc".to_string(),
-        "subnet".to_string(),
+        absolute_binding("tgw"),
+        absolute_binding("vpc"),
+        absolute_binding("subnet"),
     ]);
 
     // route depends on rt and tgw_attach (but after partial resolution,
@@ -7375,25 +7427,25 @@ fn test_build_dependency_levels_transitive_ref_preserves_direct_dep() {
     let mut route = Resource::new("ec2.route", "my-route");
     route.set_attr(
         "transit_gateway_id".to_string(),
-        Value::resource_ref("tgw".to_string(), "id".to_string(), vec![]),
+        Value::root_resource_ref("tgw".to_string(), "id".to_string(), vec![]),
     );
     route.dependency_bindings =
-        std::collections::BTreeSet::from(["rt".to_string(), "tgw_attach".to_string()]);
+        std::collections::BTreeSet::from([absolute_binding("rt"), absolute_binding("tgw_attach")]);
 
     // Other resources
     let mut vpc = Resource::new("ec2.Vpc", "vpc");
-    vpc.binding = Some("vpc".to_string());
+    vpc.binding = Some(absolute_binding("vpc"));
 
     let mut tgw = Resource::new("ec2.transit_gateway", "tgw");
-    tgw.binding = Some("tgw".to_string());
+    tgw.binding = Some(absolute_binding("tgw"));
 
     let mut subnet = Resource::new("ec2.Subnet", "subnet");
-    subnet.binding = Some("subnet".to_string());
-    subnet.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
+    subnet.binding = Some(absolute_binding("subnet"));
+    subnet.dependency_bindings = std::collections::BTreeSet::from([absolute_binding("vpc")]);
 
     let mut rt = Resource::new("ec2.RouteTable", "rt");
-    rt.binding = Some("rt".to_string());
-    rt.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
+    rt.binding = Some(absolute_binding("rt"));
+    rt.dependency_bindings = std::collections::BTreeSet::from([absolute_binding("vpc")]);
 
     let mut plan = Plan::new();
     plan.add(create_effect(vpc)); // idx 0
@@ -7700,14 +7752,14 @@ fn tag_update_resource(binding: &str, parent_ref: Option<&str>) -> Resource {
         "test",
         crate::resource::ResourceIdentity::try_from(binding.to_string()).unwrap(),
     );
-    resource.binding = Some(binding.to_string());
+    resource.binding = Some(absolute_binding(binding));
     resource.set_attr(
         "id",
         Value::Concrete(ConcreteValue::String(format!("{binding}-id").into())),
     );
     resource.set_attr("tags", Value::Concrete(ConcreteValue::String("new".into())));
     if let Some(parent) = parent_ref {
-        resource.set_attr("vpc_id", Value::resource_ref(parent, "id", vec![]));
+        resource.set_attr("vpc_id", Value::root_resource_ref(parent, "id", vec![]));
     }
     resource
 }
@@ -7739,7 +7791,7 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
     let mut current_states = HashMap::new();
     let mut plan = Plan::new();
     for resource in &resources {
-        let binding = resource.binding.as_deref().unwrap();
+        let binding = resource.binding.as_ref().unwrap().as_str();
         let from = tag_update_state(&resource.id, binding);
         current_states.insert(resource.id.clone(), from.clone());
         plan.add(Effect::Update {
@@ -7807,18 +7859,18 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
     let mut parent = tag_update_resource("vpc", None);
     let mut child = tag_update_resource("child", None);
     if unknown_read {
-        child.directives.depends_on.push("vpc".to_string());
+        child.directives.depends_on.push(absolute_binding("vpc"));
     } else {
-        child.set_attr("vpc_id", Value::resource_ref("vpc", "id", vec![]));
+        child.set_attr("vpc_id", Value::root_resource_ref("vpc", "id", vec![]));
     }
-    parent.binding = Some("vpc".to_string());
-    child.binding = Some("child".to_string());
+    parent.binding = Some(absolute_binding("vpc"));
+    child.binding = Some(absolute_binding("child"));
     let resources = vec![parent, child];
 
     let mut current_states = HashMap::new();
     let mut plan = Plan::new();
     for resource in &resources {
-        let binding = resource.binding.as_deref().unwrap();
+        let binding = resource.binding.as_ref().unwrap().as_str();
         let from = tag_update_state(&resource.id, binding);
         current_states.insert(resource.id.clone(), from.clone());
         plan.add(Effect::Update {
@@ -8012,7 +8064,7 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
         identifier: crate::effect::fixture_applied_identifier("vpc-123"),
         generation: EffectGeneration::Current,
         directives: Directives::default(),
-        binding: Some("vpc".to_string()),
+        binding: Some(absolute_binding("vpc")),
         dependencies: HashSet::new(), // vpc has no deps
         explicit_dependencies: HashSet::new(),
         blocked_by_updates: HashSet::new(),
@@ -8025,8 +8077,8 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
         identifier: crate::effect::fixture_applied_identifier("subnet-456"),
         generation: EffectGeneration::Current,
         directives: Directives::default(),
-        binding: Some("subnet".to_string()),
-        dependencies: HashSet::from(["vpc".to_string()]), // subnet depends on vpc
+        binding: Some(absolute_binding("subnet")),
+        dependencies: HashSet::from([absolute_binding("vpc")]), // subnet depends on vpc
         explicit_dependencies: HashSet::new(),
         blocked_by_updates: HashSet::new(),
     });
@@ -8054,7 +8106,7 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
     let consumer_id = ResourceId::with_identity("test.Consumer", "consumer");
     let orphan_id = ResourceId::with_identity("test.Dependency", "dependency");
     let desired = Resource::new("test.Consumer", "consumer")
-        .with_binding("consumer")
+        .with_root_binding("consumer")
         .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
     let consumer_state = State::existing(
         consumer_id.clone(),
@@ -8064,7 +8116,7 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
         )]),
     )
     .with_identifier("consumer-id")
-    .with_dependency_bindings(std::collections::BTreeSet::from(["dependency".to_string()]));
+    .with_root_dependency_bindings(std::collections::BTreeSet::from(["dependency".to_string()]));
     let orphan_state =
         State::existing(orphan_id.clone(), HashMap::new()).with_identifier("dependency-id");
     let current_states = HashMap::from([(consumer_id, consumer_state)]);
@@ -8079,7 +8131,7 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
     let desired = ResolvedResource::collect_resolved([desired]).unwrap();
     let orphans = crate::differ::Orphans::from([crate::differ::Orphan::from_state(
         orphan_state,
-        Some("dependency".to_string()),
+        Some(absolute_binding("dependency")),
         Directives::default(),
     )]);
     let plan = crate::differ::create_plan(
@@ -8240,7 +8292,7 @@ fn test_dependency_analysis_respects_delete_dependencies() {
         identifier: crate::effect::fixture_applied_identifier("vpc-123"),
         generation: EffectGeneration::Current,
         directives: Directives::default(),
-        binding: Some("vpc".to_string()),
+        binding: Some(absolute_binding("vpc")),
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
         blocked_by_updates: HashSet::new(),
@@ -8253,8 +8305,8 @@ fn test_dependency_analysis_respects_delete_dependencies() {
         identifier: crate::effect::fixture_applied_identifier("subnet-456"),
         generation: EffectGeneration::Current,
         directives: Directives::default(),
-        binding: Some("subnet".to_string()),
-        dependencies: HashSet::from(["vpc".to_string()]),
+        binding: Some(absolute_binding("subnet")),
+        dependencies: HashSet::from([absolute_binding("vpc")]),
         explicit_dependencies: std::collections::HashSet::new(),
         blocked_by_updates: HashSet::new(),
     });
@@ -8287,7 +8339,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
 
     // VPC resource with binding "vpc"
     let mut vpc = Resource::new("test", "vpc");
-    vpc.binding = Some("vpc".to_string());
+    vpc.binding = Some(absolute_binding("vpc"));
     vpc.set_attr(
         "cidr_block",
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
@@ -8298,13 +8350,13 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     let mut subnet = Resource::new("test", "subnet");
     subnet.set_attr(
         "vpc_id",
-        Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+        Value::root_resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
     );
     subnet.set_attr(
         "cidr_block",
         Value::Concrete(ConcreteValue::String("10.0.1.0/24".into())),
     );
-    subnet.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
+    subnet.dependency_bindings = std::collections::BTreeSet::from([absolute_binding("vpc")]);
     let subnet_id = subnet.id.clone();
 
     let mut plan = Plan::new();
@@ -8664,19 +8716,19 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     );
 
     let mut managed_vpc = Resource::new("ec2.Vpc", "vpc")
-        .with_binding("vpc")
+        .with_root_binding("vpc")
         .with_attribute("cidr_block", string("10.221.0.0/16"));
     managed_vpc.directives.create_before_destroy = true;
     let unresolved_vpc = managed_vpc.clone();
 
     let managed_subnet = Resource::new("ec2.Subnet", "subnet")
-        .with_binding("subnet")
+        .with_root_binding("subnet")
         .with_attribute("vpc_id", string("vpc-old"))
         .with_attribute("cidr_block", string("10.221.1.0/24"))
         .with_attribute("availability_zone", string("ap-northeast-1c"));
     let unresolved_subnet = Resource::new("ec2.Subnet", "subnet")
-        .with_binding("subnet")
-        .with_attribute("vpc_id", Value::resource_ref("vpc", "vpc_id", vec![]))
+        .with_root_binding("subnet")
+        .with_attribute("vpc_id", Value::root_resource_ref("vpc", "vpc_id", vec![]))
         .with_attribute("cidr_block", string("10.221.1.0/24"))
         .with_attribute("availability_zone", string("ap-northeast-1c"));
 
@@ -8835,15 +8887,15 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     // `dist` references the wait binding so the scheduler links it.
     dist.set_attr(
         "ref_cert_issued".to_string(),
-        Value::resource_ref("cert_issued".to_string(), "arn".to_string(), vec![]),
+        Value::root_resource_ref("cert_issued".to_string(), "arn".to_string(), vec![]),
     );
-    dist.dependency_bindings = ["cert_issued".to_string()].into_iter().collect();
+    dist.dependency_bindings = [absolute_binding("cert_issued")].into_iter().collect();
     let dist_id = dist.id.clone();
 
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_issued"),
+        identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -8956,11 +9008,11 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     // mirroring `viewer_certificate = { acm_certificate_arn =
     // cert_issued.certificate_arn }`.
     let mut dist = Resource::new("test", "dist");
-    dist.binding = Some("dist".to_string());
+    dist.binding = Some(absolute_binding("dist"));
     let mut viewer_certificate = indexmap::IndexMap::new();
     viewer_certificate.insert(
         "acm_certificate_arn".to_string(),
-        Value::resource_ref(
+        Value::root_resource_ref(
             "cert_issued".to_string(),
             "certificate_arn".to_string(),
             vec![],
@@ -8990,7 +9042,8 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     // from the *nested* ref. If this fails the scheduler can never link
     // the Distribution to the wait.
     assert!(
-        dist.dependency_bindings.contains("cert_issued"),
+        dist.dependency_bindings
+            .contains(&absolute_binding("cert_issued")),
         "get_resource_value_ref_dependencies must recover the nested \
          `cert_issued` ref; got {:?}",
         dist.dependency_bindings
@@ -8999,7 +9052,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_issued"),
+        identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -9106,7 +9159,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_issued"),
+        identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -9192,7 +9245,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
     // state. Mirror the real ACM Certificate's user-facing shape.
     let cert = {
         let mut r = Resource::new("test", "cert");
-        r.binding = Some("cert".to_string());
+        r.binding = Some(absolute_binding("cert"));
         r.set_attr(
             "domain_name",
             Value::Concrete(ConcreteValue::String("example.com".into())),
@@ -9206,9 +9259,9 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
     //   resource_records = [cert.domain_validation_options[0].resource_record_value]
     let record = {
         let mut r = Resource::new("test", "record");
-        r.binding = Some("record".to_string());
-        r.dependency_bindings = ["cert".to_string()].into_iter().collect();
-        let value_path = AccessPath::with_segments(
+        r.binding = Some(absolute_binding("record"));
+        r.dependency_bindings = [absolute_binding("cert")].into_iter().collect();
+        let value_path = AccessPath::root_with_segments(
             "cert",
             "domain_validation_options",
             vec![
@@ -9319,12 +9372,12 @@ async fn test_apply_rejects_wrong_shape_access_without_wait_guidance() {
 
     let provider = MockProvider::new();
     let mut consumer = Resource::new("test", "consumer");
-    consumer.binding = Some("consumer".to_string());
-    consumer.dependency_bindings.insert("q".to_string());
+    consumer.binding = Some(absolute_binding("consumer"));
+    consumer.dependency_bindings.insert(absolute_binding("q"));
     consumer.set_attr(
         "name",
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::with_segments(
+            path: AccessPath::root_with_segments(
                 "q",
                 "identifier",
                 vec![PathSegment::Subscript {
@@ -9424,7 +9477,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
     // inserts it.
     let cert = {
         let mut r = Resource::new("test", "cert");
-        r.binding = Some("cert".to_string());
+        r.binding = Some(absolute_binding("cert"));
         r.set_attr(
             "domain_name",
             Value::Concrete(ConcreteValue::String("example.com".into())),
@@ -9438,10 +9491,10 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
     // `resource_record` is a struct with `name`/`type`/`value`.
     let record = {
         let mut r = Resource::new("test", "record");
-        r.binding = Some("record".to_string());
-        r.dependency_bindings = ["cert".to_string()].into_iter().collect();
+        r.binding = Some(absolute_binding("record"));
+        r.dependency_bindings = [absolute_binding("cert")].into_iter().collect();
         let chained_dvo = |leaf: &str| {
-            AccessPath::with_segments(
+            AccessPath::root_with_segments(
                 "cert",
                 "domain_validation_options",
                 vec![
@@ -9716,7 +9769,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
     let mut cert = Resource::new("test", "cert");
-    cert.binding = Some("cert".to_string());
+    cert.binding = Some(absolute_binding("cert"));
     let cert_id = cert.id.clone();
 
     // Post-create state: the provider hands back the real identifier
@@ -9734,7 +9787,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_issued"),
+        identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -9932,7 +9985,7 @@ async fn apply_time_unbound_child_collision_with_unabsorbed_state_row_is_typed_e
 }
 
 fn legacy_unbound_deferred_replace(
-    template: crate::parser::DeferredForExpression,
+    template: crate::parser::ExpandedDeferredForExpression,
     legacy_id: &ResourceId,
 ) -> Effect {
     Effect::DeferredReplace(Box::new(DeferredReplacePayload {
@@ -9940,7 +9993,7 @@ fn legacy_unbound_deferred_replace(
             id: crate::resource::ResolvedResourceId::new(legacy_id.clone()),
             identifier: crate::effect::fixture_applied_identifier("existing"),
             directives: Directives::default(),
-            binding: legacy_id.identity_str().map(str::to_string),
+            binding: legacy_id.identity_str().map(absolute_binding),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -10109,7 +10162,7 @@ async fn completed_plain_anonymous_delete_releases_id_for_unbound_deferred_child
 #[tokio::test]
 async fn deferred_create_returns_error_when_iterable_attr_missing() {
     let mut cert = Resource::new("test", "cert_missing_attr");
-    cert.binding = Some("cert".to_string());
+    cert.binding = Some(absolute_binding("cert"));
     let cert_id = cert.id.clone();
 
     let provider = MockProvider::new();
@@ -10156,7 +10209,7 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
 #[tokio::test]
 async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
     let mut cert = Resource::new("test", "cert_shape_mismatch");
-    cert.binding = Some("cert".to_string());
+    cert.binding = Some(absolute_binding("cert"));
     let cert_id = cert.id.clone();
     let cert_state = State::existing(
         cert_id.clone(),
@@ -10242,7 +10295,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
     provider.push_delete(Ok(()));
 
     let mut cert = Resource::new("test", "cert");
-    cert.binding = Some("cert".to_string());
+    cert.binding = Some(absolute_binding("cert"));
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
@@ -10254,7 +10307,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
                 )),
                 identifier: crate::effect::fixture_applied_identifier("old-validation-0"),
                 directives: Directives::default(),
-                binding: Some("validation_records[0]".to_string()),
+                binding: Some(absolute_binding("validation_records[0]")),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
                 blocked_by_updates: HashSet::new(),
@@ -10266,7 +10319,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
                 )),
                 identifier: crate::effect::fixture_applied_identifier("old-validation-1"),
                 directives: Directives::default(),
-                binding: Some("validation_records[1]".to_string()),
+                binding: Some(absolute_binding("validation_records[1]")),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
                 blocked_by_updates: HashSet::new(),
@@ -10352,7 +10405,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
     provider.push_create(Err(ProviderError::api_error("create failed")));
 
     let mut cert = Resource::new("test", "cert");
-    cert.binding = Some("cert".to_string());
+    cert.binding = Some(absolute_binding("cert"));
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
@@ -10363,7 +10416,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
             )),
             identifier: crate::effect::fixture_applied_identifier("old-validation"),
             directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
+            binding: Some(absolute_binding("validation_records[0]")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -10622,8 +10675,8 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             )),
             identifier: crate::effect::fixture_applied_identifier("old-validation"),
             directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::from(["cert".to_string()]),
+            binding: Some(absolute_binding("validation_records[0]")),
+            dependencies: HashSet::from([absolute_binding("cert")]),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         }])
@@ -10693,7 +10746,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
 
 fn resource_with_binding(name: &'static str, binding: &str) -> Resource {
     let mut resource = Resource::new("test", name);
-    resource.binding = Some(binding.to_string());
+    resource.binding = Some(absolute_binding(binding));
     resource
 }
 
@@ -10760,7 +10813,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
     let ds_id = ResourceId::with_provider_identity("aws", "iam.Roles", "admin_access_roles", None);
     let mut ds = DataSource::with_provider("aws", "iam.Roles", "admin_access_roles", None);
     ds.id = ds_id.clone();
-    ds.binding = Some("admin_access_roles".to_string());
+    ds.binding = Some(absolute_binding("admin_access_roles"));
     ds.attributes.insert(
         "path_prefix".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -10794,7 +10847,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
     let role = {
         let mut r = Resource::with_provider("awscc", "iam.Role", "rd.role", None);
         r.id = role_id.clone();
-        r.binding = Some("role".to_string());
+        r.binding = Some(absolute_binding("role"));
         // No `dependency_bindings` — the executor's dependency-graph
         // path only registers managed-resource bindings into
         // `binding_to_idx` (data sources never become effects), so the
@@ -10804,7 +10857,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
         r.set_attr(
             "assume_role_policy_document_arns",
             Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("admin_access_roles", "arns"),
+                path: AccessPath::root("admin_access_roles", "arns"),
             }),
         );
         r
@@ -10896,7 +10949,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
     let upstream_id = ResourceId::with_provider_identity("test", "Upstream", "target", None);
     let mut upstream = Resource::with_provider("test", "Upstream", "target", None);
     upstream.id = upstream_id.clone();
-    upstream.binding = Some("target".to_string());
+    upstream.binding = Some(absolute_binding("target"));
     upstream.set_attr(
         "name",
         Value::Concrete(ConcreteValue::String("target".into())),
@@ -10905,22 +10958,22 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
     let ds_id = ResourceId::with_provider_identity("test", "Lookup", "roles", None);
     let mut data_source = DataSource::with_provider("test", "Lookup", "roles", None);
     data_source.id = ds_id.clone();
-    data_source.binding = Some("roles".to_string());
+    data_source.binding = Some(absolute_binding("roles"));
     data_source.attributes.insert(
         "filter".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("target", "generated"),
+            path: AccessPath::root("target", "generated"),
         }),
     );
 
     let consumer_id = ResourceId::with_provider_identity("test", "Consumer", "consumer", None);
     let mut consumer = Resource::with_provider("test", "Consumer", "consumer", None);
     consumer.id = consumer_id.clone();
-    consumer.binding = Some("consumer".to_string());
+    consumer.binding = Some(absolute_binding("consumer"));
     consumer.set_attr(
         "description",
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::with_segments(
+            path: AccessPath::root_with_segments(
                 "roles",
                 "names",
                 vec![PathSegment::Subscript {
@@ -11049,7 +11102,7 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
     let upstream_id = ResourceId::with_provider_identity("test", "Upstream", "target", None);
     let mut upstream = Resource::with_provider("test", "Upstream", "target", None);
     upstream.id = upstream_id.clone();
-    upstream.binding = Some("target".to_string());
+    upstream.binding = Some(absolute_binding("target"));
     upstream.set_attr(
         "name",
         Value::Concrete(ConcreteValue::String("target".into())),
@@ -11058,22 +11111,22 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
     let ds_id = ResourceId::with_provider_identity("test", "Lookup", "roles", None);
     let mut data_source = DataSource::with_provider("test", "Lookup", "roles", None);
     data_source.id = ds_id.clone();
-    data_source.binding = Some("roles".to_string());
+    data_source.binding = Some(absolute_binding("roles"));
     data_source.attributes.insert(
         "filter".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("target", "generated"),
+            path: AccessPath::root("target", "generated"),
         }),
     );
 
     let consumer_id = ResourceId::with_provider_identity("test", "Consumer", "consumer", None);
     let mut consumer = Resource::with_provider("test", "Consumer", "consumer", None);
     consumer.id = consumer_id.clone();
-    consumer.binding = Some("consumer".to_string());
+    consumer.binding = Some(absolute_binding("consumer"));
     consumer.set_attr(
         "description",
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::with_segments(
+            path: AccessPath::root_with_segments(
                 "roles",
                 "names",
                 vec![PathSegment::Subscript {
@@ -11171,7 +11224,7 @@ async fn test_apply_time_data_source_read_retries_throttling_errors() {
     let ds_id = ResourceId::with_provider_identity("test", "Lookup", "roles", None);
     let mut data_source = DataSource::with_provider("test", "Lookup", "roles", None);
     data_source.id = ds_id.clone();
-    data_source.binding = Some("roles".to_string());
+    data_source.binding = Some(absolute_binding("roles"));
     data_source.set_attr(
         "filter".to_string(),
         Value::Concrete(ConcreteValue::String("literal".into())),
@@ -11241,7 +11294,7 @@ async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
     let ds_id = ResourceId::with_provider_identity("test", "Lookup", "roles", None);
     let mut data_source = DataSource::with_provider("test", "Lookup", "roles", None);
     data_source.id = ds_id.clone();
-    data_source.binding = Some("roles".to_string());
+    data_source.binding = Some(absolute_binding("roles"));
     data_source.attributes.insert(
         "filter".to_string(),
         Value::Concrete(ConcreteValue::String("literal".into())),
@@ -11250,11 +11303,11 @@ async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
     let consumer_id = ResourceId::with_provider_identity("test", "Consumer", "consumer", None);
     let mut consumer = Resource::with_provider("test", "Consumer", "consumer", None);
     consumer.id = consumer_id.clone();
-    consumer.binding = Some("consumer".to_string());
+    consumer.binding = Some(absolute_binding("consumer"));
     consumer.set_attr(
         "description",
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::with_segments(
+            path: AccessPath::root_with_segments(
                 "roles",
                 "names",
                 vec![PathSegment::Subscript {

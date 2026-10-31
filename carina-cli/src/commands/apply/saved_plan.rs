@@ -3,7 +3,9 @@ use std::path::Path;
 
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::{Orphan, Orphans, restore_current_move_source};
-use carina_core::parser::{BackendConfig, InferredExportParam, SavedProviderConfigs};
+use carina_core::parser::{
+    ExpandedBackendConfig as BackendConfig, ExpandedInferredExportParam, SavedProviderConfigs,
+};
 use carina_core::plan::SavedPlan;
 use carina_core::provider::{
     AppliedIdentifier, PersistedAttributes, Provider, ProviderRouter, ReadRequest,
@@ -281,7 +283,9 @@ impl ProviderBoundPlanFile {
             InspectedPlanFile::NeedsSecretVerification(plan) => {
                 let unresolved = carina_core::parser::ParsedFile::default();
                 let providers = providers.check_saved_plan_config_pair(
-                    carina_core::parser::InferredFile::default(),
+                    carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(
+                        carina_core::parser::InferredFile::default(),
+                    ),
                     carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
                     base_dir,
                     false,
@@ -372,7 +376,7 @@ impl ReloadedPendingPlanFile {
     ) -> Result<
         (
             SchemaCheckedPendingPlanFile,
-            ValidatedConfig<crate::wiring::CanonicalResourcePair<InferredExportParam>>,
+            ValidatedConfig<crate::wiring::CanonicalResourcePair<ExpandedInferredExportParam>>,
         ),
         AppError,
     > {
@@ -492,19 +496,19 @@ fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
 /// [`ExpandedCanonicalResources`] witness, so a pending saved plan cannot be
 /// verified accidentally against the parser's pre-expansion resource view.
 pub(super) struct SavedPlanSecretCandidates {
-    validated: ValidatedConfig<ExpandedCanonicalResources<InferredExportParam>>,
+    validated: ValidatedConfig<ExpandedCanonicalResources<ExpandedInferredExportParam>>,
     provider_inputs: ResolvedProviderInputs,
 }
 
 #[cfg(test)]
 pub(super) struct TestSavedPlanSecretCandidates {
-    parsed: carina_core::parser::ModuleResolvedInferredFile,
+    parsed: carina_core::parser::ExpandedInferredFile,
     provider_inputs: ResolvedProviderInputs,
 }
 
 #[cfg(test)]
 impl TestSavedPlanSecretCandidates {
-    pub(super) fn parsed(&self) -> &carina_core::parser::ModuleResolvedInferredFile {
+    pub(super) fn parsed(&self) -> &carina_core::parser::ExpandedInferredFile {
         &self.parsed
     }
 
@@ -515,7 +519,7 @@ impl TestSavedPlanSecretCandidates {
 
 impl SavedPlanSecretCandidates {
     pub(super) fn from_expansion(
-        validated: ValidatedConfig<ExpandedCanonicalResources<InferredExportParam>>,
+        validated: ValidatedConfig<ExpandedCanonicalResources<ExpandedInferredExportParam>>,
         provider_inputs: ResolvedProviderInputs,
     ) -> Self {
         Self {
@@ -526,7 +530,7 @@ impl SavedPlanSecretCandidates {
 
     #[cfg(test)]
     pub(super) fn from_test_parts(
-        parsed: carina_core::parser::ModuleResolvedInferredFile,
+        parsed: carina_core::parser::ExpandedInferredFile,
         provider_inputs: ResolvedProviderInputs,
     ) -> TestSavedPlanSecretCandidates {
         TestSavedPlanSecretCandidates {
@@ -535,7 +539,7 @@ impl SavedPlanSecretCandidates {
         }
     }
 
-    pub(super) fn parsed(&self) -> &carina_core::parser::ModuleResolvedInferredFile {
+    pub(super) fn parsed(&self) -> &carina_core::parser::ExpandedInferredFile {
         self.validated.resources().parsed()
     }
 
@@ -669,7 +673,9 @@ pub(super) enum DesiredPlanFile {
 
 enum SavedPlanExecutionConfig {
     WithoutCurrentConfig(Box<ValidatedConfig<()>>),
-    WithCurrentConfig(Box<ValidatedConfig<ExpandedCanonicalResources<InferredExportParam>>>),
+    WithCurrentConfig(
+        Box<ValidatedConfig<ExpandedCanonicalResources<ExpandedInferredExportParam>>>,
+    ),
 }
 
 impl SavedPlanExecutionConfig {
@@ -698,7 +704,7 @@ impl ValidatedDesiredPlan {
 
     fn with_current_config(
         plan: DesiredPlanFile,
-        config: ValidatedConfig<ExpandedCanonicalResources<InferredExportParam>>,
+        config: ValidatedConfig<ExpandedCanonicalResources<ExpandedInferredExportParam>>,
     ) -> Self {
         Self {
             plan,
@@ -1166,8 +1172,8 @@ mod tests {
         ProviderRouter, ReferenceScope,
     };
     use carina_core::resource::{
-        ConcreteValue, Current, DataSource, DeferredValue, ResolvedResourceId, Resource,
-        ResourceId, State, Value,
+        ConcreteValue, Current, DeferredValue, ResolvedResourceId, Resource, ResourceId, State,
+        Value,
     };
     use carina_state::{ResourceState, StateFile};
     use indexmap::IndexMap;
@@ -1294,6 +1300,7 @@ mod tests {
     ) -> carina_core::parser::SavedProviderConfigs {
         let mut parsed = carina_core::parser::InferredFile::default();
         parsed.providers = configs;
+        let parsed = parsed.resolve_root_for_test();
         let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &HashMap::new(),
@@ -1765,8 +1772,14 @@ mod tests {
 
     #[tokio::test]
     async fn historical_verification_rehydrates_read_outcome_without_current_state_row() {
-        let data_source =
-            DataSource::with_provider("mock", "iam.Roles", "roles", None).with_binding("roles");
+        let data_source = carina_core::resource::AuthoredDataSource::with_provider(
+            "mock",
+            "iam.Roles",
+            "roles",
+            None,
+        )
+        .with_binding("roles")
+        .resolve_root_for_test();
         let plaintext = Value::Concrete(ConcreteValue::String("provider-secret".into()));
         let state_with_secret = State::existing(
             data_source.id.clone(),

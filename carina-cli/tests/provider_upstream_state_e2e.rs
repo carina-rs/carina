@@ -125,12 +125,10 @@ fn provider_attributes_resolve_upstream_state_refs_post_load() {
     let mut remote = std::collections::HashMap::new();
     remote.insert("mgmt".to_string(), mgmt_attrs);
 
-    let resolved = resolve_provider_attributes_with_remote(
-        &config.parsed,
-        &remote,
-        &ProviderContext::default(),
-    )
-    .expect("resolve must succeed");
+    let expanded = config.into_root_expanded();
+    let resolved =
+        resolve_provider_attributes_with_remote(&expanded, &remote, &ProviderContext::default())
+            .expect("resolve must succeed");
 
     let pc = resolved
         .iter()

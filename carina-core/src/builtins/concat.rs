@@ -1,6 +1,6 @@
 //! `concat(items, base_list)` built-in function
 
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{BindingAddress, ConcreteValue, Value};
 
 use super::value_type_name;
 
@@ -20,7 +20,7 @@ use super::value_type_name;
 /// concat([3, 4], [1, 2])         // => [1, 2, 3, 4]
 /// [1, 2] |> concat([3, 4])       // => [1, 2, 3, 4] (pipe form)
 /// ```
-pub(crate) fn builtin_concat(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_concat<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
     if args.len() != 2 {
         return Err(format!(
             "concat() expects 2 arguments (items, base_list), got {}",
@@ -57,7 +57,7 @@ pub(crate) fn builtin_concat(args: &[Value]) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::{ConcreteValue, Value};
+    use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
 
     #[test]
     fn concat_basic() {

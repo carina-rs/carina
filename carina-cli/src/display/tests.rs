@@ -11,6 +11,18 @@ use carina_core::resource::{
 };
 use carina_core::value::{PrettyLayout, PrettyValue, render_value};
 
+fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(name)
+}
+
+fn root_resource_ref(binding: &str, attribute: &str) -> Value {
+    Value::resource_ref(binding, attribute, Vec::new()).resolve_root_for_test()
+}
+
+fn concrete(value: ConcreteValue) -> Value {
+    Value::Concrete(value)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn format_plan_for_test<S, D: HistoricalDisplaySource<S> + ?Sized>(
     plan: &Plan<S>,
@@ -65,12 +77,9 @@ fn make_resource(
     deps: &[&str],
 ) -> Resource {
     let mut r = Resource::new(resource_type, name);
-    r.binding = Some(binding.to_string());
+    r.binding = Some(absolute_binding(binding));
     for dep in deps {
-        r.set_attr(
-            format!("ref_{}", dep),
-            Value::resource_ref(dep.to_string(), "id".to_string(), vec![]),
-        );
+        r.set_attr(format!("ref_{}", dep), root_resource_ref(dep, "id"));
     }
     r
 }
@@ -455,14 +464,14 @@ fn test_dependency_free_resource_nested_under_shallowest_referencing_resource() 
 /// Test that extract_compact_hint returns only the first non-parent ResourceRef hint.
 #[test]
 fn test_extract_compact_hint_resource_ref() {
-    let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
+    let mut r: Resource = Resource::new("ec2.subnet_route_table_association", "hash123");
     r.set_attr(
         "route_table_id".to_string(),
-        Value::resource_ref("public_rt".to_string(), "id".to_string(), vec![]),
+        root_resource_ref("public_rt", "id"),
     );
     r.set_attr(
         "subnet_id".to_string(),
-        Value::resource_ref("public_subnet_1a".to_string(), "id".to_string(), vec![]),
+        root_resource_ref("public_subnet_1a", "id"),
     );
 
     let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
@@ -473,14 +482,14 @@ fn test_extract_compact_hint_resource_ref() {
 /// Test that extract_compact_hint skips ResourceRef that matches parent binding.
 #[test]
 fn test_extract_compact_hint_skips_parent_ref() {
-    let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
+    let mut r: Resource = Resource::new("ec2.subnet_route_table_association", "hash123");
     r.set_attr(
         "route_table_id".to_string(),
-        Value::resource_ref("database_rt".to_string(), "id".to_string(), vec![]),
+        root_resource_ref("database_rt", "id"),
     );
     r.set_attr(
         "subnet_id".to_string(),
-        Value::resource_ref("database_subnet_1a".to_string(), "id".to_string(), vec![]),
+        root_resource_ref("database_subnet_1a", "id"),
     );
 
     // When parent is database_rt, should skip route_table_id and show only subnet_id
@@ -494,7 +503,7 @@ fn test_extract_compact_hint_skips_parent_ref() {
 /// Test that extract_compact_hint falls back to string values when no ResourceRef.
 #[test]
 fn test_extract_compact_hint_string_fallback() {
-    let mut r = Resource::new("ec2.route", "hash456");
+    let mut r: Resource = Resource::new("ec2.route", "hash456");
     r.set_attr(
         "destination_cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("0.0.0.0/0".into())),
@@ -507,7 +516,7 @@ fn test_extract_compact_hint_string_fallback() {
 /// Test that extract_compact_hint returns None when no useful attributes.
 #[test]
 fn test_extract_compact_hint_none() {
-    let r = Resource::new("ec2.route", "hash789");
+    let r: Resource = Resource::new("ec2.route", "hash789");
     let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
     assert_eq!(hint, None);
 }
@@ -515,15 +524,12 @@ fn test_extract_compact_hint_none() {
 /// Test that extract_compact_hint prefers string over ResourceRef.
 #[test]
 fn test_extract_compact_hint_prefers_string_over_resource_ref() {
-    let mut r = Resource::new("ec2.route", "hash_mixed");
+    let mut r: Resource = Resource::new("ec2.route", "hash_mixed");
     r.set_attr(
         "destination".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/8".into())),
     );
-    r.set_attr(
-        "gateway_id".to_string(),
-        Value::resource_ref("igw".to_string(), "id".to_string(), vec![]),
-    );
+    r.set_attr("gateway_id".to_string(), root_resource_ref("igw", "id"));
 
     let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
     // String takes priority over ResourceRef
@@ -533,7 +539,7 @@ fn test_extract_compact_hint_prefers_string_over_resource_ref() {
 /// Test that extract_compact_hint shortens service_name values.
 #[test]
 fn test_extract_compact_hint_service_name_shortening() {
-    let mut r = Resource::new("ec2.vpc_endpoint", "hash_svc");
+    let mut r: Resource = Resource::new("ec2.vpc_endpoint", "hash_svc");
     r.set_attr(
         "service_name".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -545,7 +551,7 @@ fn test_extract_compact_hint_service_name_shortening() {
     assert_eq!(hint, Some("service: ecr.dkr".to_string()));
 
     // Single service component
-    let mut r2 = Resource::new("ec2.vpc_endpoint", "hash_svc2");
+    let mut r2: Resource = Resource::new("ec2.vpc_endpoint", "hash_svc2");
     r2.set_attr(
         "service_name".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -560,10 +566,10 @@ fn test_extract_compact_hint_service_name_shortening() {
 /// Test that extract_compact_hint falls back to string when all ResourceRefs match parent.
 #[test]
 fn test_extract_compact_hint_all_refs_match_parent() {
-    let mut r = Resource::new("ec2.security_group_ingress", "hash_sg");
+    let mut r: Resource = Resource::new("ec2.security_group_ingress", "hash_sg");
     r.set_attr(
         "group_id".to_string(),
-        Value::resource_ref("endpoint_sg".to_string(), "id".to_string(), vec![]),
+        root_resource_ref("endpoint_sg", "id"),
     );
     r.set_attr(
         "description".to_string(),
@@ -581,7 +587,7 @@ fn test_extract_compact_hint_all_refs_match_parent() {
 /// Test that extract_compact_hint prefers string over ResourceRef for vpc_endpoint.
 #[test]
 fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
-    let mut r = Resource::new("ec2.vpc_endpoint", "hash_ep");
+    let mut r: Resource = Resource::new("ec2.vpc_endpoint", "hash_ep");
     r.set_attr(
         "service_name".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -590,16 +596,12 @@ fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
     );
     r.set_attr(
         "security_group_ids".to_string(),
-        Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
-            "endpoint_sg".to_string(),
-            "group_id".to_string(),
-            vec![],
+        Value::Concrete(ConcreteValue::List(vec![root_resource_ref(
+            "endpoint_sg",
+            "group_id",
         )])),
     );
-    r.set_attr(
-        "vpc_id".to_string(),
-        Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
-    );
+    r.set_attr("vpc_id".to_string(), root_resource_ref("vpc", "id"));
 
     // String attribute (service_name) takes priority over ResourceRef
     let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), Some("vpc"));
@@ -609,13 +611,13 @@ fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
 /// Test that has_binding correctly detects bound vs anonymous resources.
 #[test]
 fn test_has_binding() {
-    let mut bound = Resource::new("ec2.Vpc", "vpc");
-    bound.binding = Some("vpc".to_string());
+    let mut bound: Resource = Resource::new("ec2.Vpc", "vpc");
+    bound.binding = Some(absolute_binding("vpc"));
     assert!(has_binding(carina_core::parser::ResourceRef::Resource(
         &bound
     )));
 
-    let anonymous = Resource::new("ec2.Vpc", "hash123");
+    let anonymous: Resource = Resource::new("ec2.Vpc", "hash123");
     assert!(!has_binding(carina_core::parser::ResourceRef::Resource(
         &anonymous
     )));
@@ -625,8 +627,8 @@ fn test_has_binding() {
 /// parenthesized hints for anonymous resources.
 #[test]
 fn test_format_compact_name_bound_resource() {
-    let mut r = Resource::new("ec2.Vpc", "vpc");
-    r.binding = Some("vpc".to_string());
+    let mut r: Resource = Resource::new("ec2.Vpc", "vpc");
+    r.binding = Some(absolute_binding("vpc"));
     // For bound resources, should show name as plain identifier (no quotes)
     let result = format_compact_name(carina_core::parser::ResourceRef::Resource(&r), "vpc", None);
     assert!(
@@ -638,10 +640,10 @@ fn test_format_compact_name_bound_resource() {
 
 #[test]
 fn test_format_compact_name_anonymous_with_hint() {
-    let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
+    let mut r: Resource = Resource::new("ec2.subnet_route_table_association", "hash123");
     r.set_attr(
         "subnet_id".to_string(),
-        Value::resource_ref("database_subnet_1a".to_string(), "id".to_string(), vec![]),
+        root_resource_ref("database_subnet_1a", "id"),
     );
     let result = format_compact_name(
         carina_core::parser::ResourceRef::Resource(&r),
@@ -694,14 +696,14 @@ fn test_print_plan_compact_does_not_panic() {
 /// Test compact mode hides provider attributes for anonymous resources.
 #[test]
 fn test_print_plan_compact_with_anonymous_resources() {
-    let mut anon = Resource::new("ec2.route", "hash_anon");
+    let mut anon: Resource = Resource::new("ec2.route", "hash_anon");
     anon.set_attr(
         "destination_cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("0.0.0.0/0".into())),
     );
     anon.set_attr(
         "route_table_id".to_string(),
-        Value::resource_ref("public_rt".to_string(), "id".to_string(), vec![]),
+        root_resource_ref("public_rt", "id"),
     );
 
     let mut plan = Plan::new();
@@ -732,13 +734,12 @@ fn test_print_plan_compact_with_anonymous_resources() {
 /// e.g., security_group_ids = [endpoint_sg.group_id] should produce "security_group: endpoint_sg"
 #[test]
 fn test_extract_compact_hint_list_containing_resource_ref() {
-    let mut r = Resource::new("ec2.vpc_endpoint", "hash_list_ref");
+    let mut r: Resource = Resource::new("ec2.vpc_endpoint", "hash_list_ref");
     r.set_attr(
         "security_group_ids".to_string(),
-        Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
-            "endpoint_sg".to_string(),
-            "group_id".to_string(),
-            vec![],
+        Value::Concrete(ConcreteValue::List(vec![root_resource_ref(
+            "endpoint_sg",
+            "group_id",
         )])),
     );
 
@@ -753,13 +754,12 @@ fn test_extract_compact_hint_list_containing_resource_ref() {
 /// Test that extract_compact_hint skips List<ResourceRef> when ref matches parent.
 #[test]
 fn test_extract_compact_hint_list_ref_skips_parent() {
-    let mut r = Resource::new("ec2.vpc_endpoint", "hash_list_parent");
+    let mut r: Resource = Resource::new("ec2.vpc_endpoint", "hash_list_parent");
     r.set_attr(
         "security_group_ids".to_string(),
-        Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
-            "endpoint_sg".to_string(),
-            "group_id".to_string(),
-            vec![],
+        Value::Concrete(ConcreteValue::List(vec![root_resource_ref(
+            "endpoint_sg",
+            "group_id",
         )])),
     );
 
@@ -787,7 +787,7 @@ fn test_shorten_attr_name_ids_suffix() {
 /// String values retain their full text even when they resemble enum identifiers.
 #[test]
 fn test_extract_compact_hint_preserves_namespaced_string() {
-    let mut r = Resource::new("ec2.Subnet", "hash_enum");
+    let mut r: Resource = Resource::new("ec2.Subnet", "hash_enum");
     r.set_attr(
         "availability_zone".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -807,8 +807,8 @@ fn test_extract_compact_hint_preserves_namespaced_string() {
 /// attribute rather than carrying another internal-key filter.
 #[test]
 fn test_extract_compact_hint_considers_all_resource_attributes() {
-    let mut r = Resource::new("ec2.Vpc", "hash_internal");
-    r.binding = Some("vpc".to_string());
+    let mut r: Resource = Resource::new("ec2.Vpc", "hash_internal");
+    r.binding = Some(absolute_binding("vpc"));
     r.set_attr(
         "_hash".to_string(),
         Value::Concrete(ConcreteValue::String("abc123".into())),
@@ -820,27 +820,28 @@ fn test_extract_compact_hint_considers_all_resource_attributes() {
 
 #[test]
 fn test_deferred_create_renders_deferred_until_apply_marker() {
-    let mut template_resource = Resource::new("route53.Record", "validation_records");
-    template_resource.binding = Some("validation_records".to_string());
+    let mut template_resource: Resource = Resource::new("route53.Record", "validation_records");
+    template_resource.binding = Some(absolute_binding("validation_records"));
     template_resource.set_attr("name", for_value_access(&["resource_record", "name"]));
 
-    let deferred = carina_core::parser::DeferredForExpression {
-        file: None,
-        line: 1,
-        header: "for opt in cert.domain_validation_options".to_string(),
-        resource_type: "aws.route53.Record".to_string(),
-        attributes: template_resource
-            .attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-        target: carina_core::parser::DeferredForTarget::Bound {
-            binding: "validation_records".to_string(),
-        },
-        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-        binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
-        template_resource,
-    };
+    let deferred: carina_core::parser::ExpandedDeferredForExpression =
+        carina_core::parser::DeferredForExpression {
+            file: None,
+            line: 1,
+            header: "for opt in cert.domain_validation_options".to_string(),
+            resource_type: "aws.route53.Record".to_string(),
+            attributes: template_resource
+                .attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            target: carina_core::parser::DeferredForTarget::Bound {
+                binding: absolute_binding("validation_records"),
+            },
+            iterable: root_resource_ref("cert", "domain_validation_options"),
+            binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
+            template_resource,
+        };
 
     let mut plan = Plan::new();
     plan.add(Effect::DeferredCreate {
@@ -880,27 +881,28 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
 }
 
 fn deferred_validation_records_effect() -> Effect {
-    let mut template_resource = Resource::new("route53.Record", "validation_records");
-    template_resource.binding = Some("validation_records".to_string());
+    let mut template_resource: Resource = Resource::new("route53.Record", "validation_records");
+    template_resource.binding = Some(absolute_binding("validation_records"));
     template_resource.set_attr("name", for_value_access(&["resource_record", "name"]));
 
-    let deferred = carina_core::parser::DeferredForExpression {
-        file: None,
-        line: 1,
-        header: "for opt in cert.domain_validation_options".to_string(),
-        resource_type: "aws.route53.Record".to_string(),
-        attributes: template_resource
-            .attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-        target: carina_core::parser::DeferredForTarget::Bound {
-            binding: "validation_records".to_string(),
-        },
-        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-        binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
-        template_resource,
-    };
+    let deferred: carina_core::parser::ExpandedDeferredForExpression =
+        carina_core::parser::DeferredForExpression {
+            file: None,
+            line: 1,
+            header: "for opt in cert.domain_validation_options".to_string(),
+            resource_type: "aws.route53.Record".to_string(),
+            attributes: template_resource
+                .attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            target: carina_core::parser::DeferredForTarget::Bound {
+                binding: absolute_binding("validation_records"),
+            },
+            iterable: root_resource_ref("cert", "domain_validation_options"),
+            binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
+            template_resource,
+        };
 
     Effect::DeferredCreate {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -920,8 +922,8 @@ fn delete_record_effect(binding: &'static str) -> Effect {
         identifier: crate::fixture_applied_identifier(format!("{binding}-id")),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
-        binding: Some(binding.to_string()),
-        dependencies: HashSet::from(["cert".to_string()]),
+        binding: Some(absolute_binding(binding)),
+        dependencies: HashSet::from([absolute_binding("cert")]),
         explicit_dependencies: HashSet::new(),
         blocked_by_updates: HashSet::new(),
     }
@@ -996,15 +998,11 @@ fn test_deferred_replace_renders_top_level() {
 
 #[test]
 fn test_deferred_replace_renders_dependent_children() {
-    let mut dependent = Resource::new("acm.CertificateValidation", "cert-validation")
-        .with_binding("cert_validation");
+    let mut dependent = Resource::new("acm.CertificateValidation", "cert-validation");
+    dependent.binding = Some(absolute_binding("cert_validation"));
     dependent.set_attr(
         "validation_record_id",
-        Value::resource_ref(
-            "__deferred_for.validation_records".to_string(),
-            "id".to_string(),
-            vec![],
-        ),
+        root_resource_ref("__deferred_for.validation_records", "id"),
     );
 
     let mut plan = Plan::new();
@@ -1045,9 +1043,9 @@ fn test_deferred_replace_renders_dependent_children() {
 #[test]
 fn test_deferred_replace_keeps_unrelated_same_type_delete() {
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resolved(
-        Resource::new("acm.Certificate", "cert").with_binding("cert"),
-    )));
+    let mut certificate = Resource::new("acm.Certificate", "cert");
+    certificate.binding = Some(absolute_binding("cert"));
+    plan.add(Effect::Create(resolved(certificate)));
     plan.add(delete_record_effect("old_record"));
     plan.add(deferred_replace_validation_records_effect());
 
@@ -1112,8 +1110,8 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
     // SG: Create effect with RESOLVED ref (string instead of ResourceRef).
     // This is what happens after resolve_refs_with_state() runs:
     // vpc_id = vpc.vpc_id becomes vpc_id = "vpc-0123456789abcdef0"
-    let mut sg = Resource::new("ec2.SecurityGroup", "sg");
-    sg.binding = Some("sg".to_string());
+    let mut sg: Resource = Resource::new("ec2.SecurityGroup", "sg");
+    sg.binding = Some(absolute_binding("sg"));
     // This is the resolved value — a plain string, NOT a ResourceRef
     sg.set_attr(
         "vpc_id".to_string(),
@@ -1125,7 +1123,7 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
     );
     // _dependency_bindings is saved by resolve_refs_with_state() before
     // ResourceRef values are resolved to strings.
-    sg.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
+    sg.dependency_bindings = std::collections::BTreeSet::from([absolute_binding("vpc")]);
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
@@ -1175,7 +1173,7 @@ fn format_effect_delete_uses_binding_name() {
         identifier: crate::fixture_applied_identifier("vpc-12345"),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
-        binding: Some("my_vpc".to_string()),
+        binding: Some(absolute_binding("my_vpc")),
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
         blocked_by_updates: HashSet::new(),
@@ -1285,9 +1283,9 @@ fn format_effect_move_separates_type_and_name_with_space() {
 
 #[test]
 fn colored_value_list_elements_colored_individually() {
-    let rendered = render_value(&Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("hello".into())),
-        Value::Concrete(ConcreteValue::String("world".into())),
+    let rendered = render_value(&concrete(ConcreteValue::List(vec![
+        concrete(ConcreteValue::String("hello".into())),
+        concrete(ConcreteValue::String("world".into())),
     ])));
     let result = colored_value(&rendered);
     // Each quoted string should be green, not the whole list
@@ -1304,11 +1302,7 @@ fn colored_value_list_elements_colored_individually() {
 
 #[test]
 fn colored_value_resource_reference_is_cyan_from_span_kind() {
-    let result = colored_value(&render_value(&Value::resource_ref(
-        "binding",
-        "attr",
-        Vec::new(),
-    )));
+    let result = colored_value(&render_value(&root_resource_ref("binding", "attr")));
     let cyan_elem = "binding.attr".cyan().to_string();
     assert!(
         result.contains(&cyan_elem),
@@ -1319,7 +1313,7 @@ fn colored_value_resource_reference_is_cyan_from_span_kind() {
 
 #[test]
 fn colored_value_map_values_colored() {
-    let value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+    let value: Value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
         (
             "Name".to_string(),
             Value::Concrete(ConcreteValue::String("test-vpc".into())),
@@ -1343,7 +1337,7 @@ fn colored_value_map_values_colored() {
 
 #[test]
 fn colored_value_map_key_apostrophe_does_not_swallow_following_values() {
-    let value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+    let value: Value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
         (
             "it's".to_string(),
             Value::Concrete(ConcreteValue::String("first".into())),
@@ -1362,21 +1356,21 @@ fn colored_value_map_key_apostrophe_does_not_swallow_following_values() {
 
 #[test]
 fn colored_value_keeps_interpolation_with_quoted_argument_as_one_list_element() {
-    let interpolation =
+    let interpolation: Value =
         Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
             Value::Deferred(DeferredValue::FunctionCall {
                 name: carina_core::builtins::BuiltinFunction::join,
                 args: vec![
                     Value::Concrete(ConcreteValue::String("it's".into())).into(),
                     Value::Deferred(DeferredValue::BindingRef {
-                        binding: "x".to_string(),
+                        binding: absolute_binding("x"),
                     })
                     .into(),
                 ],
                 source_line: (1).into(),
             }),
         )]));
-    let value = Value::Concrete(ConcreteValue::List(vec![
+    let value: Value = Value::Concrete(ConcreteValue::List(vec![
         interpolation,
         Value::Concrete(ConcreteValue::String("next".into())),
     ]));
@@ -1388,7 +1382,7 @@ fn colored_value_keeps_interpolation_with_quoted_argument_as_one_list_element() 
 
 #[test]
 fn colored_value_does_not_split_colon_inside_vertical_string() {
-    let value = Value::Concrete(ConcreteValue::StringList(vec![
+    let value: Value = Value::Concrete(ConcreteValue::StringList(vec![
         "a: b".into(),
         "a value long enough to force this list onto vertical lines in plan output".into(),
     ]));
@@ -1403,13 +1397,13 @@ fn colored_value_does_not_split_colon_inside_vertical_string() {
 
 #[test]
 fn colored_value_empty_list() {
-    let value = Value::Concrete(ConcreteValue::List(Vec::new()));
+    let value: Value = Value::Concrete(ConcreteValue::List(Vec::new()));
     assert_eq!(colored_value(&render_value(&value)), "[]");
 }
 
 #[test]
 fn colored_value_empty_map() {
-    let value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::new()));
+    let value: Value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::new()));
     assert_eq!(colored_value(&render_value(&value)), "{}");
 }
 
@@ -1516,7 +1510,7 @@ fn render_value_ansi_restores_gutter_without_styling_line_boundaries() {
 
 #[test]
 fn render_value_ansi_single_line_with_gutter_is_unchanged() {
-    let rendered = render_value(&Value::Concrete(ConcreteValue::List(Vec::new())));
+    let rendered = render_value(&concrete(ConcreteValue::List(Vec::new())));
     assert_eq!(
         render_value_ansi(&rendered, AnsiValueStyle::Semantic, Some("     │  ")),
         "[]"
@@ -1547,7 +1541,7 @@ fn colored_value_preserves_vertical_list_layout() {
     // exceed the 80-col threshold. `colored_value` must NOT collapse the
     // layout back to inline — it should color atoms in place and keep
     // newlines / leading indentation intact.
-    let value = Value::Concrete(ConcreteValue::StringList(vec![
+    let value: Value = Value::Concrete(ConcreteValue::StringList(vec![
         "a".repeat(40).into(),
         "b".repeat(40).into(),
         "c".repeat(40).into(),
@@ -1572,7 +1566,7 @@ fn colored_value_preserves_vertical_list_closing_bracket_alone() {
     // The closing `]` sits on its own line, indented to the parent. This is
     // the most layout-fragile token — earlier impls collapsed it into the
     // previous line as `,]`. Pin its standalone-line preservation explicitly.
-    let value = Value::Concrete(ConcreteValue::StringList(vec!["x".repeat(80).into()]));
+    let value: Value = Value::Concrete(ConcreteValue::StringList(vec!["x".repeat(80).into()]));
     let rendered = PrettyValue::new(value).render(PrettyLayout::for_attribute(0, "values"));
     let input = rendered.plain();
     let result = colored_value(&rendered);
@@ -1587,7 +1581,7 @@ fn colored_value_preserves_vertical_list_closing_bracket_alone() {
 #[test]
 fn colored_value_preserves_vertical_map_layout() {
     // Same constraint for `format_map_vertical` output.
-    let value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+    let value: Value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
         (
             "k1".to_string(),
             Value::Concrete(ConcreteValue::String("v1".into())),
@@ -1606,7 +1600,7 @@ fn colored_value_preserves_vertical_map_layout() {
 
 #[test]
 fn plan_export_duration_renders_canonical() {
-    let v = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60)));
+    let v: Value = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60)));
     assert_eq!(render_value(&v).plain(), "1min");
 }
 
@@ -1615,7 +1609,7 @@ fn plan_export_values_use_the_core_value_formatter() {
     use crate::commands::plan::ExportChange;
     use carina_core::resource::RawEnumIdentifier;
 
-    let value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+    let value: Value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
         (
             "ratio".to_string(),
             Value::Concrete(ConcreteValue::Float(1.0)),
@@ -1725,7 +1719,7 @@ fn plan_export_shows_env_plaintext() {
     }
     let value = carina_core::builtins::evaluate_builtin_to_value(
         "env",
-        &[Value::Concrete(ConcreteValue::String(name.into()))],
+        &[concrete(ConcreteValue::String(name.into()))],
     )
     .expect("env value");
 
@@ -1739,7 +1733,7 @@ fn plan_export_shows_env_plaintext() {
 #[test]
 fn format_deferred_value_duration_renders_canonical() {
     // Same canonical formatter, with the deferred-for context applied.
-    let v = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60)));
+    let v: Value = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60)));
     let result = carina_core::plan_tree::render_deferred_for_template_value(&v, "cert", "applies");
     // The deferred path may inject ANSI dimming for Unknown variants,
     // but a resolved Duration must render verbatim.
@@ -1863,8 +1857,8 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
 fn forcing_changed_uses_plain_green_cli_value() {
     let row = DetailRow::ChangedForcesReplacement {
         key: "name".to_string(),
-        old: render_value(&Value::Concrete(ConcreteValue::String("old".into()))),
-        new: render_value(&Value::Concrete(ConcreteValue::String("new".into()))),
+        old: render_value(&concrete(ConcreteValue::String("old".into()))),
+        new: render_value(&concrete(ConcreteValue::String("new".into()))),
     };
     let effect = Effect::Update {
         identifier: crate::fixture_applied_identifier("w"),
@@ -1892,14 +1886,14 @@ fn forcing_changed_uses_plain_green_cli_value() {
 
 #[test]
 fn forcing_changed_multiline_green_style_does_not_cross_newline() {
-    let new = PrettyValue::new(Value::Concrete(ConcreteValue::StringList(vec![
+    let new = PrettyValue::new(concrete(ConcreteValue::StringList(vec![
         "new".repeat(30).into(),
     ])))
     .render(PrettyLayout::for_attribute(60, "rules"));
     assert!(new.plain().contains('\n'));
     let row = DetailRow::ChangedForcesReplacement {
         key: "rules".to_string(),
-        old: render_value(&Value::Concrete(ConcreteValue::List(Vec::new()))),
+        old: render_value(&concrete(ConcreteValue::List(Vec::new()))),
         new,
     };
     let effect = Effect::Update {
@@ -1935,9 +1929,7 @@ fn string_list_diff_renders_preformatted_literals_without_adding_quotes() {
     let row = DetailRow::StringListDiff {
         key: "items".to_string(),
         unchanged: Vec::new(),
-        added: vec![render_value(&Value::Concrete(ConcreteValue::String(
-            "a".into(),
-        )))],
+        added: vec![render_value(&concrete(ConcreteValue::String("a".into())))],
         removed: Vec::new(),
     };
     let effect = Effect::Update {

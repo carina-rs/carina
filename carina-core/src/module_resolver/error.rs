@@ -254,7 +254,7 @@ impl ModuleError {
         match self {
             Self::Multiple(_errors) => None,
             Self::OwnedByCalls { calls: _, error } => error.failing_call(),
-            Self::AtCall { call, error: _ } => Some(call),
+            Self::AtCall { call, error } => error.failing_call().or(Some(call)),
             Self::NotFound(_)
             | Self::CircularImport(_)
             | Self::MissingArgument {

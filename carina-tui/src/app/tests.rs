@@ -1,7 +1,9 @@
 use super::*;
-use carina_core::parser::{DeferredForExpression, ForBinding};
+use carina_core::parser::{ExpandedDeferredForExpression as DeferredForExpression, ForBinding};
 use carina_core::resource::{
-    ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, State, Value,
+    AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
+    ExpandedDirectives as Directives, ExpandedResource as Resource, ExpandedValue as Value,
+    ResolvedResource, ResourceId, State,
 };
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 use carina_core::value::format_value;
@@ -12,6 +14,15 @@ fn resolved(resource: Resource) -> ResolvedResource {
 
 fn create(resource: Resource) -> Effect {
     Effect::Create(resolved(resource))
+}
+
+fn absolute(binding: &str) -> AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(binding)
+}
+
+fn root_ref(binding: &str, attribute: &str) -> Value {
+    carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
+        .resolve_root_for_test()
 }
 
 #[test]
@@ -105,8 +116,8 @@ fn removed_plan_shows_each_abandoned_deposed_generation() {
 
 #[test]
 fn deferred_create_uses_create_symbol_and_kind() {
-    let template_resource =
-        Resource::new("route53.Record", "validation_records").with_binding("validation_records");
+    let template_resource = Resource::new("route53.Record", "validation_records")
+        .with_absolute_binding(absolute("validation_records"));
     let deferred = DeferredForExpression {
         file: None,
         line: 1,
@@ -114,9 +125,9 @@ fn deferred_create_uses_create_symbol_and_kind() {
         resource_type: "aws.route53.Record".to_string(),
         attributes: Vec::new(),
         target: carina_core::parser::DeferredForTarget::Bound {
-            binding: "validation_records".to_string(),
+            binding: absolute("validation_records"),
         },
-        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        iterable: root_ref("cert", "domain_validation_options"),
         binding: ForBinding::Simple("opt".to_string()),
         template_resource,
     };
@@ -295,7 +306,7 @@ fn host_metadata_fields_are_not_rendered_as_attributes() {
                 "name",
                 Value::Concrete(ConcreteValue::String("test".into())),
             )
-            .with_binding("my_bucket")
+            .with_absolute_binding(absolute("my_bucket"))
             .with_module_source(carina_core::resource::ModuleSource::Root),
     ));
 
@@ -336,7 +347,7 @@ fn tree_structure_with_dependencies() {
     let mut plan = Plan::new();
     plan.add(create(
         Resource::new("ec2.Vpc", "my-vpc")
-            .with_binding("vpc")
+            .with_absolute_binding(absolute("vpc"))
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
@@ -344,11 +355,8 @@ fn tree_structure_with_dependencies() {
     ));
     plan.add(create(
         Resource::new("ec2.Subnet", "my-subnet")
-            .with_binding("subnet")
-            .with_attribute(
-                "vpc_id",
-                Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-            ),
+            .with_absolute_binding(absolute("subnet"))
+            .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
     ));
 
     let app = App::for_plan(&plan, &SchemaRegistry::new());
@@ -509,7 +517,7 @@ fn make_tree_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(create(
         Resource::new("ec2.Vpc", "my-vpc")
-            .with_binding("vpc")
+            .with_absolute_binding(absolute("vpc"))
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
@@ -517,14 +525,11 @@ fn make_tree_plan() -> Plan {
     ));
     plan.add(create(
         Resource::new("ec2.Subnet", "my-subnet")
-            .with_binding("subnet")
-            .with_attribute(
-                "vpc_id",
-                Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-            ),
+            .with_absolute_binding(absolute("subnet"))
+            .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
     ));
     plan.add(create(
-        Resource::new("s3.Bucket", "my-bucket").with_binding("bucket"),
+        Resource::new("s3.Bucket", "my-bucket").with_absolute_binding(absolute("bucket")),
     ));
     plan
 }
@@ -711,10 +716,12 @@ fn tab_complete_with_provider_prefix() {
     // Resource types with provider prefix (e.g., "awscc.ec2.Vpc")
     let mut plan = Plan::new();
     plan.add(create(
-        Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_binding("vpc"),
+        Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None)
+            .with_absolute_binding(absolute("vpc")),
     ));
     plan.add(create(
-        Resource::with_provider("awscc", "ec2.Subnet", "my-subnet", None).with_binding("subnet"),
+        Resource::with_provider("awscc", "ec2.Subnet", "my-subnet", None)
+            .with_absolute_binding(absolute("subnet")),
     ));
     let mut app = App::for_plan(&plan, &SchemaRegistry::new());
     app.search_active = true;
@@ -762,14 +769,7 @@ fn format_value_preserves_strings_that_resemble_enum_identifiers() {
     );
 
     // ResourceRef should NOT be resolved (not a DSL enum)
-    assert_eq!(
-        format_value(&Value::resource_ref(
-            "vpc".to_string(),
-            "vpc_id".to_string(),
-            vec![]
-        )),
-        "vpc.vpc_id"
-    );
+    assert_eq!(format_value(&root_ref("vpc", "vpc_id")), "vpc.vpc_id");
 }
 
 #[test]
@@ -781,10 +781,7 @@ fn create_effect_attributes_preserve_dotted_string_values() {
                 "name",
                 Value::Concrete(ConcreteValue::String("A.json".into())),
             )
-            .with_attribute(
-                "vpc_id",
-                Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-            ),
+            .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
     ));
 
     let app = App::for_plan(&plan, &SchemaRegistry::new());

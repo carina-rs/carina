@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use crate::parser::{
     ResourceTypePath, TypeExpr, display_double_quoted_literal_part, display_string_literal,
 };
-use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
+use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, Resource, Value};
 use crate::static_type::{ConsumerStaticType, consumer_static_type_label};
 
 /// Dependency between resources
@@ -119,7 +119,7 @@ impl DependencyGraph {
 }
 
 /// Format a Value for display
-fn format_value(value: &Value) -> String {
+fn format_value<B: BindingAddress>(value: &Value<B>) -> String {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => format!(
             "if {} {{ {} }} else {{ {} }}",
@@ -183,7 +183,7 @@ fn format_value(value: &Value) -> String {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             format!("{}.{}", path.binding(), path.attribute())
         }
-        Value::Deferred(DeferredValue::BindingRef { binding }) => binding.clone(),
+        Value::Deferred(DeferredValue::BindingRef { binding }) => binding.to_string(),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             format!("{} ?? {}", format_value(value), format_value(default))
         }
@@ -388,16 +388,23 @@ pub struct ModuleCallInfo {
     pub arguments: Vec<String>,
 }
 
-fn resource_graph_binding(resource: &Resource, declaration_index: usize) -> String {
+fn resource_graph_binding<S, B: BindingAddress>(
+    resource: &Resource<S, B>,
+    declaration_index: usize,
+) -> String {
     resource
         .binding
-        .clone()
+        .as_ref()
+        .map(ToString::to_string)
         .unwrap_or_else(|| format!("<anonymous:{declaration_index}>"))
 }
 
 impl RootConfigSignature {
     /// Build a root config signature from a parsed file
-    pub fn from_parsed_file<E>(parsed: &crate::parser::File<E>, file_name: &str) -> Self {
+    pub fn from_parsed_file<E, B: BindingAddress>(
+        parsed: &crate::parser::File<E, B>,
+        file_name: &str,
+    ) -> Self {
         // Build imports
         let imports: Vec<ImportInfo> = parsed
             .uses
@@ -436,7 +443,7 @@ impl RootConfigSignature {
             .iter()
             .map(|call| ModuleCallInfo {
                 module_name: call.module_name.clone(),
-                binding_name: call.binding_name.clone(),
+                binding_name: call.binding_name.as_ref().map(ToString::to_string),
                 arguments: call.arguments().map(|(name, _)| name.to_string()).collect(),
             })
             .collect();
@@ -475,10 +482,10 @@ impl RootConfigSignature {
         }
     }
 
-    fn collect_typed_dependencies(
+    fn collect_typed_dependencies<B: BindingAddress>(
         from: &str,
         attr_key: &str,
-        value: &Value,
+        value: &Value<B>,
         graph: &mut TypedDependencyGraph,
         binding_types: &HashMap<String, ResourceTypePath>,
     ) {
@@ -505,11 +512,11 @@ impl RootConfigSignature {
             // displayed `attribute` slot stays empty so
             // `format_dep_detail` renders `target (via used_in)`.
             Value::Deferred(DeferredValue::BindingRef { binding }) => {
-                let target_type = binding_types.get(binding).cloned();
+                let target_type = binding_types.get(binding.as_str()).cloned();
                 graph.add_edge(
                     from.to_string(),
                     TypedDependency {
-                        target: binding.clone(),
+                        target: binding.to_string(),
                         target_type,
                         attribute: String::new(),
                         used_in: attr_key.to_string(),
@@ -916,8 +923,8 @@ impl ModuleSignature {
     }
 
     /// Build a module signature from a directory-based module (ParsedFile with top-level arguments/attributes)
-    pub fn from_directory_module<E>(
-        parsed: &crate::parser::File<E>,
+    pub fn from_directory_module<E, B: BindingAddress, D>(
+        parsed: &crate::parser::File<E, B, D>,
         module_name: &str,
         config: &crate::parser::ProviderContext,
     ) -> Self {
@@ -1030,10 +1037,10 @@ impl ModuleSignature {
         }
     }
 
-    fn collect_typed_dependencies(
+    fn collect_typed_dependencies<B: BindingAddress>(
         from: &str,
         attr_key: &str,
-        value: &Value,
+        value: &Value<B>,
         graph: &mut TypedDependencyGraph,
         binding_types: &HashMap<String, ResourceTypePath>,
         argument_types: &HashMap<String, TypeExpr>,
@@ -1074,15 +1081,15 @@ impl ModuleSignature {
             // `vpc`, since #2847) — same dependency edge, empty
             // attribute slot.
             Value::Deferred(DeferredValue::BindingRef { binding }) => {
-                let target_type = if let Some(arg_type) = argument_types.get(binding) {
+                let target_type = if let Some(arg_type) = argument_types.get(binding.as_str()) {
                     Self::dependency_target_type(arg_type)
                 } else {
-                    binding_types.get(binding).cloned()
+                    binding_types.get(binding.as_str()).cloned()
                 };
                 graph.add_edge(
                     from.to_string(),
                     TypedDependency {
-                        target: binding.clone(),
+                        target: binding.to_string(),
                         target_type,
                         attribute: String::new(),
                         used_in: attr_key.to_string(),
@@ -1519,6 +1526,10 @@ mod tests {
     use super::*;
     use crate::parser::TypeExpr;
 
+    type Value = crate::resource::ExpandedValue;
+    type ConcreteValue = crate::resource::ExpandedConcreteValue;
+    type DeferredValue = crate::resource::ExpandedDeferredValue;
+
     #[test]
     fn format_value_uses_canonical_string_literals() {
         assert_eq!(
@@ -1537,7 +1548,7 @@ mod tests {
                 crate::resource::InterpolationPart::Literal("prefix-".into()),
                 crate::resource::InterpolationPart::Expr(Value::Deferred(
                     DeferredValue::BindingRef {
-                        binding: "name".to_string(),
+                        binding: crate::resource::RootScope::new().resolve("name".into()),
                     },
                 )),
             ]))),
@@ -1548,7 +1559,7 @@ mod tests {
                 crate::resource::InterpolationPart::Literal(r#"prefix-${literal}""#.into(),),
                 crate::resource::InterpolationPart::Expr(Value::Deferred(
                     DeferredValue::BindingRef {
-                        binding: "name".to_string(),
+                        binding: crate::resource::RootScope::new().resolve("name".into()),
                     },
                 )),
             ]))),
@@ -1838,11 +1849,15 @@ mod tests {
         )]);
         let binding_types = HashMap::new();
         let values = [
-            ("resource ref", Value::resource_ref("vpc", "id", vec![])),
+            (
+                "resource ref",
+                crate::resource::AuthoredValue::resource_ref("vpc", "id", vec![])
+                    .resolve_root(&crate::resource::RootScope::new()),
+            ),
             (
                 "bare binding ref",
                 Value::Deferred(DeferredValue::BindingRef {
-                    binding: "vpc".to_string(),
+                    binding: crate::resource::RootScope::new().resolve("vpc".into()),
                 }),
             ),
             (

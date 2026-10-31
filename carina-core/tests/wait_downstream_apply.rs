@@ -299,21 +299,25 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     );
     let wb = &parsed.wait_bindings[0];
     assert_eq!(
-        wb.binding, "r.cert_issued",
+        wb.binding.as_str(),
+        "r.cert_issued",
         "wait binding must be instance-prefixed (r.cert_issued)"
     );
     assert_eq!(
-        wb.target, "r.cert",
+        wb.target.as_str(),
+        "r.cert",
         "wait target must be instance-prefixed (r.cert)"
     );
     assert_eq!(
-        wb.until_predicate.lhs_segments.first().map(String::as_str),
-        Some("r.cert"),
+        wb.until_predicate.root.as_str(),
+        "r.cert",
         "until predicate LHS root must be instance-prefixed; got {:?}",
-        wb.until_predicate.lhs_segments
+        wb.until_predicate.root
     );
     assert!(
-        wb.depends_on.iter().any(|d| d == "r.validation_record"),
+        wb.depends_on
+            .iter()
+            .any(|dependency| dependency.as_str() == "r.validation_record"),
         "depends_on entries must be instance-prefixed; got {:?}",
         wb.depends_on
     );
@@ -330,7 +334,8 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         carina_core::deps::get_resource_value_ref_dependencies(
             carina_core::parser::ResourceRef::Resource(dist)
         )
-        .contains("r.cert_issued"),
+        .iter()
+        .any(|dependency| dependency.as_str() == "r.cert_issued"),
         "Distribution must depend on the prefixed wait binding \
          `r.cert_issued`; deps were {:?}",
         carina_core::deps::get_resource_value_ref_dependencies(
@@ -487,13 +492,13 @@ async fn nested_module_wait_binding_survives_two_expansions() {
             .collect::<Vec<_>>()
     );
     let wb = &parsed.wait_bindings[0];
-    assert_eq!(wb.binding, "o.c.cert_issued");
-    assert_eq!(wb.target, "o.c.cert");
+    assert_eq!(wb.binding.as_str(), "o.c.cert_issued");
+    assert_eq!(wb.target.as_str(), "o.c.cert");
     assert_eq!(
-        wb.until_predicate.lhs_segments.first().map(String::as_str),
-        Some("o.c.cert"),
+        wb.until_predicate.root.as_str(),
+        "o.c.cert",
         "until LHS root must be doubly-prefixed; got {:?}",
-        wb.until_predicate.lhs_segments
+        wb.until_predicate.root
     );
 
     // The inner Distribution's nested ref was doubly-rewritten to match.
@@ -506,7 +511,8 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         carina_core::deps::get_resource_value_ref_dependencies(
             carina_core::parser::ResourceRef::Resource(dist)
         )
-        .contains("o.c.cert_issued"),
+        .iter()
+        .any(|dependency| dependency.as_str() == "o.c.cert_issued"),
         "Distribution must depend on the doubly-prefixed wait binding \
          `o.c.cert_issued`; deps were {:?}",
         carina_core::deps::get_resource_value_ref_dependencies(

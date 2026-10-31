@@ -2482,7 +2482,10 @@ mod tests {
     use crate::explicit::{ExplicitFields, PendingPaths};
     use crate::parser::ProviderConfig;
     use crate::plan::{ReplaceDisplayMetadata, SavedPlan};
-    use crate::resource::{ResolvedResource, Resource, ResourceId, State};
+    use crate::resource::{
+        ExpandedConcreteValue as ConcreteValue, ExpandedResource as Resource,
+        ExpandedValue as Value, ResolvedResource, ResourceId, State,
+    };
     use std::collections::HashSet;
 
     fn build_replace_detail_rows_from_display<S>(
@@ -3812,9 +3815,9 @@ mod tests {
             rule(443, None),
         ]));
         let desired_rules = Value::Concrete(ConcreteValue::List(vec![rule(443, None)]));
-        let applied = Resource::new("test.Listener", "listener")
+        let applied: Resource = Resource::new("test.Listener", "listener")
             .with_attribute("rules", applied_rules.clone());
-        let desired =
+        let desired: Resource =
             Resource::new("test.Listener", "listener").with_attribute("rules", desired_rules);
         let stored = HashMap::from([("rules".to_string(), applied_rules.clone())]);
         let sent = crate::executor::AcceptedRequest::create_for_test();

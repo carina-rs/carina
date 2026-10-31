@@ -9,7 +9,7 @@
 //!   [`parse_if_value_expr_with_mode`], which only allows a [`Value`] body and
 //!   requires an `else` branch so the false case also has a value.
 
-use crate::eval_value::EvalValue;
+use crate::eval_value::AuthoredEvalValue as EvalValue;
 use crate::parser::context::ExpressionMode;
 use crate::parser::expressions::for_expr::LoopParseTarget;
 use crate::parser::{
@@ -18,7 +18,10 @@ use crate::parser::{
     decide_if_condition, first_inner, if_structural_handle, next_pair, parse_expression,
     parse_expression_eval, parse_module_call, parse_read_resource_expr, parse_resource_for_target,
 };
-use crate::resource::{DataSource, DeferredValue, LoopKind, Resource, Value};
+use crate::resource::{
+    AuthoredDataSource as DataSource, AuthoredDeferredValue as DeferredValue,
+    AuthoredResource as Resource, AuthoredValue as Value, LoopKind,
+};
 
 /// Result of parsing an if expression body: a managed resource, a data
 /// source, a module call, or a value.
@@ -421,7 +424,9 @@ fn parse_if_body(
                 let mut call =
                     parse_module_call(inner, &local_ctx, preprocessed_file, source_file)?;
                 call.binding_name = match target {
-                    LoopParseTarget::Bound { .. } => Some(target.scheduler_key().to_string()),
+                    LoopParseTarget::Bound { .. } => Some(
+                        crate::resource::RelativeBindingName::new(target.scheduler_key()),
+                    ),
                     LoopParseTarget::Unbound(_) => None,
                 };
                 call.set_loop_origin(target.if_origin());

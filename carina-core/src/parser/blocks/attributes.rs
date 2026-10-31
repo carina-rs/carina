@@ -15,7 +15,10 @@ use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::grammar::PreprocessedFile;
 use crate::parser::parse_expression;
 use crate::parser::types::parse_type_expr;
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{
+    AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
+    AuthoredValue as Value,
+};
 
 pub(in crate::parser) struct ParsedArgumentsBlock {
     pub parameters: Vec<ArgumentParameter>,

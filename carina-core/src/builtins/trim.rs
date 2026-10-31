@@ -1,6 +1,6 @@
 //! `trim(string)` built-in function
 
-use crate::resource::{ConcreteValue, Value, ValueString};
+use crate::resource::{BindingAddress, ConcreteValue, Value, ValueString};
 
 use super::value_type_name;
 
@@ -14,7 +14,7 @@ use super::value_type_name;
 /// trim("  hello  ")  // => "hello"
 /// trim("\n hello \t") // => "hello"
 /// ```
-pub(crate) fn builtin_trim(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_trim<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
     if args.len() != 1 {
         return Err(format!(
             "trim() expects 1 argument (string), got {}",
@@ -40,7 +40,7 @@ pub(crate) fn builtin_trim(args: &[Value]) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::{ConcreteValue, Value};
+    use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
 
     #[test]
     fn trim_both_sides() {
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn trim_no_args() {
-        let args = vec![];
+        let args: Vec<Value> = vec![];
         let result = evaluate_builtin("trim", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 1 argument"));

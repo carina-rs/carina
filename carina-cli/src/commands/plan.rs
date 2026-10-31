@@ -14,7 +14,8 @@ use carina_core::effect::{Effect, EffectGeneration, UnresolvedSavedEffect};
 #[cfg(test)]
 use carina_core::parser::ProviderConfig;
 use carina_core::parser::{
-    BackendConfig, ProviderContext, ResolvedProviderConfigs, SavedProviderConfigs, UpstreamState,
+    ExpandedBackendConfig as BackendConfig, ProviderContext, ResolvedProviderConfigs,
+    SavedProviderConfigs, UpstreamState,
 };
 use carina_core::plan::{Plan, SavedPlan, UnresolvedSavedPlan};
 use carina_core::provider::{ProviderInstanceKey, ProviderRouter, ReferenceScope};
@@ -480,6 +481,7 @@ mod provider_scope_evidence_tests {
         ];
         let mut parsed = carina_core::parser::InferredFile::default();
         parsed.providers = configs.clone();
+        let parsed = resolve_file_for_test(parsed, Path::new("."));
         let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &HashMap::new(),
@@ -509,7 +511,8 @@ mod provider_scope_evidence_tests {
 
         let mut contents = empty_contents(SavedProviderConfigs::from(&resolved));
         let arithmetic = carina_core::integer_arithmetic::evaluate_integer_values(
-            Value::resource_ref("source", "seconds", Vec::new()),
+            carina_core::resource::AuthoredValue::resource_ref("source", "seconds", Vec::new())
+                .resolve_root_for_test(),
             carina_core::integer_arithmetic::IntegerOp::Divide,
             Value::Concrete(ConcreteValue::Int(60)),
             carina_core::integer_arithmetic::IntegerOperatorSpan::synthetic(),
@@ -522,7 +525,8 @@ mod provider_scope_evidence_tests {
             .evaluate_with_operands(
                 Value::Deferred(DeferredValue::Unknown(
                     carina_core::resource::UnknownReason::UpstreamExport {
-                        path: carina_core::resource::AccessPath::new("source", "seconds"),
+                        path: carina_core::resource::AuthoredAccessPath::new("source", "seconds")
+                            .resolve_root_for_test(),
                     },
                 )),
                 Value::Concrete(ConcreteValue::Int(60)),
@@ -2664,6 +2668,7 @@ mod schema_fingerprint_tests {
     fn saved_provider_configs(configs: Vec<ProviderConfig>) -> SavedProviderConfigs {
         let mut parsed = carina_core::parser::InferredFile::default();
         parsed.providers = configs;
+        let parsed = parsed.resolve_root_for_test();
         let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &HashMap::new(),
@@ -3063,8 +3068,8 @@ mod historical_display_tests {
 /// `carina_core::binding_index::WaitAliasSpec` at apply-from-plan time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanWaitBinding {
-    pub binding: String,
-    pub target: String,
+    pub binding: carina_core::resource::AbsoluteBindingAddress,
+    pub target: carina_core::resource::AbsoluteBindingAddress,
 }
 
 /// Serializable representation of an `upstream_state` declaration's
@@ -3075,7 +3080,7 @@ pub struct PlanWaitBinding {
 /// apply-from-plan time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamSource {
-    pub binding: String,
+    pub binding: carina_core::resource::AbsoluteBindingAddress,
     pub source: std::path::PathBuf,
 }
 
@@ -3667,7 +3672,7 @@ mod managed_current_serde_tests {
 
     #[test]
     fn saved_plan_unknown_marker_round_trips_and_rejects_status_changes() {
-        let resource = ResolvedResource::new(Resource::with_provider(
+        let resource: ResolvedResource = ResolvedResource::new(Resource::with_provider(
             "mock",
             "test.Resource",
             "unknown",
@@ -3803,7 +3808,7 @@ mod managed_current_serde_tests {
 
     #[test]
     fn saved_plan_rejects_in_flight_status_change_in_both_directions() {
-        let resource = ResolvedResource::new(Resource::with_provider(
+        let resource: ResolvedResource = ResolvedResource::new(Resource::with_provider(
             "mock",
             "test.Resource",
             "pending",
@@ -3856,7 +3861,7 @@ mod managed_current_serde_tests {
     fn saved_plan_rejects_new_in_flight_address_missing_from_snapshot() {
         let planned_id =
             ResourceId::with_provider_identity("mock", "test.Resource", "planned", None);
-        let unexpected_resource = ResolvedResource::new(Resource::with_provider(
+        let unexpected_resource: ResolvedResource = ResolvedResource::new(Resource::with_provider(
             "mock",
             "test.Resource",
             "unexpected",
@@ -3902,7 +3907,8 @@ mod managed_current_serde_tests {
         let source = ResourceId::with_provider_identity("mock", "test.Resource", "source", None);
         let destination =
             ResourceId::with_provider_identity("mock", "test.Resource", "destination", None);
-        let source_resource = ResolvedResource::new(Resource::from_id(source.clone()));
+        let source_resource: ResolvedResource =
+            ResolvedResource::new(Resource::from_id(source.clone()));
         let pending = crate::fixture_in_flight_create(
             &source,
             "state-owned-token",
@@ -3964,7 +3970,8 @@ mod managed_current_serde_tests {
         let source = ResourceId::with_provider_identity("mock", "test.Resource", "source", None);
         let destination =
             ResourceId::with_provider_identity("mock", "test.Resource", "destination", None);
-        let source_resource = ResolvedResource::new(Resource::from_id(source.clone()));
+        let source_resource: ResolvedResource =
+            ResolvedResource::new(Resource::from_id(source.clone()));
         let unknown = unknown_outcome(source.clone());
         let started_at = unknown.started_at().clone();
         let row = ResourceState::from_unknown_create_outcome(
@@ -4444,8 +4451,8 @@ fn build_plan_file_contents<E>(
             .wait_bindings
             .iter()
             .map(|wb| PlanWaitBinding {
-                binding: wb.binding.as_str().to_string(),
-                target: wb.target.as_str().to_string(),
+                binding: wb.binding.clone(),
+                target: wb.target.clone(),
             })
             .collect(),
     };
@@ -5128,7 +5135,7 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
 /// Every field is mandatory so plan and apply cannot accidentally omit a
 /// binding layer or the provider-aware builtin context.
 pub(crate) struct CheckExportsPreApplyInput<'a> {
-    pub export_params: &'a [carina_core::parser::InferredExportParam],
+    pub export_params: &'a [carina_core::parser::ExpandedInferredExportParam],
     pub resources: &'a [Resource],
     pub compositions: &'a [carina_core::resource::LiveComposition],
     pub managed_current: &'a HashMap<ResourceId, Current>,
@@ -5149,7 +5156,9 @@ pub(crate) struct CheckExportsPreApplyInput<'a> {
 pub(crate) fn check_exports_pre_apply(
     input: CheckExportsPreApplyInput<'_>,
 ) -> Result<
-    carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam>,
+    carina_core::validation::ExportsCheckedPreApply<
+        carina_core::parser::ExpandedInferredExportParam,
+    >,
     String,
 > {
     // carina#3248: build the unified pre-apply bindings view so an
@@ -5243,7 +5252,7 @@ impl ExportChange {
 /// `StateFile.exports`.
 pub fn compute_export_diffs(
     checked_exports: &carina_core::validation::ExportsCheckedPreApply<
-        carina_core::parser::InferredExportParam,
+        carina_core::parser::ExpandedInferredExportParam,
     >,
     current_exports: &HashMap<String, PersistedExportValue>,
 ) -> Vec<ExportChange> {
@@ -5408,7 +5417,7 @@ struct ProviderAttributeRequirement {
 
 #[derive(Clone, Debug)]
 struct ProviderReferencedUpstream {
-    upstream: UpstreamState,
+    upstream: UpstreamState<carina_core::resource::AbsoluteBindingAddress>,
     required_by: ProviderAttributeRequirement,
 }
 
@@ -5524,7 +5533,7 @@ fn provider_referenced_upstream_states<E>(
         .iter()
         .filter_map(|upstream| {
             referenced_upstreams
-                .get(&upstream.binding)
+                .get(upstream.binding.as_str())
                 .cloned()
                 .map(|required_by| ProviderReferencedUpstream {
                     upstream: upstream.clone(),
@@ -5548,8 +5557,8 @@ fn provider_referenced_upstream_states<E>(
 /// resolution failures, upstream `.crn` parse errors, and backend I/O
 /// errors remain hard errors regardless — they indicate structural
 /// problems the user must fix before plan output can mean anything.
-pub(crate) async fn load_upstream_states(
-    upstream_states: &[UpstreamState],
+pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddress>(
+    upstream_states: &[UpstreamState<B>],
     base_dir: &Path,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<PathBuf>,
@@ -5586,7 +5595,7 @@ pub(crate) async fn load_upstream_states(
             .map_err(AppError::Backend)?;
         match (published_exports, policy) {
             (Some(exports), _) => {
-                result.insert(us.binding.clone(), exports.build_remote_bindings());
+                result.insert(us.binding.to_string(), exports.build_remote_bindings());
             }
             (None, UpstreamMissingStatePolicy::Strict) => {
                 return Err(AppError::Config(format!(
@@ -5618,8 +5627,8 @@ pub(crate) async fn load_upstream_states(
 /// chain (cycle detection only — never state I/O — see
 /// carina-rs/carina#2608), then build the backend honoring local-path
 /// anchoring. Shared between strict and lenient upstream loaders.
-async fn build_upstream_backend(
-    us: &UpstreamState,
+async fn build_upstream_backend<B: carina_core::resource::BindingAddress>(
+    us: &UpstreamState<B>,
     source_abs: &Path,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<PathBuf>,
@@ -5672,8 +5681,8 @@ async fn build_upstream_backend(
 ///
 /// Returns `Ok(())` on success; the caller does not consume any
 /// bindings — there are none.
-async fn walk_upstream_cycles_only(
-    upstream_states: &[UpstreamState],
+async fn walk_upstream_cycles_only<B: carina_core::resource::BindingAddress>(
+    upstream_states: &[UpstreamState<B>],
     base_dir: &Path,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<PathBuf>,
@@ -5725,12 +5734,12 @@ async fn walk_upstream_cycles_only(
 }
 
 #[cfg(test)]
-fn resolve_file_for_test<E: carina_core::parser::ExportParamLike>(
+fn resolve_file_for_test<E: carina_core::parser::ResolveExportBindingPhase>(
     parsed: carina_core::parser::File<E>,
     base_dir: &Path,
-) -> carina_core::parser::ModuleResolvedFile<E> {
+) -> carina_core::parser::ModuleResolvedFile<E::Absolute> {
     carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
+        carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
         base_dir,
         &ProviderContext::default(),
         &carina_core::schema::SchemaRegistry::new(),
@@ -5742,6 +5751,10 @@ fn resolve_file_for_test<E: carina_core::parser::ExportParamLike>(
 mod load_upstream_states_tests {
     use super::*;
     use std::fs;
+
+    fn relative_binding(name: &str) -> carina_core::resource::RelativeBindingName {
+        carina_core::resource::RelativeBindingName::new(name)
+    }
 
     fn write_state(dir: &Path, exports: &[(&str, serde_json::Value)]) {
         let mut state = StateFile::new();
@@ -5874,11 +5887,11 @@ mod load_upstream_states_tests {
         });
         parsed.upstream_states.extend([
             UpstreamState {
-                binding: "mgmt".to_string(),
+                binding: relative_binding("mgmt"),
                 source: referenced,
             },
             UpstreamState {
-                binding: "unrelated".to_string(),
+                binding: relative_binding("unrelated"),
                 source: unrelated,
             },
         ]);
@@ -5912,13 +5925,13 @@ mod load_upstream_states_tests {
             Value::resource_ref("bridge", "role_arn", vec![]),
         );
         let mut bridge = Resource::with_provider("test", "thing", "bridge", None);
-        bridge.binding = Some("bridge".to_string());
+        bridge.binding = Some(relative_binding("bridge"));
         bridge.set_attr(
             "role_arn".to_string(),
             Value::resource_ref("relay", "role_arn", vec![]),
         );
         let mut relay = Resource::with_provider("test", "thing", "relay", None);
-        relay.binding = Some("relay".to_string());
+        relay.binding = Some(relative_binding("relay"));
         relay.set_attr(
             "role_arn".to_string(),
             Value::resource_ref("mgmt", "role_arn", vec![]),
@@ -5965,7 +5978,7 @@ mod load_upstream_states_tests {
         });
         for (binding, target) in [("a", "b"), ("b", "a")] {
             let mut resource = Resource::with_provider("test", "thing", binding, None);
-            resource.binding = Some(binding.to_string());
+            resource.binding = Some(relative_binding(binding));
             resource.set_attr(
                 "value".to_string(),
                 Value::resource_ref(target, "value", vec![]),
@@ -5988,7 +6001,7 @@ mod load_upstream_states_tests {
         write_state(dir.path(), &[("account_id", serde_json::json!("123"))]);
 
         let upstream_states = vec![UpstreamState {
-            binding: "orgs".to_string(),
+            binding: relative_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
 
@@ -6040,7 +6053,7 @@ mod load_upstream_states_tests {
             .unwrap();
 
         let upstream_states = vec![UpstreamState {
-            binding: "orgs".to_string(),
+            binding: relative_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
         let result = load_upstream_states(
@@ -6089,7 +6102,7 @@ mod load_upstream_states_tests {
         .unwrap();
 
         let upstream_states = vec![UpstreamState {
-            binding: "orgs".to_string(),
+            binding: relative_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
         let result = load_upstream_states(
@@ -6127,7 +6140,7 @@ mod load_upstream_states_tests {
         .unwrap();
 
         let upstream_states = vec![UpstreamState {
-            binding: "b".to_string(),
+            binding: relative_binding("b"),
             source: PathBuf::from("../b"),
         }];
 
@@ -6149,7 +6162,7 @@ mod load_upstream_states_tests {
     #[tokio::test]
     async fn load_upstream_states_errors_when_source_missing() {
         let upstream_states = vec![UpstreamState {
-            binding: "orgs".to_string(),
+            binding: relative_binding("orgs"),
             source: PathBuf::from("/nonexistent/carina/upstream/path"),
         }];
         let err = load_upstream_states(
@@ -6182,7 +6195,7 @@ mod load_upstream_states_tests {
         // Intentionally do NOT write carina.state.json.
 
         let upstream_states = vec![UpstreamState {
-            binding: "orgs".to_string(),
+            binding: relative_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
         let base_dir = dir.path().parent().unwrap();
@@ -6221,7 +6234,7 @@ mod load_upstream_states_tests {
         .unwrap();
 
         let upstream_states = vec![UpstreamState {
-            binding: "orgs".to_string(),
+            binding: relative_binding("orgs"),
             source: dir.path().to_path_buf(),
         }];
         let base_dir = dir.path().parent().unwrap();
@@ -6298,7 +6311,7 @@ let internal = upstream_state {{ source = '{}' }}"#,
 
         // A reads B.
         let upstream_states = vec![UpstreamState {
-            binding: "bootstrap".to_string(),
+            binding: relative_binding("bootstrap"),
             source: b_dir.clone(),
         }];
 
@@ -6361,7 +6374,7 @@ let back = upstream_state {{ source = '{}' }}"#,
         // Pretend a "downstream" reads A; the loader must catch the
         // A → B → A cycle.
         let upstream_states = vec![UpstreamState {
-            binding: "a".to_string(),
+            binding: relative_binding("a"),
             source: a_dir.clone(),
         }];
 
@@ -6458,7 +6471,9 @@ exports { region: String = "ap-northeast-1" }"#,
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load config")
-        .parsed;
+        .parsed
+        .into_parsed()
+        .resolve_root_for_test();
         let mut guard = seed_cycle_guard(&dir_b);
         let bindings = load_upstream_states(
             &parsed.upstream_states,
@@ -6555,6 +6570,14 @@ mod run_plan_out_tests {
         ResourceId, Value,
     };
     use std::fs;
+
+    fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(name)
+    }
+
+    fn root_resource_ref(binding: &str, attribute: &str) -> Value {
+        Value::resource_ref(binding, attribute, Vec::new()).resolve_root_for_test()
+    }
 
     fn resolved_image_target(path: PathBuf, theme: ImageTheme) -> ResolvedPlanImageTarget {
         let target = PlanImageTarget::try_from(path).unwrap();
@@ -6697,7 +6720,7 @@ mod run_plan_out_tests {
         let updated_effect = resource_with_secret("updated", "UPDATE_SECRET").with_attribute(
             "web_acl_arn",
             Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("producer", "identifier"),
+                path: AccessPath::new("producer", "identifier").resolve_root_for_test(),
             }),
         );
         let persisted_update_marker = PersistedValue::encode_provider_value(
@@ -7083,8 +7106,9 @@ mod run_plan_out_tests {
         let path = tmp.path().join("main.crn");
         fs::write(&path, "provider mock {}\n").unwrap();
 
-        let mut parsed_data_source = DataSource::with_provider("mock", "iam.Roles", "roles", None);
-        parsed_data_source.binding = Some("roles".to_string());
+        let mut parsed_data_source: DataSource =
+            DataSource::with_provider("mock", "iam.Roles", "roles", None);
+        parsed_data_source.binding = Some(absolute_binding("roles"));
         parsed_data_source.set_attr(
             "name_regex".to_string(),
             Value::Concrete(carina_core::resource::ConcreteValue::String(
@@ -7092,13 +7116,13 @@ mod run_plan_out_tests {
             )),
         );
 
-        let mut deferred_data_source =
+        let mut deferred_data_source: DataSource =
             DataSource::with_provider("mock", "iam.Roles", "roles", None);
-        deferred_data_source.binding = Some("roles".to_string());
+        deferred_data_source.binding = Some(absolute_binding("roles"));
         deferred_data_source.set_attr(
             "name_regex".to_string(),
             Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("target_role", "role_name"),
+                path: AccessPath::new("target_role", "role_name").resolve_root_for_test(),
             }),
         );
         let data_source_values =
@@ -7107,9 +7131,8 @@ mod run_plan_out_tests {
                 |_| carina_core::data_source_value::DataSourceValue::deferred_to_apply(Vec::new()),
             );
 
-        let mut parsed = carina_core::parser::ParsedFile::default();
+        let mut parsed = carina_core::parser::ModuleResolvedParsedFile::default();
         parsed.data_sources = vec![parsed_data_source];
-        let parsed = resolve_file_for_test(parsed, tmp.path());
         let ctx = crate::wiring::PlanContext {
             plan: Plan::new(),
             provider: ProviderRouter::new(),
@@ -7168,9 +7191,9 @@ mod run_plan_out_tests {
         let mut arguments = indexmap::IndexMap::new();
         arguments.insert(
             "name".to_string(),
-            saved_composition_argument(Value::resource_ref("producer", "name", vec![])),
+            saved_composition_argument(root_resource_ref("producer", "name")),
         );
-        let prepared = LiveComposition {
+        let prepared: LiveComposition = LiveComposition {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", "checked",
             )),
@@ -7187,7 +7210,7 @@ mod run_plan_out_tests {
                     message: "name must not be bad".to_string(),
                 }],
             },
-            binding: Some("checked".to_string()),
+            binding: Some(absolute_binding("checked")),
             dependency_bindings: Default::default(),
             module_name: "checked_module".to_string(),
             instance: "root.checked".to_string(),
@@ -7378,15 +7401,19 @@ mod run_plan_out_tests {
 #[cfg(test)]
 mod export_diff_tests {
     use super::*;
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam;
     use carina_core::resource::DeferredValue;
+
+    fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(name)
+    }
 
     fn persisted(value: serde_json::Value) -> PersistedExportValue {
         serde_json::from_value(value).expect("test value is valid persisted JSON")
     }
 
-    fn param(name: &str, value: Value) -> InferredExportParam {
-        InferredExportParam {
+    fn param(name: &str, value: Value) -> ExpandedInferredExportParam {
+        ExpandedInferredExportParam {
             name: name.to_string(),
             static_type: carina_core::static_type::ExportStaticType::Inferred(
                 carina_core::static_type::StaticType::Unchecked(
@@ -7402,8 +7429,8 @@ mod export_diff_tests {
     }
 
     fn checked(
-        params: Vec<InferredExportParam>,
-    ) -> carina_core::validation::ExportsCheckedPreApply<InferredExportParam> {
+        params: Vec<ExpandedInferredExportParam>,
+    ) -> carina_core::validation::ExportsCheckedPreApply<ExpandedInferredExportParam> {
         carina_core::validation::check_export_values_pre_apply(
             &params,
             &carina_core::binding_index::ResolvedBindings::default(),
@@ -7477,8 +7504,8 @@ mod export_diff_tests {
 
     #[test]
     fn resolve_export_value_preserves_dotted_string_literal() {
-        let resource = Resource::with_provider("test", "r.Vpc", "vpc", None)
-            .with_binding("vpc")
+        let resource = <Resource>::with_provider("test", "r.Vpc", "vpc", None)
+            .with_absolute_binding(absolute_binding("vpc"))
             .with_attribute(
                 "vpc_id",
                 Value::Concrete(ConcreteValue::String("vpc-123".into())),
@@ -7507,8 +7534,8 @@ mod export_diff_tests {
 
     #[test]
     fn resolved_resource_reference_exposes_secret_export_for_plan_rejection() {
-        let resource = Resource::with_provider("test", "r.Vpc", "vpc", None)
-            .with_binding("vpc")
+        let resource = <Resource>::with_provider("test", "r.Vpc", "vpc", None)
+            .with_absolute_binding(absolute_binding("vpc"))
             .with_attribute(
                 "password",
                 Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
@@ -7527,7 +7554,7 @@ mod export_diff_tests {
         );
         let params = vec![param(
             "password",
-            Value::resource_ref("vpc", "password", vec![]),
+            Value::resource_ref("vpc", "password", vec![]).resolve_root_for_test(),
         )];
         let error = carina_core::validation::check_export_values_pre_apply(
             &params,
@@ -7554,7 +7581,8 @@ mod plan_serialization_error_tests {
     use carina_core::value::{PersistedValue, SerializationError, redact_secrets_in_resource};
 
     fn upstream_unknown() -> Value {
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()])
+            .resolve_root_for_test();
         Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
             path,
         }))
@@ -7564,10 +7592,10 @@ mod plan_serialization_error_tests {
     fn value_to_json_errors_on_top_level_unknown() {
         let err = PersistedValue::encode_provider_value(&upstream_unknown(), None).unwrap_err();
         match err {
-            SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamExport { path },
-                ..
-            } => {
+            SerializationError::UnknownNotAllowed { reason, context: _ } => {
+                let UnknownReason::UpstreamExport { path } = reason.as_ref() else {
+                    panic!("expected UpstreamExport reason, got: {reason:?}");
+                };
                 assert_eq!(path.to_dot_string(), "network.vpc.vpc_id");
             }
             other => panic!("expected UnknownNotAllowed/UpstreamExport, got: {other:?}"),
@@ -7619,7 +7647,7 @@ mod plan_serialization_error_tests {
             .unwrap_err();
             match err {
                 SerializationError::UnknownNotAllowed { reason, .. } => {
-                    assert_eq!(reason, variant, "expected {label} round-trip");
+                    assert_eq!(*reason, variant, "expected {label} round-trip");
                 }
                 other => panic!("expected UnknownNotAllowed for {label}, got: {other:?}"),
             }

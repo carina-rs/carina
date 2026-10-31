@@ -5,7 +5,7 @@
 //! before parsing begins.
 
 use crate::parser::ProviderContext;
-use crate::resource::{ConcreteValue, DeferredValue, Value, ValueString};
+use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, Value, ValueString};
 
 use super::value_type_name;
 
@@ -14,7 +14,7 @@ use super::value_type_name;
 /// This is the fallback entry point used by `evaluate_builtin` (no config).
 /// It always returns an error since the decryptor is only available via `ProviderContext`.
 /// Use `builtin_decrypt_with_config` for the config-aware version.
-pub(crate) fn builtin_decrypt(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_decrypt<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
     // Validate arguments for better error messages
     let (_ciphertext, _key) = parse_decrypt_args(args)?;
 
@@ -26,10 +26,10 @@ pub(crate) fn builtin_decrypt(args: &[Value]) -> Result<Value, String> {
 }
 
 /// `decrypt()` implementation that uses the decryptor from [`ProviderContext`].
-pub(crate) fn builtin_decrypt_with_config(
-    args: &[Value],
+pub(crate) fn builtin_decrypt_with_config<B: BindingAddress>(
+    args: &[Value<B>],
     config: &ProviderContext,
-) -> Result<Value, String> {
+) -> Result<Value<B>, String> {
     let (ciphertext, key) = parse_decrypt_args(args)?;
     let decryptor = config.decryptor.as_ref().ok_or_else(|| {
         "decrypt() requires a configured provider with encryption support. \
@@ -57,7 +57,9 @@ pub(crate) fn builtin_decrypt_with_config(
 /// Parse and validate arguments for `decrypt()`.
 ///
 /// Returns `(ciphertext, optional_key)` or an error.
-fn parse_decrypt_args(args: &[Value]) -> Result<(&ValueString, Option<&ValueString>), String> {
+fn parse_decrypt_args<B: BindingAddress>(
+    args: &[Value<B>],
+) -> Result<(&ValueString, Option<&ValueString>), String> {
     if args.is_empty() || args.len() > 2 {
         return Err(format!(
             "decrypt() expects 1 or 2 arguments (ciphertext[, key]), got {}",
@@ -97,7 +99,10 @@ mod tests {
 
     use crate::builtins::evaluate_builtin_with_config_to_value as evaluate_builtin_with_config;
     use crate::parser::ProviderContext;
-    use crate::resource::{ConcreteValue, DeferredValue, Value};
+    use crate::resource::{
+        ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
+        ExpandedValue as Value,
+    };
 
     use super::builtin_decrypt;
 
@@ -174,7 +179,7 @@ mod tests {
     #[test]
     fn decrypt_error_on_no_args() {
         let config = ProviderContext::default();
-        let args = vec![];
+        let args: Vec<Value> = vec![];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 1 or 2 arguments"));

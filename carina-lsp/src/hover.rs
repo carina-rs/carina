@@ -7,7 +7,7 @@ use crate::document::Document;
 use crate::enclosing_block::{EnclosingBlock, ResourceTypePatterns, StructPath, enclosing_block};
 use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, display_string_literal};
-use carina_core::resource::{ConcreteValue, Value};
+use carina_core::resource::{AuthoredConcreteValue as ConcreteValue, AuthoredValue as Value};
 use carina_core::schema::EffectiveSchemaNode;
 #[cfg(test)]
 use carina_core::schema::ResourceSchema;

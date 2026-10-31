@@ -11,7 +11,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::resource::Value;
+use carina_core::resource::AuthoredValue as Value;
 use carina_core::schema::{
     EffectiveType, FieldPath, FieldPathStep, TypeError, ValidatedResourceSchema,
 };
@@ -36,7 +36,7 @@ impl DiagnosticEngine {
         effective_type: &EffectiveType<'_>,
         value_range: Option<Range>,
     ) -> Vec<Diagnostic> {
-        let errors = effective_type.validate_collect(value);
+        let errors = effective_type.validate_collect_in_phase(value);
         let mut diagnostics = Vec::new();
         for (path, err) in errors {
             if let Some((line, col, end_col)) = self.range_for_path(doc, attr_name, &path) {
