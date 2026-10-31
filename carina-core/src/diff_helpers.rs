@@ -12,6 +12,7 @@ use crate::resource::Value;
 use crate::schema::{
     AttributeType, ResourceSchema, ValidatedResourceSchema, empty_defs_for_schema_walks,
 };
+use crate::value::CanonicalState;
 
 /// Schema-aware value equality shared by the plan renderer
 /// (`detail_rows`) and the unchanged-count helper below (carina#3073).
@@ -63,13 +64,18 @@ pub fn resource_attribute_values_equal(
     let effective_type = attribute.value_type();
     let old = attribute.canonicalize_state(old.clone());
     let new = attribute.canonicalize_state(new.clone());
-    schema_aware_equal(
-        &old,
-        &new,
-        Some(effective_type.as_type()),
-        effective_type.defs(),
-        context,
-    )
+    match (old, new) {
+        (CanonicalState::Absent, CanonicalState::Absent) => true,
+        (CanonicalState::Present(old), CanonicalState::Present(new)) => schema_aware_equal(
+            &old,
+            &new,
+            Some(effective_type.as_type()),
+            effective_type.defs(),
+            context,
+        ),
+        (CanonicalState::Present(_), CanonicalState::Absent)
+        | (CanonicalState::Absent, CanonicalState::Present(_)) => false,
+    }
 }
 
 /// Resolve the subtype for map entry `key`: a `Map`'s `value` type, a

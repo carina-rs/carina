@@ -9947,6 +9947,116 @@ impl PlanInputCurrent {
     }
 }
 
+/// Desired resource split into comparison and provider-boundary views.
+///
+/// The comparison view uses the same canonical absence representation as
+/// [`PlanInputCurrent`]. The authored resource remains untouched so create and
+/// update effects send explicit empty objects to the provider.
+#[derive(Debug)]
+pub struct PlanInputDesired<'a> {
+    authored: &'a ResolvedResource,
+    comparison_attributes: CanonicalComparisonAttributes,
+}
+
+/// Attribute map whose schema-known values use the canonical absence form.
+///
+/// This is the only map shape accepted by desired/current comparison views
+/// built after the plan-input boundary. Construction applies state-style
+/// post-order canonicalization without mutating the provider-bound resource.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CanonicalComparisonAttributes {
+    attributes: HashMap<String, Value>,
+}
+
+impl CanonicalComparisonAttributes {
+    pub(crate) fn from_attributes(
+        mut attributes: HashMap<String, Value>,
+        schema: Option<&crate::schema::ResourceSchema>,
+    ) -> Self {
+        if let Some(schema) = schema {
+            crate::value::canonicalize_state_attribute_map_with_resource_schema(
+                &mut attributes,
+                schema,
+            );
+        }
+        Self { attributes }
+    }
+
+    pub(crate) fn as_map(&self) -> &HashMap<String, Value> {
+        &self.attributes
+    }
+
+    pub(crate) fn into_map(self) -> HashMap<String, Value> {
+        self.attributes
+    }
+}
+
+impl<'a> PlanInputDesired<'a> {
+    pub fn authored(&self) -> &'a ResolvedResource {
+        self.authored
+    }
+
+    pub(crate) fn comparison_attributes(&self) -> &HashMap<String, Value> {
+        self.comparison_attributes.as_map()
+    }
+
+    pub(crate) fn with_resource_schema(
+        authored: &'a ResolvedResource,
+        schema: Option<&crate::schema::ResourceSchema>,
+    ) -> Self {
+        let comparison_attributes =
+            CanonicalComparisonAttributes::from_attributes(authored.resolved_attributes(), schema);
+        Self {
+            authored,
+            comparison_attributes,
+        }
+    }
+
+    pub(crate) fn with_validated_schema(
+        authored: &'a ResolvedResource,
+        schema: Option<&crate::schema::ValidatedResourceSchema>,
+    ) -> Self {
+        Self::with_resource_schema(authored, schema.map(|schema| schema.as_schema()))
+    }
+}
+
+#[derive(Debug)]
+pub struct PlanInputDesiredResources<'a> {
+    authored: &'a [ResolvedResource],
+    comparison: Vec<PlanInputDesired<'a>>,
+}
+
+impl<'a> PlanInputDesiredResources<'a> {
+    pub fn authored(&self) -> &'a [ResolvedResource] {
+        self.authored
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &PlanInputDesired<'a>> {
+        self.comparison.iter()
+    }
+}
+
+/// Build desired comparison inputs without mutating provider-bound values.
+pub fn plan_input_desired_resources<'a>(
+    resources: &'a [ResolvedResource],
+    schemas: &crate::schema::SchemaRegistry,
+) -> PlanInputDesiredResources<'a> {
+    let comparison = resources
+        .iter()
+        .map(|authored| {
+            let schema = schemas.get_for(authored.as_resource());
+            PlanInputDesired::with_validated_schema(
+                authored,
+                schema.as_ref().map(|schema| schema.schema()),
+            )
+        })
+        .collect();
+    PlanInputDesiredResources {
+        authored: resources,
+        comparison,
+    }
+}
+
 pub fn into_plan_input_current_map<S>(
     mut current: HashMap<ResourceId, Current>,
     schemas: &crate::schema::SchemaRegistry,

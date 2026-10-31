@@ -16,8 +16,9 @@ use crate::provider::{
     StateTransformMap,
 };
 use crate::resource::{
-    Current, Directives, PlanInputCurrent, PresentResourceState, ResolvedResource, Resource,
-    ResourceId, State, UnidentifiedState, Value, into_plan_input_current_map,
+    Current, Directives, PlanInputCurrent, PlanInputDesired, PresentResourceState,
+    ResolvedResource, Resource, ResourceId, State, UnidentifiedState, Value,
+    into_plan_input_current_map,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, ValidatedResourceSchema};
 
@@ -55,8 +56,9 @@ pub fn managed_binding_stability(
         let owner_schema = resolved_comparison.owner_schema();
         let context = resolved_comparison.context();
         let schema = owner_schema.schema();
+        let desired = PlanInputDesired::with_validated_schema(resource, Some(schema));
         let changed_attributes = match diff_present_with_releases(
-            resource,
+            &desired,
             present,
             saved_attrs.get(&resource.id),
             saved_attrs.nested_write_only(&resource.id),
@@ -1112,7 +1114,7 @@ fn filter_explicit_list_elements(
 }
 
 fn diff_present_with_releases(
-    desired: &ResolvedResource,
+    desired: &PlanInputDesired<'_>,
     current: &PresentResourceState,
     saved: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
@@ -1121,7 +1123,7 @@ fn diff_present_with_releases(
     context: &ComparisonContext<'_>,
 ) -> PresentDiffResult {
     let releases = find_keyed_partial_update_releases(
-        &desired.resolved_attributes(),
+        desired.comparison_attributes(),
         &current.state().attributes,
         saved,
         prev_explicit,
@@ -1195,7 +1197,7 @@ fn diff_present_with_releases(
 }
 
 fn diff_present(
-    desired: &ResolvedResource,
+    desired: &PlanInputDesired<'_>,
     current: &PresentResourceState,
     saved: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
@@ -1215,7 +1217,7 @@ fn diff_present(
 }
 
 fn diff_existing_state(
-    desired: &ResolvedResource,
+    desired: &PlanInputDesired<'_>,
     current: &State,
     saved: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
@@ -1223,16 +1225,17 @@ fn diff_existing_state(
     schema: Option<&ResourceSchema>,
     context: &ComparisonContext<'_>,
 ) -> PresentDiff {
+    let authored = desired.authored();
     let changes = comparison::find_changed_attributes_with_ignores(
         comparison::AttributeValueViews::new(
-            &desired.resolved_attributes(),
+            desired.comparison_attributes(),
             &current.attributes,
             saved,
             nested_write_only,
         ),
         prev_explicit,
         schema,
-        desired.ignore_changes(),
+        authored.ignore_changes(),
         context,
     );
 
@@ -1242,9 +1245,9 @@ fn diff_existing_state(
         }
     } else {
         PresentDiff::Update {
-            id: desired.id.clone(),
+            id: authored.id.clone(),
             from: Box::new(current.clone()),
-            to: Box::new(desired.as_resource().clone()),
+            to: Box::new(authored.as_resource().clone()),
             changed_attributes: changes.changed,
             ignored_readable_differences: changes.ignored_readable_differences,
         }
@@ -1322,8 +1325,9 @@ fn diff_with_saved_parts(
     if !current.exists {
         return Diff::Create(desired.as_resource().clone());
     }
+    let comparison_desired = PlanInputDesired::with_resource_schema(desired, schema);
     match diff_existing_state(
-        desired,
+        &comparison_desired,
         current,
         saved,
         nested_write_only,

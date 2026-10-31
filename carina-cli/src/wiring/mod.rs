@@ -5986,8 +5986,10 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         state_file,
         override_aware_resources.resources(),
     );
+    let plan_input_desired =
+        carina_core::resource::plan_input_desired_resources(&resolved_resources, context.schemas());
     let mut plan = create_plan_with_cascades(
-        &resolved_resources,
+        &plan_input_desired,
         &resolved_unresolved_resources,
         &data_sources_for_plan,
         provider,

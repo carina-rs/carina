@@ -514,8 +514,7 @@ fn type_aware_struct_equal(
 /// - Float: `0.0`
 /// - String / Enum: `""`
 /// - List: empty list
-/// - Map / Struct: empty map
-/// - Custom: delegates to the base type
+/// - Map: empty map
 fn is_type_default(
     value: &Value,
     attr_type: Option<&AttributeType>,
@@ -526,7 +525,7 @@ fn is_type_default(
     // `Shape` enum has no `Ref` variant by construction, so the type
     // system rather than convention enforces that every default-value
     // classification has seen its target shape.
-    let shape = attr_type.map(|t| t.shape_with_defs(defs));
+    let shape = attr_type.map(|attr_type| attr_type.shape_with_defs(defs));
     match (value, shape) {
         (Value::Concrete(ConcreteValue::Bool(false)), Some(crate::schema::Shape::Bool) | None) => {
             true
@@ -561,10 +560,11 @@ fn is_type_default(
         {
             true
         }
-        (
-            Value::Concrete(ConcreteValue::Map(m)),
-            Some(crate::schema::Shape::Map { .. } | crate::schema::Shape::Struct { .. }),
-        ) if m.is_empty() => true,
+        (Value::Concrete(ConcreteValue::Map(m)), Some(crate::schema::Shape::Map { .. }))
+            if m.is_empty() =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -1080,23 +1080,24 @@ pub(super) fn find_changed_attributes_with_ignores(
         let current_leaf = current
             .get(path.attribute())
             .and_then(|value| value_at_leaf(value, path.leaf()));
+        let attr_type = path
+            .leaf()
+            .segments()
+            .is_empty()
+            .then(|| {
+                schema?
+                    .attributes
+                    .get(path.attribute())
+                    .map(|attr| &attr.attr_type)
+            })
+            .flatten();
         let equal = match (desired_leaf, current_leaf) {
             (Some(desired), Some(current)) => {
-                let attr_type = path
-                    .leaf()
-                    .segments()
-                    .is_empty()
-                    .then(|| {
-                        schema?
-                            .attributes
-                            .get(path.attribute())
-                            .map(|attr| &attr.attr_type)
-                    })
-                    .flatten();
                 type_aware_equal(current, desired, attr_type, defs, context)
             }
             (None, None) => true,
-            (Some(_), None) | (None, Some(_)) => false,
+            (Some(_), None) => false,
+            (None, Some(_)) => false,
         };
         if !equal {
             differing_ignored_paths.insert(path.authored());

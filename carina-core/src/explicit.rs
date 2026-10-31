@@ -11,8 +11,8 @@ use crate::diff_helpers::{list_element_type, map_entry_subtype};
 use crate::differ::ComparisonContext;
 use crate::provider::SentDesiredAttributes;
 use crate::resource::{
-    ConcreteValue, ListElementPairing, Resource, Value, pair_list_elements,
-    pair_list_elements_with_uniqueness,
+    CanonicalComparisonAttributes, ConcreteValue, ListElementPairing, Resource, Value,
+    pair_list_elements, pair_list_elements_with_uniqueness,
 };
 use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
 use indexmap::IndexMap;
@@ -1313,10 +1313,11 @@ impl<'a> ExplicitProjection<'a> {
             .map(|schema| &schema.defs)
             .unwrap_or(empty_defs_for_schema_walks());
         let ExplicitFields::Struct { children } = self.explicit else {
-            return ProjectedAttributes {
+            return ProjectedAttributes::canonicalized(
                 attributes,
-                authoring: ProjectedAuthoring::from_unprojected(self.explicit),
-            };
+                ProjectedAuthoring::from_unprojected(self.explicit),
+                self.schema,
+            );
         };
 
         let mut projected_attributes = HashMap::new();
@@ -1350,40 +1351,54 @@ impl<'a> ExplicitProjection<'a> {
             projected_attributes.insert(key.clone(), projected.value);
             projected_children.insert(key, projected.authoring);
         }
-        ProjectedAttributes {
-            attributes: projected_attributes,
-            authoring: ProjectedAuthoring::Struct {
+        ProjectedAttributes::canonicalized(
+            projected_attributes,
+            ProjectedAuthoring::Struct {
                 children: projected_children,
             },
-        }
+            self.schema,
+        )
     }
 }
 
 /// Values produced by an [`ExplicitProjection`].
 pub struct ProjectedAttributes {
-    attributes: HashMap<String, Value>,
+    attributes: CanonicalComparisonAttributes,
     pub(crate) authoring: ProjectedAuthoring,
 }
 
 impl ProjectedAttributes {
-    pub(crate) fn unprojected(
+    fn canonicalized(
         attributes: HashMap<String, Value>,
-        explicit: Option<&ExplicitFields>,
+        authoring: ProjectedAuthoring,
+        schema: Option<&ResourceSchema>,
     ) -> Self {
         Self {
-            attributes,
-            authoring: explicit.map_or(ProjectedAuthoring::Opaque, |explicit| {
-                ProjectedAuthoring::from_unprojected(explicit)
-            }),
+            attributes: CanonicalComparisonAttributes::from_attributes(attributes, schema),
+            authoring,
         }
     }
 
+    pub(crate) fn unprojected(
+        attributes: HashMap<String, Value>,
+        explicit: Option<&ExplicitFields>,
+        schema: Option<&ResourceSchema>,
+    ) -> Self {
+        Self::canonicalized(
+            attributes,
+            explicit.map_or(ProjectedAuthoring::Opaque, |explicit| {
+                ProjectedAuthoring::from_unprojected(explicit)
+            }),
+            schema,
+        )
+    }
+
     pub fn attributes(&self) -> &HashMap<String, Value> {
-        &self.attributes
+        self.attributes.as_map()
     }
 
     pub fn into_attributes(self) -> HashMap<String, Value> {
-        self.attributes
+        self.attributes.into_map()
     }
 }
 

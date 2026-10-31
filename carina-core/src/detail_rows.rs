@@ -22,7 +22,8 @@ use crate::plan::{Plan, ReplaceDisplayInfo};
 use crate::provider::{ComparisonResolutionError, ProviderResult, ProviderRouter};
 use crate::provider::{NestedWriteOnlyRecord, PersistedAttributes};
 use crate::resource::{
-    ConcreteValue, DefaultTagKeys, DeferredValue, ResourceId, Value, pair_list_elements,
+    CanonicalComparisonAttributes, ConcreteValue, DefaultTagKeys, DeferredValue, ResourceId, Value,
+    pair_list_elements,
 };
 use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry, empty_defs_for_schema_walks};
 use crate::value::{
@@ -890,6 +891,13 @@ fn build_update_rows<S>(
     let mut display_attributes = to.attributes.clone();
     to.resolved_ignore_changes
         .mask_desired_readable_leaves(&mut display_attributes, from_attributes);
+    let comparison_attributes = CanonicalComparisonAttributes::from_attributes(
+        display_attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        schema,
+    );
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
@@ -905,7 +913,7 @@ fn build_update_rows<S>(
 
     let attr_rows = build_attribute_diff_rows(
         to,
-        &display_attributes,
+        comparison_attributes.as_map(),
         AttributeDiffContext::for_update(
             from_attributes,
             from_attrs_projected,
@@ -924,7 +932,7 @@ fn build_update_rows<S>(
     // removals (refs awscc#206).
     let mut removed_keys: Vec<_> = changed_attributes
         .iter()
-        .filter(|k| !display_attributes.contains_key(k.as_str()))
+        .filter(|k| !comparison_attributes.as_map().contains_key(k.as_str()))
         .collect();
     removed_keys.sort();
     for key in removed_keys {
@@ -940,13 +948,9 @@ fn build_update_rows<S>(
 
     // In Full mode, show count of unchanged attributes hidden
     if detail == DetailLevel::Full {
-        let displayed_attributes = display_attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
         let unchanged_count = compute_unchanged_count(
             from_attrs_projected,
-            &displayed_attributes,
+            comparison_attributes.as_map(),
             None,
             schema,
             &comparison,
@@ -1183,7 +1187,9 @@ fn project_from_attrs(
             &comparison,
         )
         .project_attributes(from_attributes.clone()),
-        None => crate::explicit::ProjectedAttributes::unprojected(from_attributes.clone(), None),
+        None => {
+            crate::explicit::ProjectedAttributes::unprojected(from_attributes.clone(), None, schema)
+        }
     }
 }
 
@@ -1209,7 +1215,7 @@ fn project_previous_attrs(
 
 fn build_attribute_diff_rows<S>(
     to: &crate::resource::Resource<S>,
-    to_attributes: &IndexMap<String, Value>,
+    to_attributes: &HashMap<String, Value>,
     ctx: AttributeDiffContext<'_>,
 ) -> AttributeDiffRows {
     let mut rows = Vec::new();
@@ -1478,11 +1484,13 @@ fn build_replace_rows_from_attributes<S>(
         comparison,
     );
     let from_attrs_projected = projected.attributes();
+    let comparison_attributes =
+        CanonicalComparisonAttributes::from_attributes(to.resolved_attributes(), schema);
     let force_keys: HashSet<&str> = changed_create_only.iter().map(|s| s.as_str()).collect();
 
     let attr_rows = build_attribute_diff_rows(
         to,
-        &to.attributes,
+        comparison_attributes.as_map(),
         AttributeDiffContext::for_replace(
             previous_attributes,
             from_attrs_projected,
@@ -1503,7 +1511,7 @@ fn build_replace_rows_from_attributes<S>(
     // Show removed create-only attributes.
     let mut removed_force_keys: Vec<_> = changed_create_only
         .iter()
-        .filter(|key| !to.attributes.contains_key(key.as_str()))
+        .filter(|key| !comparison_attributes.as_map().contains_key(key.as_str()))
         .collect();
     removed_force_keys.sort();
     for key in removed_force_keys {
@@ -1519,7 +1527,8 @@ fn build_replace_rows_from_attributes<S>(
     let mut removed_non_force_keys: Vec<_> = from_attrs_projected
         .keys()
         .filter(|key| {
-            !to.attributes.contains_key(key.as_str()) && !force_keys.contains(key.as_str())
+            !comparison_attributes.as_map().contains_key(key.as_str())
+                && !force_keys.contains(key.as_str())
         })
         .collect();
     removed_non_force_keys.sort();
@@ -1548,7 +1557,7 @@ fn build_replace_rows_from_attributes<S>(
     if detail == DetailLevel::Full {
         let unchanged_count = compute_unchanged_count(
             from_attrs_projected,
-            &to.resolved_attributes(),
+            comparison_attributes.as_map(),
             Some(&force_keys),
             schema,
             &comparison,
@@ -2631,6 +2640,132 @@ mod tests {
             prev_explicit.and_then(|map| map.get(&id)),
             crate::differ::exact_comparison_context_for_tests(),
         )
+    }
+
+    fn empty_struct_comparison_registry() -> SchemaRegistry {
+        use crate::schema::{AttributeSchema, StructField};
+
+        let config = AttributeType::struct_(
+            "Config",
+            vec![StructField::optional("label", AttributeType::string()).build()],
+        );
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "",
+            ResourceSchema::new("test.Widget")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                .attribute(AttributeSchema::optional("config", config.clone()).build())
+                .attribute(
+                    AttributeSchema::optional(
+                        "settings",
+                        AttributeType::struct_(
+                            "Settings",
+                            vec![
+                                StructField::optional("x", AttributeType::int()).build(),
+                                StructField::optional("config", config).build(),
+                            ],
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .expect("schema fixture must be valid"),
+        );
+        registry
+    }
+
+    #[test]
+    fn update_rows_do_not_render_top_level_absent_equivalent_struct() {
+        let id = ResourceId::with_identity("test.Widget", "example");
+        let from = State::existing(
+            id,
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("before".into())),
+            )]),
+        );
+        let to = Resource::new("test.Widget", "example")
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("after".into())),
+            )
+            .with_attribute(
+                "config",
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            );
+        let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("widget-id"),
+            from: Box::new(from),
+            to: resolved(to),
+            changed_attributes: vec!["name".to_string()],
+        };
+
+        let rows = build_detail_rows(
+            &effect,
+            Some(&empty_struct_comparison_registry()),
+            DetailLevel::Full,
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            rows.as_slice(),
+            [DetailRow::Changed { key, .. }] if key == "name"
+        ));
+    }
+
+    #[test]
+    fn update_rows_do_not_render_nested_absent_equivalent_struct() {
+        let settings = |include_config| {
+            let mut fields =
+                IndexMap::from([("x".to_string(), Value::Concrete(ConcreteValue::Int(1)))]);
+            if include_config {
+                fields.insert(
+                    "config".to_string(),
+                    Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let id = ResourceId::with_identity("test.Widget", "example");
+        let from = State::existing(
+            id,
+            HashMap::from([
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("before".into())),
+                ),
+                ("settings".to_string(), settings(false)),
+            ]),
+        );
+        let to = Resource::new("test.Widget", "example")
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("after".into())),
+            )
+            .with_attribute("settings", settings(true));
+        let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("widget-id"),
+            from: Box::new(from),
+            to: resolved(to),
+            changed_attributes: vec!["name".to_string()],
+        };
+
+        let rows = build_detail_rows(
+            &effect,
+            Some(&empty_struct_comparison_registry()),
+            DetailLevel::Full,
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            rows.as_slice(),
+            [
+                DetailRow::Changed { key, .. },
+                DetailRow::HiddenUnchanged { count: 1 }
+            ] if key == "name"
+        ));
     }
 
     fn resource_with_merged_default_tags(

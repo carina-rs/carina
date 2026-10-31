@@ -481,15 +481,17 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
         ResolvedResourceId::new(imported_id.clone()),
         Value::Concrete(ConcreteValue::String("provider-id".into())),
     );
+    let schemas = SchemaRegistry::new();
+    let desired = crate::resource::plan_input_desired_resources(&managed, &schemas);
 
     let plan = create_plan_with_cascades(
-        &managed,
+        &desired,
         &managed,
         &[],
         &ProviderRouter::new(),
         PlanPriorStates::new(&current, &orphans),
         &HashMap::new(),
-        &SchemaRegistry::new(),
+        &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &[],
@@ -2724,6 +2726,647 @@ fn explicit_top_level_removal_still_detected() {
         }
         _ => panic!("Expected Update for explicit-unset, got {:?}", result),
     }
+}
+
+#[test]
+fn plan_ignores_removed_required_struct_read_back_as_empty_map() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let desired = Resource::new("test.Widget", "example");
+    let id = desired.id.clone();
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(
+            id.clone(),
+            HashMap::from([(
+                "archive_policy".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            )]),
+        ),
+    )]);
+    let prev_explicit = HashMap::from([(id.clone(), explicit_top_level(&["archive_policy"]))]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional(
+                    "archive_policy",
+                    AttributeType::struct_(
+                        "ArchivePolicy",
+                        vec![StructField::required("retention_days", AttributeType::int()).build()],
+                    ),
+                )
+                .removable()
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+
+    let state = match current[&id].current() {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+        Current::CreateInFlight(_) | Current::CreateOutcomeUnknown(_) => {
+            panic!("fixture must carry provider state")
+        }
+    };
+    assert!(!state.attributes.contains_key("archive_policy"));
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &prev_explicit,
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(
+        plan.effects().is_empty(),
+        "an empty required-field struct from state must canonicalize to absence"
+    );
+}
+
+#[test]
+fn plan_drops_unwritten_empty_all_optional_struct_from_state() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let desired = Resource::new("test.Widget", "example");
+    let id = desired.id.clone();
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(
+            id.clone(),
+            HashMap::from([(
+                "config".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            )]),
+        ),
+    )]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional(
+                    "config",
+                    AttributeType::struct_(
+                        "Config",
+                        vec![StructField::optional("label", AttributeType::string()).build()],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+
+    let state = match current[&id].current() {
+        Current::Absent(state) => state.state(),
+        Current::Present(present) => present.state(),
+        Current::MissingIdentifier(state) => state.state(),
+        Current::CreateInFlight(_) | Current::CreateOutcomeUnknown(_) => {
+            panic!("fixture must carry provider state")
+        }
+    };
+    assert!(!state.attributes.contains_key("config"));
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+    assert!(plan.effects().is_empty());
+}
+
+#[test]
+fn plan_treats_authored_empty_all_optional_struct_and_empty_state_as_equal() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let empty = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let desired = Resource::new("test.Widget", "example").with_attribute("config", empty());
+    let id = desired.id.clone();
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(id.clone(), HashMap::from([("config".to_string(), empty())])),
+    )]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional(
+                    "config",
+                    AttributeType::struct_(
+                        "Config",
+                        vec![StructField::optional("label", AttributeType::string()).build()],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::from([(id, explicit_top_level(&["config"]))]),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(
+        plan.effects().is_empty(),
+        "desired empty struct must match state canonicalized to absence"
+    );
+}
+
+#[test]
+fn plan_converges_after_projection_empties_authored_top_level_struct() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let empty = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let desired = Resource::new("test.Widget", "example").with_attribute("config", empty());
+    let id = desired.id.clone();
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(
+            id.clone(),
+            HashMap::from([(
+                "config".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "label".to_string(),
+                    Value::Concrete(ConcreteValue::String("server-default".into())),
+                )]))),
+            )]),
+        ),
+    )]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional(
+                    "config",
+                    AttributeType::struct_(
+                        "Config",
+                        vec![StructField::optional("label", AttributeType::string()).build()],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+    let prev_explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "config".to_string(),
+            ExplicitFields::Struct {
+                children: HashMap::new(),
+            },
+        )]),
+    };
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::from([(id, prev_explicit)]),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(
+        plan.effects().is_empty(),
+        "a projected server default that leaves an empty struct must converge"
+    );
+}
+
+#[test]
+fn plan_converges_after_projection_empties_authored_nested_struct() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let empty = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let settings = |config: Value| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("x".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+            ("config".to_string(), config),
+        ])))
+    };
+    let desired =
+        Resource::new("test.Widget", "example").with_attribute("settings", settings(empty()));
+    let id = desired.id.clone();
+    let server_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "label".to_string(),
+        Value::Concrete(ConcreteValue::String("server-default".into())),
+    )])));
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(
+            id.clone(),
+            HashMap::from([("settings".to_string(), settings(server_config))]),
+        ),
+    )]);
+    let config_type = AttributeType::struct_(
+        "Config",
+        vec![StructField::optional("label", AttributeType::string()).build()],
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::optional("x", AttributeType::int()).build(),
+                            StructField::optional("config", config_type).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+    let prev_explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "settings".to_string(),
+            ExplicitFields::Struct {
+                children: HashMap::from([
+                    ("x".to_string(), ExplicitFields::Leaf),
+                    (
+                        "config".to_string(),
+                        ExplicitFields::Struct {
+                            children: HashMap::new(),
+                        },
+                    ),
+                ]),
+            },
+        )]),
+    };
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::from([(id, prev_explicit)]),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(
+        plan.effects().is_empty(),
+        "a nested projected server default that leaves an empty struct must converge"
+    );
+}
+
+#[test]
+fn plan_still_removes_projected_non_empty_authored_struct() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let desired = Resource::new("test.Widget", "example");
+    let id = desired.id.clone();
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(
+            id.clone(),
+            HashMap::from([(
+                "config".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "label".to_string(),
+                    Value::Concrete(ConcreteValue::String("authored".into())),
+                )]))),
+            )]),
+        ),
+    )]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional(
+                    "config",
+                    AttributeType::struct_(
+                        "Config",
+                        vec![StructField::optional("label", AttributeType::string()).build()],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+    let prev_explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "config".to_string(),
+            ExplicitFields::Struct {
+                children: HashMap::from([("label".to_string(), ExplicitFields::Leaf)]),
+            },
+        )]),
+    };
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::from([(id, prev_explicit)]),
+        &Orphans::new(),
+        &[],
+    );
+
+    let [
+        Effect::Update {
+            changed_attributes, ..
+        },
+    ] = plan.effects()
+    else {
+        panic!("removing an authored non-empty struct must update");
+    };
+    assert_eq!(changed_attributes, &["config".to_string()]);
+}
+
+#[test]
+fn plan_canonicalizes_nested_ignored_empty_structs_before_comparison() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let empty = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let mut desired = Resource::new("test.Widget", "example").with_attribute(
+        "settings",
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "cfg".to_string(),
+            empty(),
+        )]))),
+    );
+    desired.directives.ignore_changes = vec![ignore_path(&["settings", "cfg"])];
+    let id = desired.id.clone();
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(
+            id.clone(),
+            HashMap::from([("settings".to_string(), empty())]),
+        ),
+    )]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::optional(
+                                "cfg",
+                                AttributeType::struct_(
+                                    "Config",
+                                    vec![
+                                        StructField::optional("label", AttributeType::string())
+                                            .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(
+        plan.effects().is_empty(),
+        "comparison canonicalization must remove the nested empty struct before ignore_changes"
+    );
+    assert!(plan.ignored_change_summaries().is_empty());
+}
+
+#[test]
+fn plan_update_keeps_authored_empty_struct_in_provider_payload() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let empty = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let desired = Resource::new("test.Widget", "example").with_attribute("config", empty());
+    let id = desired.id.clone();
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(
+            id.clone(),
+            HashMap::from([(
+                "config".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "label".to_string(),
+                    Value::Concrete(ConcreteValue::String("configured".into())),
+                )]))),
+            )]),
+        ),
+    )]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional(
+                    "config",
+                    AttributeType::struct_(
+                        "Config",
+                        vec![StructField::optional("label", AttributeType::string()).build()],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::from([(id, explicit_top_level(&["config"]))]),
+        &Orphans::new(),
+        &[],
+    );
+
+    let [Effect::Update { to, .. }] = plan.effects() else {
+        panic!("changing a non-empty struct to an authored empty struct must update");
+    };
+    assert_eq!(to.get_attr("config"), Some(&empty()));
+}
+
+#[test]
+fn plan_updates_when_top_level_and_nested_zero_field_markers_disappear() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let empty = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let settings = |include_marker| {
+        let mut fields = IndexMap::from([(
+            "label".to_string(),
+            Value::Concrete(ConcreteValue::String("configured".into())),
+        )]);
+        if include_marker {
+            fields.insert("count".to_string(), empty());
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+    let desired = Resource::new("test.Widget", "example")
+        .with_attribute("count", empty())
+        .with_attribute("settings", settings(true));
+    let id = desired.id.clone();
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(
+            id.clone(),
+            HashMap::from([("settings".to_string(), settings(false))]),
+        ),
+    )]);
+    let marker = AttributeType::struct_("Count", Vec::new());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::optional("count", marker.clone()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::optional("label", AttributeType::string()).build(),
+                            StructField::optional("count", marker).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    let [
+        Effect::Update {
+            changed_attributes, ..
+        },
+    ] = plan.effects()
+    else {
+        panic!(
+            "missing markers must produce one Update, got {:#?}",
+            plan.effects()
+        );
+    };
+    assert!(changed_attributes.contains(&"count".to_string()));
+    assert!(changed_attributes.contains(&"settings".to_string()));
 }
 
 #[test]

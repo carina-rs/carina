@@ -5127,8 +5127,7 @@ fn is_string_or_list_of_strings(
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
-    let unwrapped = peel_custom(attr_type);
-    let Some(members) = crate::schema::union_members_with_defs(unwrapped, defs) else {
+    let Some(members) = crate::schema::union_members_with_defs(attr_type, defs) else {
         return false;
     };
     if members.len() != 2 {
@@ -5140,26 +5139,18 @@ fn is_string_or_list_of_strings(
         let Some(member) = member else {
             return false;
         };
-        match &peel_custom(member.as_attr()).kind {
+        match &member.as_attr().kind {
             AttrTypeKind::String { .. } => has_string = true,
             AttrTypeKind::List {
                 element_type: inner,
                 ..
-            } if matches!(
-                &peel_custom(inner.as_ref()).kind,
-                AttrTypeKind::String { .. }
-            ) =>
-            {
+            } if matches!(&inner.kind, AttrTypeKind::String { .. }) => {
                 has_list_of_string = true;
             }
             _ => return false,
         }
     }
     has_string && has_list_of_string
-}
-
-fn peel_custom(t: &AttributeType) -> &AttributeType {
-    t
 }
 
 /// Where a strict desired value came from. Both variants must be fully
@@ -5170,6 +5161,37 @@ fn peel_custom(t: &AttributeType) -> &AttributeType {
 pub(crate) enum DesiredValueSource {
     AuthoredDsl,
     ProviderOutput,
+}
+
+/// Result of canonicalizing a provider or persisted-state value.
+///
+/// `Absent` is distinct from an empty value so every state container walker
+/// must decide whether to remove its key. Desired-value canonicalization never
+/// produces `Absent`; authored empty objects remain available to providers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanonicalState<H: PlaceholderKind = crate::resource::NoPlaceholder> {
+    Present(Value<H>),
+    Absent,
+}
+
+impl<H: PlaceholderKind> CanonicalState<H> {
+    pub fn into_present(self) -> Option<Value<H>> {
+        match self {
+            Self::Present(value) => Some(value),
+            Self::Absent => None,
+        }
+    }
+
+    pub fn expect_present(self, context: &str) -> Value<H> {
+        self.into_present()
+            .unwrap_or_else(|| panic!("{context}: canonicalized value unexpectedly became absent"))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CanonicalizationPosition {
+    StateEntry,
+    CollectionElement,
 }
 
 /// Internal recursion policy. Public and crate-visible callers enter through
@@ -5386,7 +5408,9 @@ fn canonicalize_desired_with_type_and_ancestry<H: PlaceholderKind>(
         ancestry,
         CanonicalizationPurpose::Desired(source),
         RejectEnumResolutionErrors,
-    )?;
+        CanonicalizationPosition::StateEntry,
+    )?
+    .expect_present("desired canonicalization");
     if let Some(error) = unresolved_enum_identifier_type_error_in(&canonical) {
         return Err(error);
     }
@@ -5457,9 +5481,9 @@ pub(crate) fn canonicalize_state_attribute_value_with_schema(
     value: Value,
     schema: &crate::schema::ResourceSchema,
     attribute: &str,
-) -> Value {
+) -> CanonicalState {
     let Some(attribute_schema) = schema.attributes.get(attribute) else {
-        return value;
+        return CanonicalState::Present(value);
     };
     canonicalize_state_with_type_and_ancestry(
         value,
@@ -5483,6 +5507,7 @@ fn canonicalize_state_with_type(
         defs,
         crate::schema::FieldAncestry::WRITABLE,
     )
+    .expect_present("test helper")
 }
 
 pub(crate) fn canonicalize_state_with_type_and_ancestry(
@@ -5490,7 +5515,7 @@ pub(crate) fn canonicalize_state_with_type_and_ancestry(
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
-) -> Value {
+) -> CanonicalState {
     unwrap_infallible(canonicalize_with_type_for_purpose(
         value,
         attr_type,
@@ -5498,6 +5523,7 @@ pub(crate) fn canonicalize_state_with_type_and_ancestry(
         ancestry,
         CanonicalizationPurpose::State,
         PreserveEnumResolutionErrors,
+        CanonicalizationPosition::StateEntry,
     ))
 }
 
@@ -5514,7 +5540,9 @@ pub(crate) fn canonicalize_wait_rhs_with_type(
         effective_type.ancestry(),
         CanonicalizationPurpose::WaitRhs,
         PreserveEnumResolutionErrors,
+        CanonicalizationPosition::StateEntry,
     ))
+    .expect_present("wait RHS canonicalization")
 }
 
 fn canonicalize_with_type_for_purpose<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
@@ -5524,33 +5552,66 @@ fn canonicalize_with_type_for_purpose<H: PlaceholderKind, P: CanonicalizationErr
     ancestry: crate::schema::FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
-) -> Result<Value<H>, P::Error> {
+    position: CanonicalizationPosition,
+) -> Result<CanonicalState<H>, P::Error> {
     let mut visited_refs = Vec::new();
-    let unwrapped = peel_custom(
-        attr_type
-            .resolve_refs_with_defs_on_path(defs, &mut visited_refs)
-            .as_attr(),
-    );
+    let resolved_type = attr_type.resolve_refs_with_defs_on_path(defs, &mut visited_refs);
+    let resolved_attr = resolved_type.as_attr();
     if let Some(fit) = crate::schema::fit_value_to_resolved_type_on_path(
-        unwrapped,
+        resolved_attr,
         &value,
         defs,
         ancestry,
         purpose,
         &mut visited_refs,
     ) {
-        return canonicalize_with_fit(value, fit, defs, purpose, error_policy);
+        canonicalize_with_fit(value, fit, defs, purpose, error_policy)
+    } else {
+        canonicalize_without_fit(
+            value,
+            resolved_attr,
+            defs,
+            ancestry,
+            purpose,
+            error_policy,
+            &mut visited_refs,
+        )
     }
+    .map(|value| canonical_state_at_position(value, resolved_type, purpose, position))
+}
 
-    canonicalize_without_fit(
-        value,
-        unwrapped,
-        defs,
-        ancestry,
-        purpose,
-        error_policy,
-        &mut visited_refs,
-    )
+fn canonical_state_at_position<H: PlaceholderKind>(
+    value: Value<H>,
+    resolved_type: crate::schema::ResolvedAttrType<'_>,
+    purpose: CanonicalizationPurpose<'_>,
+    position: CanonicalizationPosition,
+) -> CanonicalState<H> {
+    if position == CanonicalizationPosition::StateEntry
+        && matches!(purpose, CanonicalizationPurpose::State)
+        && crate::schema::reads_as_absent(&value, resolved_type)
+    {
+        CanonicalState::Absent
+    } else {
+        CanonicalState::Present(value)
+    }
+}
+
+fn canonicalize_fit_for_purpose<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
+    value: Value<H>,
+    fit: crate::schema::Fit<'_>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    purpose: CanonicalizationPurpose<'_>,
+    error_policy: P,
+) -> Result<CanonicalState<H>, P::Error> {
+    let resolved_type = fit.attr;
+    canonicalize_with_fit(value, fit, defs, purpose, error_policy).map(|value| {
+        canonical_state_at_position(
+            value,
+            resolved_type,
+            purpose,
+            CanonicalizationPosition::StateEntry,
+        )
+    })
 }
 
 /// Consume a successful fit witness without re-validating any selected Union
@@ -5563,7 +5624,8 @@ fn canonicalize_with_fit<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
 ) -> Result<Value<H>, P::Error> {
-    if purpose.canonicalizes_full_shape() && is_string_or_list_of_strings(fit.attr, defs) {
+    if purpose.canonicalizes_full_shape() && is_string_or_list_of_strings(fit.attr.as_attr(), defs)
+    {
         return Ok(canonicalize_to_string_list(value));
     }
 
@@ -5673,10 +5735,12 @@ fn canonicalize_with_fit<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
             let fields = map
                 .into_iter()
                 .zip(fits)
-                .map(|((key, value), fit)| {
-                    let value = canonicalize_with_fit(value, fit, defs, purpose, error_policy)
-                        .map_err(|error| error_policy.at_struct_field(key.clone(), error))?;
-                    Ok((key, value))
+                .filter_map(|((key, value), fit)| {
+                    canonicalize_fit_for_purpose(value, fit, defs, purpose, error_policy)
+                        .map_err(|error| error_policy.at_struct_field(key.clone(), error))
+                        .map(CanonicalState::into_present)
+                        .transpose()
+                        .map(|result| result.map(|value| (key, value)))
                 })
                 .collect::<Result<IndexMap<_, _>, P::Error>>()?;
             Ok(Value::Concrete(ConcreteValue::Map(fields)))
@@ -5865,7 +5929,7 @@ fn canonicalize_without_fit<'a, H: PlaceholderKind, P: CanonicalizationErrorPoli
         {
             let canonical = canonicalize_without_fit(
                 value,
-                peel_custom(member),
+                member,
                 defs,
                 ancestry,
                 purpose,
@@ -5908,7 +5972,9 @@ fn canonicalize_without_fit<'a, H: PlaceholderKind, P: CanonicalizationErrorPoli
                         ancestry,
                         purpose,
                         error_policy,
+                        CanonicalizationPosition::CollectionElement,
                     )
+                    .map(|state| state.expect_present("list element canonicalization"))
                     .map_err(|error| error_policy.at_list_index(index, error))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -5938,7 +6004,9 @@ fn canonicalize_without_fit<'a, H: PlaceholderKind, P: CanonicalizationErrorPoli
                         ancestry,
                         purpose,
                         error_policy,
+                        CanonicalizationPosition::CollectionElement,
                     )
+                    .map(|state| state.expect_present("string-list element canonicalization"))
                     .map_err(|error| error_policy.at_list_index(index, error))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -5974,7 +6042,9 @@ fn canonicalize_without_fit<'a, H: PlaceholderKind, P: CanonicalizationErrorPoli
                         ancestry,
                         purpose,
                         error_policy,
+                        CanonicalizationPosition::CollectionElement,
                     )
+                    .map(|state| state.expect_present("map key canonicalization"))
                     .map_err(|error| error_policy.at_map_key(key.clone(), error))?;
                     let canonical_key = match canonical_map_key_text(canonical_key_value) {
                         Ok(canonical_key) => canonical_key,
@@ -5993,7 +6063,9 @@ fn canonicalize_without_fit<'a, H: PlaceholderKind, P: CanonicalizationErrorPoli
                         ancestry,
                         purpose,
                         error_policy,
+                        CanonicalizationPosition::CollectionElement,
                     )
+                    .map(|state| state.expect_present("map value canonicalization"))
                     .map_err(|error| error_policy.at_map_value(key.clone(), error))?;
                     Ok((key, canonical_key, canonical_value))
                 })
@@ -6014,21 +6086,23 @@ fn canonicalize_without_fit<'a, H: PlaceholderKind, P: CanonicalizationErrorPoli
                 .expect("Shape::Struct must expose struct fields internally");
             let canonicalized = map
                 .into_iter()
-                .map(|(key, value)| {
-                    let canonical =
-                        match crate::schema::struct_field_for_key(fields, &key, ancestry) {
-                            Some(field) => canonicalize_with_type_for_purpose(
-                                value,
-                                &field.field_type,
-                                defs,
-                                ancestry.descend(field),
-                                purpose,
-                                error_policy,
-                            )
-                            .map_err(|error| error_policy.at_struct_field(key.clone(), error))?,
-                            None => value,
-                        };
-                    Ok((key, canonical))
+                .filter_map(|(key, value)| {
+                    match crate::schema::struct_field_for_key(fields, &key, ancestry) {
+                        Some(field) => canonicalize_with_type_for_purpose(
+                            value,
+                            &field.field_type,
+                            defs,
+                            ancestry.descend(field),
+                            purpose,
+                            error_policy,
+                            CanonicalizationPosition::StateEntry,
+                        )
+                        .map_err(|error| error_policy.at_struct_field(key.clone(), error))
+                        .map(CanonicalState::into_present)
+                        .transpose()
+                        .map(|result| result.map(|value| (key, value))),
+                        None => Some(Ok((key, value))),
+                    }
                 })
                 .collect::<Result<IndexMap<_, _>, P::Error>>()?;
             finish_no_fit(
@@ -6399,12 +6473,26 @@ pub(crate) fn canonicalize_state_attribute_map_with_schema<Attributes>(
 {
     *attributes = std::mem::take(attributes)
         .into_iter()
-        .map(|(key, value)| {
-            let canonical = match schema.effective_attribute(&key) {
-                Some(attribute) => attribute.canonicalize_state(value),
-                None => value,
-            };
-            (key, canonical)
+        .filter_map(|(key, value)| match schema.effective_attribute(&key) {
+            Some(attribute) => attribute
+                .canonicalize_state(value)
+                .into_present()
+                .map(|value| (key, value)),
+            None => Some((key, value)),
+        })
+        .collect();
+}
+
+pub(crate) fn canonicalize_state_attribute_map_with_resource_schema(
+    attributes: &mut HashMap<String, Value>,
+    schema: &crate::schema::ResourceSchema,
+) {
+    *attributes = std::mem::take(attributes)
+        .into_iter()
+        .filter_map(|(key, value)| {
+            canonicalize_state_attribute_value_with_schema(value, schema, &key)
+                .into_present()
+                .map(|value| (key, value))
         })
         .collect();
 }
@@ -6508,7 +6596,9 @@ pub(crate) fn canonicalize_provider_config_with_type_and_ancestry<H: Placeholder
         ancestry,
         CanonicalizationPurpose::ProviderConfig { provider_name },
         RejectEnumResolutionErrors,
-    )?;
+        CanonicalizationPosition::StateEntry,
+    )?
+    .expect_present("provider config canonicalization");
     if let Some(error) = unresolved_enum_identifier_type_error_in(&canonical) {
         return Err(error);
     }
@@ -6688,6 +6778,10 @@ mod tests {
     type LoopValue = crate::resource::Value<LoopSlot>;
     type LoopDeferredValue = crate::resource::DeferredValue<LoopSlot>;
 
+    fn present_canonical_state(state: CanonicalState) -> Value {
+        state.expect_present("test fixture")
+    }
+
     #[derive(Debug, Clone, PartialEq, serde::Serialize)]
     struct DisplayMutablePlaceholder {
         identity: String,
@@ -6786,6 +6880,309 @@ mod tests {
             output.get("mode"),
             Some(Value::Concrete(ConcreteValue::StringList(values)))
                 if values == &[ValueString::from("api_value")]
+        ));
+    }
+
+    #[test]
+    fn state_canonicalization_cascades_without_a_fit_and_is_idempotent() {
+        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+
+        let archive_policy = AttributeType::struct_(
+            "ArchivePolicy",
+            vec![StructField::required("retention_days", AttributeType::int()).build()],
+        );
+        let schema = ResourceSchema::new("test.Widget")
+            .with_def("ArchivePolicy", archive_policy)
+            .attribute(
+                AttributeSchema::optional("archive_policy", AttributeType::ref_("ArchivePolicy"))
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::optional(
+                                "archive_policy",
+                                AttributeType::ref_("ArchivePolicy"),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid");
+        let empty_map = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+        let mut attributes = IndexMap::from([
+            ("archive_policy".to_string(), empty_map()),
+            (
+                "settings".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "archive_policy".to_string(),
+                    empty_map(),
+                )]))),
+            ),
+        ]);
+
+        assert_eq!(
+            schema
+                .effective_attribute("archive_policy")
+                .expect("archive_policy attribute")
+                .canonicalize_state(empty_map()),
+            CanonicalState::Absent,
+        );
+
+        canonicalize_state_attribute_map_with_schema(&mut attributes, &schema);
+
+        assert!(!attributes.contains_key("archive_policy"));
+        assert!(
+            !attributes.contains_key("settings"),
+            "the parent struct must become absent after its only child becomes absent"
+        );
+
+        let canonical_once = attributes.clone();
+        canonicalize_state_attribute_map_with_schema(&mut attributes, &schema);
+        assert_eq!(
+            attributes, canonical_once,
+            "state canonicalization must be idempotent"
+        );
+    }
+
+    #[test]
+    fn state_canonicalization_cascades_empty_required_struct_from_successful_fit() {
+        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "output",
+                    AttributeType::struct_(
+                        "Output",
+                        vec![
+                            StructField::optional(
+                                "archive_policy",
+                                AttributeType::struct_(
+                                    "ArchivePolicy",
+                                    vec![
+                                        StructField::required(
+                                            "retention_days",
+                                            AttributeType::int(),
+                                        )
+                                        .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid");
+        let mut attributes = IndexMap::from([(
+            "output".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "archive_policy".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            )]))),
+        )]);
+
+        canonicalize_state_attribute_map_with_schema(&mut attributes, &schema);
+
+        assert!(
+            !attributes.contains_key("output"),
+            "the fitted parent struct must become absent after its only child becomes absent"
+        );
+    }
+
+    #[test]
+    fn state_canonicalization_is_idempotent_when_dropping_a_required_field_changes_fit() {
+        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+
+        let settings_type = AttributeType::struct_(
+            "Settings",
+            vec![
+                StructField::required(
+                    "config",
+                    AttributeType::struct_(
+                        "Config",
+                        vec![StructField::optional("label", AttributeType::string()).build()],
+                    ),
+                )
+                .build(),
+                StructField::optional("keep", AttributeType::string()).build(),
+            ],
+        );
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::optional("settings", settings_type).build())
+            .validate()
+            .expect("schema fixture must be valid");
+        let settings = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "config".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            ),
+            (
+                "keep".to_string(),
+                Value::Concrete(ConcreteValue::String("present".into())),
+            ),
+        ])));
+        let mut visited_refs = Vec::new();
+        let attribute = &schema.as_schema().attributes["settings"];
+        let resolved = attribute
+            .attr_type
+            .resolve_refs_with_defs_on_path(&schema.as_schema().defs, &mut visited_refs);
+        assert!(
+            crate::schema::fit_value_to_resolved_type_on_path(
+                resolved.as_attr(),
+                &settings,
+                &schema.as_schema().defs,
+                crate::schema::FieldAncestry::from_input_mode(attribute.input_mode()),
+                CanonicalizationPurpose::State,
+                &mut visited_refs,
+            )
+            .is_some(),
+            "the first pass must exercise the fit worker"
+        );
+        let mut attributes = IndexMap::from([("settings".to_string(), settings)]);
+
+        canonicalize_state_attribute_map_with_schema(&mut attributes, &schema);
+        let canonical_once = attributes.clone();
+        let canonical_settings = &canonical_once["settings"];
+        let mut visited_refs = Vec::new();
+        assert!(
+            crate::schema::fit_value_to_resolved_type_on_path(
+                resolved.as_attr(),
+                canonical_settings,
+                &schema.as_schema().defs,
+                crate::schema::FieldAncestry::from_input_mode(attribute.input_mode()),
+                CanonicalizationPurpose::State,
+                &mut visited_refs,
+            )
+            .is_none(),
+            "dropping the required config field must route the second pass through no-fit"
+        );
+
+        canonicalize_state_attribute_map_with_schema(&mut attributes, &schema);
+        assert_eq!(attributes, canonical_once);
+    }
+
+    #[test]
+    fn state_canonicalization_drops_empty_all_optional_struct_and_keeps_zero_field_marker() {
+        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+
+        let optional_config = AttributeType::struct_(
+            "OptionalConfig",
+            vec![StructField::optional("label", AttributeType::string()).build()],
+        );
+        let marker = AttributeType::struct_("Marker", Vec::new());
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::optional("marker", marker.clone()).build())
+            .attribute(
+                AttributeSchema::optional("optional_config", optional_config.clone()).build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::optional("optional_config", optional_config).build(),
+                            StructField::optional("marker", marker).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid");
+        let mut attributes = IndexMap::from([
+            (
+                "marker".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            ),
+            (
+                "optional_config".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            ),
+            (
+                "settings".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    (
+                        "optional_config".to_string(),
+                        Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+                    ),
+                    (
+                        "marker".to_string(),
+                        Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+                    ),
+                ]))),
+            ),
+        ]);
+
+        let empty = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+        assert_eq!(
+            schema
+                .effective_attribute("optional_config")
+                .expect("optional_config attribute")
+                .canonicalize_state(empty.clone()),
+            CanonicalState::Absent,
+        );
+        assert_eq!(
+            schema
+                .effective_attribute("marker")
+                .expect("marker attribute")
+                .canonicalize_state(empty.clone()),
+            CanonicalState::Present(empty),
+        );
+
+        canonicalize_state_attribute_map_with_schema(&mut attributes, &schema);
+
+        assert!(attributes.contains_key("marker"));
+        assert!(!attributes.contains_key("optional_config"));
+        let Some(Value::Concrete(ConcreteValue::Map(settings))) = attributes.get("settings") else {
+            panic!("settings must remain a map");
+        };
+        assert!(!settings.contains_key("optional_config"));
+        assert!(settings.contains_key("marker"));
+    }
+
+    #[test]
+    fn reads_as_absent_owns_the_empty_value_and_resolved_struct_type_decision() {
+        use crate::schema::StructField;
+
+        let non_empty_struct = AttributeType::struct_(
+            "Config",
+            vec![StructField::optional("label", AttributeType::string()).build()],
+        );
+        let marker = AttributeType::struct_("Marker", Vec::new());
+        let map = AttributeType::map(AttributeType::string());
+        let defs = crate::schema::empty_defs_for_schema_walks();
+        let empty = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+        let populated = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "label".to_string(),
+            Value::Concrete(ConcreteValue::String("configured".into())),
+        )])));
+
+        assert!(crate::schema::reads_as_absent(
+            &empty,
+            non_empty_struct.resolve_refs_with_defs(defs),
+        ));
+        assert!(!crate::schema::reads_as_absent(
+            &populated,
+            non_empty_struct.resolve_refs_with_defs(defs),
+        ));
+        assert!(!crate::schema::reads_as_absent(
+            &empty,
+            marker.resolve_refs_with_defs(defs),
+        ));
+        assert!(!crate::schema::reads_as_absent(
+            &empty,
+            map.resolve_refs_with_defs(defs),
         ));
     }
 
@@ -12098,7 +12495,9 @@ mod tests {
             )])),
         );
 
-        let canon = schema.canonicalize_state(Value::Concrete(ConcreteValue::Map(policy)));
+        let canon = present_canonical_state(
+            schema.canonicalize_state(Value::Concrete(ConcreteValue::Map(policy))),
+        );
         let Value::Concrete(ConcreteValue::Map(policy)) = canon else {
             panic!("expected policy document map");
         };
@@ -12308,7 +12707,7 @@ mod tests {
         let value = Value::Concrete(ConcreteValue::Map(map));
 
         assert!(schema.validate(&value).is_ok());
-        let canon = schema.canonicalize_state(value);
+        let canon = present_canonical_state(schema.canonicalize_state(value));
         let Value::Concrete(ConcreteValue::Map(map)) = canon else {
             panic!("expected Map");
         };
@@ -12332,7 +12731,7 @@ mod tests {
         let value = Value::Concrete(ConcreteValue::String("x".into()));
 
         assert!(schema.validate(&value).is_ok());
-        let canon = schema.canonicalize_state(value);
+        let canon = present_canonical_state(schema.canonicalize_state(value));
         assert_eq!(
             canon,
             Value::Concrete(ConcreteValue::StringList(vec!["x".into()]))
@@ -12356,7 +12755,10 @@ mod tests {
         };
         let value = Value::Concrete(ConcreteValue::String("x".into()));
 
-        assert_eq!(schema.canonicalize_state(value.clone()), value);
+        assert_eq!(
+            present_canonical_state(schema.canonicalize_state(value.clone())),
+            value
+        );
     }
 
     #[test]
@@ -12413,7 +12815,7 @@ mod tests {
 
         assert!(schema.validate(&value).is_ok());
         assert_eq!(
-            schema.canonicalize_state(value),
+            present_canonical_state(schema.canonicalize_state(value)),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::List(vec![Value::Concrete(ConcreteValue::StringList(vec![
                     "x".into(),
