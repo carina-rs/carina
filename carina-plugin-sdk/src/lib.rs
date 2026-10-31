@@ -224,9 +224,29 @@ pub enum BindingPattern {
 pub struct Pending<T> {
     pub token: T,
     pub poll_after_secs: u32,
+    pub phase: carina_provider_protocol::PendingPhase,
 }
 
 pub use carina_provider_protocol::types::{PendingToken, Sent};
+pub use carina_provider_protocol::{PendingPhase, PollFinality, PollRequest};
+
+impl<T> Pending<T> {
+    pub fn operation(token: T, poll_after_secs: u32) -> Self {
+        Self {
+            token,
+            poll_after_secs,
+            phase: PendingPhase::Operation,
+        }
+    }
+
+    pub fn read_back(token: T, poll_after_secs: u32) -> Self {
+        Self {
+            token,
+            poll_after_secs,
+            phase: PendingPhase::ReadBack,
+        }
+    }
+}
 
 /// Initial-create typestate minted only by the guest transport.
 ///
@@ -270,6 +290,7 @@ impl CreateAttempt {
                 identifier: None,
                 sent,
                 poll_after_secs,
+                phase: PendingPhase::Operation,
             },
         ))
     }
@@ -288,6 +309,7 @@ impl CreateAttempt {
                     identifier: None,
                     sent,
                     poll_after_secs,
+                    phase: PendingPhase::Operation,
                 },
                 error,
             },
@@ -343,6 +365,7 @@ impl PollAttempt {
                 identifier: None,
                 sent: self.sent,
                 poll_after_secs,
+                phase: PendingPhase::Operation,
             },
         ))
     }
@@ -360,6 +383,7 @@ impl PollAttempt {
                     identifier: None,
                     sent: self.sent,
                     poll_after_secs,
+                    phase: PendingPhase::Operation,
                 },
                 error,
             },
@@ -391,12 +415,27 @@ impl IssuedCreate {
     }
 
     pub fn pending<T>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
+        self.pending_in_phase(token, poll_after_secs, PendingPhase::Operation)
+    }
+
+    /// Continue polling the post-create read after the identifier is known.
+    pub fn pending_read_back<T>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
+        self.pending_in_phase(token, poll_after_secs, PendingPhase::ReadBack)
+    }
+
+    fn pending_in_phase<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        phase: PendingPhase,
+    ) -> CreateStep<T> {
         CreateStep(carina_provider_protocol::types::CreateStep::Pending(
             carina_provider_protocol::types::PendingCreate {
                 token,
                 identifier: Some(self.identifier),
                 sent: self.sent,
                 poll_after_secs,
+                phase,
             },
         ))
     }
@@ -407,6 +446,25 @@ impl IssuedCreate {
         poll_after_secs: u32,
         error: ProviderError,
     ) -> CreateVerdict<T> {
+        self.preserve_in_phase(token, poll_after_secs, PendingPhase::Operation, error)
+    }
+
+    pub fn preserve_read_back<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        error: ProviderError,
+    ) -> CreateVerdict<T> {
+        self.preserve_in_phase(token, poll_after_secs, PendingPhase::ReadBack, error)
+    }
+
+    fn preserve_in_phase<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        phase: PendingPhase,
+        error: ProviderError,
+    ) -> CreateVerdict<T> {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::InFlight(
             carina_provider_protocol::types::CreateInFlight {
                 pending: carina_provider_protocol::types::PendingCreate {
@@ -414,6 +472,7 @@ impl IssuedCreate {
                     identifier: Some(self.identifier),
                     sent: self.sent,
                     poll_after_secs,
+                    phase,
                 },
                 error,
             },
@@ -546,6 +605,7 @@ impl ResumeAttempt {
                 token,
                 identifier: None,
                 poll_after_secs,
+                phase: PendingPhase::Operation,
             },
         ))
     }
@@ -556,12 +616,23 @@ impl ResumeAttempt {
         poll_after_secs: u32,
         error: ProviderError,
     ) -> ResumeVerdict<T> {
+        self.preserve_in_phase(token, poll_after_secs, PendingPhase::Operation, error)
+    }
+
+    fn preserve_in_phase<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        phase: PendingPhase,
+        error: ProviderError,
+    ) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::InFlight(
             carina_provider_protocol::types::ResumeInFlight {
                 pending: carina_provider_protocol::types::ResumePending {
                     token,
                     identifier: None,
                     poll_after_secs,
+                    phase,
                 },
                 error,
             },
@@ -627,11 +698,25 @@ impl ResumedCreate {
     }
 
     pub fn pending<T>(self, token: T, poll_after_secs: u32) -> ResumeStep<T> {
+        self.pending_in_phase(token, poll_after_secs, PendingPhase::Operation)
+    }
+
+    pub fn pending_read_back<T>(self, token: T, poll_after_secs: u32) -> ResumeStep<T> {
+        self.pending_in_phase(token, poll_after_secs, PendingPhase::ReadBack)
+    }
+
+    fn pending_in_phase<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        phase: PendingPhase,
+    ) -> ResumeStep<T> {
         ResumeStep(carina_provider_protocol::types::ResumeStep::Pending(
             carina_provider_protocol::types::ResumePending {
                 token,
                 identifier: Some(self.identifier),
                 poll_after_secs,
+                phase,
             },
         ))
     }
@@ -642,12 +727,32 @@ impl ResumedCreate {
         poll_after_secs: u32,
         error: ProviderError,
     ) -> ResumeVerdict<T> {
+        self.preserve_in_phase(token, poll_after_secs, PendingPhase::Operation, error)
+    }
+
+    pub fn preserve_read_back<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        error: ProviderError,
+    ) -> ResumeVerdict<T> {
+        self.preserve_in_phase(token, poll_after_secs, PendingPhase::ReadBack, error)
+    }
+
+    fn preserve_in_phase<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        phase: PendingPhase,
+        error: ProviderError,
+    ) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::InFlight(
             carina_provider_protocol::types::ResumeInFlight {
                 pending: carina_provider_protocol::types::ResumePending {
                     token,
                     identifier: Some(self.identifier),
                     poll_after_secs,
+                    phase,
                 },
                 error,
             },
@@ -1213,12 +1318,16 @@ pub trait CarinaProvider {
     /// Perform one short poll step for a pending create operation.
     ///
     /// The host passes the original request on every poll. This method may
-    /// return [`CreateOutcome::Pending`] again and must not wait in-call.
+    /// return a pending step again and must not wait in-call. When
+    /// `poll_request.finality` is [`PollFinality::FinalAttempt`], it must not
+    /// return another read-back pending step; finish with success, partial
+    /// success, or an error.
     fn poll_create(
         &self,
         id: &ResourceId,
         request: CreateRequest,
         poll: Poll<Self::CreateToken>,
+        poll_request: PollRequest,
     ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>>;
 
     /// Continue a create operation loaded from state.
@@ -1249,13 +1358,15 @@ pub trait CarinaProvider {
     ///
     /// The host passes the original request and identifier on every poll. This
     /// method may return [`UpdateOutcome::Pending`] again and must not wait
-    /// in-call.
+    /// in-call. A [`PollFinality::FinalAttempt`] request must not return
+    /// another read-back pending outcome.
     fn poll_update(
         &self,
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
         pending: Pending<Self::UpdateToken>,
+        poll_request: PollRequest,
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError>;
 
     /// Perform one short delete step.
@@ -1368,13 +1479,14 @@ pub fn dispatch_poll_create<P: CarinaProvider + ?Sized>(
     identifier: Option<AppliedIdentifier>,
     sent: Sent,
     token: P::CreateToken,
+    poll_request: PollRequest,
 ) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolPollVerdict<P::CreateToken>>> {
     let poll = match identifier {
         Some(identifier) => Poll::Issued(IssuedCreate::from_parts(identifier, sent), token),
         None => Poll::Unissued(PollAttempt::from_sent(sent), token),
     };
     provider
-        .poll_create(id, request, poll)
+        .poll_create(id, request, poll, poll_request)
         .map(CreateStep::into_protocol)
         .map_err(|verdict| Box::new(verdict.into_protocol()))
 }
@@ -1474,6 +1586,7 @@ mod tests {
             _id: &ResourceId,
             _request: CreateRequest,
             _poll: Poll<Self::CreateToken>,
+            _poll_request: PollRequest,
         ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
             unimplemented!("schema-only provider")
         }
@@ -1502,6 +1615,7 @@ mod tests {
             _identifier: &AppliedIdentifier,
             _request: UpdateRequest,
             _pending: Pending<Self::UpdateToken>,
+            _poll_request: PollRequest,
         ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
             unimplemented!("schema-only provider")
         }
@@ -1671,9 +1785,9 @@ mod tests {
                 .build(),
             )
             .validate()
-            .expect_err("a validated schema must always be projectable to protocol v13");
+            .expect_err("a validated schema must always be projectable to protocol v14");
 
-        assert!(error.to_string().contains("protocol v13"), "{error}");
+        assert!(error.to_string().contains("protocol v14"), "{error}");
     }
 
     #[test]

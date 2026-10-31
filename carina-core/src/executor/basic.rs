@@ -5,7 +5,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::binding_index::{ResolvedBindings, SecretPreservingAttributes};
+use crate::binding_index::{
+    AppliedOperation, BindingCompleteness, PartialReadBack, ResolvedBindings,
+    SecretPreservingAttributes,
+};
 use crate::differ::{AttrComparison, LeafProvenance, TypedAttr, secret_grafted_comparison_view};
 use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
 use crate::executor::provider_ready::{
@@ -542,13 +545,21 @@ fn unresolved_binding_message(
         ),
     };
 
-    let remediation = match bindings.source(referenced_binding) {
-        Some(crate::binding_index::BindingValueSource::Upstream) => format!(
-            "Binding `{referenced_binding}` comes from an `upstream_state` block, but the referenced export is not present in the upstream's saved state. \
-             Apply the upstream stack first, then re-run apply here. \
-             A `wait` block cannot be used here — `wait` only synchronizes on attributes of managed resources in this configuration."
+    let remediation = match bindings.completeness(referenced_binding) {
+        Some(BindingCompleteness::PartialReadBack(partial)) => format!(
+            "`{referenced_binding}` was {} but its read-back did not complete within the configured budget: {}. \
+             The value will be filled on the next apply or refresh.",
+            partial.operation().past_tense(),
+            partial.pending(),
         ),
-        _ => "At least one referenced binding has not been published yet; add a `wait` block on the upstream binding to synchronize before downstream resources read it.".to_string(),
+        _ => match bindings.source(referenced_binding) {
+            Some(crate::binding_index::BindingValueSource::Upstream) => format!(
+                "Binding `{referenced_binding}` comes from an `upstream_state` block, but the referenced export is not present in the upstream's saved state. \
+                 Apply the upstream stack first, then re-run apply here. \
+                 A `wait` block cannot be used here — `wait` only synchronizes on attributes of managed resources in this configuration."
+            ),
+            _ => "At least one referenced binding has not been published yet; add a `wait` block on the upstream binding to synchronize before downstream resources read it.".to_string(),
+        },
     };
 
     format!("{opener} {remediation}")
@@ -664,9 +675,12 @@ fn process_basic_outcome<S: Clone>(
             exec.accumulator.mutate(|accumulated| {
                 accumulated.success_count += 1;
                 if let Some(attrs) = &resolved_attrs {
-                    accumulated
-                        .bindings
-                        .record_applied(binding.as_deref(), attrs, &state);
+                    accumulated.bindings.record_applied(
+                        binding.as_deref(),
+                        attrs,
+                        &state,
+                        BindingCompleteness::Complete,
+                    );
                 }
             });
             let state = *state;
@@ -698,9 +712,12 @@ fn process_basic_outcome<S: Clone>(
             let state = completed.observed_state();
             exec.accumulator.mutate(|accumulated| {
                 accumulated.success_count += 1;
-                accumulated
-                    .bindings
-                    .record_applied(binding.as_deref(), &resolved_attrs, &state);
+                accumulated.bindings.record_applied(
+                    binding.as_deref(),
+                    &resolved_attrs,
+                    &state,
+                    BindingCompleteness::Complete,
+                );
             });
             exec.accumulator.insert_published(
                 resource_id,
@@ -728,12 +745,27 @@ fn process_basic_outcome<S: Clone>(
             resolved_attrs,
             binding,
         } => {
+            let operation = match request.kind() {
+                super::AcceptedRequestKind::Create => AppliedOperation::Create,
+                super::AcceptedRequestKind::Update { .. } => AppliedOperation::Update,
+            };
+            let pending = state
+                .partial_read
+                .as_ref()
+                .expect("a partial-success result carries a partial-read marker")
+                .pending()
+                .clone();
+            let completeness =
+                BindingCompleteness::PartialReadBack(PartialReadBack::new(operation, pending));
             exec.accumulator.mutate(|accumulated| {
                 accumulated.partial_count += 1;
                 if let Some(attrs) = &resolved_attrs {
-                    accumulated
-                        .bindings
-                        .record_applied(binding.as_deref(), attrs, &state);
+                    accumulated.bindings.record_applied(
+                        binding.as_deref(),
+                        attrs,
+                        &state,
+                        completeness,
+                    );
                 }
                 accumulated
                     .partial_diagnostics
@@ -1346,6 +1378,9 @@ mod process_basic_result_tests {
             pending_refreshes: &mut pending_refreshes,
         };
 
+        let resolved_attrs =
+            SecretPreservingAttributes::from_provider_values(&HashMap::new(), &HashMap::new());
+
         process_basic_outcome(
             BasicEffectResult::PartialSuccess {
                 completed: CompletedEffect {
@@ -1354,8 +1389,8 @@ mod process_basic_result_tests {
                 },
                 resource_id: id.clone(),
                 diagnostic: diagnostic.clone(),
-                resolved_attrs: None::<SecretPreservingAttributes>,
-                binding: None,
+                resolved_attrs: Some(resolved_attrs),
+                binding: Some("upstream".to_string()),
             },
             &mut exec,
         );
@@ -1395,6 +1430,16 @@ mod process_basic_result_tests {
             &crate::resource::PendingReRead::incomplete("mock partial create")
         );
         assert!(marker.missing_attributes().contains("computed"));
+        assert_eq!(
+            result.bindings.completeness("upstream"),
+            Some(&crate::binding_index::BindingCompleteness::PartialReadBack(
+                crate::binding_index::PartialReadBack::new(
+                    crate::binding_index::AppliedOperation::Create,
+                    crate::resource::PendingReRead::incomplete("mock partial create"),
+                ),
+            )),
+            "a partial read-back must not publish a complete binding snapshot",
+        );
     }
 }
 
@@ -1488,6 +1533,40 @@ mod assert_fully_resolved_tests {
             err.contains("wait"),
             "error must point at `wait` as the workaround; got: {err}",
         );
+    }
+
+    #[test]
+    fn partial_read_back_uses_operation_specific_guidance_without_wait_hint() {
+        for (operation, verb) in [
+            (crate::binding_index::AppliedOperation::Create, "created"),
+            (crate::binding_index::AppliedOperation::Update, "updated"),
+        ] {
+            let mut bindings = ResolvedBindings::default();
+            bindings.set_with_completeness(
+                "cert",
+                HashMap::new(),
+                BindingValueSource::Local,
+                crate::binding_index::BindingCompleteness::PartialReadBack(
+                    crate::binding_index::PartialReadBack::new(
+                        operation,
+                        crate::resource::PendingReRead::incomplete("DVO is not populated yet"),
+                    ),
+                ),
+            );
+
+            let error = assert_fully_resolved(&dvo_chained_ref(), "records", &bindings)
+                .expect_err("the partial read-back must keep the missing value unresolved");
+            assert!(
+                error.contains(&format!(
+                    "`cert` was {verb} but its read-back did not complete within the configured budget: read after apply was incomplete: DVO is not populated yet. The value will be filled on the next apply or refresh."
+                )),
+                "unexpected partial read-back guidance: {error}",
+            );
+            assert!(
+                !error.contains("wait"),
+                "partial read-back guidance must not suggest a wait block: {error}",
+            );
+        }
     }
 
     #[test]

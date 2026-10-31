@@ -1665,7 +1665,7 @@ fn schema_admission_checks_identified_types_inside_referenced_definitions() {
 }
 
 #[test]
-fn schema_admission_rejects_closed_enum_transform_not_representable_in_v13() {
+fn schema_admission_rejects_closed_enum_transform_not_representable_in_v14() {
     let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
     let error = admission_error(
         ResourceSchema::new("test.Widget").attribute(
@@ -1684,12 +1684,12 @@ fn schema_admission_rejects_closed_enum_transform_not_representable_in_v13() {
     );
 
     assert!(error.contains("test.widget.Mode"), "{error}");
-    assert!(error.contains("protocol v13"), "{error}");
+    assert!(error.contains("protocol v14"), "{error}");
     assert!(error.contains("transform"), "{error}");
 }
 
 #[test]
-fn config_schema_admission_enforces_scalar_and_v13_enum_invariants() {
+fn config_schema_admission_enforces_scalar_and_v14_enum_invariants() {
     let errors = ValidatedConfigSchema::validate(BTreeMap::from([
         (
             "non_scalar".to_string(),
@@ -1717,7 +1717,7 @@ fn config_schema_admission_enforces_scalar_and_v13_enum_invariants() {
 
     let rendered = errors.to_string();
     assert!(rendered.contains("scalar base"), "{rendered}");
-    assert!(rendered.contains("protocol v13"), "{rendered}");
+    assert!(rendered.contains("protocol v14"), "{rendered}");
 }
 
 #[test]
@@ -13063,6 +13063,7 @@ enum FingerprintChange {
     SchemaKind,
     UniqueName,
     OperationConfig,
+    ReadBackBudget,
     FieldGroup,
     WaitTimeout,
     WaitInterval,
@@ -13156,6 +13157,13 @@ fn schema_fingerprint_fixture_with(
         } else {
             Some(17)
         },
+        read_back: ReadBackBudget::from_secs(
+            if change == Some(FingerprintChange::ReadBackBudget) {
+                23
+            } else {
+                19
+            },
+        ),
     };
     let mut schema = ResourceSchema::new(if change == Some(FingerprintChange::ResourceType) {
         "test.WidgetV2"
@@ -13219,6 +13227,7 @@ fn schema_fingerprint_fixture_with(
             | FingerprintChange::SchemaKind
             | FingerprintChange::UniqueName
             | FingerprintChange::OperationConfig
+            | FingerprintChange::ReadBackBudget
             | FingerprintChange::FieldGroup
             | FingerprintChange::WaitTimeout
             | FingerprintChange::WaitInterval
@@ -13410,6 +13419,7 @@ fn resource_schema_semantic_fingerprint_covers_planning_and_apply_fields() {
         ("schema kind", FingerprintChange::SchemaKind),
         ("unique name", FingerprintChange::UniqueName),
         ("operation config", FingerprintChange::OperationConfig),
+        ("read-back budget", FingerprintChange::ReadBackBudget),
         ("field group", FingerprintChange::FieldGroup),
         ("wait timeout", FingerprintChange::WaitTimeout),
         ("wait interval", FingerprintChange::WaitInterval),

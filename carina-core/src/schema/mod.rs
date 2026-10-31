@@ -208,7 +208,7 @@ pub use carina_provider_protocol::types::{
     DslTransform, ReferenceForm, ReferenceTemplate, ReferenceTemplateError,
 };
 /// Per-resource operational configuration for provider timeouts and retries.
-pub use carina_provider_protocol::{OperationConfig, ValidatorType};
+pub use carina_provider_protocol::{OperationConfig, ReadBackBudget, ValidatorType};
 pub use resolved_attr_type::ResolvedAttrType;
 use resolved_union_members::UnionMemberTypes;
 pub use resolved_union_members::{ResolvedUnionMember, UnionMembers};
@@ -9225,7 +9225,7 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "closed enum `{identity}` has a DSL transform that protocol v13 cannot represent"
+                                "closed enum `{identity}` has a DSL transform that protocol v14 cannot represent"
                             ),
                         );
                     }
@@ -9243,7 +9243,7 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "closed enum `{identity}` has base metadata that protocol v13 cannot represent"
+                                "closed enum `{identity}` has base metadata that protocol v14 cannot represent"
                             ),
                         );
                     }
@@ -9254,7 +9254,7 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "open enum `{identity}` has DSL aliases that protocol v13 cannot represent"
+                                "open enum `{identity}` has DSL aliases that protocol v14 cannot represent"
                             ),
                         );
                     }
@@ -9262,7 +9262,7 @@ fn validate_identified_scalar_kind_consistency(
                         push_schema_issue(
                             issues,
                             &location,
-                            format!("open enum `{identity}` has no namespace for protocol v13"),
+                            format!("open enum `{identity}` has no namespace for protocol v14"),
                         );
                     }
                 }

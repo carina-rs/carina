@@ -1115,6 +1115,7 @@ impl fmt::Debug for PendingToken {
 struct PendingOperation {
     token: PendingToken,
     poll_after_secs: u32,
+    phase: proto::PendingPhase,
 }
 
 impl PendingOperation {
@@ -1122,10 +1123,12 @@ impl PendingOperation {
         let wit::PendingOperation {
             token,
             poll_after_secs,
+            phase,
         } = pending;
         Self {
             token: PendingToken(token),
             poll_after_secs,
+            phase: wit_to_core_pending_phase(phase),
         }
     }
 
@@ -1133,16 +1136,53 @@ impl PendingOperation {
         self.poll_after_secs
     }
 
+    fn phase(&self) -> proto::PendingPhase {
+        self.phase
+    }
+
     fn into_wit(self) -> wit::PendingOperation {
         let Self {
             token: PendingToken(token),
             poll_after_secs,
+            phase,
         } = self;
         wit::PendingOperation {
             token,
             poll_after_secs,
+            phase: core_to_wit_pending_phase(phase),
         }
     }
+}
+
+fn core_to_wit_pending_phase(phase: proto::PendingPhase) -> wit::PendingPhase {
+    match phase {
+        proto::PendingPhase::Operation => wit::PendingPhase::Operation,
+        proto::PendingPhase::ReadBack => wit::PendingPhase::ReadBack,
+    }
+}
+
+fn wit_to_core_pending_phase(phase: wit::PendingPhase) -> proto::PendingPhase {
+    match phase {
+        wit::PendingPhase::Operation => proto::PendingPhase::Operation,
+        wit::PendingPhase::ReadBack => proto::PendingPhase::ReadBack,
+    }
+}
+
+pub(crate) fn core_to_wit_poll_request(request: proto::PollRequest) -> wit::PollRequest {
+    let finality = match request.finality {
+        proto::PollFinality::Continue => wit::PollFinality::Continue,
+        proto::PollFinality::FinalAttempt => wit::PollFinality::FinalAttempt,
+    };
+    wit::PollRequest { finality }
+}
+
+#[cfg(test)]
+pub(crate) fn wit_to_core_poll_request(request: wit::PollRequest) -> proto::PollRequest {
+    let finality = match request.finality {
+        wit::PollFinality::Continue => proto::PollFinality::Continue,
+        wit::PollFinality::FinalAttempt => proto::PollFinality::FinalAttempt,
+    };
+    proto::PollRequest { finality }
 }
 
 #[derive(Clone)]
@@ -1151,6 +1191,10 @@ pub(crate) struct UpdatePendingOperation(PendingOperation);
 impl UpdatePendingOperation {
     pub(crate) fn poll_after_secs(&self) -> u32 {
         self.0.poll_after_secs()
+    }
+
+    pub(crate) fn phase(&self) -> proto::PendingPhase {
+        self.0.phase()
     }
 
     pub(crate) fn into_wit(self) -> wit::PendingOperation {
@@ -1164,6 +1208,10 @@ pub(crate) struct DeletePendingOperation(PendingOperation);
 impl DeletePendingOperation {
     pub(crate) fn poll_after_secs(&self) -> u32 {
         self.0.poll_after_secs()
+    }
+
+    pub(crate) fn phase(&self) -> proto::PendingPhase {
+        self.0.phase()
     }
 
     pub(crate) fn into_wit(self) -> wit::PendingOperation {
@@ -1289,6 +1337,7 @@ pub(crate) fn core_to_wit_pending_create(pending: &CorePendingCreate) -> wit::Pe
         pending.identifier(),
         pending.sent(),
         pending.poll_after_secs(),
+        pending.phase(),
     )
 }
 
@@ -1297,6 +1346,7 @@ pub(crate) fn core_to_wit_pending_create_parts(
     identifier: Option<&proto::AppliedIdentifier>,
     sent: &proto::Sent,
     poll_after_secs: u32,
+    phase: proto::PendingPhase,
 ) -> wit::PendingCreate {
     let sent = match sent {
         proto::Sent::AllRequestAttributes => wit::SentAttributes::All,
@@ -1308,6 +1358,7 @@ pub(crate) fn core_to_wit_pending_create_parts(
         operation: wit::PendingOperation {
             token: token.expose_for_provider_call().to_string(),
             poll_after_secs,
+            phase: core_to_wit_pending_phase(phase),
         },
         identifier: identifier.map(ToString::to_string),
         sent,
@@ -1322,6 +1373,7 @@ pub(crate) fn core_to_wit_resume_pending(
         operation: wit::PendingOperation {
             token: token.expose_for_provider_call().to_string(),
             poll_after_secs: 1,
+            phase: wit::PendingPhase::Operation,
         },
         identifier: identifier.map(ToString::to_string),
     }
@@ -1339,6 +1391,7 @@ fn wit_to_core_pending_create(
     let wit::PendingOperation {
         token,
         poll_after_secs,
+        phase,
     } = operation;
     let identifier = identifier
         .map(|identifier| decode_create_identifier(identifier, id))
@@ -1348,6 +1401,7 @@ fn wit_to_core_pending_create(
         identifier,
         sent: wit_to_core_sent(sent),
         poll_after_secs,
+        phase: wit_to_core_pending_phase(phase),
     })
 }
 
@@ -1362,6 +1416,7 @@ fn wit_to_core_resume_pending(
     let wit::PendingOperation {
         token,
         poll_after_secs,
+        phase,
     } = operation;
     let identifier = identifier
         .map(|identifier| decode_create_identifier(identifier, id))
@@ -1370,6 +1425,7 @@ fn wit_to_core_resume_pending(
         token: proto::PendingToken::new(token),
         identifier,
         poll_after_secs,
+        phase: wit_to_core_pending_phase(phase),
     })
 }
 
@@ -2011,6 +2067,34 @@ mod tests {
     }
 
     #[test]
+    fn pending_phase_and_poll_request_roundtrip_through_wit() {
+        for phase in [
+            proto::PendingPhase::Operation,
+            proto::PendingPhase::ReadBack,
+        ] {
+            let operation = PendingOperation {
+                token: PendingToken("opaque".to_string()),
+                poll_after_secs: 7,
+                phase,
+            };
+            let roundtrip = PendingOperation::from_wit(operation.into_wit());
+            assert_eq!(roundtrip.phase(), phase);
+            assert_eq!(roundtrip.poll_after_secs(), 7);
+        }
+
+        for finality in [
+            proto::PollFinality::Continue,
+            proto::PollFinality::FinalAttempt,
+        ] {
+            let request = proto::PollRequest { finality };
+            assert_eq!(
+                wit_to_core_poll_request(core_to_wit_poll_request(request)),
+                request,
+            );
+        }
+    }
+
+    #[test]
     fn reference_scope_transport_preserves_both_closed_variants() {
         let available = wit::ReferenceScope::Available(wit::ReferenceScopeValues {
             partition: "aws".to_string(),
@@ -2052,6 +2136,7 @@ mod tests {
             operation: wit::PendingOperation {
                 token: token.to_string(),
                 poll_after_secs: 7,
+                phase: wit::PendingPhase::Operation,
             },
             identifier: Some("resource-123".to_string()),
             sent: wit::SentAttributes::Only(vec!["name".to_string()]),
@@ -2135,6 +2220,7 @@ mod tests {
                     operation: wit::PendingOperation {
                         token: "resume-token".to_string(),
                         poll_after_secs: 11,
+                        phase: wit::PendingPhase::Operation,
                     },
                     identifier: Some("resource-456".to_string()),
                 },
@@ -4557,21 +4643,21 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v13_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 13);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 13);
+    fn test_protocol_version_range_is_v14_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 14);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 14);
     }
 
     #[test]
-    fn test_check_protocol_version_rejects_v12_provider() {
+    fn test_check_protocol_version_rejects_v13_provider() {
         let error = check_protocol_version(
-            r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":12}"#,
+            r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":13}"#,
         )
-        .expect_err("a v13 host must reject a v12 provider");
+        .expect_err("a v14 host must reject a v13 provider");
 
         assert!(error.contains("provider 'old'"));
-        assert!(error.contains("protocol version 12"));
-        assert!(error.contains("requires at least version 13"));
+        assert!(error.contains("protocol version 13"));
+        assert!(error.contains("requires at least version 14"));
     }
 
     #[test]

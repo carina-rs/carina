@@ -305,6 +305,7 @@ impl CarinaProvider for MockHttpProvider {
         _id: &ResourceId,
         _request: CreateRequest,
         _poll: Poll<Self::CreateToken>,
+        _poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
         unreachable!("the NaN fixture token cannot cross the guest boundary")
     }
@@ -337,6 +338,7 @@ impl CarinaProvider for MockHttpProvider {
         _identifier: &AppliedIdentifier,
         _request: UpdateRequest,
         pending: Pending<Self::UpdateToken>,
+        _poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
         match pending.token {}
     }

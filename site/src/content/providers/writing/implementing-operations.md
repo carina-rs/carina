@@ -62,7 +62,7 @@ use carina_plugin_sdk::core::schema::ReferenceForms;
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending, Poll,
-    PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
+    PollFinality, PollRequest, PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
 };
 use serde::{Deserialize, Serialize};
 
@@ -277,6 +277,7 @@ fn poll_create(
     id: &ResourceId,
     request: CreateRequest,
     poll: Poll<CreateToken>,
+    poll_request: PollRequest,
 ) -> Result<CreateStep<CreateToken>, PollVerdict<CreateToken>> {
     let (attempt, token) = match poll {
         Poll::Unissued(attempt, token) => (attempt, token),
@@ -291,8 +292,19 @@ fn poll_create(
                         error(ProviderErrorKind::ApiError, "widget vanished after create"),
                     )
                     .into()),
-                // A read error: try again on the next poll.
-                Err(_) => Ok(issued.pending(token, 5)),
+                // The deadline poll must finish. Preserve the applied state
+                // and tell Carina which value still needs a later refresh.
+                Err(_) if poll_request.finality == PollFinality::FinalAttempt => {
+                    Ok(issued.partial(
+                        request.resource.attributes,
+                        PartialReadDiagnostic {
+                            reason: "widget read-back is still pending".to_string(),
+                            missing_attributes: vec!["status".to_string()],
+                        },
+                    ))
+                }
+                // A read error before the deadline: try again in read-back phase.
+                Err(_) => Ok(issued.pending_read_back(token, 5)),
             };
         }
     };
@@ -332,7 +344,7 @@ fn poll_create(
                 // next poll, through the Poll::Issued arm above.
                 Ok(identifier) => Ok(attempt
                     .issued(identifier)
-                    .pending(CreateToken::Operation(operation), 0)),
+                    .pending_read_back(CreateToken::Operation(operation), 0)),
                 Err(err) => Err(attempt.preserve(
                     CreateToken::Operation(operation),
                     5,
@@ -375,7 +387,7 @@ A `Starting` token retries the create with the same client token. Because the AP
 
 A rejected retry is `preserve`, not `untracked`. The first call may have created the widget, and the API can refuse the reused token for reasons of its own, for example because the configuration changed before a later apply resumed the create. `preserve` carries the same continuation plus the error, so Carina keeps the attempt while surfacing why this poll stopped. Any other failure keeps the attempt pending.
 
-When the operation finishes, the provider calls `attempt.issued(identifier)` and returns `pending` once more. That records the identifier right away, and the next poll goes to the `Poll::Issued` arm, which reads the widget back and finishes with `succeeded`. A read that fails stays pending instead of turning a healthy widget into a failed create.
+When the operation finishes, the provider calls `attempt.issued(identifier)` and returns `pending_read_back` once more. That records the identifier right away, starts the host's read-back budget, and makes the next poll go to the `Poll::Issued` arm. `poll_request.finality` is `Continue` on ordinary polls and `FinalAttempt` on the one poll at the active deadline. Before that deadline a failed read remains `pending_read_back`; on the final attempt the provider must return success, partial success, or an error. Returning another read-back continuation is a protocol violation, so this example returns `partial` with the known state and missing attributes.
 
 A create for which the provider reported an identifier is `failed` with that identifier, so Carina records the identifier plus only observed or sent values, and the next plan re-checks it. `failed` also takes an `Observation`: what the provider saw when it read the widget, either `Observation::Read` with the read outcome or `Observation::ReadFailed` with the read error. The observation passed to `failed` says whether the resource was found and supplies any observed state Carina can record. `failed` returns a `CreateVerdict<CreateToken>`, and `.into()` turns it into the `PollVerdict<CreateToken>` that `poll_create` returns.
 
@@ -493,7 +505,7 @@ Treat "already gone" as success. Carina does not special-case a `NotFound` error
 
 ## Long-running update and delete
 
-`update` and `delete` can also return `Pending` with a token and `poll_after_secs`. The host then calls `poll_update` or `poll_delete` with the original request until the operation finishes or the resource's time budget runs out. The token rules are the same as for create. A provider that finishes every update and delete in one call sets the token types to `Never`, as this one does.
+`update` and `delete` can also return `Pending` with a token and `poll_after_secs`. The host then calls `poll_update` or `poll_delete` with the original request until the operation finishes or the resource's time budget runs out. `poll_update` receives the same `PollRequest` finality as `poll_create`, and update read-back uses `Pending::read_back`; `poll_delete` is unchanged. The token rules are the same as for create. A provider that finishes every update and delete in one call sets the token types to `Never`, as this one does.
 
 ## Secrets
 

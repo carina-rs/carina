@@ -1231,6 +1231,125 @@ async fn test_wasm_pending_create_polls_until_success() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_create_read_back_completes_within_budget() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "read-back-create", None);
+    let resource = resource_with_int_attribute(
+        "test.resource",
+        "read-back-create",
+        "create_read_back_pending_polls",
+        1,
+    );
+
+    let state = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect("read-back should settle within the default budget"),
+    );
+
+    assert_eq!(
+        state.attributes.get("computed"),
+        Some(&Value::Concrete(ConcreteValue::String("ready".into())))
+    );
+    assert!(state.partial_read.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_create_read_back_budget_returns_partial_then_refresh_completes() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "read-back-create-partial",
+        None,
+    );
+    let resource = resource_with_int_attribute(
+        "test.short_budget",
+        "read-back-create-partial",
+        "create_read_back_pending_polls",
+        100,
+    );
+
+    let outcome = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect("the final attempt should return a partial success");
+    let diagnostic = outcome
+        .diagnostic()
+        .expect("budget exhaustion must keep the partial-read diagnostic");
+    assert_eq!(diagnostic.missing_attributes(), &["computed".to_string()]);
+    let partial = create_state_for_writeback(outcome);
+    assert!(partial.partial_read.is_some());
+    assert_eq!(partial.identifier.as_deref(), Some("mock-id"));
+
+    let refreshed = provider
+        .provider()
+        .read(&id, &mock_identifier(), ReadRequest)
+        .await
+        .expect("the next refresh should re-read the created resource")
+        .into_state();
+    assert_eq!(
+        refreshed.attributes.get("computed"),
+        Some(&Value::Concrete(ConcreteValue::String("ready".into())))
+    );
+    assert!(refreshed.partial_read.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_create_read_back_pending_after_final_preserves_identifier() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "read-back-create-violation",
+        None,
+    );
+    let mut resource = resource_with_int_attribute(
+        "test.short_budget",
+        "read-back-create-violation",
+        "create_read_back_pending_polls",
+        100,
+    );
+    resource.set_attr(
+        "create_read_back_pending_after_final",
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+
+    let failure = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("pending/read-back after final-attempt is a protocol violation")
+        .into_kind();
+    let CreateFailureKind::InFlight { pending, error } = failure else {
+        panic!("an issued read-back violation must remain recoverable")
+    };
+    assert_eq!(
+        pending.identifier().map(AppliedIdentifier::as_str),
+        Some("mock-id")
+    );
+    assert!(error.to_string().contains("final-attempt"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_pending_update_polls_until_success() {
     const PENDING_POLLS: u32 = 2;
 
@@ -1278,6 +1397,114 @@ async fn test_wasm_pending_update_polls_until_success() {
             PENDING_POLLS
         ))))
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_update_read_back_completes_within_budget() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "read-back-update", None);
+    let mut resource = resource_with_int_attribute("test.resource", "read-back-update", "value", 1);
+    let created = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource.clone()).await)
+            .await
+            .expect("setup create should succeed"),
+    );
+    resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
+    resource.set_attr(
+        "update_read_back_pending_polls",
+        Value::Concrete(ConcreteValue::Int(1)),
+    );
+    let request = update_request_for_test(
+        resource,
+        created,
+        &[
+            "value".to_string(),
+            "update_read_back_pending_polls".to_string(),
+        ],
+    )
+    .await;
+
+    let state = provider
+        .provider()
+        .update(&id, &mock_identifier(), request)
+        .await
+        .expect("update read-back should settle within the default budget")
+        .into_state_for_writeback();
+    assert_eq!(
+        state.attributes.get("computed"),
+        Some(&Value::Concrete(ConcreteValue::String("ready".into())))
+    );
+    assert!(state.partial_read.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_update_read_back_budget_returns_partial_then_refresh_completes() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "read-back-update-partial",
+        None,
+    );
+    let mut resource =
+        resource_with_int_attribute("test.short_budget", "read-back-update-partial", "value", 1);
+    let created = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource.clone()).await)
+            .await
+            .expect("setup create should succeed"),
+    );
+    resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
+    resource.set_attr(
+        "update_read_back_pending_polls",
+        Value::Concrete(ConcreteValue::Int(100)),
+    );
+    let request = update_request_for_test(
+        resource,
+        created,
+        &[
+            "value".to_string(),
+            "update_read_back_pending_polls".to_string(),
+        ],
+    )
+    .await;
+
+    let outcome = provider
+        .provider()
+        .update(&id, &mock_identifier(), request)
+        .await
+        .expect("the final update attempt should return a partial success");
+    let diagnostic = outcome
+        .diagnostic()
+        .expect("budget exhaustion must keep the partial-read diagnostic");
+    assert_eq!(diagnostic.missing_attributes(), &["computed".to_string()]);
+    let partial = outcome.into_state_for_writeback();
+    assert!(partial.partial_read.is_some());
+
+    let refreshed = provider
+        .provider()
+        .read(&id, &mock_identifier(), ReadRequest)
+        .await
+        .expect("the next refresh should re-read the updated resource")
+        .into_state();
+    assert_eq!(
+        refreshed.attributes.get("computed"),
+        Some(&Value::Concrete(ConcreteValue::String("ready".into())))
+    );
+    assert!(refreshed.partial_read.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2065,7 +2292,10 @@ async fn test_wasm_operation_budget_includes_initial_guest_call() {
     );
     resource.set_attr(
         "create_pending_polls",
-        Value::Concrete(ConcreteValue::Int(1)),
+        // The slow initial call reaches the operation deadline. Protocol v14
+        // still grants exactly one final poll, so keep the mock pending after
+        // that poll to verify that the initial call consumed the budget.
+        Value::Concrete(ConcreteValue::Int(2)),
     );
 
     let error = provider

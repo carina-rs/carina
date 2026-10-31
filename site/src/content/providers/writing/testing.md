@@ -19,6 +19,7 @@ mod tests {
         CreateStep as WireCreateStep, CreateVerdict as WireCreateVerdict,
         PollVerdict as WirePollVerdict,
     };
+    use carina_plugin_sdk::{PollFinality, PollRequest};
     use std::cell::RefCell;
 
     /// An in-memory API that records what the provider asked for.
@@ -101,6 +102,7 @@ mod tests {
             pending.identifier,
             pending.sent,
             pending.token,
+            PollRequest { finality: PollFinality::Continue },
         )
         .expect("poll should not fail")
     }
@@ -181,6 +183,7 @@ mod tests {
             pending.identifier,
             pending.sent,
             pending.token,
+            PollRequest { finality: PollFinality::Continue },
         )
         .expect_err("a rejected retry must not succeed");
         let WirePollVerdict::InFlight(in_flight) = *verdict else {

@@ -1,5 +1,35 @@
 # Provider protocol versions
 
+## Version 14
+
+Protocol v14 separates an asynchronous mutation from its post-mutation
+read-back. Every `pending-operation` now carries a `pending-phase`, either
+`operation` or `read-back`. `poll-create` and `poll-update` also receive a
+`poll-request` whose `finality` is `continue` or `final-attempt`.
+
+The host starts the operation's existing deadline before the initial call.
+The read-back deadline starts only when the first `read-back` pending result
+arrives and is the earlier of that time plus the resource's read-back budget
+and the operation deadline. The schema may set a typed, non-zero
+`operation_config.read_back.timeout_secs`; otherwise the host uses two
+minutes. The read-back budget never extends or adds to the 15-minute default
+operation budget. Poll delays remain clamped to 1–300 seconds against the
+active deadline.
+
+At the active deadline the host sends exactly one `final-attempt`. A create or
+update provider must finish with success, partial success, or an error; it
+must not return another `pending/read-back`. Doing so is a protocol violation.
+For create, the host retains the known identifier and continuation in recovery
+state. Providers should return partial success when the mutation is known to
+have completed but the final read still lacks attributes. Core records the
+partial-read marker, does not publish the binding as complete, and retries the
+read on the next apply or refresh.
+
+`OperationConfig.read_back` participates in semantic schema fingerprint
+encoding v6. Provider protocol and minimum supported protocol are both 14;
+v13 providers are rejected because they cannot receive poll finality or
+distinguish operation pending from read-back pending.
+
 ## Version 13
 
 Protocol v13 makes initialized reference scope, provider-declared reference
