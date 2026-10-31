@@ -108,6 +108,7 @@ use carina_core::executor::{
     ProviderReadyConfig, UnresolvedDataSourceInput, UnresolvedResource,
     prepare_provider_ready_config, unresolved_data_source_inputs,
 };
+use carina_core::hint::ProjectCommand;
 use carina_core::identifier::{
     self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
 };
@@ -972,13 +973,10 @@ impl ProviderLoad {
         providers: &[ProviderConfig<P>],
         base_dir: &Path,
     ) -> (ReportingProviderLoad, Option<AppError>) {
-        match Self::load(user_dirs, providers, base_dir) {
-            Ok(Self {
-                context,
-                load_errors,
-            }) => (
+        match build_schema_factories_from_providers(user_dirs, providers, base_dir) {
+            Ok((factories, load_errors)) => (
                 ReportingProviderLoad {
-                    context,
+                    context: WiringContext::new(factories, providers),
                     load_errors,
                 },
                 None,
@@ -1787,6 +1785,12 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
 /// Provider factories paired with provider-specific load diagnostics.
 type ProviderFactoryLoad = (Vec<LoadedProviderFactory>, HashMap<String, String>);
 
+#[derive(Clone, Copy)]
+enum ProviderFactoryNetwork {
+    SchemaOnly,
+    Runtime,
+}
+
 #[derive(Debug)]
 pub(crate) enum ProviderFactoryDiagnostic {
     LockConstraint(carina_provider_resolver::LockConstraintError),
@@ -2046,7 +2050,30 @@ fn build_factories_from_providers<P: PlaceholderKind>(
     let providers = provider_loading_configs(providers);
     carina_provider_resolver::validate_lock_constraints(base_dir, &providers)?;
 
-    build_factories_from_providers_impl(user_dirs, &providers, base_dir, true)
+    build_factories_from_providers_impl(
+        user_dirs,
+        &providers,
+        base_dir,
+        true,
+        ProviderFactoryNetwork::Runtime,
+    )
+}
+
+fn build_schema_factories_from_providers<P: PlaceholderKind>(
+    user_dirs: &carina_core::UserDirs,
+    providers: &[ProviderConfig<P>],
+    base_dir: &Path,
+) -> Result<ProviderFactoryLoad, AppError> {
+    let providers = provider_loading_configs(providers);
+    carina_provider_resolver::validate_lock_constraints(base_dir, &providers)?;
+
+    build_factories_from_providers_impl(
+        user_dirs,
+        &providers,
+        base_dir,
+        true,
+        ProviderFactoryNetwork::SchemaOnly,
+    )
 }
 
 /// Best-effort factory loading for schema-aware formatting.
@@ -2072,8 +2099,13 @@ fn build_factories_from_providers_for_formatting<P: PlaceholderKind>(
         ));
     }
 
-    let (factories, load_errors) =
-        build_factories_from_providers_impl(user_dirs, &providers, base_dir, false)?;
+    let (factories, load_errors) = build_factories_from_providers_impl(
+        user_dirs,
+        &providers,
+        base_dir,
+        false,
+        ProviderFactoryNetwork::SchemaOnly,
+    )?;
     Ok((
         factories,
         load_errors
@@ -2088,6 +2120,7 @@ fn build_factories_from_providers_impl(
     providers: &[ProviderConfig],
     base_dir: &Path,
     report_errors: bool,
+    network: ProviderFactoryNetwork,
 ) -> Result<ProviderFactoryLoad, AppError> {
     #[cfg(test)]
     record_tracked_provider_load();
@@ -2095,6 +2128,7 @@ fn build_factories_from_providers_impl(
     let grant_inputs =
         TRUSTED_LOCAL_GRANT_INPUTS.get_or_init(|| TrustedLocalGrantInputs::new(Vec::new(), None));
     let loader_user_dirs = user_dirs.clone();
+    let loader_project_dir = base_dir.to_path_buf();
     build_factories_from_providers_impl_using(
         user_dirs,
         providers,
@@ -2103,8 +2137,24 @@ fn build_factories_from_providers_impl(
         grant_inputs,
         move |verified| {
             let user_dirs = loader_user_dirs.clone();
+            let project_dir = loader_project_dir.clone();
             async move {
-                carina_plugin_host::WasmProviderFactory::from_bytes(verified, &user_dirs).await
+                match network {
+                    ProviderFactoryNetwork::SchemaOnly => {
+                        carina_plugin_host::WasmProviderFactory::from_bytes(verified, &user_dirs)
+                            .await
+                    }
+                    ProviderFactoryNetwork::Runtime => {
+                        let locked_egress =
+                            carina_provider_resolver::load_locked_egress(&project_dir, &verified)?;
+                        carina_plugin_host::WasmProviderFactory::from_bytes_with_egress(
+                            verified,
+                            &user_dirs,
+                            locked_egress.as_ref(),
+                        )
+                        .await
+                    }
+                }
             }
         },
     )
@@ -2206,7 +2256,14 @@ where
                 // Final UI boundary: `ProviderArtifactLoadError::Display`
                 // renders the structured host chain first, followed by the
                 // resolver-owned provenance and mode-accurate hint.
-                let reason = error.to_string();
+                let reason = if matches!(
+                    error.loader_error(),
+                    Some(carina_plugin_host::WasmProviderLoadError::EgressConsent(_))
+                ) {
+                    format!("{error}\nRun `{}`.", ProjectCommand::new("init", base_dir))
+                } else {
+                    error.to_string()
+                };
                 if report_errors {
                     eprintln!("{}", reason.red());
                 }
@@ -3994,6 +4051,9 @@ fn source_provider_kind_mismatch_from_load_error(
             provider_source: source.to_string(),
         }),
         carina_plugin_host::WasmProviderLoadError::PrecompiledDeserialization(_)
+        | carina_plugin_host::WasmProviderLoadError::EgressDeclaration(_)
+        | carina_plugin_host::WasmProviderLoadError::EgressLock(_)
+        | carina_plugin_host::WasmProviderLoadError::EgressConsent(_)
         | carina_plugin_host::WasmProviderLoadError::Instantiation(_)
         | carina_plugin_host::WasmProviderLoadError::Metadata { .. }
         | carina_plugin_host::WasmProviderLoadError::Other(_) => None,

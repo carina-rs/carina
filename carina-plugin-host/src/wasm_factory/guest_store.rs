@@ -10,7 +10,7 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use super::{
-    AllowListHttpHooks, CallEgressRecorder, HttpTestRoute, ProviderKind, ProviderLabel,
+    AllowListHttpHooks, CallEgressRecorder, GuestNetwork, HttpTestRoute, ProviderLabel,
     build_sandboxed_wasi_ctx,
 };
 
@@ -177,25 +177,25 @@ impl GuestStore {
     pub(super) fn new(
         engine: &Engine,
         label: Arc<ProviderLabel>,
-        kind: Option<ProviderKind>,
+        network: GuestNetwork,
         http_ctx: Option<WasiHttpCtx>,
         limits: StoreLimits,
         budget: GuestCallBudget,
     ) -> Self {
-        Self::new_with_http_test_route(engine, label, kind, http_ctx, limits, budget, None)
+        Self::new_with_http_test_route(engine, label, network, http_ctx, limits, budget, None)
     }
 
     pub(super) fn new_with_http_test_route(
         engine: &Engine,
         label: Arc<ProviderLabel>,
-        kind: Option<ProviderKind>,
+        network: GuestNetwork,
         http_ctx: Option<WasiHttpCtx>,
         limits: StoreLimits,
         budget: GuestCallBudget,
         http_test_route: Option<HttpTestRoute>,
     ) -> Self {
-        let wasi_ctx = build_sandboxed_wasi_ctx(kind);
-        let http_hooks = AllowListHttpHooks::with_test_route(label, kind, http_test_route);
+        let wasi_ctx = build_sandboxed_wasi_ctx(network.kind());
+        let http_hooks = AllowListHttpHooks::with_test_route(label, network, http_test_route);
         let host_state = HostState {
             wasi_ctx,
             http_ctx,
@@ -308,6 +308,7 @@ mod tests {
             name: "guest-store-test".to_string(),
             source: carina_provider_resolver::ProviderLoadSource::LocalFile {
                 path: std::path::PathBuf::from("/test-providers/guest-store-test.wasm"),
+                canonical_source: std::path::PathBuf::from("guest-store-test.wasm"),
             },
         })
     }
@@ -321,7 +322,7 @@ mod tests {
         let mut store = GuestStore::new(
             &engine,
             test_provider_label(),
-            None,
+            GuestNetwork::SchemaOnly,
             None,
             limits,
             GuestCallBudget::new(Duration::from_secs(30), Duration::from_millis(20)),

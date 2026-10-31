@@ -14,13 +14,50 @@ A provider is a [WebAssembly component](https://component-model.bytecodealliance
 | World | Use it when |
 |-------|-------------|
 | `carina-provider` | The provider needs no network access. |
-| `carina-provider-with-http` | The provider calls an HTTP API through `wasi:http`. Only AWS hosts are reachable today; see below. |
+| `carina-provider-with-http` | The provider calls an HTTP API through `wasi:http` and declares the hosts it may reach. |
 
 You do not write WIT bindings by hand. The `carina-plugin-sdk` crate defines a `CarinaProvider` trait, and its `export_provider!` macro generates the bindings and connects them to your implementation. The SDK re-exports the request and schema types from `carina-provider-protocol`.
 
-`export_provider!(MyProvider)` exports `carina-provider`. To export `carina-provider-with-http`, write `export_provider!(MyProvider, http)` and add the `wasi` crate (version 0.14) to the provider's `wasm32` dependencies, because the generated bindings refer to it. The SDK's `carina_plugin_sdk::wasi_http::send_request` then sends an `http::Request` through the host.
+`export_provider!(MyProvider)` exports `carina-provider`. To export `carina-provider-with-http`, declare every hostname the provider may contact:
 
-The host checks every outgoing request against a fixed allow-list. Hosts ending in `.amazonaws.com` or `.amazonaws.com.cn` are reachable, while the EC2 and ECS metadata addresses are reachable only by providers the host trusts as AWS. It denies any other host, and neither a provider nor a configuration can extend the list yet, so a provider for a non-AWS API cannot reach that API today. The EKS Pod Identity endpoints (`169.254.170.23` and `fd00:ec2::23`) and arbitrary hosts named by `AWS_CONTAINER_CREDENTIALS_FULL_URI` are not reachable. This is tracked in [carina#4021](https://github.com/carina-rs/carina/issues/4021).
+```rust
+carina_plugin_sdk::export_provider!(
+    MyProvider,
+    http,
+    egress: ["api.example.com", "*.service.example.com"],
+);
+```
+
+Add the `wasi` crate (version 0.14) to the provider's `wasm32` dependencies, because the generated bindings refer to it. The SDK's `carina_plugin_sdk::wasi_http::send_request` then sends an `http::Request` through the host.
+
+The HTTP form embeds a versioned `carina:egress` custom section in the component. The declaration is mandatory. The host reads it from the exact bytes being loaded and permits only consented patterns:
+
+- `api.example.com` matches exactly that host.
+- `*.example.com` matches one label, such as `api.example.com`, but not `v1.api.example.com`.
+- `**.example.com` matches one or more labels at any depth below `example.com`. It does not match `example.com` itself.
+
+Wildcards are allowed only as the complete leftmost label and cannot sit directly above a public suffix. IP literals, localhost, metadata and link-local names, non-ASCII labels, empty labels, and labels longer than 63 bytes are rejected. DNS resolution is checked separately: loopback, unspecified, and link-local addresses are always denied; metadata is withheld except for a provider kind's own endpoints (currently AWS IMDS and ECS endpoints for AWS-kind providers); and Alibaba or Azure metadata is always withheld. Private IPv4, IPv6, and CGNAT addresses are denied except for AWS-kind providers, which need them for VPC interface endpoints and PrivateLink.
+
+In native provider tests, validate declaration patterns with `carina_plugin_sdk::protocol::HostPattern::parse`.
+
+`carina init` copies the normalized declaration into `carina-providers.lock`. A declaration from a verified, allow-listed `carina-rs` provider is recorded without a prompt. Other providers require explicit consent; see [`carina init`](/reference/cli/init/#provider-egress-consent). Runtime operations fail closed when the record is absent or stale, while schema loading for `validate`, `fmt`, and the LSP never receives network access.
+
+### Non-Rust components
+
+`wasm-tools` 1.246 does not have a command that adds an arbitrary custom section. Add the annotation to the language toolchain's core module in text form before wrapping it as a component:
+
+```bash
+# core.wasm: the language toolchain's core module output
+wasm-tools print core.wasm > core.wat
+# Insert this annotation before the module's final ")":
+#   (@custom "carina:egress" "{\"version\":1,\"hosts\":[\"api.example.com\"]}")
+wasm-tools parse core.wat -o core-with-egress.wasm
+wasm-tools component embed carina-plugin-wit/wit --world carina-provider-with-http \
+  core-with-egress.wasm -o embedded.wasm
+wasm-tools component new embedded.wasm -o provider.wasm
+```
+
+For a toolchain that already emits a component, add the same annotation to its core module before `component new`. Do not run `wasm-tools strip` on the finished provider unless the command is configured to preserve `carina:egress`; both the default strip operation and `strip --all` remove the declaration, and an HTTP provider without it is rejected at load time.
 
 ## How the host calls a provider
 

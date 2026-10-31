@@ -6669,7 +6669,7 @@ mod run_plan_out_tests {
         .to_string();
 
         assert!(
-            error.contains("Failed to load WASM component"),
+            error.contains("failed to read provider component"),
             "the provider load diagnostic must survive planning: {error}"
         );
         assert!(

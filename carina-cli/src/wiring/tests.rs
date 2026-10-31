@@ -12095,6 +12095,37 @@ mod kind_default_source_tests {
 /// must combine the host's structured instantiation diagnostic with the
 /// resolver's typed lock provenance. Neither half may be re-derived at a
 /// command-specific consumer.
+fn push_test_leb128_u32(bytes: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        bytes.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn append_test_custom_section(component: &mut Vec<u8>, name: &str, payload: &[u8]) {
+    let mut contents = Vec::new();
+    push_test_leb128_u32(
+        &mut contents,
+        u32::try_from(name.len()).expect("custom section name length fits u32"),
+    );
+    contents.extend_from_slice(name.as_bytes());
+    contents.extend_from_slice(payload);
+
+    component.push(0);
+    push_test_leb128_u32(
+        component,
+        u32::try_from(contents.len()).expect("custom section length fits u32"),
+    );
+    component.extend_from_slice(&contents);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let user_dirs = carina_core::TestUserDirs::new();
@@ -12118,8 +12149,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
         &resolved_sha,
     );
     std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &wasm_path,
+    let mut wasm = wat::parse_str(
         r#"
             (component
               (type $empty (instance))
@@ -12128,6 +12158,8 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
         "#,
     )
     .unwrap();
+    append_test_custom_section(&mut wasm, "carina:egress", br#"{"version":1,"hosts":[]}"#);
+    std::fs::write(&wasm_path, wasm).unwrap();
 
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
@@ -12340,7 +12372,7 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
         .get("awscc")
         .expect("invalid WASM fixture must be reported during factory loading");
     assert!(
-        load_error.contains("Failed to load WASM component"),
+        load_error.contains("failed to read provider component"),
         "{load_error}"
     );
     assert!(load_error.contains("carina-providers.lock"), "{load_error}");

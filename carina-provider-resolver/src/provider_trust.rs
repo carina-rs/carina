@@ -21,6 +21,7 @@ pub enum ProviderTrustClass {
 pub struct ProviderTrust {
     class: ProviderTrustClass,
     name_requirement: ProviderNameRequirement,
+    carina_rs_signed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +34,10 @@ enum ProviderNameRequirement {
 impl ProviderTrust {
     pub fn class(&self) -> ProviderTrustClass {
         self.class
+    }
+
+    pub(crate) fn is_carina_rs_signed(&self) -> bool {
+        self.carina_rs_signed
     }
 
     pub(crate) fn from_verified_remote(identity: &UserVerifiedIdentity) -> Option<Self> {
@@ -51,6 +56,7 @@ impl ProviderTrust {
                 ProviderTrustClass::GitHub => ProviderNameRequirement::Exact("github"),
                 ProviderTrustClass::Untrusted => ProviderNameRequirement::Any,
             },
+            carina_rs_signed: false,
         }
     }
 
@@ -58,6 +64,7 @@ impl ProviderTrust {
         Self {
             class: ProviderTrustClass::Untrusted,
             name_requirement: ProviderNameRequirement::Any,
+            carina_rs_signed: false,
         }
     }
 }
@@ -72,6 +79,7 @@ fn classify_verified_remote(
     remote_trust_shape(source).map(|(class, name_requirement)| ProviderTrust {
         class,
         name_requirement,
+        carina_rs_signed: true,
     })
 }
 
@@ -97,14 +105,22 @@ fn remote_trust_shape(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderLoadSource {
-    LocalFile { path: PathBuf },
-    Remote { source: RemoteSourceKey },
+    LocalFile {
+        path: PathBuf,
+        canonical_source: PathBuf,
+    },
+    Remote {
+        source: RemoteSourceKey,
+    },
 }
 
 impl fmt::Display for ProviderLoadSource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProviderLoadSource::LocalFile { path } => {
+            ProviderLoadSource::LocalFile {
+                path,
+                canonical_source: _,
+            } => {
                 write!(formatter, "file://{}", path.display())
             }
             ProviderLoadSource::Remote { source } => source.fmt(formatter),
@@ -163,17 +179,19 @@ impl ProviderLoadIdentity {
         })
     }
 
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(configured_name: impl Into<String>, class: ProviderTrustClass) -> Self {
         let configured_name = configured_name.into();
         let source = ProviderLoadSource::LocalFile {
             path: PathBuf::from(format!("/test-providers/{configured_name}.wasm")),
+            canonical_source: PathBuf::from(format!("{configured_name}.wasm")),
         };
         Self {
             configured_name,
             trust: ProviderTrust {
                 class,
                 name_requirement: ProviderNameRequirement::Any,
+                carina_rs_signed: false,
             },
             source,
         }
@@ -517,6 +535,7 @@ mod tests {
             ProviderTrust::untrusted(),
             ProviderLoadSource::LocalFile {
                 path: PathBuf::from("/tmp/aws.wasm"),
+                canonical_source: PathBuf::from("aws.wasm"),
             },
         )
         .unwrap();

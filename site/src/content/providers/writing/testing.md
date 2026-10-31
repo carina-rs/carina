@@ -279,7 +279,7 @@ Unit tests cannot tell you whether a resource converges: whether, after `apply`,
 
 The official providers keep acceptance tests in an `acceptance-tests/` directory, one directory per resource type with one or more `.crn` configurations, and a script that runs each one through a full cycle:
 
-1. `carina init` installs the component under test. Run it again after every rebuild; otherwise the test runs the copy installed earlier.
+1. `carina init` installs the component under test. Run it again after every rebuild; otherwise the test runs the copy installed earlier. On that init, an unchanged egress declaration carries consent forward without a prompt, while a changed declaration shows the diff and asks again.
 2. `carina apply --auto-approve` creates the resources.
 3. `carina plan --detailed-exitcode` must exit with `0`. It exits with `2` when the plan has changes, which means the resource does not converge, usually because `read` returns a value in a different form than the configuration or leaves an attribute out.
 4. `carina destroy --auto-approve` removes everything.

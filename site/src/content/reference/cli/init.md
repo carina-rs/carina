@@ -16,11 +16,21 @@ carina init [OPTIONS] [PATH]
 
 ## Provider Verification
 
-Every installed or cached provider artifact is checked against the SHA-256 recorded in `carina-providers.lock`, and `validate`, `plan` and `apply` check the installed copy again before loading it. If a cached copy does not match, `init` stops without changing the lock file, removes the mismatched copy, and asks you to run `carina init` again to download a verified one. If a freshly downloaded artifact does not match the pin, the origin changed the artifact after it was pinned; confirm the change is legitimate before removing that provider's entry from the lock file and running `carina init` again. A cached artifact that has no lock entry is never trusted; `init` downloads it from the origin instead.
+Every installed or cached remote provider artifact is checked against the SHA-256 recorded in `carina-providers.lock`, and `validate`, `plan` and `apply` check the installed copy again before loading it. If a cached copy does not match, `init` stops without changing the lock file, removes the mismatched copy, and asks you to run `carina init` again to download a verified one. If a freshly downloaded artifact does not match the pin, the origin changed the artifact after it was pinned; confirm the change is legitimate before removing that provider's entry from the lock file and running `carina init` again. A cached artifact that has no lock entry is never trusted; `init` downloads it from the origin instead. A `file://` provider is loaded from the copy installed by `init`; its recorded SHA-256 is informational for egress consent, which remains bound to the source path and declaration.
 
 For official `carina-rs` providers, `init` also records the verified artifact for the current user under `~/.carina/trust/` (override with `CARINA_TRUST_RECORD_DIR`). These providers fail to load until the user running Carina has run `carina init`. See [Installation](/getting-started/installation/) for details.
 
 Concurrent `carina init` runs in the same project are serialized: a second run waits and prints `Waiting for provider install lock at <path> (held by another carina process)...`.
+
+## Provider egress consent
+
+An HTTP provider embeds the hostname patterns it may contact in its WASM component. `init` validates the declaration from the exact installed bytes and records the normalized, sorted hosts under `[provider.egress]` in `carina-providers.lock`.
+
+For a verified, allow-listed `carina-rs` provider, the verified signature is enough to record a new or changed declaration without prompting. For a local or other provider, `init` displays the declaration and asks `y/N` on a terminal. In a non-interactive process it fails unless the source is named by the repeatable `--accept-egress <SOURCE>` option or `CARINA_ACCEPT_EGRESS`.
+
+Consent belongs to the canonical source and declaration, not to the provider block's configured name. When explicitly consented hosts are unchanged across a new build of the same source, `init` prints `egress hosts unchanged` and carries the consent forward. When they change, it displays the added and removed patterns and asks again. A `**.` pattern is called out because it permits a host at any depth below its suffix.
+
+Plan, apply, and destroy refuse to create runtime provider instances when the lock has no matching consent record and tell you to run `carina init`. After rebuilding a `file://` provider, run `carina init` so runtime commands use the newly installed copy. On that init, an unchanged declaration carries consent forward without a prompt, while a changed declaration shows the diff and asks again. `validate`, `fmt`, and the LSP validate the section but use a schema-only instance with no network access, so they do not require consent.
 
 ## Flags
 
@@ -30,11 +40,31 @@ Re-resolve all provider versions from the constraints in `providers.crn`, ignori
 
 ### `--locked`
 
-Require the lock file to match `providers.crn` exactly. Errors if any declared provider is missing from the lock file. Intended for CI, similar to `cargo --locked`.
+Require the lock file to match `providers.crn` exactly. Errors if any declared provider or current egress declaration is missing from the lock file. The command never writes the lock or prompts. Intended for CI, similar to `cargo --locked`.
 
 It also errors on `github.com/...` lock entries written by older Carina versions (a `version` entry without its release tag, or a `revision` entry without its artifact ID); run `carina init` once without `--locked` to rewrite them.
 
-`--upgrade` and `--locked` are mutually exclusive.
+`--upgrade` and `--locked` are mutually exclusive. `--accept-egress` also conflicts with `--locked`.
+
+### `--accept-egress <SOURCE>`
+
+Give non-interactive `carina init` explicit consent to record one provider source's declared egress hosts. The flag is repeatable and matches the canonical source, never the configured provider name. A relative `file://` value is resolved from the directory containing `carina-providers.lock`; an absolute `file://` value is normalized into that same lock-directory-relative coordinate system. Use the canonical registry or GitHub source for a remote provider:
+
+```bash
+carina init --accept-egress /abs/path/provider.wasm
+carina init --accept-egress github.com/example/carina-provider-example
+```
+
+Two configured provider blocks that share a source share one consent record. The option does not widen a provider's declaration and is rejected together with `--locked`.
+
+`CARINA_ACCEPT_EGRESS` supplies the same sources as a comma-separated list. Whitespace around entries is ignored, and `file://` sources can be used directly:
+
+```bash
+export CARINA_ACCEPT_EGRESS='file:///abs/path/one.wasm, file:///abs/path/two.wasm'
+carina init
+```
+
+The consent is written to `[provider.egress]` in `carina-providers.lock`; the option and environment variable themselves are not persisted.
 
 ### `--migrate-state`
 
