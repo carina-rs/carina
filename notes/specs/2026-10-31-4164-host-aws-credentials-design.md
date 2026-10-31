@@ -184,6 +184,86 @@ before any effect starts, as the first decision required. Later failures,
 for example an SSO session that ends during a long apply, reach the guest
 as `aws-credential-error` and surface as that operation's provider error.
 
+### D7. `assume_role` and the two expiry clocks
+
+Both providers accept `assume_role = { role_arn, session_name?,
+external_id?, duration? }` and check `allowed_account_ids` against the
+role's account. In aws this is `extract_assume_role` /
+`check_cross_account` in `factory.rs`; awscc has the same pair in `main.rs`.
+Both build the guest config with `aws_config::defaults(...)` and wrap it
+with `aws_config::sts::AssumeRoleProvider::builder(role_arn).configure(&base)`.
+`configure` takes the base config's credentials provider as the source
+credentials. infra uses this in the registry dev/prod `serve` stacks
+(`envs/registry/{dev,prod}/serve/providers.crn`, the named instance for
+the cross-account delegation-writer role used for the Route 53 alias).
+
+This stays in the guest unchanged. Only the base changes: the base config's
+credentials provider becomes `HostCredentialsProvider` instead of the
+default chain. `AssumeRoleProvider` then calls STS `AssumeRole` with
+host-provided base credentials, exactly as it does today with
+env-provided ones. `check_cross_account` and the
+`allowed_account_ids` / `forbidden_account_ids` guard run before and after,
+as today.
+
+There are two expiry clocks, and each side owns one:
+
+- **Base credentials** (SSO role credentials, env keys, ECS/IMDS) belong
+  to the host. The host's identity cache refreshes them near expiry, using
+  the SSO token cache for SSO. The guest sees them through
+  `HostCredentialsProvider`, whose `expires-at` makes the guest's identity
+  cache ask the host again before expiry. If the SSO session itself has
+  ended, the refresh fails as `provider-failed` with the SDK's message (for
+  example, run `aws sso login`).
+- **Assumed-role credentials** belong to the guest. `AssumeRoleProvider`
+  caches them with their STS expiry and calls `AssumeRole` again near
+  expiry. That call signs with the current base credentials, which come
+  from the host. So a long apply crossing either expiry keeps working
+  without any special code. A base refresh failure surfaces as the
+  `AssumeRole` call's credentials error.
+
+The host never sees the role ARN or the assumed credentials. The import
+returns only the base identity.
+
+### D8. Region
+
+Region does not change, and nothing visible to users changes.
+
+Neither provider ever read a profile's `region`. Both call
+`extract_region_from_attrs(attributes, "ap-northeast-1")` and pass the
+result to `aws_config::defaults(...).region(...)`. So the guest SDK always
+gets an explicit region: the provider block's `region`, or
+`ap-northeast-1` when it is omitted. The guest also never had the profile
+file, so a profile region was unreachable twice over. The region stays a
+provider-block setting, passed to the guest as today. `AWS_REGION` and
+`AWS_DEFAULT_REGION` stay in the env allowlist for the SDK's own use.
+
+The host-side chain resolves its own region from the profile or env, and
+uses it only for the credential sources that need one: the SSO portal uses
+the profile's `sso_region`, and STS web identity uses the profile or env
+region. That region is not passed to the guest.
+
+### D9. One source per run, per-block settings stay per instance
+
+The base identity comes from the process environment, `AWS_PROFILE` and
+`~/.aws`. All of these are global to the process, and no provider block
+has a `profile` attribute today. So the CLI creates exactly one
+`AwsCredentialSource` per command run and shares it across every AWS-kind
+instance: every block of `aws` and `awscc`, including aliases such as
+infra's `let us = provider aws { region = us_east_1 }`.
+
+What differs per block stays per instance in the guest: region,
+`assume_role` (each instance has its own `AssumeRoleProvider` and cache),
+`allowed_account_ids` / `forbidden_account_ids`, and `default_tags`. Two
+blocks with different `assume_role` therefore hold two different assumed
+identities over the same base.
+
+`RuntimeCapabilities::Aws { credentials }` carries the source per
+instance. A later per-block `profile` attribute would therefore pass a
+different source to that instance, with no change to the type.
+
+The S3 state backend keeps its own `aws_config` loader in carina-state, as
+today. Sharing it with this source is outside this issue.
+
 ### D6. Protocol
 
 This is a WIT change. The protocol moves to the version after #4168's
@@ -220,6 +300,38 @@ together with the egress declarations already in flight.
 - CLI e2e: with no AWS credentials anywhere, `apply` of an AWS-kind
   provider fails fast with the typed error, which pins this issue's
   reported hang path at the CLI level.
+- aws / awscc (in their repos): with a fake host source, the guest config
+  uses `HostCredentialsProvider` as the base. `assume_role` builds
+  `AssumeRoleProvider` over that base, verified with a recorded STS
+  exchange. Two instances with different `assume_role` keep separate
+  assumed identities over one source.
+
+### Real-account checks
+
+These run before the provider rev bump merges. They use carina-test-*
+accounts only.
+
+1. SSO only: `AWS_PROFILE=<sso profile>` with no env keys. `apply` and
+   `destroy` an `awscc.sns.Topic` and an `aws` resource. This is #4164's
+   own repro, so it must now succeed.
+2. Static env keys only (the acceptance-tests runner path) and an empty
+   environment (expect the typed error, promptly).
+3. `assume_role` alias: two `aws` blocks in one directory, one with
+   `assume_role` into a second carina-test account and one without. Each
+   resource lands in its own account. Run it with an SSO base and with an
+   env-key base.
+4. Refresh: a role session of 15 minutes (the shortest STS allows) and an
+   `assume_role.duration` of 15 minutes. Run an apply that outlives both,
+   for example a resource with a long create wait. It must finish without
+   a credentials error.
+
+infra itself is not run by me (no real-infra AWS commands). Once the
+providers are bumped, the maintainer runs `carina plan` with their usual
+credentials in these directories and expects no change:
+`envs/registry/dev/serve` and `envs/registry/prod/serve` (region alias
+plus the cross-account `assume_role` alias), `aws/management/route53`,
+and one plain directory such as `envs/registry/dev/network`. I hand over
+the exact commands.
 
 ## Impact
 
