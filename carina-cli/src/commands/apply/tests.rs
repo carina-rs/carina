@@ -225,6 +225,35 @@ fn mock_http_wasm_path() -> Option<PathBuf> {
     .find(|path| path.exists())
 }
 
+fn mock_http_test_egress(
+    load: &carina_provider_resolver::VerifiedLoad,
+    lock_dir: &Path,
+) -> carina_provider_resolver::LockedEgress {
+    let declaration = carina_provider_resolver::VerifiedEgressDeclaration::read(load)
+        .expect("mock HTTP provider must carry a valid egress declaration");
+    let canonical_source = declaration.source().to_string();
+    let source = canonical_source
+        .strip_prefix("file://")
+        .map(|path| format!("file://{}", lock_dir.join(path).display()))
+        .unwrap_or(canonical_source);
+    let hosts = declaration
+        .patterns()
+        .iter()
+        .map(|pattern| format!("    {:?},", pattern.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!hosts.is_empty(), "mock HTTP provider must declare egress");
+    let lock = format!(
+        "version = 5\n\n[[provider]]\nname = \"mock_http\"\nsource = {source:?}\nmode = \"file\"\nsha256 = {:?}\n\n[provider.egress]\nconsent = \"explicit\"\nhosts = [\n{hosts}\n]\n",
+        declaration.sha256().as_str(),
+    );
+    std::fs::write(lock_dir.join("carina-providers.lock"), lock)
+        .expect("write mock HTTP egress consent");
+    carina_provider_resolver::load_locked_egress(lock_dir, load)
+        .expect("load mock HTTP egress consent")
+        .expect("mock HTTP egress consent must match the fixture")
+}
+
 fn spawn_mock_http_server(
     expected_requests: usize,
 ) -> Option<(SocketAddr, std::thread::JoinHandle<Vec<usize>>)> {
@@ -400,13 +429,16 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
             carina_provider_resolver::ProviderTrustClass::Untrusted,
         ),
     );
-    let fresh_factory = carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
-        fresh_verified,
-        cache.path(),
-    )
-    .await
-    .expect("load mock HTTP WASM provider")
-    .with_http_test_route("phase-test.invalid", server_address);
+    let locked_egress = mock_http_test_egress(&fresh_verified, cache.path());
+    let fresh_factory =
+        carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+            fresh_verified,
+            cache.path(),
+            Some(&locked_egress),
+        )
+        .await
+        .expect("load mock HTTP WASM provider")
+        .with_http_test_route("phase-test.invalid", server_address);
     let fresh_ready = mock_http_ready_config(&fresh_factory);
     let fresh_initialized = fresh_factory
         .create_initialized_provider(None, &fresh_ready)
@@ -473,13 +505,15 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
             carina_provider_resolver::ProviderTrustClass::Untrusted,
         ),
     );
-    let replacement_factory = carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
-        replacement_verified,
-        cache.path(),
-    )
-    .await
-    .expect("load replacement mock HTTP WASM provider")
-    .with_http_test_route("phase-test.invalid", server_address);
+    let replacement_factory =
+        carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+            replacement_verified,
+            cache.path(),
+            Some(&locked_egress),
+        )
+        .await
+        .expect("load replacement mock HTTP WASM provider")
+        .with_http_test_route("phase-test.invalid", server_address);
     let replacement_ready = mock_http_ready_config(&replacement_factory);
     let replacement_initialized = replacement_factory
         .create_initialized_provider(None, &replacement_ready)
