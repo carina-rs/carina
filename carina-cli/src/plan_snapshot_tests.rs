@@ -38,7 +38,10 @@ fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
 ) -> String {
-    let summary = PlanChangeSummary::new(plan, export_changes, deferred_for_expressions);
+    let deferred_for_expressions = crate::plan_summary::resolved_deferred_for_for_test(
+        deferred_for_expressions.iter().cloned(),
+    );
+    let summary = PlanChangeSummary::new(plan, export_changes, &deferred_for_expressions);
     let provider = provider_router_for_plan(plan);
     format_plan_with_delete_instances(
         plan,
@@ -192,6 +195,28 @@ fn snapshot_postfix_access() {
     ));
 
     insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_deferred_integer_arithmetic_is_structural() {
+    let expression = carina_core::integer_arithmetic::evaluate_integer_values(
+        carina_core::resource::Value::<carina_core::resource::LoopSlot>::Deferred(
+            carina_core::resource::DeferredValue::Placeholder(
+                carina_core::resource::LoopSlot::Value,
+            ),
+        ),
+        carina_core::integer_arithmetic::IntegerOp::Divide,
+        carina_core::resource::Value::Concrete(carina_core::resource::ConcreteValue::Int(60)),
+        carina_core::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+    )
+    .expect("deferred Int arithmetic must be structurally valid");
+    let rendered = carina_core::plan_tree::render_deferred_for_template_value(
+        &expression,
+        "source",
+        "applies",
+    );
+
+    insta::assert_snapshot!(rendered.plain(), @"(known after source applies) / 60");
 }
 
 #[test]
@@ -2301,11 +2326,11 @@ fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
     ));
     let loaded = load_configuration(&fixture_path).unwrap();
     let duplicate_declarations = loaded.duplicate_declarations;
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let providers =
         crate::wiring::ProviderLoad::load(&user_dirs, &parsed.providers, &fixture_path).unwrap();
     let errors = crate::commands::validate_and_resolve_errors(
-        &mut parsed,
+        &parsed,
         &fixture_path,
         &providers,
         true,

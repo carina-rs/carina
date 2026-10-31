@@ -43,7 +43,7 @@
 //! ```
 
 use crate::data_source_value::{DataSourceValue, DataSourceValues};
-use crate::parser::{BindingName, TopLevelResourceRef};
+use crate::parser::{BindingName, DeferredIfBody, TopLevelResourceRef};
 use crate::resource::composition::CompositionRuntimeRef;
 use crate::resource::{
     AccessPath, LiveComposition, ParserPlaceholder, PathSegment, PlaceholderKind, PlanInputCurrent,
@@ -459,8 +459,8 @@ impl<'a> BindingIndex<'a> {
     /// silently skipped — callers (validation / LSP) treat unknown resource
     /// types as a separate diagnostic, so reporting them again here would
     /// double-count. LiveComposition bindings do not need a registry lookup.
-    pub fn from_parsed<E>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    pub fn from_parsed<E, D>(
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
         registry: &'a SchemaRegistry,
     ) -> Self {
         Self::build(parsed, registry, None, None)
@@ -470,8 +470,8 @@ impl<'a> BindingIndex<'a> {
     /// This is the pre-expansion authority for references such as `web.url`:
     /// the module call is not a [`LiveComposition`] yet, but its imported
     /// signature already declares the output type.
-    pub fn from_parsed_with_module_signatures<E>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    pub fn from_parsed_with_module_signatures<E, D>(
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
         registry: &'a SchemaRegistry,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     ) -> Self {
@@ -481,8 +481,8 @@ impl<'a> BindingIndex<'a> {
     /// Build the index with statically resolved `upstream_state` exports.
     /// Bindings whose source could not be loaded are still recorded as known
     /// and therefore resolve to [`RefType::Unchecked`].
-    pub fn from_parsed_with_upstream_exports<E>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    pub fn from_parsed_with_upstream_exports<E, D>(
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
         registry: &'a SchemaRegistry,
         upstream_exports: &'a crate::upstream_exports::UpstreamExports,
     ) -> Self {
@@ -490,8 +490,8 @@ impl<'a> BindingIndex<'a> {
     }
 
     /// Build the complete pre-expansion validation index used by the LSP.
-    pub fn from_parsed_with_upstream_exports_and_module_signatures<E>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    pub fn from_parsed_with_upstream_exports_and_module_signatures<E, D>(
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
         registry: &'a SchemaRegistry,
         upstream_exports: &'a crate::upstream_exports::UpstreamExports,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
@@ -504,8 +504,8 @@ impl<'a> BindingIndex<'a> {
         )
     }
 
-    fn build<E>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    fn build<E, D>(
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
         registry: &'a SchemaRegistry,
         upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports>,
         module_signatures: Option<&'a crate::module_resolver::ResolvedModuleSignatures>,
@@ -552,6 +552,88 @@ impl<'a> BindingIndex<'a> {
                 continue;
             };
             entries.insert(binding_name.to_string(), BindingEntry { target });
+        }
+        // Structural `if` branches are declarations in the reusable module's
+        // lexical scope even though a caller argument may later remove one of
+        // them. Record every branch binding before validating the template so
+        // references are treated as conditionally available, not as unknown.
+        // Expansion then rebuilds the index from the selected graph, while the
+        // resolver's dropped-binding check owns the false-branch diagnostic.
+        for body in parsed
+            .deferred_module_ifs
+            .iter()
+            .flat_map(|deferred| deferred.branches())
+        {
+            match body {
+                DeferredIfBody::Resource(resource) => {
+                    let Some(binding_name) = resource.binding.as_deref() else {
+                        continue;
+                    };
+                    known_names.insert(binding_name.to_string());
+                    resource_handles.insert(
+                        binding_name.to_string(),
+                        AttributeType::resource_handle(
+                            resource.id.provider.clone(),
+                            resource.id.resource_type.clone(),
+                        ),
+                    );
+                    if let Some(schema) = registry.get_for(resource) {
+                        entries
+                            .entry(binding_name.to_string())
+                            .or_insert(BindingEntry {
+                                target: BindingTarget::Schema(schema.schema().as_schema()),
+                            });
+                    }
+                }
+                DeferredIfBody::DataSource(data_source) => {
+                    let Some(binding_name) = data_source.binding.as_deref() else {
+                        continue;
+                    };
+                    known_names.insert(binding_name.to_string());
+                    resource_handles.insert(
+                        binding_name.to_string(),
+                        AttributeType::resource_handle(
+                            data_source.id.provider.clone(),
+                            data_source.id.resource_type.clone(),
+                        ),
+                    );
+                    if let Some(schema) = registry.get_for_data_source(data_source) {
+                        entries
+                            .entry(binding_name.to_string())
+                            .or_insert(BindingEntry {
+                                target: BindingTarget::Schema(schema.schema().as_schema()),
+                            });
+                    }
+                }
+                DeferredIfBody::ModuleCall(call) => {
+                    let Some(binding_name) = call.binding_name.as_deref() else {
+                        continue;
+                    };
+                    known_names.insert(binding_name.to_string());
+                    if let Some(signature) =
+                        module_signatures.and_then(|signatures| signatures.get(&call.module_name))
+                    {
+                        entries
+                            .entry(binding_name.to_string())
+                            .or_insert(BindingEntry {
+                                target: BindingTarget::ModuleCall(signature),
+                            });
+                    }
+                }
+                DeferredIfBody::ExpandedModuleCall(contribution) => {
+                    for composition in &contribution.compositions {
+                        let Some(binding_name) = composition.binding.as_deref() else {
+                            continue;
+                        };
+                        known_names.insert(binding_name.to_string());
+                        entries
+                            .entry(binding_name.to_string())
+                            .or_insert(BindingEntry {
+                                target: BindingTarget::LiveComposition(composition),
+                            });
+                    }
+                }
+            }
         }
         // Module-call bindings expose the imported module's declared output
         // surface before expansion. Record the binding even when its import
@@ -1165,7 +1247,14 @@ impl BindingNameSet {
     /// — keeps `Variable` last because `parsed.variables` is the
     /// catch-all "any `let`-RHS placeholder lives here" map, while the
     /// preceding sources are narrower declaration forms.
-    pub fn from_parsed<E>(parsed: &crate::parser::File<E>) -> Self {
+    pub fn from_parsed<E, D>(
+        parsed: &crate::parser::File<
+            E,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            D,
+        >,
+    ) -> Self {
         let mut by_name: HashMap<String, BindingNameKind> = HashMap::new();
 
         // carina#3181: walk the typed top-level slices — managed
@@ -1561,8 +1650,8 @@ impl ResolvedBindings<ParserPlaceholder> {
     /// Build the value-level binding view used before the parser-to-expanded
     /// boundary. Parser placeholders remain typed as such until
     /// `ResolvedFile` consumes the complete file.
-    pub fn for_validation<E>(
-        parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    pub fn for_validation<E, D>(
+        parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
     ) -> Self {
         let mut by_name = HashMap::new();
 

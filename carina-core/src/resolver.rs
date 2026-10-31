@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use indexmap::IndexMap;
 
 use crate::binding_index::{BindingValueSource, ResolvedBindings};
+use crate::integer_arithmetic::IntegerExpressionError;
 #[cfg(test)]
 use crate::resource::State;
 use crate::resource::{
@@ -108,6 +109,7 @@ fn resolve_refs_inner(
             let resolved = resolve_ref_value(value, bindings)?;
             let final_value = if mark_unresolved_upstream {
                 stamp_unresolved_upstream(resolved, unresolved_upstream_bindings)
+                    .map_err(|error| error.to_string())?
             } else {
                 resolved
             };
@@ -190,6 +192,7 @@ fn resolve_data_source_refs_inner(
             let resolved = resolve_ref_value(value, bindings)?;
             let final_value = if mark_unresolved_upstream {
                 stamp_unresolved_upstream(resolved, unresolved_upstream_bindings)
+                    .map_err(|error| error.to_string())?
             } else {
                 resolved
             };
@@ -286,8 +289,14 @@ fn resolve_composition_attributes<A: RuntimeCompositionAttribute>(
 fn stamp_unresolved_upstream(
     value: Value,
     upstream_binding_names: &std::collections::HashSet<&str>,
-) -> Value {
-    match value {
+) -> Result<Value, IntegerExpressionError> {
+    Ok(match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let deferred = deferred.try_map(|value| {
+                stamp_unresolved_upstream(value.clone(), upstream_binding_names)
+            })?;
+            Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred)))
+        }
         Value::Deferred(DeferredValue::ResourceRef { path })
             if upstream_binding_names.contains(path.binding()) =>
         {
@@ -304,20 +313,25 @@ fn stamp_unresolved_upstream(
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(stamp_unresolved_upstream(*value, upstream_binding_names)),
-                default: Box::new(stamp_unresolved_upstream(*default, upstream_binding_names)),
+                value: Box::new(stamp_unresolved_upstream(*value, upstream_binding_names)?),
+                default: Box::new(stamp_unresolved_upstream(*default, upstream_binding_names)?),
             })
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = stamp_unresolved_upstream(expression.lhs().clone(), upstream_binding_names)?;
+            let rhs = stamp_unresolved_upstream(expression.rhs().clone(), upstream_binding_names)?;
+            expression.evaluate_with_operands(lhs, rhs)?
         }
         Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
                 .into_iter()
                 .map(|v| stamp_unresolved_upstream(v, upstream_binding_names))
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
         )),
         Value::Concrete(ConcreteValue::Map(map)) => {
             let mut out: IndexMap<String, Value> = IndexMap::new();
             for (k, v) in map {
-                out.insert(k, stamp_unresolved_upstream(v, upstream_binding_names));
+                out.insert(k, stamp_unresolved_upstream(v, upstream_binding_names)?);
             }
             Value::Concrete(ConcreteValue::Map(out))
         }
@@ -326,12 +340,13 @@ fn stamp_unresolved_upstream(
                 parts
                     .into_iter()
                     .map(|p| match p {
-                        InterpolationPart::Expr(v) => InterpolationPart::Expr(
-                            stamp_unresolved_upstream(v, upstream_binding_names),
-                        ),
-                        other => other,
+                        InterpolationPart::Expr(v) => {
+                            stamp_unresolved_upstream(v, upstream_binding_names)
+                                .map(InterpolationPart::Expr)
+                        }
+                        other => Ok(other),
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>, _>>()?,
             ))
         }
         Value::Deferred(DeferredValue::FunctionCall {
@@ -343,16 +358,11 @@ fn stamp_unresolved_upstream(
             args: args
                 .iter()
                 .map(|argument| {
-                    argument
-                        .try_map_value(|value| {
-                            Ok::<_, std::convert::Infallible>(stamp_unresolved_upstream(
-                                value.clone(),
-                                upstream_binding_names,
-                            ))
-                        })
-                        .expect("infallible function-argument rewrite")
+                    argument.try_map_value(|value| {
+                        stamp_unresolved_upstream(value.clone(), upstream_binding_names)
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             source_line,
         }),
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
@@ -366,29 +376,24 @@ fn stamp_unresolved_upstream(
             args: args
                 .iter()
                 .map(|argument| {
-                    argument
-                        .try_map_value(|value| {
-                            Ok::<_, std::convert::Infallible>(stamp_unresolved_upstream(
-                                value.clone(),
-                                upstream_binding_names,
-                            ))
-                        })
-                        .expect("infallible function-argument rewrite")
+                    argument.try_map_value(|value| {
+                        stamp_unresolved_upstream(value.clone(), upstream_binding_names)
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             source_line,
         }),
         Value::Deferred(DeferredValue::Access(access)) => {
             let original = Value::Deferred(DeferredValue::Access(access.clone()));
             access
                 .rebuild_with_base(
-                    stamp_unresolved_upstream(access.base().clone(), upstream_binding_names),
+                    stamp_unresolved_upstream(access.base().clone(), upstream_binding_names)?,
                     AccessMissPolicy::Error,
                 )
                 .unwrap_or(original)
         }
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            Box::new(stamp_unresolved_upstream(*inner, upstream_binding_names)),
+            Box::new(stamp_unresolved_upstream(*inner, upstream_binding_names)?),
         )),
         // Already-stamped or non-reference leaves pass through unchanged.
         value @ Value::Concrete(
@@ -409,7 +414,7 @@ fn stamp_unresolved_upstream(
             | DeferredValue::Unknown(_),
         ) => value,
         Value::Deferred(DeferredValue::Placeholder(never)) => match never {},
-    }
+    })
 }
 
 /// Plan-only single-value counterpart of [`resolve_refs_for_plan`].
@@ -439,6 +444,7 @@ pub fn resolve_value_for_plan(
         resolved
     } else {
         stamp_unresolved_upstream(resolved, unresolved_upstream_bindings)
+            .unwrap_or_else(|_| value.clone())
     }
 }
 
@@ -513,6 +519,9 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind>(
     allow_absent_default: bool,
 ) -> Result<ValueResolution<P>, String> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err("unresolved module-template conditional reached runtime resolver".to_string())
+        }
         Value::Deferred(DeferredValue::Coalesce {
             value: left,
             default,
@@ -640,6 +649,7 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind>(
         Value::Concrete(_)
         | Value::Deferred(
             DeferredValue::Interpolation(_)
+            | DeferredValue::IntegerArithmetic(_)
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Secret(_)
@@ -722,6 +732,9 @@ fn resolve_ref_value_inner<P: PlaceholderKind>(
     config: Option<&crate::parser::ProviderContext>,
 ) -> Result<Value<P>, String> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err("unresolved module-template conditional reached runtime resolver".to_string())
+        }
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             match resolve_ref_value_status_inner(value, bindings, config, false)? {
                 ValueResolution::Present(value) | ValueResolution::Unknown(value) => Ok(value),
@@ -759,6 +772,21 @@ fn resolve_ref_value_inner<P: PlaceholderKind>(
             }
             // Keep as-is if not found
             Ok(value.clone())
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = resolve_ref_value_inner(expression.lhs(), bindings, config)?;
+            let rhs = resolve_ref_value_inner(expression.rhs(), bindings, config)?;
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| {
+                    let span = expression.operator_span();
+                    match (span.line(), span.column()) {
+                        (Some(line), Some(column)) => {
+                            format!("at line {line}, column {column}: {error}")
+                        }
+                        _ => error.to_string(),
+                    }
+                })
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => Ok(value.clone()),
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -965,6 +993,131 @@ mod tests {
             value: Box::new(value),
             default: Box::new(default),
         })
+    }
+
+    fn integer_expression(
+        lhs: Value,
+        op: crate::integer_arithmetic::IntegerOp,
+        rhs: Value,
+    ) -> Value {
+        crate::integer_arithmetic::evaluate_integer_values(
+            lhs,
+            op,
+            rhs,
+            crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+        )
+        .expect("test integer expression should be structurally valid")
+    }
+
+    #[test]
+    fn deferred_integer_arithmetic_resolves_known_deferred_and_nested_operands() {
+        use crate::integer_arithmetic::IntegerOp;
+
+        let expression = integer_expression(
+            integer_expression(
+                Value::resource_ref("source", "seconds", vec![]),
+                IntegerOp::Add,
+                Value::Concrete(ConcreteValue::Int(30)),
+            ),
+            IntegerOp::Divide,
+            Value::resource_ref("config", "divisor", vec![]),
+        );
+        assert_eq!(
+            expression.root_bindings(),
+            ["config".to_string(), "source".to_string()].into(),
+            "dependency discovery must recurse into both arithmetic operands",
+        );
+        let bindings = bindings_from(vec![
+            (
+                "source",
+                vec![("seconds", Value::Concrete(ConcreteValue::Int(90)))],
+            ),
+            (
+                "config",
+                vec![("divisor", Value::Concrete(ConcreteValue::Int(60)))],
+            ),
+        ]);
+
+        assert_eq!(
+            resolve_ref_value(&expression, &bindings),
+            Ok(Value::Concrete(ConcreteValue::Int(2)))
+        );
+
+        let partial = bindings_from(vec![(
+            "source",
+            vec![("seconds", Value::Concrete(ConcreteValue::Int(90)))],
+        )]);
+        assert!(matches!(
+            resolve_ref_value(&expression, &partial),
+            Ok(Value::Deferred(DeferredValue::IntegerArithmetic(_)))
+        ));
+    }
+
+    #[test]
+    fn deferred_integer_arithmetic_reports_runtime_zero_and_overflow() {
+        use crate::integer_arithmetic::IntegerOp;
+
+        let divide_by_deferred_zero = integer_expression(
+            Value::Concrete(ConcreteValue::Int(100)),
+            IntegerOp::Divide,
+            Value::resource_ref("source", "value", vec![]),
+        );
+        let zero = bindings_from(vec![(
+            "source",
+            vec![("value", Value::Concrete(ConcreteValue::Int(0)))],
+        )]);
+        assert_eq!(
+            resolve_ref_value(&divide_by_deferred_zero, &zero),
+            Err("integer division by zero".to_string())
+        );
+
+        let overflow = integer_expression(
+            Value::resource_ref("source", "value", vec![]),
+            IntegerOp::Divide,
+            Value::Concrete(ConcreteValue::Int(-1)),
+        );
+        let minimum = bindings_from(vec![(
+            "source",
+            vec![("value", Value::Concrete(ConcreteValue::Int(i64::MIN)))],
+        )]);
+        assert_eq!(
+            resolve_ref_value(&overflow, &minimum),
+            Err("integer arithmetic overflow".to_string())
+        );
+    }
+
+    #[test]
+    fn stamp_unresolved_upstream_propagates_typed_integer_errors() {
+        use crate::integer_arithmetic::{
+            IntegerArithmeticError, IntegerExpressionError, IntegerOp, IntegerOperatorSpan,
+            ValidatedIntegerExpr,
+        };
+
+        let expression = ValidatedIntegerExpr::new(
+            Value::resource_ref("source", "value", vec![]),
+            IntegerOp::Divide,
+            Value::resource_ref("source", "divisor", vec![]),
+            IntegerOperatorSpan::synthetic(),
+        )
+        .expect("resource operands are valid deferred Ints");
+        let expression = expression
+            .rebuild(
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::Int(1),
+                )))),
+                Value::Concrete(ConcreteValue::Int(0)),
+            )
+            .expect("post-validation operand shapes remain valid");
+
+        let error = stamp_unresolved_upstream(
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)),
+            &HashSet::new(),
+        )
+        .expect_err("stamping must not retain a failed arithmetic node");
+        assert_eq!(
+            error,
+            IntegerExpressionError::SecretEvaluation(IntegerArithmeticError::DivideByZero),
+        );
     }
 
     #[test]

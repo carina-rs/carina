@@ -92,7 +92,9 @@ pub type InferenceBindings<P = NoPlaceholder> = HashMap<String, InferenceBinding
 /// Build an [`InferenceBindings`] map from a `ParsedFile`. Convenience
 /// over [`bindings_from_parts`] for the common case of having a parsed
 /// file in hand.
-pub fn bindings_from_parsed<E, P, T>(parsed: &crate::parser::File<E, P, T>) -> InferenceBindings<P>
+pub fn bindings_from_parsed<E, P, T, D>(
+    parsed: &crate::parser::File<E, P, T, D>,
+) -> InferenceBindings<P>
 where
     P: PlaceholderKind + PartialEq,
     T: PlaceholderKind,
@@ -271,11 +273,25 @@ pub(crate) fn infer_type_from_value_without_bindings<P: PlaceholderKind>(
     }
 
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let then_type = infer_type_from_value_without_bindings(deferred.then_value())?;
+            let else_type = infer_type_from_value_without_bindings(deferred.else_value())?;
+            if then_type == else_type {
+                Ok(then_type)
+            } else {
+                Err(heterogeneous_collection_error(&then_type, &else_type).into())
+            }
+        }
         Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
         | Value::Concrete(ConcreteValue::CanonicalEnum(_))
         | Value::Deferred(DeferredValue::Interpolation(_)) => Ok(TypeExpr::String),
         Value::Concrete(ConcreteValue::Int(_)) => Ok(TypeExpr::Int),
+        // The result shape is intrinsic even when this deliberately
+        // authority-free inferer cannot prove deferred operands. Final
+        // directory validation uses `infer_type_from_value` below and rejects
+        // every operand that is not proven Int.
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => Ok(TypeExpr::Int),
         Value::Concrete(ConcreteValue::Float(_)) => Ok(TypeExpr::Float),
         Value::Concrete(ConcreteValue::Bool(_)) => Ok(TypeExpr::Bool),
         Value::Concrete(ConcreteValue::Duration(_)) => Ok(TypeExpr::Duration),
@@ -400,6 +416,25 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind>(
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceIssue> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let then_type = infer_type_from_value_with_visiting(
+                deferred.then_value(),
+                bindings,
+                schemas,
+                visiting,
+            )?;
+            let else_type = infer_type_from_value_with_visiting(
+                deferred.else_value(),
+                bindings,
+                schemas,
+                visiting,
+            )?;
+            if then_type == else_type {
+                Ok(then_type)
+            } else {
+                Err(heterogeneous_collection_error(&then_type, &else_type).into())
+            }
+        }
         Value::Concrete(ConcreteValue::String(_)) => Ok(TypeExpr::String),
         // Enum identifiers infer as `String` for the type-expression
         // layer — the value-layer distinction matters only inside the
@@ -407,6 +442,27 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind>(
         Value::Concrete(ConcreteValue::EnumIdentifier(_)) => Ok(TypeExpr::String),
         Value::Concrete(ConcreteValue::CanonicalEnum(_)) => Ok(TypeExpr::String),
         Value::Concrete(ConcreteValue::Int(_)) => Ok(TypeExpr::Int),
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = require_proven_integer_operand(
+                infer_type_from_value_with_visiting(expression.lhs(), bindings, schemas, visiting),
+                expression.op(),
+                crate::integer_arithmetic::IntegerOperandSide::Left,
+                expression.operator_span(),
+            )?;
+            let rhs = require_proven_integer_operand(
+                infer_type_from_value_with_visiting(expression.rhs(), bindings, schemas, visiting),
+                expression.op(),
+                crate::integer_arithmetic::IntegerOperandSide::Right,
+                expression.operator_span(),
+            )?;
+            require_integer_arithmetic_operands(
+                expression.op(),
+                expression.operator_span(),
+                &lhs,
+                &rhs,
+                schemas,
+            )
+        }
         Value::Concrete(ConcreteValue::Float(_)) => Ok(TypeExpr::Float),
         Value::Concrete(ConcreteValue::Bool(_)) => Ok(TypeExpr::Bool),
         Value::Concrete(ConcreteValue::Duration(_)) => Ok(TypeExpr::Duration),
@@ -501,7 +557,7 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind>(
             })
         }
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
-            let Some(name) = placeholder.module_argument_name() else {
+            let Some(name) = placeholder.inference_binding_name() else {
                 return Err(InferenceError::UnknownType {
                     reason: "parser placeholder has no inferable type authority".to_string(),
                 }
@@ -515,7 +571,7 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind>(
                 | Some(InferenceBinding::ModuleCall)
                 | Some(InferenceBinding::UserFunction { .. })
                 | None => Err(InferenceError::UnknownType {
-                    reason: format!("module argument `{name}` has no type authority"),
+                    reason: format!("parser binding `{name}` has no type authority"),
                 }
                 .into()),
             }
@@ -524,6 +580,82 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind>(
             reason: "value not yet known at plan time (unresolved upstream)".to_string(),
         }
         .into()),
+    }
+}
+
+fn require_proven_integer_operand(
+    inferred: Result<TypeExpr, InferenceIssue>,
+    op: crate::integer_arithmetic::IntegerOp,
+    side: crate::integer_arithmetic::IntegerOperandSide,
+    operator_span: crate::integer_arithmetic::IntegerOperatorSpan,
+) -> Result<TypeExpr, InferenceIssue> {
+    match inferred {
+        Ok(inferred) => Ok(inferred),
+        Err(
+            error @ InferenceIssue::Failed(InferenceError::InvalidIntegerArithmeticOperand {
+                ..
+            }),
+        ) => Err(error),
+        Err(error) => Err(InferenceError::InvalidIntegerArithmeticOperand {
+            op,
+            side,
+            actual: format!("unproven type ({error})"),
+            operator_span,
+        }
+        .into()),
+    }
+}
+
+fn require_integer_arithmetic_operands(
+    op: crate::integer_arithmetic::IntegerOp,
+    operator_span: crate::integer_arithmetic::IntegerOperatorSpan,
+    lhs: &TypeExpr,
+    rhs: &TypeExpr,
+    schemas: &SchemaRegistry,
+) -> Result<TypeExpr, InferenceIssue> {
+    for (side, operand) in [
+        (crate::integer_arithmetic::IntegerOperandSide::Left, lhs),
+        (crate::integer_arithmetic::IntegerOperandSide::Right, rhs),
+    ] {
+        if inferred_scalar_kind(operand, schemas) != Some(crate::schema::RefinedScalarKind::Int) {
+            return Err(InferenceError::InvalidIntegerArithmeticOperand {
+                op,
+                side,
+                actual: operand.to_string(),
+                operator_span,
+            }
+            .into());
+        }
+    }
+    Ok(TypeExpr::Int)
+}
+
+fn inferred_scalar_kind(
+    inferred: &TypeExpr,
+    schemas: &SchemaRegistry,
+) -> Option<crate::schema::RefinedScalarKind> {
+    use crate::schema::RefinedScalarKind;
+
+    match inferred {
+        TypeExpr::String | TypeExpr::StringLiteral(_) => Some(RefinedScalarKind::String),
+        TypeExpr::Int => Some(RefinedScalarKind::Int),
+        TypeExpr::Float => Some(RefinedScalarKind::Float),
+        TypeExpr::SchemaType { owned } => {
+            let mut kinds = owned
+                .provider_names()
+                .map(|owner| schemas.identified_scalar_kind(owner, owned.identity()));
+            let first = kinds.next()??;
+            kinds.all(|kind| kind == Some(first)).then_some(first)
+        }
+        TypeExpr::Bool
+        | TypeExpr::Duration
+        | TypeExpr::Simple(_)
+        | TypeExpr::List(_)
+        | TypeExpr::Map(_)
+        | TypeExpr::Ref(_)
+        | TypeExpr::DottedUnresolved(_)
+        | TypeExpr::Struct { .. }
+        | TypeExpr::Union(_) => None,
     }
 }
 
@@ -950,10 +1082,20 @@ fn infer_function_call<P: PlaceholderKind>(
 
 /// Phase transition (#2360 stage 2): attach declared/inferred origin and any
 /// typed unchecked reason to every export.
-pub fn apply_inference(
-    parsed: crate::parser::ParsedFile,
+pub fn apply_inference<D>(
+    parsed: crate::parser::File<
+        crate::parser::ParsedExportParam,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     schemas: &SchemaRegistry,
-) -> crate::parser::InferredFile {
+) -> crate::parser::File<
+    crate::parser::InferredExportParam,
+    crate::resource::ParserPlaceholder,
+    crate::resource::ParserPlaceholder,
+    D,
+> {
     let inferred_exports = infer_export_params(&parsed, schemas).into_parameters();
     // Single phase-axis surface (carina#3126): only `export_params`
     // changes phase; every other field moves through `map_export_params`
@@ -984,8 +1126,13 @@ impl SchemaCheckedExportParams {
 /// non-export field; consumers that only need the export-side typecheck
 /// (LSP diagnostics, in particular) should use this instead to avoid
 /// the per-keystroke deep-clone.
-pub fn infer_export_params(
-    parsed: &crate::parser::ParsedFile,
+pub fn infer_export_params<D>(
+    parsed: &crate::parser::File<
+        crate::parser::ParsedExportParam,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     schemas: &SchemaRegistry,
 ) -> SchemaCheckedExportParams {
     let bindings = bindings_from_parsed(parsed);
@@ -1040,8 +1187,13 @@ impl ExportParamsInferredWithLoadedProviderSchemas {
 }
 
 /// Infer export parameters using schemas proven to come from provider loading.
-pub fn infer_export_params_with_loaded_provider_schemas(
-    parsed: &crate::parser::ParsedFile,
+pub fn infer_export_params_with_loaded_provider_schemas<D>(
+    parsed: &crate::parser::File<
+        crate::parser::ParsedExportParam,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     schemas: &ProviderLoadedSchemaRegistry,
 ) -> ExportParamsInferredWithLoadedProviderSchemas {
     ExportParamsInferredWithLoadedProviderSchemas {
@@ -1085,8 +1237,13 @@ pub fn attached_inference_failures<'a>(
 /// Retry inferred exports whose original reason was not having enough schema
 /// authority. A newly reportable failure replaces that reason; successful or
 /// still-deferred probes retain the original provenance.
-pub fn retry_unchecked_export_inference<'a>(
-    parsed: &'a mut crate::parser::InferredFile,
+pub fn retry_unchecked_export_inference<'a, D>(
+    parsed: &'a mut crate::parser::File<
+        crate::parser::InferredExportParam,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     schemas: &ProviderLoadedSchemaRegistry,
 ) -> ExportsInferredWithLoadedProviderSchemas<'a> {
     let bindings = bindings_from_parsed(parsed);
@@ -1174,6 +1331,134 @@ mod tests {
         ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
             .attribute(AttributeSchema::optional("vpc_id", vpc_id_custom()).build())
+    }
+
+    #[test]
+    fn integer_arithmetic_requires_proven_operands_but_accepts_typed_deferred_ints() {
+        use crate::integer_arithmetic::{IntegerOp, IntegerOperatorSpan, evaluate_integer_values};
+
+        let source = format!("\n{}+", " ".repeat(19));
+        let preprocessed = crate::parser::preprocess_file(&source).expect("test source");
+        let operator_span = IntegerOperatorSpan::from_original_position(
+            preprocessed.original_position(source.len() - 1),
+        );
+
+        let bare = evaluate_integer_values(
+            Value::Deferred(DeferredValue::BindingRef {
+                binding: "source".to_string(),
+            }),
+            IntegerOp::Add,
+            Value::Concrete(ConcreteValue::Int(1)),
+            operator_span,
+        )
+        .expect("parser-stage bare references remain pending until validation");
+        assert!(matches!(
+            infer_type_from_value(&bare, &InferenceBindings::new(), &SchemaRegistry::new()),
+            Err(InferenceIssue::Failed(
+                InferenceError::InvalidIntegerArithmeticOperand {
+                    side: crate::integer_arithmetic::IntegerOperandSide::Left,
+                    actual,
+                    operator_span,
+                    ..
+                }
+            )) if actual.contains("unproven type")
+                && operator_span.line() == Some(2)
+                && operator_span.column() == Some(20)
+        ));
+
+        let schema = ResourceSchema::new("clock.Source").attribute(
+            AttributeSchema::provider_populated("seconds", AttributeType::int()).build(),
+        );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            schema.validate().expect("clock schema must be valid"),
+        );
+        let bindings = InferenceBindings::from([(
+            "source".to_string(),
+            InferenceBinding::Resource {
+                provider: "test".to_string(),
+                resource_type: "clock.Source".to_string(),
+            },
+        )]);
+        let deferred = evaluate_integer_values(
+            Value::resource_ref("source", "seconds", Vec::new()),
+            IntegerOp::Divide,
+            Value::Concrete(ConcreteValue::Int(60)),
+            IntegerOperatorSpan::synthetic(),
+        )
+        .expect("resource arithmetic is structurally valid");
+        assert_eq!(
+            infer_type_from_value(&deferred, &bindings, &schemas),
+            Ok(TypeExpr::Int),
+        );
+    }
+
+    #[test]
+    fn refined_module_arguments_use_their_declared_scalar_base_for_arithmetic() {
+        use crate::integer_arithmetic::{IntegerOp, IntegerOperatorSpan, evaluate_integer_values};
+
+        let port_identity = TypeIdentity::bare("Port");
+        let label_identity = TypeIdentity::bare("Label");
+        let schema = ResourceSchema::new("clock.Source")
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "port",
+                    AttributeType::refined_int(Some(port_identity.clone()), None),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "label",
+                    AttributeType::refined_string(Some(label_identity.clone()), None, None, None),
+                )
+                .build(),
+            );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            schema.validate().expect("clock schema must be valid"),
+        );
+
+        let infer_argument_arithmetic = |name: &str, identity: TypeIdentity| {
+            let bindings = InferenceBindings::from([(
+                name.to_string(),
+                InferenceBinding::Argument {
+                    type_expr: TypeExpr::SchemaType {
+                        owned: crate::parser::OwnedTypeIdentity::provider("test", identity),
+                    },
+                },
+            )]);
+            let expression = evaluate_integer_values(
+                Value::Deferred(DeferredValue::Placeholder(
+                    crate::resource::ParserPlaceholder::ModuleArgument {
+                        name: name.to_string(),
+                        diagnostic: Default::default(),
+                    },
+                )),
+                IntegerOp::Add,
+                Value::Concrete(ConcreteValue::Int(1)),
+                IntegerOperatorSpan::synthetic(),
+            )
+            .expect("a typed module argument is structurally valid before inference");
+            infer_type_from_value(&expression, &bindings, &schemas)
+        };
+
+        assert_eq!(
+            infer_argument_arithmetic("port", port_identity),
+            Ok(TypeExpr::Int),
+            "an identity-bound refined Int argument remains an Int operand",
+        );
+        assert!(matches!(
+            infer_argument_arithmetic("label", label_identity),
+            Err(InferenceIssue::Failed(
+                InferenceError::InvalidIntegerArithmeticOperand {
+                    side: crate::integer_arithmetic::IntegerOperandSide::Left,
+                    ..
+                }
+            )),
+        ));
     }
 
     fn schemas_with_vpc() -> SchemaRegistry {

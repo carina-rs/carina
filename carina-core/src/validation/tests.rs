@@ -5,7 +5,7 @@ use crate::parser::{
 };
 use crate::resource::{
     CompositionCall, CompositionCallPath, DataSource, LiveComposition, LiveCompositionArgument,
-    LiveCompositionAttribute, LiveCompositionSignature, Resource,
+    LiveCompositionAttribute, LiveCompositionSignature, NoPlaceholder, Resource,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -224,7 +224,9 @@ fn empty_parsed() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: Vec::new(),
-        deferred_for_expressions: Vec::new(),
+        deferred_for_phase: crate::parser::ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -245,7 +247,7 @@ for item in upstream.items {
     )
     .expect("fixture parses");
     assert_eq!(parsed.iter_top_level_resources().count(), 2);
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
 
     let error = validate_resources(
         &parsed,
@@ -318,7 +320,7 @@ fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
     );
 }
 
-fn validate_resource_ref_types_for_test<E>(
+fn validate_resource_ref_types_for_test<E: crate::parser::ExportParamLike>(
     parsed: &crate::parser::File<E>,
     schemas: &SchemaRegistry,
 ) -> Result<(), String> {
@@ -329,6 +331,242 @@ fn validate_resource_ref_types_for_test<E>(
         .map(|argument| argument.name.clone())
         .collect();
     super::validate_resource_ref_types(parsed, schemas, &argument_names, &bindings)
+}
+
+#[test]
+fn unused_let_integer_arithmetic_requires_proven_int_operands() {
+    use crate::schema::AttributeSchema;
+
+    let parsed = crate::parser::parse(
+        r#"
+let source = mock.test.Source {}
+let invalid = source.ratio + 1
+let sink = mock.test.Consumer { count = invalid }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse before schema-aware validation");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Source")
+            .attribute(AttributeSchema::provider_populated("ratio", AttributeType::float()).build())
+            .validate()
+            .expect("source schema must be valid"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Consumer")
+            .attribute(AttributeSchema::required("count", AttributeType::int()).build())
+            .validate()
+            .expect("consumer schema must be valid"),
+    );
+
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas)
+        .expect_err("an unused arithmetic let must still prove both operands are Int");
+    assert_eq!(
+        error, "operator '+': left operand must be Int, got Float",
+        "the declaration and its consuming resource attribute must not duplicate the finding",
+    );
+}
+
+#[test]
+fn refined_int_resource_operand_is_still_an_int_operand() {
+    use crate::schema::AttributeSchema;
+
+    let parsed = crate::parser::parse(
+        r#"
+let source = mock.test.Source {}
+let valid = source.count + 1
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse before schema-aware validation");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Source")
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "count",
+                    AttributeType::refined_int(Some(TypeIdentity::bare("Count")), None),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("source schema must be valid"),
+    );
+
+    validate_resource_ref_types_for_test(&parsed, &schemas)
+        .expect("a refined Int retains its Int arithmetic shape");
+}
+
+#[test]
+fn refined_string_resource_operand_is_not_an_int_operand() {
+    use crate::schema::AttributeSchema;
+
+    let parsed = crate::parser::parse(
+        r#"
+let source = mock.test.Source {}
+let invalid = source.count + 1
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse before schema-aware validation");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Source")
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "count",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::bare("CountLabel")),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("source schema must be valid"),
+    );
+
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas)
+        .expect_err("a refined String must not become an arithmetic Int operand");
+    assert!(error.contains("left operand must be Int"), "{error}");
+}
+
+#[test]
+fn deferred_string_resource_attribute_is_not_an_int_operand() {
+    use crate::schema::AttributeSchema;
+
+    let parsed = crate::parser::parse(
+        "let source = mock.test.Source {}\nlet invalid = source.label + 1\n",
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse before schema-aware validation");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Source")
+            .attribute(
+                AttributeSchema::provider_populated("label", AttributeType::string()).build(),
+            )
+            .validate()
+            .expect("source schema must be valid"),
+    );
+
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas)
+        .expect_err("a deferred String attribute cannot be an arithmetic operand");
+    assert_eq!(error, "operator '+': left operand must be Int, got String");
+}
+
+#[test]
+fn integer_arithmetic_result_obeys_the_declared_resource_sink() {
+    use crate::schema::AttributeSchema;
+
+    let parsed = crate::parser::parse(
+        r#"
+let source = mock.test.Source {}
+let invalid = mock.test.Consumer { label = source.count + 1 }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("sink fixture must parse before schema-aware validation");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Source")
+            .attribute(AttributeSchema::provider_populated("count", AttributeType::int()).build())
+            .validate()
+            .expect("source schema must be valid"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Consumer")
+            .attribute(AttributeSchema::required("label", AttributeType::string()).build())
+            .validate()
+            .expect("consumer schema must be valid"),
+    );
+
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas)
+        .expect_err("an Int expression cannot satisfy a String resource sink");
+    assert!(
+        error.contains("expected String") && error.contains("got Int"),
+        "unexpected result-sink diagnostic: {error}"
+    );
+}
+
+#[test]
+fn module_attribute_integer_arithmetic_uses_declared_argument_types() {
+    let valid = crate::parser::parse(
+        r#"
+arguments { count: Int }
+attributes { doubled: Int = count * 2 }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("valid module fixture must parse");
+    validate_resource_ref_types_for_test(&valid, &SchemaRegistry::new())
+        .expect("a declared Int module argument proves the arithmetic operand");
+
+    let invalid = crate::parser::parse(
+        r#"
+arguments { ratio: Float }
+attributes { rounded: Int = ratio + 1 }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("invalid module fixture must parse before type validation");
+    let error = validate_resource_ref_types_for_test(&invalid, &SchemaRegistry::new())
+        .expect_err("a declared Float module argument cannot be used in integer arithmetic");
+    assert_eq!(error, "operator '+': left operand must be Int, got Float");
+}
+
+#[test]
+fn unused_function_integer_arithmetic_uses_declared_parameter_types() {
+    let valid = crate::parser::parse(
+        "fn doubled(value: Int): Int { value * 2 }\n",
+        &ProviderContext::default(),
+    )
+    .expect("valid function fixture must parse");
+    validate_resource_ref_types_for_test(&valid, &SchemaRegistry::new())
+        .expect("a declared Int function parameter proves the arithmetic operand");
+
+    let invalid = crate::parser::parse(
+        "fn rounded(value: Float): Int { value + 1 }\n",
+        &ProviderContext::default(),
+    )
+    .expect("invalid function fixture must parse before type validation");
+    let error = validate_resource_ref_types_for_test(&invalid, &SchemaRegistry::new())
+        .expect_err("an unused function must still reject a Float arithmetic operand");
+    assert_eq!(error, "operator '+': left operand must be Int, got Float");
+
+    let invalid_return = crate::parser::parse(
+        "fn mislabeled(value: Int): String { value + 1 }\n",
+        &ProviderContext::default(),
+    )
+    .expect("return-sink fixture must parse before directory type validation");
+    let error = validate_resource_ref_types_for_test(&invalid_return, &SchemaRegistry::new())
+        .expect_err("an arithmetic Int result cannot satisfy a declared String return type");
+    assert!(
+        error.contains("expected String") && error.contains("got Int"),
+        "unexpected return-sink diagnostic: {error}"
+    );
+
+    let untyped = crate::parser::parse(
+        "fn unproven(value): Int { value + 1 }\n",
+        &ProviderContext::default(),
+    )
+    .expect("untyped-parameter fixture must parse before directory type validation");
+    let error = validate_resource_ref_types_for_test(&untyped, &SchemaRegistry::new())
+        .expect_err("an untyped function parameter cannot prove an Int operand");
+    assert!(
+        error.contains("left operand must be Int") && error.contains("unproven type"),
+        "unexpected untyped-operand diagnostic: {error}"
+    );
 }
 
 fn function_ref_schema() -> SchemaRegistry {
@@ -361,6 +599,32 @@ mock.test.resource { name = f(r.name) }
 
     let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings)
         .expect_err("String resource attribute passed to Int must be rejected");
+    assert!(
+        error.contains("expected Int") && error.contains("got String"),
+        "{error}"
+    );
+}
+
+#[test]
+fn function_call_reference_in_parser_side_deferred_body_is_checked() {
+    let parsed = crate::parser::parse(
+        r#"
+let pending = upstream_state { source = "../pending" }
+let r = mock.test.resource { name = "r" }
+fn f(x: Int) { "fixed" }
+let generated = for item in pending.items {
+    mock.test.resource { name = f(r.name) }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
+    let schemas = function_ref_schema();
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+
+    let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings)
+        .expect_err("deferred body function argument mismatch must be rejected");
     assert!(
         error.contains("expected Int") && error.contains("got String"),
         "{error}"
@@ -926,7 +1190,7 @@ fn binding_referenced_only_by_deferred_for_iterable_is_not_unused() {
     "#;
     let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
 
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     assert!(check_unused_bindings(&authored_binding_view(src)).is_empty());
 }
 
@@ -1017,6 +1281,40 @@ fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
     assert!(
         source.source().is_none(),
         "a terminal resolution diagnostic must not repeat its own Display",
+    );
+}
+
+#[test]
+fn parser_side_deferred_resource_keeps_bare_binding_sink_type() {
+    let parsed = crate::parser::parse(
+        r#"
+arguments {
+    items: list(String)
+    value: Int
+}
+let generated = for item in items {
+    mock.test.resource { name = value }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
+    let schemas = function_ref_schema();
+    let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
+    let provider_context = LoadedProviderContext::empty_for_test();
+    let context =
+        ValidationTypeContext::new(&parsed, &schemas, &provider_context, &module_signatures);
+
+    let report = check_bare_binding_uses(&parsed, &context);
+    assert!(
+        !report.is_ready(),
+        "expected typed sink mismatch: {report:#?}"
+    );
+    let rendered = format!("{:#?}", report.findings());
+    assert!(
+        rendered.contains("String") && rendered.contains("Int"),
+        "{rendered}"
     );
 }
 
@@ -1324,10 +1622,10 @@ mock.test.Consumer { name = shared }
 
     let config = ProviderContext::default();
     let schemas = SchemaRegistry::new();
-    let mut parsed = crate::config_loader::parse_directory(fixture.path(), &config)
+    let parsed = crate::config_loader::parse_directory(fixture.path(), &config)
         .expect("load module fixture");
-    crate::module_resolver::resolve_modules_with_providerless_config(
-        &mut parsed,
+    let parsed = crate::module_resolver::resolve_modules_with_providerless_config(
+        parsed,
         fixture.path(),
         &config,
         &schemas,
@@ -1335,7 +1633,7 @@ mock.test.Consumer { name = shared }
     .expect("expand nested module");
 
     assert_eq!(
-        check_unused_bindings_in_file(&parsed),
+        check_unused_bindings_in_resolved_file(&parsed),
         vec!["shared"],
         "module-local provenance must not count as a use of the root binding",
     );

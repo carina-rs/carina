@@ -762,6 +762,9 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
         &crate::parser::ProviderContext::default(),
     )
     .expect("the parser must preserve the authored use for typed validation");
+    let parsed =
+        crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+            .expect("the fixture crosses module resolution before readiness validation");
     let error = crate::validation::resolve_bare_binding_uses(
         parsed,
         &SchemaRegistry::new(),
@@ -7475,8 +7478,8 @@ import {
     )
     .expect("bound discard loop and state blocks parse");
     assert!(matches!(
-        parsed.deferred_for_expressions.as_slice(),
-        [crate::parser::DeferredForExpression {
+        parsed.parsed_deferred_for_expressions(),
+        [crate::parser::ParsedDeferredForExpression {
             target: crate::parser::DeferredForTarget::Bound { binding },
             ..
         }] if binding == "_"

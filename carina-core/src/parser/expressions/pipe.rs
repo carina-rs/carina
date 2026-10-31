@@ -9,7 +9,7 @@
 use crate::eval_value::EvalValue;
 use crate::parser::ParsedValue as Value;
 use crate::parser::context::ExpressionMode;
-use crate::parser::expressions::primary::parse_postfix_eval_with_mode;
+use crate::parser::expressions::integer_arithmetic::parse_additive_expr_with_mode;
 use crate::parser::functions::{
     apply_parser_closure, evaluate_user_function_eval, lower_function_arguments,
     record_deferred_function_type_check, reject_builtin_handle_arguments,
@@ -147,7 +147,7 @@ pub(crate) fn parse_coalesce_expr_with_mode(
     Ok(result)
 }
 
-fn combine_coalesce_operands(
+pub(crate) fn combine_coalesce_operands(
     value: EvalValue,
     default: EvalValue,
     line: usize,
@@ -210,58 +210,62 @@ fn parse_compose_expr_with_mode(
 ) -> Result<EvalValue, ParseError> {
     let mut inner = pair.into_inner();
     let has_composition = inner.clone().count() > 1;
-    let first = next_pair(&mut inner, "postfix expression", "compose expression")?;
+    let first = next_pair(&mut inner, "additive expression", "compose expression")?;
     let operand_mode = has_composition.then(ExpressionMode::untyped);
     let operand_mode = operand_mode.as_ref().unwrap_or(mode);
-    let mut value = parse_postfix_eval_with_mode(first, ctx, operand_mode)?;
+    let mut value = parse_additive_expr_with_mode(first, ctx, operand_mode)?;
 
     // Collect remaining primaries for >> composition
     for rhs_pair in inner {
-        let rhs = parse_postfix_eval_with_mode(rhs_pair, ctx, operand_mode)?;
+        let rhs = parse_additive_expr_with_mode(rhs_pair, ctx, operand_mode)?;
 
-        // Both sides must be Closures
-        if !value.is_closure() {
-            return Err(ParseError::InvalidExpression {
-                line: 0,
-                message: format!(
-                    "left side of >> must be a Closure (partially applied function), got {}",
-                    eval_type_name(&value)
-                ),
-            });
-        }
-        if !rhs.is_closure() {
-            return Err(ParseError::InvalidExpression {
-                line: 0,
-                message: format!(
-                    "right side of >> must be a Closure (partially applied function), got {}",
-                    eval_type_name(&rhs)
-                ),
-            });
-        }
-
-        // Build a composed closure: __compose__ with the chain stored in captured_args
-        // If the left side is already a __compose__, extend the chain; otherwise start a new one
-        let functions = if let EvalValue::Closure {
-            name,
-            captured_args,
-            ..
-        } = &value
-            && name == "__compose__"
-        {
-            let mut fns = captured_args.clone();
-            fns.push(rhs);
-            fns
-        } else {
-            vec![value, rhs]
-        };
-
-        value = EvalValue::closure("__compose__", functions, 1);
+        value = combine_compose_operands(value, rhs)?;
     }
 
     Ok(value)
 }
 
-fn parse_pipe_expr_with_mode(
+pub(crate) fn combine_compose_operands(
+    value: EvalValue,
+    rhs: EvalValue,
+) -> Result<EvalValue, ParseError> {
+    if !value.is_closure() {
+        return Err(ParseError::InvalidExpression {
+            line: 0,
+            message: format!(
+                "left side of >> must be a Closure (partially applied function), got {}",
+                eval_type_name(&value)
+            ),
+        });
+    }
+    if !rhs.is_closure() {
+        return Err(ParseError::InvalidExpression {
+            line: 0,
+            message: format!(
+                "right side of >> must be a Closure (partially applied function), got {}",
+                eval_type_name(&rhs)
+            ),
+        });
+    }
+
+    let functions = if let EvalValue::Closure {
+        name,
+        captured_args,
+        ..
+    } = &value
+        && name == "__compose__"
+    {
+        let mut functions = captured_args.clone();
+        functions.push(rhs);
+        functions
+    } else {
+        vec![value, rhs]
+    };
+
+    Ok(EvalValue::closure("__compose__", functions, 1))
+}
+
+pub(crate) fn parse_pipe_expr_with_mode(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     mode: &ExpressionMode<'_>,

@@ -63,16 +63,31 @@ impl LexedLine {
         self.heredoc_body
     }
 
-    /// Replace every non-code character with one space. This preserves source
-    /// character positions (the unit used by LSP ranges), though replacing a
-    /// non-ASCII character intentionally does not preserve UTF-8 byte offsets.
+    /// Replace every non-code character with one space. An interpolation's
+    /// MACRO token owns its complete range, so its otherwise-code-visible
+    /// interior is masked here as well. This preserves source character
+    /// positions (the unit used by LSP ranges), though replacing a non-ASCII
+    /// character intentionally does not preserve UTF-8 byte offsets.
     pub(crate) fn masked_code(&self) -> MaskedCode {
+        let heredoc_opener =
+            carina_core::heredoc::find_heredoc_opener_range(&self.text).map(|range| {
+                (
+                    self.text[..range.start].chars().count(),
+                    self.text[..range.end].chars().count(),
+                )
+            });
         MaskedCode(
             self.text
                 .chars()
                 .zip(&self.chars)
-                .map(|(ch, classified)| {
-                    if classified.is_code_visible() {
+                .enumerate()
+                .map(|(index, (ch, classified))| {
+                    let inside_heredoc_opener =
+                        heredoc_opener.is_some_and(|(start, end)| index >= start && index < end);
+                    if classified.is_code_visible()
+                        && !classified.is_inside_interpolation()
+                        && !inside_heredoc_opener
+                    {
                         ch
                     } else {
                         ' '

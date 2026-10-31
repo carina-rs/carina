@@ -119,7 +119,7 @@ pub(super) fn parse_fn_def(
     for body_inner in body_pair.into_inner() {
         match body_inner.as_rule() {
             Rule::fn_local_let => {
-                let source_line = body_inner.line_col().0;
+                let source_line = body_ctx.original_position(&body_inner)?.line();
                 let mut let_inner = body_inner.into_inner();
                 let let_name = next_pair(&mut let_inner, "let name", "fn_local_let")?
                     .as_str()
@@ -138,7 +138,7 @@ pub(super) fn parse_fn_def(
             }
             _ => {
                 // This should be the expression (the body)
-                let source_line = body_inner.line_col().0;
+                let source_line = body_ctx.original_position(&body_inner)?.line();
                 body = Some(UserFunctionBody {
                     value: parse_expression(body_inner, &body_ctx)?,
                     source_line,
@@ -310,6 +310,10 @@ fn function_argument_must_remain_deferred(argument: &FunctionArgument) -> bool {
 
 fn contains_deferred_user_function_call(value: &Value) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
+            .values()
+            .into_iter()
+            .any(contains_deferred_user_function_call),
         Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
             crate::builtins::builtin_arity(name).is_none()
                 || args.iter().any(|argument| {
@@ -342,6 +346,10 @@ fn contains_deferred_user_function_call(value: &Value) -> bool {
             contains_deferred_user_function_call(value)
                 || contains_deferred_user_function_call(default)
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            contains_deferred_user_function_call(expression.lhs())
+                || contains_deferred_user_function_call(expression.rhs())
+        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -371,8 +379,11 @@ fn function_argument_awaits_module_substitution(argument: &FunctionArgument) -> 
         || argument.value().is_some_and(contains_module_argument)
 }
 
-fn contains_module_argument(value: &Value) -> bool {
+pub(super) fn contains_module_argument(value: &Value) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred.values().into_iter().any(contains_module_argument)
+        }
         Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument { .. })) => true,
         Value::Deferred(DeferredValue::Placeholder(
             ParserPlaceholder::FnParam { .. }
@@ -406,6 +417,10 @@ fn contains_module_argument(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Secret(inner)) => contains_module_argument(inner),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_module_argument(value) || contains_module_argument(default)
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            contains_module_argument(expression.lhs())
+                || contains_module_argument(expression.rhs())
         }
         Value::Deferred(
             DeferredValue::ResourceRef { .. }
@@ -918,6 +933,9 @@ fn locate_function_body_error(func: &UserFunction, error: ParseError) -> ParseEr
 
 pub fn contains_function_call(value: &Value) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred.values().into_iter().any(contains_function_call)
+        }
         Value::Deferred(
             DeferredValue::FunctionCall { .. }
             | DeferredValue::ResolvedFunctionCall { .. },
@@ -933,6 +951,9 @@ pub fn contains_function_call(value: &Value) -> bool {
             matches!(part, crate::resource::InterpolationPart::Expr(value) if contains_function_call(value))
         }),
         Value::Deferred(DeferredValue::Secret(inner)) => contains_function_call(inner),
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            contains_function_call(expression.lhs()) || contains_function_call(expression.rhs())
+        }
         _ => false,
     }
 }
@@ -1012,6 +1033,11 @@ fn substitute_fn_params_with_position(
     position: FunctionSubstitutionPosition,
 ) -> Result<Value, ParseError> {
     Ok(match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let deferred = deferred
+                .try_map(|value| substitute_fn_params(value, substitutions, source_line))?;
+            Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred)))
+        }
         Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnParam { name }))
         | Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnLocal { name })) => {
             match substitutions.get(name) {
@@ -1166,6 +1192,14 @@ fn substitute_fn_params_with_position(
                 default: Box::new(substitute_fn_params(default, substitutions, source_line)?),
             })
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = substitute_fn_params(expression.lhs(), substitutions, source_line)?;
+            let rhs = substitute_fn_params(expression.rhs(), substitutions, source_line)?;
+            let span = expression.operator_span();
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| ParseError::integer_arithmetic(span, source_line, error))?
+        }
         Value::Deferred(DeferredValue::Unknown(_))
         | Value::Deferred(DeferredValue::Placeholder(
             ParserPlaceholder::ModuleArgument { .. }
@@ -1295,6 +1329,17 @@ pub(super) fn try_evaluate_fn_value<Source: Clone>(
     containing_line: usize,
 ) -> Result<Value, ParseError> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let mut deferred = *deferred;
+            deferred.condition.value = try_evaluate_fn_value(
+                deferred.condition.value,
+                ctx,
+                deferred.condition.source_line,
+            )?;
+            deferred.then_value = try_evaluate_fn_value(deferred.then_value, ctx, containing_line)?;
+            deferred.else_value = try_evaluate_fn_value(deferred.else_value, ctx, containing_line)?;
+            Ok(Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred))))
+        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,
@@ -1365,6 +1410,22 @@ pub(super) fn try_evaluate_fn_value<Source: Clone>(
                     line: access.source_line(),
                     message: error.to_string(),
                 })
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let span = expression.operator_span();
+            let lhs = try_evaluate_fn_value(
+                expression.lhs().clone(),
+                ctx,
+                span.line().unwrap_or(containing_line),
+            )?;
+            let rhs = try_evaluate_fn_value(
+                expression.rhs().clone(),
+                ctx,
+                span.line().unwrap_or(containing_line),
+            )?;
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| ParseError::integer_arithmetic(span, containing_line, error))
         }
         Value::Concrete(ConcreteValue::List(items)) => {
             let evaluated: Result<Vec<Value>, ParseError> = items

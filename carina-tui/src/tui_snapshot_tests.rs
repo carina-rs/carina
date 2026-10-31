@@ -275,17 +275,24 @@ fn build_anonymous_deferred_for_plan() -> Plan {
     template_resource
         .attributes
         .extend(deferred_record_attributes());
-    let target = carina_core::parser::parse_file(
+    let parsed = carina_core::parser::parse_file(
         "for opt in cert.domain_validation_options {\n  aws.route53.Record { name = opt }\n}\n",
         std::path::Path::new("main.crn"),
         &carina_core::parser::ProviderContext::default(),
     )
-    .expect("parse anonymous deferred-for target")
-    .deferred_for_expressions
-    .into_iter()
-    .next()
-    .expect("anonymous deferred-for expression")
-    .target;
+    .expect("parse anonymous deferred-for target");
+    let parsed = carina_core::module_resolver::resolve_modules_providerless(
+        parsed,
+        std::path::Path::new("."),
+    )
+    .expect("resolve anonymous deferred-for target");
+    let target = parsed
+        .deferred_for_expressions()
+        .iter()
+        .next()
+        .cloned()
+        .expect("anonymous deferred-for expression")
+        .target;
     assert!(matches!(
         &target,
         carina_core::parser::DeferredForTarget::Unbound { .. }
@@ -410,7 +417,12 @@ fn snapshot_anonymous_loop_origin_effect_labels() {
         std::path::Path::new("main.crn"),
         &carina_core::parser::ProviderContext::default(),
     )
-    .expect("parse anonymous-loop fixture")
+    .expect("parse anonymous-loop fixture");
+    let parsed = carina_core::module_resolver::resolve_modules_providerless(
+        parsed,
+        std::path::Path::new("."),
+    )
+    .expect("resolve anonymous-loop fixture")
     .into_expanded()
     .expect("anonymous-loop fixture must not retain parser placeholders");
     let mut resource = parsed

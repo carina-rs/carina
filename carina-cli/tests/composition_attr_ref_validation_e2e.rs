@@ -656,10 +656,10 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
     );
     let provider_context = loaded_providers.provider_context();
     let schemas = loaded_providers.schemas();
-    let mut parsed = carina_core::config_loader::parse_directory(&fixture.caller, provider_context)
+    let parsed = carina_core::config_loader::parse_directory(&fixture.caller, provider_context)
         .expect("parse directory-scoped fixture");
-    carina_core::module_resolver::resolve_modules_with_config(
-        &mut parsed,
+    let parsed = carina_core::module_resolver::resolve_modules_with_config(
+        parsed,
         carina_core::config_loader::get_base_dir(&fixture.caller),
         provider_context,
         schemas.schemas(),

@@ -280,10 +280,10 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let mut caller = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     caller.push("tests/fixtures/wait/module_wait_downstream/caller");
 
-    let mut parsed = parse_directory(&caller, &ProviderContext::default())
+    let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed for the caller fixture");
 
-    resolve_modules(&mut parsed, &caller).expect("module resolution should succeed");
+    let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
     let parsed = parsed
         .into_expanded()
         .expect("expanded module fixture contains no parser placeholders");
@@ -474,10 +474,10 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     root.push("tests/fixtures/wait/module_wait_nested/root");
 
-    let mut parsed = parse_directory(&root, &ProviderContext::default())
+    let parsed = parse_directory(&root, &ProviderContext::default())
         .expect("parse_directory should succeed for the nested root fixture");
 
-    resolve_modules(&mut parsed, &root).expect("nested module resolution should succeed");
+    let parsed = resolve_modules(parsed, &root).expect("nested module resolution should succeed");
     let parsed = parsed
         .into_expanded()
         .expect("expanded nested module fixture contains no parser placeholders");
@@ -654,9 +654,9 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     let mut caller = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     caller.push("tests/fixtures/wait/module_wait_downstream/caller");
 
-    let mut parsed = parse_directory(&caller, &ProviderContext::default())
+    let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed");
-    resolve_modules(&mut parsed, &caller).expect("module resolution should succeed");
+    let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
     let parsed = parsed
         .into_expanded()
         .expect("expanded module fixture contains no parser placeholders");

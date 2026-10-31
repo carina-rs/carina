@@ -325,6 +325,10 @@ impl<'de> Deserialize<'de> for WaitPredicateValue {
 
 fn unresolved_enum_identifier<P: PlaceholderKind>(value: &Value<P>) -> Option<&str> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
+            .values()
+            .into_iter()
+            .find_map(unresolved_enum_identifier),
         Value::Concrete(ConcreteValue::EnumIdentifier(identifier)) => Some(identifier.as_str()),
         Value::Concrete(ConcreteValue::List(items)) => {
             items.iter().find_map(unresolved_enum_identifier)
@@ -350,6 +354,10 @@ fn unresolved_enum_identifier<P: PlaceholderKind>(value: &Value<P>) -> Option<&s
         Value::Deferred(DeferredValue::Secret(inner)) => unresolved_enum_identifier(inner),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             unresolved_enum_identifier(value).or_else(|| unresolved_enum_identifier(default))
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            unresolved_enum_identifier(expression.lhs())
+                .or_else(|| unresolved_enum_identifier(expression.rhs()))
         }
         Value::Concrete(
             ConcreteValue::String(_)

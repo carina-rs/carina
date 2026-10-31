@@ -302,3 +302,158 @@ fn validate_enumerates_deferred_for_body_over_same_config_read_attr() {
         ids
     );
 }
+
+#[test]
+fn validate_lists_authored_module_if_iterable_expression() {
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"arguments {
+  flag: Bool
+  enabled: list(String)
+  disabled: list(String)
+}
+let names = if flag { enabled } else { disabled }
+let resources = for name in names {
+  aws.route53.RecordSet { name = name }
+}
+"#,
+    )]);
+
+    let ids = carina_cli::commands::validate::validated_resource_ids_with_factories(
+        fixture.path(),
+        factories(),
+    );
+    let listing = ids.join("\n");
+    assert!(
+        listing.contains("deferred: for name in names"),
+        "validate did not preserve the authored iterable expression: {listing}",
+    );
+    assert!(!listing.contains("unresolved module argument"), "{listing}");
+}
+
+#[test]
+fn validate_reports_runtime_deferred_module_call_body_at_resolution_seam() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider aws { region = 'us-east-1' }\n"),
+        (
+            "main.crn",
+            "let child = use { source = './child' }\n\
+             let cert = aws.acm.Certificate { domain_name = 'example.com' }\n\
+             let items = for item in cert.domain_validation_options { child { item = item } }\n",
+        ),
+    ]);
+    std::fs::create_dir(fixture.path().join("child")).expect("child directory");
+    std::fs::write(
+        fixture.path().join("child/main.crn"),
+        "arguments { item: String }\naws.route53.RecordSet { name = item }\n",
+    )
+    .expect("child module");
+
+    let errors =
+        carina_cli::commands::validate::validate_with_factories(fixture.path(), factories());
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("for item in cert.domain_validation_options")
+                && error.contains("module call `child`")
+                && error.contains("line 3")
+                && error.contains("still unresolved after module expansion")
+        }),
+        "carina validate must report the typed deferred-body error: {errors:#?}"
+    );
+}
+
+#[test]
+fn validate_reports_runtime_deferred_read_body_at_resolution_seam() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider aws { region = 'us-east-1' }\n"),
+        (
+            "main.crn",
+            "let cert = aws.acm.Certificate { domain_name = 'example.com' }\n\
+             let items = for item in cert.domain_validation_options {\n\
+               read aws.route53.RecordSet { name = item }\n\
+             }\n",
+        ),
+    ]);
+
+    let errors =
+        carina_cli::commands::validate::validate_with_factories(fixture.path(), factories());
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("for item in cert.domain_validation_options")
+                && error.contains("read `aws.route53.RecordSet`")
+                && error.contains("line 2")
+                && error.contains("still unresolved after module expansion")
+        }),
+        "carina validate must report the typed deferred-body error: {errors:#?}"
+    );
+}
+
+#[test]
+fn validate_reports_imported_deferred_body_at_owning_call() {
+    let fixture = write_fixture(&[(
+        "caller.crn",
+        "let parent = use { source = './parent' }\n\
+         let instance = parent { names = ['one'] }\n",
+    )]);
+    std::fs::create_dir_all(fixture.path().join("parent/grandchild"))
+        .expect("nested module directories");
+    std::fs::write(
+        fixture.path().join("parent/main.crn"),
+        "arguments { names: list(String) }\n\
+         let grandchild = use { source = './grandchild' }\n\
+         let children = for name in names { grandchild { name = name } }\n",
+    )
+    .expect("parent module");
+    std::fs::write(
+        fixture.path().join("parent/grandchild/main.crn"),
+        "arguments { name: String }\n",
+    )
+    .expect("grandchild module");
+
+    let errors =
+        carina_cli::commands::validate::validate_with_factories(fixture.path(), factories());
+    let error = errors
+        .iter()
+        .find(|error| error.contains("cannot use module call `grandchild`"))
+        .unwrap_or_else(|| panic!("missing deferred-body error: {errors:#?}"));
+    assert!(
+        error.contains("caller.crn") && error.contains("line 2"),
+        "the error must identify the root module call that owns the imported rejection: {error}"
+    );
+}
+
+#[test]
+fn validate_reports_every_rejected_loop_across_files() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider aws { region = 'us-east-1' }\n"),
+        (
+            "main.crn",
+            "let child = use { source = './child' }\n\
+             let cert = aws.acm.Certificate { domain_name = 'example.com' }\n",
+        ),
+        (
+            "first.crn",
+            "let first = for item in cert.domain_validation_options { child { item = item } }\n",
+        ),
+        (
+            "second.crn",
+            "let second = for item in cert.domain_validation_options { child { item = item } }\n",
+        ),
+    ]);
+    std::fs::create_dir(fixture.path().join("child")).expect("child directory");
+    std::fs::write(
+        fixture.path().join("child/main.crn"),
+        "arguments { item: String }\n",
+    )
+    .expect("child module");
+
+    let errors =
+        carina_cli::commands::validate::validate_with_factories(fixture.path(), factories());
+    let rejected = errors
+        .iter()
+        .filter(|error| error.contains("only a managed resource body can be deferred"))
+        .collect::<Vec<_>>();
+    assert_eq!(rejected.len(), 2, "errors: {errors:#?}");
+    assert!(rejected.iter().any(|error| error.contains("first.crn")));
+    assert!(rejected.iter().any(|error| error.contains("second.crn")));
+}

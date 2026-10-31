@@ -318,9 +318,9 @@ pub fn top_level_anonymous_resource_spans(
                 provider: provider.to_string(),
                 resource_type: resource_type.to_string(),
                 span: TopLevelBlockSourceSpan {
-                    start_line: start.line,
-                    start_column: start.column,
-                    end_column: start.column + full_type.chars().count(),
+                    start_line: start.line(),
+                    start_column: start.column(),
+                    end_column: start.column() + full_type.chars().count(),
                 },
             });
         }
@@ -357,9 +357,9 @@ fn top_level_block_spans(
             };
             let start = preprocessed_file.original_position(block.as_span().start());
             spans.push(TopLevelBlockSourceSpan {
-                start_line: start.line,
-                start_column: start.column,
-                end_column: start.column + keyword.len(),
+                start_line: start.line(),
+                start_column: start.column(),
+                end_column: start.column() + keyword.len(),
             });
         }
     }
@@ -531,6 +531,7 @@ fn resolve_top_level_user_functions(
                     }
 
                     let mut warnings = Vec::new();
+                    ctx.set_preprocessed_file(&preprocessed_file);
                     match parse_fn_def(statement, &ctx, &mut warnings, &preprocessed_file) {
                         Ok(mut function) => {
                             function.body.source_file = Some((*path).to_path_buf());
@@ -1133,7 +1134,8 @@ fn parse_with_seeded_bindings_inner(
     parsed.structural_bindings = ctx.structural_bindings;
     parsed.parser_binding_metadata = parser_binding_metadata;
     parsed.warnings = ctx.warnings;
-    parsed.deferred_for_expressions = ctx.deferred_for_expressions;
+    *parsed.parsed_deferred_for_expressions_mut() = ctx.parsed_deferred_for_expressions;
+    parsed.deferred_module_ifs = ctx.deferred_module_ifs;
     let binding_scope = crate::binding_index::BindingNameSet::from_parsed(&parsed);
     parsed.set_loop_binding_scope(binding_scope.iter_names().map(str::to_string).collect());
     // The parser never synthesizes composition resources, so its default
@@ -1170,10 +1172,10 @@ fn collect_single_quoted_interpolation_warnings_from_pair(
             let start = preprocessed_file.original_position(content_start + start);
             let end = preprocessed_file.original_position(content_start + end);
             let span = ParseWarningSpan {
-                start_line: start.line,
-                start_column: start.column,
-                end_line: end.line,
-                end_column: end.column,
+                start_line: start.line(),
+                start_column: start.column(),
+                end_line: end.line(),
+                end_column: end.column(),
             };
             warnings.push(ParseWarning {
                 file: None,

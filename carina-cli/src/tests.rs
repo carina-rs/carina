@@ -66,8 +66,8 @@ fn loaded_provider_context() -> LoadedProviderContext {
 }
 
 #[test]
-fn saved_plan_version_is_37_for_deferred_value_stages() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 37);
+fn saved_plan_version_is_35_for_deferred_value_stages() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 35);
 }
 
 #[test]
@@ -3650,13 +3650,25 @@ fn plan_file_serialization_redacts_secrets() {
     let secret_password = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("super-secret-pw".into()),
     ))));
+    let secret_arithmetic = Value::Deferred(DeferredValue::IntegerArithmetic(
+        carina_core::integer_arithmetic::ValidatedIntegerExpr::new(
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::Int(42),
+            )))),
+            carina_core::integer_arithmetic::IntegerOp::Add,
+            Value::Concrete(ConcreteValue::Int(1)),
+            carina_core::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+        )
+        .expect("a secret Int is a valid arithmetic operand"),
+    ));
 
     let resource_with_secret = Resource::with_provider("awscc", "rds.db_instance", "my-db", None)
         .with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("my-db".into())),
         )
-        .with_attribute("master_password", secret_password.clone());
+        .with_attribute("master_password", secret_password.clone())
+        .with_attribute("secret_number", secret_arithmetic.clone());
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(resource_with_secret.clone())));
@@ -3667,6 +3679,7 @@ fn plan_file_serialization_redacts_secrets() {
         Value::Concrete(ConcreteValue::String("my-db".into())),
     );
     state_attrs.insert("master_password".to_string(), secret_password.clone());
+    state_attrs.insert("secret_number".to_string(), secret_arithmetic);
     let state_with_secret = State::existing(
         ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None),
         state_attrs,
@@ -3709,6 +3722,11 @@ fn plan_file_serialization_redacts_secrets() {
     assert!(
         !json.contains("super-secret-pw"),
         "Plan file JSON must not contain plaintext secret value.\nJSON:\n{}",
+        json
+    );
+    assert!(
+        !json.contains("\"Int\": 42"),
+        "Plan file JSON must not contain a secret arithmetic operand.\nJSON:\n{}",
         json
     );
 
@@ -3826,7 +3844,7 @@ fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
     let parsed = parsed
         .into_expanded()
         .expect("bound deferred loop must contain only loop slots");
-    let template = parsed.deferred_for_expressions[0].clone();
+    let template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(
         template.target,
         carina_core::parser::DeferredForTarget::Bound { .. }
@@ -3899,7 +3917,7 @@ fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
     let parsed = parsed
         .into_expanded()
         .expect("unbound deferred loop must contain only loop slots");
-    let mut template = parsed.deferred_for_expressions[0].clone();
+    let mut template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(
         template.target,
         carina_core::parser::DeferredForTarget::Unbound { .. }

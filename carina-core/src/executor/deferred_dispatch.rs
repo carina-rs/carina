@@ -493,7 +493,7 @@ mod tests {
         .expect("deferred unbound loop parses")
         .into_expanded()
         .expect("deferred-loop fixture contains no parser placeholders");
-        let template = &parsed.deferred_for_expressions[0];
+        let template = &parsed.deferred_for_expressions()[0];
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(
             "upstream",
@@ -554,7 +554,7 @@ mod tests {
         .expect("deferred unbound enum loop parses")
         .into_expanded()
         .expect("deferred-loop fixture contains no parser placeholders");
-        let template = &parsed.deferred_for_expressions[0];
+        let template = &parsed.deferred_for_expressions()[0];
         let iterable = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::enum_identifier("foo"),
         )]));
@@ -635,7 +635,7 @@ mod tests {
         .expect("deferred unbound loop parses")
         .into_expanded()
         .expect("deferred-loop fixture contains no parser placeholders");
-        let template = &parsed.deferred_for_expressions[0];
+        let template = &parsed.deferred_for_expressions()[0];
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(
             "upstream",

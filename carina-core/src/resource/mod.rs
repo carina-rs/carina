@@ -2482,6 +2482,24 @@ impl<P: PlaceholderKind> StructuralOperand<P> {
         }
     }
 
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visitor: &mut impl FnMut(&Value<P>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::Value { value, access_base } => {
+                visitor(value)?;
+                if let Some(access_base) = access_base {
+                    visitor(access_base)?;
+                }
+            }
+            Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => {
+                visitor(access_base)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn try_map<E>(
         &self,
         mut map: impl FnMut(&Value<P>) -> Result<Value<P>, E>,
@@ -2489,7 +2507,7 @@ impl<P: PlaceholderKind> StructuralOperand<P> {
         Ok(match self {
             Self::Value { value, access_base } => Self::Value {
                 value: map(value)?,
-                access_base: access_base.as_ref().map(&mut map).transpose()?,
+                access_base: access_base.as_ref().map(map).transpose()?,
             },
             Self::Handle {
                 handle,
@@ -2588,6 +2606,13 @@ impl<P: PlaceholderKind> FunctionArgument<P> {
 
     pub(crate) fn walker_value_mut(&mut self) -> &mut Value<P> {
         self.operand.traversal_value_mut()
+    }
+
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value<P>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.operand.try_visit_values(visit)
     }
 
     pub(crate) fn try_map_value<E>(
@@ -2952,6 +2977,10 @@ impl fmt::Display for UnavailableReason {
 /// (apply time, upstream load, function evaluation).
 #[derive(Clone)]
 pub enum DeferredValue<P: PlaceholderKind = NoPlaceholder> {
+    /// A value-level `if` whose condition depends on a reusable module
+    /// argument. Module expansion selects a branch after call-site
+    /// substitution; it cannot cross the expansion boundary.
+    ModuleIf(Box<crate::parser::DeferredValueIf<P>>),
     /// Reference to another resource's attribute via an access path.
     ResourceRef { path: AccessPath },
     /// Reference to a binding without an attribute selector.
@@ -2962,6 +2991,9 @@ pub enum DeferredValue<P: PlaceholderKind = NoPlaceholder> {
         value: Box<Value<P>>,
         default: Box<Value<P>>,
     },
+    /// A typed binary Int expression that is evaluated once both operands are
+    /// available. This is an intrinsic node, not a hidden built-in call.
+    IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr<P>),
     /// String interpolation: `"prefix-${expr}-suffix"`
     Interpolation(Vec<InterpolationPart<P>>),
     /// Built-in function call: `join("-", ["a", "b"])` or via pipe
@@ -3030,9 +3062,20 @@ impl<P: PlaceholderKind> DeferredValue<P> {
         &self,
     ) -> Option<(crate::builtins::BuiltinFunction, &[FunctionArgument<P>])> {
         match self {
+            Self::ModuleIf(_) => None,
             Self::FunctionCall { name, args, .. } => Some((*name, args)),
             Self::Unavailable { name, args, .. } => Some((*name, args)),
-            _ => None,
+            Self::ResourceRef { .. }
+            | Self::BindingRef { .. }
+            | Self::Coalesce { .. }
+            | Self::IntegerArithmetic(_)
+            | Self::Interpolation(_)
+            | Self::ResolvedFunctionCall { .. }
+            | Self::Access(_)
+            | Self::Secret(_)
+            | Self::RedactedSecret { .. }
+            | Self::Unknown(_)
+            | Self::Placeholder(_) => None,
         }
     }
 }
@@ -3247,9 +3290,11 @@ impl<P: PlaceholderKind> Value<P> {
             )
             | Value::Deferred(DeferredValue::RedactedSecret { .. }) => true,
             Value::Deferred(
-                DeferredValue::ResourceRef { .. }
+                DeferredValue::ModuleIf(_)
+                | DeferredValue::ResourceRef { .. }
                 | DeferredValue::BindingRef { .. }
                 | DeferredValue::Coalesce { .. }
+                | DeferredValue::IntegerArithmetic(_)
                 | DeferredValue::Interpolation(_)
                 | DeferredValue::FunctionCall { .. }
                 | DeferredValue::Unavailable { .. }
@@ -3317,6 +3362,7 @@ where
                 value: &'a Value<P>,
                 default: &'a Value<P>,
             },
+            IntegerArithmetic(&'a crate::integer_arithmetic::ValidatedIntegerExpr<P>),
             Interpolation(&'a [InterpolationPart<P>]),
             FunctionCall {
                 name: &'a str,
@@ -3334,6 +3380,9 @@ where
         }
 
         match self {
+            Self::ModuleIf(_) => Err(serde::ser::Error::custom(
+                "module-template conditional cannot be serialized before expansion",
+            )),
             Self::ResourceRef { path } => {
                 let value: SerializableDeferredValue<'_, P> =
                     SerializableDeferredValue::ResourceRef { path };
@@ -3348,6 +3397,9 @@ where
             }
             Self::Coalesce { value, default } => {
                 SerializableDeferredValue::Coalesce { value, default }.serialize(serializer)
+            }
+            Self::IntegerArithmetic(expression) => {
+                SerializableDeferredValue::IntegerArithmetic(expression).serialize(serializer)
             }
             Self::Interpolation(parts) => {
                 SerializableDeferredValue::Interpolation(parts).serialize(serializer)
@@ -3416,6 +3468,7 @@ where
                 value: Box<Value<P>>,
                 default: Box<Value<P>>,
             },
+            IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr<P>),
             Interpolation(Vec<InterpolationPart<P>>),
             FunctionCall {
                 name: String,
@@ -3438,6 +3491,9 @@ where
             DeserializableDeferredValue::BindingRef { binding } => Ok(Self::BindingRef { binding }),
             DeserializableDeferredValue::Coalesce { value, default } => {
                 Ok(Self::Coalesce { value, default })
+            }
+            DeserializableDeferredValue::IntegerArithmetic(expression) => {
+                Ok(Self::IntegerArithmetic(expression))
             }
             DeserializableDeferredValue::Interpolation(parts) => Ok(Self::Interpolation(parts)),
             DeserializableDeferredValue::FunctionCall { name, args, .. } => {
@@ -3518,6 +3574,7 @@ where
                 value: Box<Value<P>>,
                 default: Box<Value<P>>,
             },
+            IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr<P>),
             Interpolation(Vec<InterpolationPart<P>>),
             FunctionCall {
                 name: String,
@@ -3560,6 +3617,9 @@ where
             }
             DeserializableValue::Coalesce { value, default } => {
                 Value::Deferred(DeferredValue::Coalesce { value, default })
+            }
+            DeserializableValue::IntegerArithmetic(expression) => {
+                Value::Deferred(DeferredValue::IntegerArithmetic(expression))
             }
             DeserializableValue::Interpolation(parts) => {
                 Value::Deferred(DeferredValue::Interpolation(parts))
@@ -3610,6 +3670,7 @@ where
 impl<P: PlaceholderKind + fmt::Debug> fmt::Debug for DeferredValue<P> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ModuleIf(deferred) => f.debug_tuple("ModuleIf").field(deferred).finish(),
             Self::ResourceRef { path } => {
                 f.debug_struct("ResourceRef").field("path", path).finish()
             }
@@ -3621,6 +3682,10 @@ impl<P: PlaceholderKind + fmt::Debug> fmt::Debug for DeferredValue<P> {
                 .debug_struct("Coalesce")
                 .field("value", value)
                 .field("default", default)
+                .finish(),
+            Self::IntegerArithmetic(expression) => f
+                .debug_tuple("IntegerArithmetic")
+                .field(expression)
                 .finish(),
             Self::Interpolation(parts) => f.debug_tuple("Interpolation").field(parts).finish(),
             Self::FunctionCall {
@@ -4455,6 +4520,7 @@ impl<P: PlaceholderKind> ConcreteValue<P> {
 /// Phase 1 of [RFC #2972](https://github.com/carina-rs/carina/issues/2972).
 #[derive(Debug, Clone, Copy)]
 pub enum DeferredValueRef<'a, P: PlaceholderKind = NoPlaceholder> {
+    ModuleIf(&'a crate::parser::DeferredValueIf<P>),
     ResourceRef {
         path: &'a AccessPath,
     },
@@ -4465,6 +4531,7 @@ pub enum DeferredValueRef<'a, P: PlaceholderKind = NoPlaceholder> {
         value: &'a Value<P>,
         default: &'a Value<P>,
     },
+    IntegerArithmetic(&'a crate::integer_arithmetic::ValidatedIntegerExpr<P>),
     Interpolation(&'a [InterpolationPart<P>]),
     FunctionCall {
         name: &'a str,
@@ -4493,6 +4560,10 @@ impl<P: PlaceholderKind> Value<P> {
     /// plaintext must be excluded from diagnostics.
     pub(crate) fn contains_diagnostic_sensitive_string(&self) -> bool {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
+                .values()
+                .into_iter()
+                .any(Value::contains_diagnostic_sensitive_string),
             Value::Concrete(ConcreteValue::String(value)) => value.is_diagnostic_sensitive(),
             Value::Concrete(ConcreteValue::StringList(values)) => {
                 values.iter().any(ValueString::is_diagnostic_sensitive)
@@ -4530,6 +4601,10 @@ impl<P: PlaceholderKind> Value<P> {
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 value.contains_diagnostic_sensitive_string()
                     || default.contains_diagnostic_sensitive_string()
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                expression.lhs().contains_diagnostic_sensitive_string()
+                    || expression.rhs().contains_diagnostic_sensitive_string()
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 inner.contains_diagnostic_sensitive_string()
@@ -4588,10 +4663,14 @@ impl<P: PlaceholderKind> Value<P> {
     pub fn as_deferred(&self) -> Option<DeferredValueRef<'_, P>> {
         match self {
             Value::Deferred(d) => Some(match d {
+                DeferredValue::ModuleIf(deferred) => DeferredValueRef::ModuleIf(deferred),
                 DeferredValue::ResourceRef { path } => DeferredValueRef::ResourceRef { path },
                 DeferredValue::BindingRef { binding } => DeferredValueRef::BindingRef { binding },
                 DeferredValue::Coalesce { value, default } => {
                     DeferredValueRef::Coalesce { value, default }
+                }
+                DeferredValue::IntegerArithmetic(expression) => {
+                    DeferredValueRef::IntegerArithmetic(expression)
                 }
                 DeferredValue::Interpolation(parts) => DeferredValueRef::Interpolation(parts),
                 DeferredValue::FunctionCall {
@@ -5104,6 +5183,11 @@ pub trait PlaceholderKind:
         None
     }
 
+    /// Lexical binding whose declared type can prove this parser slot's type.
+    fn inference_binding_name(&self) -> Option<&str> {
+        self.module_argument_name()
+    }
+
     fn loop_slot(&self) -> Option<LoopSlot> {
         None
     }
@@ -5176,6 +5260,15 @@ impl PlaceholderKind for ParserPlaceholder {
         }
     }
 
+    fn inference_binding_name(&self) -> Option<&str> {
+        match self {
+            Self::FnParam { name } | Self::FnLocal { name } | Self::ModuleArgument { name, .. } => {
+                Some(name)
+            }
+            Self::Loop(_) | Self::EmptyInterpolation { .. } => None,
+        }
+    }
+
     fn loop_slot(&self) -> Option<LoopSlot> {
         match self {
             Self::Loop(slot) => Some(*slot),
@@ -5219,6 +5312,11 @@ impl<P: PlaceholderKind> Value<P> {
     pub(crate) fn visit_placeholders(&self, visitor: &mut impl FnMut(&P)) {
         match self {
             Value::Deferred(DeferredValue::Placeholder(placeholder)) => visitor(placeholder),
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                for value in deferred.values() {
+                    value.visit_placeholders(visitor);
+                }
+            }
             Value::Concrete(ConcreteValue::List(values)) => {
                 for value in values {
                     value.visit_placeholders(visitor);
@@ -5253,6 +5351,10 @@ impl<P: PlaceholderKind> Value<P> {
             }
             Value::Deferred(DeferredValue::Access(access)) => {
                 access.base().visit_placeholders(visitor);
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                expression.lhs().visit_placeholders(visitor);
+                expression.rhs().visit_placeholders(visitor);
             }
             Value::Deferred(DeferredValue::Secret(value)) => {
                 value.visit_placeholders(visitor);
@@ -5290,6 +5392,11 @@ impl<P: PlaceholderKind> Value<P> {
         };
 
         Ok(match self {
+            Self::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                Value::Deferred(DeferredValue::ModuleIf(Box::new(
+                    deferred.try_map_stage(|value| value.try_map_placeholder(map))?,
+                )))
+            }
             Self::Concrete(ConcreteValue::String(value)) => {
                 Value::Concrete(ConcreteValue::String(value))
             }
@@ -5335,6 +5442,11 @@ impl<P: PlaceholderKind> Value<P> {
                     value: Box::new(value.try_map_placeholder(map)?),
                     default: Box::new(default.try_map_placeholder(map)?),
                 })
+            }
+            Self::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                Value::Deferred(DeferredValue::IntegerArithmetic(
+                    expression.try_map_stage(|value| value.try_map_placeholder(map))?,
+                ))
             }
             Self::Deferred(DeferredValue::Interpolation(parts)) => {
                 Value::Deferred(DeferredValue::Interpolation(
@@ -5603,6 +5715,14 @@ impl<P: PlaceholderKind + PartialEq> PartialEq for Value<P> {
                 }),
             ) => av == bv && ad == bd,
             (
+                Value::Deferred(DeferredValue::ModuleIf(a)),
+                Value::Deferred(DeferredValue::ModuleIf(b)),
+            ) => a == b,
+            (
+                Value::Deferred(DeferredValue::IntegerArithmetic(a)),
+                Value::Deferred(DeferredValue::IntegerArithmetic(b)),
+            ) => a == b,
+            (
                 Value::Deferred(DeferredValue::Interpolation(a)),
                 Value::Deferred(DeferredValue::Interpolation(b)),
             ) => a == b,
@@ -5745,6 +5865,13 @@ impl<P: PlaceholderKind> Value<P> {
     /// only has a `&mut Value` (e.g. inside `IndexMap::values_mut()`).
     pub fn canonicalize_in_place(&mut self) {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                **deferred = deferred.map(|value| {
+                    let mut value = value.clone();
+                    value.canonicalize_in_place();
+                    value
+                });
+            }
             Value::Concrete(ConcreteValue::List(items)) => {
                 for item in items {
                     item.canonicalize_in_place();
@@ -5759,6 +5886,18 @@ impl<P: PlaceholderKind> Value<P> {
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 value.canonicalize_in_place();
                 default.canonicalize_in_place();
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                let expression = expression.clone();
+                let original =
+                    Value::Deferred(DeferredValue::IntegerArithmetic(expression.clone()));
+                let mut lhs = expression.lhs().clone();
+                let mut rhs = expression.rhs().clone();
+                lhs.canonicalize_in_place();
+                rhs.canonicalize_in_place();
+                *self = expression
+                    .evaluate_with_operands(lhs, rhs)
+                    .unwrap_or(original);
             }
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
@@ -5861,6 +6000,11 @@ impl<P: PlaceholderKind> Value<P> {
         f: &mut impl FnMut(&AccessPath, ResourceRefUsage),
     ) {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred.values().into_iter().for_each(|value| {
+                    value.visit_resource_refs_with_usage_inner(usage, f);
+                });
+            }
             Value::Deferred(DeferredValue::ResourceRef { path }) => f(path, usage),
             Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
@@ -5911,6 +6055,14 @@ impl<P: PlaceholderKind> Value<P> {
                 value.visit_resource_refs_with_usage_inner(value_usage, f);
                 default.visit_resource_refs_with_usage_inner(default_usage, f);
             }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                expression
+                    .lhs()
+                    .visit_resource_refs_with_usage_inner(usage, f);
+                expression
+                    .rhs()
+                    .visit_resource_refs_with_usage_inner(usage, f);
+            }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 inner.visit_resource_refs_with_usage_inner(usage, f)
             }
@@ -5940,6 +6092,12 @@ impl<P: PlaceholderKind> Value<P> {
     /// that needs both must call both — drift is visible at the call site.
     pub fn visit_binding_refs(&self, f: &mut impl FnMut(&str)) {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred
+                    .values()
+                    .into_iter()
+                    .for_each(|value| value.visit_binding_refs(f));
+            }
             Value::Deferred(DeferredValue::BindingRef { binding }) => f(binding),
             Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
@@ -5974,6 +6132,10 @@ impl<P: PlaceholderKind> Value<P> {
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 value.visit_binding_refs(f);
                 default.visit_binding_refs(f);
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                expression.lhs().visit_binding_refs(f);
+                expression.rhs().visit_binding_refs(f);
             }
             Value::Deferred(DeferredValue::Secret(inner)) => inner.visit_binding_refs(f),
             Value::Concrete(ConcreteValue::String(_))
@@ -6027,6 +6189,9 @@ pub fn contains_resource_ref<P: PlaceholderKind>(value: &Value<P>) -> bool {
 /// `Value::Deferred(DeferredValue::Unknown)`.
 pub fn value_contains_unknown(value: &Value) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred.values().into_iter().any(value_contains_unknown)
+        }
         Value::Deferred(DeferredValue::Unknown(_)) => true,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(value_contains_unknown),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().any(value_contains_unknown),
@@ -6047,6 +6212,9 @@ pub fn value_contains_unknown(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Secret(inner)) => value_contains_unknown(inner),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             value_contains_unknown(value) || value_contains_unknown(default)
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            value_contains_unknown(expression.lhs()) || value_contains_unknown(expression.rhs())
         }
         _ => false,
     }
@@ -6091,6 +6259,9 @@ pub(crate) fn find_unavailable_evaluation<P: PlaceholderKind>(
     )> {
         let recurse = |value| find(value, coalesce_policy, secret_policy, inside_secret);
         match value {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred.values().into_iter().find_map(recurse)
+            }
             Value::Deferred(DeferredValue::Unavailable {
                 name,
                 reason,
@@ -6129,6 +6300,9 @@ pub(crate) fn find_unavailable_evaluation<P: PlaceholderKind>(
                     UnavailableCoalescePolicy::ExcludeDefault => None,
                     UnavailableCoalescePolicy::IncludeDefault => recurse(default),
                 })
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                recurse(expression.lhs()).or_else(|| recurse(expression.rhs()))
             }
             Value::Concrete(
                 ConcreteValue::String(_)
@@ -6182,6 +6356,12 @@ impl Value {
     fn hash_into(&self, hasher: &mut impl Hasher) {
         std::mem::discriminant(self).hash(hasher);
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred
+                    .values()
+                    .into_iter()
+                    .for_each(|value| value.hash_into(hasher));
+            }
             Value::Concrete(ConcreteValue::String(s)) => s.hash(hasher),
             Value::Concrete(ConcreteValue::EnumIdentifier(s)) => s.hash(hasher),
             Value::Concrete(ConcreteValue::CanonicalEnum(c)) => c.hash(hasher),
@@ -6244,6 +6424,11 @@ impl Value {
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 value.hash_into(hasher);
                 default.hash_into(hasher);
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                expression.lhs().hash_into(hasher);
+                expression.op().hash(hasher);
+                expression.rhs().hash_into(hasher);
             }
             Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 parts.len().hash(hasher);
@@ -7041,6 +7226,10 @@ fn pairing_hashes(
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
             hashes.push(secret_state_pairing_hash());
         }
+        // Arithmetic has its own canonical hash above. A nested Secret is
+        // normalized to an outer Secret by the evaluator before comparison,
+        // so operand hashes must not become candidate hashes for the result.
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {}
         _ => {}
     }
     if let Some(attr_type) = attr_type {
@@ -9009,6 +9198,9 @@ pub(crate) fn assert_value_fully_resolved(
 ) -> Result<(), crate::value::SerializationError> {
     let context = crate::value::SerializationContext::WasmBoundary;
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err(crate::value::SerializationError::UnexpandedModuleIf { context })
+        }
         Value::Concrete(ConcreteValue::List(items)) => {
             for item in items {
                 assert_value_fully_resolved(item)?;
@@ -9039,6 +9231,9 @@ pub(crate) fn assert_value_fully_resolved(
         }
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             Err(crate::value::SerializationError::UnresolvedCoalesce { context })
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            Err(crate::value::SerializationError::UnresolvedIntegerArithmetic { context })
         }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             Err(crate::value::SerializationError::UnresolvedInterpolation { context })

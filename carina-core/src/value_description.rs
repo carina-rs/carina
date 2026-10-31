@@ -19,6 +19,7 @@ impl ValueDescription {
     /// Describe `value` for a type-mismatch diagnostic.
     pub fn of<P: PlaceholderKind>(value: &Value<P>) -> Self {
         Self(match value {
+            Value::Deferred(DeferredValue::ModuleIf(_)) => "module conditional".to_string(),
             Value::Concrete(ConcreteValue::String(value)) => value
                 .diagnostic_literal()
                 .map(|value| format!("string {}", display_string_literal(value)))
@@ -39,6 +40,9 @@ impl ValueDescription {
             Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource reference".to_string(),
             Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference".to_string(),
             Value::Deferred(DeferredValue::Coalesce { .. }) => "coalesce expression".to_string(),
+            Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+                "integer arithmetic expression".to_string()
+            }
             Value::Deferred(DeferredValue::Interpolation(_)) => "interpolation".to_string(),
             Value::Deferred(
                 DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },

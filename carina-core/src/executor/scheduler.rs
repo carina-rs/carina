@@ -304,7 +304,7 @@ mod tests {
         .expect("unbound deferred loop parses")
         .into_expanded()
         .expect("deferred-loop fixture contains no parser placeholders");
-        let template = parsed.deferred_for_expressions[0].clone();
+        let template = parsed.deferred_for_expressions()[0].clone();
         let scheduler_key = template.target.scheduler_key().to_string();
         assert!(scheduler_key.starts_with("_loop_"));
 

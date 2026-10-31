@@ -233,7 +233,7 @@ pub struct FixturePlan {
     pub state_file: Option<StateFile>,
     pub schemas: SchemaRegistry,
     pub moved_origins: HashMap<ResourceId, ResourceId>,
-    pub deferred_for_expressions: Vec<carina_core::parser::DeferredForExpression>,
+    pub deferred_for_expressions: carina_core::parser::ResolvedDeferredForExpressions,
     pub export_params: Vec<carina_core::parser::ExpandedInferredExportParam>,
     pub resolved_export_params: carina_core::validation::ExportsCheckedPreApply<
         carina_core::parser::ExpandedInferredExportParam,
@@ -549,17 +549,15 @@ where
         .iter()
         .filter_map(|resource| resource.binding.clone())
         .collect();
-    let non_managed_deferred_for = parsed
-        .deferred_for_expressions
-        .iter()
-        .filter(|deferred| {
+    let (non_managed_deferred_for, _managed_deferred_for) = parsed
+        .deferred_for_expressions()
+        .clone()
+        .partition(|deferred| {
             !deferred
                 .root_bindings()
                 .iter()
                 .any(|binding| managed_bindings.contains(binding))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+        });
     let reconciled_expansion = expansion_prelude
         .bind_projected_phase1_state(managed_current, orphans, HashSet::new())
         .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Print)

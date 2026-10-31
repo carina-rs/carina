@@ -743,6 +743,16 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&ApplyTimeUnknown)) {
             visit_unknowns(value, f);
             visit_unknowns(default, f);
         }
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred
+                .values()
+                .into_iter()
+                .for_each(|value| visit_unknowns(value, f));
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            visit_unknowns(expression.lhs(), f);
+            visit_unknowns(expression.rhs(), f);
+        }
         Value::Concrete(_)
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })

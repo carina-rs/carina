@@ -280,9 +280,11 @@ pub(super) async fn resolve_resource<S: Clone>(
 fn needs_apply_resolution(value: &Value) -> bool {
     match value {
         Value::Deferred(
-            DeferredValue::ResourceRef { .. }
+            DeferredValue::ModuleIf(_)
+            | DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Coalesce { .. }
+            | DeferredValue::IntegerArithmetic(_)
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
@@ -404,6 +406,10 @@ fn assert_fully_resolved(
             assert_fully_resolved(inner, attribute_key, bindings)
         }
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        Value::Deferred(DeferredValue::ModuleIf(_)) => Err(format!(
+            "Attribute '{}' contains an unresolved module-template conditional",
+            attribute_key
+        )),
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => Err(format!(
             "Attribute '{}' contains a saved-plan secret that was not rehydrated; create a new saved plan before applying",
             attribute_key
@@ -429,6 +435,17 @@ fn assert_fully_resolved(
                 context: SerializationContext::WasmBoundary,
             }
             .to_string())
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
+            Err(unresolved_binding_message(
+                attribute_key,
+                UnresolvedSite::IntegerArithmetic {
+                    expression: crate::value::format_value(value),
+                },
+                leaf.unwrap_or(""),
+                bindings,
+            ))
         }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
@@ -494,6 +511,7 @@ fn assert_fully_resolved(
 
 enum UnresolvedSite {
     Ref { path: String },
+    IntegerArithmetic { expression: String },
     Interpolation,
     FunctionCall { name: String },
     Access { expression: String },
@@ -508,6 +526,9 @@ fn unresolved_binding_message(
     let opener = match &site {
         UnresolvedSite::Ref { path } => format!(
             "attribute `{attribute_key}` references `{path}` which has not been published yet by the upstream binding."
+        ),
+        UnresolvedSite::IntegerArithmetic { expression } => format!(
+            "attribute `{attribute_key}` contains integer arithmetic `{expression}` that did not fully resolve at apply time."
         ),
         UnresolvedSite::Interpolation => format!(
             "attribute `{attribute_key}` contains an interpolation that did not fully resolve at apply time."
@@ -538,6 +559,12 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
         Value::Deferred(DeferredValue::ResourceRef { path }) => out.push(path.binding()),
         Value::Deferred(DeferredValue::BindingRef { binding }) => out.push(binding.as_str()),
         Value::Deferred(DeferredValue::Secret(inner)) => collect_unresolved_bindings(inner, out),
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred
+                .values()
+                .into_iter()
+                .for_each(|value| collect_unresolved_bindings(value, out));
+        }
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => {}
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for p in parts {
@@ -561,6 +588,10 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             collect_unresolved_bindings(value, out);
             collect_unresolved_bindings(default, out);
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            collect_unresolved_bindings(expression.lhs(), out);
+            collect_unresolved_bindings(expression.rhs(), out);
         }
         Value::Deferred(DeferredValue::Unknown(_)) => {}
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
@@ -1630,6 +1661,28 @@ mod assert_fully_resolved_tests {
         assert!(
             err.contains("upstream_state") && err.contains("Apply the upstream stack first"),
             "upstream_state remediation expected; got: {err}",
+        );
+    }
+
+    #[test]
+    fn integer_arithmetic_names_its_unresolved_upstream_binding() {
+        let value = crate::integer_arithmetic::evaluate_integer_values(
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("infra", "port"),
+            }),
+            crate::integer_arithmetic::IntegerOp::Add,
+            Value::Concrete(ConcreteValue::Int(1)),
+            crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+        )
+        .expect("resource arithmetic remains deferred");
+        let bindings = bindings_with("infra", BindingValueSource::Upstream);
+
+        let error = assert_fully_resolved(&value, "port", &bindings)
+            .expect_err("unresolved arithmetic must fail before provider dispatch");
+        assert!(error.contains("infra"), "binding must be named: {error}");
+        assert!(
+            error.contains("upstream_state") && error.contains("Apply the upstream stack first"),
+            "upstream remediation must be selected: {error}"
         );
     }
 

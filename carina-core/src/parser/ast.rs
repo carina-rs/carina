@@ -5,8 +5,12 @@
 //! Static-type states that cannot be represented by a sound [`TypeExpr`] live
 //! in [`crate::static_type`] rather than as a sentinel variant here.
 
+use super::deferred_if::DeferredIfBody;
 use super::display_string_literal;
-use super::error::{ParseWarning, WarningKind};
+use super::error::{
+    DeferredForBodyKind, DeferredForBodyUnsupportedError, DeferredForIterableResolution,
+    ParseError, ParseWarning, WarningKind,
+};
 use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
@@ -95,6 +99,10 @@ impl DeferredForTarget {
 }
 
 /// A for-expression whose iterable is unresolved (e.g., upstream_state not yet available).
+///
+/// Parser-side deferred loops use [`ParsedDeferredForExpression`] instead.
+/// This resource-only shape is the resolved typestate consumed by planning,
+/// execution, display, and state persistence.
 /// Captures the structural shape of the loop body so the plan can show what
 /// resources *would* be created once the iterable becomes available.
 /// Also stores enough information to expand the loop later when the iterable
@@ -132,6 +140,196 @@ pub struct DeferredForExpression<
     /// Template resource for expansion (the for body parsed with placeholders).
     #[serde(with = "deferred_template_resource_serde")]
     pub template_resource: Resource<S, T>,
+}
+
+impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
+    pub fn site(&self) -> DeferredForSite<'_, P> {
+        DeferredForSite {
+            file: self.file.as_deref(),
+            line: self.line,
+            header: &self.header,
+            binding: &self.binding,
+            iterable: &self.iterable,
+        }
+    }
+}
+
+/// Typed parser-side body of a deferred `for` expression.
+///
+/// Every grammar-supported body kind is retained until module expansion has
+/// substituted caller arguments. Only the resource arm can cross the final
+/// resolution seam into [`DeferredForExpression`].
+#[derive(Debug, Clone)]
+pub enum DeferredForBody<P: PlaceholderKind = ParserPlaceholder> {
+    Resource(Box<Resource<ModuleSource, P>>),
+    Read(Box<DataSource<ModuleSource, P>>),
+    ModuleCall(ModuleCall<P>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParsedDeferredForIterableState {
+    Deferred,
+    UndefinedIdentifier { name: String },
+}
+
+#[derive(Debug)]
+pub(crate) enum DeferredForResourceExpressionError {
+    UndefinedIterable(ParseError),
+    Unsupported {
+        file: Option<String>,
+        error: Box<DeferredForBodyUnsupportedError>,
+    },
+}
+
+/// Parser-side typestate for a deferred `for` expression.
+#[derive(Debug, Clone)]
+pub struct ParsedDeferredForExpression<P: PlaceholderKind = ParserPlaceholder> {
+    pub file: Option<String>,
+    pub line: usize,
+    pub span: SourceSpan,
+    pub header: String,
+    pub target: DeferredForTarget,
+    pub iterable: Value<P>,
+    pub(crate) iterable_state: ParsedDeferredForIterableState,
+    pub binding: ForBinding,
+    pub body: DeferredForBody<P>,
+}
+
+impl<P: PlaceholderKind> ParsedDeferredForExpression<P> {
+    pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
+        self.site().root_bindings()
+    }
+
+    pub fn site(&self) -> DeferredForSite<'_, P> {
+        DeferredForSite {
+            file: self.file.as_deref(),
+            line: self.line,
+            header: &self.header,
+            binding: &self.binding,
+            iterable: &self.iterable,
+        }
+    }
+
+    pub(crate) fn undefined_iterable_error(&self, known_bindings: &[String]) -> Option<ParseError> {
+        let ParsedDeferredForIterableState::UndefinedIdentifier { name } = &self.iterable_state
+        else {
+            return None;
+        };
+        let error = ParseError::undefined_deferred_iterable(
+            name.clone(),
+            self.line,
+            known_bindings.to_vec(),
+            self.span,
+        );
+        Some(match &self.file {
+            Some(path) => error.in_file(path),
+            None => error,
+        })
+    }
+}
+
+impl ParsedDeferredForExpression<ParserPlaceholder> {
+    pub(crate) fn into_resource_expression(
+        self,
+        known_bindings: &[String],
+    ) -> Result<
+        DeferredForExpression<ModuleSource, ParserPlaceholder, ParserPlaceholder>,
+        DeferredForResourceExpressionError,
+    > {
+        if let Some(error) = self.undefined_iterable_error(known_bindings) {
+            return Err(DeferredForResourceExpressionError::UndefinedIterable(error));
+        }
+        let Self {
+            file,
+            line,
+            span,
+            header,
+            target,
+            iterable,
+            iterable_state,
+            binding,
+            body,
+        } = self;
+        debug_assert!(matches!(
+            iterable_state,
+            ParsedDeferredForIterableState::Deferred
+        ));
+        let iterable_resolution = if super::functions::contains_module_argument(&iterable) {
+            DeferredForIterableResolution::DependsOnEnclosingModuleArgument
+        } else {
+            match &iterable {
+                Value::Concrete(_) => {
+                    DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution
+                }
+                Value::Deferred(_) => DeferredForIterableResolution::StillDeferred,
+            }
+        };
+        let template_resource = match body {
+            DeferredForBody::Resource(resource) => *resource,
+            DeferredForBody::Read(data_source) => {
+                return Err(DeferredForResourceExpressionError::Unsupported {
+                    file,
+                    error: Box::new(DeferredForBodyUnsupportedError {
+                        line,
+                        header,
+                        body: DeferredForBodyKind::Read {
+                            resource_type: data_source.id.display_type(),
+                        },
+                        span,
+                        iterable_resolution,
+                    }),
+                });
+            }
+            DeferredForBody::ModuleCall(call) => {
+                return Err(DeferredForResourceExpressionError::Unsupported {
+                    file,
+                    error: Box::new(DeferredForBodyUnsupportedError {
+                        line,
+                        header,
+                        body: DeferredForBodyKind::ModuleCall {
+                            name: call.module_name,
+                        },
+                        span,
+                        iterable_resolution,
+                    }),
+                });
+            }
+        };
+        let resource_type = if template_resource.id.provider.is_empty() {
+            template_resource.id.resource_type.clone()
+        } else {
+            format!(
+                "{}.{}",
+                template_resource.id.provider, template_resource.id.resource_type
+            )
+        };
+        Ok(DeferredForExpression {
+            file,
+            line,
+            header,
+            resource_type,
+            target,
+            iterable,
+            binding,
+            template_resource,
+        })
+    }
+}
+
+/// Phase-neutral, read-only metadata for a deferred `for` expression.
+#[derive(Debug, Clone, Copy)]
+pub struct DeferredForSite<'a, P: PlaceholderKind = NoPlaceholder> {
+    pub file: Option<&'a str>,
+    pub line: usize,
+    pub header: &'a str,
+    pub binding: &'a ForBinding,
+    pub iterable: &'a Value<P>,
+}
+
+impl<P: PlaceholderKind> DeferredForSite<'_, P> {
+    pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
+        self.iterable.root_bindings()
+    }
 }
 
 pub type SavedDeferredForExpression =
@@ -307,7 +505,7 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
     /// Every binding that can affect the iterable, including references in a
     /// coalesce fallback.
     pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
-        self.iterable.root_bindings()
+        self.site().root_bindings()
     }
 
     /// Every direct reference spelling that may contribute the iterable.
@@ -421,43 +619,41 @@ impl ShapeMismatch {
     }
 }
 
-/// Origin of a resource yielded by [`ParsedFile::iter_all_resources`].
+/// Origin of a resource yielded by [`File::iter_all_resources`].
 ///
 /// `Direct` means the resource was declared at top-level and its iterable
-/// (if any) resolved at parse time. `Deferred` means the resource is the
-/// template body of a `for` expression whose iterable resolves later;
-/// consumers that care about loop-variable placeholders need the
-/// `DeferredForExpression` reference to filter them out.
+/// (if any) resolved at parse time. `Deferred` carries the phase-specific
+/// loop expression: parser files expose [`ParsedDeferredForExpression`], and
+/// module-resolved files expose [`DeferredForExpression`].
 #[derive(Debug)]
 pub enum ResourceContext<
     'a,
-    S = ModuleSource,
-    P: PlaceholderKind = NoPlaceholder,
-    T: PlaceholderKind = P,
+    S: 'a = ModuleSource,
+    P: PlaceholderKind + 'a = NoPlaceholder,
+    T: PlaceholderKind + 'a = P,
+    D: DeferredForPhaseTraversal<P, T> + 'a = ResolvedDeferredForPhase<P, T>,
 > {
     Direct,
-    Deferred(&'a DeferredForExpression<S, P, T>),
+    Deferred(D::DeferredRef<'a, S>),
 }
 
 /// A resource yielded by [`File::iter_all_resources`], discriminated by
 /// its typestate arm.
 ///
-/// Part of the carina#3181 resource typestate split. The three typed
-/// arms borrow from `File`'s typed slices ([`File::resources`] managed
-/// rows, [`File::compositions`], [`File::data_sources`]); the
-/// `Deferred` arm is a `for`-expression template body that still lives
-/// as a legacy [`Resource`] in [`File::deferred_for_expressions`].
+/// Part of the carina#3181 resource typestate split. The top-level arms borrow
+/// from [`File::resources`], [`File::compositions`], and
+/// [`File::data_sources`]. The deferred arm borrows the managed-resource
+/// template and the phase-specific loop expression.
 ///
-/// Read-only consumers reach the shared accessors via
-/// [`ResourceRef::as_resource_like`] (or the `id` / `attributes` /
-/// `binding` passthroughs); callers that branch on the kind match the
-/// enum arm directly.
+/// Read-only consumers use the `id`, `attributes`, and `binding` passthroughs;
+/// callers that branch on the kind match the enum arm directly.
 #[derive(Debug)]
 pub enum ResourceRef<
     'a,
-    S = ModuleSource,
-    P: PlaceholderKind = NoPlaceholder,
-    T: PlaceholderKind = P,
+    S: 'a = ModuleSource,
+    P: PlaceholderKind + 'a = NoPlaceholder,
+    T: PlaceholderKind + 'a = P,
+    D: DeferredForPhaseTraversal<P, T> + 'a = ResolvedDeferredForPhase<P, T>,
 > {
     /// A top-level resource.
     Resource(&'a Resource<S, P>),
@@ -469,7 +665,19 @@ pub enum ResourceRef<
     /// resource (`for` bodies never carry `read` / composition).
     Deferred {
         resource: &'a Resource<S, T>,
-        deferred: &'a DeferredForExpression<S, P, T>,
+        deferred: D::DeferredRef<'a, S>,
+    },
+}
+
+/// Mutable counterpart of [`ResourceRef`] used by whole-file resource
+/// transformations.
+#[derive(Debug)]
+pub enum ResourceMut<'a, P: PlaceholderKind = NoPlaceholder, T: PlaceholderKind = P> {
+    Resource(&'a mut Resource<ModuleSource, P>),
+    LiveComposition(&'a mut LiveComposition<P>),
+    DataSource(&'a mut DataSource<ModuleSource, P>),
+    Deferred {
+        resource: &'a mut Resource<ModuleSource, T>,
     },
 }
 
@@ -544,30 +752,48 @@ impl<'a, S, P: PlaceholderKind> TopLevelResourceRef<'a, S, P> {
     }
 }
 
-impl<S, P: PlaceholderKind, T: PlaceholderKind> Copy for ResourceContext<'_, S, P, T> {}
+impl<S, P: PlaceholderKind, T: PlaceholderKind, D: DeferredForPhaseTraversal<P, T>> Copy
+    for ResourceContext<'_, S, P, T, D>
+{
+}
 
-impl<S, P: PlaceholderKind, T: PlaceholderKind> Clone for ResourceContext<'_, S, P, T> {
+impl<S, P: PlaceholderKind, T: PlaceholderKind, D: DeferredForPhaseTraversal<P, T>> Clone
+    for ResourceContext<'_, S, P, T, D>
+{
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<S, P: PlaceholderKind, T: PlaceholderKind> Copy for ResourceRef<'_, S, P, T> {}
+impl<S, P: PlaceholderKind, T: PlaceholderKind, D: DeferredForPhaseTraversal<P, T>> Copy
+    for ResourceRef<'_, S, P, T, D>
+{
+}
 
-impl<S, P: PlaceholderKind, T: PlaceholderKind> Clone for ResourceRef<'_, S, P, T> {
+impl<S, P: PlaceholderKind, T: PlaceholderKind, D: DeferredForPhaseTraversal<P, T>> Clone
+    for ResourceRef<'_, S, P, T, D>
+{
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, S, P: PlaceholderKind, T: PlaceholderKind> ResourceRef<'a, S, P, T> {
+impl<'a, S, P, T, D> ResourceRef<'a, S, P, T, D>
+where
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    D: DeferredForPhaseTraversal<P, T>,
+{
     /// Stable identifier of this resource.
     pub fn id(&self) -> &'a ResourceId {
         match self {
             ResourceRef::Resource(r) => &r.id,
             ResourceRef::LiveComposition(v) => &v.id,
             ResourceRef::DataSource(d) => &d.id,
-            ResourceRef::Deferred { resource, .. } => &resource.id,
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => &resource.id,
         }
     }
 
@@ -577,7 +803,10 @@ impl<'a, S, P: PlaceholderKind, T: PlaceholderKind> ResourceRef<'a, S, P, T> {
             ResourceRef::Resource(r) => r.binding.as_deref(),
             ResourceRef::LiveComposition(v) => v.binding.as_deref(),
             ResourceRef::DataSource(d) => d.binding.as_deref(),
-            ResourceRef::Deferred { resource, .. } => resource.binding.as_deref(),
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => resource.binding.as_deref(),
         }
     }
 
@@ -592,7 +821,10 @@ impl<'a, S, P: PlaceholderKind, T: PlaceholderKind> ResourceRef<'a, S, P, T> {
             ResourceRef::Resource(r) => &r.dependency_bindings,
             ResourceRef::LiveComposition(v) => &v.dependency_bindings,
             ResourceRef::DataSource(d) => &d.dependency_bindings,
-            ResourceRef::Deferred { resource, .. } => &resource.dependency_bindings,
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => &resource.dependency_bindings,
         }
     }
 
@@ -604,7 +836,10 @@ impl<'a, S, P: PlaceholderKind, T: PlaceholderKind> ResourceRef<'a, S, P, T> {
             ResourceRef::Resource(r) => Some(&r.directives),
             ResourceRef::LiveComposition(_) => None,
             ResourceRef::DataSource(d) => Some(&d.directives),
-            ResourceRef::Deferred { resource, .. } => Some(&resource.directives),
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => Some(&resource.directives),
         }
     }
 
@@ -614,22 +849,34 @@ impl<'a, S, P: PlaceholderKind, T: PlaceholderKind> ResourceRef<'a, S, P, T> {
             ResourceRef::Resource(r) => &r.quoted_string_attrs,
             ResourceRef::LiveComposition(v) => &v.quoted_string_attrs,
             ResourceRef::DataSource(d) => &d.quoted_string_attrs,
-            ResourceRef::Deferred { resource, .. } => &resource.quoted_string_attrs,
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => &resource.quoted_string_attrs,
         }
     }
 
     /// The [`ResourceContext`] an old `iter_all_resources` caller would
     /// have seen — `Deferred` for a for-expression template, `Direct`
     /// otherwise.
-    pub fn context(&self) -> ResourceContext<'a, S, P, T> {
+    pub fn context(&self) -> ResourceContext<'a, S, P, T, D> {
         match self {
-            ResourceRef::Deferred { deferred, .. } => ResourceContext::Deferred(deferred),
-            _ => ResourceContext::Direct,
+            ResourceRef::Deferred {
+                resource: _resource,
+                deferred,
+            } => ResourceContext::Deferred(*deferred),
+            ResourceRef::Resource(_)
+            | ResourceRef::LiveComposition(_)
+            | ResourceRef::DataSource(_) => ResourceContext::Direct,
         }
     }
 }
 
-impl<'a, S, P: PlaceholderKind> ResourceRef<'a, S, P, P> {
+impl<'a, S, P, D> ResourceRef<'a, S, P, P, D>
+where
+    P: PlaceholderKind,
+    D: DeferredForPhaseTraversal<P, P>,
+{
     /// Source-order preserving attribute map as `Value`s.
     ///
     /// Returned as a [`Cow`](std::borrow::Cow) because
@@ -898,6 +1145,15 @@ impl<P: PlaceholderKind> ValidationBlock<P> {
     pub fn source_file(&self) -> &std::path::Path {
         &self.source.file
     }
+
+    pub(crate) fn condition_for_module_if_audit(&self) -> &ValidateExpr<P> {
+        let Self {
+            condition,
+            error_message: _error_message,
+            source: _source,
+        } = self;
+        condition
+    }
 }
 
 impl ValidationBlock<ParserPlaceholder> {
@@ -944,6 +1200,17 @@ pub enum ValidateExpr<P: PlaceholderKind = NoPlaceholder> {
         operand: String,
         value: Value<P>,
     },
+    /// Binary Int arithmetic used by `require` and argument validation.
+    IntegerArithmetic {
+        lhs: Box<ValidateExpr<P>>,
+        op: crate::integer_arithmetic::IntegerOp,
+        rhs: Box<ValidateExpr<P>>,
+        #[serde(
+            skip,
+            default = "crate::integer_arithmetic::IntegerOperatorSpan::synthetic"
+        )]
+        operator_span: crate::integer_arithmetic::IntegerOperatorSpan,
+    },
     /// Comparison: lhs op rhs
     Compare {
         lhs: Box<ValidateExpr<P>>,
@@ -979,6 +1246,15 @@ impl ValidateExpr<ParserPlaceholder> {
                 value,
             } => {
                 value.collect_leftover_placeholders(context.clone(), policy, errors);
+            }
+            Self::IntegerArithmetic {
+                lhs,
+                op: _op,
+                rhs,
+                operator_span: _operator_span,
+            } => {
+                lhs.collect_leftover_placeholders(context, policy, errors);
+                rhs.collect_leftover_placeholders(context, policy, errors);
             }
             Self::Compare { lhs, op: _op, rhs } => {
                 lhs.collect_leftover_placeholders(context, policy, errors);
@@ -1027,6 +1303,17 @@ impl ValidateExpr<ParserPlaceholder> {
                 argument,
                 operand,
                 value: value.into_expanded()?,
+            },
+            Self::IntegerArithmetic {
+                lhs,
+                op,
+                rhs,
+                operator_span,
+            } => ValidateExpr::IntegerArithmetic {
+                lhs: Box::new(lhs.into_expanded()?),
+                op,
+                rhs: Box::new(rhs.into_expanded()?),
+                operator_span,
             },
             Self::Compare { lhs, op, rhs } => ValidateExpr::Compare {
                 lhs: Box::new(lhs.into_expanded()?),
@@ -1094,6 +1381,15 @@ impl<P: PlaceholderKind> RequireBlock<P> {
     pub fn source_file(&self) -> &std::path::Path {
         &self.source.file
     }
+
+    pub(crate) fn condition_for_module_if_audit(&self) -> &ValidateExpr<P> {
+        let Self {
+            condition,
+            error_message: _error_message,
+            source: _source,
+        } = self;
+        condition
+    }
 }
 
 impl RequireBlock<ParserPlaceholder> {
@@ -1156,6 +1452,16 @@ impl<P: PlaceholderKind> AttributeParameter<TypeExpr, P> {
 }
 
 impl<T, P: PlaceholderKind> AttributeParameter<T, P> {
+    pub(crate) fn value_for_module_if_audit(&self) -> Option<&Value<P>> {
+        let Self {
+            name: _name,
+            static_type: _static_type,
+            value,
+            source: _source,
+        } = self;
+        value.as_ref()
+    }
+
     pub(crate) fn map_type_expr<U>(self, map: impl FnOnce(T) -> U) -> AttributeParameter<U, P> {
         AttributeParameter {
             name: self.name,
@@ -1750,6 +2056,13 @@ impl<P: PlaceholderKind> ModuleArgument<P> {
         self.operand.traversal_value()
     }
 
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value<P>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.operand.try_visit_values(visit)
+    }
+
     pub(crate) fn try_rewrite<E>(
         &mut self,
         rewrite: impl FnMut(&Value<P>) -> Result<Value<P>, E>,
@@ -2011,6 +2324,46 @@ impl ParsedBindingUses {
         &self.records
     }
 
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value<ParserPlaceholder>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let Self {
+            records,
+            record_indices_by_owner: _record_indices_by_owner,
+        } = self;
+        for record in records {
+            match &record.source {
+                BareBindingSource::Value {
+                    value,
+                    declared_type: _declared_type,
+                } => visit(value)?,
+                BareBindingSource::Structural(_handle) => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_rewrite_values<E>(
+        &mut self,
+        mut rewrite: impl FnMut(&Value<ParserPlaceholder>) -> Result<Value<ParserPlaceholder>, E>,
+    ) -> Result<(), E> {
+        let Self {
+            records,
+            record_indices_by_owner: _record_indices_by_owner,
+        } = self;
+        for record in records {
+            if let BareBindingSource::Value {
+                value,
+                declared_type: _declared_type,
+            } = &mut record.source
+            {
+                *value = Arc::new(rewrite(value.as_ref())?);
+            }
+        }
+        Ok(())
+    }
+
     pub fn uses(&self) -> impl ExactSizeIterator<Item = &BareBindingUse> {
         self.records.iter().map(|record| &record.authored)
     }
@@ -2260,6 +2613,23 @@ impl<P: PlaceholderKind> ModuleCall<P> {
         self.arguments.get(name).map(|argument| &argument.argument)
     }
 
+    pub(crate) fn try_visit_values_for_module_if_audit<E>(
+        &self,
+        visit: &mut impl FnMut(&Value<P>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let Self {
+            module_name: _module_name,
+            binding_name: _binding_name,
+            arguments,
+            source: _source,
+            loop_origin: _loop_origin,
+        } = self;
+        for argument in arguments.values() {
+            argument.argument.try_visit_values(visit)?;
+        }
+        Ok(())
+    }
+
     pub fn authored_argument(&self, name: &str) -> Option<AuthoredArgumentRef<'_, P>> {
         self.arguments
             .get_key_value(name)
@@ -2489,12 +2859,12 @@ impl SourceSpan {
         let start = file.original_position(start_byte);
         let end = file.original_position(end_byte);
         Self {
-            start_byte: start.byte,
-            end_byte: end.byte,
-            start_line: start.line,
-            start_column: start.column,
-            end_line: end.line,
-            end_column: end.column,
+            start_byte: start.byte(),
+            end_byte: end.byte(),
+            start_line: start.line(),
+            start_column: start.column(),
+            end_line: end.line(),
+            end_column: end.column(),
         }
     }
 
@@ -2574,6 +2944,7 @@ pub struct ParserBindingMetadata {
     structural_aliases: IndexMap<String, StructuralHandle>,
     value_structural_handles: IndexMap<String, StructuralHandleMetadata>,
     resource_source_files: HashMap<ResourceId, PathBuf>,
+    template_dependency_values: HashMap<ResourceId, IndexMap<String, Value<ParserPlaceholder>>>,
     argument_type_sources: IndexMap<String, (SourceFileId, SourceSpan)>,
     pending_function_type_checks: Vec<PendingFunctionTypeCheck>,
 }
@@ -2627,6 +2998,21 @@ impl ParserBindingMetadata {
         self.resource_source_files.get(id).map(PathBuf::as_path)
     }
 
+    pub(crate) fn insert_template_dependency_values(
+        &mut self,
+        id: ResourceId,
+        values: IndexMap<String, Value<ParserPlaceholder>>,
+    ) {
+        self.template_dependency_values.insert(id, values);
+    }
+
+    pub(crate) fn template_dependency_values(
+        &self,
+        id: &ResourceId,
+    ) -> Option<&IndexMap<String, Value<ParserPlaceholder>>> {
+        self.template_dependency_values.get(id)
+    }
+
     pub(crate) fn insert_argument_type_source(
         &mut self,
         name: String,
@@ -2653,6 +3039,35 @@ impl ParserBindingMetadata {
         &self.pending_function_type_checks
     }
 
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value<ParserPlaceholder>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let Self {
+            structural_handles: _structural_handles,
+            structural_aliases: _structural_aliases,
+            value_structural_handles,
+            resource_source_files: _resource_source_files,
+            template_dependency_values,
+            argument_type_sources: _argument_type_sources,
+            pending_function_type_checks,
+        } = self;
+        for metadata in value_structural_handles.values() {
+            metadata.try_visit_values(visit)?;
+        }
+        for values in template_dependency_values.values() {
+            for value in values.values() {
+                visit(value)?;
+            }
+        }
+        for check in pending_function_type_checks {
+            for argument in &check.arguments {
+                argument.try_visit_values(visit)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_pending_function_source_file(&mut self, path: &Path) {
         for check in &mut self.pending_function_type_checks {
             check.source_file = Some(path.to_path_buf());
@@ -2676,6 +3091,8 @@ impl ParserBindingMetadata {
             .extend(other.value_structural_handles);
         self.resource_source_files
             .extend(other.resource_source_files);
+        self.template_dependency_values
+            .extend(other.template_dependency_values);
         self.argument_type_sources
             .extend(other.argument_type_sources);
         for check in other.pending_function_type_checks {
@@ -3073,116 +3490,432 @@ impl IntoExpandedExportParam for InferredExportParam<ParserPlaceholder> {
     }
 }
 
-/// Parse result, generic over the export-parameter shape.
-///
-/// Two phases share this struct via aliases (see [`ParsedFile`] and
-/// [`InferredFile`]): the parser produces `File<ParsedExportParam>`
-/// where `static_type` is an optional [`TypeExpr`]; the loader runs `apply_inference` and
-/// yields `File<InferredExportParam>` where every export carries its origin
-/// and unchecked reason. Every other field is identical between
-/// phases. See `notes/specs/2026-05-03-typeexpr-stage2-design.md`.
-///
-/// Bare-binding provenance is read-only outside the parser pipeline in
-/// production builds, so callers cannot erase it to bypass
-/// [`crate::validation::resolve_bare_binding_uses`].
+/// Deferred-loop bodies before the module-resolution seam.
 #[derive(Debug, Clone)]
-pub struct File<E, P: PlaceholderKind = ParserPlaceholder, T: PlaceholderKind = P> {
+pub struct ParsedDeferredForPhase<P: PlaceholderKind = ParserPlaceholder> {
+    pub(crate) expressions: Vec<ParsedDeferredForExpression<P>>,
+}
+
+impl<P: PlaceholderKind> Default for ParsedDeferredForPhase<P> {
+    fn default() -> Self {
+        Self {
+            expressions: Vec::new(),
+        }
+    }
+}
+
+/// Resource-only deferred loops carried by a finalized file.
+#[derive(Debug, Clone)]
+pub struct ResolvedDeferredForExpressions<
+    P: PlaceholderKind = NoPlaceholder,
+    T: PlaceholderKind = LoopSlot,
+>(Vec<DeferredForExpression<ModuleSource, P, T>>);
+
+impl<P: PlaceholderKind, T: PlaceholderKind> ResolvedDeferredForExpressions<P, T> {
+    pub fn as_slice(&self) -> &[DeferredForExpression<ModuleSource, P, T>] {
+        &self.0
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, DeferredForExpression<ModuleSource, P, T>> {
+        self.0.iter()
+    }
+
+    pub fn iter_mut(
+        &mut self,
+    ) -> std::slice::IterMut<'_, DeferredForExpression<ModuleSource, P, T>> {
+        self.0.iter_mut()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn empty_like(&self) -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn partition(
+        self,
+        mut predicate: impl FnMut(&DeferredForExpression<ModuleSource, P, T>) -> bool,
+    ) -> (Self, Self) {
+        let (selected, retained) = self.0.into_iter().partition(|item| predicate(item));
+        (Self(selected), Self(retained))
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn from_expressions_for_test(
+        expressions: impl IntoIterator<Item = DeferredForExpression<ModuleSource, P, T>>,
+    ) -> Self {
+        Self(expressions.into_iter().collect())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn pop(&mut self) -> Option<DeferredForExpression<ModuleSource, P, T>> {
+        self.0.pop()
+    }
+
+    pub(crate) fn remove(&mut self, index: usize) -> DeferredForExpression<ModuleSource, P, T> {
+        self.0.remove(index)
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
+    pub fn append_finalized(&mut self, other: Self) {
+        self.extend(other);
+    }
+}
+
+impl<P: PlaceholderKind, T: PlaceholderKind> std::ops::Index<usize>
+    for ResolvedDeferredForExpressions<P, T>
+{
+    type Output = DeferredForExpression<ModuleSource, P, T>;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index]
+    }
+}
+
+impl<P: PlaceholderKind, T: PlaceholderKind> std::ops::Deref
+    for ResolvedDeferredForExpressions<P, T>
+{
+    type Target = [DeferredForExpression<ModuleSource, P, T>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<P: PlaceholderKind, T: PlaceholderKind> IntoIterator for ResolvedDeferredForExpressions<P, T> {
+    type Item = DeferredForExpression<ModuleSource, P, T>;
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a, P: PlaceholderKind, T: PlaceholderKind> IntoIterator
+    for &'a ResolvedDeferredForExpressions<P, T>
+{
+    type Item = &'a DeferredForExpression<ModuleSource, P, T>;
+    type IntoIter = std::slice::Iter<'a, DeferredForExpression<ModuleSource, P, T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+/// Deferred-loop phase reached only by module-resolution finalization.
+#[derive(Debug, Clone)]
+pub struct ResolvedDeferredForPhase<
+    P: PlaceholderKind = NoPlaceholder,
+    T: PlaceholderKind = LoopSlot,
+> {
+    pub(crate) expressions: ResolvedDeferredForExpressions<P, T>,
+}
+
+impl<P: PlaceholderKind, T: PlaceholderKind> Default for ResolvedDeferredForPhase<P, T> {
+    fn default() -> Self {
+        Self {
+            expressions: ResolvedDeferredForExpressions(Vec::new()),
+        }
+    }
+}
+
+mod deferred_for_phase_private {
+    pub trait Sealed {}
+}
+
+#[doc(hidden)]
+pub trait DeferredForPhaseTraversal<P: PlaceholderKind = ParserPlaceholder, T: PlaceholderKind = P>:
+    deferred_for_phase_private::Sealed
+{
+    type DeferredRef<'a, S: 'a>: Copy
+    where
+        Self: 'a,
+        P: 'a,
+        T: 'a;
+
+    fn resource_refs(
+        &self,
+    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, P, T, Self>> + '_>
+    where
+        Self: Sized;
+
+    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, T>> + '_>
+    where
+        Self: Sized;
+
+    fn sites(&self) -> Box<dyn Iterator<Item = DeferredForSite<'_, P>> + '_>;
+
+    fn deferred_header<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a str
+    where
+        P: 'a,
+        T: 'a;
+
+    fn deferred_line<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> usize
+    where
+        P: 'a,
+        T: 'a;
+}
+
+#[doc(hidden)]
+pub trait ParserDeferredForPhaseAudit:
+    DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder>
+{
+    fn try_visit_values_for_module_if_audit<E>(
+        &self,
+        visit: &mut impl FnMut(&Value<ParserPlaceholder>) -> Result<(), E>,
+    ) -> Result<(), E>;
+}
+
+impl<P: PlaceholderKind> deferred_for_phase_private::Sealed for ParsedDeferredForPhase<P> {}
+
+impl<P: PlaceholderKind> DeferredForPhaseTraversal<P, P> for ParsedDeferredForPhase<P> {
+    type DeferredRef<'a, S: 'a>
+        = &'a ParsedDeferredForExpression<P>
+    where
+        P: 'a;
+
+    fn resource_refs(
+        &self,
+    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, P, P, Self>> + '_> {
+        Box::new(
+            self.expressions
+                .iter()
+                .filter_map(|deferred| match &deferred.body {
+                    DeferredForBody::Resource(resource) => {
+                        Some(ResourceRef::Deferred { resource, deferred })
+                    }
+                    DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => None,
+                }),
+        )
+    }
+
+    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, P>> + '_> {
+        Box::new(
+            self.expressions
+                .iter_mut()
+                .filter_map(|deferred| match &mut deferred.body {
+                    DeferredForBody::Resource(resource) => Some(ResourceMut::Deferred { resource }),
+                    DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => None,
+                }),
+        )
+    }
+
+    fn sites(&self) -> Box<dyn Iterator<Item = DeferredForSite<'_, P>> + '_> {
+        Box::new(
+            self.expressions
+                .iter()
+                .map(ParsedDeferredForExpression::site),
+        )
+    }
+
+    fn deferred_header<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a str {
+        &deferred.header
+    }
+
+    fn deferred_line<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> usize {
+        deferred.line
+    }
+}
+
+impl ParserDeferredForPhaseAudit for ParsedDeferredForPhase<ParserPlaceholder> {
+    fn try_visit_values_for_module_if_audit<E>(
+        &self,
+        visit: &mut impl FnMut(&Value<ParserPlaceholder>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for expression in &self.expressions {
+            visit(&expression.iterable)?;
+            match &expression.body {
+                DeferredForBody::Resource(resource) => {
+                    for value in resource.attributes.values() {
+                        visit(value)?;
+                    }
+                }
+                DeferredForBody::Read(data_source) => {
+                    for value in data_source.attributes.values() {
+                        visit(value)?;
+                    }
+                }
+                DeferredForBody::ModuleCall(call) => {
+                    call.try_visit_values_for_module_if_audit(visit)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<P: PlaceholderKind, T: PlaceholderKind> deferred_for_phase_private::Sealed
+    for ResolvedDeferredForPhase<P, T>
+{
+}
+
+impl<P: PlaceholderKind, T: PlaceholderKind> DeferredForPhaseTraversal<P, T>
+    for ResolvedDeferredForPhase<P, T>
+{
+    type DeferredRef<'a, S: 'a>
+        = &'a DeferredForExpression<S, P, T>
+    where
+        P: 'a,
+        T: 'a;
+
+    fn resource_refs(
+        &self,
+    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, P, T, Self>> + '_> {
+        Box::new(
+            self.expressions
+                .iter()
+                .map(|deferred| ResourceRef::Deferred {
+                    resource: &deferred.template_resource,
+                    deferred,
+                }),
+        )
+    }
+
+    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, T>> + '_> {
+        Box::new(
+            self.expressions
+                .iter_mut()
+                .map(|deferred| ResourceMut::Deferred {
+                    resource: &mut deferred.template_resource,
+                }),
+        )
+    }
+
+    fn sites(&self) -> Box<dyn Iterator<Item = DeferredForSite<'_, P>> + '_> {
+        Box::new(self.expressions.iter().map(DeferredForExpression::site))
+    }
+
+    fn deferred_header<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a str
+    where
+        P: 'a,
+        T: 'a,
+    {
+        &deferred.header
+    }
+
+    fn deferred_line<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> usize
+    where
+        P: 'a,
+        T: 'a,
+    {
+        deferred.line
+    }
+}
+
+impl ParserDeferredForPhaseAudit
+    for ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder>
+{
+    fn try_visit_values_for_module_if_audit<E>(
+        &self,
+        visit: &mut impl FnMut(&Value<ParserPlaceholder>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for expression in &self.expressions {
+            visit(&expression.iterable)?;
+            for value in expression.template_resource.attributes.values() {
+                visit(value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parse result, generic over export parameters, ordinary values, template
+/// values, and the deferred-loop phase.
+#[derive(Debug, Clone)]
+pub struct File<
+    E,
+    P: PlaceholderKind = ParserPlaceholder,
+    T: PlaceholderKind = P,
+    D = ParsedDeferredForPhase<P>,
+> {
     pub providers: Vec<ProviderConfig<P>>,
-    /// Top-level managed infrastructure resources.
     pub resources: Vec<Resource<ModuleSource, P>>,
-    /// Read-only data-source resources (`read`-keyword resources).
     pub data_sources: Vec<DataSource<ModuleSource, P>>,
-    /// Virtual resources synthesized by module-call expansion.
     pub compositions: Vec<LiveComposition<P>>,
     pub variables: IndexMap<String, Value<P>>,
-    /// Module `use` statements
     pub uses: Vec<UseStatement>,
-    /// Module calls (instantiations)
     pub module_calls: Vec<ModuleCall<P>>,
-    /// Top-level argument parameters (directory-based module style)
     pub arguments: Vec<ArgumentParameter<TypeExpr, P>>,
-    /// Top-level attribute parameters (directory-based module style)
     pub attribute_params: Vec<AttributeParameter<TypeExpr, P>>,
-    /// Top-level export parameters (published to upstream_state consumers).
-    /// Element type varies by phase — see [`ParsedExportParam`] / [`InferredExportParam`].
     pub export_params: Vec<E>,
-    /// Backend configuration for state storage
     pub backend: Option<BackendConfig<P>>,
-    /// State manipulation blocks (import, removed, moved)
     pub state_blocks: Vec<StateBlock<P>>,
-    /// User-defined pure functions
     pub user_functions: HashMap<String, UserFunction>,
-    /// Upstream state references (read-only views of other Carina configurations)
     pub upstream_states: Vec<UpstreamState>,
-    /// `wait` bindings declared via `let <name> = wait <target> { ... }`.
     pub wait_bindings: Vec<WaitBinding>,
-    /// Require blocks (cross-argument constraints)
     pub requires: Vec<RequireBlock<P>>,
-    /// Binding names that are structurally required (if/for/read expressions)
-    /// and should not trigger unused-binding warnings.
     pub structural_bindings: HashSet<String>,
-    /// Evaluator-only classification carried between directory parse passes.
     #[doc(hidden)]
     pub parser_binding_metadata: ParserBindingMetadata,
-    /// Bare binding provenance and typed pending value slots.
+    #[doc(hidden)]
     #[cfg(not(test))]
-    #[doc(hidden)]
     parsed_binding_uses: ParsedBindingUses,
-    /// Crate-local unit-test fixtures may initialize the otherwise-private
-    /// provenance channel.
     #[cfg(test)]
-    #[doc(hidden)]
     pub(crate) parsed_binding_uses: ParsedBindingUses,
-    /// Non-fatal warnings collected during parsing.
     pub warnings: Vec<ParseWarning>,
-    /// For-expressions whose iterables are unresolved; displayed as deferred in plan.
-    pub deferred_for_expressions: Vec<DeferredForExpression<ModuleSource, P, T>>,
-    /// Plan-scoped lineage of leaf nodes back to the composition call
-    /// sites that produced them (#3306).
-    ///
-    /// Populated by `ModuleResolver::expand_module_call`: every leaf
-    /// resource added to the expanded `File` records its originating
-    /// call-site chain (outermost first). Leaves declared at the DSL
-    /// root are absent from the map.
-    ///
-    /// Not serialized to state — the trace is plan-scoped and rebuilt
-    /// from DSL on every parse. (`File` itself does not derive Serde,
-    /// so no annotation is required.)
+    pub(crate) deferred_for_phase: D,
+    /// Carries the deferred-template placeholder stage even when `D` is an
+    /// opaque phase parameter. The marker has no runtime representation.
+    pub(crate) template_placeholder: std::marker::PhantomData<fn() -> T>,
+    pub deferred_module_ifs: Vec<super::DeferredStructuralIf<P>>,
     pub expansion_trace: crate::resource::ExpansionTrace,
 }
 
-/// Parse-phase file: exports retain their optional annotation shape.
-pub type ParsedFile =
-    File<ParsedExportParam<ParserPlaceholder>, ParserPlaceholder, ParserPlaceholder>;
+pub type ParsedFile = File<
+    ParsedExportParam<ParserPlaceholder>,
+    ParserPlaceholder,
+    ParserPlaceholder,
+    ParsedDeferredForPhase<ParserPlaceholder>,
+>;
 
-/// Parser-placeholder policy at the validation/expansion boundary.
-///
-/// A called root configuration must be fully expanded. A standalone module
-/// definition may retain typed module-argument slots only in fields that the
-/// module expander substitutes when a caller supplies its arguments.
+pub type InferredFile = File<
+    InferredExportParam<ParserPlaceholder>,
+    ParserPlaceholder,
+    ParserPlaceholder,
+    ParsedDeferredForPhase<ParserPlaceholder>,
+>;
+
+pub type ModuleResolvedFile<E> = File<
+    E,
+    ParserPlaceholder,
+    ParserPlaceholder,
+    ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder>,
+>;
+
+pub type ModuleResolvedParsedFile = ModuleResolvedFile<ParsedExportParam<ParserPlaceholder>>;
+
+pub type ModuleResolvedInferredFile = ModuleResolvedFile<InferredExportParam<ParserPlaceholder>>;
+
+pub type ExpandedFile<E> =
+    File<E, NoPlaceholder, LoopSlot, ResolvedDeferredForPhase<NoPlaceholder, LoopSlot>>;
+
+pub type ExpandedParsedFile = ExpandedFile<ParsedExportParam<NoPlaceholder>>;
+pub type ExpandedInferredFile = ExpandedFile<InferredExportParam<NoPlaceholder>>;
+pub type ExpandedInferredExportParam = InferredExportParam<NoPlaceholder>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParserPlaceholderBoundary {
     ExpandedFile,
     ModuleDefinition,
 }
 
-/// Post-inference file: every export carries origin and unchecked provenance.
-pub type InferredFile =
-    File<InferredExportParam<ParserPlaceholder>, ParserPlaceholder, ParserPlaceholder>;
-
-/// A file whose ordinary values have crossed the parser-placeholder boundary.
-pub type ExpandedFile<E> = File<E, NoPlaceholder, LoopSlot>;
-
-/// Parse-shaped exports after ordinary values have crossed the expansion boundary.
-pub type ExpandedParsedFile = ExpandedFile<ParsedExportParam<NoPlaceholder>>;
-
-/// Inference-shaped exports after ordinary values have crossed the expansion boundary.
-pub type ExpandedInferredFile = ExpandedFile<InferredExportParam<NoPlaceholder>>;
-
-/// The post-expansion export-parameter shape used by validated configurations.
-pub type ExpandedInferredExportParam = InferredExportParam<NoPlaceholder>;
-
-impl<E, P: PlaceholderKind, T: PlaceholderKind> Default for File<E, P, T> {
+impl<E, P, T, D> Default for File<E, P, T, D>
+where
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    D: Default,
+{
     fn default() -> Self {
         Self {
             providers: Vec::new(),
@@ -3205,13 +3938,99 @@ impl<E, P: PlaceholderKind, T: PlaceholderKind> Default for File<E, P, T> {
             parser_binding_metadata: ParserBindingMetadata::default(),
             parsed_binding_uses: ParsedBindingUses::default(),
             warnings: Vec::new(),
-            deferred_for_expressions: Vec::new(),
+            deferred_for_phase: D::default(),
+            template_placeholder: std::marker::PhantomData,
+            deferred_module_ifs: Vec::new(),
             expansion_trace: crate::resource::ExpansionTrace::new(),
         }
     }
 }
 
-impl<E, P: PlaceholderKind + PartialEq, T: PlaceholderKind> File<E, P, T> {
+impl<E> File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<ParserPlaceholder>> {
+    pub(crate) fn capture_template_dependency_values(&mut self) {
+        fn capture_deferred(
+            deferred: &super::DeferredStructuralIf<ParserPlaceholder>,
+            captured: &mut Vec<(ResourceId, IndexMap<String, Value<ParserPlaceholder>>)>,
+        ) {
+            for branch in deferred.branches() {
+                match branch {
+                    DeferredIfBody::Resource(resource) => {
+                        captured.push((resource.id.clone(), resource.attributes.clone()));
+                    }
+                    DeferredIfBody::DataSource(data_source) => {
+                        captured.push((data_source.id.clone(), data_source.attributes.clone()));
+                    }
+                    DeferredIfBody::ModuleCall(_) => {}
+                    DeferredIfBody::ExpandedModuleCall(contribution) => {
+                        for nested in &contribution.deferred_module_ifs {
+                            capture_deferred(nested, captured);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut captured =
+            self.resources
+                .iter()
+                .map(|resource| (resource.id.clone(), resource.attributes.clone()))
+                .chain(
+                    self.data_sources.iter().map(|data_source| {
+                        (data_source.id.clone(), data_source.attributes.clone())
+                    }),
+                )
+                .chain(
+                    self.deferred_for_phase.expressions.iter().filter_map(
+                        |deferred| match &deferred.body {
+                            DeferredForBody::Resource(resource) => {
+                                Some((resource.id.clone(), resource.attributes.clone()))
+                            }
+                            DeferredForBody::Read(data_source) => {
+                                Some((data_source.id.clone(), data_source.attributes.clone()))
+                            }
+                            DeferredForBody::ModuleCall(_) => None,
+                        },
+                    ),
+                )
+                .collect::<Vec<_>>();
+        for deferred in &self.deferred_module_ifs {
+            capture_deferred(deferred, &mut captured);
+        }
+        for (id, values) in captured {
+            self.parser_binding_metadata
+                .insert_template_dependency_values(id, values);
+        }
+    }
+
+    pub fn parsed_deferred_for_expressions(&self) -> &[ParsedDeferredForExpression] {
+        &self.deferred_for_phase.expressions
+    }
+
+    pub fn deferred_for_scope_reference_sites(
+        &self,
+    ) -> impl Iterator<Item = DeferredForSite<'_, ParserPlaceholder>> {
+        self.deferred_for_phase
+            .expressions
+            .iter()
+            .filter(|expression| {
+                matches!(
+                    expression.iterable_state,
+                    ParsedDeferredForIterableState::Deferred
+                )
+            })
+            .map(ParsedDeferredForExpression::site)
+    }
+
+    pub(crate) fn parsed_deferred_for_expressions_mut(
+        &mut self,
+    ) -> &mut Vec<ParsedDeferredForExpression> {
+        &mut self.deferred_for_phase.expressions
+    }
+
+    pub fn into_parsed_deferred_for_expressions(self) -> Vec<ParsedDeferredForExpression> {
+        self.deferred_for_phase.expressions
+    }
+
     pub(crate) fn set_loop_binding_scope(
         &mut self,
         binding_scope: std::collections::BTreeSet<String>,
@@ -3227,19 +4046,33 @@ impl<E, P: PlaceholderKind + PartialEq, T: PlaceholderKind> File<E, P, T> {
                 origin.set_binding_scope(std::sync::Arc::clone(&binding_scope));
             }
         }
-        for deferred in &mut self.deferred_for_expressions {
+        for deferred in &mut self.deferred_for_phase.expressions {
             deferred
                 .target
                 .set_loop_binding_scope(std::sync::Arc::clone(&binding_scope));
-            deferred
-                .template_resource
-                .loop_provenance
-                .set_binding_scope(std::sync::Arc::clone(&binding_scope));
+            match &mut deferred.body {
+                DeferredForBody::Resource(resource) => resource
+                    .loop_provenance
+                    .set_binding_scope(std::sync::Arc::clone(&binding_scope)),
+                DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => {}
+            }
         }
-    }
-
-    pub fn bare_binding_uses(&self) -> &ParsedBindingUses {
-        &self.parsed_binding_uses
+        for deferred in &mut self.deferred_module_ifs {
+            for branch in deferred.branches_mut() {
+                match branch {
+                    DeferredIfBody::Resource(resource) => resource
+                        .loop_provenance
+                        .set_binding_scope(std::sync::Arc::clone(&binding_scope)),
+                    DeferredIfBody::DataSource(_) => {}
+                    DeferredIfBody::ModuleCall(call) => {
+                        if let Some(origin) = call.loop_origin_mut() {
+                            origin.set_binding_scope(std::sync::Arc::clone(&binding_scope));
+                        }
+                    }
+                    DeferredIfBody::ExpandedModuleCall(_) => {}
+                }
+            }
+        }
     }
 
     pub(crate) fn empty_with_parsed_binding_uses(parsed_binding_uses: ParsedBindingUses) -> Self {
@@ -3249,9 +4082,6 @@ impl<E, P: PlaceholderKind + PartialEq, T: PlaceholderKind> File<E, P, T> {
         }
     }
 
-    /// Merge one same-phase file without exposing mutable bare-binding
-    /// provenance. The exhaustive destructure keeps new `File` fields from
-    /// being silently dropped by directory and module merges.
     pub(crate) fn merge_from(&mut self, source: Self) {
         let File {
             providers,
@@ -3274,7 +4104,9 @@ impl<E, P: PlaceholderKind + PartialEq, T: PlaceholderKind> File<E, P, T> {
             parser_binding_metadata,
             parsed_binding_uses,
             warnings,
-            deferred_for_expressions,
+            deferred_for_phase,
+            template_placeholder: _,
+            deferred_module_ifs,
             expansion_trace,
         } = source;
 
@@ -3297,8 +4129,10 @@ impl<E, P: PlaceholderKind + PartialEq, T: PlaceholderKind> File<E, P, T> {
         self.parser_binding_metadata.extend(parser_binding_metadata);
         self.parsed_binding_uses.extend(parsed_binding_uses);
         self.warnings.extend(warnings);
-        self.deferred_for_expressions
-            .extend(deferred_for_expressions);
+        self.deferred_for_phase
+            .expressions
+            .extend(deferred_for_phase.expressions);
+        self.deferred_module_ifs.extend(deferred_module_ifs);
         for (leaf, call_sites) in expansion_trace.leaf_to_call_sites {
             self.expansion_trace.record(leaf, call_sites);
         }
@@ -3307,20 +4141,15 @@ impl<E, P: PlaceholderKind + PartialEq, T: PlaceholderKind> File<E, P, T> {
         }
     }
 
-    /// Transform only the export-param phase (`File<E>` → `File<B>`),
-    /// applying `f` to the export params and moving every other field
-    /// through unchanged.
-    ///
-    /// This is the **single** place the "every non-export field passes
-    /// a phase change untouched" knowledge lives. The struct is
-    /// **destructured exhaustively** — the carina#3126 / carina#3061
-    /// compile-time forcing function for the *phase axis*: a new
-    /// `File<E>` field cannot compile until it is moved through here
-    /// too. Both [`relabel_export_phase`](crate::config_loader) (module
-    /// contribution → caller phase, export params asserted empty) and
-    /// `apply_inference` (parser → inferred, export params type-inferred)
-    /// delegate here instead of hand-listing every field each.
-    pub fn map_export_params<B>(self, f: impl FnOnce(Vec<E>) -> Vec<B>) -> File<B, P, T> {
+    pub(crate) fn map_deferred_for_phase<A>(
+        self,
+        map: impl FnOnce(
+            Vec<ParsedDeferredForExpression>,
+        ) -> (
+            Vec<DeferredForExpression<ModuleSource, ParserPlaceholder, ParserPlaceholder>>,
+            A,
+        ),
+    ) -> (ModuleResolvedFile<E>, A) {
         let File {
             providers,
             resources,
@@ -3342,7 +4171,151 @@ impl<E, P: PlaceholderKind + PartialEq, T: PlaceholderKind> File<E, P, T> {
             parser_binding_metadata,
             parsed_binding_uses,
             warnings,
-            deferred_for_expressions,
+            deferred_for_phase,
+            template_placeholder,
+            deferred_module_ifs,
+            expansion_trace,
+        } = self;
+        let (expressions, auxiliary) = map(deferred_for_phase.expressions);
+        (
+            File {
+                providers,
+                resources,
+                data_sources,
+                compositions,
+                variables,
+                uses,
+                module_calls,
+                arguments,
+                attribute_params,
+                export_params,
+                backend,
+                state_blocks,
+                user_functions,
+                upstream_states,
+                wait_bindings,
+                requires,
+                structural_bindings,
+                parser_binding_metadata,
+                parsed_binding_uses,
+                warnings,
+                deferred_for_phase: ResolvedDeferredForPhase {
+                    expressions: ResolvedDeferredForExpressions(expressions),
+                },
+                template_placeholder,
+                deferred_module_ifs,
+                expansion_trace,
+            },
+            auxiliary,
+        )
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl<E: IntoExpandedExportParam>
+    File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<ParserPlaceholder>>
+{
+    /// Unit-test convenience for fixtures that do not exercise the module
+    /// resolver itself. Production callers must cross the resolver's typed
+    /// deferred-body finalization seam before publishing an expanded file.
+    pub fn into_expanded(self) -> Result<ExpandedFile<E::Expanded>, LeftoverPlaceholders> {
+        let mut known_bindings = self
+            .structural_binding_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        known_bindings.extend(self.variables.keys().cloned());
+        known_bindings.sort_unstable();
+        known_bindings.dedup();
+        let (resolved, errors) = self.map_deferred_for_phase(|pending| {
+            let mut resolved = Vec::with_capacity(pending.len());
+            let mut errors = Vec::new();
+            for expression in pending {
+                match expression.into_resource_expression(&known_bindings) {
+                    Ok(expression) => resolved.push(expression),
+                    Err(error) => errors.push(error),
+                }
+            }
+            (resolved, errors)
+        });
+        assert!(
+            errors.is_empty(),
+            "test fixture bypassed deferred-body finalization with unsupported bodies: {errors:?}"
+        );
+        resolved.into_expanded()
+    }
+}
+
+impl<E, P, T, D> File<E, P, T, D>
+where
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+{
+    pub fn bare_binding_uses(&self) -> &ParsedBindingUses {
+        &self.parsed_binding_uses
+    }
+
+    pub(crate) fn try_visit_bare_binding_values<A>(
+        &self,
+        visit: &mut impl FnMut(&Value<ParserPlaceholder>) -> Result<(), A>,
+    ) -> Result<(), A> {
+        self.parsed_binding_uses.try_visit_values(visit)
+    }
+
+    pub(crate) fn assert_module_if_audit_classifies_every_field(&self) {
+        let File {
+            providers: _providers,
+            resources: _resources,
+            data_sources: _data_sources,
+            compositions: _compositions,
+            variables: _variables,
+            uses: _uses,
+            module_calls: _module_calls,
+            arguments: _arguments,
+            attribute_params: _attribute_params,
+            export_params: _export_params,
+            backend: _backend,
+            state_blocks: _state_blocks,
+            user_functions: _user_functions,
+            upstream_states: _upstream_states,
+            wait_bindings: _wait_bindings,
+            requires: _requires,
+            structural_bindings: _structural_bindings,
+            parser_binding_metadata: _parser_binding_metadata,
+            parsed_binding_uses: _parsed_binding_uses,
+            warnings: _warnings,
+            deferred_for_phase: _deferred_for_phase,
+            template_placeholder: _template_placeholder,
+            deferred_module_ifs: _deferred_module_ifs,
+            expansion_trace: _expansion_trace,
+        } = self;
+    }
+
+    pub fn map_export_params<B>(self, f: impl FnOnce(Vec<E>) -> Vec<B>) -> File<B, P, T, D> {
+        let File {
+            providers,
+            resources,
+            data_sources,
+            compositions,
+            variables,
+            uses,
+            module_calls,
+            arguments,
+            attribute_params,
+            export_params,
+            backend,
+            state_blocks,
+            user_functions,
+            upstream_states,
+            wait_bindings,
+            requires,
+            structural_bindings,
+            parser_binding_metadata,
+            parsed_binding_uses,
+            warnings,
+            deferred_for_phase,
+            template_placeholder,
+            deferred_module_ifs,
             expansion_trace,
         } = self;
 
@@ -3367,51 +4340,13 @@ impl<E, P: PlaceholderKind + PartialEq, T: PlaceholderKind> File<E, P, T> {
             parser_binding_metadata,
             parsed_binding_uses,
             warnings,
-            deferred_for_expressions,
+            deferred_for_phase,
+            template_placeholder,
+            deferred_module_ifs,
             expansion_trace,
         }
     }
 
-    /// Iterate every resource reachable from the parsed file — the
-    /// top-level managed resources, composition resources, data sources, and
-    /// the `template_resource` of each deferred for-expression — each
-    /// wrapped in a typed [`ResourceRef`].
-    ///
-    /// Per-attribute checkers (type, enum, required, ref validity, etc.)
-    /// should prefer this over `self.resources.iter()` so they stay in sync
-    /// with for-body code. See
-    /// `notes/specs/2026-04-19-unify-resource-walk-design.md` for the
-    /// rationale.
-    ///
-    /// **carina#3181 PR C:** `self.resources` is now managed-only — the
-    /// parser, module expander, and deferred-for expansion write each
-    /// resource into exactly one of `resources` / `data_sources` /
-    /// `compositions`. The iterator chains the three typed slices
-    /// plus the deferred for-expression templates.
-    pub fn iter_all_resources(&self) -> impl Iterator<Item = ResourceRef<'_, ModuleSource, P, T>> {
-        self.resources
-            .iter()
-            .map(ResourceRef::Resource)
-            .chain(self.compositions.iter().map(ResourceRef::LiveComposition))
-            .chain(self.data_sources.iter().map(ResourceRef::DataSource))
-            .chain(
-                self.deferred_for_expressions
-                    .iter()
-                    .map(|d| ResourceRef::Deferred {
-                        resource: &d.template_resource,
-                        deferred: d,
-                    }),
-            )
-    }
-
-    /// Iterate the top-level resources — managed, composition, and data
-    /// source — as typed [`ResourceRef`]s, **excluding** deferred
-    /// for-expression templates.
-    ///
-    /// Use this over [`iter_all_resources`](Self::iter_all_resources)
-    /// when a consumer needs only the concrete top-level declarations
-    /// (binding-name collection, dependency sorting) and a for-body
-    /// template would be a spurious entry.
     pub fn iter_top_level_resources(
         &self,
     ) -> impl Iterator<Item = TopLevelResourceRef<'_, ModuleSource, P>> {
@@ -3430,15 +4365,125 @@ impl<E, P: PlaceholderKind + PartialEq, T: PlaceholderKind> File<E, P, T> {
             )
     }
 
-    /// Names declared by `upstream_state`, independent of whether loading a
-    /// particular state produced a binding-map entry.
     pub fn upstream_binding_names(&self) -> HashSet<&str> {
         self.upstream_states
             .iter()
             .map(|upstream| upstream.binding.as_str())
             .collect()
     }
+}
 
+impl<E, P, T, D> File<E, P, T, D>
+where
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    D: DeferredForPhaseTraversal<P, T>,
+{
+    pub fn iter_all_resources(
+        &self,
+    ) -> impl Iterator<Item = ResourceRef<'_, ModuleSource, P, T, D>> {
+        self.resources
+            .iter()
+            .map(ResourceRef::Resource)
+            .chain(self.compositions.iter().map(ResourceRef::LiveComposition))
+            .chain(self.data_sources.iter().map(ResourceRef::DataSource))
+            .chain(self.deferred_for_phase.resource_refs())
+            .chain(
+                self.deferred_module_ifs
+                    .iter()
+                    .flat_map(|deferred| deferred.branches())
+                    .filter_map(|branch| match branch {
+                        DeferredIfBody::Resource(resource) => Some(ResourceRef::Resource(resource)),
+                        DeferredIfBody::DataSource(data_source) => {
+                            Some(ResourceRef::DataSource(data_source))
+                        }
+                        DeferredIfBody::ModuleCall(_) | DeferredIfBody::ExpandedModuleCall(_) => {
+                            None
+                        }
+                    }),
+            )
+    }
+
+    pub fn iter_all_resources_mut(&mut self) -> impl Iterator<Item = ResourceMut<'_, P, T>> {
+        self.resources
+            .iter_mut()
+            .map(ResourceMut::Resource)
+            .chain(
+                self.compositions
+                    .iter_mut()
+                    .map(ResourceMut::LiveComposition),
+            )
+            .chain(self.data_sources.iter_mut().map(ResourceMut::DataSource))
+            .chain(self.deferred_for_phase.resource_muts())
+            .chain(
+                self.deferred_module_ifs
+                    .iter_mut()
+                    .flat_map(|deferred| deferred.branches_mut())
+                    .filter_map(|branch| match branch {
+                        DeferredIfBody::Resource(resource) => Some(ResourceMut::Resource(resource)),
+                        DeferredIfBody::DataSource(data_source) => {
+                            Some(ResourceMut::DataSource(data_source))
+                        }
+                        DeferredIfBody::ModuleCall(_) | DeferredIfBody::ExpandedModuleCall(_) => {
+                            None
+                        }
+                    }),
+            )
+    }
+
+    pub fn deferred_for_sites(&self) -> impl Iterator<Item = DeferredForSite<'_, P>> {
+        self.deferred_for_phase.sites()
+    }
+}
+
+impl<E, D> File<E, ParserPlaceholder, ParserPlaceholder, D>
+where
+    D: ParserDeferredForPhaseAudit,
+{
+    pub(crate) fn try_visit_deferred_for_values_for_module_if_audit<A>(
+        &self,
+        visit: &mut impl FnMut(&Value<ParserPlaceholder>) -> Result<(), A>,
+    ) -> Result<(), A> {
+        self.deferred_for_phase
+            .try_visit_values_for_module_if_audit(visit)
+    }
+}
+
+impl<E, P, T> File<E, P, T, ResolvedDeferredForPhase<P, T>>
+where
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+{
+    pub fn deferred_for_expressions(&self) -> &ResolvedDeferredForExpressions<P, T> {
+        &self.deferred_for_phase.expressions
+    }
+
+    pub fn deferred_for_expressions_mut(&mut self) -> &mut ResolvedDeferredForExpressions<P, T> {
+        &mut self.deferred_for_phase.expressions
+    }
+
+    pub fn take_deferred_for_expressions(&mut self) -> ResolvedDeferredForExpressions<P, T> {
+        let empty = self.deferred_for_phase.expressions.empty_like();
+        std::mem::replace(&mut self.deferred_for_phase.expressions, empty)
+    }
+
+    pub fn replace_deferred_for_expressions(
+        &mut self,
+        expressions: ResolvedDeferredForExpressions<P, T>,
+    ) -> ResolvedDeferredForExpressions<P, T> {
+        std::mem::replace(&mut self.deferred_for_phase.expressions, expressions)
+    }
+
+    pub fn into_deferred_for_expressions(self) -> ResolvedDeferredForExpressions<P, T> {
+        self.deferred_for_phase.expressions
+    }
+}
+
+impl<E, P, T, D> File<E, P, T, D>
+where
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+{
     /// Every non-variable binding name declared in the file.
     ///
     /// This intentionally excludes `variables`: parser-side variables
@@ -3454,6 +4499,12 @@ impl<E, P: PlaceholderKind + PartialEq, T: PlaceholderKind> File<E, P, T> {
             self.module_calls
                 .iter()
                 .filter_map(|c| c.binding_name.as_deref()),
+        );
+        names.extend(
+            self.deferred_module_ifs
+                .iter()
+                .flat_map(|deferred| deferred.branches())
+                .filter_map(DeferredIfBody::binding),
         );
         names.extend(self.upstream_states.iter().map(|u| u.binding.as_str()));
         names.extend(self.wait_bindings.iter().map(|w| w.binding.as_str()));
@@ -3567,7 +4618,185 @@ impl<E, P: PlaceholderKind + PartialEq, T: PlaceholderKind> File<E, P, T> {
     }
 }
 
-impl<E: IntoExpandedExportParam> File<E, ParserPlaceholder, ParserPlaceholder> {
+trait ParserBoundaryDeferredPhase {
+    fn collect_leftover_placeholders(
+        &self,
+        module_expansion_field: LeftoverPlaceholderPolicy,
+        deferred_template: LeftoverPlaceholderPolicy,
+        errors: &mut Vec<crate::resource::LeftoverPlaceholder>,
+    );
+}
+
+impl ParserBoundaryDeferredPhase for ParsedDeferredForPhase<ParserPlaceholder> {
+    fn collect_leftover_placeholders(
+        &self,
+        module_expansion_field: LeftoverPlaceholderPolicy,
+        deferred_template: LeftoverPlaceholderPolicy,
+        errors: &mut Vec<crate::resource::LeftoverPlaceholder>,
+    ) {
+        for deferred in &self.expressions {
+            deferred.iterable.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::DeferredForIterable {
+                    header: deferred.header.clone(),
+                },
+                module_expansion_field,
+                errors,
+            );
+            match &deferred.body {
+                DeferredForBody::Resource(resource) => {
+                    collect_deferred_for_resource_placeholders(
+                        &deferred.header,
+                        resource,
+                        deferred_template,
+                        errors,
+                    );
+                }
+                DeferredForBody::Read(data_source) => {
+                    for (attribute, value) in &data_source.attributes {
+                        value.collect_leftover_placeholders(
+                            LeftoverPlaceholderContext::DeferredForAttribute {
+                                header: deferred.header.clone(),
+                                attribute: attribute.clone(),
+                            },
+                            deferred_template,
+                            errors,
+                        );
+                    }
+                }
+                DeferredForBody::ModuleCall(call) => {
+                    collect_module_call_placeholders(call, deferred_template, errors);
+                }
+            }
+        }
+    }
+}
+
+impl ParserBoundaryDeferredPhase
+    for ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder>
+{
+    fn collect_leftover_placeholders(
+        &self,
+        module_expansion_field: LeftoverPlaceholderPolicy,
+        deferred_template: LeftoverPlaceholderPolicy,
+        errors: &mut Vec<crate::resource::LeftoverPlaceholder>,
+    ) {
+        for deferred in &self.expressions {
+            deferred.iterable.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::DeferredForIterable {
+                    header: deferred.header.clone(),
+                },
+                module_expansion_field,
+                errors,
+            );
+            collect_deferred_for_resource_placeholders(
+                &deferred.header,
+                &deferred.template_resource,
+                deferred_template,
+                errors,
+            );
+        }
+    }
+}
+
+fn collect_deferred_for_resource_placeholders(
+    header: &str,
+    resource: &Resource<ModuleSource, ParserPlaceholder>,
+    policy: LeftoverPlaceholderPolicy,
+    errors: &mut Vec<crate::resource::LeftoverPlaceholder>,
+) {
+    for (attribute, value) in &resource.attributes {
+        value.collect_leftover_placeholders(
+            LeftoverPlaceholderContext::DeferredForAttribute {
+                header: header.to_string(),
+                attribute: attribute.clone(),
+            },
+            policy,
+            errors,
+        );
+    }
+}
+
+fn collect_module_call_placeholders(
+    call: &ModuleCall<ParserPlaceholder>,
+    policy: LeftoverPlaceholderPolicy,
+    errors: &mut Vec<crate::resource::LeftoverPlaceholder>,
+) {
+    let module_call_name = call
+        .binding_name
+        .as_ref()
+        .unwrap_or(&call.module_name)
+        .clone();
+    for (argument_name, authored_argument) in &call.arguments {
+        authored_argument
+            .argument
+            .operand
+            .visit_values(&mut |value| {
+                value.collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::ModuleCallArgument {
+                        module_call: module_call_name.clone(),
+                        argument: argument_name.clone(),
+                    },
+                    policy,
+                    errors,
+                );
+            });
+    }
+}
+
+fn collect_deferred_if_placeholders(
+    deferred: &super::DeferredStructuralIf<ParserPlaceholder>,
+    policy: LeftoverPlaceholderPolicy,
+    errors: &mut Vec<crate::resource::LeftoverPlaceholder>,
+) {
+    deferred.condition.value.collect_leftover_placeholders(
+        LeftoverPlaceholderContext::Value,
+        policy,
+        errors,
+    );
+    for branch in deferred.branches() {
+        match branch {
+            DeferredIfBody::Resource(resource) => {
+                for (attribute, value) in &resource.attributes {
+                    value.collect_leftover_placeholders(
+                        LeftoverPlaceholderContext::ResourceAttribute {
+                            resource: resource.id.to_string(),
+                            attribute: attribute.clone(),
+                        },
+                        policy,
+                        errors,
+                    );
+                }
+            }
+            DeferredIfBody::DataSource(data_source) => {
+                for (attribute, value) in &data_source.attributes {
+                    value.collect_leftover_placeholders(
+                        LeftoverPlaceholderContext::ResourceAttribute {
+                            resource: data_source.id.to_string(),
+                            attribute: attribute.clone(),
+                        },
+                        policy,
+                        errors,
+                    );
+                }
+            }
+            DeferredIfBody::ModuleCall(call) => {
+                collect_module_call_placeholders(call, policy, errors);
+            }
+            DeferredIfBody::ExpandedModuleCall(contribution) => {
+                errors.extend(
+                    contribution.leftover_placeholders(ParserPlaceholderBoundary::ModuleDefinition),
+                );
+            }
+        }
+    }
+}
+
+#[allow(private_bounds)]
+impl<E, D> File<E, ParserPlaceholder, ParserPlaceholder, D>
+where
+    E: IntoExpandedExportParam,
+    D: ParserBoundaryDeferredPhase,
+{
     fn leftover_placeholders(
         &self,
         boundary: ParserPlaceholderBoundary,
@@ -3593,7 +4822,9 @@ impl<E: IntoExpandedExportParam> File<E, ParserPlaceholder, ParserPlaceholder> {
             parser_binding_metadata,
             parsed_binding_uses,
             warnings,
-            deferred_for_expressions,
+            deferred_for_phase,
+            template_placeholder: _template_placeholder,
+            deferred_module_ifs,
             expansion_trace,
         } = self;
         let _non_value_fields = (
@@ -3876,60 +5107,14 @@ impl<E: IntoExpandedExportParam> File<E, ParserPlaceholder, ParserPlaceholder> {
             );
         }
 
-        for deferred in deferred_for_expressions {
-            let DeferredForExpression {
-                file,
-                line,
-                header,
-                resource_type,
-                target,
-                iterable,
-                binding,
-                template_resource,
-            } = deferred;
-            let _deferred_metadata = (file, line, resource_type, target, binding);
-            iterable.collect_leftover_placeholders(
-                LeftoverPlaceholderContext::DeferredForIterable {
-                    header: header.clone(),
-                },
-                module_expansion_field,
-                &mut errors,
-            );
-            let Resource {
-                id,
-                attributes,
-                directives,
-                resolved_ignore_changes,
-                prefixes,
-                binding,
-                dependency_bindings,
-                module_source,
-                default_tag_keys,
-                loop_provenance,
-                quoted_string_attrs,
-            } = template_resource;
-            let _template_metadata = (
-                id,
-                directives,
-                resolved_ignore_changes,
-                prefixes,
-                binding,
-                dependency_bindings,
-                module_source,
-                default_tag_keys,
-                loop_provenance,
-                quoted_string_attrs,
-            );
-            for (attribute, value) in attributes {
-                value.collect_leftover_placeholders(
-                    LeftoverPlaceholderContext::DeferredForAttribute {
-                        header: header.clone(),
-                        attribute: attribute.clone(),
-                    },
-                    deferred_template,
-                    &mut errors,
-                );
-            }
+        deferred_for_phase.collect_leftover_placeholders(
+            module_expansion_field,
+            deferred_template,
+            &mut errors,
+        );
+
+        for deferred in deferred_module_ifs {
+            collect_deferred_if_placeholders(deferred, module_expansion_field, &mut errors);
         }
 
         errors
@@ -3947,11 +5132,18 @@ impl<E: IntoExpandedExportParam> File<E, ParserPlaceholder, ParserPlaceholder> {
             Err(LeftoverPlaceholders::new(errors))
         }
     }
+}
 
+impl<E: IntoExpandedExportParam>
+    File<
+        E,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder>,
+    >
+{
     #[doc(hidden)]
-    pub fn into_expanded(
-        self,
-    ) -> Result<File<E::Expanded, NoPlaceholder, LoopSlot>, LeftoverPlaceholders> {
+    pub fn into_expanded(self) -> Result<ExpandedFile<E::Expanded>, LeftoverPlaceholders> {
         self.validate_expansion_boundary(ParserPlaceholderBoundary::ExpandedFile)?;
 
         let File {
@@ -3975,7 +5167,9 @@ impl<E: IntoExpandedExportParam> File<E, ParserPlaceholder, ParserPlaceholder> {
             parser_binding_metadata,
             parsed_binding_uses,
             warnings,
-            deferred_for_expressions,
+            deferred_for_phase,
+            template_placeholder: _template_placeholder,
+            deferred_module_ifs,
             expansion_trace,
         } = self;
 
@@ -4030,16 +5224,29 @@ impl<E: IntoExpandedExportParam> File<E, ParserPlaceholder, ParserPlaceholder> {
             parser_binding_metadata,
             parsed_binding_uses,
             warnings,
-            deferred_for_expressions: deferred_for_expressions
-                .into_iter()
-                .map(DeferredForExpression::into_expanded)
-                .collect::<Result<_, _>>()?,
+            deferred_for_phase: ResolvedDeferredForPhase {
+                expressions: ResolvedDeferredForExpressions(
+                    deferred_for_phase
+                        .expressions
+                        .into_iter()
+                        .map(DeferredForExpression::into_expanded)
+                        .collect::<Result<_, _>>()?,
+                ),
+            },
+            template_placeholder: std::marker::PhantomData,
+            deferred_module_ifs: {
+                assert!(
+                    deferred_module_ifs.is_empty(),
+                    "module resolution must select every structural if before expansion"
+                );
+                Vec::new()
+            },
             expansion_trace,
         })
     }
 }
 
-impl<E> File<E, NoPlaceholder, LoopSlot> {
+impl<E> ExpandedFile<E> {
     /// Expand deferred for-expressions against the resolved binding view.
     ///
     /// For each deferred for-expression whose iterable can now be resolved
@@ -4069,7 +5276,7 @@ impl<E> File<E, NoPlaceholder, LoopSlot> {
         let mut mismatched_indices: Vec<usize> = Vec::new();
         let mut new_warnings: Vec<ParseWarning> = Vec::new();
 
-        for (idx, deferred) in self.deferred_for_expressions.iter().enumerate() {
+        for (idx, deferred) in self.deferred_for_phase.expressions.iter().enumerate() {
             let iterable_value =
                 match bindings
                     .resolve_value(&deferred.iterable)
@@ -4152,16 +5359,16 @@ impl<E> File<E, NoPlaceholder, LoopSlot> {
         // Remove parse-time warnings for mismatched entries (the new
         // shape-mismatch warning replaces the generic "not yet available" one).
         for idx in &mismatched_indices {
-            let deferred = &self.deferred_for_expressions[*idx];
+            let deferred = &self.deferred_for_phase.expressions[*idx];
             retain_non_matching_deferred_for_warnings(&mut self.warnings, deferred);
         }
 
         // Remove resolved deferred entries (reverse order to preserve indices)
         for idx in resolved_indices.into_iter().rev() {
             // Also remove the corresponding warning
-            let deferred = &self.deferred_for_expressions[idx];
+            let deferred = &self.deferred_for_phase.expressions[idx];
             retain_non_matching_deferred_for_warnings(&mut self.warnings, deferred);
-            self.deferred_for_expressions.remove(idx);
+            self.deferred_for_phase.expressions.remove(idx);
         }
 
         // carina#3181: a deferred for-expression's `template_resource` is
@@ -4254,9 +5461,13 @@ fn deferred_iterable_kind(value: &Value) -> &'static str {
         Value::Concrete(ConcreteValue::List(_)) => "list",
         Value::Concrete(ConcreteValue::StringList(_)) => "string list",
         Value::Concrete(ConcreteValue::Map(_)) => "map",
+        Value::Deferred(DeferredValue::ModuleIf(_)) => "deferred module conditional",
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "deferred resource reference",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "deferred binding reference",
         Value::Deferred(DeferredValue::Coalesce { .. }) => "deferred coalesce expression",
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            "deferred integer arithmetic expression"
+        }
         Value::Deferred(DeferredValue::Interpolation(_)) => "deferred interpolation",
         Value::Deferred(
             DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
@@ -4417,6 +5628,13 @@ fn normalize_substituted_value(
     miss_policy: crate::resource::AccessMissPolicy,
 ) -> Result<(), PlaceholderAccessError> {
     match v {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            **deferred = deferred.try_map(|branch| {
+                let mut branch = branch.clone();
+                normalize_substituted_value(&mut branch, miss_policy)?;
+                Ok::<_, PlaceholderAccessError>(branch)
+            })?;
+        }
         Value::Concrete(ConcreteValue::List(items)) => {
             for item in items.iter_mut() {
                 normalize_substituted_value(item, miss_policy).map_err(nested_placeholder_error)?;
@@ -4449,7 +5667,7 @@ fn normalize_substituted_value(
                 }
                 Ok(()) => {
                     let mut resolved_default = default.as_ref().clone();
-                    normalize_substituted_lazily(&mut resolved_default);
+                    normalize_substituted_lazily(&mut resolved_default)?;
                     *v = Value::Deferred(DeferredValue::Coalesce {
                         value: Box::new(resolved_left),
                         default: Box::new(resolved_default),
@@ -4499,6 +5717,20 @@ fn normalize_substituted_value(
                 }
             }
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let expression = expression.clone();
+            let mut lhs = expression.lhs().clone();
+            let mut rhs = expression.rhs().clone();
+            normalize_substituted_value(&mut lhs, miss_policy).map_err(nested_placeholder_error)?;
+            normalize_substituted_value(&mut rhs, miss_policy).map_err(nested_placeholder_error)?;
+            *v = expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| PlaceholderAccessError {
+                    line: expression.operator_span().line().unwrap_or(0),
+                    message: error.to_string(),
+                    coalesce_absence: false,
+                })?;
+        }
         Value::Deferred(DeferredValue::Secret(inner)) => {
             normalize_substituted_value(inner, miss_policy)?;
         }
@@ -4526,22 +5758,29 @@ fn normalize_substituted_value(
 /// Normalize an already-substituted unselected `??` fallback. Concrete
 /// accesses may collapse, while missing accesses and surrounding functions
 /// remain lazy until the fallback is selected.
-fn normalize_substituted_lazily(value: &mut Value) {
+fn normalize_substituted_lazily(value: &mut Value) -> Result<(), PlaceholderAccessError> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            **deferred = deferred.try_map(|branch| {
+                let mut branch = branch.clone();
+                normalize_substituted_lazily(&mut branch)?;
+                Ok::<_, PlaceholderAccessError>(branch)
+            })?;
+        }
         Value::Concrete(ConcreteValue::List(values)) => {
             for value in values {
-                normalize_substituted_lazily(value);
+                normalize_substituted_lazily(value).map_err(nested_placeholder_error)?;
             }
         }
         Value::Concrete(ConcreteValue::Map(values)) => {
             for value in values.values_mut() {
-                normalize_substituted_lazily(value);
+                normalize_substituted_lazily(value).map_err(nested_placeholder_error)?;
             }
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for part in parts {
                 if let crate::resource::InterpolationPart::Expr(value) = part {
-                    normalize_substituted_lazily(value);
+                    normalize_substituted_lazily(value).map_err(nested_placeholder_error)?;
                 }
             }
         }
@@ -4551,13 +5790,14 @@ fn normalize_substituted_lazily(value: &mut Value) {
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for argument in args {
-                normalize_substituted_lazily(argument.walker_value_mut());
+                normalize_substituted_lazily(argument.walker_value_mut())
+                    .map_err(nested_placeholder_error)?;
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let access = access.clone();
             let mut base = access.base().clone();
-            normalize_substituted_lazily(&mut base);
+            normalize_substituted_lazily(&mut base)?;
             *value = match access.rebuild_result(
                 base.clone(),
                 access.step().clone(),
@@ -4574,11 +5814,25 @@ fn normalize_substituted_lazily(value: &mut Value) {
             value: left,
             default,
         }) => {
-            normalize_substituted_lazily(left);
-            normalize_substituted_lazily(default);
+            normalize_substituted_lazily(left)?;
+            normalize_substituted_lazily(default)?;
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let expression = expression.clone();
+            let mut lhs = expression.lhs().clone();
+            let mut rhs = expression.rhs().clone();
+            normalize_substituted_lazily(&mut lhs).map_err(nested_placeholder_error)?;
+            normalize_substituted_lazily(&mut rhs).map_err(nested_placeholder_error)?;
+            *value = expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| PlaceholderAccessError {
+                    line: expression.operator_span().line().unwrap_or(0),
+                    message: error.to_string(),
+                    coalesce_absence: false,
+                })?;
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            normalize_substituted_lazily(inner);
+            normalize_substituted_lazily(inner)?;
         }
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
         Value::Concrete(
@@ -4598,6 +5852,7 @@ fn normalize_substituted_lazily(value: &mut Value) {
             | DeferredValue::Unknown(_),
         ) => {}
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4610,6 +5865,34 @@ mod substitute_placeholder_tests {
     use std::collections::BTreeSet;
 
     type LoopValue = Value<LoopSlot>;
+
+    #[test]
+    fn lazy_coalesce_for_substitution_rejects_non_integer_items_without_panicking() {
+        for item in [
+            Value::Concrete(ConcreteValue::String("not-an-int".into())),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        ] {
+            let arithmetic: LoopValue = crate::integer_arithmetic::evaluate_integer_values(
+                Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
+                crate::integer_arithmetic::IntegerOp::Add,
+                Value::Concrete(ConcreteValue::Int(1)),
+                crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+            )
+            .expect("a for-value placeholder is admitted until substitution");
+            let value: LoopValue = Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(Value::resource_ref("source", "optional", Vec::new())),
+                default: Box::new(arithmetic),
+            });
+
+            let error = substitute_placeholder(value, None, None, &item)
+                .expect_err("a substituted non-Int arithmetic operand must be typed error");
+            assert!(
+                error.message.contains("operand must be Int"),
+                "unexpected substitution error: {}",
+                error.message
+            );
+        }
+    }
 
     #[test]
     fn module_argument_rewrite_cannot_leave_its_access_base_stale() {
@@ -4782,7 +6065,9 @@ mod substitute_placeholder_tests {
             parser_binding_metadata: _,
             parsed_binding_uses: _,
             warnings: _,
-            deferred_for_expressions: _,
+            deferred_for_phase: _,
+            template_placeholder: _,
+            deferred_module_ifs: _,
             expansion_trace: _,
         } = parsed;
     }
@@ -4926,7 +6211,7 @@ mod substitute_placeholder_tests {
         )
         .expect("deferred unbound loop parses");
         let parsed = parsed.into_expanded().expect("template must expand");
-        let deferred = &parsed.deferred_for_expressions[0];
+        let deferred = &parsed.deferred_for_expressions()[0];
         let children = expand_deferred_children(
             deferred,
             &Value::Concrete(ConcreteValue::List(vec![
@@ -4999,7 +6284,10 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let target = &parsed.deferred_for_expressions[0].target;
+        let parsed =
+            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+                .expect("deferred fixture crosses the module-resolution seam");
+        let target = &parsed.deferred_for_expressions()[0].target;
         let mut json = serde_json::to_value(target).expect("serialize deferred target");
         json["template"]["source"]
             .as_object_mut()

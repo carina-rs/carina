@@ -198,9 +198,11 @@ pub fn is_value_fully_concrete_for_expansion(value: &Value) -> bool {
             ConcreteValue::Map(map) => map.values().all(is_value_fully_concrete_for_expansion),
         },
         Value::Deferred(deferred) => match deferred {
+            DeferredValue::ModuleIf(_) => false,
             DeferredValue::ResourceRef { .. } => false,
             DeferredValue::BindingRef { .. } => false,
             DeferredValue::Coalesce { .. } => false,
+            DeferredValue::IntegerArithmetic(_) => false,
             DeferredValue::Interpolation(_) => false,
             DeferredValue::FunctionCall { .. } => false,
             DeferredValue::Unavailable { .. } => false,

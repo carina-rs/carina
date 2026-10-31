@@ -1250,7 +1250,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
 
         assert_eq!(model.nodes.len(), 2);
@@ -1275,7 +1279,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
 
@@ -1302,7 +1310,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
 
@@ -1356,7 +1368,7 @@ mod tests {
             .into_expanded()
             .expect("deferred loop fixture must contain no parser placeholders");
         let template = parsed
-            .deferred_for_expressions
+            .deferred_for_expressions_mut()
             .pop()
             .expect("fixture contains one deferred loop");
         assert_eq!(template.target.display_name(), "main.crn:2");
@@ -1440,7 +1452,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
 
@@ -1460,7 +1476,11 @@ mod tests {
             &plan,
             &[],
             &[],
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let leaf = model.node(&GraphNodeId::Effect(2)).unwrap();
         let affected_by: HashSet<_> = leaf
@@ -1490,7 +1510,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let connector_id = GraphNodeId::Unchanged(ResolvedResourceId::new(connector.id));
         let unrelated_id = GraphNodeId::Unchanged(ResolvedResourceId::new(unrelated.id));
@@ -1509,7 +1533,7 @@ mod tests {
             compositions: &[],
             expansion_trace: None,
             state: None,
-            summary: &PlanChangeSummary::new(&fixture.plan, &[], &[]),
+            summary: &PlanChangeSummary::new(&fixture.plan, &[], &fixture.deferred_for_expressions),
         });
 
         let replacements: Vec<_> = model
@@ -1537,7 +1561,11 @@ mod tests {
             &plan,
             &[],
             &[],
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let source = model
             .nodes
@@ -1584,7 +1612,11 @@ mod tests {
                 &plan,
                 &desired,
                 &unresolved,
-                &PlanChangeSummary::new(&plan, &[], &[]),
+                &PlanChangeSummary::new(
+                    &plan,
+                    &[],
+                    &crate::plan_summary::resolved_deferred_for_for_test([]),
+                ),
             )
         });
 
@@ -1636,7 +1668,11 @@ mod tests {
                 &plan,
                 &desired,
                 &unresolved,
-                &PlanChangeSummary::new(&plan, &[], &[]),
+                &PlanChangeSummary::new(
+                    &plan,
+                    &[],
+                    &crate::plan_summary::resolved_deferred_for_for_test([]),
+                ),
             )
         });
         let deleted = model.node(&GraphNodeId::Effect(0)).expect("delete node");
@@ -1662,7 +1698,7 @@ mod tests {
             compositions: &fixture.compositions,
             expansion_trace: Some(&fixture.expansion_trace),
             state: None,
-            summary: &PlanChangeSummary::new(&fixture.plan, &[], &[]),
+            summary: &PlanChangeSummary::new(&fixture.plan, &[], &fixture.deferred_for_expressions),
         });
 
         let replacements: Vec<_> = model

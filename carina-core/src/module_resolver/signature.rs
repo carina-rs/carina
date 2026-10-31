@@ -68,8 +68,8 @@ pub(super) fn resolved_signature_with_policy<P: TypeResolutionPolicy>(
 }
 
 /// Load and resolve every module signature imported by `parsed`.
-pub fn load_resolved_module_signatures<E>(
-    parsed: &File<E>,
+pub fn load_resolved_module_signatures<E, D>(
+    parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D>,
     base_dir: &Path,
     config: &ProviderContext,
 ) -> ResolvedModuleSignatures {

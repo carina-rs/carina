@@ -213,15 +213,17 @@ struct Sealer {
 }
 
 impl Sealer {
+    fn seal_as_token(&mut self, value: &Value) -> Value {
+        let index = self.secrets.len();
+        self.secrets.push(value.clone());
+        Value::Concrete(ConcreteValue::String(
+            format!("{}{index}", self.nonce_prefix).into(),
+        ))
+    }
+
     fn seal_value(&mut self, value: &Value) -> Value {
         match value {
-            Value::Deferred(DeferredValue::Secret(_)) => {
-                let index = self.secrets.len();
-                self.secrets.push(value.clone());
-                Value::Concrete(ConcreteValue::String(
-                    format!("{}{index}", self.nonce_prefix).into(),
-                ))
-            }
+            Value::Deferred(DeferredValue::Secret(_)) => self.seal_as_token(value),
             Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
                 items.iter().map(|item| self.seal_value(item)).collect(),
             )),
@@ -231,6 +233,25 @@ impl Sealer {
                     .map(|(key, value)| (key.clone(), self.seal_value(value)))
                     .collect(),
             )),
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                let checkpoint = self.secrets.len();
+                let lhs = self.seal_value(expression.lhs());
+                let rhs = self.seal_value(expression.rhs());
+                if lhs == *expression.lhs() && rhs == *expression.rhs() {
+                    return expression
+                        .rebuild(lhs, rhs)
+                        .map(DeferredValue::IntegerArithmetic)
+                        .map(Value::Deferred)
+                        .unwrap_or_else(|_| value.clone());
+                }
+
+                // A string token is intentionally not a valid Int operand.
+                // Preserve the arithmetic invariant by sealing the complete
+                // expression as one opaque token after recursively detecting
+                // a nested secret; discard the speculative operand tokens.
+                self.secrets.truncate(checkpoint);
+                self.seal_as_token(value)
+            }
             _ => value.clone(),
         }
     }
@@ -322,6 +343,7 @@ impl Unsealer {
         }
 
         match value {
+            Value::Deferred(DeferredValue::ModuleIf(_)) => false,
             Value::Concrete(ConcreteValue::List(items)) => {
                 items.iter_mut().all(|item| self.restore_value(item))
             }
@@ -365,6 +387,19 @@ impl Unsealer {
             }
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 self.restore_value(value) && self.restore_value(default)
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                let expression = expression.clone();
+                let mut lhs = expression.lhs().clone();
+                let mut rhs = expression.rhs().clone();
+                if !self.restore_value(&mut lhs) || !self.restore_value(&mut rhs) {
+                    return false;
+                }
+                let Ok(expression) = expression.rebuild(lhs, rhs) else {
+                    return false;
+                };
+                *value = Value::Deferred(DeferredValue::IntegerArithmetic(expression));
+                true
             }
             Value::Deferred(DeferredValue::RedactedSecret { .. }) => false,
             Value::Concrete(
@@ -505,9 +540,11 @@ fn preserve_equal_json_subtrees(
                 | ConcreteValue::StringList(_),
             )
             | Value::Deferred(
-                DeferredValue::ResourceRef { .. }
+                DeferredValue::ModuleIf(_)
+                | DeferredValue::ResourceRef { .. }
                 | DeferredValue::BindingRef { .. }
                 | DeferredValue::Coalesce { .. }
+                | DeferredValue::IntegerArithmetic(_)
                 | DeferredValue::Interpolation(_)
                 | DeferredValue::FunctionCall { .. }
                 | DeferredValue::Unavailable { .. }
@@ -892,6 +929,41 @@ mod tests {
         restored.apply_to(&mut resources);
 
         assert_eq!(resources[0].get_attr("nested"), Some(&original));
+    }
+
+    #[test]
+    fn seal_restore_preserves_a_secret_nested_in_integer_arithmetic() {
+        let original = Value::Deferred(DeferredValue::IntegerArithmetic(
+            carina_core::integer_arithmetic::ValidatedIntegerExpr::new(
+                secret(Value::Concrete(ConcreteValue::Int(42))),
+                carina_core::integer_arithmetic::IntegerOp::Add,
+                Value::Concrete(ConcreteValue::Int(1)),
+                carina_core::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+            )
+            .expect("a secret Int is a valid arithmetic operand"),
+        ));
+        let mut sealer = Sealer {
+            nonce_prefix: format!("{TOKEN_NAMESPACE}:test:"),
+            secrets: Vec::new(),
+        };
+
+        let mut sealed = sealer.seal_value(&original);
+        assert_ne!(
+            sealed, original,
+            "the arithmetic node must not be treated as a leaf"
+        );
+        assert_eq!(sealer.secrets.len(), 1);
+
+        let unsealer = Unsealer {
+            nonce_prefix: sealer.nonce_prefix,
+            secrets: sealer.secrets,
+            host_attributes: Vec::new(),
+            sent_attributes: Vec::new(),
+            deferred: Vec::new(),
+            expected_resource_count: 0,
+        };
+        assert!(unsealer.restore_value(&mut sealed));
+        assert_eq!(sealed, original);
     }
 
     #[test]

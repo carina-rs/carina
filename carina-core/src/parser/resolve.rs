@@ -770,15 +770,20 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // call here would serialize its plaintext arguments from a deferred plan
     // effect. Keep resource references deferred so apply-time expansion still
     // substitutes the loop value and other runtime bindings normally.
-    for deferred in &mut parsed.deferred_for_expressions {
-        for value in deferred.template_resource.attributes.values_mut() {
-            *value = resolve_function_calls_only(
-                value,
-                &binding_map,
-                &fn_ctx,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
-            )?;
+    for deferred in parsed.parsed_deferred_for_expressions_mut() {
+        match &mut deferred.body {
+            super::DeferredForBody::Resource(resource) => {
+                for value in resource.attributes.values_mut() {
+                    *value = resolve_function_calls_only(
+                        value,
+                        &binding_map,
+                        &fn_ctx,
+                        defer_unknown_functions,
+                        preserve_failed_user_calls,
+                    )?;
+                }
+            }
+            super::DeferredForBody::Read(_) | super::DeferredForBody::ModuleCall(_) => {}
         }
     }
 
@@ -894,7 +899,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
 /// because `accumulate_*` helpers below still take `&HashSet<&str>` as a
 /// borrowed view (changing that signature would force `undefined_identifier_error`
 /// to rebuild a borrowed view per call).
-pub fn collect_known_bindings_merged(parsed: &ParsedFile) -> std::collections::HashSet<&str> {
+pub fn collect_known_bindings_merged<E>(parsed: &File<E>) -> std::collections::HashSet<&str> {
     let mut known = parsed.structural_binding_names();
     known.extend(parsed.variables.keys().map(String::as_str));
     known
@@ -1056,6 +1061,11 @@ fn collect_reference_roots(
     roots: &mut Vec<String>,
 ) {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            for nested in deferred.values() {
+                collect_reference_roots(nested, variables, structural, roots);
+            }
+        }
         Value::Concrete(ConcreteValue::EnumIdentifier(name)) => {
             // Bare-identifier fallback (`EnumIdentifier("B")`) and dotted-access
             // fallback (`EnumIdentifier("B.attr")`) both appear before the parser
@@ -1107,6 +1117,10 @@ fn collect_reference_roots(
             collect_reference_roots(value, variables, structural, roots);
             collect_reference_roots(default, variables, structural, roots);
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            collect_reference_roots(expression.lhs(), variables, structural, roots);
+            collect_reference_roots(expression.rhs(), variables, structural, roots);
+        }
         Value::Concrete(
             ConcreteValue::Int(_)
             | ConcreteValue::Float(_)
@@ -1143,19 +1157,14 @@ fn push_root(
 /// - Every `ResourceRef` whose root binding is not in scope (roots in
 ///   resource attributes, attribute-parameter values, module-call
 ///   arguments, and export-parameter values).
-/// - Every deferred for-expression iterable whose root is not in scope.
-///
-/// Errors are returned in a deterministic order: ResourceRef findings
-/// first (in resource / attribute / module / export order), then
-/// deferred-iterable findings. The caller (CLI `load_configuration_with_config`,
-/// LSP analysis pipeline) just inspects the returned `Vec` — both
-/// checks share the same `collect_known_bindings_merged` pass, so there
-/// is no performance reason to split them at the callsite.
+/// - Every deferred for-expression reference root whose iterable is not in
+///   scope, including bare identifiers represented by the parser's distinct
+///   undefined-iterable state.
 ///
 /// **This is the canonical entry point for "is this identifier in
 /// scope?" checks.** Follow the #2104 rule: any new semantic check in
 /// that family gets added *here*, not as a new sibling function.
-pub fn check_identifier_scope(parsed: &ParsedFile) -> Vec<ParseError> {
+pub fn check_identifier_scope<E: ExportParamLike>(parsed: &File<E>) -> Vec<ParseError> {
     let known = collect_known_bindings_merged(parsed);
     let mut errors = Vec::new();
     accumulate_undefined_reference_errors(parsed, &known, &mut errors);
@@ -1185,7 +1194,7 @@ pub fn check_identifier_scope(parsed: &ParsedFile) -> Vec<ParseError> {
 /// from the generic "is this identifier in scope" walk, and folding
 /// them together would force callers that only want one kind of
 /// validation to pay for both.
-pub fn check_provider_instance_routing(parsed: &ParsedFile) -> Vec<ParseError> {
+pub fn check_provider_instance_routing<E>(parsed: &File<E>) -> Vec<ParseError> {
     let mut errors = Vec::new();
     // carina#3181: walk the typed top-level slices. `directives()` is
     // `None` for the composition arm (no `directives` on a synthetic node),
@@ -1259,7 +1268,7 @@ pub fn check_provider_instance_routing(parsed: &ParsedFile) -> Vec<ParseError> {
 }
 
 fn accumulate_undefined_reference_errors(
-    parsed: &ParsedFile,
+    parsed: &File<impl ExportParamLike>,
     known: &std::collections::HashSet<&str>,
     errors: &mut Vec<ParseError>,
 ) {
@@ -1277,7 +1286,7 @@ fn accumulate_undefined_reference_errors(
 
     // carina#3181: walk the typed top-level slices (managed, composition,
     // data source) — `parsed.resources` is managed-only now. Deferred
-    // for-expression templates are handled by
+    // for-expression templates are handled separately by
     // `accumulate_deferred_iterable_errors`, so they are excluded here.
     for rref in parsed.iter_top_level_resources() {
         for value in rref.attributes().values() {
@@ -1295,7 +1304,7 @@ fn accumulate_undefined_reference_errors(
         }
     }
     for export in &parsed.export_params {
-        if let Some(value) = &export.value {
+        if let Some(value) = export.value() {
             check(value);
         }
     }
@@ -1310,16 +1319,25 @@ fn accumulate_undefined_reference_errors(
 }
 
 fn accumulate_deferred_iterable_errors(
-    parsed: &ParsedFile,
+    parsed: &File<impl ExportParamLike>,
     known: &std::collections::HashSet<&str>,
     errors: &mut Vec<ParseError>,
 ) {
-    for d in &parsed.deferred_for_expressions {
-        for root in d.root_bindings() {
+    let mut known_bindings = known
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    known_bindings.sort_unstable();
+    for deferred in parsed.parsed_deferred_for_expressions() {
+        if let Some(error) = deferred.undefined_iterable_error(&known_bindings) {
+            errors.push(error);
+            continue;
+        }
+        for root in deferred.root_bindings() {
             if known.contains(root.as_str()) {
                 continue;
             }
-            errors.push(undefined_identifier_error(known, root, d.line));
+            errors.push(undefined_identifier_error(known, root, deferred.line));
         }
     }
 }
@@ -1332,6 +1350,18 @@ fn resolve_value_with_config(
     preserve_failed_user_calls: bool,
 ) -> Result<Value, ParseError> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let deferred = deferred.try_map(|value| {
+                resolve_value_with_config(
+                    value,
+                    binding_map,
+                    fn_ctx,
+                    defer_unknown_functions,
+                    preserve_failed_user_calls,
+                )
+            })?;
+            Ok(Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred))))
+        }
         Value::Deferred(DeferredValue::Coalesce {
             value: left,
             default,
@@ -1355,6 +1385,26 @@ fn resolve_value_with_config(
                     default: Box::new(default),
                 }))
             }
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = resolve_value_with_config(
+                expression.lhs(),
+                binding_map,
+                fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
+            let rhs = resolve_value_with_config(
+                expression.rhs(),
+                binding_map,
+                fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
+            let span = expression.operator_span();
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| ParseError::integer_arithmetic(span, 0, error))
         }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             // A suffix is part of the authored reference, not decoration on
@@ -1641,11 +1691,13 @@ fn resolve_function_calls_only(
 ) -> Result<Value, ParseError> {
     match value {
         Value::Deferred(
-            DeferredValue::FunctionCall { .. }
+            DeferredValue::ModuleIf(_)
+            | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
-            | DeferredValue::Coalesce { .. },
+            | DeferredValue::Coalesce { .. }
+            | DeferredValue::IntegerArithmetic(_),
         ) => resolve_value_with_config(
             value,
             binding_map,
@@ -1739,8 +1791,13 @@ fn resolve_function_calls_only(
 /// Generic over the export-parameter shape so callers can pass either
 /// `ParsedFile` or `InferredFile` — we only touch
 /// `provider.unresolved_attributes`, never `export_params`.
-pub fn resolve_provider_unresolved_attributes<E>(
-    parsed: &mut super::File<E>,
+pub fn resolve_provider_unresolved_attributes<E, D>(
+    parsed: &mut super::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -1802,8 +1859,8 @@ pub fn resolve_provider_unresolved_attributes<E>(
 /// validation/LSP paths that intentionally tolerate incomplete edits use the
 /// lower-level parser resolution passes and never receive
 /// [`ResolvedProviderConfigs`].
-pub fn resolve_provider_attributes_with_remote<E>(
-    parsed: &super::File<E, NoPlaceholder, LoopSlot>,
+pub fn resolve_provider_attributes_with_remote<E, D>(
+    parsed: &super::File<E, NoPlaceholder, LoopSlot, D>,
     remote_bindings: &HashMap<String, HashMap<String, GenericValue>>,
     config: &ProviderContext,
 ) -> Result<ResolvedProviderConfigs, ProviderConfigResolutionError> {
@@ -1901,7 +1958,14 @@ pub fn resolve_provider_attributes_with_remote<E>(
 ///
 /// Errors when a resolved value has the wrong shape (e.g.
 /// `default_tags = "string"`).
-pub fn finalize_provider_configs<E>(parsed: &mut super::File<E>) -> Result<(), ParseError> {
+pub fn finalize_provider_configs<E, D>(
+    parsed: &mut super::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
+) -> Result<(), ParseError> {
     for provider in parsed.providers.iter_mut() {
         if let Some(value) = provider.unresolved_attributes.shift_remove("default_tags") {
             match value {
@@ -2197,7 +2261,11 @@ for item in source.arn {
             &ProviderContext::default(),
         )
         .expect("parse deferred for fixture");
-        let template = &parsed.deferred_for_expressions[0].template_resource;
+        let crate::parser::DeferredForBody::Resource(template) =
+            &parsed.parsed_deferred_for_expressions()[0].body
+        else {
+            panic!("deferred fixture body must be a resource")
+        };
         assert!(matches!(
             template.attributes.get("comment"),
             Some(Value::Deferred(DeferredValue::FunctionCall { name, .. })) if name == "secret"
@@ -2206,7 +2274,11 @@ for item in source.arn {
         resolve_resource_refs_with_config(&mut parsed, &ProviderContext::default())
             .expect("resolve deferred template functions");
 
-        let template = &parsed.deferred_for_expressions[0].template_resource;
+        let crate::parser::DeferredForBody::Resource(template) =
+            &parsed.parsed_deferred_for_expressions()[0].body
+        else {
+            panic!("deferred fixture body must be a resource")
+        };
         assert!(matches!(
             template.attributes.get("comment"),
             Some(Value::Deferred(DeferredValue::Secret(_)))

@@ -6624,6 +6624,55 @@ let b = selector { items = ['x', 'y'] }\n";
 }
 
 #[test]
+fn imported_deferred_body_rejection_is_anchored_in_the_caller() {
+    let caller = "let parent = use { source = './parent' }\n\
+let instance = parent { names = ['one'] }\n";
+    let fixture = write_tag_key_fixture(&[
+        ("caller.crn", caller),
+        (
+            "parent/main.crn",
+            "arguments { names: list(String) }\n\
+             let grandchild = use { source = './grandchild' }\n\
+             let children = for name in names { grandchild { name = name } }\n",
+        ),
+        ("parent/grandchild/main.crn", "arguments { name: String }\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), fixture.path(), "caller.crn", caller);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("cannot use module call `grandchild`")
+        })
+        .unwrap_or_else(|| panic!("missing deferred-body diagnostic: {diagnostics:#?}"));
+    assert_eq!(diagnostic.range.start.line, 1, "{diagnostic:#?}");
+    assert_eq!(diagnostic.range.start.character, 15, "{diagnostic:#?}");
+}
+
+#[test]
+fn imported_syntax_error_remains_anchored_at_the_owning_call() {
+    let caller = "let broken = use { source = './broken' }\n\
+broken {}\n";
+    let fixture = write_tag_key_fixture(&[
+        ("caller.crn", caller),
+        ("broken/main.crn", "arguments { value: String\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), fixture.path(), "caller.crn", caller);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Syntax error"))
+        .unwrap_or_else(|| panic!("missing imported syntax diagnostic: {diagnostics:#?}"));
+    assert_eq!(diagnostic.range.start.line, 1, "{diagnostic:#?}");
+    assert_eq!(diagnostic.range.start.character, 0, "{diagnostic:#?}");
+    assert_eq!(diagnostic.range.end.character, 6, "{diagnostic:#?}");
+    assert!(diagnostic.message.contains("broken/main.crn"));
+    assert!(!diagnostic.message.contains("module call in caller.crn"));
+}
+
+#[test]
 fn heredoc_argument_type_diagnostic_anchors_the_argument_value() {
     let main = r#"let m = use { source = './m' }
 let inst = m {
@@ -9166,6 +9215,8 @@ for _, id in orgs.xs {
 }
 "#;
     let doc = create_document(source);
+    let parsed = doc.parsed().expect("buffer fixture parses");
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     let diagnostics = provider.analyze(&doc, None);
     assert!(
         diagnostics.iter().any(|d| d.message.contains("aaaa")),
@@ -11226,6 +11277,29 @@ provider awscc {
         diags.iter().any(|d| d.message.contains("nonexistent")),
         "LSP must surface UndefinedIdentifier for `nonexistent`; got: {:?}",
         diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn directory_bare_undefined_deferred_iterable_is_reported_exactly_once() {
+    let fixture = tempfile::tempdir().expect("undefined iterable LSP fixture");
+    let source = "let items = ['one']\n\
+                  let resources = for item in itmes {\n\
+                    mock.test.resource { name = item }\n\
+                  }\n";
+    let file = fixture.path().join("main.crn");
+    std::fs::write(&file, source).expect("write LSP fixture");
+
+    let diagnostics = analyze_with_buffer(&test_engine(), fixture.path(), "main.crn", source);
+    let undefined = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("Undefined identifier `itmes`"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        undefined.len(),
+        1,
+        "the typed undefined iterable must have one LSP owner: {diagnostics:#?}",
     );
 }
 
@@ -13880,6 +13954,59 @@ attributes { o: String = name_with_suffix(r) }
     assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
     assert_eq!(matching[0].range.start.line, 1);
     assert_eq!(matching[0].range.start.character, 45);
+}
+
+#[test]
+fn module_argument_if_has_no_runtime_condition_diagnostic_when_opened_standalone() {
+    let module = tempfile::tempdir().unwrap();
+    let source = r#"arguments { flag: Bool }
+fn identity(value: Bool): Bool { value }
+attributes {
+  selected: String = if identity(flag) { "yes" } else { "no" }
+}
+"#;
+    std::fs::write(module.path().join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&test_engine(), module.path(), "main.crn", source);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains(
+                "if condition depends on a runtime value; condition must be statically known at parse time",
+            )
+        }),
+        "a standalone module argument is a template dependency, not a runtime condition: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn module_argument_if_validates_both_value_branches_when_opened_standalone() {
+    let module = tempfile::tempdir().unwrap();
+    let source = r#"arguments { flag: Bool }
+attributes {
+  selected: String = if flag { "yes" } else { 42 }
+}
+"#;
+    std::fs::write(module.path().join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&test_engine(), module.path(), "main.crn", source);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains(
+                "if condition depends on a runtime value; condition must be statically known at parse time",
+            )
+        }),
+        "the unresolved module-only condition itself must not be diagnosed: {diagnostics:#?}",
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("attribute 'selected': type mismatch")
+                || (diagnostic.message.contains("expected String")
+                    && diagnostic.message.contains("got int"))
+        }),
+        "the unselected-at-template-time else branch must still be type-checked: {diagnostics:#?}",
+    );
 }
 
 #[test]

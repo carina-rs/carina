@@ -9,6 +9,604 @@ use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
+fn parsed_int_binding(source: &str, name: &str) -> i64 {
+    let parsed = parse_and_resolve(source).expect("integer expression should parse and resolve");
+    let value = parsed
+        .variables
+        .get(name)
+        .unwrap_or_else(|| panic!("missing `{name}` binding"));
+    let Value::Concrete(ConcreteValue::Int(value)) = value else {
+        panic!("`{name}` should be an Int, got {value:?}");
+    };
+    *value
+}
+
+#[test]
+fn integer_arithmetic_obeys_precedence_parentheses_and_left_associativity() {
+    assert_eq!(parsed_int_binding("let value = 1 + 2 * 3", "value"), 7);
+    assert_eq!(parsed_int_binding("let value = (1 + 2) * 3", "value"), 9);
+    assert_eq!(
+        parsed_int_binding("let value = [10, 20][1] + 1", "value"),
+        21,
+        "postfix access must bind more tightly than arithmetic",
+    );
+    assert_eq!(
+        parsed_int_binding("let value = 1 + 2 |> max(10)", "value"),
+        10,
+        "arithmetic must bind more tightly than the pipe operator",
+    );
+    assert_eq!(parsed_int_binding("let value = 20 - 6 - 3", "value"), 11);
+    assert_eq!(parsed_int_binding("let value = 20 / 3 / 2", "value"), 3);
+    assert_eq!(parsed_int_binding("let value = -5 / 2", "value"), -2);
+    assert_eq!(parsed_int_binding("let value = -5 % 2", "value"), -1);
+    assert_eq!(
+        parsed_int_binding("let value = -9223372036854775808", "value"),
+        i64::MIN,
+        "the signed i64 minimum remains a numeric literal",
+    );
+
+    let compose_error = parse_and_resolve("let value = 1 + 2 >> max(10)")
+        .expect_err("arithmetic binds before function composition");
+    assert!(
+        compose_error.to_string().contains("left side of >>"),
+        "unexpected composition error: {compose_error}",
+    );
+
+    let parsed =
+        parse_and_resolve("let source = test.clock {}\nlet value = source.seconds ?? 2 + 3")
+            .expect("coalesce default arithmetic should parse");
+    let Some(Value::Deferred(DeferredValue::Coalesce { default, .. })) =
+        parsed.variables.get("value")
+    else {
+        panic!("deferred coalesce should retain its folded arithmetic default");
+    };
+    assert_eq!(**default, Value::Concrete(ConcreteValue::Int(5)));
+}
+
+#[test]
+fn integer_arithmetic_lexing_preserves_signed_literals_and_comments() {
+    for (expression, expected) in [
+        ("5-1", 4),
+        ("5 -1", 4),
+        ("5 - 1", 4),
+        ("5--1", 6),
+        ("5 + -1", 4),
+        ("6 / /* outer /* nested */ block */ 2", 3),
+        ("6 /* block */ * 2", 12),
+        ("6 # line\n / 2", 3),
+        ("6 // line\n / 2", 3),
+    ] {
+        assert_eq!(
+            parsed_int_binding(&format!("let value = {expression}"), "value"),
+            expected,
+            "expression: {expression}"
+        );
+        let interpolated = parse_and_resolve(&format!("let value = \"${{{expression}}}\""))
+            .unwrap_or_else(|error| panic!("interpolation {expression:?} failed: {error}"));
+        assert_eq!(
+            interpolated.variables.get("value"),
+            Some(&Value::Concrete(ConcreteValue::String(
+                expected.to_string().into(),
+            ))),
+            "interpolation expression: {expression}",
+        );
+    }
+
+    for expression in ["a-1", "a -1", "a - 1", "a--1", "a + -1"] {
+        let expected = if expression == "a--1" { 6 } else { 4 };
+        assert_eq!(
+            parsed_int_binding(&format!("let a = 5\nlet value = {expression}"), "value"),
+            expected,
+            "identifier-adjacent expression: {expression}",
+        );
+    }
+
+    assert!(
+        parse_and_resolve("let value = -(1)").is_err(),
+        "minus is part of a signed numeric literal, not a unary operator",
+    );
+}
+
+#[test]
+fn integer_arithmetic_reports_checked_zero_errors() {
+    for (expression, expected) in [
+        ("1 / 0", "division by zero"),
+        ("1 % 0", "remainder by zero"),
+    ] {
+        let error = parse_and_resolve(&format!("let value = {expression}"))
+            .expect_err("zero divisor must be rejected");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?}, got {error}"
+        );
+    }
+}
+
+#[test]
+fn integer_arithmetic_operator_span_uses_original_line_after_heredoc() {
+    let error = parse(
+        "let p = <<EOT\na\nb\nc\nd\nEOT\n\nlet x = 1 / 0\n",
+        &ProviderContext::default(),
+    )
+    .expect_err("division by zero after a heredoc must be rejected");
+
+    let ParseError::IntegerArithmetic {
+        line,
+        column,
+        end_column,
+        message,
+    } = error
+    else {
+        panic!("expected an operator-local arithmetic error, got: {error}");
+    };
+    assert_eq!((line, column, end_column), (8, 11, 12));
+    assert!(message.contains("division by zero"), "{message}");
+}
+
+#[test]
+fn integer_arithmetic_rejects_every_non_int_operand_family() {
+    for (expression, expected) in [
+        ("1.0 + 2.0", "Float"),
+        ("-1.0 + 2", "Float"),
+        ("1 + 2.0", "Float"),
+        ("'x' + 1", "String"),
+        ("true + 1", "Bool"),
+        ("1s + 1", "Duration"),
+        ("[1] + [2]", "List"),
+        ("{ a = 1 } + { a = 2 }", "Map"),
+    ] {
+        let error = parse_and_resolve(&format!("let value = {expression}"))
+            .expect_err("non-Int operands must be rejected");
+        assert!(
+            error.to_string().contains(expected),
+            "expression {expression:?}: expected {expected:?}, got {error}"
+        );
+    }
+}
+
+#[test]
+fn integer_arithmetic_converts_to_string_only_at_interpolation_boundary() {
+    let parsed = parse_and_resolve(
+        r#"
+        let plain = 125 / 60
+        let text = "minutes=${125 / 60}"
+        "#,
+    )
+    .expect("arithmetic should be valid in and outside interpolation");
+
+    assert_eq!(
+        parsed.variables.get("plain"),
+        Some(&Value::Concrete(ConcreteValue::Int(2)))
+    );
+    assert_eq!(
+        parsed.variables.get("text"),
+        Some(&Value::Concrete(ConcreteValue::String("minutes=2".into())))
+    );
+}
+
+#[test]
+fn deferred_integer_arithmetic_stays_typed_inside_interpolation_and_tracks_dependencies() {
+    let parsed = parse_and_resolve(
+        r#"
+        let source = test.clock {}
+        let plain = (source.seconds + 30) / 60
+        let text = "minutes=${(source.seconds + 30) / 60}"
+        "#,
+    )
+    .expect("resource Int arithmetic should remain deferred");
+
+    let plain = parsed.variables.get("plain").expect("plain binding");
+    assert!(matches!(
+        plain,
+        Value::Deferred(DeferredValue::IntegerArithmetic(_))
+    ));
+    assert_eq!(plain.root_bindings(), ["source".to_string()].into());
+
+    let Some(Value::Deferred(DeferredValue::Interpolation(parts))) = parsed.variables.get("text")
+    else {
+        panic!("deferred interpolation should retain its expression part");
+    };
+    assert!(parts.iter().any(|part| matches!(
+        part,
+        InterpolationPart::Expr(Value::Deferred(DeferredValue::IntegerArithmetic(_)))
+    )));
+}
+
+#[test]
+fn secret_integer_arithmetic_taints_plain_and_interpolated_results() {
+    let parsed = parse_and_resolve(
+        r#"
+        let plain = secret(125) / 60
+        let text = "minutes=${secret(125) / 60}"
+        "#,
+    )
+    .expect("secret Int arithmetic should evaluate without losing sensitivity");
+
+    assert_eq!(
+        parsed.variables.get("plain"),
+        Some(&Value::Deferred(DeferredValue::Secret(Box::new(
+            Value::Concrete(ConcreteValue::Int(2)),
+        ))))
+    );
+    assert_eq!(
+        parsed.variables.get("text"),
+        Some(&Value::Deferred(DeferredValue::Secret(Box::new(
+            Value::Concrete(ConcreteValue::String("minutes=2".into())),
+        ))))
+    );
+}
+
+#[test]
+fn integer_arithmetic_accepts_typed_function_and_module_operands() {
+    let function = parse_and_resolve(
+        r#"
+        fn plus_one(value: Int): Int {
+            value + 1
+        }
+        let result = plus_one(41)
+        "#,
+    )
+    .expect("a typed Int function parameter is a valid arithmetic operand");
+    assert_eq!(
+        function.variables.get("result"),
+        Some(&Value::Concrete(ConcreteValue::Int(42)))
+    );
+
+    let module = parse(
+        r#"
+        arguments {
+            count: Int
+        }
+        attributes {
+            doubled: Int = count * 2
+        }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a typed Int module argument is a valid deferred arithmetic operand");
+    assert!(matches!(
+        module.attribute_params[0].value,
+        Some(Value::Deferred(DeferredValue::IntegerArithmetic(_)))
+    ));
+}
+
+#[test]
+fn wait_predicates_reject_actual_integer_arithmetic_with_targeted_error() {
+    for predicate in [
+        "source.count + 1 == 2",
+        "(source.count + 1) == 2",
+        "source.count == (1 + 1)",
+    ] {
+        let source = r#"
+        let source = mock.test.Thing { name = 'source' }
+        let ready = wait source {
+            until = __PREDICATE__
+        }
+        "#
+        .replace("__PREDICATE__", predicate);
+        let error = parse(&source, &ProviderContext::default())
+            .expect_err("wait predicates deliberately remain narrow equality predicates");
+        assert!(
+            error
+                .to_string()
+                .contains("integer arithmetic is not supported in wait predicates"),
+            "predicate {predicate:?} produced an unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn structural_for_declarations_keep_pipe_and_postfix_behavior() {
+    let resource_pipe = parse(
+        r#"
+        fn f(value) { 7 }
+        let n = for x in [1] {
+            mock.test.Thing { value = x }
+        } |> f()
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("the resource binding should replace the pipe's computed value binding");
+    assert_eq!(resource_pipe.resources.len(), 1);
+    assert!(
+        !resource_pipe.variables.contains_key("n"),
+        "a resource pipe must not also leave `n` bound to the pipe result",
+    );
+    assert!(resource_pipe.structural_bindings.contains("n"));
+
+    let module_pipe = parse(
+        r#"
+        fn f(value) { 7 }
+        let n = for x in [1] {
+            child { value = x }
+        } |> f()
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a structural module-call for-expression should remain a valid pipe input");
+    assert_eq!(module_pipe.module_calls.len(), 1);
+    assert!(
+        !module_pipe.variables.contains_key("n"),
+        "a module-call pipe must not also leave `n` bound to the pipe result",
+    );
+    assert!(module_pipe.structural_bindings.contains("n"));
+
+    for body in ["mock.test.Thing { value = x }", "child { value = x }"] {
+        let postfix = parse(
+            &format!("let n = for x in [1] {{ {body} }}.value"),
+            &ProviderContext::default(),
+        )
+        .expect_err("postfix access on a structural for-expression is invalid");
+        assert!(
+            postfix
+                .to_string()
+                .contains("postfix access cannot be applied to a resource or module declaration"),
+            "body {body:?} produced an unexpected postfix diagnostic: {postfix}",
+        );
+
+        let arithmetic = parse(
+            &format!("let n = for x in [1] {{ {body} }} + 1"),
+            &ProviderContext::default(),
+        )
+        .expect_err("integer arithmetic on a structural for-expression is invalid");
+        assert!(
+            arithmetic.to_string().contains(
+                "integer arithmetic cannot be applied to a resource, module, data-source, or import declaration"
+            ),
+            "body {body:?} produced an unexpected arithmetic diagnostic: {arithmetic}",
+        );
+    }
+}
+
+#[test]
+fn structural_for_resource_pipe_is_not_exported_as_a_value() {
+    let error = parse(
+        r#"
+        fn f(value) { 7 }
+        let n = for x in [1] {
+            mock.test.Thing { value = x }
+        } |> f()
+        exports { out: Int = n }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("a resource and a computed pipe value cannot share one exported name");
+
+    assert!(
+        error
+            .to_string()
+            .contains("'n' is a resource, not a value; reference one of its attributes"),
+        "unexpected exported resource pipe diagnostic: {error}",
+    );
+}
+
+#[test]
+fn value_producing_for_body_is_a_syntax_error() {
+    let error = parse(
+        "mock.test.Thing { attr = for x in [1] { x } }",
+        &ProviderContext::default(),
+    )
+    .expect_err("for-expression bodies cannot produce ordinary values");
+    let is_syntax_error = match &error {
+        ParseError::Syntax(_) => true,
+        ParseError::Located { error, .. } => matches!(error.as_ref(), ParseError::Syntax(_)),
+        _ => false,
+    };
+    assert!(
+        is_syntax_error,
+        "value-producing for body must fail in the grammar, got: {error}",
+    );
+    assert!(
+        !error
+            .to_string()
+            .contains("structural ForExpr expression reached ordinary value lowering"),
+        "value-producing for body leaked into ordinary value lowering: {error}",
+    );
+}
+
+#[test]
+fn structural_declarations_are_parsed_before_pipe_application() {
+    for (source, binding, expected_module_calls, expected_upstreams) in [
+        (
+            r#"
+            fn f(value) { 1 }
+            let v = mymod { a = 1 } |> f()
+        "#,
+            "v",
+            1,
+            0,
+        ),
+        (
+            r#"
+            fn f(value) { 1 }
+            let u = upstream_state { source = "../x" } |> f()
+        "#,
+            "u",
+            0,
+            1,
+        ),
+    ] {
+        let parsed = parse(source, &ProviderContext::default())
+            .unwrap_or_else(|error| panic!("structural pipe should parse: {error}"));
+        assert!(
+            !parsed.variables.contains_key(binding),
+            "a structural declaration must not also retain its pipe result as a value",
+        );
+        assert_eq!(parsed.module_calls.len(), expected_module_calls);
+        assert_eq!(parsed.upstream_states.len(), expected_upstreams);
+    }
+}
+
+#[test]
+fn postfix_and_arithmetic_on_declarations_have_targeted_errors() {
+    let postfix = parse(
+        "let b = aws.s3.Bucket { name = 'b' }.arn",
+        &ProviderContext::default(),
+    )
+    .expect_err("postfix access on an inline resource declaration is invalid");
+    assert!(
+        postfix
+            .to_string()
+            .contains("postfix access cannot be applied to a resource or module declaration"),
+        "unexpected postfix diagnostic: {postfix}",
+    );
+
+    let arithmetic = parse(
+        "let n = for x in [1] { mock.test.Thing { value = x } } + 1",
+        &ProviderContext::default(),
+    )
+    .expect_err("integer arithmetic on a structural declaration is invalid");
+    assert!(
+        arithmetic.to_string().contains(
+            "integer arithmetic cannot be applied to a resource, module, data-source, or import declaration"
+        ),
+        "unexpected arithmetic diagnostic: {arithmetic}",
+    );
+}
+
+#[test]
+fn value_if_expressions_are_integer_operands_in_every_position() {
+    for expression in [
+        "if c { 1 } else { 2 } + 1",
+        "1 + if c { 1 } else { 2 }",
+        "(if c { 1 } else { 2 }) + 1",
+        "1 + (if c { 1 } else { 2 })",
+    ] {
+        let parsed = parse_and_resolve(&format!("let c = true\nlet x = {expression}"))
+            .unwrap_or_else(|error| panic!("let operand {expression:?} failed: {error}"));
+        assert_eq!(
+            parsed.variables.get("x"),
+            Some(&Value::Concrete(ConcreteValue::Int(2))),
+            "let operand: {expression}",
+        );
+
+        let parsed = parse_and_resolve(&format!(
+            "let c = true\nmock.test.Thing {{ n = {expression} }}"
+        ))
+        .unwrap_or_else(|error| panic!("attribute operand {expression:?} failed: {error}"));
+        assert_eq!(
+            parsed.resources[0].get_attr("n"),
+            Some(&Value::Concrete(ConcreteValue::Int(2))),
+            "attribute operand: {expression}",
+        );
+    }
+}
+
+#[test]
+fn declaration_if_expressions_are_rejected_as_integer_operands_everywhere() {
+    let declaration = "if c { mock.test.Child { n = 1 } } else { mock.test.Child { n = 2 } }";
+    let expected = "integer arithmetic cannot be applied to a resource, module, data-source, or import declaration";
+
+    for expression in [
+        format!("{declaration} + 1"),
+        format!("1 + {declaration}"),
+        format!("({declaration}) + 1"),
+        format!("1 + ({declaration})"),
+    ] {
+        for source in [
+            format!("let c = true\nlet x = {expression}"),
+            format!("let c = true\nmock.test.Thing {{ n = {expression} }}"),
+        ] {
+            let error = parse(&source, &ProviderContext::default())
+                .expect_err("a declaration-valued if cannot be an integer operand");
+            assert!(
+                error.to_string().contains(expected),
+                "expression {expression:?} produced an unexpected error: {error}",
+            );
+        }
+    }
+}
+
+#[test]
+fn let_rhs_coalesce_errors_keep_the_authored_line() {
+    let closure_error = parse(
+        "let source = mock.test.Thing {}\nlet a = source.value\nlet x = a ?? join(\",\")",
+        &ProviderContext::default(),
+    )
+    .expect_err("a closure cannot be a coalesce default value");
+    let ParseError::InvalidExpression { line, .. } = closure_error else {
+        panic!("expected an invalid-expression error, got: {closure_error}");
+    };
+    assert_eq!(line, 3);
+
+    let resource_error = parse(
+        "let first = 1\nlet second = 2\nlet b = mock.test.Thing {} ?? 1",
+        &ProviderContext::default(),
+    )
+    .expect_err("a resource declaration cannot be coalesced as a value");
+    let ParseError::InvalidExpression { line, message } = resource_error else {
+        panic!("expected an invalid-expression error, got: {resource_error}");
+    };
+    assert_eq!(line, 3);
+    assert!(message.contains("not a value"), "{message}");
+
+    let upstream_error = parse(
+        "let first = 1\nlet u = upstream_state { source = \"../x\" } ?? {}",
+        &ProviderContext::default(),
+    )
+    .expect_err("an upstream-state declaration cannot be coalesced as a value");
+    let ParseError::InvalidExpression { line, message } = upstream_error else {
+        panic!("expected an invalid-expression error, got: {upstream_error}");
+    };
+    assert_eq!(line, 2);
+    assert!(message.contains("not a value"), "{message}");
+}
+
+#[test]
+fn integer_arithmetic_in_a_for_body_resolves_after_its_deferred_iterable() {
+    let parsed = cross_deferred_for_resolution_seam(
+        parse(
+            r#"
+            let source = mock.test.Source {}
+            let children = for item in source.items {
+                mock.test.Target { count = item + 1 }
+            }
+            "#,
+            &ProviderContext::default(),
+        )
+        .expect("deferred iterable fixture parses"),
+    );
+    let template_count = parsed.deferred_for_expressions()[0]
+        .template_resource
+        .get_attr("count")
+        .expect("template count");
+    assert!(matches!(
+        template_count,
+        Value::Deferred(DeferredValue::IntegerArithmetic(_))
+    ));
+    let mut parsed = parsed
+        .into_expanded()
+        .expect("deferred arithmetic fixture crosses the placeholder boundary");
+
+    let mut bindings = ResolvedBindings::default();
+    bindings.set(
+        "source",
+        HashMap::from([(
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Int(41),
+            )])),
+        )]),
+        crate::binding_index::BindingValueSource::Local,
+    );
+    parsed
+        .expand_deferred_for_expressions(&bindings.project_iterable_bindings())
+        .expect("deferred loop expands");
+    assert_eq!(
+        parsed
+            .resources
+            .iter()
+            .find(|resource| resource.binding.as_deref() == Some("children[0]"))
+            .and_then(|resource| resource.get_attr("count")),
+        Some(&Value::Concrete(ConcreteValue::Int(42))),
+    );
+}
+
+fn cross_deferred_for_resolution_seam(parsed: ParsedFile) -> ModuleResolvedParsedFile {
+    crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+        .expect("deferred fixture crosses the module-resolution seam")
+}
+
 fn known(type_expr: TypeExpr) -> TypeExpr {
     type_expr
 }
@@ -186,18 +784,20 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
     template_resource
         .attributes
         .insert("name".to_string(), empty());
-    file.deferred_for_expressions.push(DeferredForExpression {
-        file: Some("loops.crn".to_string()),
-        line: 1,
-        header: "for item in pending.items".to_string(),
-        resource_type: "mock.test.resource".to_string(),
-        target: DeferredForTarget::Bound {
-            binding: "items".to_string(),
-        },
-        iterable: empty(),
-        binding: ForBinding::Simple("item".to_string()),
-        template_resource,
-    });
+    file.parsed_deferred_for_expressions_mut()
+        .push(ParsedDeferredForExpression {
+            file: Some("loops.crn".to_string()),
+            line: 1,
+            span: SourceSpan::dummy(),
+            header: "for item in pending.items".to_string(),
+            target: DeferredForTarget::Bound {
+                binding: "items".to_string(),
+            },
+            iterable: empty(),
+            iterable_state: ParsedDeferredForIterableState::Deferred,
+            binding: ForBinding::Simple("item".to_string()),
+            body: DeferredForBody::Resource(Box::new(template_resource)),
+        });
 
     let rendered = file
         .into_expanded()
@@ -260,20 +860,22 @@ fn expansion_boundary_checks_canonical_deferred_template_resource_attributes() {
         .attributes
         .insert("name".to_string(), empty_interpolation_placeholder());
     let mut file = ParsedFile::default();
-    file.deferred_for_expressions.push(DeferredForExpression {
-        file: Some("loops.crn".to_string()),
-        line: 1,
-        header: "for item in pending.items".to_string(),
-        resource_type: "mock.test.resource".to_string(),
-        target: DeferredForTarget::Bound {
-            binding: "items".to_string(),
-        },
-        iterable: Value::Deferred(DeferredValue::BindingRef {
-            binding: "pending.items".to_string(),
-        }),
-        binding: ForBinding::Simple("item".to_string()),
-        template_resource,
-    });
+    file.parsed_deferred_for_expressions_mut()
+        .push(ParsedDeferredForExpression {
+            file: Some("loops.crn".to_string()),
+            line: 1,
+            span: SourceSpan::dummy(),
+            header: "for item in pending.items".to_string(),
+            target: DeferredForTarget::Bound {
+                binding: "items".to_string(),
+            },
+            iterable: Value::Deferred(DeferredValue::BindingRef {
+                binding: "pending.items".to_string(),
+            }),
+            iterable_state: ParsedDeferredForIterableState::Deferred,
+            binding: ForBinding::Simple("item".to_string()),
+            body: DeferredForBody::Resource(Box::new(template_resource)),
+        });
 
     let rendered = file
         .validate_expansion_boundary(ParserPlaceholderBoundary::ExpandedFile)
@@ -349,7 +951,8 @@ fn iter_all_resources_yields_direct_then_deferred() {
             }
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed =
+        cross_deferred_for_resolution_seam(parse(src, &ProviderContext::default()).unwrap());
 
     let items: Vec<_> = parsed.iter_all_resources().collect();
     assert_eq!(items.len(), 2, "expected one direct + one deferred");
@@ -363,8 +966,34 @@ fn iter_all_resources_yields_direct_then_deferred() {
     );
 
     // The for-expression template body comes last as a Deferred arm.
-    assert!(matches!(items[1], ResourceRef::Deferred { .. }));
+    let ResourceRef::Deferred { resource, deferred } = items[1] else {
+        panic!("expected a resolved deferred resource, got {:?}", items[1]);
+    };
+    assert_eq!(resource.id, deferred.template_resource.id);
     assert!(matches!(items[1].context(), ResourceContext::Deferred(_)));
+}
+
+#[test]
+fn resolved_resource_iterator_is_phase_exhaustive() {
+    let resolved = cross_deferred_for_resolution_seam(ParsedFile::default());
+
+    let kinds = resolved
+        .iter_all_resources()
+        .map(|resource| match resource {
+            ResourceRef::Resource(resource) => resource.id.resource_type.as_str(),
+            ResourceRef::LiveComposition(composition) => composition.id.resource_type.as_str(),
+            ResourceRef::DataSource(data_source) => data_source.id.resource_type.as_str(),
+            ResourceRef::Deferred { resource, deferred } => {
+                assert_eq!(
+                    resource.id.resource_type,
+                    deferred.template_resource.id.resource_type
+                );
+                resource.id.resource_type.as_str()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    assert!(kinds.is_empty());
 }
 
 /// carina#3181: `iter_all_resources` yields each resource exactly once
@@ -5990,6 +6619,445 @@ fn parse_if_resource_ref_condition_errors() {
 }
 
 #[test]
+fn parse_if_module_argument_defers_value_selection() {
+    let parsed = parse(
+        r#"
+            arguments { flag: Bool }
+            let choice = if flag { "yes" } else { "no" }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a Bool module argument may select a value branch during expansion");
+    assert!(matches!(
+        parsed.variables.get("choice"),
+        Some(Value::Deferred(DeferredValue::ModuleIf(_)))
+    ));
+}
+
+#[test]
+fn parse_if_module_argument_defers_structural_selection() {
+    let parsed = parse(
+        r#"
+            arguments { flag: Bool }
+            let choice = if flag {
+                mock.test.Thing { name = "yes" }
+            } else {
+                mock.test.Thing { name = "no" }
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a Bool module argument may select a resource branch during expansion");
+    assert_eq!(parsed.deferred_module_ifs.len(), 1);
+    assert!(matches!(
+        parsed.deferred_module_ifs[0].then_branch(),
+        super::DeferredIfBody::Resource(_)
+    ));
+}
+
+#[test]
+fn parse_if_module_argument_defers_nested_value_carriers() {
+    let parsed = parse(
+        r#"
+            arguments { flag: Bool }
+
+            attributes {
+                selected: String = if flag { "yes" } else { "no" }
+            }
+
+            mock.test.Thing {
+                direct = if flag { "yes" } else { "no" }
+                nested = [
+                    { selected = if flag { "yes" } else { "no" } }
+                ]
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("deferred value conditionals may appear in every recursive value carrier");
+
+    assert!(matches!(
+        parsed.attribute_params[0].value,
+        Some(Value::Deferred(DeferredValue::ModuleIf(_)))
+    ));
+    assert!(matches!(
+        parsed.resources[0].get_attr("direct"),
+        Some(Value::Deferred(DeferredValue::ModuleIf(_)))
+    ));
+    let Some(Value::Concrete(ConcreteValue::List(items))) = parsed.resources[0].get_attr("nested")
+    else {
+        panic!("nested carrier was not parsed as a list")
+    };
+    let Value::Concrete(ConcreteValue::Map(item)) = &items[0] else {
+        panic!("nested carrier item was not parsed as a map")
+    };
+    assert!(matches!(
+        item.get("selected"),
+        Some(Value::Deferred(DeferredValue::ModuleIf(_)))
+    ));
+}
+
+#[test]
+fn parse_if_module_argument_through_pure_user_function_is_deferred() {
+    let parsed = parse(
+        r#"
+            arguments { flag: Bool }
+            fn identity(value: Bool): Bool { value }
+            let choice = if identity(flag) { "yes" } else { "no" }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a pure user function of a module argument remains module-dependent");
+    assert!(matches!(
+        parsed.variables.get("choice"),
+        Some(Value::Deferred(DeferredValue::ModuleIf(_)))
+    ));
+}
+
+#[test]
+fn parse_if_static_pure_function_with_handle_argument_keeps_head_behavior() {
+    let parsed = parse(
+        r#"
+            let source = mock.test.Thing { name = "source" }
+            fn always_true(value: mock.test.Thing): Bool { true }
+            let choice = if always_true(source) { "yes" } else { "no" }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("is_static_value-accepted handle arguments must remain valid in root conditions");
+
+    assert_eq!(
+        parsed.variables.get("choice"),
+        Some(&Value::Concrete(ConcreteValue::String("yes".into())))
+    );
+}
+
+#[test]
+fn parse_if_runtime_conditions_keep_static_parse_error() {
+    let cases = [
+        "if source.ready { \"yes\" } else { \"no\" }",
+        "if [source.ready][0] { \"yes\" } else { \"no\" }",
+        "if identity(source.ready) { \"yes\" } else { \"no\" }",
+    ];
+
+    for condition in cases {
+        let input = format!(
+            r#"
+                fn identity(value: Bool): Bool {{ value }}
+                let source = mock.test.Thing {{ name = "source" }}
+                let choice = {condition}
+            "#,
+        );
+        let error = parse(&input, &ProviderContext::default())
+            .expect_err("resource-dependent conditions must remain parse errors");
+        assert!(
+            error.to_string().contains(
+                "if condition depends on a runtime value; condition must be statically known at parse time"
+            ),
+            "runtime-condition wording changed for `{condition}`: {error}",
+        );
+    }
+}
+
+#[test]
+fn parse_if_user_function_body_with_runtime_reference_keeps_static_parse_error() {
+    let input = r#"
+        let source = mock.test.Thing { name = "source" }
+        fn selected(flag: Bool): Bool {
+            let ignored = flag
+            source.ready
+        }
+        arguments { flag: Bool }
+        let choice = if selected(flag) { "yes" } else { "no" }
+    "#;
+
+    let error = parse(input, &ProviderContext::default())
+        .expect_err("a runtime reference inside a function body must dominate its module argument");
+    assert!(
+        error.to_string().contains(
+            "if condition depends on a runtime value; condition must be statically known at parse time"
+        ),
+        "runtime-condition wording changed: {error}",
+    );
+}
+
+#[test]
+fn parse_if_runtime_condition_in_module_reports_condition_line() {
+    let source = r#"arguments { flag: Bool }
+let runtime = mock.test.Thing { name = "runtime" }
+let choice = if runtime.ready { "yes" } else { "no" }
+"#;
+
+    let error = super::parse_file(
+        source,
+        std::path::Path::new("module/main.crn"),
+        &ProviderContext::default(),
+    )
+    .expect_err("runtime conditions in module templates must still fail while parsing");
+
+    assert!(
+        matches!(
+            error,
+            super::ParseError::InvalidExpression { line: 3, ref message }
+                if message == "if condition depends on a runtime value; condition must be statically known at parse time"
+        ),
+        "unexpected module runtime-condition diagnostic: {error}",
+    );
+}
+
+#[test]
+fn parse_if_module_argument_value_without_else_is_rejected() {
+    let error = parse(
+        r#"
+            arguments { flag: Bool }
+            let choice = if flag { "yes" }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("value conditionals require an else branch");
+
+    assert!(
+        matches!(
+            error,
+            super::ParseError::InvalidExpression { line: 3, ref message }
+                if message == "an `if` that produces a value must have an `else` branch, because there is no value to use when the condition is false; add `else { <value> }`"
+        ),
+        "unexpected missing-else error: {error}",
+    );
+}
+
+#[test]
+fn parse_if_module_argument_resource_without_else_is_deferred() {
+    let parsed = parse(
+        r#"
+            arguments { flag: Bool }
+            let choice = if flag {
+                mock.test.Thing { name = "yes" }
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a false structural branch may contribute no resource");
+    assert_eq!(parsed.deferred_module_ifs.len(), 1);
+    assert!(parsed.deferred_module_ifs[0].else_branch().is_none());
+}
+
+#[test]
+fn parse_if_module_argument_rejects_mixed_value_and_structural_branches() {
+    let cases = [
+        (
+            r#"
+                arguments { flag: Bool }
+                let choice = if flag {
+                    mock.test.Thing { name = "yes" }
+                } else {
+                    "no"
+                }
+            "#,
+            "both branches of this `if` must be the same kind: the `then` branch declares resources/module calls but the `else` branch produces a value; make both branches values, or both branches resource/module declarations",
+        ),
+        (
+            r#"
+                arguments { flag: Bool }
+                let choice = if flag {
+                    "yes"
+                } else {
+                    mock.test.Thing { name = "no" }
+                }
+            "#,
+            "both branches of this `if` must be the same kind: the `then` branch produces a value but the `else` branch declares resources/module calls; make both branches values, or both branches resource/module declarations",
+        ),
+    ];
+
+    for (input, expected) in cases {
+        let error = parse(input, &ProviderContext::default())
+            .expect_err("a binding category cannot depend on a caller argument");
+        assert!(
+            matches!(
+                error,
+                super::ParseError::InvalidExpression { line: 3, ref message }
+                    if message == expected
+            ),
+            "unexpected mixed-branch error: {error}",
+        );
+    }
+}
+
+#[test]
+fn parse_if_static_value_without_else_is_rejected_in_statement_position() {
+    let expected = "an `if` that produces a value must have an `else` branch, because there is no value to use when the condition is false; add `else { <value> }`";
+    for condition in ["true", "false"] {
+        let input = format!("let choice = if {condition} {{ 'yes' }}\n");
+        let error = parse(&input, &ProviderContext::default())
+            .expect_err("statement-position value conditionals require an else branch");
+        assert!(
+            matches!(
+                error,
+                super::ParseError::InvalidExpression { line: 1, ref message }
+                    if message == expected
+            ),
+            "unexpected missing-else error for {condition}: {error}",
+        );
+    }
+}
+
+#[test]
+fn parse_if_static_rejects_mixed_value_and_structural_branches() {
+    let cases = [
+        (
+            r#"mock.test.Thing { name = "yes" }"#,
+            r#""no""#,
+            "both branches of this `if` must be the same kind: the `then` branch declares resources/module calls but the `else` branch produces a value; make both branches values, or both branches resource/module declarations",
+        ),
+        (
+            r#""yes""#,
+            r#"mock.test.Thing { name = "no" }"#,
+            "both branches of this `if` must be the same kind: the `then` branch produces a value but the `else` branch declares resources/module calls; make both branches values, or both branches resource/module declarations",
+        ),
+    ];
+    for condition in ["true", "false"] {
+        for (then_body, else_body, expected) in cases {
+            let input = format!(
+                r#"
+                    let choice = if {condition} {{
+                        {then_body}
+                    }} else {{
+                        {else_body}
+                    }}
+                "#,
+            );
+            let error = parse(&input, &ProviderContext::default())
+                .expect_err("a root binding category cannot depend on branch selection");
+            assert!(
+                matches!(
+                    error,
+                    super::ParseError::InvalidExpression { line: 2, ref message }
+                        if message == expected
+                ),
+                "unexpected mixed-branch error for {condition}: {error}",
+            );
+        }
+    }
+}
+
+#[test]
+fn parse_nested_structural_if_in_value_position_reports_the_structural_error() {
+    let expected = "resource expressions and module calls cannot be used in if value expressions; use a let binding instead";
+    let cases = [
+        (
+            "root",
+            r#"let nested = if true {
+  if true { mock.test.resource { name = "n" } }
+}
+"#,
+        ),
+        (
+            "module",
+            r#"arguments { flag: Bool }
+let nested = if flag {
+  if true { mock.test.resource { name = "n" } }
+}
+"#,
+        ),
+    ];
+
+    for (label, source) in cases {
+        let error = super::parse_file(
+            source,
+            std::path::Path::new("module/main.crn"),
+            &ProviderContext::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                super::ParseError::InvalidExpression { ref message, .. }
+                    if message == expected
+            ),
+            "{label} nested structural-if diagnostic was misleading: {error}",
+        );
+    }
+}
+
+#[test]
+fn parse_if_rejects_resource_producing_for_branches_for_static_conditions() {
+    let expected = "resource-producing `for` expressions cannot be used directly as `if` branches; condition the `for` iterable instead, for example `for item in (if flag { items } else { [] }) { ... }`";
+
+    for condition in ["true", "false"] {
+        let source = format!(
+            r#"let selected = if {condition} {{
+  for name in ["one", "two"] {{
+    mock.test.resource {{ name = name }}
+  }}
+}} else {{
+  mock.test.resource {{ name = "fallback" }}
+}}
+"#,
+        );
+        let error = parse(&source, &ProviderContext::default())
+            .expect_err("a resource-producing for cannot be an if branch");
+        assert!(
+            matches!(
+                error,
+                ParseError::InvalidExpression { line: 1, ref message }
+                    if message == expected
+            ),
+            "static `{condition}` reported the wrong diagnostic: {error}",
+        );
+        assert!(!error.to_string().contains("Internal parser error"));
+    }
+}
+
+#[test]
+fn parse_if_rejects_every_resource_producing_for_module_branch_shape() {
+    let expected = "resource-producing `for` expressions cannot be used directly as `if` branches; condition the `for` iterable instead, for example `for item in (if flag { items } else { [] }) { ... }`";
+    let cases = [
+        (
+            "for expressions in both branches",
+            r#"arguments { flag: Bool }
+let selected = if flag {
+  for name in ["then"] { mock.test.resource { name = name } }
+} else {
+  for name in ["else"] { mock.test.resource { name = name } }
+}
+"#,
+        ),
+        (
+            "a for expression paired with a resource",
+            r#"arguments { flag: Bool }
+let selected = if flag {
+  for name in ["then"] { mock.test.resource { name = name } }
+} else {
+  mock.test.resource { name = "else" }
+}
+"#,
+        ),
+        (
+            "a for expression without an else branch",
+            r#"arguments { flag: Bool }
+let selected = if flag {
+  for name in ["then"] { mock.test.resource { name = name } }
+}
+"#,
+        ),
+    ];
+
+    for (label, source) in cases {
+        let error = parse(source, &ProviderContext::default())
+            .expect_err("a resource-producing for cannot be an if branch");
+        assert!(
+            matches!(
+                error,
+                ParseError::InvalidExpression { line: 2, ref message }
+                    if message == expected
+            ),
+            "{label} reported the wrong diagnostic: {error}",
+        );
+        assert!(!error.to_string().contains("Internal parser error"));
+    }
+}
+
+#[test]
 fn parse_if_with_module_call() {
     let input = r#"
         let web = use { source = "modules/web" }
@@ -6078,21 +7146,21 @@ fn parse_if_else_value_expr_in_attribute_false() {
 }
 
 #[test]
-fn parse_if_value_expr_no_else_true() {
-    // When condition is true and no else, the value is used
+fn parse_if_value_expr_no_else_true_errors() {
+    // Value-producing conditionals always require an else branch (#1203),
+    // even when a literal condition would select the then branch eagerly.
     let input = r#"
         awscc.ec2.Vpc {
             cidr_block = if true { "10.0.0.0/16" }
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(result.resources.len(), 1);
-    assert_eq!(
-        result.resources[0].get_attr("cidr_block"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.0.0/16".into()
-        )))
+    let error = parse(input, &ProviderContext::default())
+        .expect_err("value if without else must be rejected")
+        .to_string();
+    assert!(
+        error.contains("an `if` that produces a value must have an `else` branch, because there is no value to use when the condition is false; add `else { <value> }`"),
+        "unexpected missing-else error: {error}"
     );
 }
 
@@ -6109,8 +7177,8 @@ fn parse_if_value_expr_no_else_false_errors() {
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("else"),
-        "Expected error about missing else clause, got: {}",
+        err.contains("an `if` that produces a value must have an `else` branch, because there is no value to use when the condition is false; add `else { <value> }`"),
+        "unexpected missing-else error: {}",
         err
     );
 }
@@ -6367,8 +7435,9 @@ fn unbound_if_read_requires_let() {
 
 #[test]
 fn deferred_unbound_target_round_trips() {
-    let parsed = parse(
-        r#"
+    let parsed = cross_deferred_for_resolution_seam(
+        parse(
+            r#"
         let orgs = upstream_state { source = "../orgs" }
         for account_id in orgs.accounts {
             awscc.sso.Assignment {
@@ -6376,11 +7445,12 @@ fn deferred_unbound_target_round_trips() {
             }
         }
     "#,
-        &ProviderContext::default(),
-    )
-    .unwrap();
+            &ProviderContext::default(),
+        )
+        .unwrap(),
+    );
 
-    let target = &parsed.deferred_for_expressions[0].target;
+    let target = &parsed.deferred_for_expressions()[0].target;
     assert!(matches!(target, DeferredForTarget::Unbound { .. }));
     let json = serde_json::to_string(target).unwrap();
     let decoded: DeferredForTarget = serde_json::from_str(&json).unwrap();
@@ -6527,10 +7597,12 @@ fn parse_top_level_for_uses_last_segment_of_dotted_iterable() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
     // Deferred (upstream_state not resolved), so no concrete resources
     // but the deferred target should retain _accounts only as migration provenance.
-    let DeferredForTarget::Unbound { template } = &result.deferred_for_expressions[0].target else {
+    let DeferredForTarget::Unbound { template } = &result.deferred_for_expressions()[0].target
+    else {
         panic!("top-level deferred loop must remain unbound")
     };
     assert_eq!(template.legacy_base().exact_state_name(), "_accounts");
@@ -6973,6 +8045,86 @@ fn parse_arguments_block_form_validation_block() {
         }
         other => panic!("Expected And, got {:?}", other),
     }
+}
+
+#[test]
+fn parse_require_and_argument_validation_integer_arithmetic() {
+    let input = r#"
+        arguments {
+            count: Int {
+                default = 4
+                validation {
+                    condition = count % 2 == 0
+                    error_message = "count must be even"
+                }
+            }
+        }
+        require count / 2 >= 1, "count must be at least two"
+    "#;
+    let result = parse(input, &ProviderContext::default()).unwrap();
+
+    let ValidateExpr::Compare { lhs, op, rhs } = &result.arguments[0].validations[0].condition
+    else {
+        panic!("argument validation must retain its comparison");
+    };
+    assert_eq!(*op, CompareOp::Eq);
+    assert_eq!(**rhs, ValidateExpr::Int(0));
+    assert!(matches!(
+        lhs.as_ref(),
+        ValidateExpr::IntegerArithmetic {
+            op: crate::integer_arithmetic::IntegerOp::Remainder,
+            ..
+        }
+    ));
+
+    let ValidateExpr::Compare { lhs, op, rhs } = &result.requires[0].condition else {
+        panic!("require must retain its comparison");
+    };
+    assert_eq!(*op, CompareOp::Gte);
+    assert_eq!(**rhs, ValidateExpr::Int(1));
+    assert!(matches!(
+        lhs.as_ref(),
+        ValidateExpr::IntegerArithmetic {
+            op: crate::integer_arithmetic::IntegerOp::Divide,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn validation_integer_operator_spans_use_original_lines_after_heredoc() {
+    let input = "let p = <<EOT\na\nb\nEOT\n\
+                 arguments {\n\
+                 count: Int {\n\
+                 validation {\n\
+                 condition = count + 1 > 0\n\
+                 }\n\
+                 }\n\
+                 }\n\
+                 require count / 2 >= 1, \"x\"\n";
+    let result = parse(input, &ProviderContext::default()).expect("fixture must parse");
+
+    let ValidateExpr::Compare { lhs, .. } = &result.arguments[0].validations[0].condition else {
+        panic!("validation must retain its comparison");
+    };
+    let ValidateExpr::IntegerArithmetic { operator_span, .. } = lhs.as_ref() else {
+        panic!("validation lhs must retain integer arithmetic");
+    };
+    assert_eq!(
+        (operator_span.line(), operator_span.column()),
+        (Some(8), Some(19))
+    );
+
+    let ValidateExpr::Compare { lhs, .. } = &result.requires[0].condition else {
+        panic!("require must retain its comparison");
+    };
+    let ValidateExpr::IntegerArithmetic { operator_span, .. } = lhs.as_ref() else {
+        panic!("require lhs must retain integer arithmetic");
+    };
+    assert_eq!(
+        (operator_span.line(), operator_span.column()),
+        (Some(12), Some(15))
+    );
 }
 
 #[test]
@@ -10371,10 +11523,10 @@ fn coalesced_resource_ref_for_iterable_is_deferred_as_a_complete_expression() {
     "#;
 
     let parsed = parse(input, &ProviderContext::default()).unwrap();
-    let [deferred] = parsed.deferred_for_expressions.as_slice() else {
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
         panic!(
             "coalesced unresolved iterable must produce one deferred for-expression: {:?}",
-            parsed.deferred_for_expressions
+            parsed.parsed_deferred_for_expressions()
         );
     };
     let Value::Deferred(DeferredValue::Coalesce { value, default }) = &deferred.iterable else {
@@ -10389,6 +11541,205 @@ fn coalesced_resource_ref_for_iterable_is_deferred_as_a_complete_expression() {
         default.as_ref(),
         &Value::Concrete(ConcreteValue::List(Vec::new())),
     );
+}
+
+#[test]
+fn deferred_for_parser_retains_every_typed_body_kind() {
+    let parsed = parse(
+        r#"let child = use { source = "./child" }
+let src = mock.test.resource { name = "src" }
+let resources = for x in src.list { mock.test.resource { name = x } }
+let reads = for x in src.list { read mock.iam.Roles { name_regex = x } }
+let calls = for x in src.list { child { item = x } }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("the parser must classify deferred bodies without rejecting them");
+
+    let bodies = &parsed.parsed_deferred_for_expressions();
+    assert_eq!(bodies.len(), 3);
+    assert!(matches!(bodies[0].body, DeferredForBody::Resource(_)));
+    assert!(matches!(bodies[1].body, DeferredForBody::Read(_)));
+    assert!(matches!(bodies[2].body, DeferredForBody::ModuleCall(_)));
+}
+
+#[test]
+fn iter_all_resources_yields_parser_side_deferred_resource_bodies_only() {
+    let parsed = parse(
+        r#"let child = use { source = "./child" }
+let src = mock.test.resource { name = "src" }
+let resources = for x in src.list { mock.test.resource { name = x } }
+let reads = for x in src.list { read mock.iam.Roles { name_regex = x } }
+let calls = for x in src.list { child { item = x } }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("the parser must retain all deferred body kinds");
+
+    let resources = parsed.iter_all_resources().collect::<Vec<_>>();
+    assert_eq!(
+        resources.len(),
+        2,
+        "the direct resource and parser-side deferred resource body must be yielded; \
+         read and module-call bodies must not be resources"
+    );
+    assert!(
+        resources
+            .iter()
+            .all(|resource| resource.id().resource_type == "test.resource")
+    );
+    assert!(matches!(resources[0], ResourceRef::Resource(_)));
+    let ResourceRef::Deferred { resource, deferred } = resources[1] else {
+        panic!(
+            "expected a parser-side deferred resource, got {:?}",
+            resources[1]
+        );
+    };
+    assert_eq!(resource.id.resource_type, "test.resource");
+    assert_eq!(deferred.header, "for x in src.list");
+    assert!(matches!(deferred.body, DeferredForBody::Resource(_)));
+    let ResourceContext::Deferred(context) = resources[1].context() else {
+        panic!("expected parser-side deferred context");
+    };
+    assert_eq!(context.header, "for x in src.list");
+}
+
+#[test]
+fn deferred_for_header_formats_multiline_iterable_without_comments() {
+    let parsed = parse(
+        r#"let src = mock.test.resource { name = "src" }
+let resources = for x in (
+  src.list
+  // fall back while the provider value is absent
+  ?? []
+) { mock.test.resource { name = x } }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("the multiline deferred iterable must parse");
+
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
+        panic!("expected one deferred loop")
+    };
+    assert_eq!(deferred.header, "for x in src.list ?? []");
+}
+
+#[test]
+fn deferred_for_header_uses_authored_module_if_iterable_expression() {
+    let parsed = parse(
+        r#"arguments {
+  flag: Bool
+  enabled: list(String)
+  disabled: list(String)
+}
+let names = if flag { enabled } else { disabled }
+let resources = for name in names {
+  mock.test.resource { name = name }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("a module-if iterable must remain a deferred for expression");
+
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
+        panic!("expected one deferred loop")
+    };
+    assert_eq!(deferred.header, "for name in names");
+    assert!(!deferred.header.contains("unresolved module argument"));
+}
+
+#[test]
+fn deferred_for_module_call_body_with_bare_unbound_iterable_records_finalization_error() {
+    let parsed = parse(
+        r#"let child = use { source = "./child" }
+let mod_items = for x in items { child { item = x } }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("body classification must retain the undefined iterable");
+
+    let errors = check_identifier_scope(&parsed);
+    assert!(matches!(
+        errors.as_slice(),
+        [ParseError::UndefinedDeferredIterable { name, .. }] if name == "items"
+    ));
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
+        panic!("expected one deferred loop")
+    };
+    assert!(matches!(
+        &deferred.iterable_state,
+        ParsedDeferredForIterableState::UndefinedIdentifier { name } if name == "items"
+    ));
+    assert!(matches!(
+        &deferred.body,
+        DeferredForBody::ModuleCall(call) if call.module_name == "child"
+    ));
+}
+
+#[test]
+fn deferred_for_read_body_with_bare_unbound_iterable_records_finalization_error() {
+    let parsed = parse(
+        r#"let read_items = for x in items {
+  read mock.iam.Roles { name_regex = x }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("body classification must retain the undefined iterable");
+
+    let errors = check_identifier_scope(&parsed);
+    assert!(matches!(
+        errors.as_slice(),
+        [ParseError::UndefinedDeferredIterable { name, .. }] if name == "items"
+    ));
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
+        panic!("expected one deferred loop")
+    };
+    assert!(matches!(
+        &deferred.iterable_state,
+        ParsedDeferredForIterableState::UndefinedIdentifier { name } if name == "items"
+    ));
+    assert!(matches!(
+        &deferred.body,
+        DeferredForBody::Read(data_source)
+            if data_source.id.resource_type == "iam.Roles"
+    ));
+}
+
+#[test]
+fn deferred_for_resource_body_propagates_reserved_attribute_error() {
+    let error = parse(
+        r#"let src = mock.test.resource { name = "src" }
+let items = for x in src.list {
+  mock.test.resource {
+    name = x
+    "_invalid" = x
+  }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect_err("a genuine parser error in a deferred resource body must be preserved");
+
+    let ParseError::DeferredForBodyTemplate {
+        line,
+        header,
+        error,
+        ..
+    } = error
+    else {
+        panic!("expected deferred body template error")
+    };
+    assert_eq!(line, 2);
+    assert_eq!(header, "for x in src.list");
+    assert!(matches!(
+        error.as_ref(),
+        ParseError::ReservedResourceAttribute {
+            attribute,
+            line: 5,
+            ..
+        } if attribute == "_invalid"
+    ));
 }
 
 #[test]
@@ -10510,7 +11861,7 @@ fn expand_deferred_for_with_remote_bindings() {
     "#;
 
     let parsed = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     assert_eq!(parsed.resources.len(), 0, "no resources before expansion"); // allow: direct — fixture test inspection
     let mut parsed = parsed
         .into_expanded()
@@ -10535,7 +11886,7 @@ fn expand_deferred_for_with_remote_bindings() {
 
     // Deferred should be resolved
     assert_eq!(
-        parsed.deferred_for_expressions.len(),
+        parsed.deferred_for_expressions().len(),
         0,
         "deferred should be empty after expansion"
     );
@@ -10589,7 +11940,7 @@ fn expand_deferred_for_no_remote_data_stays_deferred() {
     "#;
 
     let parsed = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     let mut parsed = parsed
         .into_expanded()
         .expect("deferred template must contain no parser placeholders");
@@ -10602,7 +11953,7 @@ fn expand_deferred_for_no_remote_data_stays_deferred() {
 
     // Should remain deferred
     assert_eq!(
-        parsed.deferred_for_expressions.len(),
+        parsed.deferred_for_expressions().len(),
         1,
         "should stay deferred when remote data not available"
     );
@@ -10627,7 +11978,7 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
     "#;
 
     let parsed = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     let mut parsed = parsed
         .into_expanded()
         .expect("deferred template must contain no parser placeholders");
@@ -10653,7 +12004,7 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
         .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
         .unwrap();
 
-    assert_eq!(parsed.deferred_for_expressions.len(), 0);
+    assert_eq!(parsed.deferred_for_expressions().len(), 0);
     assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
 
     // Verify both key and value are substituted.
@@ -10698,7 +12049,7 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
     "#;
 
     let parsed = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     let mut parsed = parsed
         .into_expanded()
         .expect("deferred template must contain no parser placeholders");
@@ -10771,7 +12122,7 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
     "#;
 
     let parsed = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 3);
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 3);
     let mut parsed = parsed
         .into_expanded()
         .expect("deferred templates must contain no parser placeholders");
@@ -10799,7 +12150,7 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
         .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
         .unwrap();
 
-    assert_eq!(parsed.deferred_for_expressions.len(), 0);
+    assert_eq!(parsed.deferred_for_expressions().len(), 0);
     assert_eq!(parsed.resources.len(), 3); // allow: direct — fixture test inspection
     for resource in &parsed.resources {
         assert!(
@@ -10830,7 +12181,7 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
     "#;
 
     let parsed = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     let mut parsed = parsed
         .into_expanded()
         .expect("deferred template must contain no parser placeholders");
@@ -10856,7 +12207,7 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
             remote_bindings.clone(),
         ))
         .unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 0);
+    assert_eq!(parsed.deferred_for_expressions().len(), 0);
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
     let bindings = ResolvedBindings::pre_data_source_read_live(LivePreDataSourceReadInputs {
@@ -10897,7 +12248,7 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
     "#;
 
     let parsed = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     let mut parsed = parsed
         .into_expanded()
         .expect("deferred template must contain no parser placeholders");
@@ -10988,7 +12339,7 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
         0,
         "simple binding with map iterable should not silently expand"
     );
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
     assert!(
         parsed
             .warnings
@@ -11042,7 +12393,7 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
         "map binding with list iterable should not silently expand"
     );
     assert_eq!(
-        parsed.deferred_for_expressions.len(),
+        parsed.deferred_for_expressions().len(),
         1,
         "should remain deferred on shape mismatch"
     );
@@ -11295,10 +12646,9 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
     // `iterable is string "org" (expected map)`, calling the identifier
     // a string and leaving the user with no did-you-mean.
     //
-    // The fix records these as `DeferredForExpression` so
-    // `check_identifier_scope` validates them against the merged
-    // directory-wide binding set (mirrors the dotted-form path). That
-    // gives us cross-file visibility for the did-you-mean candidates.
+    // The parser records these as an explicitly undefined iterable so both
+    // static scope validation and final module resolution read the same typed
+    // error source.
     let input = r#"
         let orgs = upstream_state { source = "../a" }
         for _, id in org {
@@ -11310,12 +12660,21 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
     let parsed = parse(input, &ProviderContext::default())
         .expect("single-file parse must not reject bare-iterable identifiers; the cross-file check runs later");
     let errs = check_identifier_scope(&parsed);
-    assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
-    let err = &errs[0];
+    assert!(matches!(
+        errs.as_slice(),
+        [ParseError::UndefinedDeferredIterable { name, .. }] if name == "org"
+    ));
+    let err =
+        crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+            .expect_err("finalization must reject the bare undefined iterable");
+    let crate::module_resolver::ModuleError::Parse(parse_error) = err.root_cause() else {
+        panic!("expected a typed parse error, got {err:?}");
+    };
+    let err = parse_error;
     let msg = err.to_string();
     assert!(
-        matches!(err, ParseError::UndefinedIdentifier { .. }),
-        "expected UndefinedIdentifier, got: {err:?}"
+        matches!(err, ParseError::UndefinedDeferredIterable { .. }),
+        "expected UndefinedDeferredIterable, got: {err:?}"
     );
     assert!(
         msg.contains("`org`"),
@@ -12363,9 +13722,9 @@ fn parse_directory_preserves_module_arg_dotted_string_literal() {
     )
     .unwrap();
 
-    let mut parsed = parse_directory(tmp.path(), &ProviderContext::default())
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
         .expect("directory fixture must parse");
-    resolve_modules(&mut parsed, tmp.path()).expect("module expansion must succeed");
+    let parsed = resolve_modules(parsed, tmp.path()).expect("module expansion must succeed");
     let record = parsed
         .resources
         .iter()
@@ -13538,11 +14897,13 @@ fn extract_directives_depends_on_in_for_loop_resource() {
         }
     "#;
     let parsed = parse(src, &ProviderContext::default()).unwrap();
-    let template = &parsed
-        .deferred_for_expressions
+    let deferred = parsed
+        .parsed_deferred_for_expressions()
         .first()
-        .expect("for expression present")
-        .template_resource;
+        .expect("for expression present");
+    let DeferredForBody::Resource(template) = &deferred.body else {
+        panic!("deferred fixture body must be a resource")
+    };
     assert_eq!(
         template.directives.depends_on,
         vec!["role".to_string()],
@@ -15567,6 +16928,51 @@ fn sibling_structural_handle_is_pending_after_directory_kind_resolution() {
 }
 
 #[test]
+fn integer_arithmetic_rejects_a_structural_handle_from_a_sibling_file_in_both_positions() {
+    use crate::config_loader::parse_directory;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("sibling.crn"),
+        "let b = mock.test.Thing { name = \"source\" }\n",
+    )
+    .unwrap();
+
+    for expression in ["a + b", "b + a"] {
+        std::fs::write(
+            directory.path().join("main.crn"),
+            format!("let a = 1\nlet n = {expression}\n"),
+        )
+        .unwrap();
+
+        let error = parse_directory(directory.path(), &ProviderContext::default())
+            .expect_err("a resource handle cannot be an arithmetic operand");
+        assert!(
+            error.contains("'b' is a resource, not a value"),
+            "expression {expression:?} produced an unexpected diagnostic: {error}"
+        );
+    }
+}
+
+#[test]
+fn integer_arithmetic_retains_provisional_metadata_for_both_operands() {
+    let parsed = parse_with_seeded_bindings(
+        "let n = a + b\n",
+        &ProviderContext::default(),
+        &[BindingSeed::provisional("a"), BindingSeed::provisional("b")],
+    )
+    .expect("provisional operands remain pending until directory kind resolution");
+
+    assert!(matches!(
+        parsed
+            .parser_binding_metadata
+            .value_structural_handles("n"),
+        Some(crate::eval_value::StructuralHandleMetadata::ExpressionOperands(operands))
+            if operands.len() == 2
+    ));
+}
+
+#[test]
 fn forward_value_binding_remains_a_value() {
     use crate::config_loader::parse_directory;
 
@@ -15953,11 +17359,8 @@ mod loop_var_field_access_matrix {
 
     fn first_name(src: &str) -> Value<ParserPlaceholder> {
         let p = parse(src, &ProviderContext::default()).expect("parse");
-        assert_eq!(
-            p.deferred_for_expressions.len(),
-            0,
-            "inline-list loop must fully expand at parse time"
-        );
+        // Raw parser output cannot expose finalized deferred loops; the
+        // concrete resource below proves this inline list expanded eagerly.
         p.resources
             .first()
             .expect("one resource")
@@ -16031,14 +17434,18 @@ mod loop_var_field_access_matrix {
             }
         "#;
         let p = parse(src, &ProviderContext::default()).expect("parse");
-        assert_eq!(p.deferred_for_expressions.len(), 1, "loop deferred");
+        assert_eq!(
+            p.parsed_deferred_for_expressions().len(),
+            1,
+            "loop deferred"
+        );
         let mut p = p
             .into_expanded()
             .expect("deferred template must contain no parser placeholders");
         // The template body must carry the deferred postfix operation, not a
         // resource ResourceRef (which would never resolve for a loop var) and
         // not a bare loop slot (which would lose the `.k`).
-        let tmpl = &p.deferred_for_expressions[0].template_resource;
+        let tmpl = &p.deferred_for_expressions()[0].template_resource;
         assert!(
             matches!(
                 tmpl.get_attr("name"),
@@ -16074,7 +17481,7 @@ mod loop_var_field_access_matrix {
         p.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote))
             .unwrap();
 
-        assert_eq!(p.deferred_for_expressions.len(), 0, "loop expanded");
+        assert_eq!(p.deferred_for_expressions().len(), 0, "loop expanded");
         assert_eq!(
             p.resources.first().expect("one resource").get_attr("name"),
             Some(&Value::Concrete(ConcreteValue::String("resolved".into()))),
@@ -16110,13 +17517,13 @@ mod loop_var_field_access_matrix {
             }
         "#;
         let parsed = parse(source, &ProviderContext::default()).expect("parse deferred loops");
-        assert_eq!(parsed.deferred_for_expressions.len(), 2);
+        assert_eq!(parsed.parsed_deferred_for_expressions().len(), 2);
 
-        for deferred in &parsed.deferred_for_expressions {
-            let name = deferred
-                .template_resource
-                .get_attr("name")
-                .expect("template name");
+        for deferred in parsed.parsed_deferred_for_expressions() {
+            let DeferredForBody::Resource(template_resource) = &deferred.body else {
+                panic!("deferred fixture body must be a resource")
+            };
+            let name = template_resource.get_attr("name").expect("template name");
             assert!(
                 matches!(
                     access_root(name),
@@ -16153,7 +17560,7 @@ mod loop_var_field_access_matrix {
         remote.insert("up".to_string(), up);
 
         let mut expanded = parsed.into_expanded().expect("cross expansion boundary");
-        for deferred in &expanded.deferred_for_expressions {
+        for deferred in expanded.deferred_for_expressions() {
             let root = loop_access_root(
                 deferred
                     .template_resource

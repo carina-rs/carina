@@ -8,7 +8,7 @@ use carina_core::config_loader::{
     find_crn_files_in_dir, get_base_dir, load_configuration_with_config,
 };
 use carina_core::lint::find_duplicate_attrs;
-use carina_core::parser::{File, ProviderContext, ResourceRef, UpstreamState};
+use carina_core::parser::{ProviderContext, ResourceRef, UpstreamState};
 use carina_core::resource::ResourceId;
 
 use crate::error::AppError;
@@ -62,20 +62,14 @@ pub fn validate_with_factories(
         Ok(l) => l,
         Err(e) => return vec![e.to_string()],
     };
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::for_test(factories, &parsed.providers);
 
     let mut error_reports: Vec<String> = Vec::new();
     error_reports.extend(
-        loaded
-            .identifier_scope_errors
-            .iter()
-            .map(ToString::to_string),
-    );
-    error_reports.extend(
         super::validate_and_resolve_errors(
-            &mut parsed,
+            &parsed,
             base_dir,
             &providers,
             false,
@@ -111,20 +105,17 @@ pub fn validated_resource_ids_with_factories(
         Ok(l) => l,
         Err(e) => panic!("fixture failed to load: {e}"),
     };
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::for_test(factories, &parsed.providers);
 
-    // Run the same resolve/validate pass as the CLI so the parsed tree
-    // (and its `deferred_for_expressions`) is in the post-validation
-    // state the display path observes.
-    let _ = super::validate_and_resolve_errors(
-        &mut parsed,
-        base_dir,
-        &providers,
-        false,
-        &loaded.duplicate_declarations,
-    );
+    // This adapter exercises only the resource-enumeration half of validate.
+    // Keep the identical module/name-resolution seam, but do not reject a
+    // fixture before enumeration for an unrelated provider-schema diagnostic.
+    let parsed = providers
+        .validation_report(&parsed, base_dir, true, &loaded.duplicate_declarations)
+        .into_result()
+        .unwrap_or_else(|errors| panic!("fixture failed validation: {:?}", errors.as_slice()));
 
     validated_entries(&parsed)
         .iter()
@@ -156,7 +147,7 @@ enum ValidatedEntry<'a> {
     /// `header` alone are identical for `for _, opt in cert.dvo { … }`
     /// repeated twice).
     DeferredLoop {
-        resource_type: &'a str,
+        resource_type: String,
         target: &'a carina_core::parser::DeferredForTarget,
         header: &'a str,
         file: Option<&'a str>,
@@ -203,7 +194,7 @@ impl std::fmt::Display for ValidatedEntry<'_> {
 }
 
 /// The resources `validate` enumerates, derived from
-/// [`File::iter_all_resources`] so it stays in sync with every other
+/// [`carina_core::parser::File::iter_all_resources`] so it stays in sync with every other
 /// resource-walking checker (the unified-walk invariant from
 /// `notes/specs/2026-04-19-unify-resource-walk-design.md`).
 ///
@@ -212,7 +203,9 @@ impl std::fmt::Display for ValidatedEntry<'_> {
 /// at their own boundary, so a deferred placeholder is structurally
 /// distinct from a resolved id rather than a string that happens to
 /// contain `[?]`.
-fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
+fn validated_entries<E>(
+    parsed: &carina_core::parser::ModuleResolvedFile<E>,
+) -> Vec<ValidatedEntry<'_>> {
     parsed
         .iter_all_resources()
         // Every call now has a composition so its typed boundary survives
@@ -226,8 +219,11 @@ fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
             )
         })
         .map(|rref| match rref {
-            ResourceRef::Deferred { deferred: d, .. } => ValidatedEntry::DeferredLoop {
-                resource_type: &d.resource_type,
+            ResourceRef::Deferred {
+                resource: _resource,
+                deferred: d,
+            } => ValidatedEntry::DeferredLoop {
+                resource_type: d.resource_type.clone(),
                 target: &d.target,
                 header: &d.header,
                 file: d.file.as_deref(),
@@ -235,8 +231,10 @@ fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
             },
             // Managed / Virtual / DataSource — all direct, classified
             // by whether the id has a resolved identity.
-            other => {
-                let id = other.id();
+            ResourceRef::Resource(_)
+            | ResourceRef::LiveComposition(_)
+            | ResourceRef::DataSource(_) => {
+                let id = rref.id();
                 if id.identity_str().is_some() {
                     ValidatedEntry::Resolved(id)
                 } else {
@@ -258,7 +256,7 @@ pub fn run_validate(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
 
@@ -266,12 +264,6 @@ pub fn run_validate(
     // them all in one pass instead of fixing one, re-running, and
     // finding the next. See #2102 / #2105.
     let mut error_reports: Vec<String> = Vec::new();
-    error_reports.extend(
-        loaded
-            .identifier_scope_errors
-            .iter()
-            .map(ToString::to_string),
-    );
     if let Err(AppError::Validation(msg)) =
         check_upstream_state_sources(base_dir, &parsed.upstream_states)
     {
@@ -289,14 +281,23 @@ pub fn run_validate(
         ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
     error_reports.extend(provider_load_error.iter().map(ToString::to_string));
     let validation_report =
-        providers.validation_report(&mut parsed, base_dir, false, &loaded.duplicate_declarations);
-    parsed.print_warnings_from(printed_warning_count);
-    error_reports.extend(
-        validation_report
-            .errors()
-            .iter()
-            .map(|error| crate::error::format_error_with_source_chain(error)),
-    );
+        providers.validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations);
+    let (validation_result, schemas) = validation_report.into_parts();
+    let parsed = match validation_result {
+        Ok(parsed) => {
+            parsed.print_warnings_from(printed_warning_count);
+            parsed
+        }
+        Err(errors) => {
+            error_reports.extend(
+                errors
+                    .as_slice()
+                    .iter()
+                    .map(|error| crate::error::format_error_with_source_chain(error)),
+            );
+            return Err(AppError::Validation(error_reports.join("\n")));
+        }
+    };
 
     if !error_reports.is_empty() {
         return Err(AppError::Validation(error_reports.join("\n")));
@@ -305,7 +306,7 @@ pub fn run_validate(
     // Check for unused let bindings (warnings, not errors)
     let unused_warnings = carina_core::validation::check_unused_bindings_with_identity_requirements(
         &loaded.authored_bindings,
-        validation_report.schemas(),
+        schemas,
     );
 
     // Check for duplicate attribute keys
@@ -427,6 +428,32 @@ fn check_upstream_state_sources(
 mod tests {
     use super::*;
 
+    fn unknown_provider_instance_fixture() -> tempfile::TempDir {
+        let fixture = tempfile::tempdir().expect("provider-routing fixture");
+        std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+            .expect("write provider declaration");
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            r#"mock.test.resource {
+  name = "example"
+  directives { provider = typo }
+}
+"#,
+        )
+        .expect("write routed resource");
+        fixture
+    }
+
+    fn resolve_file_for_test(
+        parsed: carina_core::parser::ParsedFile,
+    ) -> carina_core::parser::ModuleResolvedParsedFile {
+        carina_core::module_resolver::resolve_modules_providerless(
+            parsed,
+            std::path::Path::new("."),
+        )
+        .expect("test fixture crosses module resolution")
+    }
+
     #[test]
     fn multi_file_empty_interpolations_report_each_site_with_context() {
         let fixture = tempfile::tempdir().expect("fixture");
@@ -510,6 +537,158 @@ backend s3 {
     }
 
     #[test]
+    fn validate_reports_multifile_unknown_provider_instance_once() {
+        let fixture = unknown_provider_instance_fixture();
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let routing_error = "`typo` is not a known provider instance";
+        let occurrences = errors
+            .iter()
+            .map(|error| error.matches(routing_error).count())
+            .sum::<usize>();
+
+        assert_eq!(
+            occurrences, 1,
+            "validate must report the routing error exactly once: {errors:#?}",
+        );
+    }
+
+    #[test]
+    fn plan_validation_reports_multifile_unknown_provider_instance_once() {
+        let fixture = unknown_provider_instance_fixture();
+        let loaded = load_configuration_with_config(
+            fixture.path(),
+            &ProviderContext::default(),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .expect("load provider-routing fixture");
+        let providers = ProviderLoad::for_test(Vec::new(), &loaded.parsed.providers);
+
+        let error = match providers.validate_config_pair(
+            loaded.parsed,
+            loaded.unresolved_parsed,
+            fixture.path(),
+            false,
+            &loaded.duplicate_declarations,
+        ) {
+            Ok(_) => panic!("plan validation must reject the unknown provider instance"),
+            Err(error) => error,
+        };
+        let rendered = error.to_string();
+        let routing_error = "`typo` is not a known provider instance";
+
+        assert_eq!(
+            rendered.matches(routing_error).count(),
+            1,
+            "plan validation must report the routing error exactly once: {rendered}",
+        );
+    }
+
+    #[test]
+    fn validate_pipeline_reports_multifile_undefined_iterable_reference() {
+        let fixture = tempfile::tempdir().expect("undefined iterable fixture");
+        std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+            .expect("write provider declaration");
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            r#"for name, account_id in does_not_exist.accounts {
+  mock.test.resource {
+    name = name
+  }
+}
+"#,
+        )
+        .expect("write undefined iterable fixture");
+
+        let loaded = load_configuration_with_config(
+            fixture.path(),
+            &ProviderContext::default(),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .expect("load merged undefined iterable fixture");
+        let scope_errors = carina_core::parser::check_identifier_scope(&loaded.parsed);
+        assert_eq!(
+            scope_errors.len(),
+            1,
+            "the merged parse must contain exactly one scope error: {scope_errors:#?}",
+        );
+        match &scope_errors[0] {
+            carina_core::parser::ParseError::UndefinedIdentifier { name, .. } => {
+                assert_eq!(name, "does_not_exist");
+            }
+            other => panic!("unexpected scope error: {other}"),
+        }
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let occurrences = errors
+            .iter()
+            .filter(|error| error.contains("Undefined identifier `does_not_exist`"))
+            .count();
+
+        assert_eq!(
+            occurrences, 1,
+            "the owning validation pipeline must report the scope error once: {errors:#?}",
+        );
+    }
+
+    #[test]
+    fn validate_pipeline_accepts_cross_file_resource_reference_scope() {
+        let fixture = tempfile::tempdir().expect("cross-file reference fixture");
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            r#"provider mock {}
+let attach = mock.test.resource {
+  name = caller.name
+}
+"#,
+        )
+        .expect("write reference consumer");
+        std::fs::write(
+            fixture.path().join("bindings.crn"),
+            "let caller = mock.test.resource { name = 'caller' }\n",
+        )
+        .expect("write reference producer");
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+
+        assert!(
+            errors
+                .iter()
+                .all(|error| !error.contains("Undefined identifier `caller`")),
+            "cross-file binding must be in scope in the owning pipeline: {errors:#?}",
+        );
+    }
+
+    #[test]
+    fn validate_pipeline_accepts_cross_file_data_source_reference_scope() {
+        let fixture = tempfile::tempdir().expect("cross-file data-source reference fixture");
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            r#"provider mock {}
+let observed_names = roles.names
+"#,
+        )
+        .expect("write data-source reference consumer");
+        std::fs::write(
+            fixture.path().join("bindings.crn"),
+            r#"let roles = read mock.iam.Roles {
+  name_regex = ".*"
+}
+"#,
+        )
+        .expect("write data-source reference producer");
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+
+        assert!(
+            errors
+                .iter()
+                .all(|error| !error.contains("Undefined identifier `roles`")),
+            "cross-file data-source binding must be in scope in the owning pipeline: {errors:#?}",
+        );
+    }
+
+    #[test]
     fn test_validate_output_serialization() {
         let output = ValidateOutput {
             status: "ok",
@@ -527,6 +706,123 @@ backend s3 {
         assert_eq!(parsed["resources"].as_array().unwrap().len(), 2);
         // warnings should be omitted when empty
         assert!(parsed.get("warnings").is_none());
+    }
+
+    #[test]
+    fn root_undefined_deferred_iterable_is_reported_exactly_once() {
+        let fixture = tempfile::tempdir().expect("undefined iterable fixture");
+        let child = fixture.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(
+            child.join("main.crn"),
+            "arguments { item: String }\nattributes { value = item }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            "let child = use { source = './child' }\n\
+             let calls = for item in itmes { child { item = item } }\n",
+        )
+        .unwrap();
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+
+        assert_eq!(errors.len(), 1, "unexpected validation errors: {errors:#?}");
+        assert!(errors[0].contains("Undefined identifier `itmes`"));
+        assert!(!errors[0].contains("cannot use module call"));
+    }
+
+    #[test]
+    fn root_undefined_deferred_iterable_is_collected_with_pre_expansion_error() {
+        let fixture = tempfile::tempdir().expect("combined validation fixture");
+        let child = fixture.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(
+            child.join("main.crn"),
+            "arguments { item: String }\nattributes { value = item }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            "backend s3 { bucket = 'state' key = 'state.json' region = true }\n\
+             let child = use { source = './child' }\n\
+             let calls = for item in itmes { child { item = item } }\n",
+        )
+        .unwrap();
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let rendered = errors.join("\n");
+
+        assert!(
+            rendered.contains("Invalid attribute 'region' for backend type 's3'"),
+            "unrelated pre-expansion error is missing: {errors:#?}",
+        );
+        assert!(
+            rendered.contains("Undefined identifier `itmes`"),
+            "undefined deferred iterable was lost behind the early return: {errors:#?}",
+        );
+    }
+
+    #[test]
+    fn module_internal_undefined_iterable_in_module_call_body_is_rejected() {
+        let fixture = tempfile::tempdir().expect("module undefined iterable fixture");
+        let child = fixture.path().join("child");
+        let parent = fixture.path().join("parent");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(
+            child.join("main.crn"),
+            "arguments { item: String }\nattributes { value = item }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            parent.join("main.crn"),
+            "let child = use { source = '../child' }\n\
+             let items = ['one']\n\
+             let calls = for item in itmes { child { item = item } }\n\
+             attributes { value = 'parent' }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            "let parent = use { source = './parent' }\nparent {}\n",
+        )
+        .unwrap();
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+
+        assert_eq!(errors.len(), 1, "unexpected validation errors: {errors:#?}");
+        assert!(errors[0].contains("Undefined identifier `itmes`"));
+        assert!(errors[0].contains("parent/main.crn"));
+        assert!(errors[0].contains("module call in main.crn at line 2"));
+    }
+
+    #[test]
+    fn module_internal_undefined_iterable_in_managed_resource_body_is_rejected() {
+        let fixture = tempfile::tempdir().expect("managed body undefined iterable fixture");
+        let parent = fixture.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(
+            parent.join("main.crn"),
+            "let items = ['one']\n\
+             let resources = for item in itmes {\n\
+               mock.test.resource { name = item }\n\
+             }\n\
+             attributes { value = 'parent' }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            "let parent = use { source = './parent' }\nparent {}\n",
+        )
+        .unwrap();
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+
+        assert_eq!(errors.len(), 1, "unexpected validation errors: {errors:#?}");
+        assert!(errors[0].contains("Undefined identifier `itmes`"));
+        assert!(errors[0].contains("parent/main.crn"));
+        assert!(errors[0].contains("line 2"));
     }
 
     /// carina#3121 fix A: the `--json` output must enumerate a `for`
@@ -562,10 +858,15 @@ backend s3 {
             &ProviderContext::default(),
         )
         .expect("fixture parses");
-        // The loop is deferred (iterable is a same-config provider-read
-        // attribute), so it is not in `parsed.resources` but is in
-        // `deferred_for_expressions` — exactly the carina#3121 shape.
-        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+        let parsed = carina_core::module_resolver::resolve_modules_providerless(
+            parsed,
+            std::path::Path::new("."),
+        )
+        .expect("cross the deferred-body resolution seam");
+        // After the resolution seam the same-config provider-read loop is not
+        // in `parsed.resources`; its resource-only template is ready for the
+        // validate display path in `deferred_for_expressions`.
+        assert_eq!(parsed.deferred_for_expressions().len(), 1);
 
         let entries = validated_entries(&parsed);
         let output = ValidateOutput {
@@ -612,6 +913,7 @@ backend s3 {
         let mut res = Resource::pending("s3.Bucket");
         res.id.provider = "aws".to_string();
         parsed.resources.push(res); // allow: direct — fixture test inspection
+        let parsed = resolve_file_for_test(parsed);
 
         let entries = validated_entries(&parsed);
         assert_eq!(entries.len(), 1);
@@ -656,6 +958,7 @@ backend s3 {
         parsed
             .compositions
             .push(composition("example_deadbeefdeadbeef", None));
+        let parsed = resolve_file_for_test(parsed);
 
         let rendered: Vec<_> = validated_entries(&parsed)
             .into_iter()

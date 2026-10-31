@@ -2687,6 +2687,13 @@ mod tests {
         ResolvedResource::new(resource)
     }
 
+    fn resolve_file_for_test<E>(
+        parsed: carina_core::parser::ExpandedFile<E>,
+        _base_dir: &Path,
+    ) -> carina_core::parser::ExpandedFile<E> {
+        parsed
+    }
+
     fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
         LiveCompositionArgument::from_value(
             value,
@@ -3188,6 +3195,16 @@ mod tests {
     #[tokio::test]
     async fn state_bucket_delete_accepts_parser_deferred_non_literal_default_tags() {
         let temp = tempfile::tempdir().unwrap();
+        let module_dir = temp.path().join("modules/standard-tags");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(
+            module_dir.join("main.crn"),
+            r#"
+                arguments { environment: String }
+                attributes { tags: map(String) = { Environment = environment } }
+            "#,
+        )
+        .unwrap();
         let parsed = parse_file(
             r#"
                 let tags_mod = use { source = "./modules/standard-tags" }
@@ -3553,6 +3570,7 @@ mod tests {
         parsed
             .data_sources
             .push(DataSource::with_provider("test", "lookup", "second", None));
+        let parsed = resolve_file_for_test(parsed, Path::new("."));
         let backend = non_empty_refresh_backend("test");
         let root = ShutdownToken::running();
         let (trigger, cancel) = root.with_graceful_shutdown_trigger();
@@ -3637,6 +3655,7 @@ mod tests {
         parsed.providers.push(provider_config);
         parsed.compositions.push(composition);
         parsed.data_sources.push(data_source);
+        let parsed = resolve_file_for_test(parsed, Path::new("."));
 
         let mut state = StateFile::new();
         state
@@ -3714,6 +3733,7 @@ mod tests {
             binding: None,
         });
         parsed.compositions.push(composition);
+        let parsed = resolve_file_for_test(parsed, Path::new("."));
 
         let mut state = StateFile::new();
         state
@@ -4316,7 +4336,7 @@ mod tests {
             &ProviderContext::default(),
         )
         .expect("test config should parse");
-        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+        assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
         let parsed = parsed
             .into_expanded()
             .expect("state-refresh fixture must contain only loop slots");

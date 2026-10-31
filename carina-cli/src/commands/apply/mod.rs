@@ -2808,7 +2808,7 @@ fn rehydrate_desired_plan_file_from_parts(
         &resource_candidates,
         &data_source_candidates,
         &import_identifiers,
-        &parsed.deferred_for_expressions,
+        parsed.deferred_for_expressions(),
     )
     .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
     *plan_file.plan_mut() = rehydrated_plan;
@@ -2972,9 +2972,10 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 37
+    // Validate version compatibility before decoding the payload. Format 35
     // adds typed deferred-for templates and stage-specific placeholder types.
-    // Format 33 adds the typed keyed-list release effect. Format 32 records provider
+    // Format 34 adds Int-only integer arithmetic. Format 33 adds the typed
+    // keyed-list release effect. Format 32 records provider
     // instance reference scopes and create-outcome-unknown markers for
     // protocol v13. Format 31 persists authored ignore paths; format 30 was
     // never emitted. Format 29 persists anonymous-loop provenance, typed
@@ -3511,7 +3512,8 @@ async fn run_apply_from_plan_locked_owned(
             let historical_display =
                 collect_historical_display_attributes(plan, &managed_current, state_file.as_ref());
 
-            let summary = PlanChangeSummary::new(plan, &[], &[]);
+            let summary =
+                PlanChangeSummary::from_reloaded_plan(rehydrated_plan_file.reloaded_plan_file());
             print_plan(
                 plan,
                 &summary,

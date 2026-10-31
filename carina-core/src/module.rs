@@ -122,6 +122,12 @@ impl DependencyGraph {
 /// Format a Value for display
 fn format_value(value: &Value) -> String {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => format!(
+            "if {} {{ {} }} else {{ {} }}",
+            format_value(deferred.condition().value()),
+            format_value(deferred.then_value()),
+            format_value(deferred.else_value())
+        ),
         Value::Concrete(ConcreteValue::String(s)) => {
             let (value, marker) =
                 crate::utils::truncate_chars_for_display(s.expose_plaintext(), 47);
@@ -182,6 +188,7 @@ fn format_value(value: &Value) -> String {
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             format!("{} ?? {}", format_value(value), format_value(default))
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => crate::value::format_value(value),
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;
             let inner: String = parts
@@ -483,6 +490,11 @@ impl RootConfigSignature {
         binding_types: &HashMap<String, ResourceTypePath>,
     ) {
         match value {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                for nested in deferred.values() {
+                    Self::collect_typed_dependencies(from, attr_key, nested, graph, binding_types);
+                }
+            }
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 let target_type = binding_types.get(path.binding()).cloned();
                 graph.add_edge(
@@ -556,6 +568,22 @@ impl RootConfigSignature {
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 Self::collect_typed_dependencies(from, attr_key, value, graph, binding_types);
                 Self::collect_typed_dependencies(from, attr_key, default, graph, binding_types);
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                Self::collect_typed_dependencies(
+                    from,
+                    attr_key,
+                    expression.lhs(),
+                    graph,
+                    binding_types,
+                );
+                Self::collect_typed_dependencies(
+                    from,
+                    attr_key,
+                    expression.rhs(),
+                    graph,
+                    binding_types,
+                );
             }
             Value::Concrete(
                 ConcreteValue::String(_)
@@ -1019,6 +1047,18 @@ impl ModuleSignature {
         argument_types: &HashMap<String, TypeExpr>,
     ) {
         match value {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                for nested in deferred.values() {
+                    Self::collect_typed_dependencies(
+                        from,
+                        attr_key,
+                        nested,
+                        graph,
+                        binding_types,
+                        argument_types,
+                    );
+                }
+            }
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 let binding_name = path.binding();
                 let target_type = if let Some(arg_type) = argument_types.get(binding_name) {
@@ -1135,6 +1175,24 @@ impl ModuleSignature {
                     from,
                     attr_key,
                     default,
+                    graph,
+                    binding_types,
+                    argument_types,
+                );
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                Self::collect_typed_dependencies(
+                    from,
+                    attr_key,
+                    expression.lhs(),
+                    graph,
+                    binding_types,
+                    argument_types,
+                );
+                Self::collect_typed_dependencies(
+                    from,
+                    attr_key,
+                    expression.rhs(),
                     graph,
                     binding_types,
                     argument_types,

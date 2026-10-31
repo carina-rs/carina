@@ -29,7 +29,7 @@ fn resolved(resource: Resource) -> ResolvedResource {
 }
 
 fn mock_saved_provider_configs() -> SavedProviderConfigs {
-    let mut parsed = carina_core::parser::InferredFile::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = vec![ProviderConfig {
         name: "mock".to_string(),
         attributes: IndexMap::new(),
@@ -40,9 +40,6 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
         unresolved_attributes: IndexMap::new(),
         binding: None,
     }];
-    let parsed = parsed
-        .into_expanded()
-        .expect("provider fixture has no parser placeholders");
     let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
         &parsed,
         &HashMap::new(),

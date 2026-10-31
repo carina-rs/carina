@@ -299,7 +299,7 @@ pub struct PlanContext {
     /// validate/plan placeholder. Replaces the pre-refresh
     /// `parsed.deferred_for_expressions` the caller used to pass to
     /// `print_plan` — expansion no longer mutates `parsed`.
-    pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
+    pub residual_deferred_for: carina_core::parser::ResolvedDeferredForExpressions,
     /// Plan-scoped lineage of leaves back to the composition call sites
     /// that produced them (#3306, #3307). Forwarded to the display
     /// layer so the rendered tree folds leaves under composition rows.
@@ -475,6 +475,19 @@ pub(crate) struct ValidationPipelineAccess {
     _private: (),
 }
 
+/// Marker for a configuration that may still contain reusable module-template
+/// nodes. Validation reports and editor/lint paths are allowed to operate in
+/// this state, but planning and serialization entry points are not.
+#[derive(Debug)]
+pub struct TemplateConfig;
+
+/// Marker for a configuration that passed the exhaustive root-graph audit.
+///
+/// The marker is carried by [`ValidatedConfig`] and its value is never exposed;
+/// only this module can construct the owner that planning and apply accept.
+#[derive(Debug)]
+pub struct ExpandedConfig;
+
 impl ValidationPipelineAccess {
     fn new() -> Self {
         Self { _private: () }
@@ -486,7 +499,7 @@ impl ValidationPipelineAccess {
     pub(crate) fn resolve_config_names<E>(
         &self,
         ctx: &WiringContext,
-        parsed: carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+        parsed: carina_core::parser::ModuleResolvedFile<E>,
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     ) -> Result<ParserCanonicalResourcePair<E>, Vec<AppError>> {
         resolve_config_names_with_ctx(self, ctx, parsed, unresolved)
@@ -679,12 +692,16 @@ impl<R> std::ops::Deref for ValidationReady<R> {
 ///     };
 /// }
 /// ```
-pub struct ValidatedConfig<R = CanonicalResourcePair<ExpandedInferredExportParam>> {
+pub struct ValidatedConfig<
+    R = CanonicalResourcePair<ExpandedInferredExportParam>,
+    C = ExpandedConfig,
+> {
     wiring: ValidatedWiring,
     resources: ValidationReady<R>,
+    config_state: std::marker::PhantomData<C>,
 }
 
-impl<R: fmt::Debug> fmt::Debug for ValidatedConfig<R> {
+impl<R: fmt::Debug, C> fmt::Debug for ValidatedConfig<R, C> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ValidatedConfig")
@@ -693,23 +710,84 @@ impl<R: fmt::Debug> fmt::Debug for ValidatedConfig<R> {
     }
 }
 
-/// Collected validation diagnostics plus the read-only schemas used by
-/// warning-only validation checks.
-pub(crate) struct ValidationReport<'a> {
-    errors: Vec<AppError>,
-    schemas: &'a SchemaRegistry,
+/// One or more validation diagnostics.
+///
+/// The inner vector is private and every constructor establishes the
+/// non-empty invariant, so a failed validation report cannot carry an empty
+/// diagnostic list.
+#[derive(Debug)]
+pub(crate) struct NonEmptyValidationErrors(Vec<AppError>);
+
+#[derive(Debug)]
+pub(crate) struct EmptyValidationErrors;
+
+impl TryFrom<Vec<AppError>> for NonEmptyValidationErrors {
+    type Error = EmptyValidationErrors;
+
+    fn try_from(errors: Vec<AppError>) -> Result<Self, Self::Error> {
+        if errors.is_empty() {
+            Err(EmptyValidationErrors)
+        } else {
+            Ok(Self(errors))
+        }
+    }
 }
 
-impl ValidationReport<'_> {
+impl NonEmptyValidationErrors {
+    pub(crate) fn as_slice(&self) -> &[AppError] {
+        &self.0
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<AppError> {
+        self.0
+    }
+
+    fn extend(&mut self, errors: impl IntoIterator<Item = AppError>) {
+        self.0.extend(errors);
+    }
+}
+
+/// Validation outcome plus the read-only schemas used by warning-only checks.
+pub(crate) struct ValidationReport<'a> {
+    result: Result<carina_core::parser::ModuleResolvedInferredFile, NonEmptyValidationErrors>,
+    schemas: &'a SchemaRegistry,
+    config_state: std::marker::PhantomData<TemplateConfig>,
+}
+
+impl<'a> ValidationReport<'a> {
+    #[cfg(test)]
     pub(crate) fn errors(&self) -> &[AppError] {
-        &self.errors
+        match &self.result {
+            Ok(_) => &[],
+            Err(errors) => errors.as_slice(),
+        }
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn into_errors(self) -> Vec<AppError> {
-        self.errors
+        match self.result {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors.into_vec(),
+        }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn into_result(
+        self,
+    ) -> Result<carina_core::parser::ModuleResolvedInferredFile, NonEmptyValidationErrors> {
+        self.result
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Result<carina_core::parser::ModuleResolvedInferredFile, NonEmptyValidationErrors>,
+        &'a SchemaRegistry,
+    ) {
+        (self.result, self.schemas)
+    }
+
+    #[cfg(test)]
     pub(crate) fn schemas(&self) -> &SchemaRegistry {
         self.schemas
     }
@@ -719,14 +797,14 @@ impl ValidationReport<'_> {
 fn validation_report_from<'a>(
     context: &'a WiringContext,
     load_errors: &HashMap<String, String>,
-    parsed: &mut carina_core::parser::InferredFile,
+    parsed: &carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> ValidationReport<'a> {
-    let errors = match crate::commands::validate_and_resolve_errors_inner(
+    let result = match crate::commands::validate_and_resolve_errors_inner(
         &ValidationPipelineAccess::new(),
-        parsed,
+        parsed.clone(),
         base_dir,
         context,
         load_errors,
@@ -734,15 +812,16 @@ fn validation_report_from<'a>(
         duplicate_declarations,
         crate::commands::ConfigNameResolution::EvaluatedOnly,
     ) {
-        Ok(crate::commands::ResolvedConfig::Evaluated { .. }) => Vec::new(),
+        Ok(crate::commands::ResolvedConfig::Evaluated { parsed }) => Ok(*parsed),
         Ok(crate::commands::ResolvedConfig::Paired { .. }) => {
             unreachable!("evaluated-only validation returned pair")
         }
-        Err(errors) => errors,
+        Err(errors) => Err(errors),
     };
     ValidationReport {
-        errors,
+        result,
         schemas: context.schemas(),
+        config_state: std::marker::PhantomData,
     }
 }
 
@@ -759,15 +838,18 @@ fn sorted_provider_load_errors(load_errors: &HashMap<String, String>) -> Vec<App
 fn resolve_config_pair_errors_with_context(
     context: &WiringContext,
     load_errors: &HashMap<String, String>,
-    mut parsed: carina_core::parser::InferredFile,
+    parsed: carina_core::parser::InferredFile,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     base_dir: &Path,
     skip_resource_validation: bool,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
-) -> Result<ParserCanonicalResourcePair<carina_core::parser::InferredExportParam>, Vec<AppError>> {
+) -> Result<
+    ParserCanonicalResourcePair<carina_core::parser::InferredExportParam>,
+    NonEmptyValidationErrors,
+> {
     match crate::commands::validate_and_resolve_errors_inner(
         &ValidationPipelineAccess::new(),
-        &mut parsed,
+        parsed,
         base_dir,
         context,
         load_errors,
@@ -801,7 +883,7 @@ fn resolve_config_pair_with_context(
         skip_resource_validation,
         duplicate_declarations,
     )
-    .map_err(crate::commands::collapse_errors)
+    .map_err(|errors| crate::commands::collapse_errors(errors.into_vec()))
 }
 
 fn binding_use_report_error(report: carina_core::validation::BindingUseReport) -> AppError {
@@ -817,8 +899,19 @@ fn resolve_file_error(error: carina_core::validation::ResolveFileError) -> AppEr
     }
 }
 
+fn require_expanded_config<E>(
+    file: &carina_core::parser::ModuleResolvedFile<E>,
+    base_dir: &Path,
+) -> Result<(), AppError>
+where
+    E: carina_core::parser::ExportParamLike,
+{
+    module_resolver::ensure_expanded_root_graph(file)
+        .map_err(|error| AppError::Config(error.display_relative_to(base_dir)))
+}
+
 fn resolve_file_binding_uses<E: IntoExpandedExportParam>(
-    file: carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    file: carina_core::parser::ModuleResolvedFile<E>,
     base_dir: &Path,
     context: &WiringContext,
 ) -> Result<carina_core::validation::ResolvedFile<E::Expanded>, AppError> {
@@ -920,7 +1013,7 @@ impl ProviderLoad {
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn validation_report<'a>(
         &'a self,
-        parsed: &mut carina_core::parser::InferredFile,
+        parsed: &carina_core::parser::InferredFile,
         base_dir: &Path,
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
@@ -939,30 +1032,40 @@ impl ProviderLoad {
     /// one executable owner.
     pub fn validate_evaluated_config(
         self,
-        mut parsed: carina_core::parser::InferredFile,
+        parsed: carina_core::parser::InferredFile,
         base_dir: &Path,
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig<ExpandedInferredFile>, AppError> {
         let ValidationReport {
-            mut errors,
+            result,
             schemas: _,
+            config_state: _,
         } = validation_report_from(
             &self.context,
             &self.load_errors,
-            &mut parsed,
+            &parsed,
             base_dir,
             skip_resource_validation,
             duplicate_declarations,
         );
+        let parsed = match result {
+            Ok(parsed) => parsed,
+            Err(mut errors) => {
+                if skip_resource_validation {
+                    errors.extend(sorted_provider_load_errors(&self.load_errors));
+                }
+                return Err(crate::commands::collapse_errors(errors.into_vec()));
+            }
+        };
         // The resource-skipping pipeline omits provider-load diagnostics.
-        // Preserve its findings first, then append the load causes by name.
         if skip_resource_validation {
-            errors.extend(sorted_provider_load_errors(&self.load_errors));
+            let errors = sorted_provider_load_errors(&self.load_errors);
+            if !errors.is_empty() {
+                return Err(crate::commands::collapse_errors(errors));
+            }
         }
-        if !errors.is_empty() {
-            return Err(crate::commands::collapse_errors(errors));
-        }
+        require_expanded_config(&parsed, base_dir)?;
         let parsed = resolve_file_binding_uses(parsed, base_dir, &self.context)?;
 
         Ok(ValidatedConfig {
@@ -970,6 +1073,7 @@ impl ProviderLoad {
                 load: self.into_complete()?,
             },
             resources: ValidationReady::from_resolved_file(parsed),
+            config_state: std::marker::PhantomData,
         })
     }
 
@@ -1009,9 +1113,10 @@ impl ProviderLoad {
                 if skip_resource_validation {
                     errors.extend(sorted_provider_load_errors(&self.load_errors));
                 }
-                return Err(crate::commands::collapse_errors(errors));
+                return Err(crate::commands::collapse_errors(errors.into_vec()));
             }
         };
+        require_expanded_config(canonical_resources.parsed(), base_dir)?;
         let (parsed, unresolved) =
             resolve_pair_binding_uses(canonical_resources, base_dir, &self.context)?;
         Ok(ValidatedConfig {
@@ -1019,6 +1124,7 @@ impl ProviderLoad {
                 load: self.into_complete()?,
             },
             resources: ValidationReady::from_resolved_pair(parsed, unresolved),
+            config_state: std::marker::PhantomData,
         })
     }
 
@@ -1083,6 +1189,7 @@ impl CompleteProviderLoad {
             skip_resource_validation,
             duplicate_declarations,
         )?;
+        require_expanded_config(canonical_resources.parsed(), base_dir)?;
         let (parsed, unresolved) =
             resolve_pair_binding_uses(canonical_resources, base_dir, &self.context)?;
         Ok(CheckedSavedPlanInputs {
@@ -1108,6 +1215,7 @@ impl CompleteProviderLoad {
             ValidatedConfig {
                 wiring: ValidatedWiring { load: self },
                 resources: ValidationReady::from_saved_plan_artifact(),
+                config_state: std::marker::PhantomData,
             },
         ))
     }
@@ -1136,6 +1244,7 @@ impl CheckedSavedPlanInputs {
             ValidatedConfig {
                 wiring: validated.wiring,
                 resources: *canonical_resources,
+                config_state: std::marker::PhantomData,
             },
         ))
     }
@@ -1144,7 +1253,7 @@ impl CheckedSavedPlanInputs {
 impl ReportingProviderLoad {
     pub(crate) fn validation_report<'a>(
         &'a self,
-        parsed: &mut carina_core::parser::InferredFile,
+        parsed: &carina_core::parser::InferredFile,
         base_dir: &Path,
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
@@ -1220,6 +1329,7 @@ impl ValidatedWiring {
                 },
             },
             resources: ValidationReady::from_resolved_pair(parsed, unresolved),
+            config_state: std::marker::PhantomData,
         }
     }
 
@@ -1294,6 +1404,7 @@ impl<R> ValidatedConfig<R> {
         Self {
             wiring: ValidatedWiring::for_test(factories, provider_configs),
             resources: ValidationReady::for_fixture(resources),
+            config_state: std::marker::PhantomData,
         }
     }
 
@@ -1315,6 +1426,7 @@ impl<R> ValidatedConfig<R> {
         Self {
             wiring,
             resources: ValidationReady::for_fixture(resources),
+            config_state: std::marker::PhantomData,
         }
     }
 
@@ -1332,6 +1444,7 @@ impl<R> ValidatedConfig<R> {
                 },
             },
             resources: ValidationReady::for_fixture(resources),
+            config_state: std::marker::PhantomData,
         }
     }
 
@@ -1349,6 +1462,7 @@ impl<R> ValidatedConfig<R> {
                 additional_schemas,
             ),
             resources: ValidationReady::for_fixture(resources),
+            config_state: std::marker::PhantomData,
         }
     }
 
@@ -1366,6 +1480,7 @@ impl<R> ValidatedConfig<R> {
                 additional_schemas,
             ),
             resources: ValidationReady::for_fixture(resources),
+            config_state: std::marker::PhantomData,
         }
     }
 
@@ -1392,6 +1507,7 @@ impl ValidatedConfig<CanonicalResourcePair<ExpandedInferredExportParam>> {
         let Self {
             wiring,
             resources: _,
+            config_state: _,
         } = self;
         let resources = resolve_config_pair_with_context(
             wiring.context(),
@@ -1402,11 +1518,13 @@ impl ValidatedConfig<CanonicalResourcePair<ExpandedInferredExportParam>> {
             skip_resource_validation,
             duplicate_declarations,
         )?;
+        require_expanded_config(resources.parsed(), base_dir)?;
         let (parsed, unresolved) =
             resolve_pair_binding_uses(resources, base_dir, wiring.context())?;
         Ok(ValidatedConfig {
             wiring,
             resources: ValidationReady::from_resolved_pair(parsed, unresolved),
+            config_state: std::marker::PhantomData,
         })
     }
 }
@@ -1418,7 +1536,9 @@ impl<E> ValidatedConfig<CanonicalResourcePair<E>> {
         &mut self,
         state_file: &Option<StateFile>,
     ) -> StateBlockResolution {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let ctx = wiring.context();
         reconcile_canonical_prefixed_names(&mut resources.inner, state_file);
         let parsed = resources.parsed();
@@ -1449,7 +1569,9 @@ impl<E> ValidatedConfig<CanonicalResourcePair<E>> {
         &mut self,
         providers: &[ProviderConfig],
     ) -> Result<Vec<AppError>, AppError> {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         compute_canonical_pair_anonymous_identifiers_with_ctx(
             wiring.context(),
             &mut resources.inner,
@@ -1487,7 +1609,9 @@ impl ValidatedConfig<ExpandedInferredFile> {
         state_file: &Option<StateFile>,
         reconcile_modules: bool,
     ) -> StateBlockClaims {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let ctx = wiring.context();
         let resources = &mut resources.inner;
         reconcile_prefixed_names(&mut resources.resources, state_file);
@@ -1531,7 +1655,9 @@ impl<E: Clone> ValidatedConfig<ExpandedFile<E>> {
             PreparedAddressPreservingDeferredForExpansion,
         >,
     ) -> Result<ExpandedRefreshState, AppError> {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let ValidatedExpandRefreshAndLiftInputs {
             provider,
             comparison_provider,
@@ -1569,7 +1695,9 @@ impl<E> ValidatedConfig<ExpandedCanonicalResources<E>> {
         provider_configs: &[ProviderConfig],
         normalizer: &dyn ProviderNormalizer,
     ) -> carina_core::provider::ProviderResult<()> {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         resources
             .inner
             .prepare_desired_side_for_plan(provider_configs, normalizer, wiring.context().schemas())
@@ -1600,7 +1728,9 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
         ),
         AppError,
     > {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let (resources, expansion) = resources
             .try_map_with_output_preserving_binding_use_resolution(|resources| {
                 prepared.expand(
@@ -1611,7 +1741,14 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
                     provider,
                 )
             })?;
-        Ok((ValidatedConfig { wiring, resources }, expansion))
+        Ok((
+            ValidatedConfig {
+                wiring,
+                resources,
+                config_state: std::marker::PhantomData,
+            },
+            expansion,
+        ))
     }
 
     /// Fixture-plan counterpart of [`Self::expand_deferred_for`] that consumes
@@ -1624,7 +1761,9 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
         warning_policy: DeferredForWarningPolicy,
         provider: &ProviderRouter,
     ) -> Result<ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>>, AppError> {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let (resources, ()) =
             resources.try_map_with_output_preserving_binding_use_resolution(|resources| {
                 prepared
@@ -1637,7 +1776,11 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
                     )
                     .map(|expanded| (expanded, ()))
             })?;
-        Ok(ValidatedConfig { wiring, resources })
+        Ok(ValidatedConfig {
+            wiring,
+            resources,
+            config_state: std::marker::PhantomData,
+        })
     }
 }
 
@@ -2118,9 +2261,14 @@ fn prefixed_validation_messages(joined: &str, prefix: impl std::fmt::Display) ->
         .collect()
 }
 
-pub fn validate_resources_with_ctx<E, P: PlaceholderKind, T: PlaceholderKind>(
+pub fn validate_resources_with_ctx<
+    E,
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    D: carina_core::parser::DeferredForPhaseTraversal<P, T>,
+>(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E, P, T>,
+    parsed: &carina_core::parser::File<E, P, T, D>,
     provider_context: &carina_core::parser::ProviderContext,
 ) -> Vec<AppError> {
     lift_validation_result(validation::validate_resources(
@@ -2135,8 +2283,8 @@ pub fn validate_resources_with_ctx<E, P: PlaceholderKind, T: PlaceholderKind>(
 /// `AppError::Validation`. Warnings are emitted to stderr (no
 /// AppError::Warning variant exists today) so they don't fail the
 /// command but remain visible.
-pub fn validate_depends_on_with_ctx<E>(
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+pub fn validate_depends_on_with_ctx<E, D: carina_core::parser::DeferredForPhaseTraversal>(
+    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
 ) -> Vec<AppError> {
     use carina_core::validation::depends_on::{Severity, validate_depends_on};
     let mut errors = Vec::new();
@@ -2152,9 +2300,9 @@ pub fn validate_depends_on_with_ctx<E>(
 /// Surface `wait <target> { ... }` diagnostics as `AppError::Validation`.
 /// Shared with the LSP via the underlying
 /// `carina_core::validation::wait::validate_wait_bindings` pass.
-pub fn validate_wait_bindings_with_ctx<E>(
+pub fn validate_wait_bindings_with_ctx<E, D>(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
 ) -> Vec<AppError> {
     carina_core::validation::wait::validate_wait_bindings(parsed, ctx.schemas())
         .into_iter()
@@ -2167,9 +2315,12 @@ pub fn validate_wait_bindings_with_ctx<E>(
 /// the LSP via the underlying
 /// `carina_core::validation::deferred_populate::validate_deferred_populate_refs`
 /// pass. carina#3034.
-pub fn validate_deferred_populate_refs_with_ctx<E>(
+pub fn validate_deferred_populate_refs_with_ctx<
+    E,
+    D: carina_core::parser::DeferredForPhaseTraversal,
+>(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
 ) -> Vec<AppError> {
     carina_core::validation::deferred_populate::validate_deferred_populate_refs(
         parsed,
@@ -2180,9 +2331,12 @@ pub fn validate_deferred_populate_refs_with_ctx<E>(
     .collect()
 }
 
-pub fn validate_resource_ref_types_with_ctx<E>(
+pub fn validate_resource_ref_types_with_ctx<
+    E: carina_core::parser::ExportParamLike,
+    D: carina_core::parser::DeferredForPhaseTraversal,
+>(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
     argument_names: &HashSet<String>,
 ) -> Vec<AppError> {
     let bindings = carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
@@ -2194,9 +2348,12 @@ pub fn validate_resource_ref_types_with_ctx<E>(
     ))
 }
 
-pub fn validate_composition_ref_types_with_ctx<E>(
+pub fn validate_composition_ref_types_with_ctx<
+    E,
+    D: carina_core::parser::DeferredForPhaseTraversal,
+>(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
 ) -> Vec<AppError> {
     let bindings = carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
     validation::validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings)
@@ -2205,9 +2362,12 @@ pub fn validate_composition_ref_types_with_ctx<E>(
         .collect()
 }
 
-pub fn validate_attribute_param_ref_types_with_ctx<E>(
+pub fn validate_attribute_param_ref_types_with_ctx<
+    E,
+    D: carina_core::parser::DeferredForPhaseTraversal,
+>(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
 ) -> Vec<AppError> {
     let bindings = carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
     lift_validation_result(
@@ -2219,9 +2379,14 @@ pub fn validate_attribute_param_ref_types_with_ctx<E>(
 }
 
 /// File-level name resolution also covers residual deferred-for templates.
-pub(crate) fn resolve_file_names_with_ctx<E, P: PlaceholderKind, T: PlaceholderKind>(
+pub(crate) fn resolve_file_names_with_ctx<
+    E,
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    D: carina_core::parser::DeferredForPhaseTraversal<P, T>,
+>(
     ctx: &WiringContext,
-    parsed: &mut carina_core::parser::File<E, P, T>,
+    parsed: &mut carina_core::parser::File<E, P, T, D>,
 ) -> Vec<AppError> {
     let mut errors = resolve_file_block_names_with_schemas(parsed, ctx.schemas())
         .err()
@@ -2234,7 +2399,7 @@ pub(crate) fn resolve_file_names_with_ctx<E, P: PlaceholderKind, T: PlaceholderK
 fn resolve_config_names_with_ctx<E>(
     access: &ValidationPipelineAccess,
     ctx: &WiringContext,
-    parsed: carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    parsed: carina_core::parser::ModuleResolvedFile<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> Result<ParserCanonicalResourcePair<E>, Vec<AppError>> {
     ParserCanonicalResourcePair::resolve_block_names(access, parsed, unresolved, ctx.schemas())
@@ -2247,7 +2412,7 @@ fn resolve_config_names_with_ctx<E>(
 /// transformations such as attribute-prefix resolution.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn resolve_config_block_names_for_test<E>(
-    parsed: carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    parsed: carina_core::parser::ModuleResolvedFile<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     registry: &SchemaRegistry,
 ) -> Result<ParserCanonicalResourcePair<E>, Vec<carina_core::schema::BlockNameConflict>> {
@@ -5026,11 +5191,15 @@ pub struct DeferredForExpansion {
     pub sorted_resources: Vec<Resource>,
     /// Loops still unresolved (iterable genuinely unknowable at plan
     /// time) — rendered as the carina#3128 validate/plan placeholder.
-    pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
+    pub residual_deferred_for: carina_core::parser::ResolvedDeferredForExpressions,
     /// Warnings after resolved/deferred loops have been removed from the
     /// parser view. Retained only by the raw-file test adapter.
     #[cfg(test)]
     residual_warnings: Vec<ParseWarning>,
+    /// Complete finalized loop collection after expansion, retained only by
+    /// the raw-file test adapter so it can move the collection as a unit.
+    #[cfg(test)]
+    post_expansion_deferred_for: carina_core::parser::ResolvedDeferredForExpressions,
     /// Loops whose iterable is deferred until apply and should become
     /// state-only `Effect::DeferredCreate` entries in the plan.
     pub deferred_create_targets: Vec<DeferredCreateTarget>,
@@ -5057,16 +5226,9 @@ impl DeferredForExpansion {
     #[cfg(test)]
     pub(crate) fn into_expanded_file<E>(self, mut parsed: ExpandedFile<E>) -> ExpandedFile<E> {
         parsed.resources = self.sorted_resources;
-        // Concrete loops now live in `resources` and must disappear from the
-        // parser view. Genuinely deferred loops still back DeferredCreate /
-        // DeferredReplace effects, so retain their fresh templates alongside
-        // any residual diagnostic-only loops.
-        parsed.deferred_for_expressions = self.residual_deferred_for;
-        parsed.deferred_for_expressions.extend(
-            self.deferred_create_targets
-                .into_iter()
-                .map(|target| target.template),
-        );
+        // Move the complete post-expansion collection as one finalized value;
+        // external code never appends individual expressions.
+        parsed.replace_deferred_for_expressions(self.post_expansion_deferred_for);
         parsed.warnings = self.residual_warnings;
         parsed
     }
@@ -5214,7 +5376,7 @@ struct PostExpansionPlanData<E> {
     addressed: AddressedState,
     data_source_values: DataSourceValues,
     wait_aliases: Vec<WaitAliasSpec>,
-    residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
+    residual_deferred_for: carina_core::parser::ResolvedDeferredForExpressions,
     deferred_create_targets: Vec<DeferredCreateTarget>,
 }
 
@@ -5509,7 +5671,7 @@ impl PostExpansionMode for ApplyMode {
 /// canonical resource owner that crossed the seam.
 pub(crate) struct PostExpansionArtifacts<R> {
     pub expanded_resources: R,
-    pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
+    pub residual_deferred_for: carina_core::parser::ResolvedDeferredForExpressions,
     pub plan: Plan,
     pub compositions: Vec<LiveComposition>,
     pub data_sources: Vec<DataSource>,
@@ -5891,7 +6053,7 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
     pub(crate) fn retain_fixture_deferred_for(
         &mut self,
         managed_bindings: &HashSet<String>,
-        non_managed: Vec<carina_core::parser::DeferredForExpression>,
+        non_managed: carina_core::parser::ResolvedDeferredForExpressions,
     ) {
         self.resources
             .inner
@@ -5908,7 +6070,7 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
             .inner
             .data
             .residual_deferred_for
-            .extend(non_managed);
+            .append_finalized(non_managed);
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -5917,7 +6079,9 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
         normalizer: &dyn ProviderNormalizer,
         state_file: &StateFile,
     ) -> Result<ValidatedConfig<PostExpansionPlanView<E, PlanChildrenSettled>>, AppError> {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let ValidationReady { inner, origin } = resources;
         let settled = inner
             .settle_children_from_cache(CachedExpandedChildrenInputs {
@@ -5933,6 +6097,7 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
                 inner: settled,
                 origin,
             },
+            config_state: std::marker::PhantomData,
         })
     }
 
@@ -5940,7 +6105,9 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
     pub(crate) fn settle_expanded_children_absent(
         self,
     ) -> ValidatedConfig<PostExpansionPlanView<E, PlanChildrenSettled>> {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let ValidationReady { inner, origin } = resources;
         let settled = inner
             .settle_children_absent(wiring.context().schemas(), None)
@@ -5951,6 +6118,7 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
                 inner: settled,
                 origin,
             },
+            config_state: std::marker::PhantomData,
         }
     }
 }
@@ -5965,7 +6133,9 @@ impl<E, S> ValidatedConfig<PostExpansionPlanView<E, S>> {
     where
         S: ChildrenSettledFor<M>,
     {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let ValidationReady {
             inner: expansion,
             origin,
@@ -5984,6 +6154,7 @@ impl<E, S> ValidatedConfig<PostExpansionPlanView<E, S>> {
                     inner: expanded_resources,
                     origin,
                 },
+                config_state: std::marker::PhantomData,
             }),
         )
     }
@@ -6049,6 +6220,8 @@ impl PreparedDeferredForExpansion {
             residual_deferred_for,
             #[cfg(test)]
                 residual_warnings: _,
+            #[cfg(test)]
+                post_expansion_deferred_for: _,
             deferred_create_targets,
             new_child_ids,
             refreshable_child_ids,
@@ -6153,7 +6326,7 @@ pub(crate) trait DeferredExpansionTarget<E> {
         bindings: &carina_core::binding_index::IterableBindings<'_>,
         classify: F,
     ) -> Result<
-        Vec<carina_core::parser::DeferredForExpression>,
+        carina_core::parser::ResolvedDeferredForExpressions,
         carina_core::parser::DeferredForExpansionError,
     >
     where
@@ -6183,7 +6356,7 @@ impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
         bindings: &carina_core::binding_index::IterableBindings<'_>,
         classify: F,
     ) -> Result<
-        Vec<carina_core::parser::DeferredForExpression>,
+        carina_core::parser::ResolvedDeferredForExpressions,
         carina_core::parser::DeferredForExpansionError,
     >
     where
@@ -6220,26 +6393,26 @@ impl<E> DeferredExpansionTarget<E> for ExpandedFile<E> {
         bindings: &carina_core::binding_index::IterableBindings<'_>,
         mut classify: F,
     ) -> Result<
-        Vec<carina_core::parser::DeferredForExpression>,
+        carina_core::parser::ResolvedDeferredForExpressions,
         carina_core::parser::DeferredForExpansionError,
     >
     where
         F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice,
     {
-        let (selected, retained): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.deferred_for_expressions)
-                .into_iter()
-                .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
+        let (selected, retained) = self
+            .take_deferred_for_expressions()
+            .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
         self.warnings.retain(|warning| {
             warning.kind != WarningKind::DeferredFor
                 || !retained
                     .iter()
                     .any(|deferred| deferred.file == warning.file && deferred.line == warning.line)
         });
-        self.deferred_for_expressions = selected;
+        self.replace_deferred_for_expressions(selected);
         self.expand_deferred_for_expressions(bindings)?;
-        let residual = self.deferred_for_expressions.clone();
-        self.deferred_for_expressions.extend(retained);
+        let residual = self.deferred_for_expressions().clone();
+        self.deferred_for_expressions_mut()
+            .append_finalized(retained);
         Ok(residual)
     }
 }
@@ -6267,14 +6440,16 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     // validate). Parse warnings still print — with no deferred-for,
     // expansion would remove none of them, so `parsed`'s set is exactly
     // what the post-expansion path would have printed.
-    if parsed.deferred_for_expressions.is_empty() {
+    if parsed.deferred_for_expressions().is_empty() {
         let printed_warnings =
             warning_policy == DeferredForWarningPolicy::Print && parsed.print_warnings();
         return Ok(DeferredForExpansion {
             sorted_resources: sorted_resources.to_vec(),
-            residual_deferred_for: Vec::new(),
+            residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             #[cfg(test)]
             residual_warnings: parsed.warnings.clone(),
+            #[cfg(test)]
+            post_expansion_deferred_for: parsed.deferred_for_expressions().clone(),
             deferred_create_targets: Vec::new(),
             new_child_ids: HashSet::new(),
             refreshable_child_ids: RefreshableChildIds::default(),
@@ -6344,6 +6519,8 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     #[cfg(test)]
     let residual_warnings = target.parsed().warnings.clone();
     let parsed = target.parsed();
+    #[cfg(test)]
+    let post_expansion_deferred_for = parsed.deferred_for_expressions().clone();
 
     let pre_ids: HashSet<ResourceId> = sorted_resources.iter().map(|r| r.id.clone()).collect();
 
@@ -6397,6 +6574,8 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
         residual_deferred_for,
         #[cfg(test)]
         residual_warnings,
+        #[cfg(test)]
+        post_expansion_deferred_for,
         deferred_create_targets,
         new_child_ids,
         refreshable_child_ids,
@@ -6596,6 +6775,7 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
     let ValidatedConfig {
         wiring,
         resources: canonical_resources,
+        config_state: _,
     } = validated;
     let ValidatedCanonicalExpandRefreshAndLiftInputs {
         provider,
@@ -6640,7 +6820,11 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
             })
             .await?
     };
-    Ok(ValidatedConfig { wiring, resources })
+    Ok(ValidatedConfig {
+        wiring,
+        resources,
+        config_state: std::marker::PhantomData,
+    })
 }
 
 async fn settle_expanded_children_live<E>(
@@ -6817,6 +7001,8 @@ async fn finish_expanded_refresh_state<
         residual_deferred_for: _,
         #[cfg(test)]
             residual_warnings: _,
+        #[cfg(test)]
+            post_expansion_deferred_for: _,
         deferred_create_targets: _,
         new_child_ids,
         refreshable_child_ids,
@@ -6877,6 +7063,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     let ValidatedConfig {
         wiring,
         resources: canonical_resources,
+        config_state: _,
     } = validated;
     let resources = {
         let context = wiring.context();
@@ -6897,7 +7084,11 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             })
             .await?
     };
-    Ok(ValidatedConfig { wiring, resources })
+    Ok(ValidatedConfig {
+        wiring,
+        resources,
+        config_state: std::marker::PhantomData,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -462,6 +462,20 @@ fn walk_custom_lookup_on_path<'a, P: PlaceholderKind>(
     errors: &mut Vec<TypeError>,
     visited_refs: &mut Vec<&'a str>,
 ) {
+    if let Value::Deferred(DeferredValue::ModuleIf(deferred)) = value {
+        for branch in &deferred.values()[1..] {
+            walk_custom_lookup_on_path(
+                attr_type,
+                branch,
+                attr_name,
+                lookup,
+                defs,
+                errors,
+                visited_refs,
+            );
+        }
+        return;
+    }
     // `Secret` is a sensitivity wrapper, not an unresolved value. Providers
     // may validate the plaintext, but diagnostics crossing back out of this
     // boundary must discard every user-derived value/message.
@@ -509,6 +523,7 @@ fn walk_custom_lookup_on_path<'a, P: PlaceholderKind>(
             | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
             | Value::Deferred(DeferredValue::Access(_))
             | Value::Deferred(DeferredValue::ResourceRef { .. })
+            | Value::Deferred(DeferredValue::IntegerArithmetic(_))
             | Value::Deferred(DeferredValue::Interpolation(_))
             | Value::Deferred(DeferredValue::Unknown(_))
             | Value::Deferred(DeferredValue::Placeholder(_))
@@ -4637,6 +4652,46 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind>(
         ));
     }
 
+    if matches!(value, Value::Deferred(DeferredValue::IntegerArithmetic(_))) {
+        return match &attr.kind {
+            AT::Int { .. } => Some(Fit::with_kind(FitExactness::EXACT, attr, FitKind::Deferred)),
+            AT::Float { .. } => Some(Fit::with_kind(
+                FitExactness::COERCIBLE,
+                attr,
+                FitKind::Deferred,
+            )),
+            AT::Union(members) => {
+                let selected = fit_union_members_on_path(
+                    members.as_raw_slice(),
+                    value,
+                    defs,
+                    ancestry,
+                    purpose,
+                    visited_refs,
+                )?;
+                let exactness = selected.fit.exactness;
+                Some(Fit::with_kind(
+                    exactness,
+                    attr,
+                    FitKind::Union {
+                        member: selected.member,
+                        fit: Box::new(selected.fit),
+                    },
+                ))
+            }
+            AT::Ref(_) => unreachable!("fit dispatch received an unresolved Ref"),
+            AT::String { .. }
+            | AT::ResourceHandle { .. }
+            | AT::StringLiteralSet { .. }
+            | AT::Bool
+            | AT::Duration
+            | AT::Enum { .. }
+            | AT::List { .. }
+            | AT::Map { .. }
+            | AT::Struct { .. } => None,
+        };
+    }
+
     let Some(concrete) = value.as_concrete() else {
         return Some(Fit::with_kind(FitExactness::EXACT, attr, FitKind::Deferred));
     };
@@ -6997,6 +7052,7 @@ impl TypeError {
 impl<P: PlaceholderKind> Value<P> {
     pub fn type_name(&self) -> String {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(_)) => "ModuleIf".to_string(),
             Value::Concrete(ConcreteValue::String(_)) => "String".to_string(),
             Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "EnumIdentifier".to_string(),
             Value::Concrete(ConcreteValue::CanonicalEnum(_)) => "CanonicalEnum".to_string(),
@@ -7014,6 +7070,7 @@ impl<P: PlaceholderKind> Value<P> {
                 format!("BindingRef({})", binding)
             }
             Value::Deferred(DeferredValue::Coalesce { .. }) => "Coalesce".to_string(),
+            Value::Deferred(DeferredValue::IntegerArithmetic(_)) => "Int".to_string(),
             Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation".to_string(),
             Value::Deferred(
                 DeferredValue::FunctionCall { name, .. } | DeferredValue::Unavailable { name, .. },
@@ -11526,67 +11583,116 @@ fn resolve_file_block_names<
     E,
     P: crate::resource::PlaceholderKind,
     T: crate::resource::PlaceholderKind,
+    D: crate::parser::DeferredForPhaseTraversal<P, T>,
 >(
-    parsed: &mut crate::parser::File<E, P, T>,
+    parsed: &mut crate::parser::File<E, P, T, D>,
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
-    let mut conflicts = resolve_block_names_detailed(&mut parsed.resources, registry);
-    for data_source in &mut parsed.data_sources {
-        if let Some(schema) = registry.get_for_data_source(data_source) {
-            conflicts.extend(resolve_attribute_block_names(
-                &data_source.id,
-                &mut data_source.attributes,
-                None,
-                schema.as_schema(),
-            ));
+    let mut conflicts = Vec::new();
+    for resource in parsed.iter_all_resources_mut() {
+        match resource {
+            crate::parser::ResourceMut::Resource(resource) => {
+                conflicts.extend(resolve_block_names_detailed(
+                    std::slice::from_mut(resource),
+                    registry,
+                ));
+            }
+            crate::parser::ResourceMut::Deferred { resource } => {
+                conflicts.extend(resolve_block_names_detailed(
+                    std::slice::from_mut(resource),
+                    registry,
+                ));
+            }
+            crate::parser::ResourceMut::DataSource(data_source) => {
+                if let Some(schema) = registry.get_for_data_source(data_source) {
+                    conflicts.extend(resolve_attribute_block_names(
+                        &data_source.id,
+                        &mut data_source.attributes,
+                        None,
+                        schema.as_schema(),
+                    ));
+                }
+            }
+            crate::parser::ResourceMut::LiveComposition(_) => {}
         }
-    }
-    for deferred in &mut parsed.deferred_for_expressions {
-        conflicts.extend(resolve_block_names_detailed(
-            std::slice::from_mut(&mut deferred.template_resource),
-            registry,
-        ));
     }
     conflicts
 }
 
-fn resolve_file_block_names_with_authored<E, A>(
-    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
-    authored: &crate::parser::File<A, ParserPlaceholder, ParserPlaceholder>,
+fn managed_resource_by_id<'a, E, D>(
+    parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
+    id: &ResourceId,
+) -> Option<&'a Resource<ModuleSource, ParserPlaceholder>>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder>,
+{
+    parsed
+        .iter_all_resources()
+        .find_map(|resource| match resource {
+            crate::parser::ResourceRef::Resource(resource)
+            | crate::parser::ResourceRef::Deferred {
+                resource,
+                deferred: _,
+            } if resource.id == *id => Some(resource),
+            crate::parser::ResourceRef::Resource(_)
+            | crate::parser::ResourceRef::LiveComposition(_)
+            | crate::parser::ResourceRef::DataSource(_)
+            | crate::parser::ResourceRef::Deferred {
+                resource: _,
+                deferred: _,
+            } => None,
+        })
+}
+
+fn resolve_file_block_names_with_authored<E, D, A, AD>(
+    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
+    authored: &crate::parser::File<A, ParserPlaceholder, ParserPlaceholder, AD>,
     registry: &SchemaRegistry,
-) -> Vec<BlockNameConflict> {
-    let mut conflicts = resolve_block_names_detailed_with_authored(
-        &mut parsed.resources,
-        &authored.resources,
-        registry,
-    );
-    for data_source in &mut parsed.data_sources {
-        if let Some(schema) = registry.get_for_data_source(data_source) {
-            let authored_attributes = authored
-                .data_sources
-                .iter()
-                .find(|candidate| candidate.id == data_source.id)
-                .map(|candidate| &candidate.attributes);
-            conflicts.extend(resolve_attribute_block_names(
-                &data_source.id,
-                &mut data_source.attributes,
-                authored_attributes,
-                schema.as_schema(),
-            ));
+) -> Vec<BlockNameConflict>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder>,
+    AD: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder>,
+{
+    let mut conflicts = Vec::new();
+    for resource in parsed.iter_all_resources_mut() {
+        match resource {
+            crate::parser::ResourceMut::Resource(resource) => {
+                let authored_resources = managed_resource_by_id(authored, &resource.id)
+                    .map(std::slice::from_ref)
+                    .unwrap_or_default();
+                conflicts.extend(resolve_block_names_detailed_with_authored(
+                    std::slice::from_mut(resource),
+                    authored_resources,
+                    registry,
+                ));
+            }
+            crate::parser::ResourceMut::Deferred { resource } => {
+                let authored_resources = managed_resource_by_id(authored, &resource.id)
+                    .map(std::slice::from_ref)
+                    .unwrap_or_default();
+                conflicts.extend(resolve_block_names_detailed_with_authored(
+                    std::slice::from_mut(resource),
+                    authored_resources,
+                    registry,
+                ));
+            }
+            crate::parser::ResourceMut::DataSource(data_source) => {
+                if let Some(schema) = registry.get_for_data_source(data_source) {
+                    let authored_attributes = authored
+                        .data_sources
+                        .iter()
+                        .find(|candidate| candidate.id == data_source.id)
+                        .map(|candidate| &candidate.attributes);
+                    conflicts.extend(resolve_attribute_block_names(
+                        &data_source.id,
+                        &mut data_source.attributes,
+                        authored_attributes,
+                        schema.as_schema(),
+                    ));
+                }
+            }
+            crate::parser::ResourceMut::LiveComposition(_) => {}
         }
-    }
-    for deferred in &mut parsed.deferred_for_expressions {
-        let authored_resources = authored
-            .deferred_for_expressions
-            .iter()
-            .find(|candidate| candidate.template_resource.id == deferred.template_resource.id)
-            .map(|candidate| std::slice::from_ref(&candidate.template_resource))
-            .unwrap_or_default();
-        conflicts.extend(resolve_block_names_detailed_with_authored(
-            std::slice::from_mut(&mut deferred.template_resource),
-            authored_resources,
-            registry,
-        ));
     }
     conflicts
 }
@@ -11597,8 +11703,9 @@ pub fn resolve_file_block_names_with_schemas<
     E,
     P: crate::resource::PlaceholderKind,
     T: crate::resource::PlaceholderKind,
+    D: crate::parser::DeferredForPhaseTraversal<P, T>,
 >(
-    parsed: &mut crate::parser::File<E, P, T>,
+    parsed: &mut crate::parser::File<E, P, T, D>,
     registry: &SchemaRegistry,
 ) -> Result<(), Vec<BlockNameConflict>> {
     let conflicts = resolve_file_block_names(parsed, registry);
@@ -11615,16 +11722,19 @@ pub fn resolve_file_block_names_with_schemas<
 /// This raw primitive returns plain values and carries no pairing guarantee.
 /// Only carina-cli's validated-wiring transition may mint its canonical
 /// resource pair from these values.
-pub type ParserStageBlockNameResolution<E> = (
-    crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+pub type ParserStageBlockNameResolution<E, D> = (
+    crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
     Vec<Resource<ModuleSource, ParserPlaceholder>>,
 );
 
-pub fn resolve_config_block_names<E>(
-    mut parsed: crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+pub fn resolve_config_block_names<E, D>(
+    mut parsed: crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
     unresolved: UnresolvedConfigSnapshot,
     registry: &SchemaRegistry,
-) -> Result<ParserStageBlockNameResolution<E>, Vec<BlockNameConflict>> {
+) -> Result<ParserStageBlockNameResolution<E, D>, Vec<BlockNameConflict>>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder>,
+{
     let mut unresolved = unresolved.into_inner();
     let mut conflicts = resolve_file_block_names_with_authored(&mut parsed, &unresolved, registry);
     let mut seen = conflicts.iter().cloned().collect::<HashSet<_>>();
@@ -12516,6 +12626,7 @@ pub struct SchemaRegistry {
     data_sources: HashMap<(String, String), ValidatedResourceSchema>,
     reference_forms: BTreeMap<String, ReferenceForms>,
     witness_backed_reference_forms: HashSet<String>,
+    identified_scalar_kinds: BTreeMap<(String, TypeIdentity), RefinedScalarKind>,
 }
 
 /// Failure to combine owner-bound schema registry declarations.
@@ -12556,6 +12667,15 @@ impl SchemaRegistry {
     #[doc(hidden)]
     pub fn insert(&mut self, provider: impl Into<String>, schema: ValidatedResourceSchema) {
         let provider = provider.into();
+        for (identity, declaration) in identified_declarations_from_witnesses(
+            std::slice::from_ref(&schema),
+            &ValidatedConfigSchema::default(),
+        ) {
+            if let Some(kind) = identified_declaration_scalar_kind(&declaration) {
+                self.identified_scalar_kinds
+                    .insert((provider.clone(), identity), kind);
+            }
+        }
         self.reference_forms.entry(provider.clone()).or_default();
         let key = (provider, schema.as_schema().resource_type.clone());
         match schema.as_schema().kind {
@@ -12590,6 +12710,12 @@ impl SchemaRegistry {
         self.reference_forms
             .insert(provider.clone(), incoming.clone());
         self.witness_backed_reference_forms.insert(provider.clone());
+        for (identity, declaration) in witness.identified_declarations() {
+            if let Some(kind) = identified_declaration_scalar_kind(&declaration) {
+                self.identified_scalar_kinds
+                    .insert((provider.clone(), identity), kind);
+            }
+        }
         for schema in witness.resources() {
             let key = (provider.clone(), schema.as_schema().resource_type.clone());
             match schema.as_schema().kind {
@@ -12613,6 +12739,7 @@ impl SchemaRegistry {
             data_sources,
             reference_forms,
             witness_backed_reference_forms,
+            identified_scalar_kinds,
         } = other;
         for (owner, incoming) in &reference_forms {
             if witness_backed_reference_forms.contains(owner)
@@ -12637,7 +12764,18 @@ impl SchemaRegistry {
                 self.reference_forms.entry(owner).or_insert(forms);
             }
         }
+        self.identified_scalar_kinds.extend(identified_scalar_kinds);
         Ok(())
+    }
+
+    pub(crate) fn identified_scalar_kind(
+        &self,
+        owner: &str,
+        identity: &TypeIdentity,
+    ) -> Option<RefinedScalarKind> {
+        self.identified_scalar_kinds
+            .get(&(owner.to_string(), identity.clone()))
+            .copied()
     }
 
     /// Look up a schema by explicit `(provider, resource_type, kind)`.

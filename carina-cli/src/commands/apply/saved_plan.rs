@@ -1105,6 +1105,10 @@ pub(super) struct ExecutablePlanFile {
 }
 
 impl ExecutablePlanFile {
+    pub(super) fn reloaded_plan_file(&self) -> &ReloadedPlanFile {
+        &self.plan.plan_file
+    }
+
     pub(super) fn plan(&self) -> &SavedPlan {
         self.plan.plan()
     }
