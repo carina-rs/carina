@@ -4236,7 +4236,7 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
     resources: &HashMap<crate::resource::ResourceId, crate::resource::Resource>,
     data_sources: &HashMap<crate::resource::ResourceId, crate::resource::DataSource>,
     import_identifiers: &HashMap<crate::resource::ResourceId, Value>,
-    deferred_templates: &[crate::parser::DeferredForExpression],
+    deferred_templates: &crate::parser::ResolvedDeferredForExpressions,
 ) -> Result<crate::plan::Plan<S>, SecretRehydrationSiteError> {
     use crate::effect::{DeferredReplacePayload, Effect};
 
@@ -6475,6 +6475,12 @@ pub fn canonicalize_states_with_schemas(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolved_deferred_templates(
+        expressions: impl IntoIterator<Item = crate::parser::DeferredForExpression>,
+    ) -> crate::parser::ResolvedDeferredForExpressions {
+        crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test(expressions)
+    }
 
     #[test]
     fn state_canonicalization_fits_provider_output_with_missing_declared_required_field() {
@@ -13223,12 +13229,13 @@ mod tests {
         let Effect::DeferredCreate { template, .. } = &effect else {
             unreachable!();
         };
+        let deferred_templates = resolved_deferred_templates([template.as_ref().clone()]);
         let rehydrated = rehydrate_plan_desired_secrets(
             &redacted_plan,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            std::slice::from_ref(template.as_ref()),
+            &deferred_templates,
         )
         .expect("unchanged deferred template secret should rehydrate");
         let Effect::DeferredCreate { template, .. } = &rehydrated.effects()[0] else {
@@ -13374,12 +13381,13 @@ mod tests {
             )),
             template: redacted_template,
         });
+        let deferred_templates = resolved_deferred_templates([]);
         let rehydrated = rehydrate_plan_desired_secrets(
             &plan,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &[],
+            &deferred_templates,
         )
         .expect("placeholder-free template must not need a candidate");
         let Effect::DeferredCreate {

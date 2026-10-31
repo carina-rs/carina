@@ -26,7 +26,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use carina_cli::commands::validate_and_resolve_errors;
 use carina_cli::wiring::{
     OverrideAwareBuildMode, OverrideAwareResources, PlanPreprocessor, ProviderLoad,
     resolve_config_block_names_for_test,
@@ -326,7 +325,7 @@ fn apply_path_propagates_module_wait_binding() {
         &carina_core::schema::SchemaRegistry::new(),
     )
     .expect("load_configuration_with_config should succeed");
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
     let providers = ProviderLoad::for_test(
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
@@ -335,8 +334,8 @@ fn apply_path_propagates_module_wait_binding() {
         &parsed.providers,
     );
 
-    let errors = validate_and_resolve_errors(
-        &mut parsed,
+    let parsed = carina_cli::commands::validate_and_resolve_with_config(
+        &parsed,
         base_dir,
         &providers,
         // `skip_resource_validation = true` is a real apply-path mode
@@ -351,13 +350,8 @@ fn apply_path_propagates_module_wait_binding() {
         // expansion).
         true,
         &[],
-    );
-    assert!(
-        errors.is_empty(),
-        "apply-path validate/resolve must succeed for the valid \
-         module fixture; got: {:?}",
-        errors.iter().map(ToString::to_string).collect::<Vec<_>>()
-    );
+    )
+    .expect("apply-path validate/resolve must succeed for the valid module fixture");
 
     // The module's `wait cert` lives two levels in. After the apply
     // path's expansion it MUST reach the caller, instance-prefixed.
@@ -451,7 +445,7 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
         &carina_core::schema::SchemaRegistry::new(),
     )
     .expect("load_configuration_with_config should succeed");
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
     let providers = ProviderLoad::for_test(
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
@@ -459,12 +453,15 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
         ]),
         &parsed.providers,
     );
-    let errors = validate_and_resolve_errors(&mut parsed, base_dir, &providers, false, &[]);
-
-    assert!(
-        errors.is_empty(),
-        "full validation must accept a module-internal wait after expansion prefixes its managed-resource target: {:?}",
-        errors.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    let parsed = carina_cli::commands::validate_and_resolve_with_config(
+        &parsed,
+        base_dir,
+        &providers,
+        false,
+        &[],
+    )
+    .expect(
+        "full validation must accept a module-internal wait after expansion prefixes its managed-resource target",
     );
     assert!(
         parsed.wait_bindings.iter().any(|wait| {
@@ -565,7 +562,11 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let resource_origins = sorted_resources.clone();
     let mut unresolved_for_plan = carina_core::parser::ParsedFile::default();
     unresolved_for_plan.resources = resources_for_plan.clone();
-    let canonical_for_plan = unresolved_for_plan.clone();
+    let canonical_for_plan = carina_core::module_resolver::resolve_modules_providerless(
+        unresolved_for_plan.clone(),
+        &caller,
+    )
+    .expect("canonical plan fixture crosses module resolution");
     let canonical_unresolved = resolve_config_block_names_for_test(
         canonical_for_plan,
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved_for_plan),

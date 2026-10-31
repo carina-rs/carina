@@ -283,28 +283,31 @@ fn resolve_upstream_exports_with_context(
                 let expansion_schemas = schemas.unwrap_or(&empty_schemas);
                 let module_resolution = match provider_context.loaded_context() {
                     Some(loaded) => crate::module_resolver::resolve_upstream_modules_with_config(
-                        &mut parsed,
+                        parsed,
                         &source_abs,
                         loaded,
                         expansion_schemas,
                     ),
                     None => {
                         crate::module_resolver::resolve_upstream_modules_with_providerless_config(
-                            &mut parsed,
+                            parsed,
                             &source_abs,
                             config,
                             expansion_schemas,
                         )
                     }
                 };
-                if let Err(reason) = module_resolution {
-                    errors.push(UpstreamResolveError {
-                        binding: us.binding.clone(),
-                        source: us.source.clone(),
-                        reason: reason.to_string(),
-                    });
-                    continue;
-                }
+                let parsed = match module_resolution {
+                    Ok(parsed) => parsed,
+                    Err(reason) => {
+                        errors.push(UpstreamResolveError {
+                            binding: us.binding.clone(),
+                            source: us.source.clone(),
+                            reason: reason.to_string(),
+                        });
+                        continue;
+                    }
+                };
                 // Declarations were resolved before expansion so inference
                 // compares canonical identities. Resolve once more afterward
                 // to classify newly inferred names that the consumer cannot
@@ -378,13 +381,16 @@ fn resolve_upstream_exports_with_context(
 /// `for-body` prefix when the resource is a deferred-for template.
 /// Three checks emit the same string; centralized here so a future
 /// tweak to the wording lands in one place.
-fn resource_attr_location(rref: ResourceRef<'_>, attr_name: &str) -> String {
+fn resource_attr_location<D: crate::parser::DeferredForPhaseTraversal>(
+    rref: ResourceRef<'_, crate::resource::ModuleSource, D>,
+    attr_name: &str,
+) -> String {
     match rref.context() {
         ResourceContext::Direct => format!("{} attribute `{}`", rref.id(), attr_name),
         ResourceContext::Deferred(d) => {
             format!(
                 "for-body `{}` {} attribute `{}`",
-                d.header,
+                D::deferred_header(d),
                 rref.id(),
                 attr_name
             )
@@ -393,12 +399,13 @@ fn resource_attr_location(rref: ResourceRef<'_>, attr_name: &str) -> String {
 }
 
 /// Walk every project value covered by the upstream export checks, with its
-/// user-facing diagnostic location. Deferred-for body attributes are included
-/// through `iter_all_resources`; iterable expressions are handled separately
-/// because they have their own shape semantics.
-fn for_each_project_value<E, F>(parsed: &crate::parser::File<E>, mut f: F)
+/// user-facing diagnostic location. Parser-side deferred resource bodies are
+/// matched explicitly; iterable expressions are handled separately because
+/// they have their own shape semantics.
+fn for_each_project_value<E, D, F>(parsed: &crate::parser::File<E, D>, mut f: F)
 where
     E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
     F: FnMut(&Value, &str),
 {
     for rref in parsed.iter_all_resources() {
@@ -429,8 +436,11 @@ where
 ///
 /// Bindings absent from `exports` are skipped — the caller decides what to
 /// do about unresolved upstreams.
-pub fn check_upstream_state_field_references<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+pub fn check_upstream_state_field_references<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamFieldError> {
     check_upstream_state_field_references_inner(parsed, exports, true)
@@ -441,15 +451,21 @@ pub fn check_upstream_state_field_references<E: crate::parser::ExportParamLike>(
 /// Production validation uses this alongside the unified typed-reference
 /// passes; the broader legacy entry point above remains useful to callers that
 /// run this check in isolation.
-pub fn check_upstream_state_untyped_field_references<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+pub fn check_upstream_state_untyped_field_references<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamFieldError> {
     check_upstream_state_field_references_inner(parsed, exports, false)
 }
 
-fn check_upstream_state_field_references_inner<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+fn check_upstream_state_field_references_inner<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
     include_typed_consumers: bool,
 ) -> Vec<UpstreamFieldError> {
@@ -509,7 +525,7 @@ fn check_upstream_state_field_references_inner<E: crate::parser::ExportParamLike
 
     // Deferred iterables are not part of the materialized resource tree yet;
     // validate their complete expression separately.
-    for deferred in &parsed.deferred_for_expressions {
+    for deferred in parsed.deferred_for_sites() {
         let location = format!("for-expression `{}`", deferred.header);
         deferred
             .iterable
@@ -683,8 +699,8 @@ impl UpstreamRefDiagnostic for UpstreamForIterableShapeError {
 /// Both flag `(ForBinding × shape)` mismatches; this one fires at
 /// validate time off the upstream's *declared* type, the parser-side
 /// one fires at expansion time off the *resolved* `Value`.
-pub fn check_upstream_state_for_iterable_shapes<E>(
-    parsed: &crate::parser::File<E>,
+pub fn check_upstream_state_for_iterable_shapes<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamForIterableShapeError> {
     fn visit_possible_iterables(value: &Value, f: &mut impl FnMut(&crate::resource::AccessPath)) {
@@ -718,9 +734,9 @@ pub fn check_upstream_state_for_iterable_shapes<E>(
     }
 
     let mut errors: Vec<UpstreamForIterableShapeError> = Vec::new();
-    for deferred in &parsed.deferred_for_expressions {
-        let binding_kind = ForIterableBindingKind::from_for_binding(&deferred.binding);
-        visit_possible_iterables(&deferred.iterable, &mut |path| {
+    for deferred in parsed.deferred_for_sites() {
+        let binding_kind = ForIterableBindingKind::from_for_binding(deferred.binding);
+        visit_possible_iterables(deferred.iterable, &mut |path| {
             let Some(fields) = exports.get(path.binding()) else {
                 return;
             };
@@ -891,8 +907,11 @@ impl UpstreamRefDiagnostic for UpstreamAttributeAccessShapeError {
 /// Sibling of [`check_upstream_state_for_iterable_shapes`] from #2317;
 /// both surface "downstream usage doesn't fit upstream's declared
 /// shape" before apply.
-pub fn check_upstream_state_attribute_access_shapes<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+pub fn check_upstream_state_attribute_access_shapes<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
     check_upstream_state_attribute_access_shapes_inner(parsed, exports, true)
@@ -905,15 +924,21 @@ pub fn check_upstream_state_attribute_access_shapes<E: crate::parser::ExportPara
 /// List, map, and scalar values reached through field syntax resolve to
 /// `Unchecked`, so this fallback retains their more specific upstream shape
 /// diagnostics without reporting a struct-field typo twice.
-pub fn check_upstream_state_attribute_access_shape_fallbacks<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+pub fn check_upstream_state_attribute_access_shape_fallbacks<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
     check_upstream_state_attribute_access_shapes_inner(parsed, exports, false)
 }
 
-fn check_upstream_state_attribute_access_shapes_inner<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+fn check_upstream_state_attribute_access_shapes_inner<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
     include_resolver_struct_errors: bool,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
@@ -927,9 +952,9 @@ fn check_upstream_state_attribute_access_shapes_inner<E: crate::parser::ExportPa
             &mut errors,
         );
     });
-    for deferred in &parsed.deferred_for_expressions {
+    for deferred in parsed.deferred_for_sites() {
         visit_attribute_access(
-            &deferred.iterable,
+            deferred.iterable,
             exports,
             &format!("for-expression `{}`", deferred.header),
             include_resolver_struct_errors,
@@ -1092,17 +1117,20 @@ impl UpstreamRefDiagnostic for UpstreamSubscriptShapeError {
 /// - the leading `field_path` already mismatches the declared shape
 ///   (already handled by `check_upstream_state_attribute_access_shapes`)
 ///   — in that case the field-walk diagnostic is enough.
-pub fn check_upstream_state_subscript_shapes<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+pub fn check_upstream_state_subscript_shapes<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamSubscriptShapeError> {
     let mut errors: Vec<UpstreamSubscriptShapeError> = Vec::new();
     for_each_project_value(parsed, |value, location| {
         visit_subscript_access(value, exports, location, &mut errors);
     });
-    for deferred in &parsed.deferred_for_expressions {
+    for deferred in parsed.deferred_for_sites() {
         visit_subscript_access(
-            &deferred.iterable,
+            deferred.iterable,
             exports,
             &format!("for-expression `{}`", deferred.header),
             &mut errors,

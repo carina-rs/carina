@@ -372,8 +372,8 @@ pub struct ValidationTypeContext<'a> {
 }
 
 impl<'a> ValidationTypeContext<'a> {
-    pub fn new<E>(
-        file: &'a crate::parser::File<E>,
+    pub fn new<E, D>(
+        file: &'a crate::parser::File<E, D>,
         schemas: &'a SchemaRegistry,
         provider_context: &'a LoadedProviderContext,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
@@ -389,8 +389,8 @@ impl<'a> ValidationTypeContext<'a> {
     /// Build the validation view used by bootstrap/editor callers that have
     /// no loaded provider custom-type catalog. Structural checks still run,
     /// while provider-owned leaves never reach the resolver.
-    pub fn new_providerless<E>(
-        file: &'a crate::parser::File<E>,
+    pub fn new_providerless<E, D>(
+        file: &'a crate::parser::File<E, D>,
         schemas: &'a SchemaRegistry,
         provider_context: &'a ProviderContext,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
@@ -403,8 +403,8 @@ impl<'a> ValidationTypeContext<'a> {
         )
     }
 
-    fn with_provider_context<E>(
-        file: &'a crate::parser::File<E>,
+    fn with_provider_context<E, D>(
+        file: &'a crate::parser::File<E, D>,
         schemas: &'a SchemaRegistry,
         provider_context: typecheck::TypecheckProviderContext<'a>,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
@@ -500,21 +500,21 @@ impl std::error::Error for BindingUseReport {}
 /// ```
 #[derive(Debug)]
 pub struct ResolvedFile<E> {
-    inner: crate::parser::File<E>,
+    inner: crate::parser::ModuleResolvedFile<E>,
 }
 
 impl<E> ResolvedFile<E> {
-    pub fn as_file(&self) -> &crate::parser::File<E> {
+    pub fn as_file(&self) -> &crate::parser::ModuleResolvedFile<E> {
         &self.inner
     }
 
-    pub fn into_file(self) -> crate::parser::File<E> {
+    pub fn into_file(self) -> crate::parser::ModuleResolvedFile<E> {
         self.inner
     }
 }
 
 impl<E> std::ops::Deref for ResolvedFile<E> {
-    type Target = crate::parser::File<E>;
+    type Target = crate::parser::ModuleResolvedFile<E>;
 
     fn deref(&self) -> &Self::Target {
         self.as_file()
@@ -902,23 +902,27 @@ fn resolve_value_source_against_sink(
     }
 }
 
-fn resource_sink<'a, E>(
-    file: &'a crate::parser::File<E>,
+fn resource_sink<'a, E, D: crate::parser::DeferredForPhaseTraversal>(
+    file: &'a crate::parser::File<E, D>,
     address: &crate::parser::ResourceAddress,
     path: &crate::parser::AttributePath,
     schemas: &'a SchemaRegistry,
 ) -> Option<RefSink<'a>> {
-    let resource = file
+    let schema = match file
         .iter_all_resources()
-        .find(|resource| resource.id() == address.resource_id())?;
-    let schema = match resource {
-        ResourceRef::LiveComposition(_) => return None,
-        ResourceRef::DataSource(data_source) => schemas.get_for_data_source(data_source),
-        ResourceRef::Resource(resource) | ResourceRef::Deferred { resource, .. } => {
-            schemas.get_for(resource)
+        .find(|resource| resource.id() == address.resource_id())
+    {
+        Some(ResourceRef::LiveComposition(_)) => return None,
+        Some(ResourceRef::DataSource(data_source)) => {
+            schemas.get_for_data_source(data_source)?.schema()
         }
-    }?
-    .schema();
+        Some(ResourceRef::Resource(resource)) => schemas.get_for(resource)?.schema(),
+        Some(ResourceRef::Deferred {
+            resource,
+            deferred: _deferred,
+        }) => schemas.get_for(resource)?.schema(),
+        None => return None,
+    };
     let mut segments = path.segments().iter();
     let crate::parser::AttributePathSegment::Attribute(root) = segments.next()? else {
         return None;
@@ -939,8 +943,8 @@ fn resource_sink<'a, E>(
     Some(sink)
 }
 
-fn module_argument_type<E>(
-    file: &crate::parser::File<E>,
+fn module_argument_type<E, D>(
+    file: &crate::parser::File<E, D>,
     call_id: &crate::parser::ModuleCallId,
     argument: &str,
     signatures: &crate::module_resolver::ResolvedModuleSignatures,
@@ -1149,8 +1153,8 @@ fn same_authored_use(
 /// module argument. A direct bare binding is the complete argument. For a
 /// nested use, ordinary container validation remains active unless the typed
 /// authority produced the diagnostic for that leaf.
-pub fn binding_use_authority_owns_module_argument<E>(
-    file: &crate::parser::File<E>,
+pub fn binding_use_authority_owns_module_argument<E, D>(
+    file: &crate::parser::File<E, D>,
     report: &BindingUseReport,
     call: &crate::parser::ModuleCallId,
     argument: &str,
@@ -1173,8 +1177,8 @@ pub fn binding_use_authority_owns_module_argument<E>(
 
 /// Whether parsing reserved this entire module argument because a structural
 /// leaf could not be represented in the runtime `Value` tree.
-pub fn module_argument_has_pending_binding_use<E>(
-    file: &crate::parser::File<E>,
+pub fn module_argument_has_pending_binding_use<E, D>(
+    file: &crate::parser::File<E, D>,
     call: &crate::parser::ModuleCallId,
     argument: &str,
 ) -> bool {
@@ -1193,8 +1197,8 @@ pub fn module_argument_has_pending_binding_use<E>(
 /// Report-only schema-aware authority for every parser-recorded bare binding
 /// use. Editor and collect-all validation paths borrow the file through this
 /// function; they do not mint production readiness.
-pub fn check_bare_binding_uses<E>(
-    file: &crate::parser::File<E>,
+pub fn check_bare_binding_uses<E, D: crate::parser::DeferredForPhaseTraversal>(
+    file: &crate::parser::File<E, D>,
     context: &ValidationTypeContext<'_>,
 ) -> BindingUseReport {
     let mut report = BindingUseReport {
@@ -1287,7 +1291,7 @@ pub fn check_bare_binding_uses<E>(
 /// channel, so no later caller can pair an unrelated file with a detached
 /// proof. On failure the report contains every authored finding.
 pub fn resolve_bare_binding_uses<E>(
-    file: crate::parser::File<E>,
+    file: crate::parser::ModuleResolvedFile<E>,
     schemas: &SchemaRegistry,
     provider_context: &LoadedProviderContext,
     module_signatures: &crate::module_resolver::ResolvedModuleSignatures,
@@ -2124,15 +2128,21 @@ fn composition_ref_error_kind(
 /// The shared value checker deliberately defers references. This pass supplies
 /// the missing binding authority: function-call arguments use their declared
 /// parameter type, and function bodies use the declared return type.
-pub fn validate_user_function_ref_types_with_bindings<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+pub fn validate_user_function_ref_types_with_bindings<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
     validate_user_function_ref_types_inner(parsed, bindings, UnknownReferencePolicy::Report)
 }
 
-fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
-    parsed: &crate::parser::File<E>,
+fn validate_user_function_ref_types_inner<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     bindings: &BindingIndex<'_>,
     unknown_policy: UnknownReferencePolicy,
 ) -> Result<(), String> {
@@ -2799,8 +2809,8 @@ pub fn validate_anonymous_resource_schemas<'a>(
 /// and a non-`read` resource requires a `Managed` registry entry. If the
 /// wrong-kind entry is present (e.g. `read` against a managed-only type),
 /// emit a kind-specific error explaining the mismatch.
-pub fn validate_resources<E>(
-    parsed: &crate::parser::File<E>,
+pub fn validate_resources<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &crate::parser::File<E, D>,
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
     provider_context: &ProviderContext,
@@ -2816,8 +2826,11 @@ pub fn validate_resources<E>(
                 parsed
                     .iter_all_resources()
                     .filter_map(|resource| match resource {
-                        ResourceRef::Resource(resource)
-                        | ResourceRef::Deferred { resource, .. } => Some(resource),
+                        ResourceRef::Resource(resource) => Some(resource),
+                        ResourceRef::Deferred {
+                            resource,
+                            deferred: _deferred,
+                        } => Some(resource),
                         ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
                     }),
                 registry,
@@ -2835,10 +2848,77 @@ pub fn validate_resources<E>(
     // and data sources route to the same schema-lookup body but render
     // different kind-mismatch diagnostics when the registry entry of the
     // *opposite* kind exists.
+    #[derive(Clone, Copy)]
     enum ValidatableKind {
         Resource,
         DataSource,
     }
+    let mut validate_resource =
+        |kind: ValidatableKind,
+         schema: Option<crate::schema::OwnerBoundResourceSchema<'_>>,
+         id: &crate::resource::ResourceId,
+         quoted_string_attrs: &HashSet<String>,
+         resolved_attributes: std::collections::HashMap<String, Value>,
+         managed_resource: Option<&crate::resource::Resource>| {
+            match schema {
+                Some(schema) => {
+                    let is_string_literal = |attr: &str| quoted_string_attrs.contains(attr);
+                    if let Err(errors) = schema.validate_with_resolver(
+                        &resolved_attributes,
+                        &is_string_literal,
+                        provider_context.custom_type_resolver(),
+                    ) {
+                        for error in errors {
+                            all_errors.push(format!("{}: {}", id, error));
+                        }
+                    }
+                    if let Some(resource) = managed_resource
+                        && let Err(errors) =
+                            crate::resource::resolve_ignore_changes(resource, &schema)
+                    {
+                        all_errors
+                            .extend(errors.into_iter().map(|error| format!("{}: {}", id, error)));
+                    }
+                }
+                None => {
+                    let provider = id.provider.as_str();
+                    let resource_type = id.resource_type.as_str();
+
+                    // No matching-kind entry. Skip if provider is not loaded —
+                    // schemas are simply not available, not a configuration error.
+                    if !provider.is_empty() && !known_providers.contains(provider) {
+                        return;
+                    }
+                    let has_managed = registry.has_managed(provider, resource_type);
+                    let has_data_source = registry.has_data_source(provider, resource_type);
+                    let kind_label = if provider.is_empty() {
+                        resource_type.to_string()
+                    } else {
+                        format!("{}.{}", provider, resource_type)
+                    };
+
+                    match kind {
+                        ValidatableKind::DataSource if has_managed => {
+                            // `read` used against a managed-only type
+                            all_errors.push(format!(
+                            "{} is a managed resource, not a data source. Remove the `read` keyword:\n  let <name> = {} {{ }}",
+                            kind_label, kind_label
+                        ));
+                        }
+                        ValidatableKind::Resource if has_data_source => {
+                            // No `read` against a data-source-only type
+                            all_errors.push(format!(
+                            "{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}",
+                            kind_label, kind_label
+                        ));
+                        }
+                        ValidatableKind::Resource | ValidatableKind::DataSource => {
+                            all_errors.push(format!("Unknown resource type: {}", kind_label));
+                        }
+                    }
+                }
+            }
+        };
     for rref in parsed.iter_all_resources() {
         // A deferred for-expression template body is always managed —
         // `for` bodies never carry `read` / composition.
@@ -2847,80 +2927,29 @@ pub fn validate_resources<E>(
             ResourceRef::DataSource(d) => {
                 (ValidatableKind::DataSource, registry.get_for_data_source(d))
             }
-            ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => {
-                (ValidatableKind::Resource, registry.get_for(m))
-            }
+            ResourceRef::Resource(m) => (ValidatableKind::Resource, registry.get_for(m)),
+            ResourceRef::Deferred {
+                resource: m,
+                deferred: _deferred,
+            } => (ValidatableKind::Resource, registry.get_for(m)),
         };
-        let id = rref.id();
-        let quoted_string_attrs = rref.quoted_string_attrs();
-
-        match schema {
-            Some(schema) => {
-                let is_string_literal = |attr: &str| quoted_string_attrs.contains(attr);
-                if let Err(errors) = schema.validate_with_resolver(
-                    &rref.resolved_attributes(),
-                    &is_string_literal,
-                    provider_context.custom_type_resolver(),
-                ) {
-                    for error in errors {
-                        all_errors.push(format!("{}: {}", id, error));
-                    }
-                }
-                if matches!(kind, ValidatableKind::Resource) {
-                    let resource = match rref {
-                        ResourceRef::Resource(resource)
-                        | ResourceRef::Deferred { resource, .. } => resource,
-                        ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => {
-                            unreachable!("managed validation kind must carry a resource")
-                        }
-                    };
-                    if let Err(errors) = crate::resource::resolve_ignore_changes(resource, &schema)
-                    {
-                        all_errors
-                            .extend(errors.into_iter().map(|error| format!("{}: {}", id, error)));
-                    }
-                }
-            }
-            None => {
-                let provider = id.provider.as_str();
-                let resource_type = id.resource_type.as_str();
-
-                // No matching-kind entry. Skip if provider is not loaded —
-                // schemas are simply not available, not a configuration error.
-                if !provider.is_empty() && !known_providers.contains(provider) {
-                    continue;
-                }
-                let has_managed = registry.has_managed(provider, resource_type);
-                let has_data_source = registry.has_data_source(provider, resource_type);
-                let kind_label = if provider.is_empty() {
-                    resource_type.to_string()
-                } else {
-                    format!("{}.{}", provider, resource_type)
-                };
-
-                match kind {
-                    ValidatableKind::DataSource if has_managed => {
-                        // `read` used against a managed-only type
-                        all_errors.push(format!(
-                            "{} is a managed resource, not a data source. Remove the `read` keyword:\n  let <name> = {} {{ }}",
-                            kind_label, kind_label
-                        ));
-                    }
-                    ValidatableKind::Resource if has_data_source => {
-                        // No `read` against a data-source-only type
-                        all_errors.push(format!(
-                            "{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}",
-                            kind_label, kind_label
-                        ));
-                    }
-                    _ => {
-                        all_errors.push(format!("Unknown resource type: {}", kind_label));
-                    }
-                }
-            }
-        }
+        let managed_resource = match rref {
+            ResourceRef::Resource(resource) => Some(resource),
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => Some(resource),
+            ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
+        };
+        validate_resource(
+            kind,
+            schema,
+            rref.id(),
+            rref.quoted_string_attrs(),
+            rref.resolved_attributes(),
+            managed_resource,
+        );
     }
-
     if all_errors.is_empty() {
         Ok(())
     } else {
@@ -2932,8 +2961,8 @@ pub fn validate_resources<E>(
 ///
 /// For example, if `ipv4_ipam_pool_id` expects `IpamPoolId` type,
 /// a reference like `vpc.vpc_id` (which is `AwsResourceId`) should be an error.
-pub fn validate_resource_ref_types<E>(
-    parsed: &crate::parser::File<E>,
+pub fn validate_resource_ref_types<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &crate::parser::File<E, D>,
     registry: &SchemaRegistry,
     _argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_>,
@@ -2941,22 +2970,118 @@ pub fn validate_resource_ref_types<E>(
     validate_resource_ref_types_inner(parsed, registry, bindings)
 }
 
-fn validate_resource_ref_types_inner<E>(
-    parsed: &crate::parser::File<E>,
+fn validate_resource_ref_types_inner<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &crate::parser::File<E, D>,
     registry: &SchemaRegistry,
     bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
     let inference_bindings = inference::bindings_from_parsed(parsed);
 
+    let mut validate_resource =
+        |resource_id: &crate::resource::ResourceId,
+         resource_location: String,
+         attrs: &indexmap::IndexMap<String, Value>,
+         validated_schema: crate::schema::OwnerBoundResourceSchema<'_>| {
+            for (attr_name, attr_value) in attrs {
+                let sink = validated_schema
+                    .effective_attribute_by_authored_name(attr_name)
+                    .map(|attribute| RefSink::from_effective_type(attribute.value_type()));
+                let string_sink = AttributeType::string();
+                visit_refs_with_sink(
+                    attr_value,
+                    sink,
+                    &mut |reference, sink, usage, _candidate_value| {
+                        let Some(source) = resolve_resource_reference(
+                            resource_id,
+                            reference,
+                            bindings,
+                            usage,
+                            &mut all_errors,
+                        ) else {
+                            return;
+                        };
+                        if matches!(
+                            reference,
+                            ReferencePathRef::Access(path) if !path.segments().is_empty()
+                        ) {
+                            // The shared postfix authority below owns both narrowing
+                            // and sink compatibility for a segmented ResourceRef.
+                            return;
+                        }
+                        let Some(sink_type) = (match sink {
+                            Some(RefSink::EffectiveType {
+                                attr_type, defs, ..
+                            }) => Some(attr_type.in_schema(defs)),
+                            Some(RefSink::String) => {
+                                Some(crate::schema::TypeInSchema::schemaless(&string_sink))
+                            }
+                            Some(RefSink::TypeExpr(_)) | None => None,
+                        }) else {
+                            return;
+                        };
+                        let Err(mismatch) = source.is_assignable_to_sink(sink_type) else {
+                            return;
+                        };
+                        let source_name = mismatch.actual_type_name();
+                        let origin = mismatch.origin_description(reference);
+                        all_errors.push(format!(
+                            "{}: cannot assign {} to '{}': expected {}, got {} ({})",
+                            resource_location,
+                            source_name,
+                            attr_name,
+                            sink_type.resolved_type_name(),
+                            source_name,
+                            origin,
+                        ));
+                    },
+                );
+                visit_computed_accesses_with_sink(attr_value, sink, &mut |access, sink| {
+                    let sink_type = match sink {
+                        Some(RefSink::EffectiveType {
+                            attr_type, defs, ..
+                        }) => attr_type.in_schema(defs),
+                        Some(RefSink::String) => {
+                            crate::schema::TypeInSchema::schemaless(&string_sink)
+                        }
+                        Some(RefSink::TypeExpr(_)) | None => return,
+                    };
+                    match check_deferred_access_type(
+                        access,
+                        sink_type,
+                        &inference_bindings,
+                        registry,
+                        bindings,
+                    ) {
+                        Ok(()) => {}
+                        Err(DeferredAccessTypeError::InvalidAccess { error }) => {
+                            all_errors.push(format!("{}: {}", resource_location, error));
+                        }
+                        Err(DeferredAccessTypeError::TypeMismatch {
+                            expected,
+                            actual,
+                            origin,
+                        }) => {
+                            all_errors.push(format!(
+                                "{}: cannot assign {} to '{}': expected {}, got {} ({})",
+                                resource_location, actual, attr_name, expected, actual, origin,
+                            ));
+                        }
+                    }
+                });
+            }
+        };
+
     for rref in parsed.iter_all_resources() {
         // A deferred for-expression template body is always managed.
         let schema = match rref {
             ResourceRef::LiveComposition(_) => continue,
             ResourceRef::DataSource(d) => registry.get_for_data_source(d),
-            ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => {
-                registry.get_for(m)
-            }
+            ResourceRef::Resource(m) => registry.get_for(m),
+            ResourceRef::Deferred {
+                resource: m,
+                deferred: _deferred,
+            } => registry.get_for(m),
         };
         let Some(validated_schema) = schema else {
             continue;
@@ -2965,96 +3090,16 @@ fn validate_resource_ref_types_inner<E>(
         let resource_location = match rref.context() {
             ResourceContext::Direct => resource_id.to_string(),
             ResourceContext::Deferred(deferred) => {
-                format!("for-body `{}` {}", deferred.header, resource_id)
+                format!(
+                    "for-body `{}` {}",
+                    D::deferred_header(deferred),
+                    resource_id
+                )
             }
         };
 
         let attrs = rref.attributes();
-        for (attr_name, attr_value) in attrs.iter() {
-            let sink = validated_schema
-                .effective_attribute_by_authored_name(attr_name)
-                .map(|attribute| RefSink::from_effective_type(attribute.value_type()));
-            let string_sink = AttributeType::string();
-            visit_refs_with_sink(
-                attr_value,
-                sink,
-                &mut |reference, sink, usage, _candidate_value| {
-                    let Some(source) = resolve_resource_reference(
-                        resource_id,
-                        reference,
-                        bindings,
-                        usage,
-                        &mut all_errors,
-                    ) else {
-                        return;
-                    };
-                    if matches!(
-                        reference,
-                        ReferencePathRef::Access(path) if !path.segments().is_empty()
-                    ) {
-                        // The shared postfix authority below owns both narrowing
-                        // and sink compatibility for a segmented ResourceRef.
-                        return;
-                    }
-                    let Some(sink_type) = (match sink {
-                        Some(RefSink::EffectiveType {
-                            attr_type, defs, ..
-                        }) => Some(attr_type.in_schema(defs)),
-                        Some(RefSink::String) => {
-                            Some(crate::schema::TypeInSchema::schemaless(&string_sink))
-                        }
-                        Some(RefSink::TypeExpr(_)) | None => None,
-                    }) else {
-                        return;
-                    };
-                    let Err(mismatch) = source.is_assignable_to_sink(sink_type) else {
-                        return;
-                    };
-                    let source_name = mismatch.actual_type_name();
-                    let origin = mismatch.origin_description(reference);
-                    all_errors.push(format!(
-                        "{}: cannot assign {} to '{}': expected {}, got {} ({})",
-                        resource_location,
-                        source_name,
-                        attr_name,
-                        sink_type.resolved_type_name(),
-                        source_name,
-                        origin,
-                    ));
-                },
-            );
-            visit_computed_accesses_with_sink(attr_value, sink, &mut |access, sink| {
-                let sink_type = match sink {
-                    Some(RefSink::EffectiveType {
-                        attr_type, defs, ..
-                    }) => attr_type.in_schema(defs),
-                    Some(RefSink::String) => crate::schema::TypeInSchema::schemaless(&string_sink),
-                    Some(RefSink::TypeExpr(_)) | None => return,
-                };
-                match check_deferred_access_type(
-                    access,
-                    sink_type,
-                    &inference_bindings,
-                    registry,
-                    bindings,
-                ) {
-                    Ok(()) => {}
-                    Err(DeferredAccessTypeError::InvalidAccess { error }) => {
-                        all_errors.push(format!("{}: {}", resource_location, error));
-                    }
-                    Err(DeferredAccessTypeError::TypeMismatch {
-                        expected,
-                        actual,
-                        origin,
-                    }) => {
-                        all_errors.push(format!(
-                            "{}: cannot assign {} to '{}': expected {}, got {} ({})",
-                            resource_location, actual, attr_name, expected, actual, origin,
-                        ));
-                    }
-                }
-            });
-        }
+        validate_resource(resource_id, resource_location, &attrs, validated_schema);
     }
 
     all_errors.extend(
@@ -3179,23 +3224,30 @@ pub fn validate_deferred_for_iterable_types<E>(
     validate_deferred_for_iterable_types_with_bindings(parsed, schemas, &bindings)
 }
 
-fn validate_deferred_for_iterable_types_with_bindings<E>(
-    parsed: &crate::parser::File<E>,
+fn validate_deferred_for_iterable_types_with_bindings<
+    E,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, D>,
     schemas: &SchemaRegistry,
     bindings: &inference::InferenceBindings,
 ) -> Vec<DeferredForIterableTypeDiagnostic> {
     let mut diagnostics = Vec::new();
-    for deferred in &parsed.deferred_for_expressions {
-        let expected = match &deferred.binding {
+    for deferred in parsed.deferred_for_sites() {
+        let expected = match deferred.binding {
             ForBinding::Simple(_) | ForBinding::Indexed(_, _) => DeferredIterableKind::List,
             ForBinding::Map(_, _) => DeferredIterableKind::Map,
         };
         validate_deferred_iterable_operand(
-            &deferred.iterable,
-            expected,
-            bindings,
-            schemas,
-            deferred,
+            deferred.iterable,
+            DeferredIterableValidationContext {
+                expected,
+                bindings,
+                schemas,
+                file: deferred.file,
+                line: deferred.line,
+                expression: deferred.iterable,
+            },
             &mut diagnostics,
         );
     }
@@ -3211,55 +3263,41 @@ impl std::fmt::Display for DeferredIterableKind {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DeferredIterableValidationContext<'a> {
+    expected: DeferredIterableKind,
+    bindings: &'a inference::InferenceBindings,
+    schemas: &'a SchemaRegistry,
+    file: Option<&'a str>,
+    line: usize,
+    expression: &'a Value,
+}
+
 fn validate_deferred_iterable_operand(
     value: &Value,
-    expected: DeferredIterableKind,
-    bindings: &inference::InferenceBindings,
-    schemas: &SchemaRegistry,
-    deferred: &crate::parser::DeferredForExpression,
+    context: DeferredIterableValidationContext<'_>,
     diagnostics: &mut Vec<DeferredForIterableTypeDiagnostic>,
 ) {
     match value {
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            validate_deferred_iterable_operand(
-                value,
-                expected,
-                bindings,
-                schemas,
-                deferred,
-                diagnostics,
-            );
-            validate_deferred_iterable_operand(
-                default,
-                expected,
-                bindings,
-                schemas,
-                deferred,
-                diagnostics,
-            );
+            validate_deferred_iterable_operand(value, context, diagnostics);
+            validate_deferred_iterable_operand(default, context, diagnostics);
             return;
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            validate_deferred_iterable_operand(
-                inner,
-                expected,
-                bindings,
-                schemas,
-                deferred,
-                diagnostics,
-            );
+            validate_deferred_iterable_operand(inner, context, diagnostics);
             return;
         }
         _ => {}
     }
 
-    let inferred = match deferred_iterable_shape(value, bindings, schemas) {
+    let inferred = match deferred_iterable_shape(value, context.bindings, context.schemas) {
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
             inference::InferenceError::IncompatibleCoalesceTypes { left, default },
         )) => {
             diagnostics.push(deferred_iterable_diagnostic(
-                deferred,
+                context,
                 format!("coalesce default type `{default}` does not match left type `{left}`"),
             ));
             None
@@ -3267,7 +3305,7 @@ fn validate_deferred_iterable_operand(
         Err(crate::static_type::InferenceIssue::Failed(
             inference::InferenceError::HeterogeneousCollection { reason },
         )) => {
-            diagnostics.push(deferred_iterable_diagnostic(deferred, reason));
+            diagnostics.push(deferred_iterable_diagnostic(context, reason));
             None
         }
         Err(crate::static_type::InferenceIssue::Failed(
@@ -3287,24 +3325,24 @@ fn validate_deferred_iterable_operand(
     let Some(inferred) = inferred else {
         return;
     };
-    match (expected, inferred) {
+    match (context.expected, inferred) {
         (DeferredIterableKind::List, DeferredIterableShape::List)
         | (DeferredIterableKind::Map, DeferredIterableShape::Map) => {}
         (DeferredIterableKind::List, DeferredIterableShape::Map) => {
             diagnostics.push(deferred_iterable_diagnostic(
-                deferred,
+                context,
                 "expected list iterable, got map".to_string(),
             ));
         }
         (DeferredIterableKind::Map, DeferredIterableShape::List) => {
             diagnostics.push(deferred_iterable_diagnostic(
-                deferred,
+                context,
                 "expected map iterable, got list".to_string(),
             ));
         }
         (expected, DeferredIterableShape::NonIterable(type_expr)) => {
             diagnostics.push(deferred_iterable_diagnostic(
-                deferred,
+                context,
                 format!("expected {expected} iterable, got {type_expr}"),
             ));
         }
@@ -3312,13 +3350,13 @@ fn validate_deferred_iterable_operand(
 }
 
 fn deferred_iterable_diagnostic(
-    deferred: &crate::parser::DeferredForExpression,
+    context: DeferredIterableValidationContext<'_>,
     message: String,
 ) -> DeferredForIterableTypeDiagnostic {
     DeferredForIterableTypeDiagnostic {
-        file: deferred.file.clone(),
-        line: deferred.line,
-        expression: crate::value::format_value(&deferred.iterable),
+        file: context.file.map(str::to_string),
+        line: context.line,
+        expression: crate::value::format_value(context.expression),
         message,
     }
 }
@@ -4443,7 +4481,7 @@ pub fn resolve_export_static_type_for_consumer(
 /// top-level `arguments` or `attributes` block marks the directory as a
 /// module whose provider configuration comes from its caller.
 #[must_use]
-pub fn is_module_definition<E>(parsed: &crate::parser::File<E>) -> bool {
+pub fn is_module_definition<E, D>(parsed: &crate::parser::File<E, D>) -> bool {
     !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty()
 }
 
@@ -6416,6 +6454,25 @@ pub fn check_unused_bindings(view: &crate::config_loader::AuthoredBindingView) -
 }
 
 fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<String> {
+    let resources = parsed.iter_all_resources().collect();
+    let deferred_sites = parsed.deferred_for_sites().collect();
+    check_unused_bindings_in_file_parts(parsed, resources, deferred_sites)
+}
+
+#[cfg(test)]
+fn check_unused_bindings_in_resolved_file(
+    parsed: &crate::parser::ModuleResolvedParsedFile,
+) -> Vec<String> {
+    let resources = parsed.iter_all_resources().collect();
+    let deferred_sites = parsed.deferred_for_sites().collect();
+    check_unused_bindings_in_file_parts(parsed, resources, deferred_sites)
+}
+
+fn check_unused_bindings_in_file_parts<'a, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &'a crate::parser::File<crate::parser::ParsedExportParam, D>,
+    resources: Vec<ResourceRef<'a, crate::resource::ModuleSource, D>>,
+    deferred_sites: Vec<crate::parser::DeferredForSite<'a>>,
+) -> Vec<String> {
     let mut referenced: HashSet<String> = HashSet::new();
     let mut scoped_bare_references: HashSet<(crate::parser::BindingScopeId, String)> =
         HashSet::new();
@@ -6442,7 +6499,7 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
     // for the top-level managed-resource arm, matching plan's `parsed.resources`
     // target-resolution set.
     let mut defined_bindings: Vec<(String, Option<crate::parser::BindingScopeId>)> = Vec::new();
-    for rref in parsed.iter_all_resources() {
+    for rref in &resources {
         if let Some(binding_name) = rref.binding() {
             if binding_name == "_" {
                 continue;
@@ -6469,7 +6526,7 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
     // Collect all referenced binding names. Walk both top-level resources
     // and for-body template resources so bindings referenced only inside a
     // `for` loop are counted as used.
-    for rref in parsed.iter_all_resources() {
+    for rref in &resources {
         let attrs = rref.attributes();
         for value in attrs.values() {
             collect_dependencies(value, &mut referenced);
@@ -6480,8 +6537,8 @@ fn check_unused_bindings_in_file(parsed: &crate::parser::ParsedFile) -> Vec<Stri
             referenced.insert(dep.clone());
         }
     }
-    for deferred in &parsed.deferred_for_expressions {
-        collect_dependencies(&deferred.iterable, &mut referenced);
+    for deferred in deferred_sites {
+        collect_dependencies(deferred.iterable, &mut referenced);
     }
     for call in &parsed.module_calls {
         for (_, value) in call.arguments() {

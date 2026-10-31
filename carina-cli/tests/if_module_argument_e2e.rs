@@ -1,5 +1,6 @@
 //! End-to-end coverage for module-argument `if` conditions (carina#4149).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -98,6 +99,103 @@ struct ConditionalDependencyFixture {
 struct GuardedReferenceFixture {
     _temp: tempfile::TempDir,
     caller: PathBuf,
+}
+
+struct OrdinaryModuleDependencyFixture {
+    _temp: tempfile::TempDir,
+    caller: PathBuf,
+}
+
+impl OrdinaryModuleDependencyFixture {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("create ordinary-module dependency fixture");
+        let inner = temp.path().join("inner");
+        let outer = temp.path().join("outer");
+        let caller = temp.path().join("caller");
+        for directory in [&inner, &outer, &caller] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(
+            inner.join("main.crn"),
+            r#"arguments { source: mock.test.resource }
+let nested = mock.test.resource {
+  name = "nested"
+  parent_name = source.name
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            outer.join("main.crn"),
+            r#"arguments {
+  source: mock.test.resource
+  names: list(String)
+}
+
+let base = mock.test.resource { name = "base" }
+let cross = mock.test.resource {
+  name = "cross"
+  parent_name = base.name
+}
+
+let inner = use { source = "../inner" }
+let nested_call = inner { source = source }
+
+let generated = for name in names {
+  mock.test.resource { name = name }
+}
+
+let roles = read mock.iam.Roles { name_regex = base.name }
+let data_consumer = mock.test.resource {
+  name = roles.names[0]
+}
+
+let ready = wait cross {
+  until = cross.name == "cross"
+  depends_on = [data_consumer]
+}
+let gated = mock.test.resource {
+  name = "gated"
+  parent_name = ready.name
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            caller.join("backend.crn"),
+            "backend local { path = \"carina.state.json\" }\nprovider mock {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            caller.join("main.crn"),
+            r#"let source = mock.test.resource { name = "caller" }
+let outer = use { source = "../outer" }
+let stack = outer {
+  source = source
+  names = [source.name]
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            caller.join("mock-provider-state.json"),
+            r#"{
+  "version": 2,
+  "states": {
+    "iam.Roles.stack.roles": {
+      "name_regex": "base",
+      "names": ["from-data"]
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+        Self {
+            _temp: temp,
+            caller,
+        }
+    }
 }
 
 impl GuardedReferenceFixture {
@@ -214,6 +312,27 @@ fn resource_dependency_bindings<'a>(
         })
         .and_then(|resource| resource.get("dependency_bindings"))
         .unwrap_or_else(|| panic!("missing dependency metadata for {binding}: {resources:#}"))
+}
+
+fn dependency_bindings_by_binding(resources: &serde_json::Value) -> BTreeMap<String, Vec<String>> {
+    resources
+        .as_array()
+        .expect("resource collection")
+        .iter()
+        .map(|resource| {
+            let binding = resource["binding"]
+                .as_str()
+                .expect("resource binding")
+                .to_string();
+            let dependencies = resource["dependency_bindings"]
+                .as_array()
+                .expect("dependency bindings")
+                .iter()
+                .map(|dependency| dependency.as_str().expect("dependency binding").to_string())
+                .collect();
+            (binding, dependencies)
+        })
+        .collect()
 }
 
 impl ConditionalReferenceFixture {
@@ -399,6 +518,71 @@ fn plan_json_dependencies_are_derived_from_the_selected_value_branch() {
         let effect = resource_dependency_bindings(&create_resources, "on.consumer");
         assert_eq!(effect, &expected, "stale dependency in create effect");
     }
+}
+
+#[test]
+fn plan_json_preserves_if_free_two_level_module_dependency_edges() {
+    let fixture = OrdinaryModuleDependencyFixture::new();
+    let plan = plan_json(&fixture.caller);
+
+    let expected = BTreeMap::from([
+        ("source".to_string(), vec![]),
+        ("stack.base".to_string(), vec![]),
+        ("stack.cross".to_string(), vec!["stack.base".to_string()]),
+        (
+            "stack.nested_call.nested".to_string(),
+            vec!["source".to_string()],
+        ),
+        ("stack.generated[0]".to_string(), vec!["source".to_string()]),
+        (
+            "stack.data_consumer".to_string(),
+            vec!["stack.roles".to_string()],
+        ),
+        ("stack.gated".to_string(), vec!["stack.ready".to_string()]),
+    ]);
+    assert_eq!(
+        dependency_bindings_by_binding(&plan["sorted_resources"]),
+        expected,
+        "ordinary module dependencies drifted in sorted_resources",
+    );
+
+    let create_resources = plan["plan"]["effects"]
+        .as_array()
+        .expect("plan effects")
+        .iter()
+        .filter_map(|effect| effect.get("Create"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        dependency_bindings_by_binding(&serde_json::Value::Array(create_resources)),
+        expected,
+        "ordinary module dependencies drifted in Create effects",
+    );
+
+    let roles = plan["plan"]["effects"]
+        .as_array()
+        .expect("plan effects")
+        .iter()
+        .filter_map(|effect| effect.get("Read"))
+        .find_map(|effect| effect.get("resource"))
+        .expect("module data-source Read effect");
+    assert_eq!(roles["binding"], "stack.roles");
+    assert_eq!(
+        roles["dependency_bindings"],
+        serde_json::json!(["stack.base"])
+    );
+
+    let wait = plan["plan"]["effects"]
+        .as_array()
+        .expect("plan effects")
+        .iter()
+        .find_map(|effect| effect.get("Wait"))
+        .expect("module wait effect");
+    assert_eq!(wait["identity"], "stack.ready");
+    assert_eq!(
+        wait["explicit_dependencies"],
+        serde_json::json!(["stack.data_consumer"]),
+    );
 }
 
 #[test]

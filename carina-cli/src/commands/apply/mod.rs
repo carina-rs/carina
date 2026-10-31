@@ -194,7 +194,7 @@ fn format_total_apply_line(elapsed: Duration) -> String {
 
 struct BootstrapCreateContext<'a> {
     backend: &'a dyn StateBackend,
-    parsed: &'a carina_core::parser::InferredFile,
+    parsed: &'a carina_core::parser::ModuleResolvedInferredFile,
     provider_configs: &'a ResolvedProviderConfigs,
     normalizer: &'a dyn ProviderNormalizer,
     factories: &'a [Box<dyn carina_core::provider::ProviderFactory>],
@@ -380,7 +380,9 @@ fn format_partial_state_bucket_create_warning(
     )
 }
 
-fn bootstrap_resolved_bindings(parsed: &carina_core::parser::InferredFile) -> ResolvedBindings {
+fn bootstrap_resolved_bindings(
+    parsed: &carina_core::parser::ModuleResolvedInferredFile,
+) -> ResolvedBindings {
     let managed_current = HashMap::new();
     let remote_bindings = HashMap::new();
     let wait_aliases: Vec<WaitAliasSpec> = parsed
@@ -1744,7 +1746,7 @@ fn reload_apply_configuration_after_bootstrap(
 }
 
 async fn load_apply_provider_inputs<E>(
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::ModuleResolvedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedProviderInputs, AppError> {
@@ -2643,7 +2645,7 @@ where
 
 fn import_identifiers_from_current_config<S>(
     plan: &carina_core::plan::Plan<S>,
-    parsed: &carina_core::parser::InferredFile,
+    parsed: &carina_core::parser::ModuleResolvedInferredFile,
 ) -> HashMap<ResourceId, Value> {
     let mut identifiers = HashMap::new();
     let bindings = bootstrap_resolved_bindings(parsed);
@@ -2782,7 +2784,7 @@ fn rehydrate_desired_plan_file(
 
 fn rehydrate_desired_plan_file_from_parts(
     plan_file: &mut ReloadedPlanFile,
-    parsed: &carina_core::parser::InferredFile,
+    parsed: &carina_core::parser::ModuleResolvedInferredFile,
     provider_inputs: &ResolvedProviderInputs,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
@@ -2805,7 +2807,7 @@ fn rehydrate_desired_plan_file_from_parts(
         &resource_candidates,
         &data_source_candidates,
         &import_identifiers,
-        &parsed.deferred_for_expressions,
+        parsed.deferred_for_expressions(),
     )
     .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
     *plan_file.plan_mut() = rehydrated_plan;
@@ -3490,7 +3492,8 @@ async fn run_apply_from_plan_locked_owned(
             let historical_display =
                 collect_historical_display_attributes(plan, &managed_current, state_file.as_ref());
 
-            let summary = PlanChangeSummary::new(plan, &[], &[]);
+            let summary =
+                PlanChangeSummary::from_reloaded_plan(rehydrated_plan_file.reloaded_plan_file());
             print_plan(
                 plan,
                 &summary,

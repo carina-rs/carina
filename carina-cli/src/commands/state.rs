@@ -1332,7 +1332,7 @@ async fn run_state_bucket_delete(
 }
 
 async fn load_state_bucket_delete_provider_inputs<E>(
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::ModuleResolvedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedProviderInputs, AppError> {
@@ -1436,7 +1436,7 @@ pub async fn run_state_refresh(
 }
 
 pub(crate) async fn run_state_refresh_locked(
-    mut validated_config: ValidatedConfig<carina_core::parser::InferredFile>,
+    mut validated_config: ValidatedConfig<carina_core::parser::ModuleResolvedInferredFile>,
     backend: &dyn StateBackend,
     lock: StateLockRef<'_>,
     base_dir: &std::path::Path,
@@ -2658,6 +2658,19 @@ mod tests {
         ResolvedResource::new(resource)
     }
 
+    fn resolve_file_for_test<E: carina_core::parser::ExportParamLike>(
+        parsed: carina_core::parser::File<E>,
+        base_dir: &Path,
+    ) -> carina_core::parser::ModuleResolvedFile<E> {
+        carina_core::module_resolver::resolve_modules_with_providerless_config(
+            parsed,
+            base_dir,
+            &ProviderContext::default(),
+            &SchemaRegistry::new(),
+        )
+        .expect("test fixture crosses module resolution")
+    }
+
     fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
         LiveCompositionArgument::from_value(
             value,
@@ -2859,6 +2872,7 @@ mod tests {
     #[tokio::test]
     async fn state_refresh_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
+        let parsed = resolve_file_for_test(parsed, &downstream);
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test(
@@ -2905,6 +2919,7 @@ mod tests {
                 binding: "unrelated".to_string(),
                 source: PathBuf::from("../unrelated"),
             });
+        let parsed = resolve_file_for_test(parsed, &downstream);
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test(
@@ -2936,6 +2951,7 @@ mod tests {
                 .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
         )
         .unwrap();
+        let parsed = resolve_file_for_test(parsed, &downstream);
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test(
@@ -3054,6 +3070,7 @@ mod tests {
     #[tokio::test]
     async fn state_bucket_delete_prepares_resolved_upstream_provider_config() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
+        let parsed = resolve_file_for_test(parsed, &downstream);
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
             &downstream,
@@ -3092,6 +3109,7 @@ mod tests {
                 .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
         )
         .unwrap();
+        let parsed = resolve_file_for_test(parsed, &downstream);
 
         let error = match load_state_bucket_delete_provider_inputs(
             &parsed,
@@ -3116,6 +3134,7 @@ mod tests {
     async fn state_bucket_delete_ignores_upstream_referenced_only_by_default_tags() {
         let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
         parsed.providers[0].name = "test".to_string();
+        let parsed = resolve_file_for_test(parsed, &base_dir);
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
             &base_dir,
@@ -3141,6 +3160,16 @@ mod tests {
     #[tokio::test]
     async fn state_bucket_delete_accepts_parser_deferred_non_literal_default_tags() {
         let temp = tempfile::tempdir().unwrap();
+        let module_dir = temp.path().join("modules/standard-tags");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(
+            module_dir.join("main.crn"),
+            r#"
+                arguments { environment: String }
+                attributes { tags: map(String) = { Environment = environment } }
+            "#,
+        )
+        .unwrap();
         let parsed = parse_file(
             r#"
                 let tags_mod = use { source = "./modules/standard-tags" }
@@ -3160,6 +3189,7 @@ mod tests {
                 .contains_key("default_tags"),
             "the fixture must exercise the parser shape used by bucket delete"
         );
+        let parsed = resolve_file_for_test(parsed, temp.path());
 
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
@@ -3503,6 +3533,7 @@ mod tests {
         parsed
             .data_sources
             .push(DataSource::with_provider("test", "lookup", "second", None));
+        let parsed = resolve_file_for_test(parsed, Path::new("."));
         let backend = non_empty_refresh_backend("test");
         let root = ShutdownToken::running();
         let (trigger, cancel) = root.with_graceful_shutdown_trigger();
@@ -3587,6 +3618,7 @@ mod tests {
         parsed.providers.push(provider_config);
         parsed.compositions.push(composition);
         parsed.data_sources.push(data_source);
+        let parsed = resolve_file_for_test(parsed, Path::new("."));
 
         let mut state = StateFile::new();
         state
@@ -3664,6 +3696,7 @@ mod tests {
             binding: None,
         });
         parsed.compositions.push(composition);
+        let parsed = resolve_file_for_test(parsed, Path::new("."));
 
         let mut state = StateFile::new();
         state
@@ -4266,7 +4299,12 @@ mod tests {
             &ProviderContext::default(),
         )
         .expect("test config should parse");
-        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+        let parsed = carina_core::module_resolver::resolve_modules_providerless(
+            parsed,
+            std::path::Path::new("."),
+        )
+        .expect("state-refresh fixture crosses module resolution");
+        assert_eq!(parsed.deferred_for_expressions().len(), 1);
 
         let sorted_resources = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let source = parsed

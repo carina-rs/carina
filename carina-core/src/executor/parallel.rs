@@ -1171,7 +1171,7 @@ mod tests {
     }
 
     fn unbound_deferred_template_in(file: &str) -> crate::parser::DeferredForExpression {
-        crate::parser::parse_file(
+        let parsed = crate::parser::parse_file(
             "let upstream = upstream_state { source = '../upstream' }\n\
              for value in upstream.accounts {\n\
                mock.test.Child { identity_input = value }\n\
@@ -1179,11 +1179,15 @@ mod tests {
             std::path::Path::new(file),
             &crate::parser::ProviderContext::default(),
         )
-        .expect("unbound deferred fixture parses")
-        .deferred_for_expressions
-        .into_iter()
-        .next()
-        .expect("fixture contains one deferred loop")
+        .expect("unbound deferred fixture parses");
+        let parsed =
+            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+                .expect("deferred fixture crosses the module-resolution seam");
+        parsed
+            .into_deferred_for_expressions()
+            .into_iter()
+            .next()
+            .expect("fixture contains one deferred loop")
     }
 
     #[test]

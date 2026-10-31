@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 
-use crate::parser::{DeferredIfBody, DeferredIfCondition, DeferredStructuralIf, ParsedFile};
+use crate::parser::{
+    DeferredForBody, DeferredIfBody, DeferredIfCondition, DeferredStructuralIf, ParsedFile,
+};
 use crate::resource::{
     AccessMissPolicy, CompositionCall, ConcreteValue, DataSource, DeferredValue, LiveComposition,
     ModuleInstanceScope, Resource, Value,
@@ -17,9 +19,10 @@ use crate::resource::{
 use super::error::ModuleError;
 use super::expander::{
     ArgumentSubstitutionError, ArgumentSubstitutionPosition, ArgumentSubstitutions,
-    TemplateValueCarrier, apply_instance_prefix, build_expansion_trace, prefix_attr_value,
-    prefix_deferred_for_expression, prefix_module_composition, prefix_module_data_source,
-    prefix_module_resource, prefix_wait_binding, settle_prefixed_composition_constraints,
+    ParserMetadataOverlay, TemplateValueCarrier, apply_instance_prefix, build_expansion_trace,
+    parsed_deferred_for_body_id, prefix_attr_value, prefix_module_composition,
+    prefix_module_data_source, prefix_module_resource, prefix_parsed_deferred_for_expression,
+    prefix_wait_binding, settle_prefixed_composition_constraints,
     substitute_arguments_with_position,
 };
 use super::resolver::{ModuleResolver, TypeResolutionPolicy};
@@ -358,12 +361,16 @@ fn first_dropped_reference(
     file: &ParsedFile,
     dropped: &HashMap<String, (&String, &ConditionalBindingOrigin)>,
 ) -> Option<String> {
+    let find_binding = |binding: &str| {
+        dropped
+            .get(binding)
+            .map(|(original, _)| (*original).clone())
+    };
     let find = |value: &Value| {
-        value.root_bindings().into_iter().find_map(|binding| {
-            dropped
-                .get(&binding)
-                .map(|(original, _)| (*original).clone())
-        })
+        value
+            .root_bindings()
+            .into_iter()
+            .find_map(|binding| find_binding(&binding))
     };
 
     for resource in &file.resources {
@@ -394,28 +401,49 @@ fn first_dropped_reference(
         }
     }
     for wait in &file.wait_bindings {
+        if let Some(binding) = find_binding(wait.target.as_str()) {
+            return Some(binding);
+        }
+        if let Some(binding) = wait
+            .depends_on
+            .iter()
+            .find_map(|binding| find_binding(binding.as_str()))
+        {
+            return Some(binding);
+        }
         if let Some(binding) = find(&wait.until_predicate.rhs) {
             return Some(binding);
         }
     }
-    for deferred in &file.deferred_for_expressions {
+    for deferred in file.parsed_deferred_for_expressions() {
         if let Some(binding) = find(&deferred.iterable) {
             return Some(binding);
         }
-        if let Some(binding) = deferred
-            .attributes
-            .iter()
-            .find_map(|(_, value)| find(value))
-        {
-            return Some(binding);
-        }
-        if let Some(binding) = deferred
-            .template_resource
-            .attributes
-            .values()
-            .find_map(&find)
-        {
-            return Some(binding);
+        match &deferred.body {
+            DeferredForBody::Resource(resource) => {
+                if let Some(binding) = resource.attributes.values().find_map(&find) {
+                    return Some(binding);
+                }
+            }
+            DeferredForBody::Read(data_source) => {
+                if let Some(binding) = data_source.attributes.values().find_map(&find) {
+                    return Some(binding);
+                }
+            }
+            DeferredForBody::ModuleCall(call) => {
+                let mut referenced = None;
+                let _ = call.try_visit_values_for_module_if_audit(&mut |value| {
+                    if let Some(binding) = find(value) {
+                        referenced = Some(binding);
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
+                });
+                if referenced.is_some() {
+                    return referenced;
+                }
+            }
         }
     }
     let mut metadata_binding = None;
@@ -728,13 +756,12 @@ fn prefix_deferred_if_body<P: TypeResolutionPolicy>(
     expanded_metadata: &mut crate::parser::ParserBindingMetadata,
     contextualize: &impl Fn(ArgumentSubstitutionError) -> ModuleError,
 ) -> Result<DeferredIfBody, ModuleError> {
+    let template_metadata = ParserMetadataOverlay::new(source_metadata, selected_metadata);
     match body {
         DeferredIfBody::Resource(resource) => {
-            let template_dependency_values = source_metadata
-                .template_dependency_values(&resource.id)
-                .or_else(|| selected_metadata.template_dependency_values(&resource.id));
+            let resource_metadata = template_metadata.resource(&resource.id);
             let expanded = prefix_module_resource(
-                TemplateValueCarrier::new(resource, template_dependency_values),
+                TemplateValueCarrier::new(resource, resource_metadata.dependency_values),
                 instance_prefix,
                 module_name,
                 module_instance_scope,
@@ -748,11 +775,9 @@ fn prefix_deferred_if_body<P: TypeResolutionPolicy>(
             )))
         }
         DeferredIfBody::DataSource(data_source) => {
-            let template_dependency_values = source_metadata
-                .template_dependency_values(&data_source.id)
-                .or_else(|| selected_metadata.template_dependency_values(&data_source.id));
+            let resource_metadata = template_metadata.resource(&data_source.id);
             let expanded = prefix_module_data_source(
-                TemplateValueCarrier::new(data_source, template_dependency_values),
+                TemplateValueCarrier::new(data_source, resource_metadata.dependency_values),
                 instance_prefix,
                 module_name,
                 module_instance_scope,
@@ -809,6 +834,10 @@ fn prefix_expanded_contribution<P: TypeResolutionPolicy>(
     // prepared contribution.
     let selected_ifs = select_deferred_module_ifs(contribution, arguments, contextualize)?;
     let selected = &selected_ifs.contribution;
+    let template_metadata = ParserMetadataOverlay::new(
+        &contribution.parser_binding_metadata,
+        &selected.parser_binding_metadata,
+    );
     let mut binding_uses = contribution.bare_binding_uses().clone();
     binding_uses.extend(selected.bare_binding_uses().clone());
     binding_uses
@@ -825,24 +854,9 @@ fn prefix_expanded_contribution<P: TypeResolutionPolicy>(
     let mut resources =
         Vec::<Resource>::with_capacity(contribution.resources.len() + selected.resources.len());
     for resource in contribution.resources.iter().chain(&selected.resources) {
-        let source_file = contribution
-            .parser_binding_metadata
-            .resource_source_file(&resource.id)
-            .or_else(|| {
-                selected
-                    .parser_binding_metadata
-                    .resource_source_file(&resource.id)
-            });
-        let template_dependency_values = contribution
-            .parser_binding_metadata
-            .template_dependency_values(&resource.id)
-            .or_else(|| {
-                selected
-                    .parser_binding_metadata
-                    .template_dependency_values(&resource.id)
-            });
+        let resource_metadata = template_metadata.resource(&resource.id);
         let expanded = prefix_module_resource(
-            TemplateValueCarrier::new(resource, template_dependency_values),
+            TemplateValueCarrier::new(resource, resource_metadata.dependency_values),
             instance_prefix,
             module_name,
             module_instance_scope,
@@ -850,9 +864,11 @@ fn prefix_expanded_contribution<P: TypeResolutionPolicy>(
             intra_module_bindings,
             arguments,
         )
-        .map_err(|error| contextualize(error.with_optional_source_file(source_file)))?;
+        .map_err(|error| {
+            contextualize(error.with_optional_source_file(resource_metadata.source_file))
+        })?;
         let expanded_id = expanded.value().id.clone();
-        if let Some(source_file) = source_file {
+        if let Some(source_file) = resource_metadata.source_file {
             metadata.insert_resource_source_file(expanded_id.clone(), source_file.to_path_buf());
         }
         binding_uses.remap_resource_owner(&resource.id, &expanded_id);
@@ -867,24 +883,9 @@ fn prefix_expanded_contribution<P: TypeResolutionPolicy>(
         .iter()
         .chain(&selected.data_sources)
     {
-        let source_file = contribution
-            .parser_binding_metadata
-            .resource_source_file(&data_source.id)
-            .or_else(|| {
-                selected
-                    .parser_binding_metadata
-                    .resource_source_file(&data_source.id)
-            });
-        let template_dependency_values = contribution
-            .parser_binding_metadata
-            .template_dependency_values(&data_source.id)
-            .or_else(|| {
-                selected
-                    .parser_binding_metadata
-                    .template_dependency_values(&data_source.id)
-            });
+        let resource_metadata = template_metadata.resource(&data_source.id);
         let expanded = prefix_module_data_source(
-            TemplateValueCarrier::new(data_source, template_dependency_values),
+            TemplateValueCarrier::new(data_source, resource_metadata.dependency_values),
             instance_prefix,
             module_name,
             module_instance_scope,
@@ -892,9 +893,11 @@ fn prefix_expanded_contribution<P: TypeResolutionPolicy>(
             intra_module_bindings,
             arguments,
         )
-        .map_err(|error| contextualize(error.with_optional_source_file(source_file)))?;
+        .map_err(|error| {
+            contextualize(error.with_optional_source_file(resource_metadata.source_file))
+        })?;
         let expanded_id = expanded.value().id.clone();
-        if let Some(source_file) = source_file {
+        if let Some(source_file) = resource_metadata.source_file {
             metadata.insert_resource_source_file(expanded_id.clone(), source_file.to_path_buf());
         }
         binding_uses.remap_resource_owner(&data_source.id, &expanded_id);
@@ -929,28 +932,19 @@ fn prefix_expanded_contribution<P: TypeResolutionPolicy>(
     }
 
     let deferred_for_expressions = contribution
-        .deferred_for_expressions
+        .parsed_deferred_for_expressions()
         .iter()
-        .chain(&selected.deferred_for_expressions)
+        .chain(selected.parsed_deferred_for_expressions())
         .map(|deferred| {
-            let source_file = contribution
-                .parser_binding_metadata
-                .resource_source_file(&deferred.template_resource.id)
-                .or_else(|| {
-                    selected
-                        .parser_binding_metadata
-                        .resource_source_file(&deferred.template_resource.id)
-                });
-            let template_dependency_values = contribution
-                .parser_binding_metadata
-                .template_dependency_values(&deferred.template_resource.id)
-                .or_else(|| {
-                    selected
-                        .parser_binding_metadata
-                        .template_dependency_values(&deferred.template_resource.id)
-                });
-            prefix_deferred_for_expression(
-                TemplateValueCarrier::new(deferred, template_dependency_values),
+            let body_id = parsed_deferred_for_body_id(deferred);
+            let resource_metadata = body_id.map(|id| template_metadata.resource(id));
+            let expanded = prefix_parsed_deferred_for_expression(
+                TemplateValueCarrier::new(
+                    deferred,
+                    resource_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.dependency_values),
+                ),
                 instance_prefix,
                 module_name,
                 module_instance_scope,
@@ -958,12 +952,32 @@ fn prefix_expanded_contribution<P: TypeResolutionPolicy>(
                 intra_module_bindings,
                 arguments,
             )
-            .map_err(|error| contextualize(error.with_optional_source_file(source_file)))
+            .map_err(|error| {
+                contextualize(
+                    error.with_optional_source_file(
+                        resource_metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.source_file),
+                    ),
+                )
+            })?;
+            if let (Some(source_id), Some(expanded_id)) =
+                (body_id, parsed_deferred_for_body_id(expanded.value()))
+            {
+                if let Some(source_file) = resource_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.source_file)
+                {
+                    metadata.insert_resource_source_file(
+                        expanded_id.clone(),
+                        source_file.to_path_buf(),
+                    );
+                }
+                binding_uses.remap_resource_owner(source_id, expanded_id);
+            }
+            Ok(expanded.into_value(&mut metadata))
         })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|expanded| expanded.into_value(&mut metadata))
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, ModuleError>>()?;
     let deferred_module_ifs = prefix_forwarded_module_ifs(
         resolver,
         &selected_ifs.forwarded,
@@ -1002,7 +1016,7 @@ fn prefix_expanded_contribution<P: TypeResolutionPolicy>(
     expanded.data_sources = data_sources;
     expanded.compositions = compositions;
     expanded.wait_bindings = wait_bindings;
-    expanded.deferred_for_expressions = deferred_for_expressions;
+    *expanded.parsed_deferred_for_expressions_mut() = deferred_for_expressions;
     expanded.deferred_module_ifs = deferred_module_ifs;
     expanded.parser_binding_metadata = metadata;
     expanded.warnings = contribution
