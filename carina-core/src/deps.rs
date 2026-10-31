@@ -199,17 +199,21 @@ fn topological_sort<S: Clone, B: BindingAddress>(
         // Visit dependencies first
         let resource = &resources[index];
         let deps = get_resource_dependencies(resource);
-        for dep in &deps {
-            if let Some(dep_index) = binding_to_index.get(dep) {
-                visit(
-                    *dep_index,
-                    resources,
-                    binding_to_index,
-                    visited,
-                    visiting,
-                    sorted,
-                )?;
-            }
+        let mut dependency_indices = deps
+            .iter()
+            .filter_map(|dep| binding_to_index.get(dep).copied())
+            .collect::<Vec<_>>();
+        dependency_indices.sort_unstable();
+        dependency_indices.dedup();
+        for dep_index in dependency_indices {
+            visit(
+                dep_index,
+                resources,
+                binding_to_index,
+                visited,
+                visiting,
+                sorted,
+            )?;
         }
 
         visiting.pop();
@@ -463,6 +467,25 @@ mod tests {
             })
             .collect();
         assert_eq!(binding_order, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn dependencies_at_the_same_level_keep_declaration_order() {
+        let consumer = make_resource("consumer", &["second", "first"]);
+        let first = make_resource("first", &[]);
+        let second = make_resource("second", &[]);
+
+        let sorted =
+            sort_resources_by_dependencies(&[consumer, first.clone(), second.clone()]).unwrap();
+
+        assert_eq!(
+            sorted,
+            vec![
+                first,
+                second,
+                make_resource("consumer", &["second", "first"])
+            ]
+        );
     }
 
     #[test]

@@ -1011,8 +1011,13 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         contribution.parser_binding_metadata = expanded_parser_metadata;
         contribution.deferred_module_ifs = selected_module_ifs.forwarded.clone();
         contribution.warnings = module.warnings.clone();
-        for nested in nested_contributions {
-            contribution.merge_from(nested);
+        // Recursive expansion materializes child contributions separately.
+        // Prefix them in authored order so the flattened runtime graph keeps
+        // origin/main's child-before-parent traversal order. Reversing here is
+        // only an assembly detail: each `merge_from` appends its source.
+        for mut nested in nested_contributions.into_iter().rev() {
+            nested.merge_from(contribution);
+            contribution = nested;
         }
         contribution.expansion_trace = expansion_trace;
         reject_dropped_conditional_references(&selected_module_ifs, &contribution)?;
@@ -3094,15 +3099,12 @@ fn expand_module_resource_with_identity(
         loop_provenance,
         quoted_string_attrs,
     } = new_resource;
-    let crate::resource::Directives {
-        force_delete,
-        create_before_destroy,
-        prevent_destroy,
-        depends_on,
-        depends_on_diagnostic_sources,
-        provider_instance,
-        ignore_changes,
-    } = directives;
+    let resolved_depends_on = resolve_directive_dependencies(
+        &directives.depends_on,
+        &directives.depends_on_diagnostic_sources,
+        resolver,
+    )?;
+    let directives = directives.with_resolved_depends_on(resolved_depends_on);
 
     Ok(crate::resource::Resource {
         id,
@@ -3110,19 +3112,7 @@ fn expand_module_resource_with_identity(
             .into_iter()
             .map(|(name, value)| Ok((name, resolve_module_value(&value, resolver)?)))
             .collect::<Result<_, ArgumentSubstitutionError>>()?,
-        directives: crate::resource::Directives {
-            force_delete,
-            create_before_destroy,
-            prevent_destroy,
-            depends_on: resolve_directive_dependencies(
-                &depends_on,
-                &depends_on_diagnostic_sources,
-                resolver,
-            )?,
-            depends_on_diagnostic_sources,
-            provider_instance,
-            ignore_changes,
-        },
+        directives,
         resolved_ignore_changes,
         prefixes,
         binding: binding
@@ -3166,34 +3156,19 @@ fn expand_module_data_source(
         module_source: _,
         quoted_string_attrs,
     } = new_data_source;
-    let crate::resource::Directives {
-        force_delete,
-        create_before_destroy,
-        prevent_destroy,
-        depends_on,
-        depends_on_diagnostic_sources,
-        provider_instance,
-        ignore_changes,
-    } = directives;
+    let resolved_depends_on = resolve_directive_dependencies(
+        &directives.depends_on,
+        &directives.depends_on_diagnostic_sources,
+        resolver,
+    )?;
+    let directives = directives.with_resolved_depends_on(resolved_depends_on);
     Ok(crate::resource::DataSource {
         id,
         attributes: attributes
             .into_iter()
             .map(|(name, value)| Ok((name, resolve_module_value(&value, resolver)?)))
             .collect::<Result<_, ArgumentSubstitutionError>>()?,
-        directives: crate::resource::Directives {
-            force_delete,
-            create_before_destroy,
-            prevent_destroy,
-            depends_on: resolve_directive_dependencies(
-                &depends_on,
-                &depends_on_diagnostic_sources,
-                resolver,
-            )?,
-            depends_on_diagnostic_sources,
-            provider_instance,
-            ignore_changes,
-        },
+        directives,
         binding: binding
             .as_ref()
             .map(|binding| resolver.resolve_declared_binding(binding))

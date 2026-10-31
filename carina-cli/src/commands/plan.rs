@@ -4259,6 +4259,14 @@ fn build_plan_file_contents<E>(
         .iter()
         .map(|resource| (resource.id.clone(), resource.clone()))
         .collect();
+    let mut current_state_ids = ctx.managed_current.keys().collect::<Vec<_>>();
+    current_state_ids.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.resource_type.cmp(&right.resource_type))
+            .then_with(|| left.identity_str().cmp(&right.identity_str()))
+            .then_with(|| left.provider_instance.cmp(&right.provider_instance))
+    });
 
     let contents = PlanFileContents {
         // carina#4150: bumped 34→35 — Directives now retain whether
@@ -4430,9 +4438,8 @@ fn build_plan_file_contents<E>(
                 },
             })
             .collect(),
-        current_states: ctx
-            .managed_current
-            .keys()
+        current_states: current_state_ids
+            .into_iter()
             .map(|id| CurrentStateEntry::Managed {
                 id: id.clone(),
                 current: SavedManagedCurrent::from_current(redacted_managed_current[id].clone()),

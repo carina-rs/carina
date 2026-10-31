@@ -73,7 +73,8 @@ use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
 use crate::display::print_plan;
 use crate::error::{
-    AppError, SavedPlanDirectiveChangesMismatchError, SavedPlanSecretVerificationError,
+    AppError, PlanFileJsonError, SavedPlanDirectiveChangesMismatchError,
+    SavedPlanSecretVerificationError,
 };
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
@@ -3148,12 +3149,14 @@ async fn run_apply_from_plan_with_observer_factory(
         });
     }
 
-    let plan_file: PlanFile =
-        serde_json::from_slice(&bytes).map_err(|error| AppError::CorruptPlanFile {
-            path: plan_path.to_path_buf(),
-            replan_command,
-            error,
-        })?;
+    let plan_file: PlanFile = (|| {
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+        let plan_file = serde_path_to_error::deserialize(&mut deserializer)
+            .map_err(PlanFileJsonError::from_path_error)?;
+        deserializer.end().map_err(PlanFileJsonError::at_root)?;
+        Ok::<PlanFile, PlanFileJsonError>(plan_file)
+    })()
+    .map_err(|error| AppError::corrupt_plan_file(plan_path.to_path_buf(), replan_command, error))?;
     let source_path = std::path::PathBuf::from(&plan_file.source_path);
     let apply_target = ApplyTarget::SavedPlan {
         plan_file: plan_path,

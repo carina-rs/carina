@@ -6966,11 +6966,10 @@ pub struct Directives<B: BindingAddress = AbsoluteBindingAddress> {
     /// If true, create the new resource before destroying the old one during replacement
     #[serde(default)]
     pub create_before_destroy: bool,
-    /// Authored destruction-protection setting. Crate-private only so typed
-    /// phase conversions can carry it; effective policy is obtained through
-    /// [`PreventDestroy::resolve`].
+    /// Authored destruction-protection setting. Private so effective policy
+    /// can only be obtained through [`PreventDestroy::resolve`].
     #[serde(default)]
-    pub(crate) prevent_destroy: PreventDestroy,
+    prevent_destroy: PreventDestroy,
     /// Explicit ordering edges declared by the user. Each element is the
     /// binding name of a sibling `let` (resource / wait / module).
     /// Set semantics (deduplicated, order-insensitive); represented as
@@ -6997,16 +6996,21 @@ pub struct Directives<B: BindingAddress = AbsoluteBindingAddress> {
 pub type AuthoredDirectives = Directives<RelativeBindingName>;
 pub type ExpandedDirectives = Directives<AbsoluteBindingAddress>;
 
-impl Directives<RelativeBindingName> {
-    fn resolve_bindings(
+impl<B: BindingAddress> Directives<B> {
+    /// Move every directive field across a binding-address phase boundary.
+    ///
+    /// Callers resolve the public dependency addresses, while this defining
+    /// module alone carries the private authored destruction setting into the
+    /// new phase.
+    pub(crate) fn with_resolved_depends_on<C: BindingAddress>(
         self,
-        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
-    ) -> Directives<AbsoluteBindingAddress> {
+        depends_on: Vec<C>,
+    ) -> Directives<C> {
         let Self {
             force_delete,
             create_before_destroy,
             prevent_destroy,
-            depends_on,
+            depends_on: _depends_on,
             depends_on_diagnostic_sources,
             ignore_changes,
             provider_instance,
@@ -7015,13 +7019,21 @@ impl Directives<RelativeBindingName> {
             force_delete,
             create_before_destroy,
             prevent_destroy,
-            depends_on: depends_on.into_iter().map(resolve).collect(),
+            depends_on,
             depends_on_diagnostic_sources,
             ignore_changes,
-            // Provider instance routing is not a binding address. Modules
-            // cannot declare providers, so this slot deliberately stays text.
             provider_instance,
         }
+    }
+}
+
+impl Directives<RelativeBindingName> {
+    fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> Directives<AbsoluteBindingAddress> {
+        let depends_on = self.depends_on.iter().cloned().map(resolve).collect();
+        self.with_resolved_depends_on(depends_on)
     }
 }
 

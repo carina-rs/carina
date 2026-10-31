@@ -30,8 +30,8 @@ use carina_provider_protocol::types as protocol;
 use indexmap::IndexMap;
 
 use crate::provider::{
-    AppliedState, PartialReadDiagnostic, PatchOp, ProviderDirectives, ReadOutcome, UpdateOutcome,
-    UpdatePatch,
+    AppliedState, PartialReadDiagnostic, PatchOp, ProviderDirectiveProtocolParts,
+    ProviderDirectives, ReadOutcome, UpdateOutcome, UpdatePatch,
 };
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, RedactedSecretHash, Resource, ResourceId,
@@ -1995,18 +1995,18 @@ pub fn protocol_to_resource_id(id: &protocol::ResourceId) -> ResourceId {
 
 /// Encode directives that have already been resolved for a provider boundary.
 pub fn directives_to_protocol(directives: &ProviderDirectives) -> protocol::Directives {
-    let ProviderDirectives {
+    let ProviderDirectiveProtocolParts {
         force_delete,
         create_before_destroy,
         prevent_destroy,
         // Protection provenance is host policy metadata. WIT v13 transports
         // only the three effective booleans.
         prevent_destroy_source: _prevent_destroy_source,
-    } = directives;
+    } = directives.protocol_parts();
     protocol::Directives {
-        force_delete: *force_delete,
-        create_before_destroy: *create_before_destroy,
-        prevent_destroy: *prevent_destroy,
+        force_delete,
+        create_before_destroy,
+        prevent_destroy,
     }
 }
 

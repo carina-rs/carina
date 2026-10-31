@@ -278,7 +278,7 @@ fn build_anonymous_deferred_for_plan() -> Plan {
     )
     .expect("parse anonymous deferred-for target");
     let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        parsed,
+        carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
         std::path::Path::new("."),
     )
     .expect("resolve anonymous deferred-for target");

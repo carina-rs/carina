@@ -547,6 +547,111 @@ fn plan_file_recreation_guidance(replan_command: Option<&str>) -> String {
     }
 }
 
+/// A saved-plan JSON decoding failure with its structural location retained.
+#[derive(Debug)]
+pub struct PlanFileJsonError {
+    json_path: String,
+    source: serde_json::Error,
+}
+
+impl PlanFileJsonError {
+    pub(crate) fn from_path_error(error: serde_path_to_error::Error<serde_json::Error>) -> Self {
+        let json_path = error.path().to_string();
+        Self {
+            json_path,
+            source: error.into_inner(),
+        }
+    }
+
+    pub(crate) fn at_root(source: serde_json::Error) -> Self {
+        Self {
+            json_path: ".".to_string(),
+            source,
+        }
+    }
+
+    /// JSON location at which decoding stopped.
+    pub fn json_path(&self) -> &str {
+        &self.json_path
+    }
+
+    /// Serde's typed error classification for the terminal failure.
+    pub fn classify(&self) -> serde_json::error::Category {
+        self.source.classify()
+    }
+
+    /// Terminal serde error, retained as the source of this location wrapper.
+    pub fn serde_error(&self) -> &serde_json::Error {
+        &self.source
+    }
+}
+
+impl std::fmt::Display for PlanFileJsonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = if self.json_path == "." {
+            "<root>"
+        } else {
+            &self.json_path
+        };
+        if self
+            .source
+            .to_string()
+            .contains("binding address cannot be empty")
+        {
+            write!(f, "JSON location {path}: the binding address is empty")
+        } else {
+            write!(f, "JSON location {path}")
+        }
+    }
+}
+
+impl std::error::Error for PlanFileJsonError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// A malformed current-version saved plan, annotated with its file and
+/// regeneration guidance while retaining the located JSON decoding error.
+#[derive(Debug)]
+pub struct CorruptPlanFileError {
+    path: PathBuf,
+    replan_command: Option<String>,
+    source: PlanFileJsonError,
+}
+
+impl CorruptPlanFileError {
+    fn new(path: PathBuf, replan_command: Option<String>, source: PlanFileJsonError) -> Self {
+        Self {
+            path,
+            replan_command,
+            source,
+        }
+    }
+
+    /// Located typed JSON decoding failure.
+    pub fn json_error(&self) -> &PlanFileJsonError {
+        &self.source
+    }
+}
+
+impl std::fmt::Display for CorruptPlanFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed to parse plan file '{}'.\nThe plan file may be corrupted. {} This will regenerate the plan; a corrupted or hand-edited plan cannot be trusted.",
+            self.path.display(),
+            plan_file_recreation_guidance(self.replan_command.as_deref())
+        )
+    }
+}
+
+impl std::error::Error for CorruptPlanFileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Render a provider initialization error as user-facing text.
 ///
 /// Detects the carina-provider-aws / carina-provider-awscc account
@@ -1039,16 +1144,8 @@ pub enum AppError {
     },
 
     /// A recognized current-version plan had a malformed full body.
-    #[error(
-        "Failed to parse plan file '{}': {error}\nThe plan file may be corrupted. {}",
-        path.display(),
-        plan_file_recreation_guidance(replan_command.as_deref())
-    )]
-    CorruptPlanFile {
-        path: PathBuf,
-        replan_command: Option<String>,
-        error: serde_json::Error,
-    },
+    #[error(transparent)]
+    CorruptPlanFile(Box<CorruptPlanFileError>),
 
     /// A saved plan was computed against different provider schemas.
     #[error("{0}")]
@@ -1081,6 +1178,18 @@ pub enum AppError {
 }
 
 impl AppError {
+    pub(crate) fn corrupt_plan_file(
+        path: PathBuf,
+        replan_command: Option<String>,
+        source: PlanFileJsonError,
+    ) -> Self {
+        Self::CorruptPlanFile(Box::new(CorruptPlanFileError::new(
+            path,
+            replan_command,
+            source,
+        )))
+    }
+
     pub(crate) fn from_locked_state_reload(
         source: LockedStateReloadError,
         project_dir: &Path,
@@ -1595,18 +1704,24 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_plan_file_renders_serde_error_once() {
+    fn corrupt_plan_file_retains_located_serde_source_chain() {
         let source = serde_json::from_value::<Vec<serde_json::Value>>(serde_json::json!({}))
             .expect_err("fixture must not match the expected structure");
-        let app_err = AppError::CorruptPlanFile {
-            path: PathBuf::from("reviewed-plan"),
-            replan_command: Some("replan command".to_string()),
-            error: source,
-        };
+        let app_err = AppError::corrupt_plan_file(
+            PathBuf::from("reviewed-plan"),
+            Some("replan command".to_string()),
+            PlanFileJsonError::at_root(source),
+        );
 
-        let rendered = app_err.to_string();
+        let rendered = format_error_with_source_chain(&app_err);
         assert_eq!(rendered.matches("invalid type").count(), 1, "{rendered}");
-        assert!(std::error::Error::source(&app_err).is_none());
+        let located = std::error::Error::source(&app_err)
+            .expect("corrupt plan must retain the located decode error");
+        assert!(located.downcast_ref::<PlanFileJsonError>().is_some());
+        assert!(
+            located.source().is_some(),
+            "serde error must remain chained"
+        );
     }
 
     #[test]

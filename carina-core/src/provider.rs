@@ -909,6 +909,7 @@ impl DeleteRequest {
 ///     force_delete: false,
 ///     create_before_destroy: false,
 ///     prevent_destroy: false,
+///     prevent_destroy_source: None,
 /// };
 /// ```
 ///
@@ -919,6 +920,20 @@ impl DeleteRequest {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderDirectives {
+    force_delete: bool,
+    create_before_destroy: bool,
+    prevent_destroy: bool,
+    prevent_destroy_source: Option<PreventDestroySource>,
+}
+
+/// Read-only projection used at the provider protocol boundary.
+///
+/// The projection is intentionally constructed only by
+/// [`ProviderDirectives::protocol_parts`]. Keeping the exhaustive projection
+/// beside the private fields means adding an effective directive cannot be
+/// silently omitted from the wire conversion.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProviderDirectiveProtocolParts {
     pub(crate) force_delete: bool,
     pub(crate) create_before_destroy: bool,
     pub(crate) prevent_destroy: bool,
@@ -975,6 +990,21 @@ impl ProviderDirectives {
     /// Provenance for effective destruction protection, when enabled.
     pub fn prevent_destroy_source(&self) -> Option<PreventDestroySource> {
         self.prevent_destroy_source
+    }
+
+    pub(crate) fn protocol_parts(&self) -> ProviderDirectiveProtocolParts {
+        let Self {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            prevent_destroy_source,
+        } = *self;
+        ProviderDirectiveProtocolParts {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            prevent_destroy_source,
+        }
     }
 }
 

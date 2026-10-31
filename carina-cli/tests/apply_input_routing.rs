@@ -22,6 +22,30 @@ impl Scenario {
         scenario
     }
 
+    fn with_mock_resource() -> Self {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().to_path_buf();
+        fs::write(
+            project.join("backend.crn"),
+            "backend local { path = 'carina.state.json' }\n",
+        )
+        .expect("write backend");
+        fs::write(project.join("providers.crn"), "provider mock {}\n").expect("write provider");
+        fs::write(
+            project.join("main.crn"),
+            "let item = mock.test.resource { name = 'item' }\n",
+        )
+        .expect("write project");
+
+        let scenario = Self {
+            _temp: temp,
+            project,
+        };
+        let init = scenario.carina(&["init", "."]);
+        assert_success("carina init", &init);
+        scenario
+    }
+
     fn carina(&self, args: &[&str]) -> Output {
         carina(&self.project, args)
     }
@@ -233,6 +257,43 @@ fn apply_softens_invalid_version_type_as_possible_plan_corruption() {
             && stderr.contains("Detail:")
             && stderr.contains("invalid type: string"),
         "data errors must allow for a corrupted real plan:\n{stderr}",
+    );
+}
+
+#[test]
+fn apply_reports_empty_saved_plan_binding_with_file_path_and_recovery() {
+    let scenario = Scenario::with_mock_resource();
+    let plan_path = scenario.save_plan("empty-binding.plan.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_slice(&fs::read(&plan_path).expect("read saved plan"))
+            .expect("parse saved plan");
+    let effects = plan["plan"]["effects"]
+        .as_array_mut()
+        .expect("saved plan effects");
+    let (effect_index, create) = effects
+        .iter_mut()
+        .enumerate()
+        .find_map(|(index, effect)| effect.get_mut("Create").map(|create| (index, create)))
+        .expect("saved plan create effect");
+    create["binding"] = serde_json::Value::String(String::new());
+    fs::write(
+        &plan_path,
+        serde_json::to_vec_pretty(&plan).expect("serialize corrupted plan"),
+    )
+    .expect("write corrupted plan");
+
+    let output = scenario.carina(&["apply", "empty-binding.plan.json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected_location = format!("plan.effects[{effect_index}].Create.binding");
+
+    assert!(!output.status.success(), "corrupted plan must fail");
+    assert!(
+        stderr.contains("empty-binding.plan.json")
+            && stderr.contains(&expected_location)
+            && stderr.contains("binding address is empty")
+            && stderr.contains("corrupted or hand-edited")
+            && stderr.contains("regenerate the plan"),
+        "saved-plan error must be located and actionable:\n{stderr}",
     );
 }
 

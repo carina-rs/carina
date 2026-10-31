@@ -36,10 +36,11 @@ use carina_core::value::{
     merge_secrets_into_observation_json, merge_secrets_into_provider_json,
     union_secret_shapes_after_resolution,
 };
+use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::backend::{BackendError, InvalidResourceIdentityError};
+use crate::backend::{BackendError, InvalidResourceIdentityError, InvalidStateJsonError};
 
 #[cfg(any(test, feature = "test-utils"))]
 fn persisted_attributes_from_test_json(
@@ -703,10 +704,53 @@ impl std::fmt::Display for ErrorSourceChain<'_> {
 
 #[derive(Debug)]
 pub(crate) enum StateFileDecodeError {
-    Json(serde_json::Error),
-    ExportsVersionTooNew { found: u32, supported: u32 },
+    Json {
+        json_path: String,
+        source: serde_json::Error,
+    },
+    ExportsVersionTooNew {
+        found: u32,
+        supported: u32,
+    },
     InvalidResourceIdentity(InvalidResourceIdentityError),
     Validation(String),
+}
+
+impl StateFileDecodeError {
+    fn json_at_root(source: serde_json::Error) -> Self {
+        Self::Json {
+            json_path: "<root>".to_string(),
+            source,
+        }
+    }
+
+    fn json_at_path(path: &serde_path_to_error::Path, source: serde_json::Error) -> Self {
+        let path = path.to_string();
+        Self::Json {
+            json_path: if path == "." {
+                "<root>".to_string()
+            } else {
+                path
+            },
+            source,
+        }
+    }
+
+    fn json_in_resource(
+        index: usize,
+        path: &serde_path_to_error::Path,
+        source: serde_json::Error,
+    ) -> Self {
+        let path = path.to_string();
+        let json_path = if path == "." {
+            format!("resources[{index}]")
+        } else if path.starts_with('[') {
+            format!("resources[{index}]{path}")
+        } else {
+            format!("resources[{index}].{path}")
+        };
+        Self::Json { json_path, source }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -774,12 +818,23 @@ fn map_state_file_decode_error(
             BackendError::ExportsVersionTooNew { found, supported }
         }
         StateFileDecodeError::InvalidResourceIdentity(error) => error.into(),
-        StateFileDecodeError::Json(error) => match migration_from {
-            Some(version) => BackendError::InvalidState(format!(
-                "Failed to migrate state file from v{version}: {error}"
-            )),
-            None => BackendError::InvalidState(format!("Failed to parse state file: {error}")),
-        },
+        StateFileDecodeError::Json { json_path, source } => {
+            let context = match migration_from {
+                Some(version) => format!("Failed to migrate state file from v{version}"),
+                None => "Failed to parse state file".to_string(),
+            };
+            let detail = if source
+                .to_string()
+                .contains("binding address cannot be empty")
+            {
+                ": the binding address is empty".to_string()
+            } else {
+                String::new()
+            };
+            BackendError::InvalidStateJson(InvalidStateJsonError::new(
+                context, json_path, detail, source,
+            ))
+        }
         StateFileDecodeError::Validation(message) => match migration_from {
             Some(version) => BackendError::InvalidState(format!(
                 "Failed to migrate state file from v{version}: {message}"
@@ -797,8 +852,15 @@ impl StateFile {
     /// (carina#3731). Parsing here still validates duplicate identities on
     /// every parse (carina#2858).
     pub(crate) fn from_json_str(content: &str) -> Result<Self, StateFileDecodeError> {
-        let unchecked: UncheckedStateFile =
-            serde_json::from_str(content).map_err(StateFileDecodeError::Json)?;
+        let mut deserializer = serde_json::Deserializer::from_str(content);
+        let unchecked: UncheckedStateFile = serde_path_to_error::deserialize(&mut deserializer)
+            .map_err(|error| {
+                let path = error.path().clone();
+                StateFileDecodeError::json_at_path(&path, error.into_inner())
+            })?;
+        deserializer
+            .end()
+            .map_err(StateFileDecodeError::json_at_root)?;
         classify_exports_version(unchecked.version, unchecked.exports_version)?;
         let resources = unchecked
             .resources
@@ -837,7 +899,17 @@ impl StateFile {
                         ),
                     ));
                 }
-                serde_json::from_value(value).map_err(StateFileDecodeError::Json)
+                let _: EncodedResourceState = serde_path_to_error::deserialize(
+                    value.clone().into_deserializer(),
+                )
+                .map_err(|error| {
+                    let path = error.path().clone();
+                    StateFileDecodeError::json_in_resource(index, &path, error.into_inner())
+                })?;
+                serde_path_to_error::deserialize(value.into_deserializer()).map_err(|error| {
+                    let path = error.path().clone();
+                    StateFileDecodeError::json_in_resource(index, &path, error.into_inner())
+                })
             })
             .collect::<Result<Vec<ResourceState>, StateFileDecodeError>>()?;
         let exports = decode_persisted_exports(unchecked.exports)?;

@@ -1670,16 +1670,17 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         )
         .await
         .expect_err("an invalid saved composition path must reject the plan");
-        let AppError::CorruptPlanFile { error, .. } = error else {
+        let AppError::CorruptPlanFile(error) = error else {
             panic!("{case}: expected typed corrupt-plan error, got {error:?}");
         };
+        let error = error.json_error();
         assert_eq!(
             error.classify(),
             serde_json::error::Category::Data,
             "{case}: path validation must be a typed data error: {error}",
         );
         assert!(
-            error.to_string().contains(expected_detail),
+            error.serde_error().to_string().contains(expected_detail),
             "{case}: validation detail was missing: {error}",
         );
     }
@@ -10355,7 +10356,7 @@ mod saved_plan_version_tests {
         .await;
 
         let error = result.expect_err("malformed current-version plan must be rejected");
-        let message = error.to_string();
+        let message = crate::error::format_error_with_source_chain(&error);
         assert!(
             message.contains("The plan file may be corrupted. Re-run"),
             "current-version structural errors must be reported as corruption: {message}",
@@ -10517,7 +10518,7 @@ mod saved_plan_version_tests {
         )
         .await;
 
-        result.expect_err(expectation).to_string()
+        crate::error::format_error_with_source_chain(&result.expect_err(expectation))
     }
 
     fn replace_first_resource_identity(value: &mut serde_json::Value, identity: &str) -> bool {

@@ -286,8 +286,9 @@ impl StateBackend for LocalBackend {
         let Some((bytes, state_location)) = self.read_state_file().await? else {
             return Ok(None);
         };
-        let outcome = state::check_and_migrate_bytes(&bytes)
-            .map_err(|error| error.with_state_location(state_location.display().to_string()))?;
+        let outcome = state::check_and_migrate_bytes(&bytes).map_err(|error| {
+            error.with_state_read_location(state_location.display().to_string())
+        })?;
         let (state, migration) = outcome.into_parts();
         if let Some(info) = migration {
             log_state_migration_once(
