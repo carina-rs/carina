@@ -6449,18 +6449,77 @@ let child = imported {
     let path = root.join("main.crn");
     let document = create_document_at(source, path.clone());
     let diagnostics = engine.analyze(&document, Some(&path));
-    let diagnostic = diagnostics
+    let matching = diagnostics
         .iter()
-        .find(|diagnostic| {
-            diagnostic
-                .message
-                .contains("depends_on parameter 'peer' received a value")
+        .filter(|diagnostic| {
+            diagnostic.message
+                == "module argument 'peer': expected resource handle mock.test.Thing; got String"
         })
-        .unwrap_or_else(|| panic!("missing substitution diagnostic: {diagnostics:#?}"));
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    let diagnostic = matching[0];
 
     assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
     assert_eq!(diagnostic.range.start.line, 5, "{diagnostic:#?}");
     assert_eq!(diagnostic.range.end.line, 5, "{diagnostic:#?}");
+}
+
+#[test]
+fn typed_identity_values_do_not_satisfy_resource_handle_arguments() {
+    let tmp = tempfile::tempdir().expect("create typed-identity boundary fixture");
+    let module = tmp.path().join("consumer");
+    std::fs::create_dir(&module).expect("create consumer module");
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  vpc: aws.ec2.Vpc\n}\n",
+    )
+    .expect("write consumer signature");
+
+    let source = r#"let main_vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+let wrong = aws.ec2.SecurityGroup {
+  name = "wrong"
+}
+
+let imported = use { source = "./consumer" }
+
+let by_vpc_id = imported {
+  vpc = main_vpc.vpc_id
+}
+
+let by_group_id = imported {
+  vpc = wrong.group_id
+}
+"#;
+    std::fs::write(tmp.path().join("main.crn"), source).expect("write caller fixture");
+
+    let diagnostics = analyze_with_buffer(
+        &module_boundary_identity_engine(),
+        tmp.path(),
+        "main.crn",
+        source,
+    );
+    let expected = [
+        (
+            "module argument 'vpc': expected resource handle aws.ec2.Vpc; got aws.ec2.Vpc.Id",
+            Range::new(Position::new(11, 8), Position::new(11, 23)),
+        ),
+        (
+            "module argument 'vpc': expected resource handle aws.ec2.Vpc; got aws.ec2.SecurityGroup.Id",
+            Range::new(Position::new(15, 8), Position::new(15, 22)),
+        ),
+    ];
+    for (message, range) in expected {
+        let matching = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message == message)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+        assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(matching[0].range, range, "diagnostic: {:#?}", matching[0]);
+    }
 }
 
 #[test]
@@ -12259,11 +12318,131 @@ fn structural_ref_engine() -> DiagnosticEngine {
         "mock",
         (ResourceSchema::new("test.resource")
             .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
-            .attribute(AttributeSchema::optional("parent", AttributeType::string()).build()))
+            .attribute(AttributeSchema::optional("parent", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("count", AttributeType::int()).build()))
         .validate()
         .expect("schema fixture must be valid"),
     );
     custom_engine(schemas)
+}
+
+#[test]
+fn inferred_and_declared_handle_exports_have_exact_state_boundary_diagnostics() {
+    let root = tempfile::tempdir().expect("create handle-export fixture");
+    std::fs::write(
+        root.path().join("resources.crn"),
+        "let instance = mock.compute.Instance { name = \"instance\" }\n",
+    )
+    .expect("write resource fixture");
+    let exports = r#"exports {
+  inferred = instance
+  declared: mock.compute.Instance = instance
+}
+"#;
+    std::fs::write(root.path().join("exports.crn"), exports).expect("write exports fixture");
+
+    let diagnostics = analyze_with_buffer(
+        &structural_ref_engine(),
+        root.path(),
+        "exports.crn",
+        exports,
+    );
+    let expected = [
+        (
+            "export 'inferred': inferred resource handle mock.compute.Instance cannot cross a state boundary; export an identity value such as mock.compute.Instance.Id instead",
+            Range::new(Position::new(1, 2), Position::new(1, 3)),
+        ),
+        (
+            "export 'declared': resource handle mock.compute.Instance cannot cross a state boundary; export an identity value such as mock.compute.Instance.Id instead",
+            Range::new(Position::new(2, 2), Position::new(2, 3)),
+        ),
+    ];
+    for (message, range) in expected {
+        let matching = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message == message)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+        assert_eq!(matching[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(matching[0].range, range, "diagnostic: {:#?}", matching[0]);
+    }
+}
+
+#[test]
+fn module_handle_output_attribute_diagnostics_use_the_underlying_schema_and_range() {
+    let root = tempfile::tempdir().expect("create module-handle reference fixture");
+    let module = root.path().join("module");
+    std::fs::create_dir(&module).expect("create module fixture");
+    std::fs::write(
+        module.join("resources.crn"),
+        "let instance = mock.compute.Instance { name = \"instance\" }\n",
+    )
+    .expect("write module resource");
+    std::fs::write(
+        module.join("attributes.crn"),
+        "attributes {\n  r = instance\n}\n",
+    )
+    .expect("write module handle output");
+
+    let source = r#"let imported = use { source = "./module" }
+let child = imported {}
+
+mock.test.resource {
+  name = "unknown"
+  parent = child.r.missing
+}
+
+mock.test.resource {
+  name = "mismatch"
+  count = child.r.arn
+}
+
+mock.test.resource {
+  name = "bare"
+  parent = child.r
+}
+"#;
+    std::fs::write(root.path().join("main.crn"), source).expect("write caller fixture");
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    let unknown = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message
+                == "Unknown attribute 'missing' on 'child.r' (type 'mock.compute.Instance')"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(unknown.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(unknown[0].severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(
+        unknown[0].range,
+        Range::new(Position::new(5, 19), Position::new(5, 26)),
+    );
+
+    let mismatch = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("child.r.arn")
+                && diagnostic.message.contains("expected Int")
+                && diagnostic.message.contains("got String")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(mismatch.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(mismatch[0].severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(mismatch[0].range.start.line, 10);
+
+    let bare = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("child.r")
+                && diagnostic.message.contains("expected String")
+                && diagnostic.message.contains("got mock.compute.Instance")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(bare.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(bare[0].severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(bare[0].range.start.line, 15);
 }
 
 #[test]

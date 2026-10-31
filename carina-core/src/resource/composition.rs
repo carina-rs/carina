@@ -53,13 +53,21 @@ use super::{AccessPath, DeferredValue, ResolvedResourceId, StructuralOperand, Va
 /// already knows how to look up. A future PR can lift this to
 /// `Forwarded(NodeId, AttrPath)` once a name → `NodeId` index is
 /// available at expansion time.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-enum CompositionAttributeValue {
+#[derive(Debug, Clone, PartialEq)]
+enum LiveCompositionAttributeValue {
     /// Single-hop alias to another node's attribute, by path.
     Forwarded(AccessPath),
     /// Multi-source expression: a literal, interpolation, function
     /// call, or any other `Value` shape that is not a bare
     /// single-hop reference.
+    Derived(Value),
+    /// A resource capability resolved to its complete scheduler identity.
+    Handle(ResolvedResourceId),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum SavedCompositionAttributeValue {
+    Forwarded(AccessPath),
     Derived(Value),
 }
 
@@ -74,7 +82,7 @@ enum CompositionAttributeValue {
 /// metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveCompositionAttribute {
-    value: CompositionAttributeValue,
+    value: LiveCompositionAttributeValue,
     declared_type: Option<ConsumerStaticType>,
     /// The module argument directly forwarded by this output before call-site
     /// substitution. Validation checks that declaration in the module's own
@@ -96,10 +104,11 @@ impl LiveCompositionAttribute {
             source_argument: _source_argument,
         } = self;
         match value {
-            CompositionAttributeValue::Forwarded(_path) => false,
-            CompositionAttributeValue::Derived(value) => {
+            LiveCompositionAttributeValue::Forwarded(_path) => false,
+            LiveCompositionAttributeValue::Derived(value) => {
                 crate::value::contains_redacted_secret(value)
             }
+            LiveCompositionAttributeValue::Handle(_id) => false,
         }
     }
 
@@ -121,14 +130,26 @@ impl LiveCompositionAttribute {
     ) -> Self {
         let value = match value {
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
-                CompositionAttributeValue::Forwarded(path)
+                LiveCompositionAttributeValue::Forwarded(path)
             }
-            other => CompositionAttributeValue::Derived(other),
+            other => LiveCompositionAttributeValue::Derived(other),
         };
         Self {
             value,
             declared_type,
             source_argument: None,
+        }
+    }
+
+    pub(crate) fn from_handle_with_static_type(
+        handle: ResolvedResourceId,
+        declared_type: Option<ConsumerStaticType>,
+        source_argument: Option<String>,
+    ) -> Self {
+        Self {
+            value: LiveCompositionAttributeValue::Handle(handle),
+            declared_type,
+            source_argument,
         }
     }
 
@@ -140,8 +161,29 @@ impl LiveCompositionAttribute {
     /// The forwarded path when this output is a single-hop alias.
     pub fn forwarded_path(&self) -> Option<&AccessPath> {
         match &self.value {
-            CompositionAttributeValue::Forwarded(path) => Some(path),
-            CompositionAttributeValue::Derived(_) => None,
+            LiveCompositionAttributeValue::Forwarded(path) => Some(path),
+            LiveCompositionAttributeValue::Derived(_)
+            | LiveCompositionAttributeValue::Handle(_) => None,
+        }
+    }
+
+    pub fn handle(&self) -> Option<&ResolvedResourceId> {
+        match &self.value {
+            LiveCompositionAttributeValue::Handle(handle) => Some(handle),
+            LiveCompositionAttributeValue::Forwarded(_)
+            | LiveCompositionAttributeValue::Derived(_) => None,
+        }
+    }
+
+    pub(crate) fn value(&self) -> Option<Value> {
+        match &self.value {
+            LiveCompositionAttributeValue::Forwarded(path) => {
+                Some(Value::Deferred(DeferredValue::ResourceRef {
+                    path: path.clone(),
+                }))
+            }
+            LiveCompositionAttributeValue::Derived(value) => Some(value.clone()),
+            LiveCompositionAttributeValue::Handle(_) => None,
         }
     }
 
@@ -159,23 +201,6 @@ impl LiveCompositionAttribute {
         Self::from_value_with_static_type(value, self.declared_type.clone())
             .with_source_argument(self.source_argument.clone())
     }
-
-    /// Reify back into a [`Value`] for callers that have not yet been
-    /// migrated to the new typed-variant dispatch.
-    ///
-    /// The post-apply resolver, plan display, and exporters consume
-    /// composition attributes as `Value`s today; this lets PR G ship
-    /// the type-level split without rewriting every consumer in one
-    /// commit. Each subsequent migration replaces a `.to_value()` site
-    /// with a direct match on `LiveCompositionAttribute`.
-    pub fn to_value(&self) -> Value {
-        match &self.value {
-            CompositionAttributeValue::Forwarded(path) => {
-                Value::Deferred(DeferredValue::ResourceRef { path: path.clone() })
-            }
-            CompositionAttributeValue::Derived(v) => v.clone(),
-        }
-    }
 }
 
 /// Saved-plan form of one module output.
@@ -185,16 +210,16 @@ impl LiveCompositionAttribute {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SavedCompositionAttribute {
-    value: CompositionAttributeValue,
+    value: SavedCompositionAttributeValue,
 }
 
 impl SavedCompositionAttribute {
     pub fn from_value(value: Value) -> Self {
         let value = match value {
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
-                CompositionAttributeValue::Forwarded(path)
+                SavedCompositionAttributeValue::Forwarded(path)
             }
-            other => CompositionAttributeValue::Derived(other),
+            other => SavedCompositionAttributeValue::Derived(other),
         };
         Self { value }
     }
@@ -202,11 +227,11 @@ impl SavedCompositionAttribute {
     pub fn contains_redacted_secret_placeholder(&self) -> bool {
         let Self { value } = self;
         match value {
-            CompositionAttributeValue::Forwarded(path) => {
+            SavedCompositionAttributeValue::Forwarded(path) => {
                 let _path = path;
                 false
             }
-            CompositionAttributeValue::Derived(value) => {
+            SavedCompositionAttributeValue::Derived(value) => {
                 crate::value::contains_redacted_secret(value)
             }
         }
@@ -214,8 +239,8 @@ impl SavedCompositionAttribute {
 
     pub fn forwarded_path(&self) -> Option<&AccessPath> {
         match &self.value {
-            CompositionAttributeValue::Forwarded(path) => Some(path),
-            CompositionAttributeValue::Derived(value) => {
+            SavedCompositionAttributeValue::Forwarded(path) => Some(path),
+            SavedCompositionAttributeValue::Derived(value) => {
                 let _value = value;
                 None
             }
@@ -228,10 +253,10 @@ impl SavedCompositionAttribute {
 
     pub fn to_value(&self) -> Value {
         match &self.value {
-            CompositionAttributeValue::Forwarded(path) => {
+            SavedCompositionAttributeValue::Forwarded(path) => {
                 Value::Deferred(DeferredValue::ResourceRef { path: path.clone() })
             }
-            CompositionAttributeValue::Derived(value) => value.clone(),
+            SavedCompositionAttributeValue::Derived(value) => value.clone(),
         }
     }
 }
@@ -296,7 +321,7 @@ impl LiveCompositionArgument {
     pub(crate) fn from_handle_with_static_type(
         value: Value,
         declared_type: ConsumerStaticType,
-        handle: crate::eval_value::StructuralHandle,
+        handle: crate::eval_value::UnexpandedStructuralHandle,
         origin: crate::parser::ArgumentOrigin,
     ) -> Self {
         Self {
@@ -330,7 +355,7 @@ impl LiveCompositionArgument {
         self.operand.handle().is_some()
     }
 
-    pub(crate) fn handle(&self) -> Option<&crate::eval_value::StructuralHandle> {
+    pub(crate) fn handle(&self) -> Option<&crate::eval_value::UnexpandedStructuralHandle> {
         self.operand.handle()
     }
 
@@ -353,7 +378,7 @@ impl LiveCompositionArgument {
     pub(crate) fn with_handle(
         &self,
         value: Value,
-        handle: crate::eval_value::StructuralHandle,
+        handle: crate::eval_value::UnexpandedStructuralHandle,
     ) -> Self {
         Self {
             operand: StructuralOperand::from_handle_with_access_base(handle, value),
@@ -1190,27 +1215,42 @@ impl LiveComposition {
                 )
             })
             .collect();
-        let attributes = attributes
-            .into_iter()
-            .map(|(name, attribute)| {
-                let LiveCompositionAttribute {
-                    value,
-                    declared_type,
-                    source_argument,
-                } = attribute;
-                let discarded_live_metadata = (declared_type, source_argument);
-                drop(discarded_live_metadata);
-                let saved_attribute = match value {
-                    CompositionAttributeValue::Forwarded(path) => SavedCompositionAttribute {
-                        value: CompositionAttributeValue::Forwarded(path),
-                    },
-                    CompositionAttributeValue::Derived(value) => SavedCompositionAttribute {
-                        value: CompositionAttributeValue::Derived(value),
-                    },
-                };
-                (name, saved_attribute)
-            })
-            .collect();
+        let mut saved_attributes = IndexMap::with_capacity(attributes.len());
+        for (name, attribute) in attributes {
+            let LiveCompositionAttribute {
+                value,
+                declared_type,
+                source_argument,
+            } = attribute;
+            let discarded_live_metadata = (declared_type, source_argument);
+            drop(discarded_live_metadata);
+            match value {
+                LiveCompositionAttributeValue::Forwarded(path) => {
+                    saved_attributes.insert(
+                        name,
+                        SavedCompositionAttribute {
+                            value: SavedCompositionAttributeValue::Forwarded(path),
+                        },
+                    );
+                }
+                LiveCompositionAttributeValue::Derived(value) => {
+                    saved_attributes.insert(
+                        name,
+                        SavedCompositionAttribute {
+                            value: SavedCompositionAttributeValue::Derived(value),
+                        },
+                    );
+                }
+                LiveCompositionAttributeValue::Handle(resolved_id) => {
+                    // The expanded-graph transition has already consumed this
+                    // address into scheduler/reference metadata. A saved
+                    // composition is value-only, so there is deliberately no
+                    // serialized attribute row for the capability itself.
+                    drop(resolved_id);
+                }
+            }
+        }
+        let attributes = saved_attributes;
         drop(quoted_string_attrs);
         Ok(SavedComposition {
             id,
@@ -1390,9 +1430,12 @@ impl<'a> Iterator for CompositionRuntimeAttributes<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::Live(attributes) => attributes
-                .next()
-                .map(|(name, attribute)| (name, attribute.to_value())),
+            Self::Live(attributes) => loop {
+                let (name, attribute) = attributes.next()?;
+                if let Some(value) = attribute.value() {
+                    return Some((name, value));
+                }
+            },
             Self::Saved(attributes) => attributes
                 .next()
                 .map(|(name, attribute)| (name, attribute.to_value())),
@@ -1434,7 +1477,7 @@ mod tests {
                 pending_constraints: Vec::new(),
             },
             binding: Some("call".to_string()),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "module".to_string(),
             instance: "call".to_string(),
             call_path: call_path("first.crn", "first"),
@@ -1493,7 +1536,7 @@ mod tests {
         let v = Value::Concrete(ConcreteValue::String("literal".into()));
         let attr = LiveCompositionAttribute::from_value(v.clone(), None);
         assert_eq!(attr.forwarded_path(), None);
-        assert_eq!(attr.to_value(), v);
+        assert_eq!(attr.value().expect("value composition attribute"), v);
     }
 
     #[test]
@@ -1507,7 +1550,7 @@ mod tests {
         ]));
         let attr = LiveCompositionAttribute::from_value(v.clone(), None);
         assert_eq!(attr.forwarded_path(), None);
-        assert_eq!(attr.to_value(), v);
+        assert_eq!(attr.value().expect("value composition attribute"), v);
     }
 
     #[test]
@@ -1517,7 +1560,7 @@ mod tests {
             Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
             None,
         );
-        let v = attr.to_value();
+        let v = attr.value().expect("value composition attribute");
         assert_eq!(
             v,
             Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
@@ -1528,7 +1571,7 @@ mod tests {
     fn derived_to_value_returns_inner() {
         let inner = Value::Concrete(ConcreteValue::String("kept".into()));
         let attr = LiveCompositionAttribute::from_value(inner.clone(), None);
-        assert_eq!(attr.to_value(), inner);
+        assert_eq!(attr.value().expect("value composition attribute"), inner);
     }
 
     /// Round-trip: a `Value` → `LiveCompositionAttribute` → `Value` is
@@ -1546,7 +1589,10 @@ mod tests {
         ];
         for original in cases {
             let lifted = LiveCompositionAttribute::from_value(original.clone(), None);
-            assert_eq!(lifted.to_value(), original);
+            assert_eq!(
+                lifted.value().expect("value composition attribute"),
+                original
+            );
         }
     }
 
@@ -1581,6 +1627,56 @@ mod tests {
         let decoded: SavedCompositionAttribute =
             serde_json::from_value(json).expect("deserialize saved attribute");
         assert_eq!(decoded.to_value(), value);
+    }
+
+    #[test]
+    fn saved_composition_consumes_handle_outputs_without_serializing_them() {
+        let source_root = tempfile::tempdir().expect("source root");
+        let composition = LiveComposition {
+            id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "instance")),
+            signature: LiveCompositionSignature {
+                arguments: IndexMap::new(),
+                attributes: IndexMap::from([
+                    (
+                        "capability_only".to_string(),
+                        LiveCompositionAttribute::from_handle_with_static_type(
+                            ResolvedResourceId::new(ResourceId::with_identity(
+                                "mock.test.resource",
+                                "producer.instance",
+                            )),
+                            None,
+                            None,
+                        ),
+                    ),
+                    (
+                        "ordinary_value".to_string(),
+                        LiveCompositionAttribute::from_value(
+                            Value::Concrete(ConcreteValue::String("kept".into())),
+                            None,
+                        ),
+                    ),
+                ]),
+                pending_constraints: Vec::new(),
+            },
+            binding: Some("instance".to_string()),
+            dependency_bindings: Default::default(),
+            module_name: "module".to_string(),
+            instance: "instance".to_string(),
+            call_path: Default::default(),
+            quoted_string_attrs: HashSet::new(),
+        };
+
+        let mut resolver = CompositionSourceIdentityResolver::new(source_root.path())
+            .expect("composition source identity resolver");
+        let saved = composition
+            .into_saved_with_resolver(&mut resolver)
+            .expect("lower live composition");
+        let json = serde_json::to_string(&saved).expect("serialize saved composition");
+
+        assert!(json.contains("ordinary_value"), "{json}");
+        assert!(!json.contains("capability_only"), "{json}");
+        assert!(!json.contains("producer.instance"), "{json}");
+        assert!(!json.contains("Handle"), "{json}");
     }
 
     #[test]
@@ -1652,7 +1748,7 @@ mod tests {
                 pending_constraints: vec![constraint.clone()],
             },
             binding: Some("secure".to_string()),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "secure_module".to_string(),
             instance: "secure".to_string(),
             call_path: Default::default(),

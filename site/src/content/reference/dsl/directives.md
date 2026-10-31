@@ -21,9 +21,45 @@ cloud.storage.Bucket {
 | `force_delete` | `false` | Ask the provider to delete a resource even when it contains dependent data |
 | `create_before_destroy` | `false` | Create a replacement before destroying the existing resource |
 | `prevent_destroy` | `false` | Reject a plan that would destroy the resource |
-| `depends_on` | `[]` | Add ordering dependencies on sibling `let` bindings |
+| `depends_on` | `[]` | Add ordering dependencies on managed-resource handles |
 | `provider` | provider-kind default | Route the resource to a [named provider instance](/reference/dsl/syntax/#named-provider-instances) |
 | `ignore_changes` | `[]` | Leave selected, authored attribute paths under another system's control after creation |
+
+## `depends_on`
+
+Use `depends_on` when a provider attribute reference does not express all of
+the ordering a resource needs. Each list item must be a managed-resource
+handle, either a local binding or a resource-handle output from a module:
+
+```crn
+let record = aws.route53.RecordSet {
+  # ...
+}
+
+let records = use { source = './modules/records' }
+let producer = records {}
+
+aws.acm.CertificateValidation {
+  # ...
+
+  directives {
+    depends_on = [record, producer.validation_record]
+  }
+}
+```
+
+Carina resolves every operand to the target resource's complete,
+instance-qualified address before planning. A literal, resource attribute,
+value output, data source, provider, wait binding, or module call is not a
+valid dependency handle. Missing or wrong-kind targets are errors; Carina does
+not silently drop an edge.
+
+Dependencies are resource-specific and affect ordering only. Depending on a
+module call as a whole is not supported: that would wait for unrelated module
+resources, reduce parallelism, and create false cycles. If the selected
+resource is unchanged, the dependent resource remains unchanged and its
+values do not become “known after apply.” When the selected resource changes,
+the dependent effect is ordered after it.
 
 ## `ignore_changes`
 

@@ -5,7 +5,7 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
-use crate::eval_value::{EvalValue, ParsedSinkValue, StructuralHandleKind};
+use crate::eval_value::{EvalValue, ParsedSinkValue, UnexpandedStructuralHandleKind};
 use crate::parser::Rule;
 use crate::parser::context::{
     ExpressionMode, ParseContext, extract_key_string, first_inner, next_pair,
@@ -18,7 +18,7 @@ use crate::resource::{
     ParsedIgnorePath, ParsedIgnorePathSegment, Resource, ResourceId, ResourceIdentity, Value,
 };
 use indexmap::IndexMap;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 pub(in crate::parser) fn parse_anonymous_resource(
     pair: pest::iterators::Pair<Rule>,
@@ -119,7 +119,7 @@ pub(crate) fn parse_resource_for_target(
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
         module_source: None,
         default_tag_keys: Default::default(),
         loop_provenance,
@@ -414,7 +414,7 @@ pub(crate) fn parse_read_resource_expr(
         attributes: attributes.into_iter().collect(),
         directives,
         binding: Some(binding_name.to_string()),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
         module_source: None,
         quoted_string_attrs,
     })
@@ -487,18 +487,17 @@ fn parse_directives(
                             .to_string(),
                     });
                 }
-                let mut names = Vec::new();
+                let mut operands = Vec::new();
                 for element in list.into_inner() {
-                    let element_line = element.line_col().0;
-                    let eval = parse_expression_eval(element, ctx)?;
-                    names.push(eval_as_binding_name(
-                        eval,
-                        "depends_on: list elements",
-                        element_line,
-                        BindingNameUse::Dependency,
-                    )?);
+                    operands.push(
+                        crate::parser::expressions::dependency::parse_dependency_operand(
+                            element,
+                            ctx,
+                            "directives.depends_on",
+                        )?,
+                    );
                 }
-                directives.depends_on = names;
+                directives.depends_on = crate::parser::UnexpandedDependencies::new(operands);
             }
             "provider" => {
                 let eval = parse_expression_eval(value_pair, ctx)?;
@@ -607,7 +606,6 @@ fn invalid_ignore_change_path(line: usize, authored: &str) -> ParseError {
 
 #[derive(Clone, Copy)]
 enum BindingNameUse {
-    Dependency,
     Provider,
 }
 
@@ -618,24 +616,17 @@ fn eval_as_binding_name(
     usage: BindingNameUse,
 ) -> Result<String, ParseError> {
     match eval {
-        EvalValue::StructuralHandle(handle) => {
-            let accepted = match usage {
-                BindingNameUse::Dependency => handle.kind().is_dependency_target(),
-                BindingNameUse::Provider => {
-                    matches!(handle.kind(), StructuralHandleKind::Provider)
-                }
-            };
+        EvalValue::UnexpandedStructuralHandle(handle) => {
+            let accepted = matches!(handle.kind(), UnexpandedStructuralHandleKind::Provider);
             if accepted {
                 Ok(handle.canonical_binding_name().to_string())
             } else {
                 let binding = handle
                     .alias_name()
+                    .map(std::borrow::Cow::Borrowed)
                     .unwrap_or_else(|| handle.canonical_binding_name());
                 let description = handle.kind().description();
                 let message = match usage {
-                    BindingNameUse::Dependency => format!(
-                        "directives.depends_on: '{binding}' is {description} and cannot be used as a dependency target"
-                    ),
                     BindingNameUse::Provider => format!(
                         "directives.provider: '{binding}' is {description}, not a provider instance"
                     ),
@@ -643,9 +634,6 @@ fn eval_as_binding_name(
                 Err(ParseError::InvalidExpression { line, message })
             }
         }
-        EvalValue::User(Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument { name, .. },
-        ))) if matches!(usage, BindingNameUse::Dependency) => Ok(name),
         EvalValue::User(Value::Deferred(DeferredValue::Unknown(
             crate::resource::UnknownReason::ModuleArgument { name, .. },
         ))) => Err(ParseError::InvalidExpression {

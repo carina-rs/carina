@@ -8,7 +8,7 @@
 //! the legacy `from_*_with_state` entries have been removed (carina#3248).
 //! a thin shim over the two new entry points.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
@@ -35,7 +35,7 @@ fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding: Some(binding.into()),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
         module_source: None,
         default_tag_keys: Default::default(),
         loop_provenance: Default::default(),
@@ -63,7 +63,7 @@ fn make_virtual(binding: &'static str, attrs: &[(&str, Value)]) -> LiveCompositi
             pending_constraints: Vec::new(),
         },
         binding: Some(binding.into()),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
         module_name: "m".into(),
         instance: binding.into(),
         call_path: Default::default(),

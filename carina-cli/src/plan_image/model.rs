@@ -310,8 +310,8 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
     for (dependent_idx, bindings) in effect_dependencies {
         let mut bindings: Vec<_> = bindings.iter().collect();
         bindings.sort();
-        for binding in bindings {
-            let Some(dependency_idx) = dependency_graph.binding_to_effect.get(binding) else {
+        for dependency_id in bindings {
+            let Some(dependency_idx) = dependency_graph.id_to_effect.get(dependency_id) else {
                 continue;
             };
             let (Some(dependency), Some(dependent)) = (
@@ -579,10 +579,7 @@ fn dependency_only_create(resource: &ResolvedResource) -> Effect {
     shell.module_source = None;
     shell.default_tag_keys = Default::default();
     shell.quoted_string_attrs.clear();
-    shell.dependency_bindings = carina_core::deps::get_resource_dependencies(resource.as_inner())
-        .into_iter()
-        .collect();
-    Effect::Create(ResolvedResource::new(shell))
+    Effect::Create(resource.replace_inner(shell))
 }
 
 fn effect_module_source(effect: &Effect) -> Option<&ModuleSource> {
@@ -703,7 +700,7 @@ fn node_from_effect(
             Some(format!("from {from}")),
         ),
         Effect::Wait {
-            identity,
+            id,
             target_id,
             until: _,
             until_surface: _,
@@ -711,13 +708,17 @@ fn node_from_effect(
             interval: _,
             explicit_dependencies: _,
         } => (
-            identity.to_string(),
+            id.identity_str().to_string(),
             format!("wait on {}", target_id.id().display_type()),
             EffectKind::Wait,
             Vec::new(),
             None,
         ),
-        Effect::DeferredCreate { id, template } => (
+        Effect::DeferredCreate {
+            id,
+            dependencies: _dependencies,
+            template,
+        } => (
             deferred_label(template, id),
             id.display_type(),
             EffectKind::DeferredCreate,
@@ -1135,6 +1136,21 @@ mod tests {
         ResolvedResource::collect_resolved(resources).expect("test resources have resolved ids")
     }
 
+    fn resolved_with_graph(resources: impl IntoIterator<Item = Resource>) -> Vec<ResolvedResource> {
+        let resources = resources.into_iter().collect::<Vec<_>>();
+        let mut parsed = carina_core::parser::ParsedFile::default();
+        let graph =
+            carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &[])
+                .expect("test graph targets resolve");
+        resources
+            .into_iter()
+            .map(|resource| {
+                graph.resolve_resource(resource, &carina_core::schema::SchemaRegistry::new())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("test graph dependencies resolve")
+    }
+
     #[test]
     fn dependency_only_create_preserves_resolved_ignore_changes() {
         use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
@@ -1194,10 +1210,16 @@ mod tests {
             binding: Some(binding.to_string()),
             dependencies: dependencies
                 .iter()
-                .map(|value| (*value).to_string())
+                .map(|value| {
+                    ResolvedResourceId::new(ResourceId::with_identity(
+                        "test.Widget",
+                        carina_core::resource::ResourceIdentity::try_from((*value).to_string())
+                            .expect("test dependency is a valid identity"),
+                    ))
+                })
                 .collect(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         }
     }
 
@@ -1302,6 +1324,7 @@ mod tests {
         };
         let effect = Effect::DeferredCreate {
             id: ResolvedResourceId::new(ResourceId::with_identity("__deferred_for", "widgets")),
+            dependencies: Default::default(),
             template: Box::new(template),
         };
 
@@ -1375,6 +1398,7 @@ mod tests {
                 "pending_accounts",
                 None,
             ),
+            dependencies: Default::default(),
             template: Box::new(round_tripped),
         });
         let node = node_from_effect(0, &plan.effects()[0], None, None);
@@ -1447,10 +1471,11 @@ mod tests {
         let sink = named_resource("sink", &["connector"]);
         let unrelated = named_resource("unrelated", &[]);
 
+        let desired = resolved_with_graph([source, connector.clone(), sink, unrelated.clone()]);
+
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(source.clone())));
-        plan.add(Effect::Create(ResolvedResource::new(sink.clone())));
-        let desired = resolved([source, connector.clone(), sink, unrelated.clone()]);
+        plan.add(Effect::Create(desired[0].clone()));
+        plan.add(Effect::Create(desired[2].clone()));
         let unresolved = unresolved(&desired);
 
         let model = build_model(input(
@@ -1498,7 +1523,18 @@ mod tests {
         let fixture = crate::fixture_plan::build_plan_from_fixture_name("replace_create_only");
         let mut plan = fixture.plan;
         let consumer = named_resource("consumer", &["alpha"]);
-        plan.add(Effect::Create(ResolvedResource::new(consumer)));
+        let alpha = ResolvedResourceId::new(ResourceId::with_provider_identity(
+            "test",
+            "test.Widget",
+            carina_core::resource::ResourceIdentity::try_from("alpha".to_string())
+                .expect("fixture dependency identity"),
+            None,
+        ));
+        plan.add(Effect::Create(ResolvedResource::from_resolved_parts(
+            consumer,
+            std::iter::once(alpha).collect(),
+            Default::default(),
+        )));
 
         let model = build_model(input(
             &plan,
@@ -1530,10 +1566,10 @@ mod tests {
         let source = named_resource("source", &[]);
         let connector = named_resource("module/connector", &["source"]);
         let sink = named_resource("sink", &["module/connector"]);
+        let desired = resolved_with_graph([source, connector.clone(), sink]);
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(source.clone())));
-        plan.add(Effect::Create(ResolvedResource::new(sink.clone())));
-        let desired = resolved([source, connector.clone(), sink]);
+        plan.add(Effect::Create(desired[0].clone()));
+        plan.add(Effect::Create(desired[2].clone()));
 
         let site = CallSite::new(
             EphemeralId::new(ResolvedResourceId::new(ResourceId::with_identity(

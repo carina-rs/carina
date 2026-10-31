@@ -1,10 +1,11 @@
 //! CLI-level regression coverage for destroy ordering through wait bindings.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use carina_core::resource::{ResolvedDependencies, ResolvedResourceId};
 use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile, check_and_migrate};
 use tempfile::TempDir;
 
@@ -110,7 +111,8 @@ let lst = mock.test.resource {{
             .with_attribute("id", serde_json::json!("lst-id"))
             .with_attribute("upstream", serde_json::json!("cert-id"));
         lst.binding = Some("lst".to_string());
-        lst.dependency_bindings.insert("cert_issued".to_string());
+        lst.dependency_bindings
+            .insert(ResolvedResourceId::with_identity("__wait", "cert_issued"));
         state
             .upsert_resource(lst)
             .expect("test state setup must be valid");
@@ -163,7 +165,7 @@ let lst = mock.test.resource {{
                 ("id".to_string(), serde_json::json!("main-old")),
                 ("status".to_string(), serde_json::json!("STALE")),
             ]),
-            BTreeSet::new(),
+            ResolvedDependencies::default(),
         ));
         state
             .upsert_resource(main)

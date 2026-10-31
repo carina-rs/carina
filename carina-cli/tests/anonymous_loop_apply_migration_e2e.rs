@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use carina_cli::commands::plan::PlanFile;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -176,7 +177,10 @@ fn current_saved_plan_apply_moves_legacy_loop_row_without_provider_mutation() {
     assert_success("carina plan --out", &plan);
 
     let saved_plan = read_json(&scenario.project.join("migration.plan.json"));
-    assert_eq!(saved_plan["version"], Value::from(31));
+    assert_eq!(
+        saved_plan["version"],
+        Value::from(PlanFile::CURRENT_VERSION),
+    );
     let move_payload = saved_plan["plan"]["effects"]
         .as_array()
         .expect("saved plan effects")

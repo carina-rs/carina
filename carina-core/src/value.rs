@@ -2558,11 +2558,11 @@ pub(crate) fn unresolved_effect_contains_redacted_secret(
         }
         UnresolvedSavedEffect::Create(resource)
         | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
-            attributes_contain_redacted_secret(resource.attributes.values())
+            attributes_contain_redacted_secret(resource.as_resource().attributes.values())
         }
         UnresolvedSavedEffect::Update { from, to, .. } => {
             attributes_contain_redacted_secret(from.attributes.values())
-                || attributes_contain_redacted_secret(to.attributes.values())
+                || attributes_contain_redacted_secret(to.as_resource().attributes.values())
         }
         UnresolvedSavedEffect::Import { identifier, .. } => contains_redacted_secret(identifier),
         UnresolvedSavedEffect::Wait { until, .. } => contains_redacted_secret(until.value()),
@@ -2621,7 +2621,7 @@ pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<
             origin: _origin,
         } => false,
         Effect::Wait {
-            identity: _identity,
+            id: _id,
             target_id: _target_id,
             until,
             until_surface: _until_surface,
@@ -2629,13 +2629,16 @@ pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<
             interval: _interval,
             explicit_dependencies: _explicit_dependencies,
         } => contains_redacted_secret(until.value()),
-        Effect::DeferredCreate { id: _id, template } => {
-            deferred_template_contains_redacted_secret(template)
-        }
+        Effect::DeferredCreate {
+            id: _id,
+            dependencies: _dependencies,
+            template,
+        } => deferred_template_contains_redacted_secret(template),
         Effect::DeferredReplace(payload) => {
             let crate::effect::DeferredReplacePayload {
                 deletes: _deletes,
                 id: _id,
+                dependencies: _dependencies,
                 template,
             } = payload.as_ref();
             deferred_template_contains_redacted_secret(template)
@@ -3698,9 +3701,11 @@ pub fn redact_secrets_in_live_composition(
         .signature
         .attributes
         .iter()
-        .map(|(k, attr)| {
-            redact_secrets_in_value(&attr.to_value())
-                .map(|value| (k.clone(), attr.with_value(value)))
+        .map(|(k, attr)| match attr.value() {
+            Some(value) => {
+                redact_secrets_in_value(&value).map(|value| (k.clone(), attr.with_value(value)))
+            }
+            None => Ok((k.clone(), attr.clone())),
         })
         .collect();
     let mut out = resource.clone();
@@ -3770,7 +3775,7 @@ pub fn rehydrate_saved_composition_secrets(
             .signature
             .attributes
             .get(key)
-            .map(crate::resource::LiveCompositionAttribute::to_value);
+            .and_then(crate::resource::LiveCompositionAttribute::value);
         let value = rehydrate_secret_entry(
             &saved_value,
             evaluated_value.as_ref(),
@@ -3958,18 +3963,16 @@ pub fn redact_secrets_in_effect(
     use crate::effect::{DeferredReplacePayload, Effect};
     Ok(match effect {
         Effect::Read { resource } => Effect::Read {
-            resource: crate::resource::ResolvedDataSource::new(redact_secrets_in_data_source(
-                resource,
-            )?),
+            resource: resource.replace_inner(redact_secrets_in_data_source(resource)?),
         },
-        Effect::Create(resource) => Effect::Create(crate::resource::ResolvedResource::new(
-            redact_secrets_in_resource(resource)?,
-        )),
+        Effect::Create(resource) => {
+            Effect::Create(resource.replace_inner(redact_secrets_in_resource(resource)?))
+        }
         Effect::ResumeCreate {
             resource,
             started_at,
         } => Effect::ResumeCreate {
-            resource: crate::resource::ResolvedResource::new(redact_secrets_in_resource(resource)?),
+            resource: resource.replace_inner(redact_secrets_in_resource(resource)?),
             started_at: started_at.clone(),
         },
         Effect::Update {
@@ -3980,7 +3983,7 @@ pub fn redact_secrets_in_effect(
         } => Effect::Update {
             from: Box::new(redact_secrets_in_state(from)?),
             identifier: identifier.clone(),
-            to: crate::resource::ResolvedResource::new(redact_secrets_in_resource(to)?),
+            to: to.replace_inner(redact_secrets_in_resource(to)?),
             changed_attributes: changed_attributes.clone(),
         },
         Effect::Delete {
@@ -4016,14 +4019,20 @@ pub fn redact_secrets_in_effect(
         // typed predicate over scalar values, surface form is the
         // user-authored source. Clone through unchanged.
         Effect::Wait { .. } => effect.clone(),
-        Effect::DeferredCreate { id, template } => Effect::DeferredCreate {
+        Effect::DeferredCreate {
+            id,
+            dependencies,
+            template,
+        } => Effect::DeferredCreate {
             id: id.clone(),
+            dependencies: dependencies.clone(),
             template: Box::new(redact_deferred_template(template)?),
         },
         Effect::DeferredReplace(payload) => {
             Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                 deletes: payload.deletes.clone(),
                 id: payload.id.clone(),
+                dependencies: payload.dependencies.clone(),
                 template: Box::new(redact_deferred_template(&payload.template)?),
             }))
         }
@@ -4063,14 +4072,14 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
         .iter()
         .map(|effect| {
             let mut effect = match effect {
-                crate::effect::Effect::Create(resource) => match reusable_resource(&resource.id) {
-                    Some(planned) => {
-                        crate::effect::Effect::Create(crate::resource::ResolvedResource::new(
+                crate::effect::Effect::Create(resource) => {
+                    match reusable_resource(&resource.id) {
+                        Some(planned) => crate::effect::Effect::Create(resource.replace_inner(
                             redact_resource_using_redacted_shape(resource, planned)?,
-                        ))
+                        )),
+                        None => redact_secrets_in_effect(effect)?,
                     }
-                    None => redact_secrets_in_effect(effect)?,
-                },
+                }
                 crate::effect::Effect::Update {
                     from,
                     identifier,
@@ -4080,12 +4089,10 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
                     from: Box::new(redact_secrets_in_state(from)?),
                     identifier: identifier.clone(),
                     to: match reusable_resource(&to.id) {
-                        Some(planned) => crate::resource::ResolvedResource::new(
-                            redact_resource_using_redacted_shape(to, planned)?,
-                        ),
-                        None => {
-                            crate::resource::ResolvedResource::new(redact_secrets_in_resource(to)?)
+                        Some(planned) => {
+                            to.replace_inner(redact_resource_using_redacted_shape(to, planned)?)
                         }
+                        None => to.replace_inner(redact_secrets_in_resource(to)?),
                     },
                     changed_attributes: changed_attributes.clone(),
                 },
@@ -4174,9 +4181,8 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                     )
                 })?;
                 Ok(Effect::Read {
-                    resource: crate::resource::ResolvedDataSource::new(
-                        rehydrate_data_source_secrets(resource, fresh)?,
-                    ),
+                    resource: resource
+                        .replace_inner(rehydrate_data_source_secrets(resource, fresh)?),
                 })
             }
             Effect::Create(resource) => {
@@ -4189,7 +4195,7 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                         SecretRehydrationError::ShapeMismatch,
                     )
                 })?;
-                Ok(Effect::Create(crate::resource::ResolvedResource::new(
+                Ok(Effect::Create(resource.replace_inner(
                     rehydrate_resource_secrets(resource, fresh)?,
                 )))
             }
@@ -4211,9 +4217,7 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                 Ok(Effect::Update {
                     from: from.clone(),
                     identifier: identifier.clone(),
-                    to: crate::resource::ResolvedResource::new(rehydrate_resource_secrets(
-                        to, fresh,
-                    )?),
+                    to: to.replace_inner(rehydrate_resource_secrets(to, fresh)?),
                     changed_attributes: changed_attributes.clone(),
                 })
             }
@@ -4229,10 +4233,15 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                     .expect("guarded by contains_redacted_secret"),
                 })
             }
-            Effect::DeferredCreate { id, template } => {
+            Effect::DeferredCreate {
+                id,
+                dependencies,
+                template,
+            } => {
                 let template = rehydrate_deferred_template(template, deferred_templates)?;
                 Ok(Effect::DeferredCreate {
                     id: id.clone(),
+                    dependencies: dependencies.clone(),
                     template: Box::new(template),
                 })
             }
@@ -4241,6 +4250,7 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                 Ok(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                     deletes: payload.deletes.clone(),
                     id: payload.id.clone(),
+                    dependencies: payload.dependencies.clone(),
                     template: Box::new(template),
                 })))
             }
@@ -5252,6 +5262,13 @@ fn canonicalize_with_type_for_purpose<P: CanonicalizationErrorPolicy>(
             .resolve_refs_with_defs_on_path(defs, &mut visited_refs)
             .as_attr(),
     );
+    if matches!(unwrapped.kind, AttrTypeKind::ResourceHandle { .. }) {
+        let source = crate::schema::TypeError::TypeMismatch {
+            expected: unwrapped.type_name(),
+            got: value.type_name(),
+        };
+        return error_policy.canonicalization_failed(value, source);
+    }
     if let Some(fit) = crate::schema::fit_value_to_resolved_type_on_path(
         unwrapped,
         &value,
@@ -8449,25 +8466,28 @@ mod tests {
     }
 
     #[test]
-    fn resource_handle_validation_and_desired_canonicalization_agree_on_string_wire_value() {
+    fn resource_handle_validation_and_desired_canonicalization_reject_values() {
         let handle = AttributeType::resource_handle("test", "widget");
         let string_id = Value::Concrete(ConcreteValue::String("widget-123".into()));
         let identifier = Value::Concrete(ConcreteValue::enum_identifier("widget_binding"));
 
-        assert!(handle.validate(&string_id).is_ok());
+        assert!(matches!(
+            handle.validate(&string_id),
+            Err(crate::schema::TypeError::TypeMismatch { .. })
+        ));
         assert!(matches!(
             handle.validate(&identifier),
             Err(crate::schema::TypeError::TypeMismatch { .. })
         ));
-        assert_eq!(
+        assert!(
             canonicalize_desired_with_type(
-                string_id.clone(),
+                string_id,
                 &handle,
                 crate::schema::empty_defs_for_schema_walks(),
                 DesiredValueSource::AuthoredDsl,
             )
-            .unwrap(),
-            string_id,
+            .is_err(),
+            "a string value must not become a resource handle during canonicalization",
         );
         assert!(
             canonicalize_desired_with_type(
@@ -10486,7 +10506,7 @@ mod tests {
         // same way managed-resource attributes are redacted.
         use crate::resource::LiveCompositionAttribute;
         use crate::resource::{LiveComposition, LiveCompositionSignature, ResourceId};
-        use std::collections::{BTreeSet, HashSet};
+        use std::collections::HashSet;
         let mut attrs: indexmap::IndexMap<String, LiveCompositionAttribute> =
             indexmap::IndexMap::new();
         attrs.insert(
@@ -10516,7 +10536,7 @@ mod tests {
                 pending_constraints: Vec::new(),
             },
             binding: Some("module_instance".to_string()),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "m".to_string(),
             instance: "module_instance".to_string(),
             call_path: Default::default(),
@@ -10531,7 +10551,7 @@ mod tests {
                 .signature
                 .attributes
                 .get("non_secret")
-                .map(|a| a.to_value()),
+                .and_then(|a| a.value()),
             Some(Value::Concrete(ConcreteValue::String("kept".into()))),
         );
 
@@ -10541,7 +10561,7 @@ mod tests {
             .signature
             .attributes
             .get("secret_field")
-            .map(|a| a.to_value())
+            .and_then(|a| a.value())
             .as_ref()
         {
             Some(Value::Deferred(DeferredValue::RedactedSecret { hash })) => {
@@ -12328,7 +12348,7 @@ mod tests {
 
     fn make_resource(attrs: Vec<(&str, Value)>) -> crate::resource::Resource {
         use crate::resource::{Resource, ResourceId};
-        use std::collections::{BTreeSet, HashMap, HashSet};
+        use std::collections::{HashMap, HashSet};
         let mut attributes = IndexMap::new();
         for (k, v) in attrs {
             attributes.insert(k.to_string(), v);
@@ -12340,7 +12360,7 @@ mod tests {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("p1".to_string()),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -12497,7 +12517,7 @@ mod tests {
 
     fn make_state(attrs: Vec<(&str, Value)>) -> crate::resource::State {
         use crate::resource::{ResourceId, State};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
         let mut attributes = HashMap::new();
         for (k, v) in attrs {
             attributes.insert(k.to_string(), v);
@@ -12507,7 +12527,7 @@ mod tests {
             identifier: Some("arn:aws:iam::123:policy/p1".to_string()),
             attributes,
             exists: true,
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             partial_read: None,
         }
     }
@@ -13043,6 +13063,7 @@ mod tests {
                 "__deferred_for",
                 "validation_records",
             )),
+            dependencies: Default::default(),
             template: Box::new(DeferredForExpression {
                 file: None,
                 line: 1,
@@ -13138,6 +13159,7 @@ mod tests {
                 "__deferred_for",
                 "records",
             )),
+            dependencies: Default::default(),
             template: Box::new(DeferredForExpression {
                 file: None,
                 line: 1,
@@ -13217,6 +13239,7 @@ mod tests {
                 "__deferred_for",
                 "children",
             )),
+            dependencies: Default::default(),
             template: Box::new(template.clone()),
         };
 
@@ -13239,6 +13262,7 @@ mod tests {
                 "__deferred_for",
                 "children",
             )),
+            dependencies: Default::default(),
             template: redacted_template,
         });
         let rehydrated = rehydrate_plan_desired_secrets(
@@ -13274,8 +13298,6 @@ mod tests {
         use crate::resource::{
             Directives, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
         };
-        use std::collections::HashSet;
-
         let id = ResourceId::with_identity("aws.s3.Bucket", "bucket");
         let mut create = Resource::new("aws.s3.Bucket", "bucket");
         create.binding = Some("bucket".to_string());
@@ -13288,8 +13310,8 @@ mod tests {
                 identifier: crate::effect::fixture_applied_identifier("bucket-old"),
                 directives: Directives::default(),
                 binding: Some("bucket".to_string()),
-                dependencies: HashSet::new(),
-                explicit_dependencies: HashSet::new(),
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
             },
             create_before_destroy: true,
             changed_create_only: ChangedCreateOnly::new(vec!["bucket_name".to_string()])
@@ -13297,7 +13319,7 @@ mod tests {
             cascade_ref_hints: vec![("vpc_id".to_string(), "vpc.id".to_string())],
             temporary_name: None,
             permanent_name_override,
-            consumer_updates: HashSet::new(),
+            consumer_updates: Default::default(),
             previous_attributes,
         });
         plan

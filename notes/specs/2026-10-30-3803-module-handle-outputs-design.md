@@ -102,6 +102,15 @@ resolution. Fixing only the wait branch would preserve the invalid state elsewhe
 7. An optional attribute annotation checks the inferred RHS type; it does not
    coerce values into handles or handles into values.
 
+## Rejected alternatives
+
+Module-level `depends_on = [child]` was considered and rejected. It is too
+coarse: it waits for every resource in the module, reducing apply parallelism
+and creating false cycles. It would also make dependents plan as “(known after
+apply)” after any unrelated change inside the module, even when the specific
+resource they depend on is unchanged. A module-level form may be added later
+only as sugar over resource-level handles.
+
 ## Invariants
 
 - Authored binding text exists only in parser/pre-expansion types and diagnostic provenance.

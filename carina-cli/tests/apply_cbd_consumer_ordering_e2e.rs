@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use carina_core::resource::{ResolvedResourceId, ResourceId};
 use carina_state::{ResourceState, StateFile};
 use tempfile::TempDir;
 
@@ -85,7 +86,10 @@ let distribution = mock.test.resource {{
         distribution.binding = Some("distribution".to_string());
         distribution
             .dependency_bindings
-            .insert("web_acl".to_string());
+            .insert(ResolvedResourceId::new(ResourceId::with_identity(
+                "mock.test.resource",
+                "web_acl",
+            )));
         state
             .upsert_resource(distribution)
             .expect("test state setup must be valid");

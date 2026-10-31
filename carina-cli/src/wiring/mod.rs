@@ -127,9 +127,10 @@ use carina_core::provider::{
 };
 use carina_core::provider_source::ProviderSource;
 use carina_core::resource::{
-    ConcreteValue, Current, DataSource, DeferredValue, Directives, LiveComposition, ModuleSource,
-    PartialReadMarker, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
-    ResourceIdentity, ResourceIdentityError, State, Value,
+    ConcreteValue, Current, DataSource, DeferredValue, LiveComposition, ModuleSource,
+    PartialReadMarker, PersistedDirectives, ResolvedDependencies, ResolvedResource,
+    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, ResourceIdentityError, State,
+    Value,
 };
 #[cfg(test)]
 use carina_core::schema::{AttributeSchema, AttributeType};
@@ -2147,7 +2148,10 @@ where
         }
     }
     for param in &parsed.attribute_params {
-        if let Some(value) = &param.value
+        if let Some(value) = param
+            .value
+            .as_ref()
+            .and_then(carina_core::parser::BoundaryExpression::value)
             && value_contains_empty_interpolation(value)
         {
             errors.push(AppError::Validation(format!(
@@ -2720,12 +2724,15 @@ pub struct ResolvedDesiredIds {
 }
 
 impl ResolvedDesiredIds {
-    fn from_resources(resources: &[Resource], schemas: &SchemaRegistry) -> Result<Self, AppError> {
-        let ids =
-            ResolvedResource::collect_resolved_with_schemas(resources.iter().cloned(), schemas)?
-                .into_iter()
-                .map(|resource| resource.resolved_id())
-                .collect();
+    fn from_resources(resources: &[Resource]) -> Result<Self, AppError> {
+        let ids = resources
+            .iter()
+            .map(|resource| {
+                ResolvedResourceId::try_new(resource.id.clone()).ok_or_else(|| {
+                    carina_core::resource::PendingResourceIdentityError::new(resource.id.clone())
+                })
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Self { ids })
     }
 }
@@ -2807,7 +2814,7 @@ pub(crate) fn reconcile_late_anonymous_identities(
     // execution as duplicates.
     inputs.resources.unresolved_by_resolved_id()?;
 
-    let desired = ResolvedDesiredIds::from_resources(inputs.resources.resources(), ctx.schemas())?;
+    let desired = ResolvedDesiredIds::from_resources(inputs.resources.resources())?;
     apply_detected_resource_moves(
         inputs.addressed,
         moves,
@@ -3456,10 +3463,14 @@ pub(crate) fn validate_module_internal_ref_types(
     for module in module_walk.iter() {
         let mut parsed = module.loaded().parsed.clone();
         let prefix = module.diagnostic_path().display();
-        // Module expansion retains the established diagnostic for malformed
-        // declarations. This pass only needs successful resolution so valid
-        // dotted argument types can act as sources before expansion.
-        let _ = validation::resolve_file_type_exprs(&mut parsed, config);
+        // The recursive module-call checker owns declaration-resolution
+        // diagnostics and their source anchors. This pass only needs a
+        // successfully resolved declaration set so valid dotted argument
+        // types can act as sources before expansion; continuing after an
+        // error would manufacture a second, string-prefixed diagnostic.
+        if !validation::resolve_file_type_exprs(&mut parsed, config).is_empty() {
+            continue;
+        }
 
         if let Err(joined) = validation::validate_attribute_params(&parsed.attribute_params, config)
         {
@@ -3932,6 +3943,7 @@ impl RefreshableChildIds {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeferredCreateTarget {
     pub id: ResolvedResourceId,
+    pub dependencies: ResolvedDependencies,
     pub template: carina_core::parser::DeferredForExpression,
 }
 
@@ -3951,6 +3963,7 @@ impl DeferredCreateTarget {
         );
         Some(Self {
             id,
+            dependencies: ResolvedDependencies::default(),
             template: deferred.clone(),
         })
     }
@@ -3958,6 +3971,7 @@ impl DeferredCreateTarget {
     fn to_effect(&self) -> Effect {
         Effect::DeferredCreate {
             id: self.id.clone(),
+            dependencies: self.dependencies.clone(),
             template: Box::new(self.template.clone()),
         }
     }
@@ -3966,6 +3980,7 @@ impl DeferredCreateTarget {
         Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(deletes).expect("planner checked non-empty deletes"),
             id: self.id.clone(),
+            dependencies: self.dependencies.clone(),
             template: Box::new(self.template.clone()),
         }))
     }
@@ -4104,7 +4119,7 @@ impl<'state> ProjectedStateRead<'state> {
     fn saved_dependency_bindings(
         &self,
         resources: &[Resource],
-    ) -> HashMap<ResourceId, BTreeSet<String>> {
+    ) -> HashMap<ResourceId, ResolvedDependencies> {
         let Some(state_file) = self.state_file else {
             return HashMap::new();
         };
@@ -4125,7 +4140,7 @@ impl<'state> ProjectedStateRead<'state> {
             .collect()
     }
 
-    pub(crate) fn build_directives(&self) -> HashMap<ResourceId, Directives> {
+    pub(crate) fn build_directives(&self) -> HashMap<ResourceId, PersistedDirectives> {
         let Some(state_file) = self.state_file else {
             return HashMap::new();
         };
@@ -4138,7 +4153,7 @@ impl<'state> ProjectedStateRead<'state> {
                     .target_by_source
                     .get(source.as_inner())
                     .map_or_else(|| source.into_inner(), |target| target.as_inner().clone());
-                (id, row.directives.clone().into())
+                (id, row.directives.clone())
             })
             .collect()
     }
@@ -4560,7 +4575,7 @@ impl<'state> DetectedDeferredForExpansionPrelude<'state> {
         &self.prelude.saved_attrs
     }
 
-    pub(crate) fn saved_dependency_bindings(&self) -> HashMap<ResourceId, BTreeSet<String>> {
+    pub(crate) fn saved_dependency_bindings(&self) -> HashMap<ResourceId, ResolvedDependencies> {
         self.automatic_moves
             .state_read_projection(self.prelude.state_file.as_ref())
             .saved_dependency_bindings(&self.prelude.sorted_resources)
@@ -4764,7 +4779,7 @@ pub(crate) struct AddressedDataSourceReadInputs<'a, 'backend> {
     pub data_sources: &'a [DataSource],
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub schemas: &'a SchemaRegistry,
-    pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
+    pub saved_dep_bindings: &'a HashMap<ResourceId, ResolvedDependencies>,
     pub factories: &'a [Box<dyn ProviderFactory>],
     pub cancel: Option<&'a ShutdownToken>,
 }
@@ -5029,6 +5044,16 @@ impl<E> ExpandedCanonicalResources<E> {
         &self.resources
     }
 
+    fn resolve_expanded_graph(
+        &mut self,
+        managed: &[Resource],
+        data_sources: &[DataSource],
+    ) -> Result<carina_core::resolved_graph::ExpandedBindingIndex, AppError> {
+        self.resources
+            .resolve_expanded_graph(managed, data_sources)
+            .map_err(AppError::from)
+    }
+
     async fn prepare_desired_side_for_plan(
         &mut self,
         provider_configs: &[ProviderConfig],
@@ -5073,31 +5098,16 @@ pub fn derive_managed_binding_stability<E>(
         &parsed.upstream_binding_names(),
     )
     .map_err(AppError::Validation)?;
-    // Identity derivation runs later in the plan pipeline. Pending resources
-    // cannot have a refreshed row addressed to them yet, so they are
-    // conservatively unavailable; resolved resources can be diffed normally.
-    let mut pending_stability = HashMap::new();
-    let mut schema_resolved = Vec::new();
-    for resource in resolved {
-        let id = resource.id.clone();
-        if resource.id.identity_str().is_none() {
-            pending_stability.insert(
-                id,
-                carina_core::binding_index::ManagedBindingStability::Unavailable,
-            );
-        } else {
-            schema_resolved.push(ResolvedResource::resolve_with_schemas(resource, schemas)?);
-        }
-    }
-    let resolved = schema_resolved;
-    let mut stability = carina_core::differ::managed_binding_stability(
+    // Identity derivation and the one dependency-address transition both run
+    // later. This early projection resolves only schema-owned lifecycle
+    // metadata and keeps authored dependency operands out of resolved types.
+    let stability = carina_core::differ::pre_graph_managed_binding_stability(
         &resolved,
         &plan_input_current,
         schemas,
         saved_attrs,
         prev_explicit,
-    );
-    stability.extend(pending_stability);
+    )?;
     Ok(stability)
 }
 
@@ -5179,7 +5189,7 @@ struct LiveExpandedChildrenInputs<'a, 'backend> {
     provider: &'a dyn Provider,
     normalizer: &'a dyn ProviderNormalizer,
     state_file: &'a StateFile,
-    saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
+    saved_dep_bindings: &'a HashMap<ResourceId, ResolvedDependencies>,
     refresh_phase: &'a RefreshPhase<'backend>,
     schemas: &'a SchemaRegistry,
 }
@@ -5564,25 +5574,24 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     let PostExpansionPlanView { data, children } = expansion;
     children.consume();
     let PostExpansionPlanData {
-        expanded_resources,
+        mut expanded_resources,
         sorted_resources,
         mut addressed,
         mut data_source_values,
         wait_aliases,
         residual_deferred_for,
-        deferred_create_targets,
+        mut deferred_create_targets,
     } = data;
-    let parsed = expanded_resources.parsed();
-
     // awscc#251 (follow-up to #3055): data sources do not flow through
     // `into_plan_input_current_map`, so lift them explicitly at this seam.
     lift_data_source_value_enum_leaves(&mut data_source_values, data_sources, context.schemas());
-    let upstream_binding_names = parsed.upstream_binding_names();
-    let no_unresolved_upstream_bindings = HashSet::new();
-    let state_block_upstream_bindings =
-        M::state_block_upstream_bindings(&upstream_binding_names, &no_unresolved_upstream_bindings);
+    let upstream_binding_names = expanded_resources.parsed().upstream_binding_names();
+    let deferred_upstream_bindings = upstream_binding_names
+        .iter()
+        .map(|binding| (*binding).to_string())
+        .collect::<HashSet<_>>();
     let managed_stability = derive_managed_binding_stability(
-        parsed,
+        expanded_resources.parsed(),
         &sorted_resources,
         &addressed.managed_current,
         &data_source_values,
@@ -5604,7 +5613,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             &projected_state,
             LivePreApplyInputs {
                 managed: &[],
-                compositions: &parsed.compositions,
+                compositions: &expanded_resources.parsed().compositions,
                 managed_current: &pre_apply_current,
                 data_source_values: &data_source_values,
                 remote_bindings,
@@ -5627,10 +5636,11 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     )?;
     let constraint_origin_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
-    let compositions = parsed.compositions.clone();
+    let mut compositions = expanded_resources.parsed().compositions.clone();
     let module_gate =
         carina_core::executor::ModuleConstraintGate::from_live_compositions(&compositions);
-    let wait_bindings = parsed.wait_bindings.clone();
+    let wait_bindings = expanded_resources.parsed().wait_bindings.clone();
+    let state_blocks = expanded_resources.parsed().state_blocks.clone();
     let preparation = if let Some(errors) = preparation_errors {
         Err(PlanPreparationError::Plan(errors))
     } else {
@@ -5700,6 +5710,18 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         state_file,
     )?;
 
+    // This is the only transition from parser/pre-expansion dependency
+    // operands to complete scheduler addresses. It deliberately runs after
+    // late anonymous identity reconciliation and before any differ input is
+    // constructed.
+    let expanded_graph = expanded_resources
+        .resolve_expanded_graph(override_aware_resources.resources(), &data_sources_for_plan)?;
+    compositions = expanded_resources.parsed().compositions.clone();
+    for target in &mut deferred_create_targets {
+        target.dependencies = expanded_graph
+            .resolve_deferred_for_dependencies(&target.template, &deferred_upstream_bindings)?;
+    }
+
     let reconciled_provider_states = provider_states_for(
         &addressed.managed_current,
         &addressed.orphans,
@@ -5710,10 +5732,12 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         context.schemas(),
         override_aware_resources.resources(),
     );
-    let stability_resources = ResolvedResource::collect_resolved_with_schemas(
-        override_aware_resources.resources().iter().cloned(),
-        context.schemas(),
-    )?;
+    let stability_resources = override_aware_resources
+        .resources()
+        .iter()
+        .cloned()
+        .map(|resource| expanded_graph.resolve_resource(resource, context.schemas()))
+        .collect::<Result<Vec<_>, _>>()?;
     let managed_stability = carina_core::differ::managed_binding_stability(
         &stability_resources,
         &reconciled_input_current,
@@ -5723,7 +5747,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     );
     override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
         RebuildBindingsInputs {
-            compositions: &parsed.compositions,
+            compositions: &compositions,
             managed_current: &reconciled_input_current,
             data_source_values: &data_source_values,
             remote_bindings,
@@ -5739,14 +5763,33 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         .build_directives();
     let paired_unresolved_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
-    let resolved_resources = ResolvedResource::collect_resolved_with_schemas(
-        override_aware_resources.resources().iter().cloned(),
-        context.schemas(),
-    )?;
-    let resolved_unresolved_resources = ResolvedResource::collect_resolved_with_schemas(
-        paired_unresolved_resources.iter().cloned(),
-        context.schemas(),
-    )?;
+    let resolved_resources = override_aware_resources
+        .resources()
+        .iter()
+        .cloned()
+        .zip(paired_unresolved_resources.iter().cloned())
+        .map(|(evaluated, authored)| {
+            expanded_graph.resolve_resource_with_dependency_source(
+                evaluated,
+                authored,
+                context.schemas(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let resolved_unresolved_resources = paired_unresolved_resources
+        .iter()
+        .cloned()
+        .map(|resource| expanded_graph.resolve_resource(resource, context.schemas()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let resolved_data_sources_for_plan = data_sources_for_plan
+        .iter()
+        .cloned()
+        .map(|data_source| expanded_graph.resolve_data_source(data_source))
+        .collect::<Result<Vec<_>, _>>()?;
+    let resolved_wait_bindings = wait_bindings
+        .iter()
+        .map(|wait| expanded_graph.resolve_wait_binding(wait))
+        .collect::<Result<Vec<_>, _>>()?;
     let plan_input_current = carina_core::resource::into_plan_input_current_map(
         addressed.managed_current.clone(),
         context.schemas(),
@@ -5755,14 +5798,14 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     let mut plan = create_plan_with_cascades(
         &resolved_resources,
         &resolved_unresolved_resources,
-        &data_sources_for_plan,
+        &resolved_data_sources_for_plan,
         provider,
         PlanPriorStates::new(&plan_input_current, &addressed.orphans),
         &directives_map,
         context.schemas(),
         &addressed.saved_attrs,
         &addressed.prev_explicit,
-        &wait_bindings,
+        &resolved_wait_bindings,
     )?;
     add_deposed_delete_effects(&mut plan, state_file, &addressed.moved_pairs);
     block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
@@ -5770,9 +5813,13 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
 
     // State blocks run after differ/deposed identifier errors so `removed`
     // remains the explicit recovery that can suppress those diagnostics.
+    let upstream_binding_names = expanded_resources.parsed().upstream_binding_names();
+    let no_unresolved_upstream_bindings = HashSet::new();
+    let state_block_upstream_bindings =
+        M::state_block_upstream_bindings(&upstream_binding_names, &no_unresolved_upstream_bindings);
     add_state_block_effects(
         &mut plan,
-        &parsed.state_blocks,
+        &state_blocks,
         state_file,
         &addressed.moved_pairs,
         override_aware_resources.resources(),
@@ -6427,7 +6474,7 @@ pub(crate) struct ExpandRefreshAndLiftInputs<'a, 'backend, P: Provider + Provide
     pub warning_policy: DeferredForWarningPolicy,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub state_file: &'a Option<StateFile>,
-    pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
+    pub saved_dep_bindings: &'a HashMap<ResourceId, ResolvedDependencies>,
     pub refresh_phase: &'a RefreshPhase<'backend>,
     pub schemas: &'a carina_core::schema::SchemaRegistry,
     pub identity_context: &'a WiringContext,
@@ -6446,7 +6493,7 @@ pub(crate) struct ValidatedExpandRefreshAndLiftInputs<
     pub warning_policy: DeferredForWarningPolicy,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub state_file: &'a Option<StateFile>,
-    pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
+    pub saved_dep_bindings: &'a HashMap<ResourceId, ResolvedDependencies>,
     pub refresh_phase: &'a RefreshPhase<'backend>,
 }
 
@@ -6462,7 +6509,7 @@ pub(crate) struct ValidatedCanonicalExpandRefreshAndLiftInputs<
     pub warning_policy: DeferredForWarningPolicy,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub state_file: &'a Option<StateFile>,
-    pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
+    pub saved_dep_bindings: &'a HashMap<ResourceId, ResolvedDependencies>,
     pub refresh_phase: &'a RefreshPhase<'backend>,
 }
 
@@ -7772,17 +7819,20 @@ pub(crate) fn deposed_delete_effects_for_row(
 ) -> (Vec<Effect>, Vec<PlanError>) {
     let mut effects = Vec::with_capacity(row.deposed.len());
     let mut errors = Vec::new();
+    let row_id = resolved_state_row_id(row, row.directives.provider_instance.clone());
     let blocked_by_current_resume = match row.current() {
-        carina_state::CurrentInstance::CreateInFlight { .. } => HashSet::from([moved_pairs
-            .iter()
-            .find_map(|(from, to)| {
-                let row_id = resolved_state_row_id(row, row.directives.provider_instance.clone());
-                (from.as_inner() == row_id.as_inner()).then(|| to.identity().clone())
-            })
-            .unwrap_or_else(|| row.identity.clone())]),
+        carina_state::CurrentInstance::CreateInFlight { .. } => std::iter::once(
+            moved_pairs
+                .iter()
+                .find_map(|(from, to)| (from == &row_id).then(|| to.clone()))
+                .unwrap_or_else(|| row_id.clone()),
+        )
+        .collect(),
         carina_state::CurrentInstance::None
         | carina_state::CurrentInstance::Applied { .. }
-        | carina_state::CurrentInstance::MissingIdentifier { .. } => HashSet::new(),
+        | carina_state::CurrentInstance::MissingIdentifier { .. } => {
+            ResolvedDependencies::default()
+        }
     };
     for deposed in &row.deposed {
         let id = resolved_state_row_id(row, deposed.provider_instance.clone());
@@ -7798,8 +7848,8 @@ pub(crate) fn deposed_delete_effects_for_row(
                 generation: EffectGeneration::Deposed(deposed.key.clone()),
                 directives: Default::default(),
                 binding: row.binding.clone(),
-                dependencies: deposed.dependency_bindings.iter().cloned().collect(),
-                explicit_dependencies: HashSet::new(),
+                dependencies: deposed.dependency_bindings.clone(),
+                explicit_dependencies: ResolvedDependencies::default(),
                 blocked_by_updates: blocked_by_current_resume.clone(),
             }),
             Err(error) => errors.push(*error),
@@ -8008,7 +8058,7 @@ pub(crate) struct RefreshResourceSetInputs<'a, 'backend> {
     pub refresh_phase: &'a RefreshPhase<'backend>,
     pub state_file: Option<&'a StateFile>,
     pub schemas: &'a SchemaRegistry,
-    pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
+    pub saved_dep_bindings: &'a HashMap<ResourceId, ResolvedDependencies>,
 }
 
 struct DirectManagedStateReads;
@@ -8152,7 +8202,7 @@ pub(crate) struct ReadDataSourcesInputs<'a, 'backend> {
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub schemas: &'a SchemaRegistry,
     pub wait_aliases: &'a [WaitAliasSpec],
-    pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
+    pub saved_dep_bindings: &'a HashMap<ResourceId, ResolvedDependencies>,
     pub factories: &'a [Box<dyn ProviderFactory>],
     /// When present, stop dispatching new provider reads as soon as the
     /// command enters graceful shutdown. Reads already in flight are drained.
@@ -8238,7 +8288,7 @@ pub(crate) struct ExpandedDataSourceReadInputs<'a, 'backend> {
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub schemas: &'a SchemaRegistry,
     pub wait_aliases: &'a [WaitAliasSpec],
-    pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
+    pub saved_dep_bindings: &'a HashMap<ResourceId, ResolvedDependencies>,
     pub factories: &'a [Box<dyn ProviderFactory>],
     pub cancel: Option<&'a ShutdownToken>,
 }

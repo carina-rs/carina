@@ -30,7 +30,7 @@ pub fn get_resource_dependencies<S>(resource: &Resource<S>) -> HashSet<String> {
         deps.insert(name.clone());
     }
     for name in &resource.directives.depends_on {
-        deps.insert(name.clone());
+        deps.insert(name.diagnostic_reference());
     }
     deps
 }
@@ -79,7 +79,7 @@ pub fn get_data_source_dependencies<S>(
         deps.insert(name.clone());
     }
     for name in &data_source.directives.depends_on {
-        deps.insert(name.clone());
+        deps.insert(name.diagnostic_reference());
     }
     deps
 }
@@ -229,14 +229,16 @@ fn topological_sort(resources: &[Resource]) -> Result<Vec<Resource>, String> {
 mod tests {
     use super::*;
     use crate::effect::Effect;
+    use crate::parser::{BindingName, UnexpandedDependencies, UnexpandedDependencyOperand};
     use crate::resource::{
-        ConcreteValue, DeferredValue, Resource, ResourceId, ResourceIdentity, Value,
+        ConcreteValue, DeferredValue, ResolvedDependencies, ResolvedResourceId, Resource,
+        ResourceId, Value,
     };
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
     fn wait_effect_with_explicit_dependency(binding: Option<&str>) -> Effect {
         Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
             target_id: crate::wait::ManagedWaitTarget::new(
                 &crate::resource::ResolvedResource::new(Resource::new("acm.Certificate", "cert")),
             ),
@@ -248,7 +250,16 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: std::time::Duration::from_secs(60),
             interval: std::time::Duration::from_millis(1),
-            explicit_dependencies: binding.into_iter().map(String::from).collect(),
+            explicit_dependencies: binding
+                .into_iter()
+                .map(|name| {
+                    ResolvedResourceId::with_identity(
+                        "test",
+                        crate::resource::ResourceIdentity::try_from(name.to_string())
+                            .expect("test identity must be non-empty"),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -448,14 +459,18 @@ mod tests {
     }
 
     #[test]
-    fn wait_blocking_bindings_include_target_before_explicit_dependencies() {
+    fn wait_blocking_dependencies_include_target_and_explicit_dependencies() {
         let effect = wait_effect_with_explicit_dependency(Some("other_failed"));
-        let blocking_bindings = effect.blocking_bindings();
+        let blocking_dependencies = effect.blocking_dependencies();
 
-        assert_eq!(blocking_bindings.first(), Some(&"cert".to_string()));
         assert_eq!(
-            blocking_bindings.into_iter().collect::<HashSet<_>>(),
-            HashSet::from(["cert".to_string(), "other_failed".to_string()])
+            blocking_dependencies,
+            [
+                ResolvedResourceId::with_identity("acm.Certificate", "cert"),
+                ResolvedResourceId::with_identity("test", "other_failed"),
+            ]
+            .into_iter()
+            .collect::<ResolvedDependencies>(),
         );
     }
 
@@ -643,7 +658,10 @@ mod tests {
     #[test]
     fn directives_depends_on_is_unioned_into_resource_dependencies() {
         let mut bucket = Resource::new("s3.Bucket", "bucket");
-        bucket.directives.depends_on = vec!["role".to_string()];
+        bucket.directives.depends_on =
+            UnexpandedDependencies::new(vec![UnexpandedDependencyOperand::BareBinding(
+                BindingName::from("role"),
+            )]);
 
         let deps = get_resource_dependencies(&bucket);
         assert!(
@@ -660,7 +678,10 @@ mod tests {
             "encryption_key".to_string(),
             Value::resource_ref("key", "arn", vec![]),
         );
-        bucket.directives.depends_on = vec!["role".to_string()];
+        bucket.directives.depends_on =
+            UnexpandedDependencies::new(vec![UnexpandedDependencyOperand::BareBinding(
+                BindingName::from("role"),
+            )]);
 
         let deps = get_resource_dependencies(&bucket);
         assert!(deps.contains("key"), "value-ref dep missing");

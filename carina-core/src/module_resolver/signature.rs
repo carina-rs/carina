@@ -54,7 +54,19 @@ pub(super) fn resolved_signature_with_policy<P: TypeResolutionPolicy>(
             let resolved = attribute
                 .static_type
                 .as_ref()
-                .map(|type_expr| P::resolve_static_type(type_expr, config));
+                .map(|type_expr| P::resolve_static_type(type_expr, config))
+                .or_else(|| {
+                    attribute
+                        .value
+                        .as_ref()
+                        .and_then(crate::parser::BoundaryExpression::handle)
+                        .map(|handle| {
+                            P::resolve_static_type(
+                                &crate::parser::TypeExpr::Ref(handle.resource_type().clone()),
+                                config,
+                            )
+                        })
+                });
             (attribute.name.clone(), resolved)
         })
         .collect();
@@ -76,7 +88,15 @@ pub fn load_resolved_module_signatures<E>(
         .uses
         .iter()
         .filter_map(|import| {
-            super::load_module(&base_dir.join(&import.path))
+            let path = base_dir.join(&import.path);
+            // Prefer the enriched parse so valid handle uses in a module body
+            // (notably `depends_on = [arg]`) do not make its signature vanish.
+            // If the body itself is invalid under enriched handle semantics,
+            // retain the providerless declaration snapshot: call-site
+            // arguments still need the signature so their independent
+            // boundary errors are reported alongside the body diagnostic.
+            super::loader::load_module_with_config(&path, config)
+                .or_else(|| super::loader::load_module(&path))
                 .map(|module| (import.alias.clone(), resolved_signature(&module, config)))
         })
         .collect()

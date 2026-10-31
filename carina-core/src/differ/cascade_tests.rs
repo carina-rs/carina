@@ -1,9 +1,7 @@
 use super::*;
 
-use std::collections::HashSet;
-
 use crate::plan::{PlanErrorKind, PreventDestroyAction, ReplacementCannotCoexistError};
-use crate::resource::{ConcreteValue, DeferredValue, ResourceIdentity};
+use crate::resource::{ConcreteValue, DeferredValue, ResolvedDependencies, ResolvedResourceId};
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
 fn string(value: &str) -> Value {
@@ -210,7 +208,11 @@ fn update_for<'a>(plan: &'a Plan, id: &ResourceId) -> Option<&'a Effect> {
         .find(|effect| matches!(effect, Effect::Update { to, .. } if to.id == *id))
 }
 
-fn delete_blocked_by<'a>(plan: &'a Plan, id: &ResourceId) -> &'a HashSet<ResourceIdentity> {
+fn resolved_id(id: &ResourceId) -> ResolvedResourceId {
+    ResolvedResourceId::try_new(id.clone()).expect("test resource identity must be resolved")
+}
+
+fn delete_blocked_by<'a>(plan: &'a Plan, id: &ResourceId) -> &'a ResolvedDependencies {
     let (_, delete_idx) = replacement_indices(plan, id);
     match &plan.effects()[delete_idx] {
         Effect::Delete {
@@ -251,7 +253,7 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
         other => panic!("expected subnet update, got {other:?}"),
     }
 
-    assert!(delete_blocked_by(&plan, &vpc_id).contains(&ResourceIdentity::new("my-subnet")));
+    assert!(delete_blocked_by(&plan, &vpc_id).contains(&resolved_id(&subnet_id)));
 }
 
 #[test]
@@ -284,7 +286,7 @@ fn cascade_reuses_existing_update_for_dependent() {
         }
         other => panic!("expected subnet update, got {other:?}"),
     }
-    assert!(delete_blocked_by(&plan, &vpc_id).contains(&ResourceIdentity::new("my-subnet")));
+    assert!(delete_blocked_by(&plan, &vpc_id).contains(&resolved_id(&subnet_id)));
 }
 
 #[test]
@@ -304,7 +306,7 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
 
     assert_eq!(plan.replace_display.len(), 2);
     assert!(update_for(&plan, &subnet_id).is_none());
-    assert!(delete_blocked_by(&plan, &vpc_id).contains(&ResourceIdentity::new("my-subnet")));
+    assert!(delete_blocked_by(&plan, &vpc_id).contains(&resolved_id(&subnet_id)));
 
     let metadata = replacement_metadata(&plan, &subnet_id);
     assert!(metadata.changed_create_only.contains("vpc_id"));
@@ -620,11 +622,11 @@ fn chained_cbd_anonymous_middle_node_auto_promoted() {
     assert!(replacement_metadata(&plan, &middle_id).create_before_destroy);
     assert!(update_for(&plan, &consumer_id).is_some());
     assert!(
-        delete_blocked_by(&plan, &producer_id).contains(&ResourceIdentity::new("anon-b")),
+        delete_blocked_by(&plan, &producer_id).contains(&resolved_id(&middle_id)),
         "producer delete should wait for anonymous middle replacement"
     );
     assert!(
-        delete_blocked_by(&plan, &middle_id).contains(&ResourceIdentity::new("consumer")),
+        delete_blocked_by(&plan, &middle_id).contains(&resolved_id(&consumer_id)),
         "anonymous middle delete should wait for downstream consumer update"
     );
 }

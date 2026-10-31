@@ -14,7 +14,8 @@ use carina_core::module_resolver::{
 };
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::resource::{
-    Current, DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
+    Current, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource,
+    ResourceId,
 };
 use carina_core::schema::SchemaRegistry;
 
@@ -2737,12 +2738,19 @@ fn snapshot_deferred_for_with_dependent_wait() {
             Effect::Create(resource)
                 if resource.id.resource_type == "acm.CertificateValidation" =>
             {
-                let mut resource = resource.into_inner();
-                resource
-                    .directives
-                    .depends_on
-                    .push("validation_records".to_string());
-                Effect::Create(resolved(resource))
+                let value_dependencies = resource.value_dependencies().clone();
+                let mut explicit_dependencies = resource.explicit_dependencies().clone();
+                explicit_dependencies.insert(ResolvedResourceId::with_provider_identity(
+                    "aws",
+                    "route53.RecordSet",
+                    "validation_records",
+                    None,
+                ));
+                Effect::Create(ResolvedResource::from_resolved_parts(
+                    resource.into_inner(),
+                    value_dependencies,
+                    explicit_dependencies,
+                ))
             }
             effect => effect,
         };

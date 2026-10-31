@@ -188,7 +188,10 @@ fn v18_migrates_partial_read_detail_to_incomplete_reread_reason() {
     let migrated = check_and_migrate(&json.to_string()).expect("v18 state must migrate");
     assert_eq!(
         migrated.migration(),
-        Some(MigrationInfo { from: 18, to: 19 })
+        Some(MigrationInfo {
+            from: 18,
+            to: StateFile::CURRENT_VERSION,
+        })
     );
     let state = migrated.into_state();
     let marker = state.resources()[0]
@@ -284,7 +287,10 @@ fn v18_empty_partial_read_marker_migrates_to_no_marker() {
         .expect("a v18 empty partial-read marker must be dropped during migration");
     assert_eq!(
         migrated.migration(),
-        Some(MigrationInfo { from: 18, to: 19 })
+        Some(MigrationInfo {
+            from: 18,
+            to: StateFile::CURRENT_VERSION,
+        })
     );
     let state = migrated.into_state();
     assert!(
@@ -667,7 +673,6 @@ fn whole_value(paths: &[&[&str]]) -> ExplicitFields {
 fn test_state_file_new() {
     let state = StateFile::new();
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
-    assert_eq!(StateFile::CURRENT_VERSION, 19);
     assert_eq!(state.serial, 0);
     assert!(!state.lineage.is_empty());
     assert!(state.resources.is_empty());
@@ -677,7 +682,6 @@ fn test_state_file_new() {
 fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
     use carina_core::resource::{Resource, State as ProviderState};
 
-    assert_eq!(StateFile::CURRENT_VERSION, 19);
     let marker = valid_legacy_marker_shaped_string("state-marker-collision");
     let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
@@ -792,14 +796,14 @@ fn upsert_resource_returns_error_for_duplicate_deposed_key() {
             identifier: "vpc-old-a".to_string(),
             provider_instance: Some("west".to_string()),
             attributes: PersistedAttributes::default(),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
         },
         DeposedInstance {
             key: duplicate_key,
             identifier: "vpc-old-b".to_string(),
             provider_instance: Some("east".to_string()),
             attributes: PersistedAttributes::default(),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
         },
     ];
 
@@ -825,14 +829,14 @@ fn upsert_deposed_generation_returns_error_when_key_and_identity_cross_generatio
             identifier: "vpc-old-a".to_string(),
             provider_instance: Some("west".to_string()),
             attributes: PersistedAttributes::default(),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
         },
         DeposedInstance {
             key: second_key,
             identifier: "vpc-old-b".to_string(),
             provider_instance: Some("east".to_string()),
             attributes: PersistedAttributes::default(),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
         },
     ];
     state
@@ -851,7 +855,7 @@ fn upsert_deposed_generation_returns_error_when_key_and_identity_cross_generatio
                 identifier: "vpc-old-b".to_string(),
                 provider_instance: Some("east".to_string()),
                 attributes: PersistedAttributes::default(),
-                dependency_bindings: BTreeSet::new(),
+                dependency_bindings: Default::default(),
             },
         )
         .expect_err("key and identity cannot select different generations");
@@ -880,7 +884,7 @@ fn upsert_resource_preserves_existing_deposed_generations() {
             "cidr_block".to_string(),
             serde_json::json!("10.255.0.0/16"),
         )])),
-        dependency_bindings: BTreeSet::from(["igw".to_string()]),
+        dependency_bindings: fixture_dependencies(["igw"]),
     });
     state
         .upsert_resource(existing)
@@ -929,7 +933,7 @@ fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
             "cidr_block".to_string(),
             serde_json::json!("10.2.0.0/16"),
         )])),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
     });
     existing.deposed.push(DeposedInstance {
         key: retained_key.clone(),
@@ -939,7 +943,7 @@ fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
             "cidr_block".to_string(),
             serde_json::json!("10.255.0.0/16"),
         )])),
-        dependency_bindings: BTreeSet::from(["igw".to_string()]),
+        dependency_bindings: fixture_dependencies(["igw"]),
     });
     state
         .upsert_resource(existing)
@@ -980,7 +984,7 @@ fn upsert_resource_keeps_deposed_generation_with_same_identifier_on_other_provid
             "cidr_block".to_string(),
             serde_json::json!("10.2.0.0/16"),
         )])),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
     });
     state
         .upsert_resource(existing)
@@ -1050,7 +1054,12 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
         children: HashMap::from([("cidr_block".to_string(), ExplicitFields::Leaf)]),
     };
     resource.binding = Some("vpc".to_string());
-    resource.dependency_bindings.insert("internet".to_string());
+    resource.dependency_bindings.insert(resolved_dependency(
+        "mock",
+        "test.Dependency",
+        "internet",
+        None,
+    ));
     resource.set_write_only_attributes_for_test(vec!["token".to_string()]);
     resource.set_partial_read_for_test(PartialReadMarker::new(
         PendingReRead::incomplete("partial"),
@@ -1064,7 +1073,7 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
             "cidr_block".to_string(),
             serde_json::json!("10.0.0.0/16"),
         )])),
-        dependency_bindings: BTreeSet::from(["network".to_string()]),
+        dependency_bindings: fixture_dependencies(["network"]),
     });
     state
         .upsert_resource(resource)
@@ -1088,9 +1097,9 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
         Some("west")
     );
     assert!(!retained.protected);
-    let expected_directives = Directives {
+    let expected_directives = PersistedDirectives {
         provider_instance: Some("west".to_string()),
-        ..Directives::default()
+        ..PersistedDirectives::default()
     };
     assert_eq!(retained.directives, expected_directives);
     assert_eq!(
@@ -1437,31 +1446,18 @@ fn test_build_saved_attrs() {
 
 #[test]
 fn test_resource_state_serialization_with_binding_and_deps() {
-    let json = r#"{
-        "resource_type": "s3.Bucket",
-        "name": "my-bucket",
-        "provider": "aws",
-        "current": {
-            "kind": "missing_identifier",
-            "attributes": {"region": "ap-northeast-1"},
-            "nested_write_only": {}
-        },
-        "protected": false,
-        "directives": {},
-        "prefixes": {},
-        "name_overrides": {},
-        "desired_keys": [],
-        "binding": "my_bucket",
-        "dependency_bindings": ["vpc", "subnet"]
-    }"#;
-
-    let deserialized: ResourceState = serde_json::from_str(json).unwrap();
+    let dependencies = ResolvedDependencies::from_iter([
+        resolved_dependency("aws", "ec2.Vpc", "vpc", None),
+        resolved_dependency("aws", "ec2.Subnet", "subnet", None),
+    ]);
+    let mut row = ResourceState::new("s3.Bucket", "my-bucket", "aws");
+    row.binding = Some("my_bucket".to_string());
+    row.dependency_bindings = dependencies.clone();
+    let json = serde_json::to_string(&row).expect("current resource state serializes");
+    let deserialized: ResourceState = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.identity.as_str(), "my-bucket");
     assert_eq!(deserialized.binding, Some("my_bucket".to_string()));
-    assert_eq!(
-        deserialized.dependency_bindings,
-        BTreeSet::from(["vpc".to_string(), "subnet".to_string()])
-    );
+    assert_eq!(deserialized.dependency_bindings, dependencies);
 }
 
 #[test]
@@ -1540,7 +1536,7 @@ fn test_from_provider_state() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -1589,7 +1585,7 @@ fn test_from_provider_state_without_existing() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -1827,7 +1823,7 @@ fn test_from_provider_state_repairs_unrecorded_from_desired_resource() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -2871,7 +2867,7 @@ fn test_from_provider_state_records_empty_struct_for_fresh_empty_body_resource()
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -2913,7 +2909,7 @@ fn test_from_provider_state_replaces_prior_authored_keys_after_all_attributes_ar
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -3143,7 +3139,7 @@ fn test_from_provider_state_replaces_unrecorded_when_desired_and_state_attrs_are
         identifier: Some("id".to_string()),
         attributes: HashMap::new(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -3578,7 +3574,7 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
             "token".to_string(),
             tag,
         )])),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
     };
 
     for decoded in [
@@ -3610,7 +3606,7 @@ fn state_file_persisted_attribute_type_preserves_serialized_bytes() {
             "token".to_string(),
             tag,
         )])),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
     });
 
     let mut state = StateFile::new();
@@ -3963,7 +3959,7 @@ fn build_state_for_resource_does_not_hide_current_content_behind_deposed_generat
         "old-id".to_string(),
         None,
         HashMap::new(),
-        BTreeSet::new(),
+        Default::default(),
     ));
     let mut state = StateFile::new();
     state
@@ -3989,7 +3985,7 @@ fn removing_last_deposed_generation_retains_malformed_current_instance() {
         "old-id".to_string(),
         None,
         HashMap::new(),
-        BTreeSet::new(),
+        Default::default(),
     ));
     let mut state = StateFile::new();
     state
@@ -4030,13 +4026,18 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
 
+    let resolved_resource = ResolvedResource::from_resolved_parts(
+        resource.clone(),
+        fixture_dependencies(["my_vpc"]),
+        Default::default(),
+    );
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resolved(&resource),
+        &resolved_resource,
         &provider_state,
         None,
         None,
@@ -4045,10 +4046,7 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
     )
     .unwrap();
     assert_eq!(rs.binding, Some("my_subnet".to_string()));
-    assert_eq!(
-        rs.dependency_bindings,
-        BTreeSet::from(["my_vpc".to_string()])
-    );
+    assert_eq!(rs.dependency_bindings, fixture_dependencies(["my_vpc"]));
 }
 
 #[test]
@@ -4063,7 +4061,7 @@ fn state_json_cannot_persist_ignore_changes_paths() {
     assert_eq!(runtime.ignore_changes.len(), 1);
 
     let mut row = ResourceState::new("test.Widget", "example", "mock");
-    row.directives = (&runtime).into();
+    row.directives = PersistedDirectives::from_resolved(&runtime, Default::default());
     let encoded = serde_json::to_string(&row).expect("state row serializes");
 
     assert!(row.directives.prevent_destroy);
@@ -4079,9 +4077,9 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     let mut rs = ResourceState::try_applied("ec2.Subnet", "orphan-subnet", "awscc", "subnet-123")
         .expect("fixture identifier is non-empty");
     rs.binding = Some("my_subnet".to_string());
-    rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
+    rs.dependency_bindings = fixture_dependencies(["my_vpc"]);
     rs.directives.prevent_destroy = true;
-    rs.directives.depends_on = vec!["security_group".to_string()];
+    rs.directives.depends_on = fixture_dependencies(["security_group"]);
     state
         .upsert_resource(rs)
         .expect("test state setup must be valid");
@@ -4115,10 +4113,13 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     );
     assert_eq!(orphan.binding(), Some("my_subnet"));
     assert!(orphan.directives().prevent_destroy);
-    assert_eq!(orphan.directives().depends_on, ["security_group"]);
+    assert_eq!(
+        orphan.directives().depends_on,
+        fixture_dependencies(["security_group"])
+    );
     assert_eq!(
         orphan_state.dependency_bindings,
-        BTreeSet::from(["my_vpc".to_string()])
+        fixture_dependencies(["my_vpc"])
     );
 
     let fresh = carina_core::resource::State::existing(
@@ -4141,10 +4142,13 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     assert_eq!(refreshed.binding(), Some("my_subnet"));
     assert_eq!(refreshed_state.id, id);
     assert!(refreshed.directives().prevent_destroy);
-    assert_eq!(refreshed.directives().depends_on, ["security_group"]);
+    assert_eq!(
+        refreshed.directives().depends_on,
+        fixture_dependencies(["security_group"])
+    );
     assert_eq!(
         refreshed_state.dependency_bindings,
-        BTreeSet::from(["my_vpc".to_string()])
+        fixture_dependencies(["my_vpc"])
     );
     assert!(refreshed_state.attributes.contains_key("cidr_block"));
 }
@@ -4427,9 +4431,9 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
         generation: generation.clone(),
         directives: Directives::default(),
         binding: None,
-        dependencies: std::collections::HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: std::collections::HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     };
     let mut delete_plan = carina_core::plan::Plan::new();
     delete_plan.add(delete.clone());
@@ -4814,7 +4818,6 @@ fn v8_state_migrates_to_current_with_empty_deposed() {
 fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
     use super::check_and_migrate;
 
-    assert_eq!(StateFile::CURRENT_VERSION, 19);
     let json = format!(
         r#"{{
         "version": 11,
@@ -4972,6 +4975,14 @@ fn v9_deposed_entries_round_trip() {
                         "dependency_bindings": ["igw"]
                     }
                 ]
+            },
+            {
+                "resource_type": "ec2.InternetGateway",
+                "identity": "igw",
+                "provider": "awscc",
+                "identifier": "igw-1",
+                "attributes": {},
+                "binding": "igw"
             }
         ]
     }"#;
@@ -4992,7 +5003,10 @@ fn v9_deposed_entries_round_trip() {
     let row_json = serde_json::to_value(row).expect("resource state should serialize");
     assert_eq!(row_json["deposed"][0]["identifier"], "vpc-old");
     assert_eq!(row_json["deposed"][0]["provider_instance"], "west");
-    assert_eq!(row_json["deposed"][0]["dependency_bindings"][0], "igw");
+    assert_eq!(
+        row_json["deposed"][0]["dependency_bindings"][0]["identity"],
+        "igw"
+    );
 }
 
 #[test]
@@ -5059,7 +5073,7 @@ fn test_build_orphans_excludes_desired() {
     let mut state = StateFile::new();
     let mut rs = ResourceState::try_applied("ec2.Subnet", "kept-subnet", "awscc", "subnet-456")
         .expect("fixture identifier is non-empty");
-    rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
+    rs.dependency_bindings = fixture_dependencies(["my_vpc"]);
     state
         .upsert_resource(rs)
         .expect("test state setup must be valid");
@@ -5123,6 +5137,153 @@ fn state_json_with_resources(version: u32, resources: Vec<serde_json::Value>) ->
         state["exports_version"] = serde_json::json!(PublishedExports::CURRENT_VERSION);
     }
     state.to_string()
+}
+
+fn resolved_dependency(
+    provider: &str,
+    resource_type: &str,
+    identity: &str,
+    provider_instance: Option<&str>,
+) -> ResolvedResourceId {
+    ResolvedResourceId::new(ResourceId::with_provider_identity(
+        provider.to_string(),
+        resource_type.to_string(),
+        ResourceIdentity::try_from(identity.to_string()).expect("fixture identity is non-empty"),
+        provider_instance.map(str::to_string),
+    ))
+}
+
+fn fixture_dependencies<const N: usize>(identities: [&str; N]) -> ResolvedDependencies {
+    identities
+        .into_iter()
+        .map(|identity| resolved_dependency("mock", "test.Dependency", identity, None))
+        .collect()
+}
+
+#[test]
+fn v20_dependency_migration_resolves_root_module_loop_origin_and_deposed_edges() {
+    let mut root = persisted_resource("mock", "test.Root", "root_target");
+    root["binding"] = serde_json::json!("root_target");
+
+    let mut module = persisted_resource("mock", "test.Module", "module_instance.target");
+    module["binding"] = serde_json::json!("module_instance.target");
+    module["directives"] = serde_json::json!({ "provider_instance": "west" });
+
+    let mut loop_target = persisted_resource("mock", "test.Loop", "module_instance.items[0]");
+    loop_target["binding"] = serde_json::json!("module_instance.items[0]");
+
+    let origin = persisted_resource("mock", "test.Origin", "moved_origin");
+
+    let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
+    consumer["binding"] = serde_json::json!("consumer");
+    consumer["dependency_bindings"] = serde_json::json!([
+        "root_target",
+        "module_instance.target",
+        "module_instance.items[0]",
+        "moved_origin"
+    ]);
+    consumer["directives"] = serde_json::json!({
+        "depends_on": ["module_instance.target"]
+    });
+    consumer["deposed"] = serde_json::json!([{
+        "key": "old-generation",
+        "identifier": "consumer-old",
+        "attributes": {},
+        "dependency_bindings": ["module_instance.items[0]"]
+    }]);
+
+    let json = state_json_with_resources(20, vec![root, module, loop_target, origin, consumer]);
+    let migrated = check_and_migrate(&json)
+        .expect("every legacy address has one exact persisted origin")
+        .into_state();
+    let consumer = &migrated.resources()[4];
+    let expected = ResolvedDependencies::from_iter([
+        resolved_dependency("mock", "test.Root", "root_target", None),
+        resolved_dependency(
+            "mock",
+            "test.Module",
+            "module_instance.target",
+            Some("west"),
+        ),
+        resolved_dependency("mock", "test.Loop", "module_instance.items[0]", None),
+        resolved_dependency("mock", "test.Origin", "moved_origin", None),
+    ]);
+    assert_eq!(consumer.dependency_bindings, expected);
+    assert_eq!(
+        consumer.directives.depends_on,
+        ResolvedDependencies::from_iter([resolved_dependency(
+            "mock",
+            "test.Module",
+            "module_instance.target",
+            Some("west"),
+        )])
+    );
+    assert_eq!(
+        consumer.deposed[0].dependency_bindings,
+        ResolvedDependencies::from_iter([resolved_dependency(
+            "mock",
+            "test.Loop",
+            "module_instance.items[0]",
+            None,
+        )])
+    );
+
+    let encoded = serde_json::to_value(&migrated).expect("migrated state serializes");
+    assert!(encoded["resources"][4]["dependency_bindings"][0].is_object());
+    assert!(encoded["resources"][4]["directives"]["depends_on"][0].is_object());
+    assert!(encoded["resources"][4]["deposed"][0]["dependency_bindings"][0].is_object());
+}
+
+#[test]
+fn v20_dependency_migration_rejects_missing_target_with_row_and_text() {
+    let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
+    consumer["binding"] = serde_json::json!("consumer");
+    consumer["dependency_bindings"] = serde_json::json!(["gone_target"]);
+    let json = state_json_with_resources(20, vec![consumer]);
+
+    let error = check_and_migrate(&json).expect_err("missing edges must never be dropped");
+    assert!(matches!(
+        error,
+        BackendError::LegacyDependencyMigration(
+            LegacyDependencyMigrationError::Missing {
+                row_index: 0,
+                ref row,
+                ref location,
+                ref dependency,
+            }
+        ) if row.contains("test.Consumer")
+            && location == "resources[0].dependency_bindings"
+            && dependency == "gone_target"
+    ));
+}
+
+#[test]
+fn v20_dependency_migration_rejects_ambiguous_binding_with_row_and_text() {
+    let mut first = persisted_resource("mock", "test.First", "first");
+    first["binding"] = serde_json::json!("shared");
+    let mut second = persisted_resource("mock", "test.Second", "second");
+    second["binding"] = serde_json::json!("shared");
+    let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
+    consumer["binding"] = serde_json::json!("consumer");
+    consumer["directives"] = serde_json::json!({ "depends_on": ["shared"] });
+    let json = state_json_with_resources(20, vec![first, second, consumer]);
+
+    let error = check_and_migrate(&json).expect_err("ambiguous edges must never be guessed");
+    assert!(matches!(
+        error,
+        BackendError::LegacyDependencyMigration(
+            LegacyDependencyMigrationError::Ambiguous {
+                row_index: 2,
+                ref row,
+                ref location,
+                ref dependency,
+                ref candidates,
+            }
+        ) if row.contains("test.Consumer")
+            && location == "resources[2].directives.depends_on"
+            && dependency == "shared"
+            && candidates.len() == 2
+    ));
 }
 
 fn invalid_state_message(result: Result<MigratedStateFile, BackendError>) -> String {
@@ -5890,7 +6051,7 @@ fn accepted_create_records_write_only_attributes() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -6055,7 +6216,7 @@ fn accepted_create_does_not_record_write_only_attribute_absent_from_desired() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -6109,7 +6270,7 @@ fn accepted_write_only_does_not_overwrite_protected_provider_value() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -6207,7 +6368,7 @@ fn test_from_provider_state_secret_stored_as_hash() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -6254,7 +6415,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -7037,7 +7198,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -7080,7 +7241,7 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
         identifier: Some("db-old".to_string()),
         attributes: HashMap::new(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -7478,7 +7639,7 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -7558,7 +7719,7 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -7626,7 +7787,7 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -7769,6 +7930,22 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
             "carina_version": "test",
             "resources": [
                 {{
+                    "resource_type": "test.Dependency",
+                    "name": "other[\"a\"]",
+                    "provider": "mock",
+                    "identifier": "other-a",
+                    "attributes": {{}},
+                    "binding": "other[\"a\"]"
+                }},
+                {{
+                    "resource_type": "test.Dependency",
+                    "name": "_envs[\"prod-east\"]",
+                    "provider": "mock",
+                    "identifier": "prod-east",
+                    "attributes": {{}},
+                    "binding": "_envs[\"prod-east\"]"
+                }},
+                {{
                     "resource_type": "sso.Assignment",
                     "name": "_accounts[\"registry_prod\"]",
                     "provider": "awscc",
@@ -7782,10 +7959,14 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
         ver = 14,
     );
     let state = check_and_migrate(&json).expect("load state").into_state();
-    let r = &state.resources[0];
+    let r = &state.resources[2];
     assert_eq!(r.identity.as_str(), "_accounts.registry_prod");
     assert_eq!(r.binding.as_deref(), Some("_accounts.registry_prod"));
-    let deps: Vec<&str> = r.dependency_bindings.iter().map(String::as_str).collect();
+    let deps: Vec<&str> = r
+        .dependency_bindings
+        .iter()
+        .map(ResolvedResourceId::identity_str)
+        .collect();
     assert!(deps.contains(&"other.a"));
     assert!(deps.contains(&"_envs['prod-east']"));
 }
@@ -7814,7 +7995,7 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };

@@ -1756,7 +1756,7 @@ mod tests {
     use super::*;
     use crate::plan_image::model::{PlanImageInput, build_model};
 
-    fn resource(binding: &str, dependencies: &[&str]) -> Resource {
+    fn resource(binding: &str, dependencies: &[&str]) -> ResolvedResource {
         let identity = carina_core::resource::ResourceIdentity::try_from(binding.to_string())
             .expect("fixture identity");
         let mut resource = Resource::new("test.Widget", identity);
@@ -1767,12 +1767,23 @@ mod tests {
                 Value::resource_ref((*dependency).to_string(), "id".to_string(), vec![]),
             );
         }
-        resource
+        let dependencies = dependencies
+            .iter()
+            .map(|dependency| {
+                let identity =
+                    carina_core::resource::ResourceIdentity::try_from((*dependency).to_string())
+                        .expect("fixture dependency identity");
+                ResolvedResourceId::new(ResourceId::with_identity("test.Widget", identity))
+            })
+            .collect();
+        ResolvedResource::from_resolved_parts(resource, dependencies, Default::default())
     }
 
-    fn model_for(plan: &Plan, desired: &[Resource], trace: Option<&ExpansionTrace>) -> GraphModel {
-        let desired = ResolvedResource::collect_resolved(desired.iter().cloned())
-            .expect("layout fixtures have resolved identities");
+    fn model_for(
+        plan: &Plan,
+        desired: &[ResolvedResource],
+        trace: Option<&ExpansionTrace>,
+    ) -> GraphModel {
         let unresolved: Vec<_> = desired
             .iter()
             .map(|resource| UnresolvedResource::from_pre_resolve(resource.as_inner().clone()))
@@ -1780,7 +1791,7 @@ mod tests {
         let summary = crate::plan_summary::PlanChangeSummary::new(plan, &[], &[]);
         build_model(PlanImageInput {
             plan,
-            desired_resources: &desired,
+            desired_resources: desired,
             unresolved_resources: &unresolved,
             compositions: &[],
             expansion_trace: trace,
@@ -1878,7 +1889,7 @@ mod tests {
         (expanded, vertices, band_bounds)
     }
 
-    fn update(resource: Resource) -> Effect {
+    fn update(resource: ResolvedResource) -> Effect {
         Effect::Update {
             from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
             identifier: AppliedIdentifier::new(format!(
@@ -1886,7 +1897,7 @@ mod tests {
                 resource.binding.as_deref().expect("test resource is bound")
             ))
             .unwrap(),
-            to: ResolvedResource::new(resource),
+            to: resource,
             changed_attributes: vec!["description".to_string()],
         }
     }
@@ -2016,8 +2027,8 @@ mod tests {
         let dependency = resource("database", &[]);
         let dependent = resource("service", &["database"]);
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(dependency.clone())));
-        plan.add(Effect::Create(ResolvedResource::new(dependent.clone())));
+        plan.add(Effect::Create(dependency.clone()));
+        plan.add(Effect::Create(dependent.clone()));
         let desired = vec![dependency, dependent];
         let layout = layout_graph(&model_for(&plan, &desired, None));
 
@@ -2043,7 +2054,7 @@ mod tests {
         ];
         let mut plan = Plan::new();
         for resource in [source, upper, middle, lower, sink] {
-            plan.add(Effect::Create(ResolvedResource::new(resource)));
+            plan.add(Effect::Create(resource));
         }
 
         let layout = layout_graph(&model_for(&plan, &desired, None));
@@ -2466,8 +2477,8 @@ mod tests {
         let u_id = GraphNodeId::Unchanged(ResolvedResourceId::new(u.id.clone()));
         let desired = vec![a.clone(), b.clone(), u];
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(a)));
-        plan.add(Effect::Create(ResolvedResource::new(b)));
+        plan.add(Effect::Create(a));
+        plan.add(Effect::Create(b));
 
         let model = model_for(&plan, &desired, None);
         let layout = layout_graph(&model);
@@ -2505,7 +2516,7 @@ mod tests {
         let desired = vec![b.clone(), c.clone(), d.clone(), a.clone(), u];
         let mut plan = Plan::new();
         for resource in [b, c, d, a] {
-            plan.add(Effect::Create(ResolvedResource::new(resource)));
+            plan.add(Effect::Create(resource));
         }
 
         let model = model_for(&plan, &desired, None);
@@ -2568,7 +2579,7 @@ mod tests {
         let m2 = resource("module.m2", &["module.m1"]);
         let desired = vec![a.clone(), m1.clone(), m2.clone()];
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(a)));
+        plan.add(Effect::Create(a));
 
         let site = CallSite::new(
             carina_core::resource::EphemeralId::new(ResolvedResourceId::new(
@@ -2577,8 +2588,8 @@ mod tests {
             "./modules/cycle",
         );
         let mut trace = ExpansionTrace::new();
-        trace.record(PersistentId::new(m1.id), vec![site.clone()]);
-        trace.record(PersistentId::new(m2.id), vec![site.clone()]);
+        trace.record(PersistentId::new(m1.id.clone()), vec![site.clone()]);
+        trace.record(PersistentId::new(m2.id.clone()), vec![site.clone()]);
 
         let model = model_for(&plan, &desired, Some(&trace));
         let layout = layout_graph(&model);
@@ -2610,9 +2621,19 @@ mod tests {
                 generation: EffectGeneration::Current,
                 directives: Default::default(),
                 binding: Some(binding.to_string()),
-                dependencies: dependencies.into_iter().map(str::to_string).collect(),
-                explicit_dependencies: HashSet::new(),
-                blocked_by_updates: HashSet::new(),
+                dependencies: dependencies
+                    .into_iter()
+                    .map(|dependency| {
+                        carina_core::resource::ResolvedResourceId::new(
+                            carina_core::resource::ResourceId::with_identity(
+                                "test.Widget",
+                                dependency,
+                            ),
+                        )
+                    })
+                    .collect(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
             });
         }
         let layout = layout_graph(&model_for(&plan, &[], None));
@@ -2629,8 +2650,8 @@ mod tests {
         let first = resource("first/leaf", &[]);
         let second = resource("second/leaf", &[]);
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(first.clone())));
-        plan.add(Effect::Create(ResolvedResource::new(second.clone())));
+        plan.add(Effect::Create(first.clone()));
+        plan.add(Effect::Create(second.clone()));
         let desired = vec![first.clone(), second.clone()];
         let first_site = CallSite::new(
             carina_core::resource::EphemeralId::new(ResolvedResourceId::new(
@@ -2645,8 +2666,8 @@ mod tests {
             "./modules/second",
         );
         let mut trace = ExpansionTrace::new();
-        trace.record(PersistentId::new(first.id), vec![first_site]);
-        trace.record(PersistentId::new(second.id), vec![second_site]);
+        trace.record(PersistentId::new(first.id.clone()), vec![first_site]);
+        trace.record(PersistentId::new(second.id.clone()), vec![second_site]);
 
         let layout = layout_graph(&model_for(&plan, &desired, Some(&trace)));
         assert_eq!(layout.modules.len(), 2);
@@ -2664,7 +2685,7 @@ mod tests {
         let desired = vec![a.clone(), b.clone(), c.clone(), d.clone()];
         let mut plan = Plan::new();
         for resource in [d, c, b, a] {
-            plan.add(Effect::Create(ResolvedResource::new(resource)));
+            plan.add(Effect::Create(resource));
         }
         let model = model_for(&plan, &desired, None);
 
@@ -2677,8 +2698,8 @@ mod tests {
         let long = resource("a_genuinely_long_resource_binding", &[]);
         let desired = vec![short.clone(), long.clone()];
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(short)));
-        plan.add(Effect::Create(ResolvedResource::new(long)));
+        plan.add(Effect::Create(short));
+        plan.add(Effect::Create(long));
 
         let layout = layout_graph(&model_for(&plan, &desired, None));
         let short = layout.node(&GraphNodeId::Effect(0)).unwrap();
@@ -2697,7 +2718,7 @@ mod tests {
     fn graph_is_left_aligned_with_the_header_margin() {
         let widget = resource("widget", &[]);
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(widget.clone())));
+        plan.add(Effect::Create(widget.clone()));
 
         let layout = layout_graph(&model_for(&plan, &[widget], None));
 
@@ -2713,7 +2734,7 @@ mod tests {
         let desired = vec![a.clone(), b.clone(), c.clone(), d.clone()];
         let mut plan = Plan::new();
         for resource in [a, b, c, d] {
-            plan.add(Effect::Create(ResolvedResource::new(resource)));
+            plan.add(Effect::Create(resource));
         }
         let model = model_for(&plan, &desired, None);
         let layout = layout_graph(&model);
@@ -2747,7 +2768,7 @@ mod tests {
         let desired = vec![a.clone(), b.clone(), c.clone(), connector, d.clone()];
         let mut plan = Plan::new();
         for resource in [a, b, c, d] {
-            plan.add(Effect::Create(ResolvedResource::new(resource)));
+            plan.add(Effect::Create(resource));
         }
         let model = model_for(&plan, &desired, None);
         let layout = layout_graph(&model);
@@ -2780,7 +2801,7 @@ mod tests {
         ];
         let mut plan = Plan::new();
         for resource in &resources {
-            plan.add(Effect::Create(ResolvedResource::new(resource.clone())));
+            plan.add(Effect::Create(resource.clone()));
         }
         let model = model_for(&plan, &resources, None);
 
@@ -2907,13 +2928,13 @@ mod tests {
         let mut plan = Plan::new();
         for index in 0..HALF {
             let source = resource(&format!("source_{index:04}"), &[]);
-            plan.add(Effect::Create(ResolvedResource::new(source.clone())));
+            plan.add(Effect::Create(source.clone()));
             desired.push(source);
         }
         for index in 0..HALF {
             let dependency = format!("source_{:04}", HALF - index - 1);
             let target = resource(&format!("target_{index:04}"), &[&dependency]);
-            plan.add(Effect::Create(ResolvedResource::new(target.clone())));
+            plan.add(Effect::Create(target.clone()));
             desired.push(target);
         }
         let model = model_for(&plan, &desired, None);

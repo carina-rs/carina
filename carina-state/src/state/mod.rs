@@ -1,7 +1,6 @@
 //! State file structures for persisting infrastructure state
 
 use carina_core::binding_index::SecretPreservingAttributes;
-use carina_core::deps::get_resource_dependencies;
 use carina_core::differ::Orphan;
 use carina_core::effect::MoveAuthority;
 use carina_core::executor::{AcceptedRequest, AcceptedRequestKind};
@@ -19,12 +18,13 @@ use carina_core::provider::{
     previous_hash,
 };
 pub use carina_core::resource::DeposedKey;
-#[cfg(test)]
-use carina_core::resource::Resource;
 use carina_core::resource::{
-    ConcreteValue, Current, DataSource, Directives, PartialReadMarker, PendingReRead,
-    PersistedDirectives, ResolvedResource, ResourceId, ResourceIdentity, State, Value,
+    ConcreteValue, Current, DataSource, PartialReadMarker, PendingReRead, PersistedDirectives,
+    ResolvedDependencies, ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity,
+    State, Value,
 };
+#[cfg(test)]
+use carina_core::resource::{Directives, Resource};
 use carina_core::schema::{ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys};
 use carina_core::value::{
     PersistedExportValue, PersistedValue, SerializationError, contains_unredacted_secret,
@@ -780,7 +780,9 @@ impl StateFile {
     /// v19: Replaced the partial-read marker's untyped detail with a typed
     ///      pending re-read reason. The v18 migration classifies legacy
     ///      details as incomplete reads.
-    pub const CURRENT_VERSION: u32 = 19;
+    /// v21: Replaced binding-text dependency records on current/deposed
+    ///      instances and persisted directives with complete resolved IDs.
+    pub const CURRENT_VERSION: u32 = 21;
 
     /// State file version that introduced the independent exports version.
     /// This value is fixed forever.
@@ -1052,12 +1054,12 @@ impl StateFile {
         Some(removed)
     }
 
-    /// Build a map of ResourceId -> Directives from this state file.
-    pub fn build_directives(&self) -> HashMap<ResourceId, Directives> {
+    /// Build a map of resource IDs to the typed directives persisted in state.
+    pub fn build_directives(&self) -> HashMap<ResourceId, PersistedDirectives> {
         let mut directives_map = HashMap::new();
         for rs in &self.resources {
             let id = Self::id_for_resource_state(rs);
-            directives_map.insert(id, Directives::from(&rs.directives));
+            directives_map.insert(id, rs.directives.clone());
         }
         directives_map
     }
@@ -1249,13 +1251,13 @@ impl StateFile {
             let orphan = match self.build_state_for_resource(&id) {
                 Current::Absent(_state) => continue,
                 Current::Present(present) => {
-                    Orphan::present(present, rs.binding.clone(), (&rs.directives).into())
+                    Orphan::present(present, rs.binding.clone(), rs.directives.clone())
                 }
                 Current::CreateInFlight(pending) => {
-                    Orphan::create_in_flight(pending, rs.binding.clone(), (&rs.directives).into())
+                    Orphan::create_in_flight(pending, rs.binding.clone(), rs.directives.clone())
                 }
                 Current::MissingIdentifier(state) => {
-                    Orphan::missing_identifier(state, rs.binding.clone(), (&rs.directives).into())
+                    Orphan::missing_identifier(state, rs.binding.clone(), rs.directives.clone())
                 }
             };
             loaded.insert(orphan);
@@ -1315,11 +1317,26 @@ impl StateFile {
             if let Some(b) = r.binding.as_ref() {
                 r.binding = Some(canonicalize_map_key_address(b));
             }
-            r.dependency_bindings = r
-                .dependency_bindings
-                .iter()
-                .map(|d| canonicalize_map_key_address(d))
-                .collect();
+            r.dependency_bindings = canonicalize_resolved_dependencies(
+                r.dependency_bindings.clone(),
+                &format!("resource {}.{} {}", r.provider, r.resource_type, r.identity),
+            )?;
+            r.directives.depends_on = canonicalize_resolved_dependencies(
+                r.directives.depends_on.clone(),
+                &format!(
+                    "resource {}.{} {} directives",
+                    r.provider, r.resource_type, r.identity
+                ),
+            )?;
+            for deposed in &mut r.deposed {
+                deposed.dependency_bindings = canonicalize_resolved_dependencies(
+                    deposed.dependency_bindings.clone(),
+                    &format!(
+                        "resource {}.{} {} deposed generation {}",
+                        r.provider, r.resource_type, r.identity, deposed.key
+                    ),
+                )?;
+            }
         }
         Ok(())
     }
@@ -1463,6 +1480,33 @@ impl StateFile {
         self.resources[pos].current = CurrentInstance::None;
         Some(previous)
     }
+}
+
+fn canonicalize_resolved_dependencies(
+    dependencies: ResolvedDependencies,
+    context: &str,
+) -> Result<ResolvedDependencies, BackendError> {
+    use carina_core::utils::canonicalize_map_key_address;
+
+    dependencies
+        .into_iter()
+        .map(|dependency| {
+            let mut id = dependency.into_inner();
+            let canonical = canonicalize_map_key_address(
+                id.identity_str()
+                    .expect("resolved dependency identity is always present"),
+            );
+            let identity = ResourceIdentity::try_from(canonical).map_err(|error| {
+                BackendError::InvalidStateIdentity {
+                    context: format!("cannot canonicalize dependency for {context}"),
+                    error,
+                }
+            })?;
+            id.set_identity(identity);
+            Ok(ResolvedResourceId::new(id))
+        })
+        .collect::<Result<Vec<_>, BackendError>>()
+        .map(ResolvedDependencies::from_iter)
 }
 
 const _: () = assert!(StateFile::EXPORTS_VERSION_INTRODUCED <= StateFile::CURRENT_VERSION);
@@ -1617,6 +1661,32 @@ pub struct MigrationInfo {
     pub to: u32,
 }
 
+/// A legacy string dependency could not be converted to one complete state
+/// address. The row and JSON field identify the owner of the bad edge; the
+/// original dependency text is retained verbatim for repair tooling.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LegacyDependencyMigrationError {
+    #[error(
+        "{location} on {row} references legacy dependency {dependency:?}, but no state row has that binding or identity"
+    )]
+    Missing {
+        row_index: usize,
+        row: String,
+        location: String,
+        dependency: String,
+    },
+    #[error(
+        "{location} on {row} references ambiguous legacy dependency {dependency:?}; matching rows: {candidates:?}"
+    )]
+    Ambiguous {
+        row_index: usize,
+        row: String,
+        location: String,
+        dependency: String,
+        candidates: Vec<String>,
+    },
+}
+
 /// Successful outcome of [`check_and_migrate`].
 ///
 /// Always carries the parsed (and possibly schema-upgraded) state.
@@ -1748,6 +1818,237 @@ pub(crate) fn log_state_migration(info: MigrationInfo, display_target: &str) {
     );
 }
 
+#[derive(Debug, Clone)]
+struct LegacyDependencyCandidate {
+    row_index: usize,
+    resolved_id: serde_json::Value,
+    display: String,
+}
+
+fn legacy_dependency_row_description(
+    row_index: usize,
+    provider: &str,
+    resource_type: &str,
+    identity: &str,
+    binding: Option<&str>,
+) -> String {
+    match binding {
+        Some(binding) => format!(
+            "resources[{row_index}] ({provider}.{resource_type} {identity:?}, binding {binding:?})"
+        ),
+        None => {
+            format!("resources[{row_index}] ({provider}.{resource_type} {identity:?}, no binding)")
+        }
+    }
+}
+
+fn migrate_legacy_dependency_array(
+    value: &mut serde_json::Value,
+    row_index: usize,
+    row: &str,
+    location: &str,
+    candidates_by_address: &HashMap<String, Vec<LegacyDependencyCandidate>>,
+) -> Result<(), BackendError> {
+    use carina_core::utils::canonicalize_map_key_address;
+
+    let dependencies = value.as_array().ok_or_else(|| {
+        BackendError::InvalidState(format!(
+            "Failed to migrate state file from v20: {location} on {row} must be an array"
+        ))
+    })?;
+    let mut migrated = Vec::with_capacity(dependencies.len());
+    for (dependency_index, dependency) in dependencies.iter().enumerate() {
+        let dependency = dependency.as_str().ok_or_else(|| {
+            BackendError::InvalidState(format!(
+                "Failed to migrate state file from v20: {location}[{dependency_index}] on {row} must be a string"
+            ))
+        })?;
+        let canonical = canonicalize_map_key_address(dependency);
+        let candidates = candidates_by_address
+            .get(&canonical)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        match candidates {
+            [] => {
+                return Err(LegacyDependencyMigrationError::Missing {
+                    row_index,
+                    row: row.to_string(),
+                    location: location.to_string(),
+                    dependency: dependency.to_string(),
+                }
+                .into());
+            }
+            [candidate] => migrated.push(candidate.resolved_id.clone()),
+            many => {
+                let mut matching_rows = many
+                    .iter()
+                    .map(|candidate| candidate.display.clone())
+                    .collect::<Vec<_>>();
+                matching_rows.sort();
+                matching_rows.dedup();
+                return Err(LegacyDependencyMigrationError::Ambiguous {
+                    row_index,
+                    row: row.to_string(),
+                    location: location.to_string(),
+                    dependency: dependency.to_string(),
+                    candidates: matching_rows,
+                }
+                .into());
+            }
+        }
+    }
+    *value = serde_json::Value::Array(migrated);
+    Ok(())
+}
+
+/// Convert every pre-v21 dependency string into the unique full resource ID
+/// identified by the same persisted binding or identity. This intentionally
+/// runs over raw JSON: the current state DTO cannot represent legacy strings,
+/// and therefore no compatibility representation survives the migration.
+fn migrate_v20_dependency_addresses(content: &str) -> Result<String, BackendError> {
+    use carina_core::utils::canonicalize_map_key_address;
+
+    let mut root: serde_json::Value = serde_json::from_str(content).map_err(|error| {
+        BackendError::InvalidState(format!("Failed to migrate state file from v20: {error}"))
+    })?;
+    let resources = root
+        .get("resources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            BackendError::InvalidState(
+                "Failed to migrate state file from v20: resources must be an array".to_string(),
+            )
+        })?;
+
+    let mut candidates_by_address: HashMap<String, Vec<LegacyDependencyCandidate>> = HashMap::new();
+    let mut row_descriptions = Vec::with_capacity(resources.len());
+    for (row_index, resource) in resources.iter().enumerate() {
+        let provider = resource
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                BackendError::InvalidState(format!(
+                    "Failed to migrate state file from v20: resources[{row_index}].provider must be a string"
+                ))
+            })?;
+        let resource_type = resource
+            .get("resource_type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                BackendError::InvalidState(format!(
+                    "Failed to migrate state file from v20: resources[{row_index}].resource_type must be a string"
+                ))
+            })?;
+        let identity = resource
+            .get("identity")
+            .or_else(|| resource.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                BackendError::InvalidState(format!(
+                    "Failed to migrate state file from v20: resources[{row_index}].identity must be a string"
+                ))
+            })?;
+        let binding = match resource.get("binding") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(value.as_str().ok_or_else(|| {
+                BackendError::InvalidState(format!(
+                    "Failed to migrate state file from v20: resources[{row_index}].binding must be a string or null"
+                ))
+            })?),
+        };
+        let provider_instance = resource
+            .get("directives")
+            .and_then(|directives| directives.get("provider_instance"))
+            .and_then(serde_json::Value::as_str);
+        let mut resolved_id = serde_json::json!({
+            "provider": provider,
+            "resource_type": resource_type,
+            "identity": identity,
+        });
+        if let Some(provider_instance) = provider_instance {
+            resolved_id["provider_instance"] = serde_json::json!(provider_instance);
+        }
+        let display = legacy_dependency_row_description(
+            row_index,
+            provider,
+            resource_type,
+            identity,
+            binding,
+        );
+        row_descriptions.push(display.clone());
+
+        let mut addresses = BTreeSet::from([canonicalize_map_key_address(identity)]);
+        if let Some(binding) = binding {
+            addresses.insert(canonicalize_map_key_address(binding));
+        }
+        for address in addresses {
+            candidates_by_address
+                .entry(address)
+                .or_default()
+                .push(LegacyDependencyCandidate {
+                    row_index,
+                    resolved_id: resolved_id.clone(),
+                    display: display.clone(),
+                });
+        }
+    }
+    for candidates in candidates_by_address.values_mut() {
+        candidates.sort_by_key(|candidate| candidate.row_index);
+        candidates.dedup_by_key(|candidate| candidate.row_index);
+    }
+
+    let resources = root
+        .get_mut("resources")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("resources shape was validated above");
+    for (row_index, resource) in resources.iter_mut().enumerate() {
+        let row = &row_descriptions[row_index];
+        if let Some(dependencies) = resource.get_mut("dependency_bindings") {
+            migrate_legacy_dependency_array(
+                dependencies,
+                row_index,
+                row,
+                &format!("resources[{row_index}].dependency_bindings"),
+                &candidates_by_address,
+            )?;
+        }
+        if let Some(depends_on) = resource
+            .get_mut("directives")
+            .and_then(|directives| directives.get_mut("depends_on"))
+        {
+            migrate_legacy_dependency_array(
+                depends_on,
+                row_index,
+                row,
+                &format!("resources[{row_index}].directives.depends_on"),
+                &candidates_by_address,
+            )?;
+        }
+        if let Some(deposed) = resource
+            .get_mut("deposed")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for (generation_index, generation) in deposed.iter_mut().enumerate() {
+                if let Some(dependencies) = generation.get_mut("dependency_bindings") {
+                    migrate_legacy_dependency_array(
+                        dependencies,
+                        row_index,
+                        row,
+                        &format!(
+                            "resources[{row_index}].deposed[{generation_index}].dependency_bindings"
+                        ),
+                        &candidates_by_address,
+                    )?;
+                }
+            }
+        }
+    }
+
+    serde_json::to_string(&root).map_err(|error| {
+        BackendError::InvalidState(format!("Failed to migrate state file from v20: {error}"))
+    })
+}
+
 /// Deserialize a state file from a JSON string, checking the version and
 /// migrating from older formats if necessary.
 ///
@@ -1779,14 +2080,23 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
                 from: v,
                 to: StateFile::CURRENT_VERSION,
             });
-            // v12 → v13: migrate every value tree before typed state
-            // deserialization validates the reserved `$` namespace.
-            let migrated_v12 = if v <= 12 {
-                Some(migrate_v12_persisted_values(content)?)
+            // v20 → v21: dependency strings must become complete addresses
+            // before any older migration DTO deserializes persisted
+            // directives or deposed generations into their current types.
+            let migrated_v20_dependencies = if v <= 20 {
+                Some(migrate_v20_dependency_addresses(content)?)
             } else {
                 None
             };
-            let pre_secret_migration = migrated_v12.as_deref().unwrap_or(content);
+            let pre_value_migration = migrated_v20_dependencies.as_deref().unwrap_or(content);
+            // v12 → v13: migrate every value tree before typed state
+            // deserialization validates the reserved `$` namespace.
+            let migrated_v12 = if v <= 12 {
+                Some(migrate_v12_persisted_values(pre_value_migration)?)
+            } else {
+                None
+            };
+            let pre_secret_migration = migrated_v12.as_deref().unwrap_or(pre_value_migration);
             let migrated_v13 = if v <= 13 {
                 Some(migrate_v13_resource_secret_markers(pre_secret_migration)?)
             } else {
@@ -1913,8 +2223,8 @@ pub struct DeposedInstance {
     pub provider_instance: Option<String>,
     /// Last known attributes of the old instance.
     attributes: PersistedAttributes,
-    /// Binding dependencies inherited from the old row.
-    pub dependency_bindings: BTreeSet<String>,
+    /// Complete resource addresses inherited from the old row.
+    pub dependency_bindings: ResolvedDependencies,
 }
 
 /// Attributes admitted to a deposed generation by a state-owned writeback
@@ -1952,7 +2262,7 @@ impl DeposedInstance {
         identifier: String,
         provider_instance: Option<String>,
         attributes: DeposedAttributes,
-        dependency_bindings: BTreeSet<String>,
+        dependency_bindings: ResolvedDependencies,
     ) -> Self {
         Self {
             key,
@@ -1971,7 +2281,7 @@ impl DeposedInstance {
         identifier: String,
         provider_instance: Option<String>,
         attributes: HashMap<String, serde_json::Value>,
-        dependency_bindings: BTreeSet<String>,
+        dependency_bindings: ResolvedDependencies,
     ) -> Self {
         Self::from_persisted_attributes(
             key,
@@ -2137,15 +2447,14 @@ pub struct ResourceState {
     /// Stored so orphan Delete effects can have tree structure.
     #[serde(default)]
     pub binding: Option<String>,
-    /// Binding names of resources this resource depends on (via ResourceRef).
+    /// Complete resource addresses this resource depends on (via value refs).
     /// Stored so orphan Delete effects can have tree structure.
     ///
-    /// Set semantics (BTreeSet) — see Resource::dependency_bindings (#2228).
-    /// Old state files persisted as JSON arrays continue to deserialize
-    /// (serde transparently coerces array → BTreeSet, deduping any
-    /// duplicates and re-serializing in sorted order on next write).
+    /// Set semantics are provided by [`ResolvedDependencies`]. State v20 and
+    /// older string arrays are converted by the version-gated raw migration
+    /// before this current representation is deserialized.
     #[serde(default)]
-    pub dependency_bindings: BTreeSet<String>,
+    pub dependency_bindings: ResolvedDependencies,
 }
 
 /// Owned resource row proven not to contain a create continuation.
@@ -2175,7 +2484,7 @@ struct EncodedDeposedInstance {
     #[serde(default)]
     provider_instance: Option<String>,
     attributes: HashMap<String, serde_json::Value>,
-    dependency_bindings: BTreeSet<String>,
+    dependency_bindings: ResolvedDependencies,
 }
 
 #[derive(Deserialize)]
@@ -2200,7 +2509,7 @@ struct EncodedResourceState {
     #[serde(default)]
     binding: Option<String>,
     #[serde(default)]
-    dependency_bindings: BTreeSet<String>,
+    dependency_bindings: ResolvedDependencies,
 }
 
 impl<'de> Deserialize<'de> for ResourceState {
@@ -2644,7 +2953,7 @@ impl ResourceState {
             name_overrides: HashMap::new(),
             explicit: ExplicitFields::default(),
             binding: None,
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: ResolvedDependencies::default(),
         }
     }
 
@@ -2903,7 +3212,10 @@ impl ResourceState {
             self.protected = existing.protected;
             self.name_overrides = existing.name_overrides.clone();
         }
-        self.directives = PersistedDirectives::from(&resource.directives);
+        self.directives = PersistedDirectives::from_resolved(
+            &resource.directives,
+            resource.explicit_dependencies().clone(),
+        );
         if self.directives.provider_instance.is_none() {
             self.directives.provider_instance = resource.id.provider_instance.clone();
         }
@@ -2942,10 +3254,7 @@ impl ResourceState {
             ),
         };
         self.binding = resource.binding.clone();
-        let dependencies = get_resource_dependencies(resource);
-        if !dependencies.is_empty() {
-            self.dependency_bindings = dependencies.into_iter().collect();
-        }
+        self.dependency_bindings = resource.value_dependencies().clone();
     }
 
     fn carried_explicit_for_stored_values<S>(
@@ -3410,7 +3719,7 @@ struct ResourceStateV14CurrentDto {
     #[serde(default)]
     binding: Option<String>,
     #[serde(default)]
-    dependency_bindings: BTreeSet<String>,
+    dependency_bindings: ResolvedDependencies,
     #[serde(default)]
     write_only_attributes: Vec<String>,
     #[serde(default)]

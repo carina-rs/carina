@@ -4,7 +4,9 @@
 //! `StateFile`: applying name overrides, building the post-apply state,
 //! resolving exports, and (for destroy) removing destroyed resources.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use carina_core::data_source_value::DataSourceValues;
@@ -17,8 +19,8 @@ use carina_core::provider::{
     AppliedIdentifier, InFlightCreate, InFlightPersistence, ObservedCreate, PersistedAttributes,
 };
 use carina_core::resource::{
-    ConcreteValue, Current, ModuleSource, ResolvedResource, ResolvedResourceId, Resource,
-    ResourceId, State, Value,
+    ConcreteValue, Current, ModuleSource, ResolvedDependencies, ResolvedResource,
+    ResolvedResourceId, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedExportValue;
@@ -868,7 +870,7 @@ struct ReplacementDeleteInput<'a> {
     identifier: &'a str,
     provider_instance: Option<String>,
     generation: &'a EffectGeneration,
-    fallback_dependency_bindings: BTreeSet<String>,
+    fallback_dependency_bindings: ResolvedDependencies,
     previous_attributes: Option<ReplacementPreviousAttributesForStateWriteback<'a>>,
 }
 
@@ -1074,7 +1076,7 @@ fn delete_input_from_effect<'a, S>(
         identifier: identifier.as_str(),
         provider_instance: id.as_inner().provider_instance.clone(),
         generation,
-        fallback_dependency_bindings: dependencies.iter().cloned().collect(),
+        fallback_dependency_bindings: dependencies.clone(),
         previous_attributes,
     })
 }
@@ -1085,7 +1087,7 @@ fn delete_input_from_deferred(delete: &DeferredReplaceDelete) -> ReplacementDele
         identifier: delete.identifier.as_str(),
         provider_instance: delete.id.as_inner().provider_instance.clone(),
         generation: &CURRENT_GENERATION,
-        fallback_dependency_bindings: delete.dependencies.iter().cloned().collect(),
+        fallback_dependency_bindings: delete.dependencies.clone(),
         previous_attributes: None,
     }
 }
@@ -1572,7 +1574,6 @@ pub(crate) fn build_orphan_resource(
     resource.directives = rs.directives.clone().into();
     resource.prefixes = rs.prefixes.clone();
     resource.binding = rs.binding.clone();
-    resource.dependency_bindings = rs.dependency_bindings.clone();
     resource
 }
 
@@ -1699,7 +1700,7 @@ mod post_apply_states_tests {
             "old-id".to_string(),
             None,
             HashMap::new(),
-            BTreeSet::new(),
+            Default::default(),
         ));
         let mut state = StateFile::new();
         state
@@ -1937,7 +1938,7 @@ mod apply_state_save_tests {
                     "older-deposed-id".to_string(),
                     None,
                     HashMap::from([("name".to_string(), serde_json::json!("older"))]),
-                    BTreeSet::new(),
+                    Default::default(),
                 ),
             )
             .expect("older deposed fixture must be valid");
@@ -1953,7 +1954,7 @@ mod apply_state_save_tests {
                         "old-record-id".to_string(),
                         None,
                         HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-                        BTreeSet::new(),
+                        Default::default(),
                     ),
                 )
                 .expect("CBD old generation fixture must be valid");
@@ -3858,7 +3859,14 @@ mod apply_state_save_tests {
                     "old-id".to_string(),
                     None,
                     HashMap::from([("name".to_string(), serde_json::json!("old"))]),
-                    BTreeSet::from(["dependency".to_string()]),
+                    [ResolvedResourceId::with_provider_identity(
+                        "mock",
+                        "test.Dependency",
+                        "dependency",
+                        None,
+                    )]
+                    .into_iter()
+                    .collect(),
                 ),
             )
             .expect("deposed fixture is valid");
@@ -4247,9 +4255,9 @@ mod apply_state_save_tests {
                 generation: EffectGeneration::Current,
                 directives: Directives::default(),
                 binding: None,
-                dependencies: HashSet::new(),
-                explicit_dependencies: HashSet::new(),
-                blocked_by_updates: HashSet::new(),
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
             });
         }
         let successfully_deleted =
@@ -4302,7 +4310,14 @@ mod apply_state_save_tests {
             "old-record-id".to_string(),
             None,
             HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-            BTreeSet::from(["cert".to_string()]),
+            [ResolvedResourceId::with_provider_identity(
+                "aws",
+                "acm.Certificate",
+                "cert",
+                None,
+            )]
+            .into_iter()
+            .collect(),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -4316,15 +4331,30 @@ mod apply_state_save_tests {
             generation: EffectGeneration::Deposed(deposed_key.clone()),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::from(["cert".to_string()]),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: [ResolvedResourceId::with_provider_identity(
+                "aws",
+                "acm.Certificate",
+                "cert",
+                None,
+            )]
+            .into_iter()
+            .collect(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.add(Effect::DeferredCreate {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "__deferred_for",
                 "validation_records",
             )),
+            dependencies: [ResolvedResourceId::with_provider_identity(
+                "aws",
+                "acm.Certificate",
+                "cert",
+                None,
+            )]
+            .into_iter()
+            .collect(),
             template: Box::new(DeferredForExpression {
                 file: Some("main.crn".to_string()),
                 line: 1,
@@ -4386,9 +4416,16 @@ mod apply_state_save_tests {
             identifier: crate::fixture_applied_identifier("old-record-id"),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::from(["cert".to_string()]),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: [ResolvedResourceId::with_provider_identity(
+                "aws",
+                "acm.Certificate",
+                "cert",
+                None,
+            )]
+            .into_iter()
+            .collect(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         }
     }
 
@@ -4407,6 +4444,14 @@ mod apply_state_save_tests {
                 "__deferred_for",
                 "validation_records",
             )),
+            dependencies: [ResolvedResourceId::with_provider_identity(
+                "aws",
+                "acm.Certificate",
+                "cert",
+                None,
+            )]
+            .into_iter()
+            .collect(),
             template: Box::new(DeferredForExpression {
                 file: Some("main.crn".to_string()),
                 line: 1,
@@ -4508,7 +4553,14 @@ mod apply_state_save_tests {
         .expect("fixture identifier is non-empty")
         .with_attribute("name", serde_json::json!("old.example.com"));
         existing.directives.provider_instance = Some("west".to_string());
-        existing.dependency_bindings.insert("cert".to_string());
+        existing
+            .dependency_bindings
+            .insert(ResolvedResourceId::with_provider_identity(
+                "aws",
+                "acm.Certificate",
+                "cert",
+                None,
+            ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -4687,7 +4739,14 @@ mod apply_state_save_tests {
         let mut existing = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-old")
             .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
-        existing.dependency_bindings.insert("igw".to_string());
+        existing
+            .dependency_bindings
+            .insert(ResolvedResourceId::with_provider_identity(
+                "awscc",
+                "ec2.InternetGateway",
+                "igw",
+                None,
+            ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -4736,7 +4795,14 @@ mod apply_state_save_tests {
         );
         assert_eq!(
             row.deposed[0].dependency_bindings,
-            BTreeSet::from(["igw".to_string()])
+            [ResolvedResourceId::with_provider_identity(
+                "awscc",
+                "ec2.InternetGateway",
+                "igw",
+                None,
+            )]
+            .into_iter()
+            .collect()
         );
     }
 
@@ -4902,9 +4968,9 @@ mod apply_state_save_tests {
             generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some("main".to_string()),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.add(Effect::Create(
             carina_core::resource::ResolvedResource::new(desired.clone()),
@@ -5056,7 +5122,7 @@ mod apply_state_save_tests {
             "old-record-id".to_string(),
             Some("west".to_string()),
             HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-            BTreeSet::new(),
+            Default::default(),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -5078,9 +5144,9 @@ mod apply_state_save_tests {
             generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.add(Effect::Create(
             carina_core::resource::ResolvedResource::new(desired.clone()),
@@ -5179,7 +5245,7 @@ mod apply_state_save_tests {
             "old-record-id".to_string(),
             Some("west".to_string()),
             HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-            BTreeSet::new(),
+            Default::default(),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -5201,9 +5267,9 @@ mod apply_state_save_tests {
             generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.add(Effect::Create(
             carina_core::resource::ResolvedResource::new(desired.clone()),
@@ -6032,7 +6098,14 @@ mod apply_state_save_tests {
                     "old-record-id".to_string(),
                     Some("west".to_string()),
                     HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-                    BTreeSet::from(["cert".to_string()]),
+                    [ResolvedResourceId::with_provider_identity(
+                        "aws",
+                        "acm.Certificate",
+                        "cert",
+                        None,
+                    )]
+                    .into_iter()
+                    .collect(),
                 ),
             },
         )
@@ -6067,7 +6140,14 @@ mod apply_state_save_tests {
             "old-record-id".to_string(),
             Some("east".to_string()),
             HashMap::from([("name".to_string(), serde_json::json!("stale"))]),
-            BTreeSet::from(["old".to_string()]),
+            [ResolvedResourceId::with_provider_identity(
+                "mock",
+                "test.Dependency",
+                "old",
+                None,
+            )]
+            .into_iter()
+            .collect(),
         ));
         let mut state = StateFile::new();
         state
@@ -6083,7 +6163,14 @@ mod apply_state_save_tests {
                     "old-record-id".to_string(),
                     Some("west".to_string()),
                     HashMap::from([("name".to_string(), serde_json::json!("fresh"))]),
-                    BTreeSet::from(["new".to_string()]),
+                    [ResolvedResourceId::with_provider_identity(
+                        "mock",
+                        "test.Dependency",
+                        "new",
+                        None,
+                    )]
+                    .into_iter()
+                    .collect(),
                 ),
             },
         )
@@ -6111,7 +6198,14 @@ mod apply_state_save_tests {
                     "old-record-id".to_string(),
                     Some("west".to_string()),
                     HashMap::from([("name".to_string(), serde_json::json!("newer"))]),
-                    BTreeSet::from(["newer".to_string()]),
+                    [ResolvedResourceId::with_provider_identity(
+                        "mock",
+                        "test.Dependency",
+                        "newer",
+                        None,
+                    )]
+                    .into_iter()
+                    .collect(),
                 ),
             },
         )
@@ -6131,7 +6225,14 @@ mod apply_state_save_tests {
         );
         assert_eq!(
             deposed.dependency_bindings,
-            BTreeSet::from(["newer".to_string()])
+            [ResolvedResourceId::with_provider_identity(
+                "mock",
+                "test.Dependency",
+                "newer",
+                None,
+            )]
+            .into_iter()
+            .collect()
         );
     }
 
@@ -6170,7 +6271,14 @@ mod apply_state_save_tests {
             "older-record-id".to_string(),
             None,
             HashMap::from([("name".to_string(), serde_json::json!("older"))]),
-            BTreeSet::from(["cert".to_string()]),
+            [ResolvedResourceId::with_provider_identity(
+                "aws",
+                "acm.Certificate",
+                "cert",
+                None,
+            )]
+            .into_iter()
+            .collect(),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -6425,7 +6533,14 @@ mod apply_state_save_tests {
                 .expect("fixture identifier is non-empty")
                 .with_attribute("bucket_name", serde_json::json!("old-name"))
                 .with_attribute("comment", persisted_secret.as_json().clone());
-        existing.dependency_bindings.insert("logs".to_string());
+        existing
+            .dependency_bindings
+            .insert(ResolvedResourceId::with_provider_identity(
+                "awscc",
+                "s3.Bucket",
+                "logs",
+                None,
+            ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -6602,7 +6717,14 @@ mod export_writeback_tests {
                 BTreeSet::from(["computed".to_string()]),
             )),
         );
-        row.dependency_bindings = BTreeSet::from(["upstream".to_string()]);
+        row.dependency_bindings = [ResolvedResourceId::with_provider_identity(
+            "mock",
+            "test.Resource",
+            "upstream",
+            None,
+        )]
+        .into_iter()
+        .collect();
         let mut state = StateFile::new();
         state
             .upsert_resource(row)
@@ -6636,7 +6758,14 @@ mod export_writeback_tests {
                 ));
                 assert_eq!(
                     present.state().dependency_bindings,
-                    BTreeSet::from(["upstream".to_string()])
+                    [ResolvedResourceId::with_provider_identity(
+                        "mock",
+                        "test.Resource",
+                        "upstream",
+                        None,
+                    )]
+                    .into_iter()
+                    .collect()
                 );
             }
             Current::MissingIdentifier(state) => {

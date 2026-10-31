@@ -17,22 +17,22 @@ mod static_eval;
 mod types;
 mod util;
 
-pub use crate::eval_value::StructuralHandleKind;
+pub use crate::eval_value::{UnexpandedResourceHandle, UnexpandedStructuralHandleKind};
 pub use ast::{
     ArgumentOrigin, ArgumentParameter, AttributeParameter, AttributePath, AttributePathSegment,
     AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingName,
-    BindingScopeId, BindingUseOwner, CallExpansion, ConsumerArgumentParameter,
+    BindingScopeId, BindingUseOwner, BoundaryExpression, CallExpansion, ConsumerArgumentParameter,
     ConsumerAttributeParameter, DeferredForExpansionError, DeferredForExpression,
     DeferredForTarget, ExpansionKey, ExportParamLike, ExportParameter, File, FnParam,
     InferredExportParam, InferredFile, ModuleArgument, ModuleCall, ModuleCallDiagnosticSource,
     ModuleCallId, MovedAddresses, ParsedBindingUses, ParsedExportParam, ParsedFile,
     ParserBindingMetadata, PendingValueSlot, ProviderConfig, RequireBlock, ResourceAddress,
     ResourceContext, ResourceRef, ResourceTypePath, SavedDeferredForExpression, ShapeMismatch,
-    SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst,
-    UpstreamState, UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock,
-    WaitBinding, expand_deferred_children,
+    SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TypeExpr, UnexpandedDependencies,
+    UnexpandedDependencyOperand, UntilPredicateAst, UpstreamState, UseStatement, UserFunction,
+    UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
 };
-pub(crate) use ast::{BareBindingSource, ParsedBareBindingUse};
+pub(crate) use ast::{BareBindingSource, ParsedBareBindingUse, UnexpandedCompositionAttribute};
 pub(crate) use config::ProviderCustomTypeSource;
 pub use config::{
     CustomTypeResolver, CustomTypeValidationError, CustomTypeValidationTarget,

@@ -24,9 +24,7 @@ use crate::provider::{
 };
 #[cfg(test)]
 use crate::provider::{ReadOutcome, fixture_read_outcome_for_identifier};
-#[cfg(test)]
-use crate::resource::ResolvedResourceId;
-use crate::resource::{Current, ResourceId, State, Value};
+use crate::resource::{Current, ResolvedResourceId, ResourceId, State, Value};
 use crate::shutdown::{CleanupAwareLoop, CleanupInterrupted, LoopStep};
 use crate::value::format_value_user_facing;
 use crate::wait::predicate::WaitPredicate;
@@ -62,7 +60,7 @@ pub(super) fn effect_started_for_test<S>(effect: &Effect<S>) -> ExecutionEvent<'
 /// Borrowed, internally consistent view of one [`Effect::Wait`].
 pub(super) struct WaitEffectRef<'a, S> {
     effect: &'a Effect<S>,
-    identity: &'a crate::resource::ResourceIdentity,
+    id: &'a ResolvedResourceId,
     target: &'a ManagedWaitTarget,
     until: &'a WaitPredicate,
     timeout: Duration,
@@ -72,7 +70,7 @@ pub(super) struct WaitEffectRef<'a, S> {
 impl<'a, S> WaitEffectRef<'a, S> {
     pub(super) fn from_effect(effect: &'a Effect<S>) -> Option<Self> {
         let Effect::Wait {
-            identity,
+            id,
             target_id,
             until,
             timeout,
@@ -84,7 +82,7 @@ impl<'a, S> WaitEffectRef<'a, S> {
         };
         Some(Self {
             effect,
-            identity,
+            id,
             target: target_id,
             until,
             timeout: *timeout,
@@ -92,8 +90,8 @@ impl<'a, S> WaitEffectRef<'a, S> {
         })
     }
 
-    pub(super) fn identity(&self) -> &crate::resource::ResourceIdentity {
-        self.identity
+    pub(super) fn id(&self) -> &ResolvedResourceId {
+        self.id
     }
 
     pub(super) fn target(&self) -> &ManagedWaitTarget {
@@ -653,7 +651,7 @@ pub(super) async fn execute_wait_effect_with_heartbeat_cadence<S>(
 ) -> WaitOutcome {
     let WaitEffectRef {
         effect,
-        identity: _,
+        id: _,
         target,
         until,
         timeout,
@@ -782,13 +780,13 @@ mod tests {
 
     fn wait_effect(timeout: Duration, interval: Duration) -> Effect {
         Effect::Wait {
-            identity: crate::resource::ResourceIdentity::new("cert_issued"),
+            id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
             target_id: managed_wait_target(),
             until: equals_status("ISSUED"),
             until_surface: "cert.status == ISSUED".to_string(),
             timeout,
             interval,
-            explicit_dependencies: HashSet::new(),
+            explicit_dependencies: Default::default(),
         }
     }
 
@@ -1492,13 +1490,13 @@ mod tests {
         let shutdown = crate::shutdown::ShutdownToken::running();
         let cleanup_loop = shutdown.cleanup_aware_loop();
         let effect: crate::effect::Effect = crate::effect::Effect::Wait {
-            identity: crate::resource::ResourceIdentity::new("cert_issued"),
+            id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
             target_id: managed_wait_target(),
             until: equals_status("ISSUED"),
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: Duration::from_millis(100),
             interval: Duration::from_millis(1),
-            explicit_dependencies: HashSet::new(),
+            explicit_dependencies: Default::default(),
         };
 
         let result = execute_wait_effect_with_heartbeat_cadence(

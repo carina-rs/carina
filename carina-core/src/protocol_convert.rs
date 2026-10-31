@@ -1844,7 +1844,7 @@ pub fn protocol_to_directives(directives: &protocol::Directives) -> Directives {
         force_delete: *force_delete,
         create_before_destroy: *create_before_destroy,
         prevent_destroy: *prevent_destroy,
-        depends_on: Vec::new(),
+        depends_on: crate::parser::UnexpandedDependencies::default(),
         ignore_changes: Vec::new(),
         provider_instance: None,
     }

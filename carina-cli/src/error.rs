@@ -557,6 +557,11 @@ pub enum AppError {
     #[error(transparent)]
     PendingResourceIdentity(#[from] carina_core::resource::PendingResourceIdentityError),
 
+    /// A post-expansion handle or dependency operand could not be mapped to
+    /// one complete scheduler address.
+    #[error(transparent)]
+    ExpandedGraphResolution(Box<carina_core::resolved_graph::ExpandedGraphResolutionError>),
+
     /// A resource's authored lifecycle paths could not cross the
     /// schema-resolved planning boundary.
     #[error(transparent)]
@@ -913,6 +918,12 @@ impl From<carina_core::resource::ResolvedResourceError> for AppError {
     }
 }
 
+impl From<carina_core::resolved_graph::ExpandedGraphResolutionError> for AppError {
+    fn from(error: carina_core::resolved_graph::ExpandedGraphResolutionError) -> Self {
+        Self::ExpandedGraphResolution(Box::new(error))
+    }
+}
+
 impl From<String> for AppError {
     fn from(s: String) -> Self {
         AppError::Config(s)
@@ -936,7 +947,7 @@ mod tests {
     use super::*;
 
     fn dependency_analysis_failure() -> carina_core::effect::deps::DependencyAnalysisFailure {
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashMap;
 
         use carina_core::effect::deps::{
             ScheduleInputs, UnresolvedResource, build_effect_dependency_analysis,
@@ -952,9 +963,13 @@ mod tests {
             generation: EffectGeneration::Current,
             directives: Default::default(),
             binding: Some("example".to_string()),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::from(["missing-consumer".into()]),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: std::iter::once(ResolvedResourceId::with_identity(
+                "mock.test.Widget",
+                "missing-consumer",
+            ))
+            .collect(),
         };
         build_effect_dependency_analysis(
             &[effect],

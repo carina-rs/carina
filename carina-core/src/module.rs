@@ -974,12 +974,21 @@ impl ModuleSignature {
             .attribute_params
             .iter()
             .map(|attr_param| {
-                let source_binding = attr_param.value.as_ref().and_then(|v| match v {
-                    Value::Deferred(DeferredValue::ResourceRef { path }) => {
-                        Some(path.binding().to_string())
-                    }
-                    _ => None,
-                });
+                let source_binding =
+                    attr_param
+                        .value
+                        .as_ref()
+                        .and_then(|expression| match expression {
+                            crate::parser::BoundaryExpression::Value(Value::Deferred(
+                                DeferredValue::ResourceRef { path },
+                            )) => Some(path.binding().to_string()),
+                            crate::parser::BoundaryExpression::Handle(handle) => {
+                                Some(handle.canonical_binding_name().to_string())
+                            }
+                            crate::parser::BoundaryExpression::Value(
+                                Value::Concrete(_) | Value::Deferred(_),
+                            ) => None,
+                        });
 
                 TypedAttributeParam {
                     name: attr_param.name.clone(),

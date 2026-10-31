@@ -462,7 +462,7 @@ fn create_plan_detects_typed_orphan_for_deletion() {
     let orphans = Orphans::from([Orphan::from_state(
         existing_state(orphan_id, orphan_attrs),
         None,
-        Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     )]);
 
     let plan = create_plan(
@@ -1346,12 +1346,13 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
     let desired = vec![];
 
     let orphan_id = ResourceId::with_identity("subnet", "my-subnet");
+    let dependency_id = crate::resource::ResolvedResourceId::with_identity("vpc", "my-vpc");
     let orphan_state = existing_state(orphan_id.clone(), HashMap::new())
-        .with_dependency_bindings(std::collections::BTreeSet::from(["my_vpc".to_string()]));
+        .with_dependency_bindings(std::iter::once(dependency_id.clone()).collect());
     let orphans = crate::differ::Orphans::from([Orphan::from_state(
         orphan_state,
         Some("my_subnet".to_string()),
-        crate::resource::Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     )]);
 
     let plan = create_plan(
@@ -1390,7 +1391,7 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
                 "Orphan Delete should preserve the typed binding"
             );
             assert!(
-                dependencies.contains("my_vpc"),
+                dependencies.contains(&dependency_id),
                 "Orphan Delete should preserve typed dependency bindings"
             );
         }

@@ -1,7 +1,8 @@
 use super::*;
 use carina_core::parser::{DeferredForExpression, ForBinding};
 use carina_core::resource::{
-    ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, State, Value,
+    ConcreteValue, Directives, ResolvedDependencies, ResolvedResource, ResolvedResourceId,
+    Resource, ResourceId, State, Value,
 };
 use carina_core::value::format_value;
 
@@ -11,6 +12,26 @@ fn resolved(resource: Resource) -> ResolvedResource {
 
 fn create(resource: Resource) -> Effect {
     Effect::Create(resolved(resource))
+}
+
+fn resolved_fixture_resources(resources: Vec<Resource>) -> Vec<ResolvedResource> {
+    let mut parsed = carina_core::parser::ParsedFile::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &[])
+        .expect("TUI fixture graph must resolve");
+    resources
+        .into_iter()
+        .map(|resource| {
+            graph
+                .resolve_resource(resource, &SchemaRegistry::new())
+                .expect("TUI fixture dependencies must resolve")
+        })
+        .collect()
+}
+
+fn add_resolved_creates(plan: &mut Plan, resources: Vec<Resource>) {
+    for resource in resolved_fixture_resources(resources) {
+        plan.add(Effect::Create(resource));
+    }
 }
 
 #[test]
@@ -34,9 +55,9 @@ fn app_from_plan_with_effects() {
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: None,
-        dependencies: HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: ResolvedDependencies::default(),
+        explicit_dependencies: ResolvedDependencies::default(),
+        blocked_by_updates: ResolvedDependencies::default(),
     });
 
     let app = App::for_plan(&plan, &SchemaRegistry::new());
@@ -126,6 +147,9 @@ fn deferred_create_uses_create_symbol_and_kind() {
             "__deferred_for",
             "validation_records",
         )),
+        dependencies: ResolvedDependencies::from_iter([ResolvedResourceId::new(
+            ResourceId::with_identity("acm.Certificate", "cert"),
+        )]),
         template: Box::new(deferred),
     });
 
@@ -310,22 +334,23 @@ fn format_value_display() {
 fn tree_structure_with_dependencies() {
     // Create a plan where subnet depends on vpc via ResourceRef
     let mut plan = Plan::new();
-    plan.add(create(
-        Resource::new("ec2.Vpc", "my-vpc")
-            .with_binding("vpc")
-            .with_attribute(
-                "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-            ),
-    ));
-    plan.add(create(
-        Resource::new("ec2.Subnet", "my-subnet")
-            .with_binding("subnet")
-            .with_attribute(
-                "vpc_id",
-                Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-            ),
-    ));
+    add_resolved_creates(
+        &mut plan,
+        vec![
+            Resource::new("ec2.Vpc", "my-vpc")
+                .with_binding("vpc")
+                .with_attribute(
+                    "cidr_block",
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+                ),
+            Resource::new("ec2.Subnet", "my-subnet")
+                .with_binding("subnet")
+                .with_attribute(
+                    "vpc_id",
+                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+                ),
+        ],
+    );
 
     let app = App::for_plan(&plan, &SchemaRegistry::new());
 
@@ -483,25 +508,24 @@ fn tree_scroll_zero_height_does_not_scroll_on_move_down() {
 /// Helper to build a plan with vpc -> subnet dependency tree for filter tests.
 fn make_tree_plan() -> Plan {
     let mut plan = Plan::new();
-    plan.add(create(
-        Resource::new("ec2.Vpc", "my-vpc")
-            .with_binding("vpc")
-            .with_attribute(
-                "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-            ),
-    ));
-    plan.add(create(
-        Resource::new("ec2.Subnet", "my-subnet")
-            .with_binding("subnet")
-            .with_attribute(
-                "vpc_id",
-                Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-            ),
-    ));
-    plan.add(create(
-        Resource::new("s3.Bucket", "my-bucket").with_binding("bucket"),
-    ));
+    add_resolved_creates(
+        &mut plan,
+        vec![
+            Resource::new("ec2.Vpc", "my-vpc")
+                .with_binding("vpc")
+                .with_attribute(
+                    "cidr_block",
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+                ),
+            Resource::new("ec2.Subnet", "my-subnet")
+                .with_binding("subnet")
+                .with_attribute(
+                    "vpc_id",
+                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+                ),
+            Resource::new("s3.Bucket", "my-bucket").with_binding("bucket"),
+        ],
+    );
     plan
 }
 

@@ -235,14 +235,14 @@ pub fn resolve_saved_composition_refs_post_apply(
     Ok(())
 }
 
-trait RuntimeCompositionAttribute: Sized {
-    fn runtime_value(&self) -> Value;
+trait RuntimeCompositionAttribute: Sized + Clone {
+    fn runtime_value(&self) -> Option<Value>;
     fn with_runtime_value(&self, value: Value) -> Self;
 }
 
 impl RuntimeCompositionAttribute for crate::resource::LiveCompositionAttribute {
-    fn runtime_value(&self) -> Value {
-        self.to_value()
+    fn runtime_value(&self) -> Option<Value> {
+        self.value()
     }
 
     fn with_runtime_value(&self, value: Value) -> Self {
@@ -251,8 +251,8 @@ impl RuntimeCompositionAttribute for crate::resource::LiveCompositionAttribute {
 }
 
 impl RuntimeCompositionAttribute for crate::resource::SavedCompositionAttribute {
-    fn runtime_value(&self) -> Value {
-        self.to_value()
+    fn runtime_value(&self) -> Option<Value> {
+        Some(self.to_value())
     }
 
     fn with_runtime_value(&self, value: Value) -> Self {
@@ -271,7 +271,10 @@ fn resolve_composition_attributes<A: RuntimeCompositionAttribute>(
             // reclassify it in the same lifecycle. A forwarded reference that
             // resolves to a literal becomes derived; one that remains a
             // reference stays forwarded.
-            let resolved = resolve_ref_value(&attribute.runtime_value(), bindings)?;
+            let Some(value) = attribute.runtime_value() else {
+                return Ok((key.clone(), attribute.clone()));
+            };
+            let resolved = resolve_ref_value(&value, bindings)?;
             Ok((key.clone(), attribute.with_runtime_value(resolved)))
         })
         .collect()
@@ -2181,7 +2184,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
-                dependency_bindings: std::collections::BTreeSet::new(),
+                dependency_bindings: Default::default(),
 
                 partial_read: None,
             },

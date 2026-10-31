@@ -15,6 +15,27 @@ By default, state is stored locally as `carina.state.json`. Use `backend local {
 
 ### State format upgrades
 
+State format v21 stores current and deposed dependency metadata as complete,
+typed resource IDs instead of binding-name strings. When Carina reads a v20
+file, it resolves every legacy dependency through the row's existing
+binding/address and origin metadata. An unmatched or ambiguous dependency is
+a migration error that names both the owning row and the dependency text;
+Carina never drops the edge.
+
+You can test this migration against a copy without changing either the copy or
+the configured backend:
+
+```bash
+cp carina.state.json /tmp/carina-state-migration-check.json
+carina state show \
+  --state-url /tmp/carina-state-migration-check.json \
+  --json >/dev/null
+```
+
+`state show` loads and migrates the copy in memory only. A successful exit
+means every legacy dependency resolved; it does not write the v21 form back to
+disk.
+
 State format v17 adds a top-level `exports_version` that versions the exports
 encoding separately from the rest of the state file. Readers that only need
 exports (`upstream_state` and `carina export`) check `exports_version` instead
@@ -272,6 +293,12 @@ awscc.ec2.SecurityGroup {
 ```
 
 The `upstream_state` expression points at an upstream project's directory. Carina loads that directory's configuration, resolves its backend, reads its state, and exposes the upstream's `exports` through the `let`-bound name. If that project has a pending backend migration, Carina warns and reads its locked old backend. In this example, `network.vpc_id` references the `vpc_id` value published by the `../network` project's `exports` block.
+
+Exports and `upstream_state` are value-only state boundaries. A module may
+expose a same-stack resource handle through `attributes`, but an `exports`
+entry whose declared or inferred type is a resource handle is rejected. Export
+an ID, ARN, or another resource attribute value instead; no handle is written
+to state.
 
 `source` is required and resolved relative to the enclosing `.crn` file's directory. The upstream directory must contain a valid Carina configuration (one or more `.crn` files — no filename is privileged) with an `exports` block that publishes the values consumers need.
 

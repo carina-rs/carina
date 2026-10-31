@@ -20,9 +20,10 @@
 //!
 //! See #2230 for the design discussion.
 
-use crate::parser::{PendingValueSlot, ResourceTypePath};
+use crate::parser::{BindingName, PendingValueSlot, ResourceTypePath};
 use crate::resource::{PathSegment, Subscript, Value};
 use indexmap::IndexMap;
+use std::borrow::Cow;
 
 /// Parser-only representation of a structural binding used as an operand.
 ///
@@ -32,13 +33,26 @@ use indexmap::IndexMap;
 /// The argument shape stays typed independently of its annotation; every
 /// ordinary value boundary rejects a bare handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StructuralHandle {
-    reference: StructuralReference,
-    kind: StructuralHandleKind,
+pub(crate) struct UnexpandedStructuralHandle {
+    reference: UnexpandedStructuralReference,
+    kind: UnexpandedStructuralHandleKind,
+    resource_type: Option<ResourceTypePath>,
+}
+
+/// Parser/pre-expansion representation of a managed resource capability.
+///
+/// Unlike [`UnexpandedStructuralHandle`], this type cannot represent module
+/// calls, providers, waits, or value parameters. It is the only structural
+/// operand accepted by module-output and dependency boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnexpandedResourceHandle {
+    reference: UnexpandedStructuralReference,
+    resource_type: ResourceTypePath,
+    kind: UnexpandedStructuralHandleKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StructuralHandleKind {
+pub enum UnexpandedStructuralHandleKind {
     Resource(ResourceTypePath),
     For,
     If,
@@ -51,16 +65,7 @@ pub enum StructuralHandleKind {
     FunctionParameter,
 }
 
-impl StructuralHandleKind {
-    /// Whether this structural kind denotes an ordering target that the
-    /// dependency graph can actually honor.
-    pub(crate) fn is_dependency_target(&self) -> bool {
-        matches!(
-            self,
-            Self::Resource(_) | Self::If | Self::Module | Self::ModuleParameter
-        )
-    }
-
+impl UnexpandedStructuralHandleKind {
     pub(crate) fn description(&self) -> &'static str {
         match self {
             Self::Resource(_) => "a resource",
@@ -105,13 +110,13 @@ impl StructuralHandleKind {
 /// resolves it to ordinary value data or rejects it once the referenced name
 /// is known to be a structural handle.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum StructuralHandleMetadata {
+pub(crate) enum UnexpandedStructuralHandleMetadata {
     Handle { access_base: Option<Value> },
-    List(Vec<Option<StructuralHandleMetadata>>),
-    Map(IndexMap<String, StructuralHandleMetadata>),
+    List(Vec<Option<UnexpandedStructuralHandleMetadata>>),
+    Map(IndexMap<String, UnexpandedStructuralHandleMetadata>),
 }
 
-impl StructuralHandleMetadata {
+impl UnexpandedStructuralHandleMetadata {
     pub(crate) fn is_handle(&self) -> bool {
         matches!(self, Self::Handle { .. })
     }
@@ -148,61 +153,132 @@ impl StructuralHandleMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum StructuralReference {
-    Addressable(String),
-    Alias { name: String, target: String },
+pub enum UnexpandedStructuralReference {
+    LocalBinding(BindingName),
+    ModuleArgument(BindingName),
+    ModuleAttribute {
+        call: BindingName,
+        attribute: String,
+    },
+    Alias {
+        alias: BindingName,
+        target: Box<Self>,
+    },
 }
 
-impl StructuralHandle {
-    pub(crate) fn new(kind: StructuralHandleKind, name: impl Into<String>) -> Self {
+impl UnexpandedStructuralReference {
+    fn canonical_name(&self) -> Cow<'_, str> {
+        match self {
+            Self::LocalBinding(binding) | Self::ModuleArgument(binding) => {
+                Cow::Borrowed(binding.as_str())
+            }
+            Self::ModuleAttribute { call, attribute } => Cow::Owned(format!("{call}.{attribute}")),
+            Self::Alias { target, .. } => target.canonical_name(),
+        }
+    }
+
+    fn alias_name(&self) -> Option<&str> {
+        match self {
+            Self::Alias { alias, .. } => Some(alias.as_str()),
+            Self::LocalBinding(_) | Self::ModuleArgument(_) | Self::ModuleAttribute { .. } => None,
+        }
+    }
+}
+
+impl UnexpandedStructuralHandle {
+    pub(crate) fn new(kind: UnexpandedStructuralHandleKind, name: impl Into<String>) -> Self {
+        let resource_type = match &kind {
+            UnexpandedStructuralHandleKind::Resource(resource_type) => Some(resource_type.clone()),
+            UnexpandedStructuralHandleKind::For
+            | UnexpandedStructuralHandleKind::If
+            | UnexpandedStructuralHandleKind::Use
+            | UnexpandedStructuralHandleKind::Module
+            | UnexpandedStructuralHandleKind::Wait
+            | UnexpandedStructuralHandleKind::UpstreamState
+            | UnexpandedStructuralHandleKind::Provider
+            | UnexpandedStructuralHandleKind::ModuleParameter
+            | UnexpandedStructuralHandleKind::FunctionParameter => None,
+        };
         Self {
-            reference: StructuralReference::Addressable(name.into()),
+            reference: UnexpandedStructuralReference::LocalBinding(name.into().into()),
             kind,
+            resource_type,
+        }
+    }
+
+    pub(crate) fn module_parameter(
+        name: impl Into<String>,
+        resource_type: ResourceTypePath,
+    ) -> Self {
+        Self {
+            reference: UnexpandedStructuralReference::ModuleArgument(name.into().into()),
+            kind: UnexpandedStructuralHandleKind::ModuleParameter,
+            resource_type: Some(resource_type),
+        }
+    }
+
+    pub(crate) fn module_attribute(
+        call: impl Into<String>,
+        attribute: impl AsRef<str>,
+        resource_type: ResourceTypePath,
+    ) -> Self {
+        let call = call.into();
+        Self {
+            reference: UnexpandedStructuralReference::ModuleAttribute {
+                call: BindingName::from(call),
+                attribute: attribute.as_ref().to_string(),
+            },
+            kind: UnexpandedStructuralHandleKind::Resource(resource_type.clone()),
+            resource_type: Some(resource_type),
         }
     }
 
     pub(crate) fn with_alias(mut self, alias: impl Into<String>) -> Self {
-        let target = self.canonical_binding_name().to_string();
-        self.reference = StructuralReference::Alias {
-            name: alias.into(),
-            target,
+        self.reference = UnexpandedStructuralReference::Alias {
+            alias: BindingName::from(alias.into()),
+            target: Box::new(self.reference),
         };
         self
     }
 
     pub(crate) fn addressable_binding(&self) -> Option<&str> {
         match &self.reference {
-            StructuralReference::Addressable(binding) => Some(binding),
-            StructuralReference::Alias { .. } => None,
+            UnexpandedStructuralReference::LocalBinding(binding)
+            | UnexpandedStructuralReference::ModuleArgument(binding) => Some(binding.as_str()),
+            UnexpandedStructuralReference::ModuleAttribute { .. }
+            | UnexpandedStructuralReference::Alias { .. } => None,
         }
     }
 
     pub(crate) fn alias_name(&self) -> Option<&str> {
-        match &self.reference {
-            StructuralReference::Alias { name, .. } => Some(name),
-            StructuralReference::Addressable(_) => None,
-        }
+        self.reference.alias_name()
     }
 
-    pub(crate) fn canonical_binding_name(&self) -> &str {
-        match &self.reference {
-            StructuralReference::Addressable(binding) => binding,
-            StructuralReference::Alias { target, .. } => target,
-        }
+    pub(crate) fn canonical_binding_name(&self) -> Cow<'_, str> {
+        self.reference.canonical_name()
     }
 
-    pub(crate) fn kind(&self) -> &StructuralHandleKind {
+    pub(crate) fn kind(&self) -> &UnexpandedStructuralHandleKind {
         &self.kind
     }
 
+    pub(crate) fn resource_handle(&self) -> Option<UnexpandedResourceHandle> {
+        Some(UnexpandedResourceHandle {
+            reference: self.reference.clone(),
+            resource_type: self.resource_type.clone()?,
+            kind: self.kind.clone(),
+        })
+    }
+
     pub(crate) fn is_for_binding(&self) -> bool {
-        self.kind == StructuralHandleKind::For
+        self.kind == UnexpandedStructuralHandleKind::For
     }
 
     pub(crate) fn is_parameter_handle(&self) -> bool {
         matches!(
             &self.kind,
-            StructuralHandleKind::ModuleParameter | StructuralHandleKind::FunctionParameter
+            UnexpandedStructuralHandleKind::ModuleParameter
+                | UnexpandedStructuralHandleKind::FunctionParameter
         )
     }
 
@@ -210,22 +286,22 @@ impl StructuralHandle {
     pub(crate) fn access_base_value(&self) -> Value {
         let binding = self.canonical_binding_name();
         match &self.kind {
-            StructuralHandleKind::ModuleParameter => {
+            UnexpandedStructuralHandleKind::ModuleParameter => {
                 Value::Deferred(crate::resource::DeferredValue::Unknown(
                     crate::resource::UnknownReason::ModuleArgument {
-                        name: binding.to_string(),
+                        name: binding.into_owned(),
                         source_line: (0).into(),
                         diagnostic_name: None,
                     },
                 ))
             }
-            StructuralHandleKind::FunctionParameter => Value::Deferred(
+            UnexpandedStructuralHandleKind::FunctionParameter => Value::Deferred(
                 crate::resource::DeferredValue::Unknown(crate::resource::UnknownReason::FnParam {
-                    name: binding.to_string(),
+                    name: binding.into_owned(),
                 }),
             ),
             _ => Value::Deferred(crate::resource::DeferredValue::BindingRef {
-                binding: binding.to_string(),
+                binding: binding.into_owned(),
             }),
         }
     }
@@ -233,6 +309,7 @@ impl StructuralHandle {
     pub(crate) fn bare_error(&self) -> BareStructuralHandle {
         let binding = self
             .alias_name()
+            .map(Cow::Borrowed)
             .unwrap_or_else(|| self.canonical_binding_name())
             .to_string();
         BareStructuralHandle {
@@ -242,10 +319,48 @@ impl StructuralHandle {
     }
 }
 
+impl UnexpandedResourceHandle {
+    pub(crate) fn new(name: impl Into<String>, resource_type: ResourceTypePath) -> Self {
+        Self {
+            reference: UnexpandedStructuralReference::LocalBinding(name.into().into()),
+            kind: UnexpandedStructuralHandleKind::Resource(resource_type.clone()),
+            resource_type,
+        }
+    }
+
+    pub fn resource_type(&self) -> &ResourceTypePath {
+        &self.resource_type
+    }
+
+    pub(crate) fn canonical_binding_name(&self) -> Cow<'_, str> {
+        self.reference.canonical_name()
+    }
+
+    pub(crate) fn diagnostic_name(&self) -> Cow<'_, str> {
+        self.reference
+            .alias_name()
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| self.reference.canonical_name())
+    }
+
+    pub(crate) fn with_canonical_binding(mut self, binding: impl Into<String>) -> Self {
+        self.reference = UnexpandedStructuralReference::LocalBinding(binding.into().into());
+        self
+    }
+
+    pub(crate) fn into_structural(self) -> UnexpandedStructuralHandle {
+        UnexpandedStructuralHandle {
+            reference: self.reference,
+            kind: self.kind,
+            resource_type: Some(self.resource_type),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BareStructuralHandle {
     pub(crate) binding: String,
-    pub(crate) kind: StructuralHandleKind,
+    pub(crate) kind: UnexpandedStructuralHandleKind,
 }
 
 impl std::fmt::Display for BareStructuralHandle {
@@ -270,7 +385,7 @@ pub(crate) enum EvalValue {
     User(Value),
 
     /// A structural operand that has not crossed the public `Value` boundary.
-    StructuralHandle(StructuralHandle),
+    UnexpandedStructuralHandle(UnexpandedStructuralHandle),
 
     /// A typed value sink reserved by the parser because a bare structural
     /// binding occurred somewhere below it. The owning resource attribute or
@@ -279,7 +394,7 @@ pub(crate) enum EvalValue {
     PendingValue(PendingValueSlot),
 
     /// A directory-scoped name whose declaration kind is not known yet.
-    /// This is deliberately distinct from `StructuralHandle`: the fixed-point
+    /// This is deliberately distinct from `UnexpandedStructuralHandle`: the fixed-point
     /// pass may prove that it names either an ordinary value or a structure.
     ProvisionalReference { binding: String },
 
@@ -287,9 +402,9 @@ pub(crate) enum EvalValue {
     /// provisional handles. The parallel metadata tree survives parser-local
     /// lets, `for` bindings, and directory seed passes until their kinds are
     /// known.
-    ComputedWithStructuralHandles {
+    ComputedWithUnexpandedStructuralHandles {
         value: Value,
-        metadata: StructuralHandleMetadata,
+        metadata: UnexpandedStructuralHandleMetadata,
     },
 
     /// Deferred-for loop value before the iterable is available. Keeping the
@@ -372,8 +487,8 @@ impl EvalValue {
         }
     }
 
-    pub(crate) fn structural_handle(handle: StructuralHandle) -> Self {
-        Self::StructuralHandle(handle)
+    pub(crate) fn structural_handle(handle: UnexpandedStructuralHandle) -> Self {
+        Self::UnexpandedStructuralHandle(handle)
     }
 
     pub(crate) fn pending_value(slot: PendingValueSlot) -> Self {
@@ -398,9 +513,12 @@ impl EvalValue {
         self
     }
 
-    pub(crate) fn computed(value: Value, metadata: Option<StructuralHandleMetadata>) -> Self {
+    pub(crate) fn computed(
+        value: Value,
+        metadata: Option<UnexpandedStructuralHandleMetadata>,
+    ) -> Self {
         match metadata {
-            Some(metadata) => Self::ComputedWithStructuralHandles { value, metadata },
+            Some(metadata) => Self::ComputedWithUnexpandedStructuralHandles { value, metadata },
             None => Self::User(value),
         }
     }
@@ -411,9 +529,9 @@ impl EvalValue {
         }
     }
 
-    pub(crate) fn structural_handle_ref(&self) -> Option<&StructuralHandle> {
+    pub(crate) fn structural_handle_ref(&self) -> Option<&UnexpandedStructuralHandle> {
         match self {
-            Self::StructuralHandle(handle) => Some(handle),
+            Self::UnexpandedStructuralHandle(handle) => Some(handle),
             _ => None,
         }
     }
@@ -425,11 +543,11 @@ impl EvalValue {
         }
     }
 
-    pub(crate) fn structural_handle_metadata(&self) -> Option<&StructuralHandleMetadata> {
+    pub(crate) fn structural_handle_metadata(&self) -> Option<&UnexpandedStructuralHandleMetadata> {
         match self {
-            Self::ComputedWithStructuralHandles { metadata, .. } => Some(metadata),
+            Self::ComputedWithUnexpandedStructuralHandles { metadata, .. } => Some(metadata),
             Self::User(_)
-            | Self::StructuralHandle(_)
+            | Self::UnexpandedStructuralHandle(_)
             | Self::PendingValue(_)
             | Self::ProvisionalReference { .. }
             | Self::DeferredForValue { .. }
@@ -439,19 +557,19 @@ impl EvalValue {
 
     pub(crate) fn into_collection_element(
         self,
-    ) -> Result<(Value, Option<StructuralHandleMetadata>), EvalValueError> {
+    ) -> Result<(Value, Option<UnexpandedStructuralHandleMetadata>), EvalValueError> {
         match self {
             Self::User(value) => {
                 let metadata = matches!(
                     value,
                     Value::Deferred(crate::resource::DeferredValue::BindingRef { .. })
                 )
-                .then(|| StructuralHandleMetadata::Handle {
+                .then(|| UnexpandedStructuralHandleMetadata::Handle {
                     access_base: Some(value.clone()),
                 });
                 Ok((value, metadata))
             }
-            Self::StructuralHandle(handle) => {
+            Self::UnexpandedStructuralHandle(handle) => {
                 Err(EvalValueError::BareStructuralHandle(handle.bare_error()))
             }
             Self::PendingValue(slot) => Err(EvalValueError::PendingValue(Box::new(slot))),
@@ -459,12 +577,14 @@ impl EvalValue {
                 let value = Value::Deferred(crate::resource::DeferredValue::BindingRef { binding });
                 Ok((
                     value.clone(),
-                    Some(StructuralHandleMetadata::Handle {
+                    Some(UnexpandedStructuralHandleMetadata::Handle {
                         access_base: Some(value),
                     }),
                 ))
             }
-            Self::ComputedWithStructuralHandles { value, metadata } => Ok((value, Some(metadata))),
+            Self::ComputedWithUnexpandedStructuralHandles { value, metadata } => {
+                Ok((value, Some(metadata)))
+            }
             Self::DeferredForValue { .. } => Ok((
                 Value::Deferred(crate::resource::DeferredValue::Unknown(
                     crate::resource::UnknownReason::ForValue,
@@ -486,7 +606,7 @@ impl EvalValue {
     /// accessed inside the module.
     pub(crate) fn module_argument_access_base(&self) -> Option<Value> {
         match self {
-            Self::StructuralHandle(handle) => Some(handle.access_base_value()),
+            Self::UnexpandedStructuralHandle(handle) => Some(handle.access_base_value()),
             Self::PendingValue(_) => None,
             Self::ProvisionalReference { binding } => Some(Value::Deferred(
                 crate::resource::DeferredValue::BindingRef {
@@ -499,14 +619,16 @@ impl EvalValue {
                     | crate::resource::DeferredValue::ResourceRef { .. },
                 ),
             ) => Some(value.clone()),
-            Self::ComputedWithStructuralHandles { metadata, .. } => metadata.access_base().cloned(),
+            Self::ComputedWithUnexpandedStructuralHandles { metadata, .. } => {
+                metadata.access_base().cloned()
+            }
             _ => None,
         }
     }
 
-    pub(crate) fn into_structural_handle(self) -> Option<StructuralHandle> {
+    pub(crate) fn into_structural_handle(self) -> Option<UnexpandedStructuralHandle> {
         match self {
-            Self::StructuralHandle(handle) => Some(handle),
+            Self::UnexpandedStructuralHandle(handle) => Some(handle),
             _ => None,
         }
     }
@@ -531,14 +653,14 @@ impl EvalValue {
     pub(crate) fn into_value(self) -> Result<Value, EvalValueError> {
         match self {
             Self::User(v) => Ok(v),
-            Self::StructuralHandle(handle) => {
+            Self::UnexpandedStructuralHandle(handle) => {
                 Err(EvalValueError::BareStructuralHandle(handle.bare_error()))
             }
             Self::PendingValue(slot) => Err(EvalValueError::PendingValue(Box::new(slot))),
             Self::ProvisionalReference { binding } => Ok(Value::Deferred(
                 crate::resource::DeferredValue::BindingRef { binding },
             )),
-            Self::ComputedWithStructuralHandles { value, .. } => Ok(value),
+            Self::ComputedWithUnexpandedStructuralHandles { value, .. } => Ok(value),
             Self::DeferredForValue { .. } => Ok(Value::Deferred(
                 crate::resource::DeferredValue::Unknown(crate::resource::UnknownReason::ForValue),
             )),

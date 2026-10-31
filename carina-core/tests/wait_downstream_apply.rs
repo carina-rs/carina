@@ -78,6 +78,31 @@ fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
     }
 }
 
+fn resolve_plan_graph(
+    parsed: &mut carina_core::parser::ParsedFile,
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+) -> (
+    Vec<ResolvedResource>,
+    Vec<carina_core::wait::ResolvedWaitBinding>,
+) {
+    let index = carina_core::resolved_graph::resolve_expanded_graph(parsed, resources, &[])
+        .expect("expanded test graph must resolve");
+    let managed = resources
+        .iter()
+        .cloned()
+        .map(|resource| index.resolve_resource(resource, registry))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("managed test dependencies must resolve");
+    let waits = parsed
+        .wait_bindings
+        .iter()
+        .map(|wait| index.resolve_wait_binding(wait))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("wait test dependencies must resolve");
+    (managed, waits)
+}
+
 /// cert read returns ISSUED (+ certificate_arn) immediately; other
 /// resources create/read trivially. Keeps a correct wait fast.
 struct MockProvider;
@@ -260,7 +285,10 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         wb.until_predicate.lhs_segments
     );
     assert!(
-        wb.depends_on.iter().any(|d| d == "r.validation_record"),
+        wb.depends_on
+            .diagnostic_references()
+            .iter()
+            .any(|d| d == "r.validation_record"),
         "depends_on entries must be instance-prefixed; got {:?}",
         wb.depends_on
     );
@@ -319,8 +347,8 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     .expect("resolve_refs should succeed");
 
     let registry = SchemaRegistry::new();
-    let resolved_resources_for_plan =
-        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
+    let (resolved_resources_for_plan, resolved_waits) =
+        resolve_plan_graph(&mut parsed, &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
@@ -337,14 +365,14 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         &registry,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &parsed.wait_bindings,
+        &resolved_waits,
     )
     .expect("test provider hints should succeed");
 
     assert!(
         plan.effects().iter().any(|e| matches!(
             e,
-            carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "r.cert_issued"
+            carina_core::effect::Effect::Wait { id, .. } if id.identity_str() == "r.cert_issued"
         )),
         "create_plan must emit Effect::Wait for the prefixed wait binding"
     );
@@ -495,8 +523,8 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     .expect("resolve_refs should succeed");
 
     let registry = SchemaRegistry::new();
-    let resolved_resources_for_plan =
-        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
+    let (resolved_resources_for_plan, resolved_waits) =
+        resolve_plan_graph(&mut parsed, &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
@@ -513,13 +541,13 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         &registry,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &parsed.wait_bindings,
+        &resolved_waits,
     )
     .expect("test provider hints should succeed");
     assert!(
         plan.effects().iter().any(|e| matches!(
             e,
-            carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "o.c.cert_issued"
+            carina_core::effect::Effect::Wait { id, .. } if id.identity_str() == "o.c.cert_issued"
         )),
         "create_plan must emit Effect::Wait for the doubly-prefixed binding"
     );
@@ -679,8 +707,8 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
 
     // ---- The dependency edge is intact: Effect::Wait still emitted.
     let registry = SchemaRegistry::new();
-    let resolved_resources_for_plan =
-        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
+    let (resolved_resources_for_plan, resolved_waits) =
+        resolve_plan_graph(&mut parsed, &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
@@ -697,13 +725,13 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         &registry,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &parsed.wait_bindings,
+        &resolved_waits,
     )
     .expect("test provider hints should succeed");
     assert!(
         plan.effects().iter().any(|e| matches!(
             e,
-            carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "r.cert_issued"
+            carina_core::effect::Effect::Wait { id, .. } if id.identity_str() == "r.cert_issued"
         )),
         "the value-layer alias fix must NOT remove the Effect::Wait \
          dependency edge — both halves of the wait binding must hold"

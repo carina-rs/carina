@@ -817,11 +817,9 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 .unwrap();
             }
             Effect::Wait {
-                identity,
-                until_surface,
-                ..
+                id, until_surface, ..
             } => {
-                let binding = identity.to_string();
+                let binding = id.identity_str();
                 writeln!(
                     self.out,
                     "{}{} {}",
@@ -2146,14 +2144,16 @@ pub fn format_effect<S>(effect: &Effect<S>) -> String {
             format!("Move {} -> {}", from.human(), to.human())
         }
         Effect::Wait {
-            identity,
-            until_surface,
-            ..
+            id, until_surface, ..
         } => {
-            let binding = identity.to_string();
+            let binding = id.identity_str();
             format!("Wait {} (until {})", binding, until_surface)
         }
-        Effect::DeferredCreate { id, template } => {
+        Effect::DeferredCreate {
+            id,
+            dependencies: _dependencies,
+            template,
+        } => {
             format!(
                 "Expand deferred for {} (waits on {})",
                 id.human(),

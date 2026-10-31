@@ -433,7 +433,7 @@ fn render_identity_literal(identity: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::path::Path;
 
     use carina_core::effect::{Effect, EffectGeneration};
@@ -508,9 +508,9 @@ mod tests {
             generation,
             directives: Directives::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
     }
 

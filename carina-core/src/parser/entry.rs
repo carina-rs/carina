@@ -28,7 +28,8 @@ use super::resolve::{
     finalize_provider_configs, resolve_provider_unresolved_attributes, resolve_resource_refs,
 };
 use crate::eval_value::{
-    EvalValue, EvalValueError, ParsedSinkValue, StructuralHandle, StructuralHandleMetadata,
+    EvalValue, EvalValueError, ParsedSinkValue, UnexpandedStructuralHandle,
+    UnexpandedStructuralHandleMetadata,
 };
 use crate::resource::{DataSource, LegacyLoopAddress, LoopKind, Resource, Value};
 use indexmap::IndexMap;
@@ -46,12 +47,12 @@ pub(crate) struct BindingSeed<'a> {
 pub(crate) enum SeedKind<'a> {
     Value {
         value: &'a Value,
-        structural_handles: Option<&'a StructuralHandleMetadata>,
+        structural_handles: Option<&'a UnexpandedStructuralHandleMetadata>,
     },
     ModuleParameter,
-    TypedStructural(&'a StructuralHandle),
+    TypedStructural(&'a UnexpandedStructuralHandle),
     Provisional,
-    StructuralAlias(&'a StructuralHandle),
+    StructuralAlias(&'a UnexpandedStructuralHandle),
 }
 
 /// Source span of a top-level declaration keyword.
@@ -91,7 +92,7 @@ impl<'a> BindingSeed<'a> {
     pub(crate) fn value_with_structural_handles(
         name: &'a str,
         value: &'a Value,
-        structural_handles: &'a StructuralHandleMetadata,
+        structural_handles: &'a UnexpandedStructuralHandleMetadata,
     ) -> Self {
         Self {
             name,
@@ -102,7 +103,7 @@ impl<'a> BindingSeed<'a> {
         }
     }
 
-    pub(crate) fn typed_structural(name: &'a str, handle: &'a StructuralHandle) -> Self {
+    pub(crate) fn typed_structural(name: &'a str, handle: &'a UnexpandedStructuralHandle) -> Self {
         Self {
             name,
             kind: SeedKind::TypedStructural(handle),
@@ -123,7 +124,7 @@ impl<'a> BindingSeed<'a> {
         }
     }
 
-    pub(crate) fn structural_alias(name: &'a str, handle: &'a StructuralHandle) -> Self {
+    pub(crate) fn structural_alias(name: &'a str, handle: &'a UnexpandedStructuralHandle) -> Self {
         Self {
             name,
             kind: SeedKind::StructuralAlias(handle),

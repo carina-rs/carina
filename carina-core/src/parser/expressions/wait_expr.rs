@@ -4,7 +4,8 @@
 //! design. The grammar piece lives in `carina.pest::wait_expr`.
 
 use super::primary::parse_duration_secs;
-use crate::parser::ast::{BindingName, UntilPredicateAst, WaitBinding};
+use crate::parser::ast::{BindingName, UnexpandedDependencies, UntilPredicateAst, WaitBinding};
+use crate::parser::context::ParseContext;
 use crate::parser::error::ParseError;
 use crate::parser::{Rule, first_inner};
 use crate::resource::{ConcreteValue, Value};
@@ -24,6 +25,7 @@ use pest::iterators::Pair;
 pub(crate) fn parse_wait_expr(
     pair: Pair<'_, Rule>,
     binding_name: &str,
+    ctx: &ParseContext<'_>,
 ) -> Result<WaitBinding, ParseError> {
     debug_assert_eq!(pair.as_rule(), Rule::wait_expr);
     let (line, _) = pair.as_span().start_pos().line_col();
@@ -39,7 +41,7 @@ pub(crate) fn parse_wait_expr(
     let mut until_predicate: Option<UntilPredicateAst> = None;
     let mut timeout_secs: Option<u64> = None;
     let mut timeout_seen = false;
-    let mut depends_on: Vec<String> = Vec::new();
+    let mut depends_on = Vec::new();
     let mut depends_on_seen = false;
 
     for attr_pair in inner {
@@ -89,10 +91,13 @@ pub(crate) fn parse_wait_expr(
                     });
                 }
                 depends_on_seen = true;
-                for ident in child.into_inner() {
-                    if ident.as_rule() == Rule::identifier {
-                        depends_on.push(ident.as_str().to_string());
-                    }
+                let list = first_inner(child, "list", "wait_depends_on_attr")?;
+                for expression in list.into_inner() {
+                    depends_on.push(super::dependency::parse_dependency_operand(
+                        expression,
+                        ctx,
+                        "wait.depends_on",
+                    )?);
                 }
             }
             other => {
@@ -118,7 +123,7 @@ pub(crate) fn parse_wait_expr(
         until_raw,
         until_predicate,
         timeout_secs,
-        depends_on: depends_on.into_iter().map(BindingName::from).collect(),
+        depends_on: UnexpandedDependencies::new(depends_on),
         line,
     })
 }
@@ -376,12 +381,18 @@ mod tests {
     use crate::parser::grammar::parse_rule_for_test;
     use crate::parser::preprocess_file;
 
+    fn parse_wait_pair(pair: Pair<'_, Rule>) -> Result<WaitBinding, ParseError> {
+        let config = crate::parser::ProviderContext::default();
+        let ctx = ParseContext::new(&config);
+        parse_wait_expr(pair, "cert_issued", &ctx)
+    }
+
     fn parse_one(src: &str) -> WaitBinding {
         let pair = parse_rule_for_test(Rule::wait_expr, src)
             .expect("pest should parse wait_expr")
             .next()
             .expect("at least one pair");
-        parse_wait_expr(pair, "cert_issued").expect("parse_wait_expr should succeed")
+        parse_wait_pair(pair).expect("parse_wait_expr should succeed")
     }
 
     #[test]
@@ -466,7 +477,7 @@ mod tests {
         let we = parse_one(
             "wait cert {\n    until = cert.status == ISSUED\n    depends_on = [a, b, c]\n}",
         );
-        assert_eq!(we.depends_on, vec!["a", "b", "c"]);
+        assert_eq!(we.depends_on.len(), 3);
     }
 
     #[test]
@@ -485,7 +496,7 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let err = parse_wait_expr(pair, "cert_issued").expect_err("missing until");
+        let err = parse_wait_pair(pair).expect_err("missing until");
         assert!(
             err.to_string().contains("until"),
             "error should mention `until`, got: {}",
@@ -502,7 +513,7 @@ mod tests {
         .unwrap()
         .next()
         .unwrap();
-        let err = parse_wait_expr(pair, "cert_issued").expect_err("duplicate until");
+        let err = parse_wait_pair(pair).expect_err("duplicate until");
         assert!(err.to_string().contains("duplicate"));
     }
 
@@ -515,7 +526,7 @@ mod tests {
         .unwrap()
         .next()
         .unwrap();
-        let err = parse_wait_expr(pair, "cert_issued").expect_err("cross-target");
+        let err = parse_wait_pair(pair).expect_err("cross-target");
         assert!(err.to_string().contains("must reference target"));
     }
 
@@ -528,7 +539,7 @@ mod tests {
         .unwrap()
         .next()
         .unwrap();
-        let err = parse_wait_expr(pair, "cert_issued").expect_err("bare binding");
+        let err = parse_wait_pair(pair).expect_err("bare binding");
         assert!(err.to_string().contains("attribute"));
     }
 
@@ -541,7 +552,7 @@ mod tests {
         .unwrap()
         .next()
         .unwrap();
-        let err = parse_wait_expr(pair, "cert_issued").expect_err("non-eq");
+        let err = parse_wait_pair(pair).expect_err("non-eq");
         assert!(err.to_string().contains("only `==` is supported"));
     }
 
@@ -554,7 +565,7 @@ mod tests {
         .unwrap()
         .next()
         .unwrap();
-        let err = parse_wait_expr(pair, "cert_issued").expect_err("&&");
+        let err = parse_wait_pair(pair).expect_err("&&");
         assert!(err.to_string().contains("boolean combinators"));
     }
 

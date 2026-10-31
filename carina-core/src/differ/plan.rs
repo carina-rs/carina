@@ -6,7 +6,6 @@ use crate::deps::get_resource_dependencies;
 
 use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
-use crate::parser::WaitBinding;
 use crate::plan::{
     CreateBeforeDestroyError, PermanentNameOverride, Plan, PlanError, PlanErrorKind,
     PreventDestroyAction, ReplacementCannotCoexistError, ReplacementDelete, ReplacementGroup,
@@ -14,16 +13,16 @@ use crate::plan::{
 };
 use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult};
 use crate::resource::{
-    ConcreteValue, Current, DataSource, Directives, PlanInputCurrent, ResolvedDataSource,
-    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
+    ConcreteValue, Current, Directives, PersistedDirectives, PlanInputCurrent, ResolvedDataSource,
+    ResolvedDependencies, ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
 };
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL,
     WAIT_DEFAULT_TIMEOUT,
 };
+use crate::wait::ResolvedWaitBinding;
 use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::resolve_wait_predicate;
-use crate::wait::{WaitTargetLookup, resolve_wait_target};
 
 use super::{PlanPriorStates, PresentDiff, diff_present};
 
@@ -34,7 +33,7 @@ pub(crate) struct PendingReplace {
     pub changed_create_only: ChangedCreateOnly,
     pub cascade_ref_hints: Vec<(String, String)>,
     pub temporary_name: Option<TemporaryName>,
-    pub consumer_updates: HashSet<ResourceIdentity>,
+    pub consumer_updates: ResolvedDependencies,
     pub previous_attributes: HashMap<String, Value>,
 }
 
@@ -308,14 +307,14 @@ pub fn generate_temporary_name(
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan(
     managed: &[ResolvedResource],
-    data_sources: &[DataSource],
+    data_sources: &[ResolvedDataSource],
     provider: &dyn Provider,
     prior_states: PlanPriorStates<'_>,
-    directives_map: &HashMap<ResourceId, Directives>,
+    directives_map: &HashMap<ResourceId, PersistedDirectives>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    wait_bindings: &[WaitBinding],
+    wait_bindings: &[ResolvedWaitBinding],
 ) -> ProviderResult<Plan> {
     let managed_current = prior_states.materialize_current_states(managed, registry);
     let mut build = create_plan_parts(
@@ -338,14 +337,14 @@ pub fn create_plan(
 pub fn create_plan_with_cascades(
     managed: &[ResolvedResource],
     unresolved_managed: &[ResolvedResource],
-    data_sources: &[DataSource],
+    data_sources: &[ResolvedDataSource],
     provider: &dyn Provider,
     prior_states: PlanPriorStates<'_>,
-    directives_map: &HashMap<ResourceId, Directives>,
+    directives_map: &HashMap<ResourceId, PersistedDirectives>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    wait_bindings: &[WaitBinding],
+    wait_bindings: &[ResolvedWaitBinding],
 ) -> ProviderResult<Plan> {
     let managed_current = prior_states.materialize_current_states(managed, registry);
     let mut build = create_plan_parts(
@@ -373,20 +372,20 @@ pub fn create_plan_with_cascades(
 
 struct PlanBuild {
     plan: Plan,
-    pending_replaces: HashMap<ResourceIdentity, PendingReplace>,
+    pending_replaces: HashMap<ResolvedResourceId, PendingReplace>,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn create_plan_parts(
     managed: &[ResolvedResource],
-    data_sources: &[DataSource],
+    data_sources: &[ResolvedDataSource],
     provider: &dyn Provider,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphans: &super::Orphans,
-    wait_bindings: &[WaitBinding],
+    wait_bindings: &[ResolvedWaitBinding],
 ) -> ProviderResult<PlanBuild> {
     let mut plan = Plan::new();
     let mut pending_replaces = HashMap::new();
@@ -398,7 +397,7 @@ fn create_plan_parts(
     // longer reachable from this loop (carina#3179).
     for ds in data_sources {
         plan.add(Effect::Read {
-            resource: ResolvedDataSource::new(ds.clone()),
+            resource: ds.clone(),
         });
     }
 
@@ -507,6 +506,7 @@ fn create_plan_parts(
                                 ));
                                 continue;
                             }
+                            let to = resource.replace_inner(to);
                             match pending_replace_from_parts(
                                 from,
                                 identifier,
@@ -517,8 +517,7 @@ fn create_plan_parts(
                                 registry,
                             ) {
                                 Ok(pending) => {
-                                    pending_replaces
-                                        .insert(resource_identity(&pending.create), pending);
+                                    pending_replaces.insert(pending.create.resolved_id(), pending);
                                 }
                                 Err(err) => plan.add_error(PlanError::new(id, err.into())),
                             }
@@ -526,7 +525,7 @@ fn create_plan_parts(
                             plan.add(Effect::Update {
                                 from,
                                 identifier,
-                                to: ResolvedResource::new(to),
+                                to: resource.replace_inner(to),
                                 changed_attributes,
                             });
                         }
@@ -569,7 +568,8 @@ fn create_plan_parts(
                 continue;
             }
         };
-        let directives = orphan.directives().clone();
+        let persisted_directives = orphan.directives().clone();
+        let directives: Directives = (&persisted_directives).into();
         if directives.prevent_destroy {
             plan.add_error(PlanError::prevent_destroy(
                 id.clone(),
@@ -578,8 +578,9 @@ fn create_plan_parts(
             continue;
         }
         let binding = orphan.binding().map(str::to_owned);
-        let dependencies = dependencies_from_prior_state(state, directives.clone());
-        let explicit_dependencies = directives.depends_on.iter().cloned().collect();
+        let explicit_dependencies = persisted_directives.depends_on;
+        let mut dependencies = state.dependency_bindings.clone();
+        dependencies.extend(explicit_dependencies.iter().cloned());
         plan.add(Effect::Delete {
             id: ResolvedResourceId::new(id.clone()),
             identifier,
@@ -588,50 +589,19 @@ fn create_plan_parts(
             binding,
             dependencies,
             explicit_dependencies,
-            blocked_by_updates: HashSet::new(),
+            blocked_by_updates: ResolvedDependencies::default(),
         });
     }
 
     // Lower each `wait` declaration into an `Effect::Wait`.
     //
-    // Target resolution: the parser has already pinned the target name;
-    // here we look it up in `desired` (the live resource set after
-    // `resolve_resource_refs`) to recover the resolved `ResourceId`. If
-    // the target is missing — typo, scoped-out binding, etc. — the
-    // wait is skipped with a plan-level error so downstream resources
-    // referencing the wait binding still fail loudly.
+    // Target and explicit dependencies crossed the fallible address
+    // resolution boundary before the differ.
     for wb in wait_bindings {
-        let target = match resolve_wait_target(wb.target.as_str(), managed, data_sources) {
-            WaitTargetLookup::Managed(target) => target,
-            WaitTargetLookup::DataSource => {
-                plan.add_error(PlanError::new(
-                    ResourceId::with_identity(
-                        "__wait",
-                        ResourceIdentity::new(wb.binding.to_string()),
-                    ),
-                    PlanErrorKind::WaitTargetIsDataSource {
-                        wait_binding: wb.binding.to_string(),
-                        target: wb.target.to_string(),
-                    },
-                ));
-                continue;
-            }
-            WaitTargetLookup::Missing => {
-                plan.add_error(PlanError::new(
-                    ResourceId::with_identity(
-                        "__wait",
-                        ResourceIdentity::new(wb.binding.to_string()),
-                    ),
-                    PlanErrorKind::WaitTargetMissing {
-                        wait_binding: wb.binding.to_string(),
-                        target: wb.target.to_string(),
-                    },
-                ));
-                continue;
-            }
-        };
+        let target = wb.target_id.clone();
         let target_id = target.id();
         let diagnostic_id = target_id.as_inner().clone();
+        let wait_binding = wb.id.identity_str();
 
         // Once the managed target is known, resolve the full nested attribute
         // path. The same function drives validation (and therefore LSP
@@ -652,7 +622,7 @@ fn create_plan_parts(
                 plan.add_error(PlanError::new(
                     diagnostic_id,
                     PlanErrorKind::WaitPredicateInvalid {
-                        wait_binding: wb.binding.to_string(),
+                        wait_binding: wait_binding.to_string(),
                         reason: error.to_string(),
                     },
                 ));
@@ -679,13 +649,13 @@ fn create_plan_parts(
         // produces the wait + its dependency edge (carina#3085 /
         // carina#3061 behavior preserved).
         let gates_a_pending_change = managed.iter().any(|m| {
-            get_resource_dependencies(m).contains(wb.binding.as_str())
+            m.value_dependencies().contains(&wb.id)
                 && plan
                     .effects()
                     .iter()
                     .any(|e| e.resource_id() == &m.id && e.is_mutating())
         }) || data_sources.iter().any(|d| {
-            crate::deps::get_data_source_dependencies(d).contains(wb.binding.as_str())
+            d.value_dependencies().contains(&wb.id)
                 && plan
                     .effects()
                     .iter()
@@ -740,11 +710,7 @@ fn create_plan_parts(
         if !wait_has_work {
             continue;
         }
-        let mut explicit_dependencies: HashSet<String> = wb
-            .depends_on
-            .iter()
-            .map(|d| d.as_str().to_string())
-            .collect();
+        let mut explicit_dependencies = wb.explicit_dependencies.clone();
         // Provider hints supplement user-authored ordering. They are additive
         // because `depends_on` is the user's source of truth and must never be
         // weakened by provider-derived knowledge.
@@ -756,7 +722,7 @@ fn create_plan_parts(
         )?);
 
         plan.add(Effect::Wait {
-            identity: ResourceIdentity::new(wb.binding.as_str()),
+            id: wb.id.clone(),
             target_id: target,
             until,
             until_surface: wb.until_raw.clone(),
@@ -794,20 +760,27 @@ fn create_plan_parts(
 /// Existing `blocked_by_updates` entries are preserved; this pass only adds missing inverse edges.
 pub fn block_deletes_on_prior_consumer_updates(
     plan: &mut Plan,
-    prior_directives: &HashMap<ResourceId, Directives>,
+    prior_directives: &HashMap<ResourceId, PersistedDirectives>,
 ) {
-    let consumers: Vec<(ResourceIdentity, HashSet<String>, HashSet<String>)> = plan
+    let consumers: Vec<(
+        ResolvedResourceId,
+        ResolvedDependencies,
+        ResolvedDependencies,
+    )> = plan
         .effects()
         .iter()
         .filter_map(|effect| match effect {
-            Effect::Update { from, to, .. } => Some((
-                resource_identity(to),
-                dependencies_from_prior_state(
-                    from,
-                    prior_directives.get(&from.id).cloned().unwrap_or_default(),
-                ),
-                get_resource_dependencies(to.as_resource()),
-            )),
+            Effect::Update { from, to, .. } => {
+                let mut prior_dependencies = from.dependency_bindings.clone();
+                if let Some(directives) = prior_directives.get(&from.id) {
+                    prior_dependencies.extend(directives.depends_on.iter().cloned());
+                }
+                Some((
+                    to.resolved_id(),
+                    prior_dependencies,
+                    to.all_dependencies().cloned().collect(),
+                ))
+            }
             _ => None,
         })
         .collect();
@@ -815,45 +788,29 @@ pub fn block_deletes_on_prior_consumer_updates(
     for effect in plan.effects_mut() {
         let Effect::Delete {
             id,
-            binding,
             blocked_by_updates,
             ..
         } = effect
         else {
             continue;
         };
-        let delete_identity = id.identity();
-        for (consumer_identity, prior_dependencies, desired_dependencies) in &consumers {
-            if consumer_identity == delete_identity {
+        for (consumer_id, prior_dependencies, desired_dependencies) in &consumers {
+            if consumer_id == id {
                 continue;
             }
-            let should_add_inverse_edge = binding.as_ref().is_some_and(|binding| {
-                prior_dependencies.contains(binding) && !desired_dependencies.contains(binding)
-            });
+            let should_add_inverse_edge =
+                prior_dependencies.contains(id) && !desired_dependencies.contains(id);
             if should_add_inverse_edge {
-                blocked_by_updates.insert(consumer_identity.clone());
+                blocked_by_updates.insert(consumer_id.clone());
             }
         }
     }
 }
 
-fn dependencies_from_prior_state(state: &State, directives: Directives) -> HashSet<String> {
-    state
-        .dependency_bindings
-        .iter()
-        .chain(&directives.depends_on)
-        .cloned()
-        .collect()
-}
-
-fn resource_identity(resource: &ResolvedResource) -> ResourceIdentity {
-    resource.identity().clone()
-}
-
 fn pending_replace_from_parts(
     from: Box<State>,
     identifier: crate::provider::AppliedIdentifier,
-    to: Resource,
+    to: ResolvedResource,
     directives: Directives,
     changed_create_only: ChangedCreateOnly,
     cascade_ref_hints: Vec<(String, String)>,
@@ -862,30 +819,35 @@ fn pending_replace_from_parts(
     let create_before_destroy = directives.create_before_destroy;
     let previous_attributes = from.attributes.clone();
     let temporary_name = if create_before_destroy {
-        temporary_name_for_cbd(&to, &from, registry)?
+        temporary_name_for_cbd(to.as_resource(), &from, registry)?
     } else {
         None
     };
+    let (to, value_dependencies, explicit_dependencies, value_dependency_reads) = to.into_parts();
     let create = apply_temporary_name(to, temporary_name.as_ref());
-    let dependencies = from.dependency_bindings.iter().cloned().collect();
-    let explicit_dependencies = directives.depends_on.iter().cloned().collect();
+    let dependencies = from.dependency_bindings.clone();
     let delete = ReplacementDelete {
         id: ResolvedResourceId::new(from.id.clone()),
         identifier,
         directives,
         binding: create.binding.clone(),
         dependencies,
-        explicit_dependencies,
+        explicit_dependencies: explicit_dependencies.clone(),
     };
 
     Ok(PendingReplace {
-        create: ResolvedResource::new(create),
+        create: ResolvedResource::from_resolved_parts_with_reads(
+            create,
+            value_dependencies,
+            explicit_dependencies.clone(),
+            value_dependency_reads,
+        ),
         delete,
         create_before_destroy,
         changed_create_only,
         cascade_ref_hints,
         temporary_name,
-        consumer_updates: HashSet::new(),
+        consumer_updates: ResolvedDependencies::default(),
         previous_attributes,
     })
 }
@@ -926,7 +888,7 @@ fn apply_temporary_name(
 
 fn decompose_replace_into_effects(
     plan: &mut Plan,
-    pending_replaces: HashMap<ResourceIdentity, PendingReplace>,
+    pending_replaces: HashMap<ResolvedResourceId, PendingReplace>,
 ) {
     let mut pending_replaces: Vec<_> = pending_replaces.into_values().collect();
     pending_replaces.sort_by_key(|pending| pending.create.id.to_string());
@@ -959,22 +921,28 @@ fn decompose_replace_into_effects(
 
 fn known_binding_names(
     managed: &[ResolvedResource],
-    data_sources: &[DataSource],
-) -> HashSet<String> {
+    data_sources: &[ResolvedDataSource],
+) -> HashMap<String, ResolvedResourceId> {
     managed
         .iter()
-        .filter_map(|resource| resource.binding.clone())
-        .chain(
-            data_sources
-                .iter()
-                .filter_map(|resource| resource.binding.clone()),
-        )
+        .filter_map(|resource| {
+            resource
+                .binding
+                .clone()
+                .map(|binding| (binding, resource.resolved_id()))
+        })
+        .chain(data_sources.iter().filter_map(|resource| {
+            resource
+                .binding
+                .clone()
+                .map(|binding| (binding, ResolvedResourceId::new(resource.id.clone())))
+        }))
         .collect()
 }
 
 fn cascade_dependent_updates(
     plan: &mut Plan,
-    pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
+    pending_replaces: &mut HashMap<ResolvedResourceId, PendingReplace>,
     unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
@@ -1002,7 +970,7 @@ fn cascade_dependent_updates(
 
 fn promote_referenced_replaces_to_cbd(
     plan: &mut Plan,
-    pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
+    pending_replaces: &mut HashMap<ResolvedResourceId, PendingReplace>,
     unresolved_managed: &[ResolvedResource],
     registry: &SchemaRegistry,
 ) {
@@ -1025,7 +993,7 @@ fn promote_referenced_replaces_to_cbd(
         }
     }
 
-    promote.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    promote.sort();
     promote.dedup();
 
     for identity in promote {
@@ -1048,7 +1016,8 @@ fn mark_pending_create_before_destroy(
         return Ok(());
     }
 
-    let mut create = pending.create.clone().into_inner();
+    let (mut create, value_dependencies, explicit_dependencies, value_dependency_reads) =
+        pending.create.clone().into_parts();
     create.directives.create_before_destroy = true;
     let from = State::existing(
         pending.delete.id.as_inner().clone(),
@@ -1057,7 +1026,12 @@ fn mark_pending_create_before_destroy(
     let temporary_name = temporary_name_for_cbd(&create, &from, registry)?;
     let create = apply_temporary_name(create, temporary_name.as_ref());
 
-    pending.create = ResolvedResource::new(create);
+    pending.create = ResolvedResource::from_resolved_parts_with_reads(
+        create,
+        value_dependencies,
+        explicit_dependencies,
+        value_dependency_reads,
+    );
     pending.create_before_destroy = true;
     pending.delete.directives.create_before_destroy = true;
     pending.temporary_name = temporary_name;
@@ -1066,7 +1040,7 @@ fn mark_pending_create_before_destroy(
 
 fn promote_pending_replaces_for_dependents(
     plan: &mut Plan,
-    pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
+    pending_replaces: &mut HashMap<ResolvedResourceId, PendingReplace>,
     unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
@@ -1075,7 +1049,7 @@ fn promote_pending_replaces_for_dependents(
     let mut promoted = false;
 
     for resource in unresolved_managed {
-        let consumer_identity = resource_identity(resource);
+        let consumer_identity = resource.resolved_id();
         let deps = get_resource_dependencies(resource);
 
         for dep in &deps {
@@ -1151,15 +1125,15 @@ fn promote_pending_replaces_for_dependents(
 }
 
 fn pending_reference_targets(
-    pending_replaces: &HashMap<ResourceIdentity, PendingReplace>,
+    pending_replaces: &HashMap<ResolvedResourceId, PendingReplace>,
     create_before_destroy_only: bool,
-) -> HashMap<String, ResourceIdentity> {
+) -> HashMap<String, ResolvedResourceId> {
     let mut targets = HashMap::new();
     for (identity, pending) in pending_replaces {
         if create_before_destroy_only && !pending.create_before_destroy {
             continue;
         }
-        targets.insert(identity.as_str().to_string(), identity.clone());
+        targets.insert(identity.identity_str().to_string(), identity.clone());
         if let Some(binding) = &pending.create.binding {
             targets.insert(binding.clone(), identity.clone());
         }
@@ -1186,7 +1160,7 @@ fn merge_pending_create_only(
 
 fn promote_resource_to_pending_replace(
     plan: &mut Plan,
-    resource: &Resource,
+    resource: &ResolvedResource,
     changed_create_only: ChangedCreateOnly,
     ref_hints: Vec<(String, String)>,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
@@ -1249,7 +1223,7 @@ fn take_update_from_plan(
 
 fn ensure_consumer_update(
     plan: &mut Plan,
-    resource: &Resource,
+    resource: &ResolvedResource,
     changed_attributes: &[String],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
 ) -> bool {
@@ -1264,7 +1238,7 @@ fn ensure_consumer_update(
             ..
         } = effect
         {
-            *to = ResolvedResource::new(resource.clone());
+            *to = resource.clone();
             for attr in changed_attributes {
                 if !existing.contains(attr) {
                     existing.push(attr.clone());
@@ -1301,7 +1275,7 @@ fn ensure_consumer_update(
     plan.add(Effect::Update {
         from: Box::new(from),
         identifier,
-        to: ResolvedResource::new(resource.clone()),
+        to: resource.clone(),
         changed_attributes: changed_attributes.to_vec(),
     });
     true
@@ -1329,12 +1303,13 @@ mod typed_current_identifier_tests {
     #[test]
     fn ensure_consumer_update_uses_identifier_carried_by_present_current() {
         let resource = Resource::with_provider("mock", "test.Resource", "consumer", None);
+        let resolved = ResolvedResource::new(resource.clone());
         let current = current_with_authoritative_identifier(&resource);
         let mut plan = Plan::new();
 
         assert!(ensure_consumer_update(
             &mut plan,
-            &resource,
+            &resolved,
             &["input".to_string()],
             &current,
         ));
@@ -1358,12 +1333,13 @@ mod typed_current_identifier_tests {
     #[test]
     fn pending_replace_promotion_uses_identifier_carried_by_present_current() {
         let resource = Resource::with_provider("mock", "test.Resource", "consumer", None);
+        let resolved = ResolvedResource::new(resource.clone());
         let current = current_with_authoritative_identifier(&resource);
         let mut plan = Plan::new();
 
         let pending = promote_resource_to_pending_replace(
             &mut plan,
-            &resource,
+            &resolved,
             ChangedCreateOnly::new(vec!["input".to_string()]).expect("non-empty change set"),
             Vec::new(),
             &current,

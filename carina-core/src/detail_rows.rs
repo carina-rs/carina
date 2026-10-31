@@ -2323,8 +2323,6 @@ mod tests {
     use crate::parser::ProviderConfig;
     use crate::plan::{ReplaceDisplayMetadata, SavedPlan};
     use crate::resource::{ResolvedResource, Resource, ResourceId, State};
-    use std::collections::HashSet;
-
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
     }
@@ -2780,9 +2778,9 @@ mod tests {
             generation: EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.replace_display_mut().push(ReplaceDisplayMetadata {
             create_idx: 0,
@@ -2995,9 +2993,9 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: std::collections::HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
@@ -3023,9 +3021,9 @@ mod tests {
             generation: EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
 
         let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
@@ -3097,9 +3095,9 @@ mod tests {
             generation: EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.replace_display_mut().push(ReplaceDisplayMetadata {
             create_idx: 0,
@@ -3151,9 +3149,9 @@ mod tests {
             generation: EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
             directives: Default::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.replace_display_mut().push(ReplaceDisplayMetadata {
             create_idx: 0,
@@ -3744,9 +3742,9 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: std::collections::HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let mut tags = IndexMap::new();
         tags.insert(
@@ -3792,9 +3790,9 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: std::collections::HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let mut entry = IndexMap::new();
         entry.insert(

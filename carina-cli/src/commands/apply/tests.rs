@@ -9,7 +9,7 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     DataSource, DeferredValue, LiveComposition, LiveCompositionArgument, LiveCompositionSignature,
-    ModuleConstraintId, PendingModuleConstraint, ResolvedDataSource, ResolvedResource, Resource,
+    ModuleConstraintId, PendingModuleConstraint, ResolvedResource, ResolvedResourceId, Resource,
     ResourceId, ResourceIdentity,
 };
 use carina_core::schema::{
@@ -430,6 +430,7 @@ for account_id in orgs.accounts {
             "bound_pending",
             None,
         )),
+        dependencies: Default::default(),
         template: Box::new(bound),
     });
     plan.add(Effect::DeferredCreate {
@@ -439,6 +440,7 @@ for account_id in orgs.accounts {
             "unbound_pending",
             None,
         )),
+        dependencies: Default::default(),
         template: Box::new(unbound),
     });
 
@@ -2484,7 +2486,11 @@ fn seed_apply_cascade_state(
         .with_attribute("vpc_id", serde_json::json!("vpc-old"))
         .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
         .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
-        subnet_state.dependency_bindings.insert("vpc".to_string());
+        subnet_state
+            .dependency_bindings
+            .insert(ResolvedResourceId::with_provider_identity(
+                "awscc", "ec2.Vpc", "vpc", None,
+            ));
         state_file
             .upsert_resource(subnet_state)
             .expect("test state setup must be valid");
@@ -2511,7 +2517,7 @@ fn seed_apply_cascade_state_with_deposed(
                 ("cidr_block".to_string(), serde_json::json!("10.220.0.0/16")),
                 ("vpc_id".to_string(), serde_json::json!(identifier)),
             ]),
-            BTreeSet::new(),
+            Default::default(),
         ));
     }
 
@@ -3332,16 +3338,31 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         }),
     );
 
+    let mut parsed = carina_core::parser::ParsedFile::default();
+    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph(
+        &mut parsed,
+        &[target.clone(), consumer.clone()],
+        std::slice::from_ref(&lookup),
+    )
+    .expect("saved-plan fixture dependencies must resolve");
+    let schemas = SchemaRegistry::new();
+
     let mut plan = Plan::new();
-    plan.add(carina_core::effect::Effect::Create(resolved(
-        target.clone(),
-    )));
+    plan.add(carina_core::effect::Effect::Create(
+        expanded_graph
+            .resolve_resource(target.clone(), &schemas)
+            .expect("target graph metadata must resolve"),
+    ));
     plan.add(carina_core::effect::Effect::Read {
-        resource: ResolvedDataSource::new(lookup.clone()),
+        resource: expanded_graph
+            .resolve_data_source(lookup.clone())
+            .expect("lookup graph metadata must resolve"),
     });
-    plan.add(carina_core::effect::Effect::Create(resolved(
-        consumer.clone(),
-    )));
+    plan.add(carina_core::effect::Effect::Create(
+        expanded_graph
+            .resolve_resource(consumer.clone(), &schemas)
+            .expect("consumer graph metadata must resolve"),
+    ));
 
     let provider_configs = saved_provider_configs(vec![ProviderConfig {
         name: "mock".to_string(),
@@ -3474,6 +3495,25 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
     );
     consumer.dependency_bindings.insert("producer".to_string());
     let consumer_id = consumer.id.clone();
+    let mut consumer_for_effect = consumer.clone();
+    consumer_for_effect.dependency_bindings.clear();
+    let consumer_for_sorted = consumer_for_effect.clone();
+    let consumer_for_unresolved = consumer_for_effect.clone();
+    let resolved_consumer = ResolvedResource::from_resolved_parts(
+        consumer_for_effect,
+        [ResolvedResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            producer_id
+                .identity()
+                .expect("resolved producer identity")
+                .clone(),
+            None,
+        )]
+        .into_iter()
+        .collect(),
+        Default::default(),
+    );
 
     let composition = saved_module_composition(
         Value::resource_ref("producer", "identifier", vec![]),
@@ -3488,9 +3528,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
     plan.add(carina_core::effect::Effect::Create(resolved(
         producer.clone(),
     )));
-    plan.add(carina_core::effect::Effect::Create(resolved(
-        consumer.clone(),
-    )));
+    plan.add(carina_core::effect::Effect::Create(resolved_consumer));
     let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
@@ -3510,8 +3548,8 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         }]),
         backend_config: None,
         plan,
-        sorted_resources: vec![producer.clone(), consumer.clone()],
-        unresolved_resources: vec![producer, consumer],
+        sorted_resources: vec![producer.clone(), consumer_for_sorted],
+        unresolved_resources: vec![producer, consumer_for_unresolved],
         compositions: vec![saved_composition],
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
@@ -4834,7 +4872,11 @@ awscc.ec2.Subnet {{
     .with_attribute("vpc_id", serde_json::json!("vpc-old"))
     .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
     .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
-    subnet_state.dependency_bindings.insert("vpc".to_string());
+    subnet_state
+        .dependency_bindings
+        .insert(ResolvedResourceId::with_provider_identity(
+            "awscc", "ec2.Vpc", "vpc", None,
+        ));
 
     let mut state_file = carina_state::StateFile::new();
     state_file

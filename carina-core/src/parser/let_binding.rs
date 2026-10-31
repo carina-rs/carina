@@ -22,7 +22,7 @@ use super::expressions::wait_expr::parse_wait_expr;
 use super::grammar::PreprocessedFile;
 use super::parse_expression_eval;
 use super::util::eval_type_name;
-use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
+use crate::eval_value::{EvalValue, UnexpandedStructuralHandle, UnexpandedStructuralHandleKind};
 use crate::resource::{DataSource, Resource};
 
 /// Tuple returned by the let-binding parser. The RHS is `EvalValue`
@@ -57,50 +57,50 @@ pub(crate) fn structural_handle(
     binding_name: &str,
     resource_type: super::ast::ResourceTypePath,
 ) -> EvalValue {
-    EvalValue::structural_handle(StructuralHandle::new(
-        StructuralHandleKind::Resource(resource_type),
+    EvalValue::structural_handle(UnexpandedStructuralHandle::new(
+        UnexpandedStructuralHandleKind::Resource(resource_type),
         binding_name,
     ))
 }
 
 pub(crate) fn for_structural_handle(binding_name: &str) -> EvalValue {
-    EvalValue::structural_handle(StructuralHandle::new(
-        StructuralHandleKind::For,
+    EvalValue::structural_handle(UnexpandedStructuralHandle::new(
+        UnexpandedStructuralHandleKind::For,
         binding_name,
     ))
 }
 
 fn upstream_state_structural_handle(binding_name: &str) -> EvalValue {
-    EvalValue::structural_handle(StructuralHandle::new(
-        StructuralHandleKind::UpstreamState,
+    EvalValue::structural_handle(UnexpandedStructuralHandle::new(
+        UnexpandedStructuralHandleKind::UpstreamState,
         binding_name,
     ))
 }
 
 fn provider_structural_handle(binding_name: &str) -> EvalValue {
-    EvalValue::structural_handle(StructuralHandle::new(
-        StructuralHandleKind::Provider,
+    EvalValue::structural_handle(UnexpandedStructuralHandle::new(
+        UnexpandedStructuralHandleKind::Provider,
         binding_name,
     ))
 }
 
 fn wait_structural_handle(binding_name: &str) -> EvalValue {
-    EvalValue::structural_handle(StructuralHandle::new(
-        StructuralHandleKind::Wait,
+    EvalValue::structural_handle(UnexpandedStructuralHandle::new(
+        UnexpandedStructuralHandleKind::Wait,
         binding_name,
     ))
 }
 
 pub(crate) fn if_structural_handle(binding_name: &str) -> EvalValue {
-    EvalValue::structural_handle(StructuralHandle::new(
-        StructuralHandleKind::If,
+    EvalValue::structural_handle(UnexpandedStructuralHandle::new(
+        UnexpandedStructuralHandleKind::If,
         binding_name,
     ))
 }
 
 pub(crate) fn module_structural_handle(binding_name: &str) -> EvalValue {
-    EvalValue::structural_handle(StructuralHandle::new(
-        StructuralHandleKind::Module,
+    EvalValue::structural_handle(UnexpandedStructuralHandle::new(
+        UnexpandedStructuralHandleKind::Module,
         binding_name,
     ))
 }
@@ -142,8 +142,10 @@ pub(super) fn parse_let_binding_extended(
     // else it is a parse error.
     if rhs_pair.as_rule() == Rule::use_expr {
         let use_stmt = parse_use_expr(rhs_pair, &name, ctx, source_span, source_file)?;
-        let value =
-            EvalValue::structural_handle(StructuralHandle::new(StructuralHandleKind::Use, &name));
+        let value = EvalValue::structural_handle(UnexpandedStructuralHandle::new(
+            UnexpandedStructuralHandleKind::Use,
+            &name,
+        ));
         return Ok((
             name,
             value,
@@ -449,7 +451,7 @@ fn parse_primary_with_resource_or_module(
         }
         Rule::wait_expr => {
             let (line, _) = inner.as_span().start_pos().line_col();
-            let wb = parse_wait_expr(inner, binding_name)?;
+            let wb = parse_wait_expr(inner, binding_name, ctx)?;
             if ctx.wait_bindings.contains_key(wb.binding.as_str()) {
                 return Err(ParseError::DuplicateBinding {
                     name: wb.binding.into_string(),

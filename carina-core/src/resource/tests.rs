@@ -1,6 +1,33 @@
 use super::*;
 use crate::explicit::ExplicitFields;
-use crate::parser::SourceSpan;
+use crate::parser::{BindingName, SourceSpan, UnexpandedDependencies, UnexpandedDependencyOperand};
+
+#[test]
+fn resolved_dependency_reads_use_typed_json_entries_and_round_trip() {
+    let id = ResolvedResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "producer.record",
+        Some("secondary".to_string()),
+    );
+    let mut reads = ResolvedDependencyReads::default();
+    reads.insert_known(id.clone(), "comment");
+
+    let encoded = serde_json::to_value(&reads).expect("serialize typed dependency reads");
+    assert!(
+        encoded.is_array(),
+        "dependency reads must not use object keys"
+    );
+    assert_eq!(encoded[0]["id"]["identity"], "producer.record");
+    assert_eq!(encoded[0]["id"]["provider_instance"], "secondary");
+    let decoded: ResolvedDependencyReads =
+        serde_json::from_value(encoded).expect("deserialize typed dependency reads");
+    assert_eq!(decoded, reads);
+    assert_eq!(
+        decoded.known_attributes(&id),
+        Some(&BTreeSet::from(["comment".to_string()]))
+    );
+}
 
 #[test]
 fn module_argument_source_location_is_not_value_data() {
@@ -674,18 +701,57 @@ fn directives_serde_default() {
 #[test]
 fn directives_depends_on_defaults_to_empty() {
     let d = Directives::default();
-    assert_eq!(d.depends_on, Vec::<String>::new());
+    assert!(d.depends_on.is_empty());
 }
 
 #[test]
-fn directives_depends_on_round_trips_serde() {
+fn directives_depends_on_is_parser_only_and_does_not_serialize() {
     let d = Directives {
-        depends_on: vec!["role".to_string(), "key".to_string()],
+        depends_on: UnexpandedDependencies::new(vec![
+            UnexpandedDependencyOperand::BareBinding(BindingName::from("role")),
+            UnexpandedDependencyOperand::BareBinding(BindingName::from("key")),
+        ]),
         ..Directives::default()
     };
     let json = serde_json::to_string(&d).unwrap();
     let back: Directives = serde_json::from_str(&json).unwrap();
-    assert_eq!(back.depends_on, d.depends_on);
+    assert!(back.depends_on.is_empty());
+    assert!(!json.contains("role") && !json.contains("key"));
+}
+
+#[test]
+fn provider_normalization_boundary_strips_then_restores_host_dependencies() {
+    let mut resource = Resource::new("test.resource", "consumer");
+    resource
+        .dependency_bindings
+        .insert("value_source".to_string());
+    resource.directives.depends_on =
+        UnexpandedDependencies::new(vec![UnexpandedDependencyOperand::BareBinding(
+            BindingName::from("explicit_source"),
+        )]);
+
+    let mut provider = resource.clone().into_provider_resource();
+    assert!(provider.dependency_bindings.is_empty());
+    assert!(provider.directives.depends_on.is_empty());
+
+    provider.attributes.insert(
+        "normalized".to_string(),
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+    resource.apply_provider_resource(provider);
+
+    assert_eq!(
+        resource.dependency_bindings,
+        BTreeSet::from(["value_source".to_string()]),
+    );
+    assert_eq!(
+        resource.directives.depends_on.diagnostic_references(),
+        ["explicit_source"],
+    );
+    assert_eq!(
+        resource.attributes.get("normalized"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true))),
+    );
 }
 
 #[test]
@@ -707,7 +773,7 @@ fn directives_depends_on_deserialises_from_legacy_json_without_field() {
     let legacy =
         r#"{ "force_delete": false, "create_before_destroy": false, "prevent_destroy": false }"#;
     let d: Directives = serde_json::from_str(legacy).unwrap();
-    assert_eq!(d.depends_on, Vec::<String>::new());
+    assert!(d.depends_on.is_empty());
 }
 
 #[test]
@@ -2415,8 +2481,9 @@ fn resource_dependency_bindings_iteration_is_sorted() {
 #[test]
 fn state_dependency_bindings_dedup_on_duplicate_insert() {
     let mut state = State::not_found(ResourceId::with_identity("ec2.Subnet", "my-subnet"));
-    state.dependency_bindings.insert("vpc".to_string());
-    state.dependency_bindings.insert("vpc".to_string());
+    let dependency = ResolvedResourceId::with_identity("ec2.Vpc", "vpc");
+    state.dependency_bindings.insert(dependency.clone());
+    state.dependency_bindings.insert(dependency);
     assert_eq!(state.dependency_bindings.len(), 1);
 }
 

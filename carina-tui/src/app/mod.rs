@@ -919,11 +919,9 @@ fn effect_to_node(
             parent: None,
         },
         Effect::Wait {
-            identity,
-            until_surface,
-            ..
+            id, until_surface, ..
         } => {
-            let binding = identity.to_string();
+            let binding = id.identity_str().to_string();
             TreeNode {
                 effect_label: format!("{} (until {})", binding, until_surface),
                 resource_type: "wait".to_string(),

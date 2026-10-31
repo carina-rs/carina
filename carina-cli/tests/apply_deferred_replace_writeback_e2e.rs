@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -15,7 +15,8 @@ use carina_core::parser::{
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
 use carina_core::resource::{
-    ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, State, Value,
+    ConcreteValue, Directives, ResolvedDependencies, ResolvedResource, ResolvedResourceId,
+    Resource, ResourceId, State, Value,
 };
 use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile, check_and_migrate};
 use indexmap::IndexMap;
@@ -231,6 +232,8 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(lb.clone())));
     plan.add(Effect::Create(resolved(cert.clone())));
+    let deferred_dependencies =
+        ResolvedDependencies::from_iter([ResolvedResourceId::new(cert.id.clone())]);
     plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: carina_core::resource::ResolvedResourceId::new(validation_id.clone()),
@@ -238,15 +241,16 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
                 .expect("fixture identifier is non-empty"),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::from(["cert".to_string()]),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: deferred_dependencies.clone(),
+            explicit_dependencies: ResolvedDependencies::default(),
+            blocked_by_updates: ResolvedDependencies::default(),
         }])
         .expect("fixture has one delete"),
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "__deferred_for",
             "validation_records",
         )),
+        dependencies: deferred_dependencies,
         template: Box::new(template),
     })));
     plan.add(Effect::Create(resolved(alias.clone())));
@@ -343,7 +347,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
             ("name".to_string(), serde_json::json!("main-old")),
             ("status".to_string(), serde_json::json!("STALE")),
         ]),
-        std::collections::BTreeSet::new(),
+        ResolvedDependencies::default(),
     ));
     state
         .upsert_resource(row)
@@ -373,9 +377,9 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         generation: EffectGeneration::Deposed(deposed_key),
         directives: Directives::default(),
         binding: Some("main".to_string()),
-        dependencies: HashSet::new(),
-        explicit_dependencies: HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: ResolvedDependencies::default(),
+        explicit_dependencies: ResolvedDependencies::default(),
+        blocked_by_updates: ResolvedDependencies::default(),
     });
     let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,

@@ -750,6 +750,46 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
 }
 
 #[test]
+fn module_handle_dependency_does_not_change_anonymous_identity_hash() {
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("name", AttributeType::string())
+            .create_only()
+            .build(),
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+
+    let resource = || {
+        let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+        resource.set_attr("name".to_string(), concrete_string("anonymous-dependent"));
+        resource
+    };
+    let mut without_dependency = vec![resource()];
+    let mut with_dependency = vec![resource()];
+    with_dependency[0].directives.depends_on = crate::parser::UnexpandedDependencies::new(vec![
+        crate::parser::UnexpandedDependencyOperand::AttributeSelection {
+            binding: crate::parser::BindingName::from("producer"),
+            attribute: "validation_record".to_string(),
+        },
+    ]);
+
+    compute_anonymous_identifiers_for_test(&mut without_dependency, &[], &registry, &|_| {
+        Vec::new()
+    })
+    .expect("identity without a handle dependency");
+    compute_anonymous_identifiers_for_test(&mut with_dependency, &[], &registry, &|_| Vec::new())
+        .expect("identity with a module handle dependency");
+
+    assert_eq!(
+        with_dependency[0].id, without_dependency[0].id,
+        "dependency capabilities are graph metadata, never identity-hash input",
+    );
+}
+
+#[test]
 fn distinct_diagnostic_sensitive_strings_produce_distinct_anonymous_identities() {
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("name", AttributeType::string())

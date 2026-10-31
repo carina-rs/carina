@@ -683,7 +683,8 @@ fn fully_qualified_shape_keeps_bound_value_head_semantics_in_every_value_positio
             .export_params
             .iter()
             .find(|export| export.name == "exported")
-            .and_then(|export| export.value.as_ref()),
+            .and_then(|export| export.value.as_ref())
+            .and_then(BoundaryExpression::value),
         Some(&expected),
     );
     assert_eq!(parsed.resources[0].get_attr("name"), Some(&expected),);
@@ -736,7 +737,8 @@ fn fully_qualified_shape_keeps_bound_structural_head_semantics_in_every_value_po
                 .export_params
                 .iter()
                 .find(|export| export.name == "exported")
-                .and_then(|export| export.value.as_ref()),
+                .and_then(|export| export.value.as_ref())
+                .and_then(BoundaryExpression::value),
             Some(&expected),
         );
         assert_eq!(
@@ -12140,7 +12142,7 @@ fn parse_directory_preserves_export_param_dotted_string_literal() {
         .expect("domain export present");
 
     assert_eq!(
-        export.value.as_ref(),
+        export.value.as_ref().and_then(BoundaryExpression::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "publish.example.com".into()
         )))
@@ -12204,7 +12206,7 @@ fn parse_preserves_attribute_param_default_dotted_string_literal() {
         .expect("domain attribute param present");
 
     assert_eq!(
-        attr.value.as_ref(),
+        attr.value.as_ref().and_then(BoundaryExpression::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "publish.example.com".into()
         )))
@@ -12891,7 +12893,7 @@ fn extract_directives_reads_depends_on_list() {
         .find(|r| r.id.identity_str().expect("resolved identity") == "bucket")
         .expect("bucket binding");
     assert_eq!(
-        bucket.directives.depends_on,
+        bucket.directives.depends_on.diagnostic_references(),
         vec!["role".to_string(), "key".to_string()]
     );
 }
@@ -13226,7 +13228,7 @@ fn extract_directives_depends_on_in_for_loop_resource() {
         .expect("for expression present")
         .template_resource;
     assert_eq!(
-        template.directives.depends_on,
+        template.directives.depends_on.diagnostic_references(),
         vec!["role".to_string()],
         "for-body resource template should carry directives.depends_on"
     );
@@ -14417,6 +14419,7 @@ fn postfix_index_on_sibling_let_bound_computed_value_is_directory_scoped() {
         .iter()
         .find(|export| export.name == "account_id")
         .and_then(|export| export.value.as_ref())
+        .and_then(BoundaryExpression::value)
         .expect("account_id export value");
 
     assert!(matches!(
@@ -14741,27 +14744,51 @@ fn assert_bare_handle_is_pending_for_typed_resource_value(source: &str, binding:
 }
 
 #[test]
-fn bare_resource_handle_is_rejected_in_untyped_value_positions() {
+fn bare_resource_handle_is_rejected_in_runtime_value_positions() {
     for source in [
         r#"let vpc = mock.test.Thing { name = "source" }
 let values = [vpc, "ok"]"#,
         r#"let vpc = mock.test.Thing { name = "source" }
 let values = { primary = vpc }"#,
         r#"let vpc = mock.test.Thing { name = "source" }
-exports { handle: String = vpc }"#,
-        r#"let vpc = mock.test.Thing { name = "source" }
-exports { handle = vpc }"#,
-        r#"let vpc = mock.test.Thing { name = "source" }
 let rendered = "prefix-${vpc}""#,
         r#"let vpc = mock.test.Thing { name = "source" }
 mock.test.Consumer { name = "prefix-${vpc}" }"#,
         r#"let vpc = mock.test.Thing { name = "source" }
 mock.test.Consumer { name = upper(vpc) }"#,
-        r#"let vpc = mock.test.Thing { name = "source" }
-attributes { handle: String = vpc }"#,
     ] {
         assert_bare_handle_error(source, "vpc", "a resource");
     }
+}
+
+#[test]
+fn boundary_blocks_preserve_bare_resource_handles_for_typed_validation() {
+    let parsed = parse(
+        r#"let vpc = mock.test.Thing { name = "source" }
+attributes { output = vpc }
+exports { exported = vpc }"#,
+        &ProviderContext::default(),
+    )
+    .expect("boundary blocks retain structural handles until validation");
+
+    assert_eq!(
+        parsed.attribute_params[0]
+            .value
+            .as_ref()
+            .and_then(crate::parser::BoundaryExpression::handle)
+            .map(|handle| handle.diagnostic_name())
+            .as_deref(),
+        Some("vpc"),
+    );
+    assert_eq!(
+        parsed.export_params[0]
+            .value
+            .as_ref()
+            .and_then(crate::parser::BoundaryExpression::handle)
+            .map(|handle| handle.diagnostic_name())
+            .as_deref(),
+        Some("vpc"),
+    );
 }
 
 #[test]
@@ -15292,7 +15319,10 @@ let us = provider mock {}
         .iter()
         .find(|resource| resource.binding.as_deref() == Some("consumer"))
         .expect("consumer");
-    assert_eq!(consumer.directives.depends_on, vec!["dependency"]);
+    assert_eq!(
+        consumer.directives.depends_on.diagnostic_references(),
+        vec!["dependency"]
+    );
     assert_eq!(consumer.directives.provider_instance.as_deref(), Some("us"));
 }
 
@@ -15320,6 +15350,42 @@ let consumer = mock.test.Consumer {
         "unexpected error: {message}"
     );
     assert!(message.contains("line 5"), "unexpected error: {message}");
+}
+
+#[test]
+fn dependency_boundaries_reject_a_string_module_argument_with_the_same_message() {
+    for (boundary, source) in [
+        (
+            "directives.depends_on",
+            r#"
+arguments { dependency: String }
+let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives { depends_on = [dependency] }
+}
+"#,
+        ),
+        (
+            "wait.depends_on",
+            r#"
+arguments { dependency: String }
+let target = mock.test.Thing { name = "target" }
+let ready = wait target {
+  until = target.name == "ready"
+  depends_on = [dependency]
+}
+"#,
+        ),
+    ] {
+        let error = parse(source, &ProviderContext::default())
+            .expect_err("a value-typed module argument is not a dependency handle");
+        assert!(
+            error.to_string().contains(&format!(
+                "{boundary}: expected a managed resource handle; got String"
+            )),
+            "unexpected {boundary} error: {error}",
+        );
+    }
 }
 
 #[test]
@@ -15451,6 +15517,7 @@ fn postfix_access_preserves_sibling_deferred_for_binding_as_resource_address() {
             .iter()
             .find(|export| export.name == name)
             .and_then(|export| export.value.as_ref())
+            .and_then(BoundaryExpression::value)
             .unwrap()
     };
     assert_eq!(value("role_grouped"), value("role_name"));
@@ -15942,6 +16009,7 @@ fn deferred_user_calls_share_the_root_lexical_scope() {
             .iter()
             .find(|parameter| parameter.name == name)
             .and_then(|parameter| parameter.value.as_ref())
+            .and_then(BoundaryExpression::value)
             .unwrap_or_else(|| panic!("missing attribute {name}"));
         let Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,

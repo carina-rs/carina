@@ -3,7 +3,11 @@ title: Expressions
 description: For loops, if/else conditionals, let bindings, wait, pipe and compose operators, and function definitions in the Carina DSL.
 ---
 
-Expressions in the Carina DSL produce values. They can appear as attribute values, function arguments, or in any context where a value is expected. Resource and module declarations instead produce structural handles; select an attribute or module output before using one as a value.
+Expressions in the Carina DSL normally produce values. They can appear as
+attribute values, function arguments, or in any context where a value is
+expected. Resource and module declarations instead produce structural
+handles. A module output can preserve a resource handle; select a resource
+attribute from that output before using it as a value.
 
 ## For Expression
 
@@ -158,10 +162,23 @@ let cert_issued = wait cert {
 | Field | Required | Meaning |
 |-------|----------|---------|
 | `until` | yes | Condition polled against the target, in the form `<target>.<attribute> == <value>` |
-| `depends_on` | no | Bindings that must complete before polling starts |
+| `depends_on` | no | Managed-resource handles that must complete before polling starts |
 | `timeout` | no | A [duration](/reference/dsl/types-and-values/#duration); defaults to the target schema's wait timeout, or 5 minutes |
 
 Attributes read through the wait binding (`cert_issued.certificate_arn`) are the target's attributes, but a resource that references them is not created until the wait succeeds. Reference the target directly (`cert.certificate_arn`) to skip the wait. A wait is not stored in state.
+
+`depends_on` accepts local handles and resource-handle module outputs. For
+example, a consumer module can declare
+`validation_record: aws.route53.RecordSet` and use
+`depends_on = [validation_record]`; its caller may pass
+`producer.validation_record` from another module. Carina resolves that operand
+to the producer resource's complete, instance-qualified address before
+planning. Values, resource attributes, data sources, and a module call itself
+are not dependency handles.
+
+A dependency adds ordering, not value flow. If the referenced resource is
+unchanged, the wait and its downstream values remain known and unchanged. If
+that resource changes, the wait is ordered after its effect.
 
 ## Let Binding
 

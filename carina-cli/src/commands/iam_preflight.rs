@@ -965,6 +965,7 @@ mod tests {
                 "__deferred_for",
                 "validation_records",
             )),
+            dependencies: Default::default(),
             template: Box::new(DeferredForExpression {
                 file: None,
                 line: 1,
@@ -1011,6 +1012,7 @@ mod tests {
                 "__deferred_for",
                 "validation_records",
             )),
+            dependencies: Default::default(),
             template: Box::new(DeferredForExpression {
                 file: None,
                 line: 1,

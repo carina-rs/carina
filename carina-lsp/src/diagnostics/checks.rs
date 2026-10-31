@@ -11,7 +11,7 @@ use carina_core::binding_index::{
 };
 use carina_core::config_loader::{DeclarationKind, DirectoryParseResult, DuplicateDeclaration};
 use carina_core::parser::{
-    AttributeParameter, ModuleCall, ParsedExportParam, ParsedFile, SourceSpan,
+    AttributeParameter, ExportParamLike, ModuleCall, ParsedExportParam, ParsedFile, SourceSpan,
     TopLevelBlockSourceSpan, TypeExpr,
 };
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
@@ -324,7 +324,9 @@ impl SemanticLookup for AttributeParameter {
     }
 
     fn value(&self) -> Option<&Value> {
-        self.value.as_ref()
+        self.value
+            .as_ref()
+            .and_then(carina_core::parser::BoundaryExpression::value)
     }
 }
 
@@ -338,7 +340,9 @@ impl SemanticLookup for ParsedExportParam {
     }
 
     fn value(&self) -> Option<&Value> {
-        self.value.as_ref()
+        self.value
+            .as_ref()
+            .and_then(carina_core::parser::BoundaryExpression::value)
     }
 }
 
@@ -2225,7 +2229,11 @@ impl DiagnosticEngine {
             .collect::<Vec<_>>();
 
         for attr_param in &parsed.attribute_params {
-            if let Some(value) = &attr_param.value {
+            if let Some(value) = attr_param
+                .value
+                .as_ref()
+                .and_then(carina_core::parser::BoundaryExpression::value)
+            {
                 // Check for undefined binding references in parser-native shapes
                 // (`Value::Deferred(DeferredValue::ResourceRef)` for `name.attr`, `Value::Deferred(DeferredValue::BindingRef)`
                 // for bare `name`, since #2847).
@@ -2446,7 +2454,7 @@ impl DiagnosticEngine {
                         continue;
                     };
                     fallback = param.clone();
-                    fallback.value = Some(value.clone());
+                    fallback.value = Some(value.clone().into());
                     &fallback
                 }
             };
@@ -2537,6 +2545,32 @@ impl DiagnosticEngine {
         } else {
             self.infer_export_params_without_loaded_provider_schemas(inference_input)
         };
+        let mut boundary_export_params = inferred_export_params.parameters().to_vec();
+        for parameter in &mut boundary_export_params {
+            let Some(type_expr) = parameter.type_expr_opt_mut() else {
+                continue;
+            };
+            if let Ok(resolved) =
+                carina_core::validation::resolve_type_expr(type_expr, &self.provider_context)
+            {
+                *type_expr = resolved;
+            }
+        }
+        if let Err(handle_errors) =
+            carina_core::validation::validate_export_handle_boundaries(&boundary_export_params)
+        {
+            for error_msg in handle_errors.split('\n') {
+                if let Some((line, col)) = self.find_ref_error_position(doc, error_msg) {
+                    diagnostics.push(carina_diagnostic(
+                        line,
+                        col,
+                        col + 1,
+                        DiagnosticSeverity::WARNING,
+                        error_msg.to_string(),
+                    ));
+                }
+            }
+        }
         let export_bindings =
             carina_core::binding_index::BindingIndex::from_parsed(inference_input, &self.schemas);
         if let Err(ref_errors) =
@@ -2784,6 +2818,8 @@ impl DiagnosticEngine {
         value.visit_resource_refs_with_usage(&mut |path, usage| {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
+            let mut diagnostic_binding = binding_name.to_string();
+            let mut diagnostic_attribute = attribute_name.to_string();
             let message = match binding_index.ref_type(path) {
                 RefType::UnknownAttribute(error)
                     if carina_core::validation::suppress_coalesce_existence_error(
@@ -2793,47 +2829,53 @@ impl DiagnosticEngine {
                     return;
                 }
                 RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
+                    binding,
+                    attribute,
                     known_attributes,
                     target: RefTargetKind::Schema { resource_type },
-                    ..
                 }) => {
+                    diagnostic_binding = binding;
+                    diagnostic_attribute = attribute;
                     let known_attrs: Vec<&str> =
                         known_attributes.iter().map(String::as_str).collect();
-                    let suggestion = suggest_similar_name(attribute_name, &known_attrs)
+                    let suggestion = suggest_similar_name(&diagnostic_attribute, &known_attrs)
                         .map(|suggestion| format!(" Did you mean '{}'?", suggestion))
                         .unwrap_or_default();
                     format!(
                         "Unknown attribute '{}' on '{}' (type '{}'){}",
-                        attribute_name, binding_name, resource_type, suggestion,
+                        diagnostic_attribute, diagnostic_binding, resource_type, suggestion,
                     )
                 }
                 RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
+                    binding,
+                    attribute,
                     known_attributes,
                     target: RefTargetKind::LiveComposition,
-                    ..
                 }) => {
+                    diagnostic_binding = binding;
+                    diagnostic_attribute = attribute;
                     let known_attrs: Vec<&str> =
                         known_attributes.iter().map(String::as_str).collect();
-                    let suffix = suggest_similar_name(attribute_name, &known_attrs)
+                    let suffix = suggest_similar_name(&diagnostic_attribute, &known_attrs)
                         .map(|suggestion| format!(". Did you mean '{}'?", suggestion))
                         .unwrap_or_else(|| ".".to_string());
                     format!(
                         "Unknown attribute '{}' on '{}'{}",
-                        attribute_name, binding_name, suffix,
+                        diagnostic_attribute, diagnostic_binding, suffix,
                     )
                 }
                 RefType::UnknownAttribute(error) => error.to_string(),
                 RefType::Typed(_) | RefType::Unchecked | RefType::UnknownBinding { .. } => return,
             };
 
-            let ref_text = format!("{}.{}", binding_name, attribute_name);
+            let ref_text = format!("{}.{}", diagnostic_binding, diagnostic_attribute);
             if let Some((line, col)) = self.find_ref_value_position(doc, &ref_text) {
                 // Highlight just the attribute part (after the dot)
-                let attr_col = col + binding_name.len() as u32 + 1; // +1 for the dot
+                let attr_col = col + diagnostic_binding.len() as u32 + 1; // +1 for the dot
                 diagnostics.push(carina_diagnostic(
                     line,
                     attr_col,
-                    attr_col + attribute_name.len() as u32,
+                    attr_col + diagnostic_attribute.len() as u32,
                     DiagnosticSeverity::WARNING,
                     message,
                 ));

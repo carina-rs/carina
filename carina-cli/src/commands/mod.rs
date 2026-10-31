@@ -592,6 +592,12 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
         }
     }
     extend_module_call_errors(&mut errors, root_type_resolution_findings);
+    if !skip_resource_validation
+        && let Err(message) =
+            carina_core::validation::validate_export_handle_boundaries(&parsed.export_params)
+    {
+        errors.extend(split_validation_message(&message));
+    }
     if let Err(error) =
         carina_core::parser::resolve_resource_refs_with_config(parsed, enriched_context)
     {

@@ -848,7 +848,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
         // reducing an `Any` builtin such as `lookup()` would incorrectly make
         // an otherwise-uninferrable output look like a concrete String.
         if attribute.static_type.is_some()
-            && let Some(value) = &mut attribute.value
+            && let Some(crate::parser::BoundaryExpression::Value(value)) = &mut attribute.value
         {
             *value = resolve_function_calls_only(
                 value,
@@ -864,20 +864,15 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
         // need their concrete values for boundary checking; unannotated
         // exports must retain the expression for return-type inference.
         let has_static_type = export.type_expr_opt().is_some();
-        if has_static_type {
-            let resolved = export
-                .value()
-                .map(|value| {
-                    resolve_function_calls_only(
-                        value,
-                        &binding_map,
-                        &fn_ctx,
-                        defer_unknown_functions,
-                        preserve_failed_user_calls,
-                    )
-                })
-                .transpose()?;
-            export.set_value(resolved);
+        if has_static_type && let Some(value) = export.value() {
+            let resolved = resolve_function_calls_only(
+                value,
+                &binding_map,
+                &fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
+            export.replace_value(resolved);
         }
     }
 
@@ -1294,7 +1289,7 @@ fn accumulate_undefined_reference_errors(
         }
     }
     for attr in &parsed.attribute_params {
-        if let Some(value) = &attr.value {
+        if let Some(crate::parser::BoundaryExpression::Value(value)) = &attr.value {
             check(value);
         }
     }
@@ -1304,7 +1299,7 @@ fn accumulate_undefined_reference_errors(
         }
     }
     for export in &parsed.export_params {
-        if let Some(value) = &export.value {
+        if let Some(crate::parser::BoundaryExpression::Value(value)) = &export.value {
             check(value);
         }
     }

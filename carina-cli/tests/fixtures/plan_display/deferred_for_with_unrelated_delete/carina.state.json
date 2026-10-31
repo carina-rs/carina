@@ -1,5 +1,6 @@
 {
-  "version": 7,
+  "version": 21,
+  "exports_version": 1,
   "serial": 1,
   "lineage": "test-lineage-deferred-for-with-unrelated-delete",
   "carina_version": "0.1.0",
@@ -8,15 +9,19 @@
       "resource_type": "route53.RecordSet",
       "identity": "extra_record",
       "provider": "aws",
-      "identifier": "Z123:_extra.registry.example.com:CNAME",
-      "attributes": {
-        "hosted_zone_id": "Z123",
-        "name": "_extra.registry.example.com",
-        "type": "CNAME",
-        "ttl": 60,
-        "resource_records": [
-          "_old-extra.example.com"
-        ]
+      "current": {
+        "kind": "applied",
+        "identifier": "Z123:_extra.registry.example.com:CNAME",
+        "attributes": {
+          "hosted_zone_id": "Z123",
+          "name": "_extra.registry.example.com",
+          "type": "CNAME",
+          "ttl": 60,
+          "resource_records": [
+            "_old-extra.example.com"
+          ]
+        },
+        "nested_write_only": {}
       },
       "protected": false,
       "directives": {},
@@ -24,7 +29,11 @@
       "name_overrides": {},
       "binding": "extra_record",
       "dependency_bindings": [
-        "cert"
+        {
+          "provider": "aws",
+          "resource_type": "acm.Certificate",
+          "identity": "cert"
+        }
       ],
       "explicit": {
         "kind": "struct",
@@ -47,5 +56,6 @@
         }
       }
     }
-  ]
+  ],
+  "exports": {}
 }

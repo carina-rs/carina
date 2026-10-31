@@ -448,16 +448,16 @@ pub(super) struct ExpansionPriorStates {
 fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
     match current {
         Current::Absent(state) => {
-            Orphan::absent(state, row.binding.clone(), row.directives.clone().into())
+            Orphan::absent(state, row.binding.clone(), row.directives.clone())
         }
         Current::Present(present) => {
-            Orphan::present(present, row.binding.clone(), row.directives.clone().into())
+            Orphan::present(present, row.binding.clone(), row.directives.clone())
         }
         Current::CreateInFlight(pending) => {
-            Orphan::create_in_flight(pending, row.binding.clone(), row.directives.clone().into())
+            Orphan::create_in_flight(pending, row.binding.clone(), row.directives.clone())
         }
         Current::MissingIdentifier(state) => {
-            Orphan::missing_identifier(state, row.binding.clone(), row.directives.clone().into())
+            Orphan::missing_identifier(state, row.binding.clone(), row.directives.clone())
         }
     }
 }

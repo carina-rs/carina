@@ -142,6 +142,9 @@ impl ResidualModuleResolutionError {
                 path: _path,
                 error: _error,
             } => Some(ResidualModuleResolutionDiagnostic::Parse),
+            ModuleError::TypeResolution(_diagnostic) => {
+                Some(ResidualModuleResolutionDiagnostic::Parse)
+            }
             ModuleError::NotFound(_module) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::CircularImport(_module) => None,
             ModuleError::Io(_error) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
@@ -319,6 +322,9 @@ impl ResidualModuleResolutionError {
                     crate::validation::TypeResolutionParserError::new(path, error),
                 )
             }
+            ModuleError::TypeResolution(diagnostic) => findings.iter().any(|finding| {
+                finding.message().type_resolution_diagnostic() == Some(diagnostic.as_ref())
+            }),
             ModuleError::UnknownModule(_) => false,
             ModuleError::ProviderInModule => false,
             ModuleError::StateBlockInModule => false,
@@ -400,6 +406,7 @@ fn without_covered_reference_type_members(
         | ModuleError::Io(_)
         | ModuleError::Parse(_)
         | ModuleError::ParseInFile { path: _, error: _ }
+        | ModuleError::TypeResolution(_)
         | ModuleError::UnknownArgument {
             module: _,
             argument: _,
@@ -649,12 +656,7 @@ impl TypeResolutionPolicy for StrictTypeResolution {
     ) -> Result<(), ModuleError> {
         let type_errors = crate::validation::resolve_file_type_exprs(parsed, config);
         if let Some(first) = type_errors.into_iter().next() {
-            return Err(ModuleError::Parse(ParseError::InvalidExpression {
-                line: first
-                    .source_location()
-                    .map_or(0, |source| source.span().start_line()),
-                message: first.to_string(),
-            }));
+            return Err(ModuleError::TypeResolution(Box::new(first)));
         }
         Ok(())
     }
@@ -852,9 +854,10 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     /// not be skipped.
     fn validate_reference_types<E: crate::parser::ExportParamLike>(
         &self,
-        parsed: &crate::parser::File<E>,
+        parsed: &mut crate::parser::File<E>,
     ) -> Result<RefCheckWitness, ModuleError> {
         let imported_modules = self.resolved_module_signatures();
+        lift_module_attribute_handles(parsed, &imported_modules);
         let bindings = crate::binding_index::BindingIndex::from_parsed_with_module_signatures(
             parsed,
             self.schemas,
@@ -1162,6 +1165,162 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     }
 }
 
+fn lift_module_attribute_handles<E>(
+    parsed: &mut crate::parser::File<E>,
+    signatures: &super::ResolvedModuleSignatures,
+) {
+    let calls = parsed
+        .module_calls
+        .iter()
+        .filter_map(|call| {
+            call.binding_name
+                .as_ref()
+                .map(|binding| (binding.clone(), call.module_name.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let local_resources = parsed
+        .resources
+        .iter()
+        .chain(
+            parsed
+                .deferred_for_expressions
+                .iter()
+                .map(|deferred| &deferred.template_resource),
+        )
+        .filter_map(|resource| {
+            resource.binding.as_ref().map(|binding| {
+                (
+                    binding.clone(),
+                    crate::parser::ResourceTypePath::new(
+                        resource.id.provider.clone(),
+                        resource.id.resource_type.clone(),
+                    ),
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+
+    let lift = |value: &crate::resource::Value| {
+        let crate::resource::Value::Deferred(crate::resource::DeferredValue::ResourceRef { path }) =
+            value
+        else {
+            return None;
+        };
+        if !path.segments().is_empty() {
+            return None;
+        }
+        let module_name = calls.get(path.binding())?;
+        let static_type = signatures
+            .get(module_name)?
+            .attributes
+            .get(path.attribute())?
+            .as_ref()?
+            .known()?;
+        let crate::parser::TypeExpr::Ref(resource_type) = static_type else {
+            return None;
+        };
+        Some(
+            crate::eval_value::UnexpandedStructuralHandle::module_attribute(
+                path.binding(),
+                path.attribute(),
+                resource_type.clone(),
+            )
+            .resource_handle()
+            .expect("a typed module attribute constructs a resource handle"),
+        )
+    };
+
+    for attribute in &mut parsed.attribute_params {
+        let handle = match attribute.value.as_ref() {
+            Some(crate::parser::BoundaryExpression::Value(value)) => lift(value),
+            Some(crate::parser::BoundaryExpression::Handle(_)) | None => None,
+        };
+        if let Some(handle) = handle {
+            attribute.value = Some(crate::parser::BoundaryExpression::Handle(handle));
+        }
+    }
+
+    for call in &mut parsed.module_calls {
+        for argument in call.arguments_mut() {
+            let handle = argument.value().and_then(&lift);
+            if let Some(handle) = handle {
+                argument.replace_with_resource_handle(handle);
+            }
+        }
+    }
+
+    let lift_dependency = |operand: &mut crate::parser::UnexpandedDependencyOperand| {
+        let handle = match operand {
+            crate::parser::UnexpandedDependencyOperand::Handle(_handle) => None,
+            crate::parser::UnexpandedDependencyOperand::BareBinding(binding) => {
+                local_resources.get(binding.as_str()).map(|resource_type| {
+                    crate::eval_value::UnexpandedResourceHandle::new(
+                        binding.as_str(),
+                        resource_type.clone(),
+                    )
+                })
+            }
+            crate::parser::UnexpandedDependencyOperand::AttributeSelection {
+                binding,
+                attribute,
+            } => calls
+                .get(binding.as_str())
+                .and_then(|module_name| signatures.get(module_name))
+                .and_then(|signature| signature.attributes.get(attribute))
+                .and_then(Option::as_ref)
+                .and_then(|static_type| static_type.known())
+                .and_then(|resolved| match resolved {
+                    crate::parser::TypeExpr::Ref(resource_type) => Some(
+                        crate::eval_value::UnexpandedStructuralHandle::module_attribute(
+                            binding.as_str(),
+                            attribute,
+                            resource_type.clone(),
+                        )
+                        .resource_handle()
+                        .expect("a typed module output constructs a resource handle"),
+                    ),
+                    crate::parser::TypeExpr::String
+                    | crate::parser::TypeExpr::Bool
+                    | crate::parser::TypeExpr::Int
+                    | crate::parser::TypeExpr::Float
+                    | crate::parser::TypeExpr::Duration
+                    | crate::parser::TypeExpr::Simple(_)
+                    | crate::parser::TypeExpr::List(_)
+                    | crate::parser::TypeExpr::Map(_)
+                    | crate::parser::TypeExpr::DottedUnresolved(_)
+                    | crate::parser::TypeExpr::SchemaType { .. }
+                    | crate::parser::TypeExpr::Struct { .. }
+                    | crate::parser::TypeExpr::StringLiteral(_)
+                    | crate::parser::TypeExpr::Union(_) => None,
+                }),
+        };
+        if let Some(handle) = handle {
+            *operand = crate::parser::UnexpandedDependencyOperand::Handle(handle);
+        }
+    };
+
+    for resource in &mut parsed.resources {
+        for operand in resource.directives.depends_on.iter_mut() {
+            lift_dependency(operand);
+        }
+    }
+    for data_source in &mut parsed.data_sources {
+        for operand in data_source.directives.depends_on.iter_mut() {
+            lift_dependency(operand);
+        }
+    }
+    for deferred in &mut parsed.deferred_for_expressions {
+        for operand in deferred.template_resource.directives.depends_on.iter_mut() {
+            lift_dependency(operand);
+        }
+    }
+    for wait in &mut parsed.wait_bindings {
+        for operand in wait.depends_on.iter_mut() {
+            lift_dependency(operand);
+        }
+    }
+}
+
 impl<'parsed, 'cfg, E: crate::parser::ExportParamLike> RefCheckedModuleGraph<'parsed, 'cfg, E> {
     /// Load the complete reachable module graph and validate every reference
     /// boundary before making expansion available.
@@ -1359,7 +1518,7 @@ fn resolve_modules_with_diagnostics_and_resolver<E: crate::parser::ExportParamLi
 ) -> ModuleResolutionDiagnosticResult<E> {
     let mut graph = parsed.clone();
     let mut errors = resolver.process_imports_collecting(&graph.uses, &graph.module_calls);
-    match resolver.validate_reference_types(&graph) {
+    match resolver.validate_reference_types(&mut graph) {
         Ok(root_witness) => errors.extend(resolve_modules_with_resolver_collecting(
             &mut graph,
             &mut resolver,

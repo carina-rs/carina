@@ -14,7 +14,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::deps::{collect_dependencies, sort_resources_by_dependencies};
-use crate::parser::{File, ResourceRef};
+use crate::parser::{
+    File, ResourceRef, TypeExpr, UnexpandedDependencies, UnexpandedDependencyOperand,
+};
 
 /// Severity of a depends_on diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,9 +77,10 @@ impl DependsOnDiagnostic {
 ///
 /// `LiveComposition` carries no directives — [`ResourceRef::directives`]
 /// is `None` for that arm, treated here as an empty `depends_on` list.
-fn depends_on_of<'a>(rref: ResourceRef<'a>) -> &'a [String] {
-    rref.directives()
-        .map_or(&[][..], |d| d.depends_on.as_slice())
+fn depends_on_of<'a>(rref: ResourceRef<'a>) -> &'a UnexpandedDependencies {
+    static EMPTY: std::sync::LazyLock<UnexpandedDependencies> =
+        std::sync::LazyLock::new(UnexpandedDependencies::default);
+    rref.directives().map_or(&EMPTY, |d| &d.depends_on)
 }
 
 /// Run all depends_on checks against a parsed file. Returns the full
@@ -112,10 +115,10 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
     // it from the module signature instead of reconstructing validity from
     // `bindings_by_name`. Expansion performs the corresponding value-vs-handle
     // check and rewrites the dependency to the caller's canonical binding.
-    let module_parameter_names: HashSet<&str> = parsed
+    let module_parameters: HashMap<&str, &TypeExpr> = parsed
         .arguments
         .iter()
-        .map(|argument| argument.name.as_str())
+        .map(|argument| (argument.name.as_str(), &argument.static_type))
         .collect();
 
     for resource in parsed.iter_all_resources() {
@@ -136,17 +139,18 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
             value_ref_deps.insert(name.clone());
         }
 
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut duplicate_warned: HashSet<&str> = HashSet::new();
-        for dep_name in depends_on {
-            if !seen.insert(dep_name.as_str()) {
-                if duplicate_warned.insert(dep_name.as_str()) {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut duplicate_warned: HashSet<String> = HashSet::new();
+        for operand in depends_on {
+            let dep_name = operand.diagnostic_reference();
+            if !seen.insert(dep_name.clone()) {
+                if duplicate_warned.insert(dep_name.clone()) {
                     diags.push(
                         DependsOnDiagnostic::warning(format!(
                             "directives.depends_on on '{}': binding '{}' is listed multiple times",
                             self_name, dep_name
                         ))
-                        .at_element(self_name, dep_name),
+                        .at_element(self_name, &dep_name),
                     );
                 }
                 continue;
@@ -159,7 +163,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
                          (binding '{}' depends on itself)",
                         self_name, dep_name
                     ))
-                    .at_element(self_name, dep_name),
+                    .at_element(self_name, &dep_name),
                 );
                 continue;
             }
@@ -171,21 +175,46 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
                          is not a valid depends_on target",
                         self_name, dep_name
                     ))
-                    .at_element(self_name, dep_name),
+                    .at_element(self_name, &dep_name),
                 );
                 continue;
             }
 
             let Some(target) = bindings_by_name.get(dep_name.as_str()) else {
-                if module_parameter_names.contains(dep_name.as_str()) {
+                if matches!(operand, UnexpandedDependencyOperand::Handle(_)) {
                     continue;
+                }
+                if let Some(parameter_type) = module_parameters.get(dep_name.as_str()) {
+                    match parameter_type {
+                        TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_) => continue,
+                        TypeExpr::String
+                        | TypeExpr::Bool
+                        | TypeExpr::Int
+                        | TypeExpr::Float
+                        | TypeExpr::Duration
+                        | TypeExpr::Simple(_)
+                        | TypeExpr::List(_)
+                        | TypeExpr::Map(_)
+                        | TypeExpr::SchemaType { .. }
+                        | TypeExpr::Struct { .. }
+                        | TypeExpr::StringLiteral(_)
+                        | TypeExpr::Union(_) => {
+                            diags.push(
+                                DependsOnDiagnostic::error(format!(
+                                    "directives.depends_on: expected a managed resource handle; got {parameter_type}",
+                                ))
+                                .at_element(self_name, &dep_name),
+                            );
+                            continue;
+                        }
+                    }
                 }
                 diags.push(
                     DependsOnDiagnostic::error(format!(
                         "directives.depends_on on '{}': binding '{}' is not declared in this scope",
                         self_name, dep_name
                     ))
-                    .at_element(self_name, dep_name),
+                    .at_element(self_name, &dep_name),
                 );
                 continue;
             };
@@ -197,7 +226,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
                          depends_on targets (binding '{}')",
                         self_name, dep_name
                     ))
-                    .at_element(self_name, dep_name),
+                    .at_element(self_name, &dep_name),
                 );
                 continue;
             }
@@ -209,7 +238,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
                          '{}' is already referenced by value",
                         self_name, dep_name, dep_name
                     ))
-                    .at_element(self_name, dep_name),
+                    .at_element(self_name, &dep_name),
                 );
             }
         }
@@ -399,8 +428,8 @@ mod tests {
         let rendered = error.to_string();
         assert!(
             rendered.contains("line 5")
-                && rendered.contains("'orgs' is an upstream state")
-                && rendered.contains("cannot be used as a dependency target"),
+                && rendered.contains("expected a managed resource handle")
+                && rendered.contains("got an upstream state"),
             "expected a typed upstream-state directive error, got {rendered:?}",
         );
     }

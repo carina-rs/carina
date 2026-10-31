@@ -129,6 +129,20 @@ impl<E> CanonicalResourcePair<E> {
         &self.parsed
     }
 
+    /// Resolve every post-expansion handle output against the final managed
+    /// and data-source address set while the canonical file is still owned by
+    /// its validated pair.
+    pub(super) fn resolve_expanded_graph(
+        &mut self,
+        managed: &[Resource],
+        data_sources: &[carina_core::resource::DataSource],
+    ) -> Result<
+        carina_core::resolved_graph::ExpandedBindingIndex,
+        carina_core::resolved_graph::ExpandedGraphResolutionError,
+    > {
+        carina_core::resolved_graph::resolve_expanded_graph(&mut self.parsed, managed, data_sources)
+    }
+
     pub fn unresolved(&self) -> &[Resource] {
         &self.unresolved
     }

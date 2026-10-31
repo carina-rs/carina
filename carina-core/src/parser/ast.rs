@@ -11,7 +11,10 @@ use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
 use crate::binding_index::IterableBindings;
-use crate::eval_value::{StructuralHandle, StructuralHandleKind, StructuralHandleMetadata};
+use crate::eval_value::{
+    UnexpandedResourceHandle, UnexpandedStructuralHandle, UnexpandedStructuralHandleKind,
+    UnexpandedStructuralHandleMetadata,
+};
 use crate::provider_source::ProviderSource;
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, Directives, ForLoopElement, FunctionArgument,
@@ -477,7 +480,7 @@ impl<'a, S> ResourceRef<'a, S> {
                 v.signature
                     .attributes
                     .iter()
-                    .map(|(k, attr)| (k.clone(), attr.to_value()))
+                    .filter_map(|(k, attr)| attr.value().map(|value| (k.clone(), value)))
                     .collect(),
             ),
             ResourceRef::DataSource(d) => std::borrow::Cow::Borrowed(&d.attributes),
@@ -869,12 +872,56 @@ impl RequireBlock {
     }
 }
 
+/// An expression at a module/state boundary, before structural handles have
+/// been consumed or rejected.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundaryExpression {
+    Value(Value),
+    Handle(UnexpandedResourceHandle),
+}
+
+/// Parser/expansion-side record for a module output whose value is a resource
+/// handle. It lives beside, rather than inside, [`LiveComposition`] until all
+/// resource identities and provider routing axes are final.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UnexpandedCompositionAttribute {
+    pub(crate) composition_instance: String,
+    pub(crate) name: String,
+    pub(crate) handle: UnexpandedResourceHandle,
+    pub(crate) declared_type: Option<ConsumerStaticType>,
+    pub(crate) source_argument: Option<String>,
+    pub(crate) source_file: PathBuf,
+    pub(crate) source_span: SourceSpan,
+}
+
+impl BoundaryExpression {
+    pub fn value(&self) -> Option<&Value> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Handle(_handle) => None,
+        }
+    }
+
+    pub fn handle(&self) -> Option<&UnexpandedResourceHandle> {
+        match self {
+            Self::Value(_value) => None,
+            Self::Handle(handle) => Some(handle),
+        }
+    }
+}
+
+impl From<Value> for BoundaryExpression {
+    fn from(value: Value) -> Self {
+        Self::Value(value)
+    }
+}
+
 /// Attribute parameter definition (in `attributes { ... }` block)
 #[derive(Debug, Clone)]
 pub struct AttributeParameter<T = TypeExpr> {
     pub name: String,
     pub static_type: Option<T>,
-    pub value: Option<Value>,
+    pub value: Option<BoundaryExpression>,
     source: DeclarationSource,
 }
 
@@ -882,7 +929,7 @@ impl AttributeParameter {
     pub(crate) fn new_in_source(
         name: String,
         type_expr: Option<TypeExpr>,
-        value: Option<Value>,
+        value: Option<BoundaryExpression>,
         source_span: SourceSpan,
         source_file: PathBuf,
     ) -> Self {
@@ -899,7 +946,7 @@ impl AttributeParameter {
         Self::new_in_source(
             name,
             type_expr,
-            value,
+            value.map(BoundaryExpression::Value),
             SourceSpan::dummy(),
             PathBuf::from("test.crn"),
         )
@@ -938,7 +985,7 @@ pub type ConsumerAttributeParameter = AttributeParameter<ConsumerStaticType>;
 pub struct ParsedExportParam {
     pub name: String,
     pub static_type: Option<TypeExpr>,
-    pub value: Option<Value>,
+    pub value: Option<BoundaryExpression>,
     source: DeclarationSource,
 }
 
@@ -946,7 +993,7 @@ impl ParsedExportParam {
     pub(crate) fn new_in_source(
         name: String,
         type_expr: Option<TypeExpr>,
-        value: Option<Value>,
+        value: Option<BoundaryExpression>,
         source_span: SourceSpan,
         source_file: PathBuf,
     ) -> Self {
@@ -963,7 +1010,7 @@ impl ParsedExportParam {
         Self::new_in_source(
             name,
             type_expr,
-            value,
+            value.map(BoundaryExpression::Value),
             SourceSpan::dummy(),
             PathBuf::from("test.crn"),
         )
@@ -1009,12 +1056,13 @@ pub type ExportParameter = ParsedExportParam;
 pub trait ExportParamLike {
     fn name(&self) -> &str;
     fn value(&self) -> Option<&Value>;
-    /// Replace the value after binding-aware export resolution.
+    fn handle(&self) -> Option<&UnexpandedResourceHandle>;
+    /// Replace an existing value after binding-aware export resolution.
     ///
-    /// This mutator is intentionally part of the phase-agnostic trait so the
-    /// export boundary can return the same parser/inference shape wrapped in
-    /// a checked type instead of maintaining parallel representations.
-    fn set_value(&mut self, value: Option<Value>);
+    /// Requiring a concrete value prevents a generic consumer from erasing a
+    /// parser-phase [`BoundaryExpression::Handle`] by writing `None` through
+    /// this phase-agnostic trait.
+    fn replace_value(&mut self, value: Value);
     fn type_expr_opt(&self) -> Option<&TypeExpr>;
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr>;
     fn inference_failed(&self) -> bool;
@@ -1025,10 +1073,13 @@ impl ExportParamLike for ParsedExportParam {
         &self.name
     }
     fn value(&self) -> Option<&Value> {
-        self.value.as_ref()
+        self.value.as_ref().and_then(BoundaryExpression::value)
     }
-    fn set_value(&mut self, value: Option<Value>) {
-        self.value = value;
+    fn handle(&self) -> Option<&UnexpandedResourceHandle> {
+        self.value.as_ref().and_then(BoundaryExpression::handle)
+    }
+    fn replace_value(&mut self, value: Value) {
+        self.value = Some(BoundaryExpression::Value(value));
     }
     fn type_expr_opt(&self) -> Option<&TypeExpr> {
         self.static_type.as_ref()
@@ -1394,10 +1445,17 @@ impl ModuleArgument {
         Self::from_parts(value, Some(access_base))
     }
 
-    pub(crate) fn from_handle(handle: StructuralHandle) -> Self {
+    pub(crate) fn from_handle(handle: UnexpandedStructuralHandle) -> Self {
         Self {
             operand: StructuralOperand::from_handle(handle),
         }
+    }
+
+    pub(crate) fn replace_with_resource_handle(
+        &mut self,
+        handle: crate::eval_value::UnexpandedResourceHandle,
+    ) {
+        self.operand = StructuralOperand::from_handle(handle.into_structural());
     }
 
     pub fn value(&self) -> Option<&Value> {
@@ -1410,7 +1468,7 @@ impl ModuleArgument {
         self.handle().map(|handle| handle.bare_error().to_string())
     }
 
-    pub(crate) fn handle(&self) -> Option<&StructuralHandle> {
+    pub(crate) fn handle(&self) -> Option<&UnexpandedStructuralHandle> {
         self.operand.handle()
     }
 
@@ -1577,7 +1635,7 @@ pub enum BareBindingKind {
         declaration: crate::schema::BindingKind,
     },
     Structural {
-        kind: StructuralHandleKind,
+        kind: UnexpandedStructuralHandleKind,
         resource_type: Option<ResourceTypePath>,
     },
 }
@@ -1609,7 +1667,7 @@ pub(crate) enum BareBindingSource {
         value: Arc<Value>,
         declared_type: Option<Arc<TypeExpr>>,
     },
-    Structural(StructuralHandle),
+    Structural(UnexpandedStructuralHandle),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2205,9 +2263,9 @@ impl ModuleCallDiagnosticSource {
 #[doc(hidden)]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParserBindingMetadata {
-    structural_handles: IndexMap<String, StructuralHandle>,
-    structural_aliases: IndexMap<String, StructuralHandle>,
-    value_structural_handles: IndexMap<String, StructuralHandleMetadata>,
+    structural_handles: IndexMap<String, UnexpandedStructuralHandle>,
+    structural_aliases: IndexMap<String, UnexpandedStructuralHandle>,
+    value_structural_handles: IndexMap<String, UnexpandedStructuralHandleMetadata>,
     resource_source_files: HashMap<ResourceId, PathBuf>,
     argument_type_sources: IndexMap<String, (SourceFileId, SourceSpan)>,
     pending_function_type_checks: Vec<PendingFunctionTypeCheck>,
@@ -2226,30 +2284,41 @@ pub(crate) struct PendingFunctionTypeCheck {
 }
 
 impl ParserBindingMetadata {
-    pub(crate) fn structural_handles(&self) -> &IndexMap<String, StructuralHandle> {
+    pub(crate) fn structural_handles(&self) -> &IndexMap<String, UnexpandedStructuralHandle> {
         &self.structural_handles
     }
 
-    pub(crate) fn insert_structural_handle(&mut self, name: String, handle: StructuralHandle) {
+    pub(crate) fn insert_structural_handle(
+        &mut self,
+        name: String,
+        handle: UnexpandedStructuralHandle,
+    ) {
         self.structural_handles.insert(name, handle);
     }
 
-    pub(crate) fn structural_aliases(&self) -> &IndexMap<String, StructuralHandle> {
+    pub(crate) fn structural_aliases(&self) -> &IndexMap<String, UnexpandedStructuralHandle> {
         &self.structural_aliases
     }
 
-    pub(crate) fn insert_structural_alias(&mut self, name: String, handle: StructuralHandle) {
+    pub(crate) fn insert_structural_alias(
+        &mut self,
+        name: String,
+        handle: UnexpandedStructuralHandle,
+    ) {
         self.structural_aliases.insert(name, handle);
     }
 
-    pub(crate) fn value_structural_handles(&self, name: &str) -> Option<&StructuralHandleMetadata> {
+    pub(crate) fn value_structural_handles(
+        &self,
+        name: &str,
+    ) -> Option<&UnexpandedStructuralHandleMetadata> {
         self.value_structural_handles.get(name)
     }
 
     pub(crate) fn insert_value_structural_handles(
         &mut self,
         name: String,
-        metadata: StructuralHandleMetadata,
+        metadata: UnexpandedStructuralHandleMetadata,
     ) {
         self.value_structural_handles.insert(name, metadata);
     }
@@ -2520,6 +2589,92 @@ impl PartialEq<BindingName> for String {
     }
 }
 
+/// One dependency expression before module-output typing and instance
+/// expansion have completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnexpandedDependencyOperand {
+    Handle(UnexpandedResourceHandle),
+    BareBinding(BindingName),
+    AttributeSelection {
+        binding: BindingName,
+        attribute: String,
+    },
+}
+
+impl UnexpandedDependencyOperand {
+    /// Authored/pre-expansion spelling retained only for validation and
+    /// diagnostics. Scheduler consumers must resolve the operand instead.
+    pub(crate) fn diagnostic_reference(&self) -> String {
+        match self {
+            Self::Handle(handle) => handle.diagnostic_name().to_string(),
+            Self::BareBinding(binding) => binding.to_string(),
+            Self::AttributeSelection { binding, attribute } => {
+                format!("{binding}.{attribute}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnexpandedDependencies(Vec<UnexpandedDependencyOperand>);
+
+impl UnexpandedDependencies {
+    pub fn new(operands: Vec<UnexpandedDependencyOperand>) -> Self {
+        Self(operands)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &UnexpandedDependencyOperand> {
+        self.0.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut UnexpandedDependencyOperand> {
+        self.0.iter_mut()
+    }
+
+    pub fn as_slice(&self) -> &[UnexpandedDependencyOperand] {
+        &self.0
+    }
+
+    pub fn push(&mut self, operand: UnexpandedDependencyOperand) {
+        self.0.push(operand);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Authored/pre-expansion spellings for diagnostics and parser tests.
+    /// This projection is deliberately unavailable on `ResolvedDependencies`.
+    pub fn diagnostic_references(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .map(UnexpandedDependencyOperand::diagnostic_reference)
+            .collect()
+    }
+}
+
+impl IntoIterator for UnexpandedDependencies {
+    type Item = UnexpandedDependencyOperand;
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a UnexpandedDependencies {
+    type Item = &'a UnexpandedDependencyOperand;
+    type IntoIter = std::slice::Iter<'a, UnexpandedDependencyOperand>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 /// A `wait <target> { ... }` declaration captured during parse.
 ///
 /// Carries the parsed surface form of the `until` predicate so plan
@@ -2546,7 +2701,7 @@ pub struct WaitBinding {
     /// Additional ordering edges declared via `depends_on = [...]`. The
     /// ordering machinery itself is shared with the per-resource
     /// `directives.depends_on` (carina#2823).
-    pub depends_on: Vec<BindingName>,
+    pub depends_on: UnexpandedDependencies,
     /// Source line of the `wait` keyword. Used by diagnostics.
     pub line: usize,
 }
@@ -2569,8 +2724,11 @@ impl ExportParamLike for InferredExportParam {
     fn value(&self) -> Option<&Value> {
         self.value.as_ref()
     }
-    fn set_value(&mut self, value: Option<Value>) {
-        self.value = value;
+    fn handle(&self) -> Option<&UnexpandedResourceHandle> {
+        None
+    }
+    fn replace_value(&mut self, value: Value) {
+        self.value = Some(value);
     }
     fn type_expr_opt(&self) -> Option<&TypeExpr> {
         self.static_type.known()
@@ -2615,6 +2773,9 @@ pub struct File<E> {
     pub data_sources: Vec<DataSource>,
     /// Virtual resources synthesized by module-call expansion.
     pub compositions: Vec<LiveComposition>,
+    /// Handle-valued composition outputs awaiting the single fallible
+    /// expanded-address resolution transition.
+    pub(crate) unexpanded_composition_attributes: Vec<UnexpandedCompositionAttribute>,
     pub variables: IndexMap<String, Value>,
     /// Module `use` statements
     pub uses: Vec<UseStatement>,
@@ -2685,6 +2846,7 @@ impl<E> Default for File<E> {
             resources: Vec::new(),
             data_sources: Vec::new(),
             compositions: Vec::new(),
+            unexpanded_composition_attributes: Vec::new(),
             variables: IndexMap::new(),
             uses: Vec::new(),
             module_calls: Vec::new(),
@@ -2754,6 +2916,7 @@ impl<E> File<E> {
             resources,
             data_sources,
             compositions,
+            unexpanded_composition_attributes,
             variables,
             uses,
             module_calls,
@@ -2778,6 +2941,8 @@ impl<E> File<E> {
         self.resources.extend(resources);
         self.data_sources.extend(data_sources);
         self.compositions.extend(compositions);
+        self.unexpanded_composition_attributes
+            .extend(unexpanded_composition_attributes);
         self.variables.extend(variables);
         self.uses.extend(uses);
         self.module_calls.extend(module_calls);
@@ -2822,6 +2987,7 @@ impl<E> File<E> {
             resources,
             data_sources,
             compositions,
+            unexpanded_composition_attributes,
             variables,
             uses,
             module_calls,
@@ -2847,6 +3013,7 @@ impl<E> File<E> {
             resources,
             data_sources,
             compositions,
+            unexpanded_composition_attributes,
             variables,
             uses,
             module_calls,
@@ -3608,8 +3775,6 @@ mod substitute_placeholder_tests {
         AccessPath, ConcreteValue, DeferredValue, InterpolationPart, LiveCompositionSignature,
         ResourceId, UnknownReason, Value,
     };
-    use std::collections::BTreeSet;
-
     #[test]
     fn module_argument_rewrite_cannot_leave_its_access_base_stale() {
         let string = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
@@ -3658,7 +3823,7 @@ mod substitute_placeholder_tests {
                 pending_constraints: Vec::new(),
             },
             binding: Some("composition_name".to_string()),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "module_name".to_string(),
             instance: "composition_name".to_string(),
             call_path: Default::default(),
@@ -3690,7 +3855,7 @@ mod substitute_placeholder_tests {
                 rhs: Value::Concrete(ConcreteValue::String("ready".into())),
             },
             timeout_secs: None,
-            depends_on: Vec::new(),
+            depends_on: Default::default(),
             line: 1,
         });
         parsed.uses.push(UseStatement::dummy(
@@ -3763,6 +3928,7 @@ mod substitute_placeholder_tests {
             resources: _,
             data_sources: _,
             compositions: _,
+            unexpanded_composition_attributes: _,
             variables: _,
             uses: _,
             module_calls: _,

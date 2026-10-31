@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use carina_cli::commands::plan::PlanFile;
 use carina_core::resource::{ConcreteValue, Value};
 use carina_state::check_and_migrate;
 use tempfile::TempDir;
@@ -879,7 +880,10 @@ fn saved_plan_apply_refills_ignored_readable_leaf_from_apply_time_read() {
         &fs::read_to_string(scenario.project.join("update.json")).expect("read saved plan"),
     )
     .expect("parse saved plan");
-    assert_eq!(saved["version"], serde_json::json!(31));
+    assert_eq!(
+        saved["version"],
+        serde_json::json!(PlanFile::CURRENT_VERSION),
+    );
     assert!(
         !saved.to_string().contains("resolved_ignore_changes"),
         "saved plans must not persist schema-resolved ignore metadata: {saved:#}"

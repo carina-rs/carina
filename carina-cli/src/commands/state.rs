@@ -1,4 +1,6 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -20,8 +22,8 @@ use carina_core::provider::{
     ProviderError, ProviderNormalizer, RawSavedAttrs,
 };
 use carina_core::resource::{
-    Current, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
-    ResourceIdentity, State, Value,
+    Current, DataSource, ResolvedDataSource, ResolvedDependencies, ResolvedResource,
+    ResolvedResourceId, ResourceId, ResourceIdentity, State, Value,
 };
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
@@ -806,8 +808,6 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
 
         // Set typed metadata fields from state
         resource.binding = rs.binding.clone();
-        resource.dependency_bindings = rs.dependency_bindings.clone();
-
         // Convert persisted JSON attributes through the state-only decoder.
         for (key, value) in rs
             .persisted_attributes()
@@ -818,7 +818,11 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
         }
 
         plan.add(Effect::Read {
-            resource: ResolvedDataSource::new(resource),
+            resource: ResolvedDataSource::from_resolved_parts(
+                resource,
+                rs.dependency_bindings.clone(),
+                rs.directives.depends_on.clone(),
+            ),
         });
     }
     plan
@@ -1318,7 +1322,7 @@ pub(crate) async fn run_state_refresh_locked(
         state_file.as_ref(),
     )
     .await?;
-    let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
+    let saved_dep_bindings: HashMap<ResourceId, ResolvedDependencies> = state_file
         .as_ref()
         .map(|sf| {
             sorted_resources
@@ -1467,10 +1471,22 @@ pub(crate) async fn run_state_refresh_locked(
         ctx.schemas(),
     );
 
-    let resolved_resources = ResolvedResource::collect_resolved_with_schemas(
-        sorted_resources.iter().cloned(),
-        ctx.schemas(),
+    // State refresh does not build a plan, but every consumer below still
+    // requires the same post-expansion dependency phase as planning. Resolve
+    // the refreshed resource set through the one graph-address transition;
+    // converting each raw resource independently would either reject its
+    // authored snapshots or silently discard ordering metadata.
+    let mut dependency_graph = parsed.clone();
+    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph(
+        &mut dependency_graph,
+        &sorted_resources,
+        &parsed.data_sources,
     )?;
+    let resolved_resources = sorted_resources
+        .iter()
+        .cloned()
+        .map(|resource| expanded_graph.resolve_resource(resource, ctx.schemas()))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut state = state_file.take().unwrap();
 
@@ -3454,7 +3470,7 @@ mod tests {
             identifier.to_string(),
             provider_instance.map(str::to_string),
             attributes,
-            BTreeSet::new(),
+            Default::default(),
         )
     }
 
@@ -4786,7 +4802,7 @@ mod tests {
                 "password".to_string(),
                 structural_legacy_secret(&"ab".repeat(32)),
             )]),
-            BTreeSet::new(),
+            Default::default(),
         ));
         state
             .upsert_resource(row)
@@ -4850,7 +4866,7 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::from([("tags".to_string(), previous_tags.clone())]),
-            BTreeSet::new(),
+            Default::default(),
         ));
         state
             .upsert_resource(row)
@@ -4926,15 +4942,20 @@ mod tests {
         let mut row = ResourceState::try_applied("ec2.Subnet", "main", "awscc", "subnet-current")
             .expect("fixture identifier is non-empty")
             .with_attribute("token", json!("old-token"));
-        row.directives = carina_core::resource::Directives {
+        let security_group_id = ResolvedResourceId::with_provider_identity(
+            "awscc",
+            "ec2.SecurityGroup",
+            "security_group",
+            None,
+        );
+        let vpc_id = ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "vpc", None);
+        row.directives = carina_core::resource::PersistedDirectives {
             force_delete: true,
             create_before_destroy: true,
             prevent_destroy: true,
-            depends_on: vec!["security_group".to_string()],
+            depends_on: [security_group_id.clone()].into_iter().collect(),
             provider_instance: Some("west".to_string()),
-            ignore_changes: Vec::new(),
-        }
-        .into();
+        };
         row.prefixes = HashMap::from([("name".to_string(), "prod-".to_string())]);
         row.protected = true;
         row.name_overrides.insert(
@@ -4945,7 +4966,7 @@ mod tests {
             },
         );
         row.binding = Some("subnet".to_string());
-        row.dependency_bindings = BTreeSet::from(["vpc".to_string()]);
+        row.dependency_bindings = [vpc_id.clone()].into_iter().collect();
         row.explicit = carina_core::explicit::ExplicitFields::Struct {
             children: HashMap::from([(
                 "cidr_block".to_string(),
@@ -5003,17 +5024,16 @@ mod tests {
         assert_eq!(refreshed.binding.as_deref(), Some("subnet"));
         assert_eq!(
             refreshed.dependency_bindings,
-            BTreeSet::from(["vpc".to_string()])
+            [vpc_id].into_iter().collect()
         );
         assert_eq!(
             refreshed.directives,
-            carina_core::resource::Directives {
+            carina_core::resource::PersistedDirectives {
                 force_delete: true,
                 create_before_destroy: true,
                 prevent_destroy: true,
-                depends_on: vec!["security_group".to_string()],
+                depends_on: [security_group_id].into_iter().collect(),
                 provider_instance: Some("west".to_string()),
-                ignore_changes: Vec::new(),
             }
         );
         assert_eq!(
@@ -6187,10 +6207,19 @@ mod tests {
         let plan = build_plan_from_state(&state);
 
         // subnet depends on vpc
-        let subnet_resource = plan.effects()[1].as_resource_ref().unwrap();
+        let Effect::Read {
+            resource: subnet_resource,
+        } = &plan.effects()[1]
+        else {
+            panic!("state plan must contain a data-source read")
+        };
         assert_eq!(
-            subnet_resource.dependency_bindings(),
-            &std::collections::BTreeSet::from(["vpc".to_string()])
+            subnet_resource.value_dependencies(),
+            &[ResolvedResourceId::with_provider_identity(
+                "awscc", "ec2.Vpc", "my-vpc", None,
+            )]
+            .into_iter()
+            .collect()
         );
     }
 

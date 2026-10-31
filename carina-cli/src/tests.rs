@@ -752,9 +752,9 @@ fn plan_file_serde_round_trip() {
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: None,
-        dependencies: HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     });
 
     let sorted_resources = vec![
@@ -906,7 +906,7 @@ fn plan_file_serde_round_trip() {
         panic!("fixture effect must remain a create");
     };
     assert_eq!(
-        resource.module_source,
+        resource.as_resource().module_source,
         Some(SavedModuleSource::Module {
             name: "web_tier".to_string(),
             instance: "web".to_string(),
@@ -1213,7 +1213,7 @@ fn test_detailed_exitcode_wait_only_no_changes() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
-        identity: "cert_issued".into(),
+        id: carina_core::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
         target_id: ManagedWaitTarget::for_test(&resolved(Resource::new("acm.Certificate", "cert"))),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -1223,7 +1223,7 @@ fn test_detailed_exitcode_wait_only_no_changes() {
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: Duration::from_secs(60),
         interval: Duration::from_secs(5),
-        explicit_dependencies: HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
 
     let has_changes = plan.mutation_count() > 0;
@@ -2469,7 +2469,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
         "old-bucket".to_string(),
         None,
         HashMap::from([("bucket".to_string(), json!("old-bucket"))]),
-        BTreeSet::new(),
+        Default::default(),
     ));
     state
         .upsert_resource(row)
@@ -2538,7 +2538,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
             ("bucket".to_string(), json!("old-bucket")),
             ("status".to_string(), json!("stale")),
         ]),
-        BTreeSet::new(),
+        Default::default(),
     ));
     state
         .upsert_resource(row)
@@ -3223,7 +3223,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )]),
             exists: true,
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             partial_read: None,
         }),
     )]);
@@ -3410,7 +3410,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
                     Value::Concrete(ConcreteValue::String("10.0.0.0/24".into())),
                 )]),
                 exists: true,
-                dependency_bindings: BTreeSet::new(),
+                dependency_bindings: Default::default(),
                 partial_read: None,
             },
             &["cidr_block", "ipv4_netmask_length"],
@@ -3672,6 +3672,7 @@ fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
             "children",
             None,
         ),
+        dependencies: Default::default(),
         template: Box::new(template),
     });
     let plan_file = record_test_plan(
@@ -3748,6 +3749,7 @@ fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
             "unbound_loop",
             None,
         ),
+        dependencies: Default::default(),
         template: Box::new(template),
     });
     let plan_file = record_test_plan(
@@ -3803,7 +3805,7 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
     let target_id = managed_target.resolved_id().as_inner().clone();
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
-        identity: "lookup_ready".into(),
+        id: carina_core::resource::ResolvedResourceId::with_identity("__wait", "lookup_ready"),
         target_id: ManagedWaitTarget::for_test(&managed_target),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -3813,7 +3815,7 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
         until_surface: "managed.status == \"ready\"".to_string(),
         timeout: Duration::from_secs(60),
         interval: Duration::from_secs(5),
-        explicit_dependencies: HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
     PlanFileContents {
         version: PlanFile::CURRENT_VERSION,

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::parser::DeferredForExpression;
-use crate::resource::ResourceId;
+use crate::resource::{ResolvedDependencies, ResourceId};
 
 use super::UnresolvedResource;
 use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
@@ -22,15 +22,25 @@ pub(super) struct SchedulerDeps {
 pub(super) struct PureMetaStep<'a, S> {
     effect: &'a Effect<S>,
     template: &'a DeferredForExpression<S>,
+    dependencies: &'a ResolvedDependencies,
 }
 
 impl<'a, S> PureMetaStep<'a, S> {
     fn from_effect(effect: &'a Effect<S>) -> Option<Self> {
         match effect {
-            Effect::DeferredCreate { template, .. } => Some(Self { effect, template }),
+            Effect::DeferredCreate {
+                dependencies,
+                template,
+                ..
+            } => Some(Self {
+                effect,
+                template,
+                dependencies,
+            }),
             Effect::DeferredReplace(payload) => Some(Self {
                 effect,
                 template: payload.template.as_ref(),
+                dependencies: &payload.dependencies,
             }),
             Effect::Create(_)
             | Effect::ResumeCreate { .. }
@@ -60,7 +70,7 @@ pub(super) fn try_dispatch_pure_meta<S: Clone + crate::resource::AnonymousIdenti
         return PureMetaOutcome::NotPureMeta;
     };
 
-    match dispatch_deferred_create(step.effect, step.template, bindings, ctx) {
+    match dispatch_deferred_create(step.effect, step.template, step.dependencies, bindings, ctx) {
         DeferredDispatchResult::Materialized(children) => PureMetaOutcome::Materialized(children),
         DeferredDispatchResult::MaterializeFailed => PureMetaOutcome::Failed,
     }
@@ -69,16 +79,8 @@ pub(super) fn try_dispatch_pure_meta<S: Clone + crate::resource::AnonymousIdenti
 /// Equality-bearing key used to carry failures across scheduler phases.
 /// Unbound loops retain their stable system key here; this value must never
 /// be rendered to users.
-pub(super) fn failure_dependency_key<S>(effect: &Effect<S>) -> Option<String> {
-    match effect {
-        Effect::DeferredCreate { template, .. } => {
-            Some(template.target.scheduler_key().to_string())
-        }
-        Effect::DeferredReplace(payload) => {
-            Some(payload.template.target.scheduler_key().to_string())
-        }
-        _ => effect.binding_name(),
-    }
+pub(super) fn failure_dependency_key<S>(effect: &Effect<S>) -> crate::resource::ResolvedResourceId {
+    effect.instance_key().id().clone()
 }
 
 /// User-facing label for waiting and dependency-failure messages.
@@ -214,7 +216,7 @@ pub(super) struct FailureView<'a, S> {
     pub(super) effects: &'a [Effect<S>],
     pub(super) deps_of: &'a HashMap<usize, HashSet<usize>>,
     pub(super) failed_indices: &'a HashSet<usize>,
-    failed_dependency_labels: HashMap<String, String>,
+    failed_dependency_labels: HashMap<crate::resource::ResolvedResourceId, Option<String>>,
 }
 
 impl<'a, S> FailureView<'a, S> {
@@ -227,10 +229,7 @@ impl<'a, S> FailureView<'a, S> {
             .iter()
             .filter_map(|idx| {
                 let effect = effects.get(*idx)?;
-                Some((
-                    failure_dependency_key(effect)?,
-                    failure_display_name(effect)?,
-                ))
+                Some((failure_dependency_key(effect), failure_display_name(effect)))
             })
             .collect();
         Self {
@@ -256,10 +255,13 @@ impl<'a, S> FailureView<'a, S> {
         }
 
         self.effects[idx]
-            .blocking_bindings()
+            .blocking_dependencies()
             .into_iter()
-            .find_map(|binding| self.failed_dependency_labels.get(&binding).cloned())
-            .map(FailedDependency::Labeled)
+            .find_map(|id| self.failed_dependency_labels.get(&id).cloned())
+            .map(|label| match label {
+                Some(label) => FailedDependency::Labeled(label),
+                None => FailedDependency::Anonymous,
+            })
     }
 
     pub(super) fn is_effectively_pre_skipped(&self, idx: usize) -> bool {
@@ -284,15 +286,15 @@ mod tests {
         )
         .expect("unbound deferred loop parses");
         let template = parsed.deferred_for_expressions[0].clone();
-        let scheduler_key = template.target.scheduler_key().to_string();
-        assert!(scheduler_key.starts_with("_loop_"));
+        let deferred_id = crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "__deferred_for",
+            "failed_unbound_loop",
+        ));
 
         let effects = vec![
             Effect::DeferredCreate {
-                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                    "__deferred_for",
-                    "failed_unbound_loop",
-                )),
+                id: deferred_id.clone(),
+                dependencies: Default::default(),
                 template: Box::new(template),
             },
             Effect::Delete {
@@ -304,9 +306,9 @@ mod tests {
                 generation: EffectGeneration::Current,
                 directives: crate::resource::Directives::default(),
                 binding: Some("dependent".to_string()),
-                dependencies: HashSet::new(),
-                explicit_dependencies: HashSet::from([scheduler_key]),
-                blocked_by_updates: HashSet::new(),
+                dependencies: Default::default(),
+                explicit_dependencies: std::iter::once(deferred_id).collect(),
+                blocked_by_updates: Default::default(),
             },
         ];
         let deps_of = HashMap::new();

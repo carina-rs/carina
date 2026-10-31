@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 /// Lexically normalize a diagnostic source path without consulting the
 /// filesystem. Parent components cancel an immediately preceding normal
 /// component, while leading parents remain intact.
-pub(crate) fn normalize_source_path(path: &Path) -> PathBuf {
+pub fn normalize_source_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {

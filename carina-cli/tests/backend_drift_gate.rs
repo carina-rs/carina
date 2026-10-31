@@ -534,7 +534,7 @@ mod backend_drift_gate {
             .expect("JSON plan must follow provider status lines");
         let plan: PlanFile = serde_json::from_str(&stdout[json_start..]).unwrap();
         let created_name = plan.plan.effects().iter().find_map(|effect| match effect {
-            UnresolvedSavedEffect::Create(resource) => resource.get_attr("name"),
+            UnresolvedSavedEffect::Create(resource) => resource.as_resource().get_attr("name"),
             _ => None,
         });
         assert_eq!(

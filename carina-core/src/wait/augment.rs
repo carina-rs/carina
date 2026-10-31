@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use crate::provider::{Provider, ProviderResult};
-use crate::resource::ResourceId;
+use crate::resource::{ResolvedDependencies, ResolvedResourceId, ResourceId};
 use crate::wait::BindingPattern;
 use crate::wait::predicate::AttrPath;
 
@@ -11,15 +11,15 @@ pub fn satisfier_augmentation(
     provider: &dyn Provider,
     target_id: &ResourceId,
     attr_path: &AttrPath,
-    known_bindings: &HashSet<String>,
-) -> ProviderResult<HashSet<String>> {
-    let mut additional = HashSet::new();
+    known_bindings: &HashMap<String, ResolvedResourceId>,
+) -> ProviderResult<ResolvedDependencies> {
+    let mut additional = ResolvedDependencies::default();
 
     for hint in provider.satisfier_hint(target_id, attr_path)? {
         match hint {
             BindingPattern::Exact(name) => {
-                if known_bindings.contains(&name) {
-                    additional.insert(name);
+                if let Some(id) = known_bindings.get(&name) {
+                    additional.insert(id.clone());
                 }
             }
             BindingPattern::ForLoopChildren { base } => {
@@ -27,8 +27,8 @@ pub fn satisfier_augmentation(
                 additional.extend(
                     known_bindings
                         .iter()
-                        .filter(|name| name.starts_with(&prefix))
-                        .cloned(),
+                        .filter(|(name, _id)| name.starts_with(&prefix))
+                        .map(|(_name, id)| id.clone()),
                 );
             }
             BindingPattern::AttributeMatch {
@@ -147,12 +147,23 @@ mod tests {
         }
     }
 
-    fn augment(hints: Vec<BindingPattern>, known: &[&str]) -> HashSet<String> {
+    fn hint_id(name: &str) -> ResolvedResourceId {
+        ResolvedResourceId::with_identity(
+            "test.Hint",
+            crate::resource::ResourceIdentity::try_from(name.to_string())
+                .expect("test identity must be non-empty"),
+        )
+    }
+
+    fn augment(hints: Vec<BindingPattern>, known: &[&str]) -> ResolvedDependencies {
         let provider = HintProvider {
             hints,
             failure: None,
         };
-        let known_bindings = known.iter().map(|name| (*name).to_string()).collect();
+        let known_bindings = known
+            .iter()
+            .map(|name| ((*name).to_string(), hint_id(name)))
+            .collect();
         satisfier_augmentation(
             &provider,
             &ResourceId::with_identity("acm.Certificate", "cert"),
@@ -166,7 +177,7 @@ mod tests {
     fn exact_hint_included_when_known() {
         assert_eq!(
             augment(vec![BindingPattern::Exact("alb".to_string())], &["alb"]),
-            HashSet::from(["alb".to_string()])
+            [hint_id("alb")].into_iter().collect()
         );
     }
 
@@ -188,10 +199,12 @@ mod tests {
                     "unrelated_binding",
                 ],
             ),
-            HashSet::from([
-                "validation_records[0]".to_string(),
-                "validation_records[1]".to_string(),
-            ])
+            [
+                hint_id("validation_records[0]"),
+                hint_id("validation_records[1]"),
+            ]
+            .into_iter()
+            .collect()
         );
     }
 
@@ -221,7 +234,7 @@ mod tests {
             &provider,
             &ResourceId::with_identity("acm.Certificate", "cert"),
             &AttrPath::single("status"),
-            &HashSet::new(),
+            &HashMap::new(),
         )
         .expect_err("provider hint failures must abort augmentation");
 

@@ -10,7 +10,7 @@
 //! `resolve_refs_with_state_and_remote(&mut [Resource], …)` shim is
 //! unchanged.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
@@ -45,7 +45,7 @@ fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding: Some(binding.into()),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
         module_source: None,
         default_tag_keys: Default::default(),
         loop_provenance: Default::default(),
@@ -73,7 +73,7 @@ fn make_virtual(binding: &'static str, attrs: &[(&str, Value)]) -> LiveCompositi
             pending_constraints: Vec::new(),
         },
         binding: Some(binding.into()),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
         module_name: "m".into(),
         instance: binding.into(),
         call_path: Default::default(),
@@ -193,7 +193,10 @@ fn resolve_live_composition_refs_post_apply_uses_provided_bindings() {
         .attributes
         .get("forwarded")
         .expect("forwarded present");
-    assert_eq!(forwarded.to_value(), s("post_apply_value"));
+    assert_eq!(
+        forwarded.value().expect("value composition attribute"),
+        s("post_apply_value")
+    );
 }
 
 #[test]
@@ -224,7 +227,7 @@ fn resolve_live_composition_refs_post_apply_picks_post_apply_value_not_pre_apply
         .get("role_arn")
         .expect("role_arn present");
     assert_eq!(
-        role_arn.to_value(),
+        role_arn.value().expect("value composition attribute"),
         s("post_apply_arn"),
         "expected post-apply ARN, got {role_arn:?}",
     );
@@ -252,7 +255,10 @@ fn resolve_live_composition_refs_post_apply_leaves_non_ref_values_intact() {
         .attributes
         .get("literal")
         .expect("literal present");
-    assert_eq!(literal.to_value(), s("kept"));
+    assert_eq!(
+        literal.value().expect("value composition attribute"),
+        s("kept")
+    );
 }
 
 #[test]

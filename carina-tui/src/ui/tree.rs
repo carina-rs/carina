@@ -178,6 +178,21 @@ mod tests {
         Effect::Create(ResolvedResource::new(resource))
     }
 
+    fn plan_with_resolved_creates(resources: Vec<Resource>) -> Plan {
+        let mut parsed = carina_core::parser::ParsedFile::default();
+        let graph =
+            carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &[])
+                .expect("tree fixture graph must resolve");
+        let mut plan = Plan::new();
+        for resource in resources {
+            let resource = graph
+                .resolve_resource(resource, &SchemaRegistry::new())
+                .expect("tree fixture dependencies must resolve");
+            plan.add(Effect::Create(resource));
+        }
+        plan
+    }
+
     #[test]
     fn tree_connector_root_has_no_prefix() {
         let mut plan = Plan::new();
@@ -188,23 +203,20 @@ mod tests {
 
     #[test]
     fn tree_connector_single_child() {
-        let mut plan = Plan::new();
-        plan.add(create(
+        let plan = plan_with_resolved_creates(vec![
             Resource::new("ec2.Vpc", "my-vpc")
                 .with_binding("vpc")
                 .with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 ),
-        ));
-        plan.add(create(
             Resource::new("ec2.Subnet", "my-subnet")
                 .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
                     Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
                 ),
-        ));
+        ]);
         let app = App::for_plan(&plan, &SchemaRegistry::new());
 
         // Subnet is the only (last) child of VPC
@@ -214,26 +226,21 @@ mod tests {
 
     #[test]
     fn tree_connector_multiple_children() {
-        let mut plan = Plan::new();
-        plan.add(create(
+        let plan = plan_with_resolved_creates(vec![
             Resource::new("ec2.Vpc", "my-vpc").with_binding("vpc"),
-        ));
-        plan.add(create(
             Resource::new("ec2.Subnet", "subnet-a")
                 .with_binding("subnet_a")
                 .with_attribute(
                     "vpc_id",
                     Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
                 ),
-        ));
-        plan.add(create(
             Resource::new("ec2.Subnet", "subnet-b")
                 .with_binding("subnet_b")
                 .with_attribute(
                     "vpc_id",
                     Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
                 ),
-        ));
+        ]);
         let app = App::for_plan(&plan, &SchemaRegistry::new());
 
         // First child gets ├─, last child gets └─
@@ -247,32 +254,25 @@ mod tests {
 
     #[test]
     fn selected_ancestor_row_keeps_connector_indent_unstyled() {
-        let mut plan = Plan::new();
-        plan.add(create(
+        let plan = plan_with_resolved_creates(vec![
             Resource::new("test.Root", "root").with_binding("root"),
-        ));
-        plan.add(create(
             Resource::new("test.Parent", "parent")
                 .with_binding("parent")
                 .with_attribute(
                     "root_id",
                     Value::resource_ref("root".to_string(), "id".to_string(), vec![]),
                 ),
-        ));
-        plan.add(create(
             Resource::new("test.Ancestor", "ancestor")
                 .with_binding("ancestor")
                 .with_attribute(
                     "parent_id",
                     Value::resource_ref("parent".to_string(), "id".to_string(), vec![]),
                 ),
-        ));
-        plan.add(create(
             Resource::new("test.Leaf", "matching-leaf").with_attribute(
                 "ancestor_id",
                 Value::resource_ref("ancestor".to_string(), "id".to_string(), vec![]),
             ),
-        ));
+        ]);
         let mut app = App::for_plan(&plan, &SchemaRegistry::new());
         app.search_query = "matching-leaf".to_string();
         app.update_search_matches();

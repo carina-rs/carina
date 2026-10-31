@@ -14,25 +14,25 @@ use colored::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
-use carina_core::deps::get_resource_dependencies;
 use carina_core::effect::deps::{
     DependencyAnalysis, DestroyWaitAlias, ScheduleInputs, UnresolvedResource,
     build_effect_dependency_analysis,
 };
 use carina_core::effect::{Effect, EffectGeneration};
-use carina_core::parser::WaitBinding;
 use carina_core::plan::{Plan, PlanError};
 use carina_core::provider::Provider;
 #[cfg(test)]
 use carina_core::resource::State;
 use carina_core::resource::{
-    ConcreteValue, Current, ResolvedResourceId, Resource, ResourceId, Value,
+    ConcreteValue, Current, ResolvedDependencies, ResolvedResource, ResolvedResourceId, Resource,
+    ResourceId, Value,
 };
 #[cfg(test)]
 use carina_core::shutdown::testing::TestShutdownTrigger;
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
 };
+use carina_core::wait::ResolvedWaitBinding;
 #[cfg(test)]
 use carina_state::LockInfo;
 use carina_state::{StateBackend, StateFile};
@@ -568,6 +568,26 @@ async fn run_destroy_locked_owned(
         }
     }
 
+    let mut destroy_graph_file = parsed.clone();
+    let destroy_graph = carina_core::resolved_graph::resolve_expanded_graph(
+        &mut destroy_graph_file,
+        &all_resources,
+        &parsed.data_sources,
+    )?;
+    let known_non_effect_targets: ResolvedDependencies = parsed
+        .data_sources
+        .iter()
+        .map(|data_source| {
+            ResolvedResourceId::try_new(data_source.id.clone())
+                .expect("destroy graph construction proved data-source identities are resolved")
+        })
+        .collect();
+    let resolved_wait_bindings = destroy_graph_file
+        .wait_bindings
+        .iter()
+        .map(|wait| destroy_graph.resolve_wait_binding(wait))
+        .collect::<Result<Vec<_>, _>>()?;
+
     // Collect resources that exist and will be destroyed
     // Skip the state bucket if it matches the backend bucket
     let mut protected_resources: Vec<&Resource> = Vec::new();
@@ -631,8 +651,12 @@ async fn run_destroy_locked_owned(
         .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
         .map(|id| state_row_key_from_id(&id))
         .collect();
+    let resolved_resources_to_destroy = resources_to_destroy
+        .iter()
+        .map(|resource| destroy_graph.resolve_resource((*resource).clone(), ctx.schemas()))
+        .collect::<Result<Vec<_>, _>>()?;
     let (delete_effects, identifier_errors) = build_destroy_delete_effects(
-        &resources_to_destroy,
+        &resolved_resources_to_destroy,
         &managed_current,
         state_file.as_ref(),
         &protected_row_keys,
@@ -645,13 +669,14 @@ async fn run_destroy_locked_owned(
         render_plan_errors_and_abort(&error_plan)?;
     }
 
-    let wait_aliases = build_destroy_wait_aliases(&parsed.wait_bindings, &delete_effects);
+    let wait_aliases = build_destroy_wait_aliases(&resolved_wait_bindings, &delete_effects);
     let dependency_analysis = build_effect_dependency_analysis(
         &delete_effects,
         &HashMap::<ResourceId, UnresolvedResource>::new(),
         &[],
         ScheduleInputs::Destroy {
             aliases: &wait_aliases,
+            known_non_effect_targets: &known_non_effect_targets,
         },
     )
     .map_err(DestroyDependencyAnalysisError::new)?;
@@ -1520,54 +1545,44 @@ fn observe_destroy_success_for_tests(
 }
 
 fn build_destroy_wait_aliases(
-    wait_bindings: &[WaitBinding],
+    wait_bindings: &[ResolvedWaitBinding],
     delete_effects: &[Effect],
 ) -> Vec<DestroyWaitAlias> {
-    let delete_dependencies: Vec<(String, HashSet<String>)> = delete_effects
+    let delete_dependencies: Vec<(ResolvedResourceId, ResolvedDependencies)> = delete_effects
         .iter()
         .filter_map(|effect| match effect {
             Effect::Delete {
                 id, dependencies, ..
-            } => Some((
-                effect
-                    .binding_name()
-                    .unwrap_or_else(|| id.identity_str().to_string()),
-                dependencies.clone(),
-            )),
+            } => Some((id.clone(), dependencies.clone())),
             _ => None,
         })
         .collect();
-    let destroy_targets: HashSet<&str> = delete_dependencies
+    let destroy_targets: HashSet<&ResolvedResourceId> =
+        delete_dependencies.iter().map(|(id, _)| id).collect();
+    let referenced_bindings: HashSet<&ResolvedResourceId> = delete_dependencies
         .iter()
-        .map(|(binding, _)| binding.as_str())
-        .collect();
-    let referenced_bindings: HashSet<&str> = delete_dependencies
-        .iter()
-        .flat_map(|(_, dependencies)| dependencies.iter().map(String::as_str))
+        .flat_map(|(_, dependencies)| dependencies.iter())
         .collect();
 
     wait_bindings
         .iter()
-        .filter(|wait| referenced_bindings.contains(wait.binding.as_str()))
+        .filter(|wait| referenced_bindings.contains(&wait.id))
         .filter_map(|wait| {
-            if !destroy_targets.contains(wait.target.as_str()) {
+            if !destroy_targets.contains(wait.target_id.id()) {
                 return None;
             }
             let mut consumers = delete_dependencies
                 .iter()
-                .filter(|(_, dependencies)| dependencies.contains(wait.binding.as_str()))
-                .map(|(binding, _)| binding.clone())
+                .filter(|(_, dependencies)| dependencies.contains(&wait.id))
+                .map(|(id, _)| id.clone())
                 .collect::<Vec<_>>();
             consumers.sort();
             consumers.dedup();
 
             DestroyWaitAlias::new(
-                wait.binding.as_str().to_string(),
-                wait.target.as_str().to_string(),
-                wait.depends_on
-                    .iter()
-                    .map(|dep| dep.as_str().to_string())
-                    .collect(),
+                wait.id.clone(),
+                wait.target_id.id().clone(),
+                wait.explicit_dependencies.clone(),
                 consumers,
             )
         })
@@ -1575,7 +1590,7 @@ fn build_destroy_wait_aliases(
 }
 
 fn build_destroy_delete_effects(
-    resources_to_destroy: &[&Resource],
+    resources_to_destroy: &[ResolvedResource],
     managed_current: &HashMap<ResourceId, Current>,
     state_file: Option<&StateFile>,
     protected_row_keys: &HashSet<StateRowKey>,
@@ -1614,17 +1629,28 @@ fn build_destroy_delete_effects(
                 continue;
             }
         };
-        let dependencies = get_resource_dependencies(resource);
-        let explicit_dependencies = resource.directives.depends_on.iter().cloned().collect();
+        let mut dependencies: ResolvedDependencies = resource.all_dependencies().cloned().collect();
+        let mut explicit_dependencies = resource.explicit_dependencies().clone();
+        if let Some(row) = state_file.and_then(|state| {
+            state.find_resource(
+                resource.id.provider.as_str(),
+                resource.id.resource_type.as_str(),
+                resource.identity_str(),
+            )
+        }) {
+            dependencies.extend(row.dependency_bindings.iter().cloned());
+            dependencies.extend(row.directives.depends_on.iter().cloned());
+            explicit_dependencies.extend(row.directives.depends_on.iter().cloned());
+        }
         delete_effects.push(Effect::Delete {
-            id: carina_core::resource::ResolvedResourceId::new(resource.id.clone()),
+            id: resource.resolved_id(),
             identifier,
             generation: EffectGeneration::Current,
             directives: resource.directives.clone(),
             binding: resource.binding.clone(),
             dependencies,
             explicit_dependencies,
-            blocked_by_updates: HashSet::new(),
+            blocked_by_updates: ResolvedDependencies::default(),
         });
     }
     if let Some(sf) = state_file {
@@ -2781,7 +2807,7 @@ mod tests {
     #[test]
     fn build_destroy_delete_effects_includes_current_and_deposed_instances() {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let resource =
             Resource::with_provider("awscc", "ec2.Vpc", "main", Some("current".to_string()))
@@ -2800,15 +2826,23 @@ mod tests {
             "vpc-old".to_string(),
             Some("deposed".to_string()),
             HashMap::new(),
-            BTreeSet::from(["subnet".to_string()]),
+            [ResolvedResourceId::with_provider_identity(
+                "awscc",
+                "ec2.Subnet",
+                "subnet",
+                None,
+            )]
+            .into_iter()
+            .collect(),
         ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
+        let resolved_resource = ResolvedResource::new(resource.clone());
         let effects = expect_valid_destroy_effects(build_destroy_delete_effects(
-            &[&resource],
+            &[resolved_resource],
             &current_states,
             Some(&state_file),
             &HashSet::new(),
@@ -2834,7 +2868,14 @@ mod tests {
             } if id.as_inner().provider_instance.as_deref() == Some("deposed")
                 && identifier.as_str() == "vpc-old"
                 && key == &deposed_key
-                && dependencies == &HashSet::from(["subnet".to_string()])
+                && dependencies == &[ResolvedResourceId::with_provider_identity(
+                    "awscc",
+                    "ec2.Subnet",
+                    "subnet",
+                    None,
+                )]
+                .into_iter()
+                .collect()
         ));
     }
 
@@ -2848,8 +2889,9 @@ mod tests {
             carina_core::resource::fixture_present_current(state, identifier),
         )]);
 
+        let resolved_resource = ResolvedResource::new(resource.clone());
         let effects = expect_valid_destroy_effects(build_destroy_delete_effects(
-            &[&resource],
+            &[resolved_resource],
             &current_states,
             None,
             &HashSet::new(),
@@ -2910,8 +2952,13 @@ mod tests {
         assert!(matches!(&loaded, Current::MissingIdentifier(_state)));
         let current_states = HashMap::from([(resource.id.clone(), loaded)]);
 
-        let (effects, errors) =
-            build_destroy_delete_effects(&[&resource], &current_states, None, &HashSet::new());
+        let resolved_resource = ResolvedResource::new(resource.clone());
+        let (effects, errors) = build_destroy_delete_effects(
+            &[resolved_resource],
+            &current_states,
+            None,
+            &HashSet::new(),
+        );
         assert!(effects.is_empty());
         let error = errors
             .first()
@@ -2950,8 +2997,12 @@ mod tests {
             (second.id.clone(), Current::create_in_flight(second_pending)),
         ]);
 
+        let resolved_resources = [
+            ResolvedResource::new(first.clone()),
+            ResolvedResource::new(second.clone()),
+        ];
         let (effects, errors) = build_destroy_delete_effects(
-            &[&first, &second],
+            &resolved_resources,
             &current_states,
             None,
             &HashSet::new(),
@@ -2974,7 +3025,7 @@ mod tests {
     #[test]
     fn orphan_destroy_uses_row_binding_and_depends_on_for_delete_ordering() {
         use carina_state::ResourceState;
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let mut parent = ResourceState::try_applied("test.Parent", "parent", "mock", "parent-123")
             .expect("fixture identifier is non-empty");
@@ -2982,8 +3033,10 @@ mod tests {
         let mut child = ResourceState::try_applied("test.Child", "child", "mock", "child-123")
             .expect("fixture identifier is non-empty");
         child.binding = Some("child".to_string());
-        child.directives.depends_on = vec!["parent".to_string()];
-        child.dependency_bindings = BTreeSet::from(["network".to_string()]);
+        let parent_id =
+            ResolvedResourceId::with_provider_identity("mock", "test.Parent", "parent", None);
+        child.directives.depends_on = [parent_id.clone()].into_iter().collect();
+        child.dependency_bindings = [parent_id.clone()].into_iter().collect();
 
         let mut state_file = StateFile::new();
         state_file.upsert_resource(parent).unwrap();
@@ -2992,11 +3045,11 @@ mod tests {
         let mut resources = orphan_entries
             .iter()
             .map(|(id, _loaded)| {
-                build_orphan_resource(
+                ResolvedResource::new(build_orphan_resource(
                     &state_file,
                     &ResolvedResourceId::try_new(id.clone())
                         .expect("test orphan id must be resolved"),
-                )
+                ))
             })
             .collect::<Vec<_>>();
         resources.sort_by_key(|resource| resource.binding.clone());
@@ -3004,10 +3057,8 @@ mod tests {
             .into_iter()
             .map(|(id, loaded)| (id, loaded.current().clone()))
             .collect();
-        let resource_refs = resources.iter().collect::<Vec<_>>();
-
         let effects = expect_valid_destroy_effects(build_destroy_delete_effects(
-            &resource_refs,
+            &resources,
             &current_states,
             Some(&state_file),
             &HashSet::new(),
@@ -3022,15 +3073,18 @@ mod tests {
                 dependencies,
                 explicit_dependencies,
                 ..
-            } if dependencies == &HashSet::from(["network".to_string(), "parent".to_string()])
-                && explicit_dependencies == &HashSet::from(["parent".to_string()])
+            } if dependencies == &[parent_id.clone()].into_iter().collect()
+                && explicit_dependencies == &[parent_id.clone()].into_iter().collect()
         ));
 
         let analysis = build_effect_dependency_analysis(
             &effects,
             &HashMap::<ResourceId, UnresolvedResource>::new(),
             &[],
-            ScheduleInputs::Destroy { aliases: &[] },
+            ScheduleInputs::Destroy {
+                aliases: &[],
+                known_non_effect_targets: &ResolvedDependencies::default(),
+            },
         )
         .expect("destroy dependency analysis must resolve");
         let deletion_deps = transitive_delete_deps(&analysis, effects.len());
@@ -3053,7 +3107,7 @@ mod tests {
     #[test]
     fn build_destroy_delete_effects_skips_deposed_generations_for_protected_rows() {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let resource =
             Resource::with_provider("awscc", "s3.Bucket", "state", None).with_binding("state");
@@ -3064,7 +3118,7 @@ mod tests {
             "old-state-bucket".to_string(),
             None,
             HashMap::new(),
-            BTreeSet::new(),
+            Default::default(),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -3090,7 +3144,7 @@ mod tests {
     #[test]
     fn build_destroy_delete_effects_keeps_deposed_generations_for_prevent_destroy_rows() {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
         row.binding = Some("main".to_string());
@@ -3101,7 +3155,7 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::new(),
-            BTreeSet::new(),
+            Default::default(),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -3129,7 +3183,7 @@ mod tests {
     #[test]
     fn deposed_only_destroy_work_prevents_all_protected_short_circuit() {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
         row.deposed.push(DeposedInstance::from_persisted_json(
@@ -3137,7 +3191,7 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::new(),
-            BTreeSet::new(),
+            Default::default(),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -3232,7 +3286,7 @@ mod tests {
     #[test]
     fn apply_destroy_to_state_preserves_deposed_generations() {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let mut state = carina_state::StateFile::new();
         let mut resource = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-new")
@@ -3243,7 +3297,11 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
-            BTreeSet::from(["network".to_string()]),
+            [ResolvedResourceId::with_provider_identity(
+                "awscc", "ec2.Vpc", "network", None,
+            )]
+            .into_iter()
+            .collect(),
         ));
         state
             .upsert_resource(resource)
@@ -3269,7 +3327,7 @@ mod tests {
     #[test]
     fn apply_destroy_to_state_removes_only_successful_deposed_generation() {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let removed_key = DeposedKey::new_unique();
         let retained_key = DeposedKey::new_unique();
@@ -3282,14 +3340,22 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
-            BTreeSet::from(["network".to_string()]),
+            [ResolvedResourceId::with_provider_identity(
+                "awscc", "ec2.Vpc", "network", None,
+            )]
+            .into_iter()
+            .collect(),
         ));
         resource.deposed.push(DeposedInstance::from_persisted_json(
             retained_key.clone(),
             "vpc-older".to_string(),
             None,
             HashMap::from([("cidr_block".to_string(), serde_json::json!("10.2.0.0/16"))]),
-            BTreeSet::from(["network".to_string()]),
+            [ResolvedResourceId::with_provider_identity(
+                "awscc", "ec2.Vpc", "network", None,
+            )]
+            .into_iter()
+            .collect(),
         ));
         state
             .upsert_resource(resource)
@@ -3316,7 +3382,7 @@ mod tests {
     #[test]
     fn apply_destroy_to_state_removes_row_after_current_and_deposed_successes() {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let deposed_key = DeposedKey::new_unique();
         let mut state = carina_state::StateFile::new();
@@ -3328,7 +3394,11 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
-            BTreeSet::from(["network".to_string()]),
+            [ResolvedResourceId::with_provider_identity(
+                "awscc", "ec2.Vpc", "network", None,
+            )]
+            .into_iter()
+            .collect(),
         ));
         state
             .upsert_resource(resource)

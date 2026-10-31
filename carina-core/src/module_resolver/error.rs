@@ -88,6 +88,12 @@ pub enum ModuleError {
         error: Box<ParseError>,
     },
 
+    /// Declaration type resolution remains typed through recursive module
+    /// loading so the CLI/LSP finding can cover this resolver backstop without
+    /// comparing rendered parse-error text.
+    #[error(transparent)]
+    TypeResolution(Box<crate::validation::TypeResolutionDiagnostic>),
+
     #[error("Unknown argument '{argument}' for module '{module}'")]
     UnknownArgument { module: String, argument: String },
 
@@ -174,6 +180,7 @@ impl ModuleError {
             | Self::Io(_)
             | Self::Parse(_)
             | Self::ParseInFile { .. }
+            | Self::TypeResolution(_)
             | Self::UnknownArgument { .. }
             | Self::UnknownModule(_)
             | Self::ProviderInModule
@@ -218,6 +225,7 @@ impl ModuleError {
             | Self::Io(_)
             | Self::Parse(_)
             | Self::ParseInFile { path: _, error: _ }
+            | Self::TypeResolution(_)
             | Self::UnknownArgument {
                 module: _,
                 argument: _,
@@ -247,6 +255,7 @@ impl ModuleError {
             | Self::Io(_)
             | Self::Parse(_)
             | Self::ParseInFile { .. }
+            | Self::TypeResolution(_)
             | Self::UnknownArgument { .. }
             | Self::UnknownModule(_)
             | Self::ProviderInModule
@@ -294,6 +303,15 @@ impl ModuleError {
                 "Parse error in {}: {}",
                 display_source_path_relative_to(path, root),
                 display_parse_error_relative_to(error, root),
+            ),
+            Self::TypeResolution(diagnostic) => diagnostic.source_location().map_or_else(
+                || diagnostic.to_string(),
+                |source| {
+                    format!(
+                        "{}: {diagnostic}",
+                        display_source_path_relative_to(source.source_file().path(), root),
+                    )
+                },
             ),
             _ => self.to_string(),
         }

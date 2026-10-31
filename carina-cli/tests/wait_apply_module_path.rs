@@ -45,7 +45,7 @@ use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, NoopNormalizer, Provider, ProviderFactory,
     ProviderNormalizer, ProviderResult, ReadOutcome,
 };
-use carina_core::resource::{Current, ResolvedResource, ResourceId, Value};
+use carina_core::resource::{Current, ResourceId, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 use indexmap::IndexMap;
 use std::sync::Mutex;
@@ -519,7 +519,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .expect("expand stage must succeed");
 
     let ctx = wiring.context();
-    let parsed = wiring.evaluated_resources_for_test();
+    let mut parsed = wiring.evaluated_resources_for_test().clone();
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources).expect("topo sort");
 
     let mut current_states: HashMap<ResourceId, Current> = HashMap::new();
@@ -602,13 +602,34 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .await
         .expect("plan preprocessing");
     let resources_for_plan = override_aware_resources.resources().to_vec();
-    let resolved_resources_for_plan =
-        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
+    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph(
+        &mut parsed,
+        &resources_for_plan,
+        &data_sources,
+    )
+    .expect("expanded graph resolution");
+    let resolved_resources_for_plan = resources_for_plan
+        .iter()
+        .cloned()
+        .map(|resource| expanded_graph.resolve_resource(resource, ctx.schemas()))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("managed dependency resolution");
+    let resolved_data_sources = data_sources
+        .iter()
+        .cloned()
+        .map(|data_source| expanded_graph.resolve_data_source(data_source))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("data source dependency resolution");
+    let resolved_wait_bindings = wait_bindings
+        .iter()
+        .map(|wait| expanded_graph.resolve_wait_binding(wait))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("wait dependency resolution");
 
     let saved_attrs = carina_core::provider::RawSavedAttrs::default().lift(ctx.schemas());
     let plan = create_plan(
         &resolved_resources_for_plan,
-        &parsed.data_sources,
+        &resolved_data_sources,
         &provider,
         carina_core::differ::PlanPriorStates::new(
             &carina_core::resource::into_plan_input_current_map(
@@ -622,12 +643,12 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         ctx.schemas(),
         &saved_attrs,
         &HashMap::new(),
-        &wait_bindings,
+        &resolved_wait_bindings,
     )
     .expect("test provider hints should succeed");
 
     let has_wait = plan.effects().iter().any(|e| {
-        matches!(e, carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "r.cert_issued")
+        matches!(e, carina_core::effect::Effect::Wait { id, .. } if id.identity_str() == "r.cert_issued")
     });
     assert!(
         has_wait,

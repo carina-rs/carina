@@ -202,6 +202,7 @@ fn empty_parsed() -> ParsedFile {
         resources: Vec::new(),
         data_sources: Vec::new(),
         compositions: Vec::new(),
+        unexpanded_composition_attributes: Vec::new(),
         variables: IndexMap::new(),
         uses: Vec::new(),
         module_calls: Vec::new(),
@@ -575,22 +576,22 @@ fn lift_type_expr_recurses_and_only_unknown_remains_unchecked() {
 
     let resource_ref =
         crate::parser::ResourceTypePath::new("aws".to_string(), "ec2.Vpc".to_string());
-    for type_expr in [
-        TypeExpr::Ref(resource_ref.clone()),
-        TypeExpr::DottedUnresolved(resource_ref),
-    ] {
-        let handle = lift_type_expr(&type_expr).expect("resource paths lift to typed handles");
-        assert!(
-            crate::schema::TypeInSchema::schemaless(&handle).is_assignable_to(
-                crate::schema::TypeInSchema::schemaless(&AttributeType::string())
-            )
-        );
-        assert!(
-            !crate::schema::TypeInSchema::schemaless(&handle).is_assignable_to(
-                crate::schema::TypeInSchema::schemaless(&AttributeType::int())
-            )
-        );
-    }
+    let handle = lift_type_expr(&TypeExpr::Ref(resource_ref.clone()))
+        .expect("resolved resource paths lift to typed handles");
+    assert!(
+        !crate::schema::TypeInSchema::schemaless(&handle).is_assignable_to(
+            crate::schema::TypeInSchema::schemaless(&AttributeType::string())
+        )
+    );
+    assert!(
+        !crate::schema::TypeInSchema::schemaless(&handle).is_assignable_to(
+            crate::schema::TypeInSchema::schemaless(&AttributeType::int())
+        )
+    );
+    assert!(
+        lift_type_expr(&TypeExpr::DottedUnresolved(resource_ref)).is_none(),
+        "an unresolved dotted declaration is not yet known to be a handle",
+    );
     let literal = lift_type_expr(&TypeExpr::StringLiteral("x".to_string()))
         .expect("string literals lift to a closed string set");
     assert!(
@@ -897,10 +898,10 @@ fn seeded_bare_structural_binding_is_a_typed_pending_slot() {
             assume_role_policy_document = "{}"
         }
     "#;
-    let handle = crate::eval_value::StructuralHandle::new(
-        crate::eval_value::StructuralHandleKind::Resource(crate::parser::ResourceTypePath::new(
-            "aws", "iam.Role",
-        )),
+    let handle = crate::eval_value::UnexpandedStructuralHandle::new(
+        crate::eval_value::UnexpandedStructuralHandleKind::Resource(
+            crate::parser::ResourceTypePath::new("aws", "iam.Role"),
+        ),
         "role",
     );
     let parsed = crate::parser::parse_with_seeded_bindings(
@@ -936,10 +937,10 @@ fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
             bucket_name = role
         }
     "#;
-    let handle = crate::eval_value::StructuralHandle::new(
-        crate::eval_value::StructuralHandleKind::Resource(crate::parser::ResourceTypePath::new(
-            "aws", "iam.Role",
-        )),
+    let handle = crate::eval_value::UnexpandedStructuralHandle::new(
+        crate::eval_value::UnexpandedStructuralHandleKind::Resource(
+            crate::parser::ResourceTypePath::new("aws", "iam.Role"),
+        ),
         "role",
     );
     let parsed = crate::parser::parse_with_seeded_bindings(
@@ -1890,7 +1891,7 @@ fn unknown_attribute_reference_through_wait_binding_reports_error() {
             rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
-        depends_on: Vec::new(),
+        depends_on: Default::default(),
         line: 1,
     });
     parsed.resources.push(listener); // allow: direct — fixture test inspection
@@ -1963,7 +1964,7 @@ fn known_attribute_reference_through_wait_binding_is_accepted() {
             rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
-        depends_on: Vec::new(),
+        depends_on: Default::default(),
         line: 1,
     });
     parsed.resources.push(listener); // allow: direct — fixture test inspection
@@ -2186,7 +2187,7 @@ fn unknown_attribute_reference_through_wait_binding_inside_nested_struct_reports
             rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
-        depends_on: Vec::new(),
+        depends_on: Default::default(),
         line: 1,
     });
     parsed.resources.push(listener); // allow: direct — fixture test inspection
@@ -5115,7 +5116,7 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
             rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
-        depends_on: Vec::new(),
+        depends_on: Default::default(),
         line: 1,
     });
 
@@ -6377,7 +6378,7 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
             rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
-        depends_on: Vec::new(),
+        depends_on: Default::default(),
         line: 1,
     });
 

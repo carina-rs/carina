@@ -1,6 +1,6 @@
 //! CLI-level regression coverage for DeferredReplace consumer update ordering.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -15,8 +15,8 @@ use carina_core::parser::{
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
 use carina_core::resource::{
-    ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, ResourceIdentity, State,
-    Value,
+    ConcreteValue, Directives, ResolvedDependencies, ResolvedResource, ResolvedResourceId,
+    Resource, ResourceId, ResourceIdentity, State, Value,
 };
 use carina_state::{ResourceState, StateFile};
 use indexmap::IndexMap;
@@ -119,7 +119,12 @@ provider mock {}
         .with_attribute("name", serde_json::json!("old-validation-token"))
         .with_attribute("identifier", serde_json::json!("old-validation-id"));
         validation.binding = Some("validation_records[0]".to_string());
-        validation.dependency_bindings.insert("cert".to_string());
+        validation
+            .dependency_bindings
+            .insert(ResolvedResourceId::new(ResourceId::with_identity(
+                "mock.test.resource",
+                "cert",
+            )));
         state
             .upsert_resource(validation)
             .expect("test state setup must be valid");
@@ -133,7 +138,10 @@ provider mock {}
         consumer.binding = Some("consumer".to_string());
         consumer
             .dependency_bindings
-            .insert("validation_records[0]".to_string());
+            .insert(ResolvedResourceId::new(ResourceId::with_identity(
+                "mock.test.resource",
+                "validation_records[0]",
+            )));
         state
             .upsert_resource(consumer)
             .expect("test state setup must be valid");
@@ -212,10 +220,6 @@ fn string(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.to_string().into()))
 }
 
-fn identity(value: &str) -> ResourceIdentity {
-    ResourceIdentity::try_from(value.to_string()).unwrap()
-}
-
 fn state_not_found(resource: &Resource) -> CurrentStateEntry {
     CurrentStateEntry::managed(resource.id.clone(), State::not_found(resource.id.clone()))
 }
@@ -240,17 +244,22 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             Value::Concrete(ConcreteValue::List(vec![string("new-validation-token")])),
         );
 
-    let mut consumer = mock_resource("consumer", "consumer")
+    let validation_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "validation_records[0]", None);
+    let validation_dependency = ResolvedResourceId::new(validation_id.clone());
+    let consumer = mock_resource("consumer", "consumer")
         .with_attribute("name", string("consumer"))
         .with_attribute("identifier", string("consumer-id"))
         .with_attribute(
             "web_acl_arn",
             Value::resource_ref("validation_records[0]", "identifier", vec![]),
         );
-    consumer
-        .dependency_bindings
-        .insert("validation_records[0]".to_string());
     let consumer_from = consumer_current_state(&consumer.id);
+    let resolved_consumer = ResolvedResource::from_resolved_parts(
+        consumer.clone(),
+        [validation_dependency.clone()].into_iter().collect(),
+        ResolvedDependencies::default(),
+    );
 
     let template_resource = mock_resource("validation_records", "validation_records");
     let template = DeferredForExpression {
@@ -267,8 +276,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         template_resource,
     };
 
-    let validation_id =
-        ResourceId::with_provider_identity("mock", "test.resource", "validation_records[0]", None);
+    let cert_dependency = ResolvedResourceId::new(cert.id.clone());
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(cert.clone())));
@@ -279,21 +287,24 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
                 .expect("fixture identifier is non-empty"),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::from(["cert".to_string()]),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::from([identity("consumer")]),
+            dependencies: ResolvedDependencies::from_iter([cert_dependency.clone()]),
+            explicit_dependencies: ResolvedDependencies::default(),
+            blocked_by_updates: ResolvedDependencies::from_iter([ResolvedResourceId::new(
+                consumer.id.clone(),
+            )]),
         }])
         .expect("fixture has one delete"),
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "__deferred_for",
             "validation_records",
         )),
+        dependencies: ResolvedDependencies::from_iter([cert_dependency]),
         template: Box::new(template),
     })));
     plan.add(Effect::Update {
         identifier: AppliedIdentifier::new("consumer-id").expect("fixture identifier is non-empty"),
         from: Box::new(consumer_from.clone()),
-        to: resolved(consumer.clone()),
+        to: resolved_consumer,
         changed_attributes: vec!["web_acl_arn".to_string()],
     });
 

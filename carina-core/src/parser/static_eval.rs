@@ -52,10 +52,10 @@ pub(crate) fn is_static_value(value: &Value) -> bool {
 pub(crate) fn is_static_eval(value: &EvalValue) -> bool {
     match value {
         EvalValue::User(v) => is_static_value(v),
-        EvalValue::StructuralHandle(_) => true,
+        EvalValue::UnexpandedStructuralHandle(_) => true,
         EvalValue::PendingValue(_) => false,
         EvalValue::ProvisionalReference { .. } => false,
-        EvalValue::ComputedWithStructuralHandles { value, .. } => is_static_value(value),
+        EvalValue::ComputedWithUnexpandedStructuralHandles { value, .. } => is_static_value(value),
         EvalValue::DeferredForValue { .. } => false,
         EvalValue::Closure { captured_args, .. } => captured_args.iter().all(is_static_eval),
     }

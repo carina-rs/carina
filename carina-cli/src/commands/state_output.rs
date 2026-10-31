@@ -301,10 +301,10 @@ fn redact_nested_write_only_leaf(value: &mut serde_json::Value, path: &LeafPath)
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
 
     use carina_core::provider::Sent;
-    use carina_core::resource::{ResolvedResource, Resource, ResourceId};
+    use carina_core::resource::{ResolvedResource, ResolvedResourceId, Resource, ResourceId};
     use carina_core::schema::{LeafPath, LeafPathSegment};
     use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
     use serde_json::{Value, json};
@@ -369,7 +369,14 @@ mod tests {
             "mock-deposed-id".to_string(),
             Some("secondary".to_string()),
             HashMap::from([("name".to_string(), json!("old"))]),
-            BTreeSet::from(["dependency".to_string()]),
+            [ResolvedResourceId::with_provider_identity(
+                "mock",
+                "test.resource",
+                "dependency",
+                None,
+            )]
+            .into_iter()
+            .collect(),
         ));
         let applied = crate::fixture_resource_state_metadata(
             applied,

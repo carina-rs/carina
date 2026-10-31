@@ -801,7 +801,7 @@ pub(super) async fn execute_effects_sequential<
                             };
                             let cleanup_loop = shutdown.cleanup_aware_loop();
                             let target_binding =
-                                match binding_snapshot.source(wait.identity().as_str()) {
+                                match binding_snapshot.source(wait.id().identity_str()) {
                                     Some(crate::binding_index::BindingValueSource::WaitAlias {
                                         target,
                                     }) => target.as_str().to_string(),
@@ -811,7 +811,7 @@ pub(super) async fn execute_effects_sequential<
                                     )
                                     | None => wait.target().id().identity_str().to_string(),
                                 };
-                            let binding = wait.identity().to_string();
+                            let binding = wait.id().identity_str().to_string();
                             let outcome = super::wait::execute_wait_effect(
                                 &cleanup_loop,
                                 provider,
@@ -1164,9 +1164,9 @@ mod tests {
                 generation: crate::effect::EffectGeneration::Current,
                 directives: Directives::default(),
                 binding: None,
-                dependencies: HashSet::new(),
-                explicit_dependencies: HashSet::new(),
-                blocked_by_updates: HashSet::new(),
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
             },
             Effect::DeferredCreate {
                 id: crate::resource::ResolvedResourceId::with_provider_identity(
@@ -1175,6 +1175,7 @@ mod tests {
                     "first_loop",
                     None,
                 ),
+                dependencies: Default::default(),
                 template: Box::new(unbound_deferred_template_in("a.crn")),
             },
             Effect::DeferredCreate {
@@ -1184,6 +1185,7 @@ mod tests {
                     "second_loop",
                     None,
                 ),
+                dependencies: Default::default(),
                 template: Box::new(unbound_deferred_template_in("b.crn")),
             },
         ];
@@ -1199,8 +1201,59 @@ mod tests {
         assert_eq!(deps_of.get(&2), Some(&HashSet::from([0])));
     }
 
-    fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+    fn fixture_id(binding: &str) -> crate::resource::ResolvedResourceId {
+        crate::resource::ResolvedResourceId::with_identity(
+            "test",
+            ResourceIdentity::try_from(binding.to_string())
+                .expect("test identity must be non-empty"),
+        )
+    }
+
+    fn resolved(mut resource: Resource) -> ResolvedResource {
+        let mut value_dependencies = crate::resource::ResolvedDependencies::default();
+        let mut reads = crate::resource::ResolvedDependencyReads::default();
+        for value in resource.attributes.values() {
+            value.visit_resource_refs(&mut |path| {
+                let id = fixture_id(path.binding());
+                value_dependencies.insert(id.clone());
+                reads.insert_known(id, path.attribute());
+            });
+            value.visit_binding_refs(&mut |binding| {
+                let id = fixture_id(binding);
+                value_dependencies.insert(id.clone());
+                reads.insert_unknown(id);
+            });
+        }
+        for binding in &resource.dependency_bindings {
+            let id = fixture_id(binding);
+            value_dependencies.insert(id.clone());
+            reads.ensure_unknown(id);
+        }
+        let explicit_dependencies = resource
+            .directives
+            .depends_on
+            .iter()
+            .map(|operand| match operand {
+                crate::parser::UnexpandedDependencyOperand::Handle(handle) => {
+                    fixture_id(handle.canonical_binding_name().as_ref())
+                }
+                crate::parser::UnexpandedDependencyOperand::BareBinding(binding) => {
+                    fixture_id(binding.as_str())
+                }
+                crate::parser::UnexpandedDependencyOperand::AttributeSelection {
+                    binding,
+                    attribute,
+                } => fixture_id(&format!("{binding}.{attribute}")),
+            })
+            .collect();
+        resource.dependency_bindings.clear();
+        resource.directives.depends_on = Default::default();
+        ResolvedResource::from_resolved_parts_with_reads(
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            reads,
+        )
     }
 
     fn managed_wait_target(id: ResourceId) -> crate::wait::ManagedWaitTarget {
@@ -1426,7 +1479,7 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Create(resolved(cert.clone())));
         plan.add(Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
             target_id: managed_wait_target(cert_id.clone()),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
@@ -1436,7 +1489,7 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: std::time::Duration::from_secs(60),
             interval: std::time::Duration::from_millis(1),
-            explicit_dependencies: std::collections::HashSet::new(),
+            explicit_dependencies: Default::default(),
         });
         plan.add(Effect::Create(resolved(alb.clone())));
 
@@ -1524,11 +1577,25 @@ mod tests {
             "certificate_arn",
             Value::resource_ref("cert_issued", "arn", vec![]),
         );
+        let listener_origin = listener.clone();
+        listener.dependency_bindings.clear();
+        let alb_dependency = fixture_id("alb");
+        let wait_dependency =
+            crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued");
+        let mut listener_reads = crate::resource::ResolvedDependencyReads::default();
+        listener_reads.insert_known(alb_dependency.clone(), "load_balancer_arn");
+        listener_reads.insert_known(wait_dependency.clone(), "arn");
+        let listener = ResolvedResource::from_resolved_parts_with_reads(
+            listener,
+            [alb_dependency, wait_dependency].into_iter().collect(),
+            Default::default(),
+            listener_reads,
+        );
 
         let mut plan = Plan::new();
         plan.add(Effect::Create(resolved(cert.clone())));
         plan.add(Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
             target_id: managed_wait_target(cert_id.clone()),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
@@ -1538,10 +1605,10 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: std::time::Duration::from_secs(60),
             interval: std::time::Duration::from_millis(1),
-            explicit_dependencies: std::collections::HashSet::new(),
+            explicit_dependencies: Default::default(),
         });
         plan.add(Effect::Create(resolved(alb.clone())));
-        plan.add(Effect::Create(resolved(listener.clone())));
+        plan.add(Effect::Create(listener));
 
         let unresolved = HashMap::from([
             (
@@ -1553,8 +1620,8 @@ mod tests {
                 UnresolvedResource::from_pre_resolve(alb.clone()),
             ),
             (
-                listener.id.clone(),
-                UnresolvedResource::from_pre_resolve(listener.clone()),
+                listener_origin.id.clone(),
+                UnresolvedResource::from_pre_resolve(listener_origin.clone()),
             ),
         ]);
         let deps =
@@ -1692,7 +1759,12 @@ mod tests {
             Effect::Update { to, .. } => to.into_inner(),
             _ => unreachable!(),
         };
-        child.directives.depends_on.push("parent".to_string());
+        child
+            .directives
+            .depends_on
+            .push(crate::parser::UnexpandedDependencyOperand::BareBinding(
+                "parent".into(),
+            ));
         let child = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("id"),
             from: Box::new(state_for(&child.id)),
@@ -1768,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn keep_update_update_edge_for_composition_expansion_unknown_read() {
+    fn keep_update_update_edge_for_flattened_composition_unknown_read() {
         let parent = update_effect("parent", &[], &["tags"]);
         let mut child = match update_effect("child", &[], &["name"]) {
             Effect::Update { to, .. } => to.into_inner(),
@@ -1798,7 +1870,7 @@ mod tests {
                 pending_constraints: Vec::new(),
             },
             binding: Some("module".to_string()),
-            dependency_bindings: std::collections::BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "network".to_string(),
             instance: "module".to_string(),
             call_path: Default::default(),
@@ -1811,7 +1883,11 @@ mod tests {
             Effect::Update {
                 identifier: crate::effect::fixture_applied_identifier("id"),
                 from: Box::new(state_for(&child_id)),
-                to: resolved(child.clone()),
+                to: ResolvedResource::from_resolved_parts(
+                    child.clone(),
+                    std::iter::once(fixture_id("parent")).collect(),
+                    Default::default(),
+                ),
                 changed_attributes: vec!["name".to_string()],
             },
         ];
@@ -1903,7 +1979,7 @@ mod tests {
                 pending_constraints: Vec::new(),
             },
             binding: Some("bootstrap".to_string()),
-            dependency_bindings: std::collections::BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "github-oidc".to_string(),
             instance: "bootstrap".to_string(),
             call_path: Default::default(),
@@ -1916,10 +1992,21 @@ mod tests {
             Value::resource_ref("bootstrap", "role_name", vec![]),
         );
 
-        let effects = vec![
-            Effect::Create(resolved(role.clone())),
-            Effect::Create(resolved(role_policy.clone())),
-        ];
+        let resources = vec![role.clone(), role_policy.clone()];
+        let mut parsed: crate::parser::ParsedFile = Default::default();
+        parsed.compositions.push(virt.clone());
+        let index = crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &[])
+            .expect("composition references flatten at the expanded graph seam");
+        let effects = resources
+            .iter()
+            .cloned()
+            .map(|resource| {
+                index
+                    .resolve_resource(resource, &crate::schema::SchemaRegistry::new())
+                    .map(Effect::Create)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("fixture resources resolve to typed dependencies");
 
         let mut unresolved: HashMap<ResourceId, UnresolvedResource> = HashMap::new();
         unresolved.insert(

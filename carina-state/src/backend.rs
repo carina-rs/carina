@@ -122,6 +122,11 @@ pub enum BackendError {
     #[error("Invalid state file: {0}")]
     InvalidState(String),
 
+    /// A pre-v21 binding-text dependency cannot be mapped to exactly one
+    /// complete resource address.
+    #[error("Invalid state file: {0}")]
+    LegacyDependencyMigration(state::LegacyDependencyMigrationError),
+
     /// State decoding failed at a concrete backend location.
     #[error("Failed to read state at {location}: {error}")]
     StateRead {
@@ -193,6 +198,12 @@ pub enum BackendError {
 impl From<InvalidResourceIdentityError> for BackendError {
     fn from(error: InvalidResourceIdentityError) -> Self {
         Self::InvalidResourceIdentity(error)
+    }
+}
+
+impl From<state::LegacyDependencyMigrationError> for BackendError {
+    fn from(error: state::LegacyDependencyMigrationError) -> Self {
+        Self::LegacyDependencyMigration(error)
     }
 }
 

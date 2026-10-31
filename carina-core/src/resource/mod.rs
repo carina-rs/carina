@@ -619,6 +619,187 @@ impl std::fmt::Display for ResourceId {
 #[serde(try_from = "ResourceId", into = "ResourceId")]
 pub struct ResolvedResourceId(ResourceId);
 
+impl PartialOrd for ResolvedResourceId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ResolvedResourceId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            &self.provider,
+            &self.resource_type,
+            self.identity_str(),
+            &self.provider_instance,
+        )
+            .cmp(&(
+                &other.provider,
+                &other.resource_type,
+                other.identity_str(),
+                &other.provider_instance,
+            ))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ResolvedDependencies(BTreeSet<ResolvedResourceId>);
+
+impl ResolvedDependencies {
+    pub fn new(dependencies: BTreeSet<ResolvedResourceId>) -> Self {
+        Self(dependencies)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ResolvedResourceId> {
+        self.0.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn contains(&self, dependency: &ResolvedResourceId) -> bool {
+        self.0.contains(dependency)
+    }
+
+    pub fn as_set(&self) -> &BTreeSet<ResolvedResourceId> {
+        &self.0
+    }
+
+    pub fn insert(&mut self, dependency: ResolvedResourceId) -> bool {
+        self.0.insert(dependency)
+    }
+
+    pub fn extend(&mut self, dependencies: impl IntoIterator<Item = ResolvedResourceId>) {
+        self.0.extend(dependencies);
+    }
+}
+
+impl FromIterator<ResolvedResourceId> for ResolvedDependencies {
+    fn from_iter<T: IntoIterator<Item = ResolvedResourceId>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl IntoIterator for ResolvedDependencies {
+    type Item = ResolvedResourceId;
+    type IntoIter = std::collections::btree_set::IntoIter<ResolvedResourceId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+/// Attribute-level provenance for value-reference dependency edges.
+///
+/// This is scheduler metadata, never a provider/state value. `Unknown` is
+/// conservative and prevents update/update edge relaxation; `Known` records
+/// the exact top-level attributes read from the dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ResolvedDependencyRead {
+    Known(BTreeSet<String>),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ResolvedDependencyReads(BTreeMap<ResolvedResourceId, ResolvedDependencyRead>);
+
+#[derive(Serialize)]
+struct ResolvedDependencyReadWireRef<'a> {
+    id: &'a ResolvedResourceId,
+    read: &'a ResolvedDependencyRead,
+}
+
+#[derive(Deserialize)]
+struct ResolvedDependencyReadWire {
+    id: ResolvedResourceId,
+    read: ResolvedDependencyRead,
+}
+
+impl Serialize for ResolvedDependencyReads {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for (id, read) in &self.0 {
+            sequence.serialize_element(&ResolvedDependencyReadWireRef { id, read })?;
+        }
+        sequence.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolvedDependencyReads {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let entries = Vec::<ResolvedDependencyReadWire>::deserialize(deserializer)?;
+        let mut reads = BTreeMap::new();
+        for entry in entries {
+            if reads.insert(entry.id.clone(), entry.read).is_some() {
+                return Err(D::Error::custom(format!(
+                    "duplicate resolved dependency-read address {}",
+                    entry.id,
+                )));
+            }
+        }
+        Ok(Self(reads))
+    }
+}
+
+impl ResolvedDependencyReads {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn unknown_for(dependencies: &ResolvedDependencies) -> Self {
+        Self(
+            dependencies
+                .iter()
+                .cloned()
+                .map(|id| (id, ResolvedDependencyRead::Unknown))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn insert_known(&mut self, id: ResolvedResourceId, attribute: impl Into<String>) {
+        let attribute = attribute.into();
+        self.0
+            .entry(id)
+            .and_modify(|read| {
+                if let ResolvedDependencyRead::Known(attributes) = read {
+                    attributes.insert(attribute.clone());
+                }
+            })
+            .or_insert_with(|| ResolvedDependencyRead::Known(BTreeSet::from([attribute])));
+    }
+
+    pub(crate) fn insert_unknown(&mut self, id: ResolvedResourceId) {
+        self.0.insert(id, ResolvedDependencyRead::Unknown);
+    }
+
+    pub(crate) fn ensure_unknown(&mut self, id: ResolvedResourceId) {
+        self.0.entry(id).or_insert(ResolvedDependencyRead::Unknown);
+    }
+
+    pub(crate) fn known_attributes(&self, id: &ResolvedResourceId) -> Option<&BTreeSet<String>> {
+        match self.0.get(id) {
+            Some(ResolvedDependencyRead::Known(attributes)) => Some(attributes),
+            Some(ResolvedDependencyRead::Unknown) | None => None,
+        }
+    }
+}
+
 impl ResolvedResourceId {
     pub fn with_identity(
         resource_type: impl Into<String>,
@@ -793,14 +974,100 @@ impl Borrow<ResourceId> for ResolvedResourceId {
     serialize = "S: Serialize + Clone",
     deserialize = "S: Deserialize<'de>"
 ))]
-#[serde(try_from = "Resource<S>", into = "Resource<S>")]
-pub struct ResolvedResource<S = ModuleSource>(Resource<S>);
+#[serde(try_from = "ResolvedResourceWire<S>", into = "ResolvedResourceWire<S>")]
+pub struct ResolvedResource<S = ModuleSource> {
+    resource: Resource<S>,
+    value_dependencies: ResolvedDependencies,
+    explicit_dependencies: ResolvedDependencies,
+    value_dependency_reads: ResolvedDependencyReads,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
+struct ResolvedResourceWire<S> {
+    #[serde(flatten)]
+    resource: Resource<S>,
+    #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
+    value_dependencies: ResolvedDependencies,
+    #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
+    explicit_dependencies: ResolvedDependencies,
+    #[serde(default, skip_serializing_if = "ResolvedDependencyReads::is_empty")]
+    value_dependency_reads: ResolvedDependencyReads,
+}
+
+/// Saved-plan resource whose identity and dependencies are resolved but whose
+/// authored `ignore_changes` paths still await fingerprint-checked schemas.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
+pub struct SchemaUnresolvedResource<S = SavedModuleSource> {
+    #[serde(flatten)]
+    resource: Resource<S>,
+    #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
+    value_dependencies: ResolvedDependencies,
+    #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
+    explicit_dependencies: ResolvedDependencies,
+    #[serde(default, skip_serializing_if = "ResolvedDependencyReads::is_empty")]
+    value_dependency_reads: ResolvedDependencyReads,
+}
+
+impl<S> From<ResolvedResource<S>> for SchemaUnresolvedResource<S> {
+    fn from(resource: ResolvedResource<S>) -> Self {
+        let (resource, value_dependencies, explicit_dependencies, value_dependency_reads) =
+            resource.into_parts();
+        Self {
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            value_dependency_reads,
+        }
+    }
+}
+
+impl<S> SchemaUnresolvedResource<S> {
+    pub fn id(&self) -> &ResourceId {
+        &self.resource.id
+    }
+
+    /// Borrow the saved-plan payload without weakening the fact that its
+    /// dependency addresses are already resolved.
+    pub fn as_resource(&self) -> &Resource<S> {
+        &self.resource
+    }
+
+    pub fn resolve_with_schemas(
+        mut self,
+        registry: &crate::schema::SchemaRegistry,
+    ) -> Result<ResolvedResource<S>, ResolvedResourceError> {
+        if matches!(
+            self.resource.id.identity_state(),
+            ResourceIdentityState::Pending(_)
+        ) {
+            return Err(PendingResourceIdentityError::new(self.resource.id.clone()).into());
+        }
+        resolve_resource_ignore_changes(&mut self.resource, registry)?;
+        self.resource.dependency_bindings.clear();
+        self.resource.directives.depends_on = Default::default();
+        Ok(ResolvedResource::from_resolved_parts_with_reads(
+            self.resource,
+            self.value_dependencies,
+            self.explicit_dependencies,
+            self.value_dependency_reads,
+        ))
+    }
+}
 
 pub type SavedResolvedResource = ResolvedResource<SavedModuleSource>;
 
 impl From<ResolvedResource> for SavedResolvedResource {
     fn from(resource: ResolvedResource) -> Self {
-        Self::new(resource.into_inner().into())
+        let (resource, value_dependencies, explicit_dependencies, value_dependency_reads) =
+            resource.into_parts();
+        Self::from_resolved_parts_with_reads(
+            resource.into(),
+            value_dependencies,
+            explicit_dependencies,
+            value_dependency_reads,
+        )
     }
 }
 
@@ -812,10 +1079,19 @@ pub struct PendingResourceIdentityError {
     id: ResourceId,
 }
 
+impl PendingResourceIdentityError {
+    pub fn new(id: ResourceId) -> Self {
+        Self { id }
+    }
+}
+
 /// A resource could not enter the schema-resolved planning boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedResourceError {
     PendingIdentity(PendingResourceIdentityError),
+    UnresolvedDependencies {
+        id: ResourceId,
+    },
     MissingSchema {
         id: ResourceId,
     },
@@ -829,6 +1105,10 @@ impl Display for ResolvedResourceError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::PendingIdentity(error) => Display::fmt(error, formatter),
+            Self::UnresolvedDependencies { id } => write!(
+                formatter,
+                "resource '{id}' reached the resolved boundary with unexpanded dependencies"
+            ),
             Self::MissingSchema { id } => write!(
                 formatter,
                 "resource '{id}' has ignore_changes paths but no managed resource schema"
@@ -851,7 +1131,9 @@ impl std::error::Error for ResolvedResourceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::PendingIdentity(error) => Some(error),
-            Self::MissingSchema { .. } | Self::InvalidIgnoreChanges { .. } => None,
+            Self::UnresolvedDependencies { .. }
+            | Self::MissingSchema { .. }
+            | Self::InvalidIgnoreChanges { .. } => None,
         }
     }
 }
@@ -896,7 +1178,7 @@ pub(crate) fn resolve_resource_ignore_changes<S>(
 impl ResolvedResource {
     /// Construct a resource from an already-resolved id.
     pub fn from_id(id: ResolvedResourceId) -> Self {
-        Self(Resource::from_id(id.into_inner()))
+        Self::new(Resource::from_id(id.into_inner()))
     }
 }
 
@@ -918,7 +1200,61 @@ impl<S> ResolvedResource<S> {
             resolved_ignore_changes_match(&resource),
             "ResolvedResource with ignore_changes requires schema resolution"
         );
-        Self(resource)
+        assert!(
+            resource.directives.depends_on.is_empty() && resource.dependency_bindings.is_empty(),
+            "ResolvedResource requires dependencies to be resolved"
+        );
+        Self {
+            resource,
+            value_dependencies: ResolvedDependencies::default(),
+            explicit_dependencies: ResolvedDependencies::default(),
+            value_dependency_reads: ResolvedDependencyReads::default(),
+        }
+    }
+
+    /// Construct the post-expansion form after every dependency operand has
+    /// been resolved to a complete resource address.
+    pub fn from_resolved_parts(
+        resource: Resource<S>,
+        value_dependencies: ResolvedDependencies,
+        explicit_dependencies: ResolvedDependencies,
+    ) -> Self {
+        let value_dependency_reads = ResolvedDependencyReads::unknown_for(&value_dependencies);
+        Self::from_resolved_parts_with_reads(
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            value_dependency_reads,
+        )
+    }
+
+    pub(crate) fn from_resolved_parts_with_reads(
+        resource: Resource<S>,
+        value_dependencies: ResolvedDependencies,
+        explicit_dependencies: ResolvedDependencies,
+        value_dependency_reads: ResolvedDependencyReads,
+    ) -> Self {
+        assert!(
+            matches!(
+                resource.id.identity_state(),
+                ResourceIdentityState::Resolved(_)
+            ),
+            "ResolvedResource requires identity"
+        );
+        assert!(
+            resolved_ignore_changes_match(&resource),
+            "ResolvedResource with ignore_changes requires schema resolution"
+        );
+        assert!(
+            resource.directives.depends_on.is_empty() && resource.dependency_bindings.is_empty(),
+            "ResolvedResource cannot retain unexpanded dependencies"
+        );
+        Self {
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            value_dependency_reads,
+        }
     }
 
     /// Try to construct; returns `None` if identity is pending.
@@ -971,12 +1307,17 @@ impl<S> ResolvedResource<S> {
             .into());
         }
         resolve_resource_ignore_changes(&mut resource, registry)?;
-        Ok(Self(resource))
+        if !resource.directives.depends_on.is_empty() || !resource.dependency_bindings.is_empty() {
+            return Err(ResolvedResourceError::UnresolvedDependencies {
+                id: resource.id.clone(),
+            });
+        }
+        Ok(Self::new(resource))
     }
 
     /// Borrow the inner [`Resource`].
     pub fn as_inner(&self) -> &Resource<S> {
-        &self.0
+        &self.resource
     }
 
     /// Borrow the underlying resource for provider-boundary consumers.
@@ -986,11 +1327,67 @@ impl<S> ResolvedResource<S> {
 
     /// Consume and return the inner [`Resource`].
     pub fn into_inner(self) -> Resource<S> {
-        self.0
+        self.resource
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Resource<S>,
+        ResolvedDependencies,
+        ResolvedDependencies,
+        ResolvedDependencyReads,
+    ) {
+        (
+            self.resource,
+            self.value_dependencies,
+            self.explicit_dependencies,
+            self.value_dependency_reads,
+        )
+    }
+
+    /// Replace only the value-bearing resource payload while preserving the
+    /// already-resolved graph metadata. Used by redaction and rehydration,
+    /// which may rewrite attributes but must not discard dependency edges.
+    pub fn replace_inner(&self, resource: Resource<S>) -> Self {
+        assert_eq!(
+            resource.id, self.resource.id,
+            "replacing a resolved resource cannot change its address"
+        );
+        Self::from_resolved_parts_with_reads(
+            resource,
+            self.value_dependencies.clone(),
+            self.explicit_dependencies.clone(),
+            self.value_dependency_reads.clone(),
+        )
+    }
+
+    pub fn value_dependencies(&self) -> &ResolvedDependencies {
+        &self.value_dependencies
+    }
+
+    pub fn explicit_dependencies(&self) -> &ResolvedDependencies {
+        &self.explicit_dependencies
+    }
+
+    pub(crate) fn known_dependency_reads(
+        &self,
+        dependency: &ResolvedResourceId,
+    ) -> Option<&BTreeSet<String>> {
+        if self.explicit_dependencies.contains(dependency) {
+            return None;
+        }
+        self.value_dependency_reads.known_attributes(dependency)
+    }
+
+    pub fn all_dependencies(&self) -> impl Iterator<Item = &ResolvedResourceId> {
+        self.value_dependencies
+            .iter()
+            .chain(self.explicit_dependencies.iter())
     }
 
     pub fn identity(&self) -> &ResourceIdentity {
-        match self.0.id.identity_state() {
+        match self.resource.id.identity_state() {
             ResourceIdentityState::Pending(_) => {
                 unreachable!("ResolvedResource requires identity")
             }
@@ -1003,16 +1400,16 @@ impl<S> ResolvedResource<S> {
     }
 
     pub fn resolved_id(&self) -> ResolvedResourceId {
-        ResolvedResourceId(self.0.id.clone())
+        ResolvedResourceId(self.resource.id.clone())
     }
 
     pub fn ignore_changes(&self) -> &ResolvedIgnoreChanges {
-        &self.0.resolved_ignore_changes
+        &self.resource.resolved_ignore_changes
     }
 
     /// Set an attribute without weakening the resolved-identity invariant.
     pub fn set_attr(&mut self, key: impl Into<String>, value: Value) {
-        self.0.attributes.insert(key.into(), value);
+        self.resource.attributes.insert(key.into(), value);
     }
 }
 
@@ -1020,13 +1417,13 @@ impl<S> Deref for ResolvedResource<S> {
     type Target = Resource<S>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.resource
     }
 }
 
 impl<S> From<ResolvedResource<S>> for Resource<S> {
     fn from(resource: ResolvedResource<S>) -> Self {
-        resource.0
+        resource.resource
     }
 }
 
@@ -1038,6 +1435,44 @@ impl<S> TryFrom<Resource<S>> for ResolvedResource<S> {
             return Err("ignore_changes requires schema resolution".to_string());
         }
         Self::try_new(resource).ok_or_else(|| "identity is required".to_string())
+    }
+}
+
+impl<S> TryFrom<ResolvedResourceWire<S>> for ResolvedResource<S> {
+    type Error = String;
+
+    fn try_from(wire: ResolvedResourceWire<S>) -> Result<Self, Self::Error> {
+        if !resolved_ignore_changes_match(&wire.resource) {
+            return Err("ignore_changes requires schema resolution".to_string());
+        }
+        if matches!(
+            wire.resource.id.identity_state(),
+            ResourceIdentityState::Pending(_)
+        ) {
+            return Err("identity is required".to_string());
+        }
+        if !wire.resource.directives.depends_on.is_empty()
+            || !wire.resource.dependency_bindings.is_empty()
+        {
+            return Err("resolved resource contains unexpanded dependencies".to_string());
+        }
+        Ok(Self {
+            resource: wire.resource,
+            value_dependencies: wire.value_dependencies,
+            explicit_dependencies: wire.explicit_dependencies,
+            value_dependency_reads: wire.value_dependency_reads,
+        })
+    }
+}
+
+impl<S> From<ResolvedResource<S>> for ResolvedResourceWire<S> {
+    fn from(resource: ResolvedResource<S>) -> Self {
+        Self {
+            resource: resource.resource,
+            value_dependencies: resource.value_dependencies,
+            explicit_dependencies: resource.explicit_dependencies,
+            value_dependency_reads: resource.value_dependency_reads,
+        }
     }
 }
 
@@ -2278,7 +2713,7 @@ pub enum ConcreteValue {
 /// evaluation boundaries. A structural handle never becomes a public
 /// [`Value`]; only its canonical access base is exposed to reference walkers.
 ///
-/// [`crate::eval_value::StructuralHandleMetadata`] is intentionally separate:
+/// [`crate::eval_value::UnexpandedStructuralHandleMetadata`] is intentionally separate:
 /// it is a pre-classification tree for directory fixed-point parsing, whereas
 /// this enum represents one already-classified argument operand.
 #[derive(Debug, Clone, PartialEq)]
@@ -2288,7 +2723,7 @@ pub(crate) enum StructuralOperand {
         access_base: Option<Value>,
     },
     Handle {
-        handle: crate::eval_value::StructuralHandle,
+        handle: crate::eval_value::UnexpandedStructuralHandle,
         access_base: Value,
     },
     /// A bare module parameter forwarded across a nested argument boundary
@@ -2302,7 +2737,7 @@ pub(crate) enum StructuralOperand {
 pub(crate) enum StructuralOperandRef<'a> {
     Value(&'a Value),
     Handle {
-        handle: &'a crate::eval_value::StructuralHandle,
+        handle: &'a crate::eval_value::UnexpandedStructuralHandle,
         access_base: &'a Value,
     },
     Parameter {
@@ -2343,7 +2778,7 @@ impl StructuralOperand {
         Self::Value { value, access_base }
     }
 
-    pub(crate) fn from_handle(handle: crate::eval_value::StructuralHandle) -> Self {
+    pub(crate) fn from_handle(handle: crate::eval_value::UnexpandedStructuralHandle) -> Self {
         let access_base = handle.access_base_value();
         Self::Handle {
             handle,
@@ -2352,7 +2787,7 @@ impl StructuralOperand {
     }
 
     pub(crate) fn from_handle_with_access_base(
-        handle: crate::eval_value::StructuralHandle,
+        handle: crate::eval_value::UnexpandedStructuralHandle,
         access_base: Value,
     ) -> Self {
         Self::Handle {
@@ -2368,7 +2803,7 @@ impl StructuralOperand {
         }
     }
 
-    pub(crate) fn handle(&self) -> Option<&crate::eval_value::StructuralHandle> {
+    pub(crate) fn handle(&self) -> Option<&crate::eval_value::UnexpandedStructuralHandle> {
         match self {
             Self::Value { .. } | Self::Parameter { .. } => None,
             Self::Handle { handle, .. } => Some(handle),
@@ -2489,7 +2924,7 @@ impl FunctionArgument {
         }
     }
 
-    pub(crate) fn from_handle(handle: crate::eval_value::StructuralHandle) -> Self {
+    pub(crate) fn from_handle(handle: crate::eval_value::UnexpandedStructuralHandle) -> Self {
         Self {
             operand: StructuralOperand::from_handle(handle),
         }
@@ -2499,7 +2934,7 @@ impl FunctionArgument {
         self.operand.value()
     }
 
-    pub(crate) fn handle(&self) -> Option<&crate::eval_value::StructuralHandle> {
+    pub(crate) fn handle(&self) -> Option<&crate::eval_value::UnexpandedStructuralHandle> {
         self.operand.handle()
     }
 
@@ -2549,7 +2984,7 @@ impl fmt::Debug for FunctionArgument {
         match self.operand.value_ref() {
             StructuralOperandRef::Value(value) => value.fmt(f),
             StructuralOperandRef::Handle { handle, .. } => f
-                .debug_tuple("StructuralHandleArgument")
+                .debug_tuple("UnexpandedStructuralHandleArgument")
                 .field(handle)
                 .finish(),
             StructuralOperandRef::Parameter { name, .. } => f
@@ -5997,8 +6432,8 @@ pub struct Directives {
     /// binding name of a sibling `let` (resource / wait / module).
     /// Set semantics (deduplicated, order-insensitive); represented as
     /// Vec to preserve source order for `carina fmt` round-tripping.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub depends_on: Vec<String>,
+    #[serde(skip)]
+    pub depends_on: crate::parser::UnexpandedDependencies,
     /// Authored attribute paths whose external changes Carina must preserve.
     /// These remain syntax-only until resolved against the resource schema.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -6024,19 +6459,19 @@ pub struct PersistedDirectives {
     pub create_before_destroy: bool,
     #[serde(default)]
     pub prevent_destroy: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
+    pub depends_on: ResolvedDependencies,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_instance: Option<String>,
 }
 
-impl From<&Directives> for PersistedDirectives {
-    fn from(directives: &Directives) -> Self {
+impl PersistedDirectives {
+    pub fn from_resolved(directives: &Directives, depends_on: ResolvedDependencies) -> Self {
         let Directives {
             force_delete,
             create_before_destroy,
             prevent_destroy,
-            depends_on,
+            depends_on: _unexpanded_dependencies,
             ignore_changes: _ignore_changes,
             provider_instance,
         } = directives;
@@ -6044,15 +6479,9 @@ impl From<&Directives> for PersistedDirectives {
             force_delete: *force_delete,
             create_before_destroy: *create_before_destroy,
             prevent_destroy: *prevent_destroy,
-            depends_on: depends_on.clone(),
+            depends_on,
             provider_instance: provider_instance.clone(),
         }
-    }
-}
-
-impl From<Directives> for PersistedDirectives {
-    fn from(directives: Directives) -> Self {
-        Self::from(&directives)
     }
 }
 
@@ -6062,7 +6491,7 @@ impl From<&PersistedDirectives> for Directives {
             force_delete: directives.force_delete,
             create_before_destroy: directives.create_before_destroy,
             prevent_destroy: directives.prevent_destroy,
-            depends_on: directives.depends_on.clone(),
+            depends_on: crate::parser::UnexpandedDependencies::default(),
             ignore_changes: Vec::new(),
             provider_instance: directives.provider_instance.clone(),
         }
@@ -6072,18 +6501,6 @@ impl From<&PersistedDirectives> for Directives {
 impl From<PersistedDirectives> for Directives {
     fn from(directives: PersistedDirectives) -> Self {
         Self::from(&directives)
-    }
-}
-
-impl PartialEq<Directives> for PersistedDirectives {
-    fn eq(&self, other: &Directives) -> bool {
-        self == &Self::from(other)
-    }
-}
-
-impl PartialEq<PersistedDirectives> for Directives {
-    fn eq(&self, other: &PersistedDirectives) -> bool {
-        other == self
     }
 }
 
@@ -6466,7 +6883,7 @@ pub struct Resource<S = ModuleSource> {
     /// in the resource's attributes contributes a single entry, and
     /// iteration is alphabetically sorted so consumers (plan display,
     /// state files) see a deterministic order. See #2228.
-    #[serde(default)]
+    #[serde(default, skip)]
     pub dependency_bindings: BTreeSet<String>,
     /// Module source info for resources that belong to a module
     #[serde(default)]
@@ -6559,7 +6976,7 @@ impl Resource {
             resolved_ignore_changes: ResolvedIgnoreChanges::default(),
             prefixes: HashMap::new(),
             binding: None,
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_source: None,
             default_tag_keys: DefaultTagKeys::default(),
             loop_provenance: LoopProvenance::default(),
@@ -6655,16 +7072,17 @@ impl<S> Resource<S> {
         let Resource {
             id,
             attributes,
-            directives,
+            mut directives,
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependency_bindings: _,
             module_source: _,
             default_tag_keys,
             loop_provenance: _,
             quoted_string_attrs,
         } = self;
+        directives.depends_on = Default::default();
         ProviderResource {
             id,
             attributes,
@@ -6672,7 +7090,7 @@ impl<S> Resource<S> {
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependency_bindings: Default::default(),
             module_source: None,
             default_tag_keys,
             loop_provenance: LoopProvenance::default(),
@@ -6681,23 +7099,34 @@ impl<S> Resource<S> {
     }
 
     /// Apply provider-normalized fields while retaining the exact live or
-    /// saved module provenance already attached to this resource.
+    /// saved host metadata already attached to this resource.
     pub(crate) fn apply_provider_resource(&mut self, provider: ProviderResource) {
         let module_source = self.module_source.take();
         let loop_provenance = std::mem::take(&mut self.loop_provenance);
+        let dependency_bindings = std::mem::take(&mut self.dependency_bindings);
+        let authored_depends_on = std::mem::take(&mut self.directives.depends_on);
         let Resource {
             id,
             attributes,
-            directives,
+            mut directives,
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependency_bindings: provider_dependency_bindings,
             module_source: _,
             default_tag_keys,
             loop_provenance: _,
             quoted_string_attrs,
         } = provider;
+        assert!(
+            provider_dependency_bindings.is_empty(),
+            "provider normalizer returned host-only dependency bindings for {id}",
+        );
+        assert!(
+            directives.depends_on.is_empty(),
+            "provider normalizer returned host-only depends_on operands for {id}",
+        );
+        directives.depends_on = authored_depends_on;
         *self = Self {
             id,
             attributes,
@@ -7964,7 +8393,7 @@ impl Current {
         }
     }
 
-    pub fn set_dependency_bindings(&mut self, dependency_bindings: BTreeSet<String>) {
+    pub fn set_dependency_bindings(&mut self, dependency_bindings: ResolvedDependencies) {
         match self {
             Self::Absent(state) => state.0.dependency_bindings = dependency_bindings,
             Self::Present(present) => {
@@ -8087,11 +8516,10 @@ pub struct State {
     pub attributes: HashMap<String, Value>,
     /// Whether this state exists
     pub exists: bool,
-    /// Binding names this resource depended on when it was last applied.
+    /// Complete resource addresses this resource depended on when it was last applied.
     /// Used by the executor to determine delete ordering during replace operations.
     ///
-    /// Set semantics (BTreeSet) — see Resource::dependency_bindings (#2228).
-    pub dependency_bindings: BTreeSet<String>,
+    pub dependency_bindings: ResolvedDependencies,
     /// Present when this state came from a partial-success create.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_read: Option<PartialReadMarker>,
@@ -8104,7 +8532,7 @@ impl State {
             identifier: None,
             attributes: HashMap::new(),
             exists: false,
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: ResolvedDependencies::default(),
             partial_read: None,
         }
     }
@@ -8115,7 +8543,7 @@ impl State {
             identifier: None,
             attributes,
             exists: true,
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: ResolvedDependencies::default(),
             partial_read: None,
         }
     }
@@ -8125,7 +8553,7 @@ impl State {
         self
     }
 
-    pub fn with_dependency_bindings(mut self, deps: BTreeSet<String>) -> Self {
+    pub fn with_dependency_bindings(mut self, deps: ResolvedDependencies) -> Self {
         self.dependency_bindings = deps;
         self
     }

@@ -1074,9 +1074,9 @@ pub(crate) enum AttrTypeKind {
     },
     /// A resource handle used only by the schema-level boundary relation.
     ///
-    /// Handles are string-backed until #3803's transport work lands, but they
-    /// retain the declared resource path so assignability can reject a handle
-    /// flowing into a scalar or a different resource type.
+    /// This is a structural capability, not a provider value. It is
+    /// assignable only to the same resource-handle type and cannot validate a
+    /// concrete scalar.
     ResourceHandle {
         provider: String,
         resource_type: String,
@@ -3266,7 +3266,6 @@ impl AttributeType {
                     .callback()
                     .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
             }
-            (AttrTypeKind::ResourceHandle { .. }, ConcreteValueRef::String(_)) => Ok(()),
             (AttrTypeKind::StringLiteralSet { values }, ConcreteValueRef::String(value))
                 if values.iter().any(|candidate| candidate == value) =>
             {
@@ -3737,12 +3736,6 @@ impl<'source> TypeInSchema<'source> {
                     ..
                 },
             ) => source_provider == sink_provider && source_resource == sink_resource,
-            // #3803 transport is not implemented yet, so resource handles are
-            // represented by id strings at runtime. Preserve main's
-            // compatibility with every open string-shaped sink while keeping
-            // closed literal sets closed.
-            (ResourceHandle { .. }, String { .. }) => true,
-            (ResourceHandle { .. }, StringLiteralSet { .. }) => false,
             (ResourceHandle { .. }, _) => false,
             // Literal declarations carry string evidence but not the identity
             // evidence required by a provider custom type (#2648).
@@ -3759,13 +3752,8 @@ impl<'source> TypeInSchema<'source> {
             (StringLiteralSet { values: source, .. }, StringLiteralSet { values: sink, .. }) => {
                 source.iter().all(|value| sink.contains(value))
             }
-            // String-backed values and attributes may still flow into a Ref
-            // sink until resource-handle transport is implemented. Numeric and
-            // structural sources never reach this arm.
-            (String { .. } | Enum { .. } | StringLiteralSet { .. }, ResourceHandle { .. }) => true,
             // Preserve the pre-existing declared String -> literal-union
-            // behavior while ensuring ResourceHandle took the rejecting arm
-            // above.
+            // behavior.
             (String { .. }, StringLiteralSet { .. }) => true,
             (_, ResourceHandle { .. } | StringLiteralSet { .. }) => false,
             (
@@ -4738,7 +4726,6 @@ fn union_member_judgement_on_path<'a>(
         // Same-constructor match — second tier.
         (AT::Map { .. }, ConcreteValueRef::Map(_))
         | (AT::String { .. }, ConcreteValueRef::String(_))
-        | (AT::ResourceHandle { .. }, ConcreteValueRef::String(_))
         | (AT::StringLiteralSet { .. }, ConcreteValueRef::String(_))
         | (AT::Int { .. }, ConcreteValueRef::Int(_))
         | (AT::Float { .. }, ConcreteValueRef::Float(_))

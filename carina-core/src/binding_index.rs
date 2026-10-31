@@ -50,7 +50,8 @@ use crate::resource::{
     ResourceId, SavedComposition, SavedModuleSource, SavedResource, State, Subscript, Value,
 };
 use crate::schema::{
-    AttributeType, ResourceSchema, SchemaRegistry, Shape, TypeInSchema, suggest_similar_name,
+    AttrTypeKind, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry, Shape, TypeInSchema,
+    suggest_similar_name,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -285,6 +286,35 @@ impl ResolvedRefType {
             .resolved_type_name()
     }
 
+    /// The managed resource type when this reference is a bare structural
+    /// handle. Value validators use this to preserve the language-level
+    /// "handle, not a value" diagnostic instead of presenting the capability
+    /// as an ordinary scalar type mismatch.
+    pub fn resource_handle_type(&self) -> Option<crate::parser::ResourceTypePath> {
+        match self.authoritative.constraint().attr_type.kind() {
+            AttrTypeKind::ResourceHandle {
+                provider,
+                resource_type,
+                ..
+            } => Some(crate::parser::ResourceTypePath::new(
+                provider.clone(),
+                resource_type.clone(),
+            )),
+            AttrTypeKind::String { .. }
+            | AttrTypeKind::StringLiteralSet { .. }
+            | AttrTypeKind::Int { .. }
+            | AttrTypeKind::Float { .. }
+            | AttrTypeKind::Bool
+            | AttrTypeKind::Duration
+            | AttrTypeKind::Enum { .. }
+            | AttrTypeKind::List { .. }
+            | AttrTypeKind::Map { .. }
+            | AttrTypeKind::Struct { .. }
+            | AttrTypeKind::Union(_)
+            | AttrTypeKind::Ref(_) => None,
+        }
+    }
+
     /// Require the authoritative boundary type and every inferred constraint
     /// accumulated through forwarded composition attributes to satisfy
     /// `sink`. The returned mismatch identifies the first failing constraint;
@@ -445,6 +475,12 @@ pub struct BindingIndex<'a> {
     entries: HashMap<String, BindingEntry<'a>>,
     known_names: std::collections::HashSet<String>,
     resource_handles: HashMap<String, AttributeType>,
+    /// Handle outputs are deliberately not inserted into a live composition
+    /// until the expanded-graph seam can resolve them to complete resource
+    /// IDs. Validation still needs their resource schema before that seam, so
+    /// keep this index-only view keyed by the visible composition binding.
+    pending_composition_handles: HashMap<String, HashMap<String, crate::parser::ResourceTypePath>>,
+    registry: &'a SchemaRegistry,
     user_functions: &'a HashMap<String, crate::parser::UserFunction>,
 }
 
@@ -512,6 +548,33 @@ impl<'a> BindingIndex<'a> {
         let mut entries = HashMap::new();
         let mut known_names = std::collections::HashSet::new();
         let mut resource_handles = HashMap::new();
+        let composition_bindings = parsed
+            .compositions
+            .iter()
+            .filter_map(|composition| {
+                composition
+                    .binding
+                    .as_ref()
+                    .map(|binding| (composition.instance.as_str(), binding.as_str()))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut pending_composition_handles: HashMap<
+            String,
+            HashMap<String, crate::parser::ResourceTypePath>,
+        > = HashMap::new();
+        for attribute in &parsed.unexpanded_composition_attributes {
+            let Some(binding) = composition_bindings.get(attribute.composition_instance.as_str())
+            else {
+                continue;
+            };
+            pending_composition_handles
+                .entry((*binding).to_string())
+                .or_default()
+                .insert(
+                    attribute.name.clone(),
+                    attribute.handle.resource_type().clone(),
+                );
+        }
         // Walk top-level resources only — managed resources, data
         // sources, and compositions (carina#3181: `iter_top_level_resources`
         // chains the typed slices and excludes deferred for-body
@@ -592,11 +655,47 @@ impl<'a> BindingIndex<'a> {
             }
         }
 
-        // Module arguments are typed values in their own module scope. They
-        // come after addressable resource bindings so malformed duplicate-name
-        // input preserves BindingNameSet's resource-first precedence.
+        // Module arguments are typed bindings in their own module scope.
+        // Explicit Ref declarations are handles by construction. During the
+        // bootstrap pass, dotted declarations have not yet been rewritten to
+        // Ref, so classify one as a handle only when the managed-resource
+        // registry proves that interpretation. They come after addressable
+        // resource bindings so malformed duplicate-name input preserves
+        // BindingNameSet's resource-first precedence.
         for argument in &parsed.arguments {
             known_names.insert(argument.name.clone());
+            let resource_type = match &argument.static_type {
+                crate::parser::TypeExpr::Ref(resource_type) => Some(resource_type),
+                crate::parser::TypeExpr::DottedUnresolved(resource_type) => registry
+                    .get(
+                        &resource_type.provider,
+                        &resource_type.resource_type,
+                        SchemaKind::Resource,
+                    )
+                    .map(|_| resource_type),
+                crate::parser::TypeExpr::String
+                | crate::parser::TypeExpr::Bool
+                | crate::parser::TypeExpr::Int
+                | crate::parser::TypeExpr::Float
+                | crate::parser::TypeExpr::Duration
+                | crate::parser::TypeExpr::Simple(_)
+                | crate::parser::TypeExpr::List(_)
+                | crate::parser::TypeExpr::Map(_)
+                | crate::parser::TypeExpr::SchemaType { .. }
+                | crate::parser::TypeExpr::Struct { .. }
+                | crate::parser::TypeExpr::StringLiteral(_)
+                | crate::parser::TypeExpr::Union(_) => None,
+            };
+            if let Some(resource_type) = resource_type {
+                resource_handles
+                    .entry(argument.name.clone())
+                    .or_insert_with(|| {
+                        AttributeType::resource_handle(
+                            resource_type.provider.clone(),
+                            resource_type.resource_type.clone(),
+                        )
+                    });
+            }
             entries
                 .entry(argument.name.clone())
                 .or_insert(BindingEntry {
@@ -624,6 +723,8 @@ impl<'a> BindingIndex<'a> {
             entries,
             known_names,
             resource_handles,
+            pending_composition_handles,
+            registry,
             user_functions: &parsed.user_functions,
         }
     }
@@ -682,6 +783,17 @@ impl<'a> BindingIndex<'a> {
                 handle.clone(),
                 crate::schema::empty_defs_for_schema_walks().clone(),
             ));
+        }
+
+        if let ReferencePathRef::Access(path) = reference
+            && let Some(resource_type) = self
+                .pending_composition_handles
+                .get(path.binding())
+                .and_then(|attributes| attributes.get(path.attribute()))
+        {
+            let result = self.resource_handle_output_ref_type(path, resource_type, check);
+            visiting.remove(&key);
+            return result;
         }
 
         let result = match self.entries.get(reference.binding()) {
@@ -744,75 +856,91 @@ impl<'a> BindingIndex<'a> {
                         ));
                     };
 
-                    match attribute.declared_type() {
-                        Some(crate::static_type::StaticType::Known(resolved)) => {
-                            let Some(declared) =
-                                crate::validation::lift_type_expr(resolved.type_expr())
-                            else {
-                                visiting.remove(&key);
-                                return RefType::Unchecked;
-                            };
-                            let defs = crate::schema::empty_defs_for_schema_walks();
-                            let rendered_path = path.to_dot_string();
-                            match narrow_type(
-                                &declared,
-                                path.segments(),
-                                defs,
-                                &rendered_path,
-                                invalid_access,
-                            ) {
-                                Ok(Some(attr_type)) => {
-                                    let inferred =
-                                        attribute.forwarded_path().and_then(|forwarded| match self
-                                            .ref_type_inner(
-                                                ReferencePathRef::Access(forwarded),
-                                                visiting,
-                                                check,
-                                            ) {
-                                            RefType::Typed(resolved) => resolved
-                                                .narrow(path.segments(), path, invalid_access)
-                                                .ok()
-                                                .flatten(),
-                                            RefType::Unchecked
-                                            | RefType::UnknownBinding { .. }
-                                            | RefType::UnknownAttribute(_) => None,
-                                        });
-                                    RefType::Typed(ResolvedRefType::with_declared_type(
-                                        ResolvedTypeConstraint::new(
-                                            attr_type.clone(),
-                                            defs.clone(),
-                                        ),
-                                        inferred,
-                                    ))
-                                }
-                                Ok(None) => RefType::Unchecked,
-                                Err(error) => RefType::UnknownAttribute(error),
-                            }
-                        }
-                        Some(crate::static_type::StaticType::Unchecked(_reason))
-                            if attribute.source_argument().is_some() =>
-                        {
-                            RefType::Unchecked
-                        }
-                        Some(crate::static_type::StaticType::Unchecked(_)) | None => {
-                            if let Some(forwarded) = attribute.forwarded_path() {
-                                match self.ref_type_inner(
-                                    ReferencePathRef::Access(forwarded),
-                                    visiting,
-                                    check,
+                    if let Some(handle) = attribute.handle() {
+                        let resource_type = crate::parser::ResourceTypePath::new(
+                            handle.provider(),
+                            handle.resource_type(),
+                        );
+                        self.resource_handle_output_ref_type(path, &resource_type, check)
+                    } else {
+                        match attribute.declared_type() {
+                            Some(crate::static_type::StaticType::Known(resolved)) => {
+                                let Some(declared) =
+                                    crate::validation::lift_type_expr(resolved.type_expr())
+                                else {
+                                    visiting.remove(&key);
+                                    return RefType::Unchecked;
+                                };
+                                let defs = crate::schema::empty_defs_for_schema_walks();
+                                let rendered_path = path.to_dot_string();
+                                match narrow_type(
+                                    &declared,
+                                    path.segments(),
+                                    defs,
+                                    &rendered_path,
+                                    invalid_access,
                                 ) {
-                                    RefType::Typed(resolved) => {
-                                        match resolved.narrow(path.segments(), path, invalid_access)
-                                        {
-                                            Ok(Some(resolved)) => RefType::Typed(resolved),
-                                            Ok(None) => RefType::Unchecked,
-                                            Err(error) => RefType::UnknownAttribute(error),
-                                        }
+                                    Ok(Some(attr_type)) => {
+                                        let inferred =
+                                            attribute.forwarded_path().and_then(|forwarded| {
+                                                match self.ref_type_inner(
+                                                    ReferencePathRef::Access(forwarded),
+                                                    visiting,
+                                                    check,
+                                                ) {
+                                                    RefType::Typed(resolved) => resolved
+                                                        .narrow(
+                                                            path.segments(),
+                                                            path,
+                                                            invalid_access,
+                                                        )
+                                                        .ok()
+                                                        .flatten(),
+                                                    RefType::Unchecked
+                                                    | RefType::UnknownBinding { .. }
+                                                    | RefType::UnknownAttribute(_) => None,
+                                                }
+                                            });
+                                        RefType::Typed(ResolvedRefType::with_declared_type(
+                                            ResolvedTypeConstraint::new(
+                                                attr_type.clone(),
+                                                defs.clone(),
+                                            ),
+                                            inferred,
+                                        ))
                                     }
-                                    other => other,
+                                    Ok(None) => RefType::Unchecked,
+                                    Err(error) => RefType::UnknownAttribute(error),
                                 }
-                            } else {
+                            }
+                            Some(crate::static_type::StaticType::Unchecked(_reason))
+                                if attribute.source_argument().is_some() =>
+                            {
                                 RefType::Unchecked
+                            }
+                            Some(crate::static_type::StaticType::Unchecked(_)) | None => {
+                                if let Some(forwarded) = attribute.forwarded_path() {
+                                    match self.ref_type_inner(
+                                        ReferencePathRef::Access(forwarded),
+                                        visiting,
+                                        check,
+                                    ) {
+                                        RefType::Typed(resolved) => {
+                                            match resolved.narrow(
+                                                path.segments(),
+                                                path,
+                                                invalid_access,
+                                            ) {
+                                                Ok(Some(resolved)) => RefType::Typed(resolved),
+                                                Ok(None) => RefType::Unchecked,
+                                                Err(error) => RefType::UnknownAttribute(error),
+                                            }
+                                        }
+                                        other => other,
+                                    }
+                                } else {
+                                    RefType::Unchecked
+                                }
                             }
                         }
                     }
@@ -839,6 +967,9 @@ impl<'a> BindingIndex<'a> {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
+                    if let crate::parser::TypeExpr::Ref(resource_type) = type_expr {
+                        return self.resource_handle_output_ref_type(path, resource_type, check);
+                    }
                     let Some(declared) = crate::validation::lift_type_expr(type_expr) else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
@@ -972,6 +1103,66 @@ impl<'a> BindingIndex<'a> {
 
         visiting.remove(&key);
         result
+    }
+
+    /// Resolve a module output whose boundary type is a resource handle.
+    /// The output name consumes the `binding.attribute` head; any remaining
+    /// path starts at the managed resource's schema. A bare output remains a
+    /// handle so ordinary value sinks reject it through normal type checking.
+    fn resource_handle_output_ref_type(
+        &self,
+        path: &AccessPath,
+        resource_type: &crate::parser::ResourceTypePath,
+        check: ReferenceTypeCheck,
+    ) -> RefType {
+        let Some((first, rest)) = path.segments().split_first() else {
+            return RefType::Typed(ResolvedRefType::new(
+                AttributeType::resource_handle(
+                    resource_type.provider.clone(),
+                    resource_type.resource_type.clone(),
+                ),
+                crate::schema::empty_defs_for_schema_walks().clone(),
+            ));
+        };
+        let PathSegment::Field { name } = first else {
+            return RefType::UnknownAttribute(RefTypeError::InvalidAccess {
+                path: path.to_dot_string(),
+                step: first.clone(),
+                actual: format!("resource handle {resource_type}"),
+            });
+        };
+        let Some(schema) = self.registry.get(
+            &resource_type.provider,
+            &resource_type.resource_type,
+            SchemaKind::Resource,
+        ) else {
+            return RefType::Unchecked;
+        };
+        let schema = schema.schema().as_schema();
+        let Some(attribute) = schema.attributes.get(name) else {
+            return RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
+                binding: format!("{}.{}", path.binding(), path.attribute()),
+                attribute: name.clone(),
+                known_attributes: schema.attributes.keys().cloned().collect(),
+                target: RefTargetKind::Schema {
+                    resource_type: resource_type.to_string(),
+                },
+            });
+        };
+        let rendered_path = path.to_dot_string();
+        match narrow_type(
+            &attribute.attr_type,
+            rest,
+            &schema.defs,
+            &rendered_path,
+            check.invalid_access_policy(BindingTarget::Schema(schema)),
+        ) {
+            Ok(Some(attr_type)) => {
+                RefType::Typed(ResolvedRefType::new(attr_type.clone(), schema.defs.clone()))
+            }
+            Ok(None) => RefType::Unchecked,
+            Err(error) => RefType::UnknownAttribute(error),
+        }
     }
 
     /// True iff a binding by this name was declared anywhere in the parsed
@@ -2610,7 +2801,7 @@ let existing = read aws.ec2.Vpc {
                 rhs: Value::Concrete(crate::resource::ConcreteValue::String("ready".into())),
             },
             timeout_secs: None,
-            depends_on: Vec::new(),
+            depends_on: Default::default(),
             line: 1,
         });
 
@@ -3062,20 +3253,43 @@ let vpc = aws.ec2.Vpc {
         ]))
         .expect("literal union must be liftable");
 
-        for accepted in [AttributeType::string(), same] {
-            assert!(
-                vpc.is_assignable_to_sink(TypeInSchema::schemaless(&accepted))
-                    .is_ok(),
-                "resource handles retain main's string-shaped compatibility"
-            );
-        }
-        for rejected in [AttributeType::int(), different, literal_union] {
+        assert!(
+            vpc.is_assignable_to_sink(TypeInSchema::schemaless(&same))
+                .is_ok(),
+            "a matching resource handle must satisfy the boundary"
+        );
+        for rejected in [
+            AttributeType::string(),
+            AttributeType::int(),
+            different,
+            literal_union,
+        ] {
             assert!(
                 vpc.is_assignable_to_sink(TypeInSchema::schemaless(&rejected))
                     .is_err(),
-                "resource handles must not flow into non-string, closed-literal, or different-handle sinks"
+                "resource handles must not flow into value or different-handle sinks"
             );
         }
+    }
+
+    #[test]
+    fn ref_type_classifies_bootstrap_dotted_module_argument_as_managed_handle() {
+        let mut parsed = parse("", &Default::default()).expect("parse");
+        let resource_type = ResourceTypePath::new("aws", "ec2.Vpc");
+        parsed.arguments.push(ArgumentParameter {
+            name: "vpc".to_string(),
+            static_type: TypeExpr::DottedUnresolved(resource_type.clone()),
+            default: None,
+            description: None,
+            validations: Vec::new(),
+        });
+        let registry = registry_with_vpc();
+        let index = BindingIndex::from_parsed(&parsed, &registry);
+
+        let RefType::Typed(vpc) = index.ref_type("vpc") else {
+            panic!("a dotted module argument naming a managed schema must be a handle");
+        };
+        assert_eq!(vpc.resource_handle_type(), Some(resource_type));
     }
 
     #[test]
@@ -3236,8 +3450,6 @@ mod resolved_bindings_tests {
         ConcreteValue, DataSource, DeferredValue, PartialReadMarker, PendingReRead, Resource,
         ResourceId, State, UnknownReason, Value,
     };
-    use std::collections::BTreeSet;
-
     fn secret_preserving(attributes: &HashMap<String, Value>) -> SecretPreservingAttributes {
         SecretPreservingAttributes::from_provider_values(attributes, attributes)
     }
@@ -3327,7 +3539,7 @@ mod resolved_bindings_tests {
                 ]
                 .into_iter()
                 .collect(),
-                dependency_bindings: BTreeSet::new(),
+                dependency_bindings: Default::default(),
 
                 partial_read: None,
             },
@@ -3570,7 +3782,7 @@ mod resolved_bindings_tests {
                 )]
                 .into_iter()
                 .collect(),
-                dependency_bindings: BTreeSet::new(),
+                dependency_bindings: Default::default(),
 
                 partial_read: None,
             },
@@ -3635,7 +3847,7 @@ mod resolved_bindings_tests {
             ]
             .into_iter()
             .collect(),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
 
             partial_read: None,
         };
@@ -3678,7 +3890,7 @@ mod resolved_bindings_tests {
             identifier: None,
             exists: true,
             attributes: HashMap::from([("comment".to_string(), plaintext.clone())]),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             partial_read: None,
         };
 
@@ -3703,7 +3915,7 @@ mod resolved_bindings_tests {
             identifier: None,
             exists: true,
             attributes: HashMap::new(),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
 
             partial_read: None,
         };
@@ -3753,7 +3965,7 @@ mod resolved_bindings_tests {
             )]
             .into_iter()
             .collect(),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
 
             partial_read: None,
         };
@@ -4037,7 +4249,7 @@ mod resolved_bindings_tests {
                 )]
                 .into_iter()
                 .collect(),
-                dependency_bindings: BTreeSet::new(),
+                dependency_bindings: Default::default(),
 
                 partial_read: None,
 
@@ -4183,7 +4395,7 @@ mod resolved_bindings_tests {
                 )]
                 .into_iter()
                 .collect(),
-                dependency_bindings: BTreeSet::new(),
+                dependency_bindings: Default::default(),
 
                 partial_read: None,
             },

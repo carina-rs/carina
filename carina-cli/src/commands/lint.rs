@@ -115,6 +115,15 @@ pub fn run_lint(
         })?;
     }
 
+    if let Some(loaded_provider_context) = loaded_provider_context {
+        carina_core::validation::resolve_file_type_exprs_best_effort(
+            &mut parsed,
+            loaded_provider_context,
+        );
+    }
+    let export_handle_errors =
+        carina_core::validation::validate_export_handle_boundaries(&parsed.export_params).err();
+
     // Collect source texts for each .crn file
     let source_texts: Vec<(PathBuf, String)> = {
         let files = find_crn_files_in_dir(path)?;
@@ -166,6 +175,13 @@ pub fn run_lint(
             message: finding.to_string(),
         })
         .collect();
+    if let Some(message) = export_handle_errors {
+        warnings.extend(message.lines().map(|message| LintWarning {
+            file: path.to_path_buf(),
+            line: 1,
+            message: message.to_string(),
+        }));
+    }
     if let Some(message) = provider_factory_error {
         warnings.push(LintWarning {
             file: path.to_path_buf(),

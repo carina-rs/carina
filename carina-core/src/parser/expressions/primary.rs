@@ -5,7 +5,7 @@
 //! partial-application handling), variable references with field/index
 //! access chains, and value-position `if` expressions.
 
-use crate::eval_value::{EvalValue, StructuralHandleMetadata};
+use crate::eval_value::{EvalValue, UnexpandedStructuralHandleMetadata};
 use crate::parser::context::{ExpressionMode, ParseBindingRef};
 use crate::parser::expressions::if_expr::parse_if_value_expr_with_mode;
 use crate::parser::expressions::string_literal::parse_string_value;
@@ -126,13 +126,13 @@ pub(crate) fn apply_postfix_path_segment(
     let mut display_root = None;
     let base = match value {
         EvalValue::User(base) => base,
-        EvalValue::StructuralHandle(handle) => {
+        EvalValue::UnexpandedStructuralHandle(handle) => {
             let binding = handle.canonical_binding_name();
             if let PathSegment::Subscript { index } = &step {
                 let binding = match index {
                     Subscript::Int { index } => format!("{binding}[{index}]"),
                     Subscript::Str { key } => {
-                        crate::utils::map_key_address(binding, key.expose_plaintext())
+                        crate::utils::map_key_address(binding.as_ref(), key.expose_plaintext())
                     }
                 };
                 return Ok(EvalValue::from_value(Value::Deferred(
@@ -145,7 +145,7 @@ pub(crate) fn apply_postfix_path_segment(
         EvalValue::ProvisionalReference { binding } => {
             Value::Deferred(DeferredValue::BindingRef { binding })
         }
-        EvalValue::ComputedWithStructuralHandles {
+        EvalValue::ComputedWithUnexpandedStructuralHandles {
             value: base,
             metadata,
         } => {
@@ -418,7 +418,7 @@ pub(crate) fn parse_primary_eval_with_mode(
             let metadata = item_metadata
                 .iter()
                 .any(Option::is_some)
-                .then_some(StructuralHandleMetadata::List(item_metadata));
+                .then_some(UnexpandedStructuralHandleMetadata::List(item_metadata));
             Ok(EvalValue::computed(
                 Value::Concrete(ConcreteValue::List(items)),
                 metadata,
@@ -490,7 +490,7 @@ pub(crate) fn parse_primary_eval_with_mode(
                 map.insert(name, Value::Concrete(ConcreteValue::List(blocks)));
             }
             let metadata = (!structural_handles.is_empty())
-                .then_some(StructuralHandleMetadata::Map(structural_handles));
+                .then_some(UnexpandedStructuralHandleMetadata::Map(structural_handles));
             Ok(EvalValue::computed(
                 Value::Concrete(ConcreteValue::Map(map)),
                 metadata,

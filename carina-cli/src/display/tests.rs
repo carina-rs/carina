@@ -7,7 +7,8 @@ use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect,
 use carina_core::plan::Plan;
 use carina_core::resource::{
     AccessMissPolicy, ConcreteValue, DeferredValue, Directives, InterpolationPart, PathSegment,
-    ResolvedResource, Resource, ResourceId, State, UnknownReason, Value, apply_postfix_access,
+    ResolvedDependencies, ResolvedResource, ResolvedResourceId, Resource, ResourceId, State,
+    UnknownReason, Value, apply_postfix_access,
 };
 use carina_core::value::{PrettyLayout, PrettyValue, render_value};
 
@@ -28,25 +29,48 @@ fn for_value_access(fields: &[&str]) -> Value {
     )
 }
 
-fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+trait IntoResolvedTestResource {
+    fn into_resolved_test_resource(self) -> ResolvedResource;
+}
+
+impl IntoResolvedTestResource for Resource {
+    fn into_resolved_test_resource(self) -> ResolvedResource {
+        ResolvedResource::new(self)
+    }
+}
+
+impl IntoResolvedTestResource for ResolvedResource {
+    fn into_resolved_test_resource(self) -> ResolvedResource {
+        self
+    }
+}
+
+fn resolved(resource: impl IntoResolvedTestResource) -> ResolvedResource {
+    resource.into_resolved_test_resource()
 }
 
 fn make_resource(
     resource_type: &str,
     name: &'static str,
     binding: &str,
-    deps: &[&str],
-) -> Resource {
+    deps: &[&ResolvedResource],
+) -> ResolvedResource {
     let mut r = Resource::new(resource_type, name);
     r.binding = Some(binding.to_string());
     for dep in deps {
+        let dependency_binding = dep.binding.as_deref().unwrap_or_else(|| dep.identity_str());
         r.set_attr(
-            format!("ref_{}", dep),
-            Value::resource_ref(dep.to_string(), "id".to_string(), vec![]),
+            format!("ref_{dependency_binding}"),
+            Value::resource_ref(dependency_binding.to_string(), "id".to_string(), vec![]),
         );
     }
-    r
+    ResolvedResource::from_resolved_parts(
+        r,
+        deps.iter()
+            .map(|dependency| dependency.resolved_id())
+            .collect(),
+        ResolvedDependencies::default(),
+    )
 }
 
 /// Test that print_plan does not panic when a resource has a dependency
@@ -57,7 +81,8 @@ fn make_resource(
 fn test_print_plan_with_external_dependency_does_not_panic() {
     // Resource "b" depends on "a", but "a" is NOT in the plan.
     // This simulates an external/unresolved dependency.
-    let b = make_resource("test.resource", "b", "b", &["a"]);
+    let a = make_resource("test.resource", "a", "a", &[]);
+    let b = make_resource("test.resource", "b", "b", &[&a]);
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(b)));
 
@@ -79,7 +104,7 @@ fn test_print_plan_with_external_dependency_does_not_panic() {
 #[test]
 fn test_print_plan_with_internal_dependency_does_not_panic() {
     let a = make_resource("test.resource", "a", "a", &[]);
-    let b = make_resource("test.resource", "b", "b", &["a"]);
+    let b = make_resource("test.resource", "b", "b", &[&a]);
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(a)));
     plan.add(Effect::Create(resolved(b)));
@@ -173,10 +198,10 @@ fn test_siblings_sorted_by_resource_type_and_binding() {
     // VPC is root. Under it: 2 subnets and 2 route tables, added in
     // interleaved order to expose HashMap non-determinism.
     let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
-    let rt_b = make_resource("ec2.RouteTable", "rt_b", "rt_b", &["vpc"]);
-    let subnet_b = make_resource("ec2.Subnet", "subnet_b", "subnet_b", &["vpc"]);
-    let rt_a = make_resource("ec2.RouteTable", "rt_a", "rt_a", &["vpc"]);
-    let subnet_a = make_resource("ec2.Subnet", "subnet_a", "subnet_a", &["vpc"]);
+    let rt_b = make_resource("ec2.RouteTable", "rt_b", "rt_b", &[&vpc]);
+    let subnet_b = make_resource("ec2.Subnet", "subnet_b", "subnet_b", &[&vpc]);
+    let rt_a = make_resource("ec2.RouteTable", "rt_a", "rt_a", &[&vpc]);
+    let subnet_a = make_resource("ec2.Subnet", "subnet_a", "subnet_a", &[&vpc]);
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(vpc)));
@@ -238,8 +263,8 @@ fn test_siblings_sorted_by_resource_type_and_binding() {
 #[test]
 fn test_parent_selection_prefers_most_ancestral_dependency() {
     let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
-    let sg = make_resource("ec2.SecurityGroup", "sg", "sg", &["vpc"]);
-    let endpoint = make_resource("ec2.vpc_endpoint", "endpoint", "endpoint", &["vpc", "sg"]);
+    let sg = make_resource("ec2.SecurityGroup", "sg", "sg", &[&vpc]);
+    let endpoint = make_resource("ec2.vpc_endpoint", "endpoint", "endpoint", &[&vpc, &sg]);
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(vpc)));
@@ -313,14 +338,14 @@ fn test_parent_selection_prefers_most_ancestral_dependency() {
 #[test]
 fn test_referenced_resource_without_deps_should_not_be_root() {
     let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
-    let rt = make_resource("ec2.RouteTable", "rt", "rt", &["vpc"]);
+    let rt = make_resource("ec2.RouteTable", "rt", "rt", &[&vpc]);
     let igw = make_resource("ec2.internet_gateway", "igw", "igw", &[]);
-    let route = make_resource("ec2.route", "route", "route", &["rt", "igw"]);
+    let route = make_resource("ec2.route", "route", "route", &[&rt, &igw]);
     let igw_attachment = make_resource(
         "ec2.vpc_gateway_attachment",
         "igw_attachment",
         "igw_attachment",
-        &["vpc", "igw"],
+        &[&vpc, &igw],
     );
 
     let mut plan = Plan::new();
@@ -358,14 +383,14 @@ fn test_referenced_resource_without_deps_should_not_be_root() {
 #[test]
 fn test_dependency_free_resource_nested_under_shallowest_referencing_resource() {
     let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
-    let rt = make_resource("ec2.RouteTable", "rt", "rt", &["vpc"]);
+    let rt = make_resource("ec2.RouteTable", "rt", "rt", &[&vpc]);
     let igw = make_resource("ec2.internet_gateway", "igw", "igw", &[]);
-    let route = make_resource("ec2.route", "route", "route", &["rt", "igw"]);
+    let route = make_resource("ec2.route", "route", "route", &[&rt, &igw]);
     let igw_attachment = make_resource(
         "ec2.vpc_gateway_attachment",
         "igw_attachment",
         "igw_attachment",
-        &["vpc", "igw"],
+        &[&vpc, &igw],
     );
 
     let mut plan = Plan::new();
@@ -623,7 +648,7 @@ fn test_format_compact_name_anonymous_with_hint() {
 #[test]
 fn test_print_plan_compact_does_not_panic() {
     let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
-    let rt = make_resource("ec2.RouteTable", "rt", "rt", &["vpc"]);
+    let rt = make_resource("ec2.RouteTable", "rt", "rt", &[&vpc]);
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(vpc)));
     plan.add(Effect::Create(resolved(rt)));
@@ -790,6 +815,7 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
             "__deferred_for",
             "validation_records",
         )),
+        dependencies: ResolvedDependencies::default(),
         template: Box::new(deferred),
     });
 
@@ -844,6 +870,9 @@ fn deferred_validation_records_effect() -> Effect {
             "__deferred_for",
             "validation_records",
         )),
+        dependencies: ResolvedDependencies::from_iter([ResolvedResourceId::new(
+            ResourceId::with_identity("acm.Certificate", "cert"),
+        )]),
         template: Box::new(deferred),
     }
 }
@@ -858,14 +887,21 @@ fn delete_record_effect(binding: &'static str) -> Effect {
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some(binding.to_string()),
-        dependencies: HashSet::from(["cert".to_string()]),
-        explicit_dependencies: HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: ResolvedDependencies::from_iter([ResolvedResourceId::new(
+            ResourceId::with_identity("acm.Certificate", "cert"),
+        )]),
+        explicit_dependencies: ResolvedDependencies::default(),
+        blocked_by_updates: ResolvedDependencies::default(),
     }
 }
 
 fn deferred_replace_validation_records_effect() -> Effect {
-    let Effect::DeferredCreate { id, template } = deferred_validation_records_effect() else {
+    let Effect::DeferredCreate {
+        id,
+        dependencies: deferred_dependencies,
+        template,
+    } = deferred_validation_records_effect()
+    else {
         unreachable!("helper constructs DeferredCreate")
     };
     let Effect::Delete {
@@ -894,6 +930,7 @@ fn deferred_replace_validation_records_effect() -> Effect {
         }])
         .expect("fixture has one delete"),
         id,
+        dependencies: deferred_dependencies,
         template,
     }))
 }
@@ -941,7 +978,14 @@ fn test_deferred_replace_renders_dependent_children() {
 
     let mut plan = Plan::new();
     plan.add(deferred_replace_validation_records_effect());
-    plan.add(Effect::Create(resolved(dependent)));
+    plan.add(Effect::Create(ResolvedResource::from_resolved_parts(
+        dependent,
+        ResolvedDependencies::from_iter([ResolvedResourceId::new(ResourceId::with_identity(
+            "__deferred_for",
+            "validation_records",
+        ))]),
+        ResolvedDependencies::default(),
+    )));
 
     let output = strip_ansi(&format_plan_with_delete_instances(
         &plan,
@@ -1045,9 +1089,13 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
         "group_description".to_string(),
         Value::Concrete(ConcreteValue::String("Test security group".into())),
     );
-    // _dependency_bindings is saved by resolve_refs_with_state() before
-    // ResourceRef values are resolved to strings.
-    sg.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
+    // The dependency address is retained as typed graph metadata after the
+    // ResourceRef value resolves to a string.
+    let sg = ResolvedResource::from_resolved_parts(
+        sg,
+        [vpc_to.resolved_id()].into_iter().collect(),
+        ResolvedDependencies::default(),
+    );
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
@@ -1061,8 +1109,7 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
     let (roots, dependents, effect_bindings, _effect_types) = build_plan_tree(&plan);
 
     // VPC (idx 0) should be the only root.
-    // SG has _dependency_bindings metadata that preserves the dependency
-    // on "vpc", so get_resource_dependencies() recovers it.
+    // SG has resolved graph metadata that preserves the dependency on VPC.
     assert_eq!(
         roots,
         vec![0],
@@ -1098,9 +1145,9 @@ fn format_effect_delete_uses_binding_name() {
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some("my_vpc".to_string()),
-        dependencies: HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     };
     assert_eq!(format_effect(&effect), "Delete awscc.ec2.Vpc my_vpc");
 }
@@ -1118,9 +1165,9 @@ fn format_effect_delete_falls_back_to_id_name() {
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: None,
-        dependencies: HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     };
     assert_eq!(
         format_effect(&effect),
@@ -2000,7 +2047,12 @@ fn module_child_connector_gutter_extends_through_nested_dependents() {
     use carina_core::schema::SchemaRegistry;
 
     let cluster = make_resource("aws.eks.Cluster", "cluster/inner", "inner", &[]);
-    let node_role = make_resource("aws.iam.Role", "cluster/node-role", "node_role", &["inner"]);
+    let node_role = make_resource(
+        "aws.iam.Role",
+        "cluster/node-role",
+        "node_role",
+        &[&cluster],
+    );
     let bucket = make_resource("aws.s3.Bucket", "cluster/logs", "logs", &[]);
     let cluster_id = cluster.id.clone();
     let bucket_id = bucket.id.clone();
@@ -2113,7 +2165,8 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
 
 #[test]
 fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
-    let parent = make_resource("aws.s3.Bucket", "parent", "parent", &[]).with_attribute(
+    let mut parent = make_resource("aws.s3.Bucket", "parent", "parent", &[]);
+    parent.set_attr(
         "bucket",
         Value::Concrete(ConcreteValue::String("parent".into())),
     );

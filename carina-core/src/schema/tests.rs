@@ -6289,10 +6289,6 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
             "Ref(aws.ec2.Vpc)",
             TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc")),
         ),
-        (
-            "DottedUnresolved(aws.ec2.Vpc)",
-            TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "ec2.Vpc")),
-        ),
     ];
 
     for (name, type_expr) in liftable {
@@ -6303,6 +6299,14 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
             "lifted TypeExpr must be assignable to itself; offending pair: lift({name}) -> lift({name})",
         );
     }
+
+    assert!(
+        crate::validation::lift_type_expr(&TypeExpr::DottedUnresolved(ResourceTypePath::new(
+            "aws", "ec2.Vpc"
+        ),))
+        .is_none(),
+        "an unresolved dotted provider type must not be guessed to be a resource handle",
+    );
 }
 
 fn contains_unrefined_primitive(attr: &AttributeType) -> bool {

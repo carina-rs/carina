@@ -1167,7 +1167,11 @@ impl<S> PlanFileContents<S> {
                 Effect::Remove { id } => {
                     insert(&mut references, id, SchemaKind::Resource);
                 }
-                Effect::DeferredCreate { id: _id, template } => {
+                Effect::DeferredCreate {
+                    id: _id,
+                    dependencies: _dependencies,
+                    template,
+                } => {
                     insert(
                         &mut references,
                         &template.template_resource.id,
@@ -1179,7 +1183,7 @@ impl<S> PlanFileContents<S> {
                     insert(&mut references, to, SchemaKind::Resource);
                 }
                 Effect::Wait {
-                    identity: _identity,
+                    id: _id,
                     target_id,
                     until: _until,
                     until_surface: _until_surface,
@@ -1251,11 +1255,11 @@ impl UnresolvedPlanFileContents {
                 }
                 UnresolvedSavedEffect::Create(resource)
                 | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
-                    insert(&mut references, &resource.id, SchemaKind::Resource);
+                    insert(&mut references, resource.id(), SchemaKind::Resource);
                 }
                 UnresolvedSavedEffect::Update { from, to, .. } => {
                     insert(&mut references, &from.id, SchemaKind::Resource);
-                    insert(&mut references, &to.id, SchemaKind::Resource);
+                    insert(&mut references, to.id(), SchemaKind::Resource);
                 }
                 UnresolvedSavedEffect::Delete { id, .. }
                 | UnresolvedSavedEffect::Import { id, .. }
@@ -1314,7 +1318,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 31;
+    pub const CURRENT_VERSION: u32 = 34;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -1667,17 +1671,17 @@ impl PlanFile {
                 }
                 UnresolvedSavedEffect::Create(resource)
                 | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
-                    require_identity(&resource.id, &location)?
+                    require_identity(resource.id(), &location)?
                 }
                 UnresolvedSavedEffect::Update { from, to, .. } => {
                     require_identity(&from.id, &format!("{location}.from"))?;
-                    require_identity(&to.id, &format!("{location}.to"))?;
+                    require_identity(to.id(), &format!("{location}.to"))?;
                 }
                 UnresolvedSavedEffect::Delete { id, .. }
                 | UnresolvedSavedEffect::Import { id, .. }
                 | UnresolvedSavedEffect::Remove { id } => require_identity(id, &location)?,
                 UnresolvedSavedEffect::Wait {
-                    identity,
+                    id,
                     target_id,
                     until: _until,
                     until_surface: _until_surface,
@@ -1693,7 +1697,8 @@ impl PlanFile {
                         .any(|resource| &resource.id == target)
                     {
                         return Err(format!(
-                            "Invalid saved plan: wait `{identity}` targets `{target}`, which is not a managed resource in this plan"
+                            "Invalid saved plan: wait `{}` targets `{target}`, which is not a managed resource in this plan",
+                            id.identity_str()
                         ));
                     }
                 }
@@ -5752,21 +5757,23 @@ mod run_plan_out_tests {
             panic!("expected update effect")
         };
         assert_eq!(
-            created_effect.attributes["comment"], saved.sorted_resources[0].attributes["comment"],
+            created_effect.as_resource().attributes["comment"],
+            saved.sorted_resources[0].attributes["comment"],
             "create effect and sorted resource must share one digest",
         );
         assert_eq!(
-            created_effect.attributes["name"],
+            created_effect.as_resource().attributes["name"],
             Value::Concrete(ConcreteValue::String("created-temporary".into())),
             "saved-plan redaction must retain a create-before-destroy temporary name",
         );
         assert_eq!(
-            updated_effect.attributes["comment"], saved.sorted_resources[1].attributes["comment"],
+            updated_effect.as_resource().attributes["comment"],
+            saved.sorted_resources[1].attributes["comment"],
             "update effect and sorted resource must share one digest",
         );
         assert!(
             matches!(
-                updated_effect.attributes.get("web_acl_arn"),
+                updated_effect.as_resource().attributes.get("web_acl_arn"),
                 Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
             ),
             "saved-plan redaction must retain unresolved cascade-consumer references",

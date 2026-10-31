@@ -13,8 +13,8 @@ use crate::binding_index::ManagedBindingStability;
 use crate::effect::MoveAuthority;
 use crate::provider::{LiftedSavedAttrs, NestedWriteOnlyRecord, ProviderError, StateTransformMap};
 use crate::resource::{
-    Current, Directives, PlanInputCurrent, PresentResourceState, ResolvedResource, Resource,
-    ResourceId, State, UnidentifiedState, Value, into_plan_input_current_map,
+    Current, PersistedDirectives, PlanInputCurrent, PresentResourceState, ResolvedResource,
+    Resource, ResourceId, State, UnidentifiedState, Value, into_plan_input_current_map,
 };
 use crate::schema::{ResourceSchema, SchemaKind, SchemaRegistry};
 
@@ -30,6 +30,57 @@ pub use plan::{block_deletes_on_prior_consumer_updates, create_plan, create_plan
 /// an unavailable/replacement result.
 pub fn managed_binding_stability(
     managed: &[ResolvedResource],
+    current_states: &HashMap<ResourceId, PlanInputCurrent>,
+    registry: &SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+) -> HashMap<ResourceId, ManagedBindingStability> {
+    managed_binding_stability_for_resources(
+        managed.iter().map(ResolvedResource::as_resource),
+        current_states,
+        registry,
+        saved_attrs,
+        prev_explicit,
+    )
+}
+
+/// Compute the early binding-stability projection without pretending that
+/// authored dependency operands have crossed the expanded-graph boundary.
+///
+/// This pass runs before late anonymous identities exist. It resolves only
+/// schema-owned `ignore_changes` metadata; dependency operands stay in their
+/// unexpanded representation until [`crate::resolved_graph`] performs the one
+/// real address transition later in planning.
+pub fn pre_graph_managed_binding_stability(
+    managed: &[Resource],
+    current_states: &HashMap<ResourceId, PlanInputCurrent>,
+    registry: &SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+) -> Result<HashMap<ResourceId, ManagedBindingStability>, crate::resource::ResolvedResourceError> {
+    let mut pending = HashMap::new();
+    let mut schema_resolved = Vec::new();
+    for resource in managed {
+        if resource.id.identity_str().is_none() {
+            pending.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
+            continue;
+        }
+        let mut resource = resource.clone();
+        crate::resource::resolve_resource_ignore_changes(&mut resource, registry)?;
+        schema_resolved.push(resource);
+    }
+    pending.extend(managed_binding_stability_for_resources(
+        schema_resolved.iter(),
+        current_states,
+        registry,
+        saved_attrs,
+        prev_explicit,
+    ));
+    Ok(pending)
+}
+
+fn managed_binding_stability_for_resources<'a>(
+    managed: impl IntoIterator<Item = &'a Resource>,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
@@ -51,7 +102,7 @@ pub fn managed_binding_stability(
                 SchemaKind::Resource,
             )
             .map(|schema| schema.schema().as_schema());
-        let changed_attributes = match diff_present(
+        let changed_attributes = match diff_present_resource(
             resource,
             present,
             saved_attrs.get(&resource.id),
@@ -73,7 +124,7 @@ pub fn managed_binding_stability(
         let changed_attributes = plan::filter_non_removable_removals(
             &resource.id.provider,
             &resource.id.resource_type,
-            resource.as_resource(),
+            resource,
             changed_attributes,
             registry,
         );
@@ -118,14 +169,14 @@ pub fn managed_binding_stability(
 pub struct Orphan {
     current: Current,
     binding: Option<String>,
-    directives: Directives,
+    directives: PersistedDirectives,
 }
 
 impl Orphan {
     pub fn absent(
         state: crate::resource::AbsentState,
         binding: Option<String>,
-        directives: Directives,
+        directives: PersistedDirectives,
     ) -> Self {
         Self {
             current: Current::Absent(state),
@@ -138,7 +189,7 @@ impl Orphan {
     pub(crate) fn from_state(
         state: State,
         binding: Option<String>,
-        directives: Directives,
+        directives: PersistedDirectives,
     ) -> Self {
         Self {
             current: Current::from_state(state),
@@ -150,7 +201,7 @@ impl Orphan {
     pub fn present(
         present: PresentResourceState,
         binding: Option<String>,
-        directives: Directives,
+        directives: PersistedDirectives,
     ) -> Self {
         Self {
             current: Current::Present(present),
@@ -162,7 +213,7 @@ impl Orphan {
     pub fn missing_identifier(
         state: UnidentifiedState,
         binding: Option<String>,
-        directives: Directives,
+        directives: PersistedDirectives,
     ) -> Self {
         Self {
             current: Current::MissingIdentifier(state),
@@ -174,7 +225,7 @@ impl Orphan {
     pub fn create_in_flight(
         pending: crate::provider::InFlightCreate,
         binding: Option<String>,
-        directives: Directives,
+        directives: PersistedDirectives,
     ) -> Self {
         Self {
             current: Current::CreateInFlight(pending),
@@ -195,7 +246,7 @@ impl Orphan {
         self.binding.as_deref()
     }
 
-    pub fn directives(&self) -> &Directives {
+    pub fn directives(&self) -> &PersistedDirectives {
         &self.directives
     }
 
@@ -204,20 +255,14 @@ impl Orphan {
     /// for its values; the projection exists only so a data-source input can
     /// resolve a binding that is no longer present in the configuration.
     pub fn binding_resource(&self) -> Resource {
-        let (attributes, dependency_bindings) = match &self.current {
-            Current::Absent(state) => (
-                &state.state().attributes,
-                &state.state().dependency_bindings,
-            ),
-            Current::Present(present) => (
-                &present.state().attributes,
-                &present.state().dependency_bindings,
-            ),
+        let attributes = match &self.current {
+            Current::Absent(state) => &state.state().attributes,
+            Current::Present(present) => &present.state().attributes,
             Current::CreateInFlight(_pending) => {
                 return Resource {
                     id: self.current.id().clone(),
                     attributes: Default::default(),
-                    directives: self.directives.clone(),
+                    directives: (&self.directives).into(),
                     resolved_ignore_changes: Default::default(),
                     prefixes: Default::default(),
                     binding: self.binding.clone(),
@@ -228,10 +273,7 @@ impl Orphan {
                     quoted_string_attrs: Default::default(),
                 };
             }
-            Current::MissingIdentifier(state) => (
-                &state.state().attributes,
-                &state.state().dependency_bindings,
-            ),
+            Current::MissingIdentifier(state) => &state.state().attributes,
         };
         Resource {
             id: self.current.id().clone(),
@@ -239,11 +281,11 @@ impl Orphan {
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
-            directives: self.directives.clone(),
+            directives: (&self.directives).into(),
             resolved_ignore_changes: Default::default(),
             prefixes: Default::default(),
             binding: self.binding.clone(),
-            dependency_bindings: dependency_bindings.clone(),
+            dependency_bindings: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -750,26 +792,52 @@ fn create_plan_for_tests(
     data_sources: &[crate::resource::DataSource],
     provider: &dyn crate::provider::Provider,
     current_states: &HashMap<ResourceId, crate::resource::PlanInputCurrent>,
-    directives_map: &HashMap<ResourceId, crate::resource::Directives>,
+    directives_map: &HashMap<ResourceId, crate::resource::PersistedDirectives>,
     registry: &crate::schema::SchemaRegistry,
     saved_attrs: &crate::provider::LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphans: &Orphans,
     wait_bindings: &[crate::parser::WaitBinding],
 ) -> crate::plan::Plan {
-    let managed =
-        ResolvedResource::collect_resolved_with_schemas(managed.iter().cloned(), registry)
-            .expect("differ test resources must have resolved identities and valid ignore paths");
+    let mut parsed = crate::parser::ParsedFile {
+        wait_bindings: wait_bindings.to_vec(),
+        ..Default::default()
+    };
+    let mut binding_resources = managed.to_vec();
+    binding_resources.extend(orphans.iter().map(|(_, orphan)| orphan.binding_resource()));
+    let binding_index = crate::resolved_graph::resolve_expanded_graph(
+        &mut parsed,
+        &binding_resources,
+        data_sources,
+    )
+    .expect("differ test graph must resolve");
+    let managed = managed
+        .iter()
+        .cloned()
+        .map(|resource| binding_index.resolve_resource(resource, registry))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("differ test resources must have resolved dependencies");
+    let data_sources = data_sources
+        .iter()
+        .cloned()
+        .map(|data_source| binding_index.resolve_data_source(data_source))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("differ test data sources must have resolved dependencies");
+    let wait_bindings = wait_bindings
+        .iter()
+        .map(|wait| binding_index.resolve_wait_binding(wait))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("differ test waits must have resolved dependencies");
     plan::create_plan(
         &managed,
-        data_sources,
+        &data_sources,
         provider,
         PlanPriorStates::new(current_states, orphans),
         directives_map,
         registry,
         saved_attrs,
         prev_explicit,
-        wait_bindings,
+        &wait_bindings,
     )
     .expect("differ test provider hints should succeed")
 }
@@ -869,7 +937,25 @@ fn diff_present(
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> PresentDiff {
-    diff_existing_state(
+    diff_present_resource(
+        desired.as_resource(),
+        current,
+        saved,
+        nested_write_only,
+        prev_explicit,
+        schema,
+    )
+}
+
+fn diff_present_resource(
+    desired: &Resource,
+    current: &PresentResourceState,
+    saved: Option<&HashMap<String, Value>>,
+    nested_write_only: &NestedWriteOnlyRecord,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+) -> PresentDiff {
+    diff_existing_resource(
         desired,
         current.state(),
         saved,
@@ -887,6 +973,24 @@ fn diff_existing_state(
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> PresentDiff {
+    diff_existing_resource(
+        desired.as_resource(),
+        current,
+        saved,
+        nested_write_only,
+        prev_explicit,
+        schema,
+    )
+}
+
+fn diff_existing_resource(
+    desired: &Resource,
+    current: &State,
+    saved: Option<&HashMap<String, Value>>,
+    nested_write_only: &NestedWriteOnlyRecord,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+) -> PresentDiff {
     let changes = comparison::find_changed_attributes_with_ignores(
         &desired.resolved_attributes(),
         &current.attributes,
@@ -894,7 +998,7 @@ fn diff_existing_state(
         nested_write_only,
         prev_explicit,
         schema,
-        desired.ignore_changes(),
+        &desired.resolved_ignore_changes,
     );
 
     if changes.changed.is_empty() {
@@ -905,7 +1009,7 @@ fn diff_existing_state(
         PresentDiff::Update {
             id: desired.id.clone(),
             from: Box::new(current.clone()),
-            to: Box::new(desired.as_resource().clone()),
+            to: Box::new(desired.clone()),
             changed_attributes: changes.changed,
             ignored_readable_differences: changes.ignored_readable_differences,
         }

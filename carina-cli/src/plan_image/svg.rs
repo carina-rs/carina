@@ -1346,8 +1346,20 @@ mod tests {
             "input",
             Value::resource_ref("connector".to_string(), "id".to_string(), vec![]),
         );
+        let resources = vec![a, connector, b];
+        let mut parsed = carina_core::parser::ParsedFile::default();
+        let graph =
+            carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &[])
+                .expect("test graph targets resolve");
+        let desired = resources
+            .into_iter()
+            .map(|resource| {
+                graph.resolve_resource(resource, &carina_core::schema::SchemaRegistry::new())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("test graph dependencies resolve");
         let mut plan = Plan::new();
-        for resource in [a.clone(), b.clone()] {
+        for resource in [desired[0].clone(), desired[2].clone()] {
             plan.add(Effect::Update {
                 from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
                 identifier: AppliedIdentifier::new(format!(
@@ -1355,11 +1367,10 @@ mod tests {
                     resource.binding.as_deref().expect("test resource is bound")
                 ))
                 .unwrap(),
-                to: ResolvedResource::new(resource),
+                to: resource,
                 changed_attributes: vec!["description".to_string()],
             });
         }
-        let desired = ResolvedResource::collect_resolved([a, connector, b]).unwrap();
         let unresolved: Vec<_> = desired
             .iter()
             .map(|resource| UnresolvedResource::from_pre_resolve(resource.as_inner().clone()))

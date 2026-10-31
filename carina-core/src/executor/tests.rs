@@ -43,6 +43,13 @@ fn uncancelled_shutdown() -> ShutdownToken {
     ShutdownToken::running()
 }
 
+fn test_resolved_id(resource_type: &str, identity: &str) -> crate::resource::ResolvedResourceId {
+    crate::resource::ResolvedResourceId::with_identity(
+        resource_type.to_string(),
+        ResourceIdentity::try_from(identity.to_string()).expect("test identity must be non-empty"),
+    )
+}
+
 #[test]
 fn executor_test_fixtures_do_not_use_raw_cancellation_tokens() {
     let retired_type = ["tokio_util::sync::", "CancellationToken"].concat();
@@ -54,6 +61,35 @@ fn executor_test_fixtures_do_not_use_raw_cancellation_tokens() {
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+fn resolved_fixture_graph(
+    managed: &[Resource],
+    data_sources: &[DataSource],
+) -> (Vec<ResolvedResource>, Vec<ResolvedDataSource>) {
+    resolved_fixture_graph_with_parsed(crate::parser::ParsedFile::default(), managed, data_sources)
+}
+
+fn resolved_fixture_graph_with_parsed(
+    mut parsed: crate::parser::ParsedFile,
+    managed: &[Resource],
+    data_sources: &[DataSource],
+) -> (Vec<ResolvedResource>, Vec<ResolvedDataSource>) {
+    let index = crate::resolved_graph::resolve_expanded_graph(&mut parsed, managed, data_sources)
+        .expect("executor fixture graph must resolve");
+    let managed = managed
+        .iter()
+        .cloned()
+        .map(|resource| index.resolve_resource(resource, &SchemaRegistry::new()))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("executor fixture resources must resolve");
+    let data_sources = data_sources
+        .iter()
+        .cloned()
+        .map(|data_source| index.resolve_data_source(data_source))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("executor fixture data sources must resolve");
+    (managed, data_sources)
 }
 
 fn managed_wait_target(id: ResourceId) -> crate::wait::ManagedWaitTarget {
@@ -99,6 +135,44 @@ fn executable_deferred_data_source_values(
 
 fn create_effect(resource: Resource) -> Effect {
     Effect::Create(resolved(resource))
+}
+
+fn create_plan_from_fixture_resources(resources: Vec<Resource>) -> Plan {
+    let resources = resolved_fixture_resources(resources);
+    let mut plan = Plan::new();
+    for resource in resources {
+        plan.add(Effect::Create(resource));
+    }
+    plan
+}
+
+fn resolved_fixture_resources(resources: Vec<Resource>) -> Vec<ResolvedResource> {
+    let (resources, data_sources) = resolved_fixture_graph(&resources, &[]);
+    assert!(data_sources.is_empty());
+    resources
+}
+
+fn resolved_fixture_resources_with_wait(
+    resources: Vec<Resource>,
+    wait_binding: &str,
+    target_binding: &str,
+) -> Vec<ResolvedResource> {
+    let mut parsed = crate::parser::ParsedFile::default();
+    parsed.wait_bindings.push(crate::parser::WaitBinding {
+        binding: wait_binding.into(),
+        target: target_binding.into(),
+        until_raw: format!("{target_binding}.ready == true"),
+        until_predicate: crate::parser::UntilPredicateAst {
+            lhs_segments: vec![target_binding.to_string(), "ready".to_string()],
+            rhs: Value::Concrete(ConcreteValue::Bool(true)),
+        },
+        timeout_secs: None,
+        depends_on: Default::default(),
+        line: 1,
+    });
+    let (resources, data_sources) = resolved_fixture_graph_with_parsed(parsed, &resources, &[]);
+    assert!(data_sources.is_empty());
+    resources
 }
 
 fn for_value_access(fields: &[&str]) -> Value {
@@ -189,6 +263,7 @@ fn anonymous_deferred_collision_fixture() -> (
     );
     let children = deferred_dispatch::materialize_deferred_create(
         &template,
+        &Default::default(),
         &bindings,
         &deferred_dispatch::DeferredIdentityInputs {
             provider_configs: &[],
@@ -251,14 +326,19 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
     let a = make_resource("plain_a", &[]);
     let b = make_resource("plain_b", &["plain_a"]);
     let c = make_resource("plain_c", &["plain_b"]);
+    let plain_origins = origins(&[a.clone(), b.clone(), c.clone()]);
+    let mut plain_resources = resolved_fixture_resources(vec![a, b, c.clone()]);
+    let resolved_a = plain_resources.remove(0);
+    let resolved_b = plain_resources.remove(0);
+    let resolved_c = plain_resources.remove(0);
     assert_matches_executor(
         "plain create/update/delete chain",
         vec![
-            create_effect(a.clone()),
+            Effect::Create(resolved_a),
             Effect::Update {
-                from: Box::new(State::existing(b.id.clone(), HashMap::new())),
+                from: Box::new(State::existing(resolved_b.id.clone(), HashMap::new())),
                 identifier: crate::effect::fixture_applied_identifier("plain-b"),
-                to: ResolvedResource::new(b.clone()),
+                to: resolved_b,
                 changed_attributes: vec!["value".to_string()],
             },
             Effect::Delete {
@@ -267,12 +347,12 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
                 generation: EffectGeneration::Current,
                 directives: Directives::default(),
                 binding: c.binding.clone(),
-                dependencies: c.dependency_bindings.iter().cloned().collect(),
-                explicit_dependencies: HashSet::new(),
-                blocked_by_updates: HashSet::new(),
+                dependencies: resolved_c.all_dependencies().cloned().collect(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
             },
         ],
-        origins(&[a, b, c]),
+        plain_origins,
         BTreeSet::from([(primary(0), primary(1))]),
     );
 
@@ -287,9 +367,9 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
                 generation: EffectGeneration::Current,
                 directives: Directives::default(),
                 binding: replacement.binding.clone(),
-                dependencies: HashSet::new(),
-                explicit_dependencies: HashSet::new(),
-                blocked_by_updates: HashSet::new(),
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
             },
         ],
         origins(std::slice::from_ref(&replacement)),
@@ -297,6 +377,7 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
     );
 
     let cert = make_resource("cert", &[]);
+    let cert_id = crate::resource::ResolvedResourceId::new(cert.id.clone());
     let deferred_replace_edges = assert_matches_executor(
         "DeferredReplace with absorbed deletes",
         vec![
@@ -310,15 +391,16 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
                     identifier: crate::effect::fixture_applied_identifier("validation-old"),
                     directives: Directives::default(),
                     binding: Some("validation_records[0]".to_string()),
-                    dependencies: HashSet::new(),
-                    explicit_dependencies: HashSet::new(),
-                    blocked_by_updates: HashSet::new(),
+                    dependencies: Default::default(),
+                    explicit_dependencies: Default::default(),
+                    blocked_by_updates: Default::default(),
                 }])
                 .expect("fixture has one delete"),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "__deferred_for",
                     "validation_records",
                 )),
+                dependencies: crate::resource::ResolvedDependencies::from_iter([cert_id]),
                 template: Box::new(validation_deferred_for_expression()),
             })),
         ],
@@ -336,12 +418,20 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
     wait_consumer
         .dependency_bindings
         .insert("wait_ready".to_string());
+    let wait_origins = origins(&[wait_target.clone(), wait_consumer.clone()]);
+    let mut wait_resources = resolved_fixture_resources_with_wait(
+        vec![wait_target.clone(), wait_consumer],
+        "wait_ready",
+        "wait_target",
+    );
+    let resolved_wait_target = wait_resources.remove(0);
+    let resolved_wait_consumer = wait_resources.remove(0);
     assert_matches_executor(
         "wait",
         vec![
-            create_effect(wait_target.clone()),
+            Effect::Create(resolved_wait_target),
             Effect::Wait {
-                identity: ResourceIdentity::new("wait_ready"),
+                id: crate::resource::ResolvedResourceId::with_identity("__wait", "wait_ready"),
                 target_id: managed_wait_target(wait_target.id.clone()),
                 until: WaitPredicate::equals(
                     AttrPath::single("status"),
@@ -351,11 +441,11 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
                 until_surface: "wait_target.status == ready".to_string(),
                 timeout: std::time::Duration::from_secs(60),
                 interval: std::time::Duration::from_secs(1),
-                explicit_dependencies: HashSet::new(),
+                explicit_dependencies: Default::default(),
             },
-            create_effect(wait_consumer.clone()),
+            Effect::Create(resolved_wait_consumer),
         ],
-        origins(&[wait_target, wait_consumer]),
+        wait_origins,
         BTreeSet::from([(primary(0), primary(1)), (primary(1), primary(2))]),
     );
 }
@@ -1637,10 +1727,10 @@ impl CancelsWhenWaitStarted {
 impl ExecutionObserver for CancelsWhenWaitStarted {
     fn on_event(&self, event: &ExecutionEvent) {
         if let ExecutionEvent::EffectStarted {
-            effect: Effect::Wait { identity, .. },
+            effect: Effect::Wait { id, .. },
             start: _,
         } = event
-            && identity.as_str() == self.binding
+            && id.identity_str() == self.binding
         {
             self.trigger.request_graceful_shutdown();
         }
@@ -1681,10 +1771,10 @@ impl ExecutionObserver for RecordingCancelsWhenWaitStarted {
             .unwrap()
             .push(format_execution_event(event));
         if let ExecutionEvent::EffectStarted {
-            effect: Effect::Wait { identity, .. },
+            effect: Effect::Wait { id, .. },
             start: _,
         } = event
-            && identity.as_str() == self.binding
+            && id.identity_str() == self.binding
         {
             self.trigger.request_graceful_shutdown();
         }
@@ -2200,9 +2290,7 @@ async fn create_success_publishes_complete() {
     let dependent = make_resource("dependent", &["source"]);
     let source_id = source.id.clone();
     let dependent_id = dependent.id.clone();
-    let mut plan = Plan::new();
-    plan.add(create_effect(source));
-    plan.add(create_effect(dependent));
+    let plan = create_plan_from_fixture_resources(vec![source, dependent]);
     provider.push_create(Ok(ok_state(&source_id)));
     provider.push_create(Ok(ok_state(&dependent_id)));
 
@@ -2235,9 +2323,12 @@ async fn resume_resumed_publishes_observed() {
     let dependent_id = dependent.id.clone();
     let pending = persisted_create_for_executor(&source_id);
     let started_at = pending.started_at().clone();
+    let mut resources = resolved_fixture_resources(vec![source, dependent]);
+    let source = resources.remove(0);
+    let dependent = resources.remove(0);
     let mut plan = Plan::new();
-    plan.add_resume_create(resolved(source), started_at);
-    plan.add(create_effect(dependent));
+    plan.add_resume_create(source, started_at);
+    plan.add(Effect::Create(dependent));
     provider.push_resume(ResumeFixture::Resumed);
     provider.push_create(Ok(ok_state(&dependent_id)));
 
@@ -2358,9 +2449,7 @@ async fn create_untracked_skips_dependents_and_writes_nothing() {
     let dependent = make_resource("dependent", &["source"]);
     let source_id = source.id.clone();
     let dependent_id = dependent.id.clone();
-    let mut plan = Plan::new();
-    plan.add(create_effect(source));
-    plan.add(create_effect(dependent));
+    let plan = create_plan_from_fixture_resources(vec![source, dependent]);
     provider.push_create(Err(ProviderError::api_error("create rejected")));
 
     let result = execute_lifecycle_fixture(&provider, &plan, HashMap::new()).await;
@@ -2385,9 +2474,12 @@ async fn resume_ended_skips_dependents_and_marks_create_ended() {
     let source_id = source.id.clone();
     let dependent_id = dependent.id.clone();
     let pending = persisted_create_for_executor(&source_id);
+    let mut resources = resolved_fixture_resources(vec![source, dependent]);
+    let source = resources.remove(0);
+    let dependent = resources.remove(0);
     let mut plan = Plan::new();
-    plan.add_resume_create(resolved(source), pending.started_at().clone());
-    plan.add(create_effect(dependent));
+    plan.add_resume_create(source, pending.started_at().clone());
+    plan.add(Effect::Create(dependent));
     provider.push_resume(ResumeFixture::Ended);
 
     let result = execute_lifecycle_fixture(
@@ -2420,9 +2512,7 @@ async fn created_failure_records_observation() {
     let dependent = make_resource("dependent", &["source"]);
     let source_id = source.id.clone();
     let dependent_id = dependent.id.clone();
-    let mut plan = Plan::new();
-    plan.add(create_effect(source));
-    plan.add(create_effect(dependent));
+    let plan = create_plan_from_fixture_resources(vec![source, dependent]);
     provider.push_classified_create(ClassifiedCreateFixture::Created);
 
     let result =
@@ -2617,9 +2707,7 @@ async fn in_flight_failure_records_pending() {
     let dependent = make_resource("dependent", &["source"]);
     let source_id = source.id.clone();
     let dependent_id = dependent.id.clone();
-    let mut plan = Plan::new();
-    plan.add(create_effect(source));
-    plan.add(create_effect(dependent));
+    let plan = create_plan_from_fixture_resources(vec![source, dependent]);
     provider.push_classified_create(ClassifiedCreateFixture::InFlight);
 
     let result = execute_lifecycle_fixture(&provider, &plan, HashMap::new()).await;
@@ -2678,9 +2766,12 @@ async fn skipped_or_cancelled_resume_has_no_applied_entry() {
     let failed_id = failed.id.clone();
     let resume_id = resume.id.clone();
     let pending = persisted_create_for_executor(&resume_id);
+    let mut resources = resolved_fixture_resources(vec![failed, resume]);
+    let failed = resources.remove(0);
+    let resume = resources.remove(0);
     let mut plan = Plan::new();
-    plan.add(create_effect(failed));
-    plan.add_resume_create(resolved(resume), pending.started_at().clone());
+    plan.add(Effect::Create(failed));
+    plan.add_resume_create(resume, pending.started_at().clone());
     provider.push_create(Err(ProviderError::api_error("dependency failed")));
 
     let result = execute_lifecycle_fixture(
@@ -3344,9 +3435,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
     )
     .with_identifier("producer-id")));
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(producer.clone()));
-    plan.add(create_effect(consumer.clone()));
+    let plan = create_plan_from_fixture_resources(vec![producer.clone(), consumer.clone()]);
     let unresolved = HashMap::from([
         (
             producer.id.clone(),
@@ -3442,14 +3531,16 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
     )
     .with_identifier("producer-id")));
 
+    let mut resolved_resources =
+        resolved_fixture_resources(vec![producer.clone(), planned_consumer.clone()]);
     let mut plan = Plan::new();
-    plan.add(create_effect(producer.clone()));
+    plan.add(Effect::Create(resolved_resources.remove(0)));
     plan.add(Effect::Update {
         identifier: crate::effect::fixture_applied_identifier(
             from.id.identity_display().to_string(),
         ),
         from: Box::new(from),
-        to: resolved(planned_consumer.clone()),
+        to: resolved_resources.remove(0),
         changed_attributes: vec!["target".to_string()],
     });
     let unresolved = HashMap::from([
@@ -3544,6 +3635,7 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
             "__deferred_for",
             "validation_records",
         )),
+        dependencies: Default::default(),
         template: Box::new(validation_deferred_for_expression()),
     });
     let schemas = deferred_child_constraint_schemas();
@@ -3606,10 +3698,14 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
     .with_identifier("producer-id")));
     provider.push_read(Ok(State::existing(data_source_id.clone(), HashMap::new())));
 
+    let (mut resolved_managed, mut resolved_data_sources) = resolved_fixture_graph(
+        std::slice::from_ref(&upstream),
+        std::slice::from_ref(&data_source),
+    );
     let mut plan = Plan::new();
-    plan.add(create_effect(upstream.clone()));
+    plan.add(Effect::Create(resolved_managed.remove(0)));
     plan.add(Effect::Read {
-        resource: resolved_data_source(data_source.clone()),
+        resource: resolved_data_sources.remove(0),
     });
     let executable_data_source_values =
         executable_deferred_data_source_values(std::slice::from_ref(&data_source));
@@ -3687,10 +3783,14 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
     .with_identifier("producer-id")));
     provider.push_read(Ok(State::existing(data_source_id.clone(), HashMap::new())));
 
+    let (mut resolved_managed, mut resolved_data_sources) = resolved_fixture_graph(
+        std::slice::from_ref(&upstream),
+        std::slice::from_ref(&data_source),
+    );
     let mut plan = Plan::new();
-    plan.add(create_effect(upstream.clone()));
+    plan.add(Effect::Create(resolved_managed.remove(0)));
     plan.add(Effect::Read {
-        resource: resolved_data_source(data_source.clone()),
+        resource: resolved_data_sources.remove(0),
     });
     let executable_data_source_values =
         executable_deferred_data_source_values(std::slice::from_ref(&data_source));
@@ -3784,7 +3884,7 @@ fn pending_module_composition(
             pending_constraints: constraints,
         },
         binding: Some(instance.to_string()),
-        dependency_bindings: std::collections::BTreeSet::new(),
+        dependency_bindings: Default::default(),
         module_name: "checked_module".to_string(),
         instance: instance.to_string(),
         call_path: Default::default(),
@@ -3867,10 +3967,17 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
     .with_identifier("producer-id")));
     provider.push_read(Ok(State::existing(data_source_id.clone(), HashMap::new())));
 
+    let mut parsed = crate::parser::ParsedFile::default();
+    parsed.compositions.push(composition.clone());
+    let (mut resolved_managed, mut resolved_data_sources) = resolved_fixture_graph_with_parsed(
+        parsed,
+        std::slice::from_ref(&upstream),
+        std::slice::from_ref(&data_source),
+    );
     let mut plan = Plan::new();
-    plan.add(create_effect(upstream.clone()));
+    plan.add(Effect::Create(resolved_managed.remove(0)));
     plan.add(Effect::Read {
-        resource: resolved_data_source(data_source.clone()),
+        resource: resolved_data_sources.remove(0),
     });
     let executable_data_source_values =
         executable_deferred_data_source_values(std::slice::from_ref(&data_source));
@@ -3997,9 +4104,7 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
     .with_identifier("producer-id")));
     provider.push_create(Ok(ok_state(&consumer_id)));
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(producer));
-    plan.add(create_effect(consumer));
+    let plan = create_plan_from_fixture_resources(vec![producer, consumer]);
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
@@ -4328,10 +4433,7 @@ async fn module_constraint_rechecks_after_binding_changes_in_same_apply() {
     .with_identifier("source-id")));
     provider.push_create(Ok(ok_state(&second_id)));
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(first));
-    plan.add(create_effect(updater));
-    plan.add(create_effect(second));
+    let plan = create_plan_from_fixture_resources(vec![first, updater, second]);
     let input = ExecutionInput {
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
@@ -4592,9 +4694,7 @@ async fn terminal_pending_constraint_is_silent_after_failed_and_skipped_effects(
         vec![("value", Value::resource_ref("missing", "value", vec![]))],
         vec![module_not_bad_constraint("value")],
     );
-    let mut plan = Plan::new();
-    plan.add(create_effect(failed));
-    plan.add(create_effect(skipped));
+    let plan = create_plan_from_fixture_resources(vec![failed, skipped]);
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
@@ -4687,6 +4787,11 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
 
     let provider = MockProvider::new();
     let target_id = ResourceId::with_identity("test", "wait-target");
+    let target_origin = make_resource("wait-target", &[]);
+    let resource_origins = HashMap::from([(
+        target_origin.id.clone(),
+        UnresolvedResource::from_pre_resolve(target_origin),
+    )]);
     let pending_state = State::existing(
         target_id.clone(),
         HashMap::from([(
@@ -4703,7 +4808,7 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
     );
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("target_ready"),
+        id: crate::resource::ResolvedResourceId::with_identity("__wait", "target_ready"),
         target_id: managed_wait_target(target_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -4713,12 +4818,15 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
         until_surface: "wait-target.status == READY".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_millis(1),
-        explicit_dependencies: HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
-        provider_check_inputs: ProviderCheckInputs::Authored,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &resource_origins,
+            data_source_origins: &[],
+        },
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
         managed_current: crate::resource::current_map_from_states(HashMap::from([(
@@ -4934,10 +5042,12 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
         Value::resource_ref("cert_ready".to_string(), "id".to_string(), vec![]),
     );
     dist.dependency_bindings = ["cert_ready".to_string()].into_iter().collect();
+    let mut resources =
+        resolved_fixture_resources_with_wait(vec![cert, dist], "cert_ready", "cert");
     let mut plan = Plan::new();
-    plan.add(create_effect(cert));
+    plan.add(Effect::Create(resources.remove(0)));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_ready"),
+        id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_ready"),
         target_id: managed_wait_target(cert_id),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -4947,9 +5057,9 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
         until_surface: "cert.status == READY".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_secs(60),
-        explicit_dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
-    plan.add(create_effect(dist));
+    plan.add(Effect::Create(resources.remove(0)));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -5001,10 +5111,12 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
     );
     dist.dependency_bindings = ["cert_ready".to_string()].into_iter().collect();
 
+    let mut resources =
+        resolved_fixture_resources_with_wait(vec![cert, dist], "cert_ready", "cert");
     let mut plan = Plan::new();
-    plan.add(create_effect(cert));
+    plan.add(Effect::Create(resources.remove(0)));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_ready"),
+        id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_ready"),
         target_id: managed_wait_target(cert_id),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -5014,9 +5126,9 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
         until_surface: "cert.status == READY".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_secs(60),
-        explicit_dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
-    plan.add(create_effect(dist));
+    plan.add(Effect::Create(resources.remove(0)));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -5618,10 +5730,14 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
         State::existing(data_source_id.clone(), HashMap::new()).with_identifier("lookup-id")
     ));
 
+    let (mut resolved_managed, mut resolved_data_sources) = resolved_fixture_graph(
+        std::slice::from_ref(&producer),
+        std::slice::from_ref(&planned),
+    );
     let mut plan = Plan::new();
-    plan.add(create_effect(producer.clone()));
+    plan.add(Effect::Create(resolved_managed.remove(0)));
     plan.add(Effect::Read {
-        resource: resolved_data_source(planned),
+        resource: resolved_data_sources.remove(0),
     });
 
     let executable_data_source_values =
@@ -6441,9 +6557,7 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
     rb.set_attr("config", Value::Concrete(ConcreteValue::Map(config)));
     let rb_id = rb.id.clone();
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(ra));
-    plan.add(create_effect(rb));
+    let plan = create_plan_from_fixture_resources(vec![ra, rb]);
     provider.push_create(Ok(ok_state(&ra_id)));
     provider.push_create(Ok(ok_state(&rb_id)));
 
@@ -6539,9 +6653,7 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
     ));
     provider.push_create(Ok(ok_state(&consumer.id)));
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(role));
-    plan.add(create_effect(consumer.clone()));
+    let plan = create_plan_from_fixture_resources(vec![role, consumer.clone()]);
     let input = ExecutionInput {
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
@@ -6658,9 +6770,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
     let rb = make_resource("b", &["a"]);
     let rb_id = rb.id.clone();
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(ra));
-    plan.add(create_effect(rb));
+    let plan = create_plan_from_fixture_resources(vec![ra, rb]);
     provider.push_create(Ok(ok_state(&ra_id)));
     provider.push_create(Ok(ok_state(&rb_id)));
 
@@ -6732,9 +6842,9 @@ async fn test_simple_delete() {
         generation: EffectGeneration::Current,
         directives: Directives::default(),
         binding: None,
-        dependencies: HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     });
 
     provider.push_delete(Ok(()));
@@ -6774,9 +6884,7 @@ async fn test_failed_effect_propagates_to_dependent() {
     let rb = make_resource("b", &["a"]);
     let _rid_a = ra.id.clone();
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(ra));
-    plan.add(create_effect(rb));
+    let plan = create_plan_from_fixture_resources(vec![ra, rb]);
 
     // First create fails
     provider.push_create(Err(ProviderError::api_error("create failed")));
@@ -6897,10 +7005,7 @@ async fn test_independent_effects_run_in_parallel() {
     let subnet_a_id = subnet_a.id.clone();
     let subnet_b_id = subnet_b.id.clone();
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(vpc));
-    plan.add(create_effect(subnet_a));
-    plan.add(create_effect(subnet_b));
+    let plan = create_plan_from_fixture_resources(vec![vpc, subnet_a, subnet_b]);
 
     provider.push_create(Ok(ok_state(&vpc_id)));
     provider.push_create(Ok(ok_state(&subnet_a_id)));
@@ -6952,11 +7057,7 @@ async fn test_parallel_failure_skips_dependents() {
     let _subnet_a_id = subnet_a.id.clone();
     let subnet_b_id = subnet_b.id.clone();
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(vpc));
-    plan.add(create_effect(subnet_a));
-    plan.add(create_effect(subnet_b));
-    plan.add(create_effect(subnet_c));
+    let plan = create_plan_from_fixture_resources(vec![vpc, subnet_a, subnet_b, subnet_c]);
 
     provider.push_create(Ok(ok_state(&vpc_id)));
     // subnet_a fails, subnet_b succeeds
@@ -7008,10 +7109,7 @@ async fn test_dependency_levels_sequential_chain() {
     let b_id = b.id.clone();
     let c_id = c.id.clone();
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(a));
-    plan.add(create_effect(b));
-    plan.add(create_effect(c));
+    let plan = create_plan_from_fixture_resources(vec![a, b, c]);
 
     provider.push_create(Ok(ok_state(&a_id)));
     provider.push_create(Ok(ok_state(&b_id)));
@@ -7054,11 +7152,7 @@ fn test_build_dependency_levels() {
     let c = make_resource("c", &["a"]);
     let d = make_resource("d", &["b", "c"]);
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(a));
-    plan.add(create_effect(b));
-    plan.add(create_effect(c));
-    plan.add(create_effect(d));
+    let plan = create_plan_from_fixture_resources(vec![a, b, c, d]);
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
 
@@ -7119,13 +7213,18 @@ fn test_build_dependency_levels_transitive_ref_preserves_direct_dep() {
     rt.binding = Some("rt".to_string());
     rt.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
+    let resources = vec![vpc, tgw, subnet, tgw_attach, rt, route];
+    let mut parsed: crate::parser::ParsedFile = Default::default();
+    let index = crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &[])
+        .expect("fixture graph must resolve");
     let mut plan = Plan::new();
-    plan.add(create_effect(vpc)); // idx 0
-    plan.add(create_effect(tgw)); // idx 1
-    plan.add(create_effect(subnet)); // idx 2
-    plan.add(create_effect(tgw_attach)); // idx 3
-    plan.add(create_effect(rt)); // idx 4
-    plan.add(create_effect(route)); // idx 5
+    for resource in resources {
+        plan.add(Effect::Create(
+            index
+                .resolve_resource(resource, &crate::schema::SchemaRegistry::new())
+                .expect("fixture dependency must resolve to a full id"),
+        ));
+    }
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
 
@@ -7263,10 +7362,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
     let b = make_resource("b", &[]);
     let c = make_resource("c", &["a"]);
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(a));
-    plan.add(create_effect(b));
-    plan.add(create_effect(c));
+    let plan = create_plan_from_fixture_resources(vec![a, b, c]);
 
     let input = ExecutionInput {
         plan: &plan,
@@ -7460,9 +7556,10 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
         resources.push(tag_update_resource(&format!("child{idx}"), Some("vpc")));
     }
 
+    let resolved_resources = resolved_fixture_resources(resources.clone());
     let mut current_states = HashMap::new();
     let mut plan = Plan::new();
-    for resource in &resources {
+    for (resource, resolved_resource) in resources.iter().zip(resolved_resources) {
         let binding = resource.binding.as_deref().unwrap();
         let from = tag_update_state(&resource.id, binding);
         current_states.insert(resource.id.clone(), from.clone());
@@ -7471,7 +7568,7 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
                 from.id.identity_display().to_string(),
             ),
             from: Box::new(from),
-            to: resolved(resource.clone()),
+            to: resolved_resource,
             changed_attributes: vec!["tags".to_string()],
         });
     }
@@ -7531,7 +7628,12 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
     let mut parent = tag_update_resource("vpc", None);
     let mut child = tag_update_resource("child", None);
     if unknown_read {
-        child.directives.depends_on.push("vpc".to_string());
+        child
+            .directives
+            .depends_on
+            .push(crate::parser::UnexpandedDependencyOperand::BareBinding(
+                "vpc".into(),
+            ));
     } else {
         child.set_attr("vpc_id", Value::resource_ref("vpc", "id", vec![]));
     }
@@ -7539,9 +7641,10 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
     child.binding = Some("child".to_string());
     let resources = vec![parent, child];
 
+    let resolved_resources = resolved_fixture_resources(resources.clone());
     let mut current_states = HashMap::new();
     let mut plan = Plan::new();
-    for resource in &resources {
+    for (resource, resolved_resource) in resources.iter().zip(resolved_resources) {
         let binding = resource.binding.as_deref().unwrap();
         let from = tag_update_state(&resource.id, binding);
         current_states.insert(resource.id.clone(), from.clone());
@@ -7550,7 +7653,7 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
                 from.id.identity_display().to_string(),
             ),
             from: Box::new(from),
-            to: resolved(resource.clone()),
+            to: resolved_resource,
             changed_attributes: vec!["tags".to_string()],
         });
     }
@@ -7649,9 +7752,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
     let a = make_resource("a", &[]);
     let c = make_resource("c", &["a"]);
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(a));
-    plan.add(create_effect(c));
+    let plan = create_plan_from_fixture_resources(vec![a, c]);
 
     let input = ExecutionInput {
         plan: &plan,
@@ -7737,9 +7838,9 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
         generation: EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some("vpc".to_string()),
-        dependencies: HashSet::new(), // vpc has no deps
-        explicit_dependencies: HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: Default::default(), // vpc has no deps
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     });
     plan.add(Effect::Delete {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -7750,9 +7851,9 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
         generation: EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some("subnet".to_string()),
-        dependencies: HashSet::from(["vpc".to_string()]), // subnet depends on vpc
-        explicit_dependencies: HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: std::iter::once(test_resolved_id("ec2.Vpc", "vpc")).collect(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     });
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
@@ -7788,15 +7889,17 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
         )]),
     )
     .with_identifier("consumer-id")
-    .with_dependency_bindings(std::collections::BTreeSet::from(["dependency".to_string()]));
+    .with_dependency_bindings(
+        std::iter::once(test_resolved_id("test.Dependency", "dependency")).collect(),
+    );
     let orphan_state =
         State::existing(orphan_id.clone(), HashMap::new()).with_identifier("dependency-id");
-    let current_states = HashMap::from([(consumer_id, consumer_state)]);
+    let current_states = HashMap::from([(consumer_id.clone(), consumer_state)]);
     let desired = ResolvedResource::collect_resolved([desired]).unwrap();
     let orphans = crate::differ::Orphans::from([crate::differ::Orphan::from_state(
         orphan_state,
         Some("dependency".to_string()),
-        Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     )]);
     let plan_input_states = crate::resource::into_plan_input_current_map_from_states(
         current_states,
@@ -7834,7 +7937,7 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
     };
     assert_eq!(
         blocked_by_updates,
-        &HashSet::from([ResourceIdentity::new("consumer")])
+        &std::iter::once(test_resolved_id("test.Consumer", "consumer")).collect()
     );
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
@@ -7864,11 +7967,7 @@ fn test_build_dependency_levels_consistent_with_dependency_map() {
     let c = make_resource("c", &["a"]);
     let d = make_resource("d", &["b", "c"]);
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(a));
-    plan.add(create_effect(b));
-    plan.add(create_effect(c));
-    plan.add(create_effect(d));
+    let plan = create_plan_from_fixture_resources(vec![a, b, c, d]);
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
     let dep_map =
@@ -7962,9 +8061,9 @@ fn test_dependency_analysis_respects_delete_dependencies() {
         generation: EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some("vpc".to_string()),
-        dependencies: HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     });
     plan.add(Effect::Delete {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -7975,9 +8074,9 @@ fn test_dependency_analysis_respects_delete_dependencies() {
         generation: EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some("subnet".to_string()),
-        dependencies: HashSet::from(["vpc".to_string()]),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: std::iter::once(test_resolved_id("ec2.Vpc", "vpc")).collect(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     });
 
     let deps =
@@ -8028,9 +8127,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     subnet.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
     let subnet_id = subnet.id.clone();
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(vpc));
-    plan.add(create_effect(subnet));
+    let plan = create_plan_from_fixture_resources(vec![vpc, subnet]);
 
     // VPC create returns state with vpc_id
     let vpc_state = State::existing(
@@ -8392,6 +8489,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
 
     let managed_subnet = Resource::new("ec2.Subnet", "subnet")
         .with_binding("subnet")
+        .with_dependency_bindings(std::collections::BTreeSet::from(["vpc".to_string()]))
         .with_attribute("vpc_id", string("vpc-old"))
         .with_attribute("cidr_block", string("10.221.1.0/24"))
         .with_attribute("availability_zone", string("ap-northeast-1c"));
@@ -8445,8 +8543,8 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
             )
         })
         .collect::<HashMap<_, _>>();
-    let unresolved = ResolvedResource::collect_resolved(authored_resources).unwrap();
-    let managed = ResolvedResource::collect_resolved(managed_resources.clone()).unwrap();
+    let unresolved = resolved_fixture_resources(authored_resources);
+    let managed = resolved_fixture_resources(managed_resources.clone());
     let plan = create_plan_with_cascades(
         &managed,
         &unresolved,
@@ -8556,10 +8654,12 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     dist.dependency_bindings = ["cert_issued".to_string()].into_iter().collect();
     let dist_id = dist.id.clone();
 
+    let mut resources =
+        resolved_fixture_resources_with_wait(vec![cert, dist], "cert_issued", "cert");
     let mut plan = Plan::new();
-    plan.add(create_effect(cert));
+    plan.add(Effect::Create(resources.remove(0)));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_issued"),
+        id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -8569,9 +8669,9 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_millis(1),
-        explicit_dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
-    plan.add(create_effect(dist));
+    plan.add(Effect::Create(resources.remove(0)));
 
     // create cert → state with status PENDING (the Create result; the
     // wait polls via read for ISSUED).
@@ -8712,10 +8812,12 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         dist.dependency_bindings
     );
 
+    let mut resources =
+        resolved_fixture_resources_with_wait(vec![cert, dist], "cert_issued", "cert");
     let mut plan = Plan::new();
-    plan.add(create_effect(cert));
+    plan.add(Effect::Create(resources.remove(0)));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_issued"),
+        id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -8725,9 +8827,9 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_millis(1),
-        explicit_dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
-    plan.add(create_effect(dist));
+    plan.add(Effect::Create(resources.remove(0)));
 
     // create cert → PENDING; wait polls read → PENDING → ISSUED+arn.
     let mut create_attrs = HashMap::new();
@@ -8822,7 +8924,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_issued"),
+        id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -8832,7 +8934,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_millis(1),
-        explicit_dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
 
     let mut issued = HashMap::new();
@@ -8946,9 +9048,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
     };
     let record_id = record.id.clone();
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(cert));
-    plan.add(create_effect(record));
+    let plan = create_plan_from_fixture_resources(vec![cert, record]);
 
     // Mirror the AWS RequestCertificate read-back race: the DVO list
     // is populated asynchronously by ACM after RequestCertificate
@@ -9051,8 +9151,24 @@ async fn test_apply_rejects_wrong_shape_access_without_wait_guidance() {
     );
     let consumer_id = consumer.id.clone();
 
+    let mut data_source = DataSource::new("test", "q");
+    data_source.binding = Some("q".to_string());
+    let data_source_state = State::existing(
+        data_source.id.clone(),
+        HashMap::from([(
+            "identifier".to_string(),
+            Value::Concrete(ConcreteValue::String("q-123".into())),
+        )]),
+    );
+    let (mut resolved_managed, mut resolved_data_sources) = resolved_fixture_graph(
+        std::slice::from_ref(&consumer),
+        std::slice::from_ref(&data_source),
+    );
     let mut plan = Plan::new();
-    plan.add(create_effect(consumer));
+    plan.add(Effect::Read {
+        resource: resolved_data_sources.remove(0),
+    });
+    plan.add(Effect::Create(resolved_managed.remove(0)));
     // Keep a slot available so a regression that forwards the unresolved
     // value reaches the assertion below instead of panicking in the mock.
     provider.push_create(Ok(
@@ -9075,7 +9191,10 @@ async fn test_apply_rejects_wrong_shape_access_without_wait_guidance() {
         compositions: &[],
         bindings,
         managed_current: HashMap::new(),
-        data_source_values: ExecutableDataSourceValues::empty(),
+        data_source_values: executable_data_source_values(
+            std::slice::from_ref(&data_source),
+            &HashMap::from([(data_source.id.clone(), data_source_state)]),
+        ),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -9189,9 +9308,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
     };
     let record_id = record.id.clone();
 
-    let mut plan = Plan::new();
-    plan.add(create_effect(cert));
-    plan.add(create_effect(record));
+    let plan = create_plan_from_fixture_resources(vec![cert, record]);
 
     // Cert create returns post-read state with DVO populated. Shape
     // mirrors what `read_acm_certificate` inserts after aws#295.
@@ -9450,7 +9567,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_issued"),
+        id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -9460,7 +9577,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         until_surface: "cert.status == \"issued\"".to_string(),
         timeout: std::time::Duration::from_secs(5),
         interval: std::time::Duration::from_millis(10),
-        explicit_dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
 
     let input = ExecutionInput {
@@ -9511,6 +9628,7 @@ async fn deferred_create_reports_iterable_reference_when_binding_missing() {
             "__deferred_for",
             "validation_records",
         )),
+        dependencies: Default::default(),
         template: Box::new(validation_deferred_for_expression()),
     });
 
@@ -9562,6 +9680,7 @@ async fn apply_time_unbound_child_collision_with_another_desired_id_is_typed_err
             "__deferred_for",
             "anonymous_collision",
         )),
+        dependencies: Default::default(),
         template: Box::new(template),
     });
     let input = ExecutionInput {
@@ -9610,6 +9729,7 @@ async fn apply_time_unbound_child_collision_with_unabsorbed_state_row_is_typed_e
             "__deferred_for",
             "anonymous_state_collision",
         )),
+        dependencies: Default::default(),
         template: Box::new(template),
     });
     let current = Current::from_state(
@@ -9657,15 +9777,16 @@ fn legacy_unbound_deferred_replace(
             identifier: crate::effect::fixture_applied_identifier("existing"),
             directives: Directives::default(),
             binding: legacy_id.identity_str().map(str::to_string),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         }])
         .expect("fixture has one delete"),
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "__deferred_for",
             "anonymous_legacy_replace",
         )),
+        dependencies: Default::default(),
         template: Box::new(template),
     }))
 }
@@ -9778,15 +9899,16 @@ async fn completed_plain_anonymous_delete_releases_id_for_unbound_deferred_child
         generation: EffectGeneration::Current,
         directives: Directives::default(),
         binding: None,
-        dependencies: HashSet::new(),
-        explicit_dependencies: HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     });
     plan.add(Effect::DeferredCreate {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "__deferred_for",
             "anonymous_remint",
         )),
+        dependencies: Default::default(),
         template: Box::new(template),
     });
     let current = Current::from_state(
@@ -9840,6 +9962,7 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
             "__deferred_for",
             "validation_records",
         )),
+        dependencies: Default::default(),
         template: Box::new(validation_deferred_for_expression()),
     });
 
@@ -9893,6 +10016,7 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
             "__deferred_for",
             "validation_records",
         )),
+        dependencies: Default::default(),
         template: Box::new(validation_deferred_for_expression()),
     });
 
@@ -9971,9 +10095,9 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
                 identifier: crate::effect::fixture_applied_identifier("old-validation-0"),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
-                dependencies: HashSet::new(),
-                explicit_dependencies: HashSet::new(),
-                blocked_by_updates: HashSet::new(),
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
             },
             DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -9983,9 +10107,9 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
                 identifier: crate::effect::fixture_applied_identifier("old-validation-1"),
                 directives: Directives::default(),
                 binding: Some("validation_records[1]".to_string()),
-                dependencies: HashSet::new(),
-                explicit_dependencies: HashSet::new(),
-                blocked_by_updates: HashSet::new(),
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
             },
         ])
         .expect("fixture has deletes"),
@@ -9993,6 +10117,8 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
             "__deferred_for",
             "validation_records",
         )),
+        dependencies: std::iter::once(crate::resource::ResolvedResourceId::new(cert_id.clone()))
+            .collect(),
         template: Box::new(validation_deferred_for_expression()),
     })));
 
@@ -10080,15 +10206,17 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
             identifier: crate::effect::fixture_applied_identifier("old-validation"),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         }])
         .expect("fixture has one delete"),
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "__deferred_for",
             "validation_records",
         )),
+        dependencies: std::iter::once(crate::resource::ResolvedResourceId::new(cert_id.clone()))
+            .collect(),
         template: Box::new(validation_deferred_for_expression()),
     })));
 
@@ -10339,15 +10467,16 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             identifier: crate::effect::fixture_applied_identifier("old-validation"),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::from(["cert".to_string()]),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: std::iter::once(test_resolved_id("test", "cert")).collect(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         }])
         .expect("fixture has one delete"),
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "__deferred_for",
             "validation_records",
         )),
+        dependencies: Default::default(),
         template: Box::new(validation_deferred_for_expression()),
     })));
 
@@ -10672,12 +10801,16 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
         State::existing(consumer_id.clone(), HashMap::new()).with_identifier("consumer-id");
     provider.push_create(Ok(consumer_state));
 
+    let (mut resolved_managed, mut resolved_data_sources) = resolved_fixture_graph(
+        &[upstream.clone(), consumer.clone()],
+        std::slice::from_ref(&data_source),
+    );
     let mut plan = Plan::new();
-    plan.add(create_effect(upstream.clone()));
+    plan.add(Effect::Create(resolved_managed.remove(0)));
     plan.add(Effect::Read {
-        resource: resolved_data_source(data_source.clone()),
+        resource: resolved_data_sources.remove(0),
     });
-    plan.add(create_effect(consumer.clone()));
+    plan.add(Effect::Create(resolved_managed.remove(0)));
 
     let current_states: HashMap<ResourceId, State> = HashMap::new();
     let executable_data_source_values =
@@ -10809,12 +10942,16 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
     .with_identifier("target-id")));
     provider.push_read(Err(ProviderError::api_error("lookup failed")));
 
+    let (mut resolved_managed, mut resolved_data_sources) = resolved_fixture_graph(
+        &[upstream.clone(), consumer.clone()],
+        std::slice::from_ref(&data_source),
+    );
     let mut plan = Plan::new();
-    plan.add(create_effect(upstream.clone()));
+    plan.add(Effect::Create(resolved_managed.remove(0)));
     plan.add(Effect::Read {
-        resource: resolved_data_source(data_source.clone()),
+        resource: resolved_data_sources.remove(0),
     });
-    plan.add(create_effect(consumer.clone()));
+    plan.add(Effect::Create(resolved_managed.remove(0)));
 
     let current_states: HashMap<ResourceId, State> = HashMap::new();
     let executable_data_source_values =

@@ -172,7 +172,7 @@ mod tests {
 
     fn sample_composition() -> LiveComposition {
         use indexmap::IndexMap;
-        use std::collections::{BTreeSet, HashSet};
+        use std::collections::HashSet;
         LiveComposition {
             id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "m")),
             signature: super::super::LiveCompositionSignature {
@@ -181,7 +181,7 @@ mod tests {
                 pending_constraints: Vec::new(),
             },
             binding: None,
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "m".to_string(),
             instance: "i".to_string(),
             call_path: Default::default(),
@@ -263,7 +263,7 @@ mod tests {
     ///         attributes: IndexMap::new(),
     ///     },
     ///     binding: None,
-    ///     dependency_bindings: BTreeSet::new(),
+    ///     dependency_bindings: Default::default(),
     ///     module_name: "m".to_string(),
     ///     instance: "i".to_string(),
     ///     call_path: Default::default(),
