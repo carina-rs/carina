@@ -467,7 +467,7 @@ mod provider_scope_evidence_tests {
     }
 
     #[test]
-    fn format_35_saved_plan_round_trips_provider_scopes_and_integer_arithmetic() {
+    fn format_34_saved_plan_round_trips_provider_scopes_and_integer_arithmetic() {
         let mut default_config = provider_config("unused");
         default_config.binding = None;
         default_config.source = Some("file:///test-provider.wasm".parse().unwrap());
@@ -645,7 +645,7 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 35 adds typed deferred integer arithmetic expressions.
+    /// Plan format 34 adds typed deferred integer arithmetic expressions.
     ///
     /// Plan format 33 adds the typed keyed-list release effect.
     ///
@@ -914,7 +914,7 @@ struct ProviderEvidence {
 /// inventory to match every referenced type exactly and the provider-artifact
 /// keys to match the providers implied by the saved provider configurations.
 ///
-/// Format 35 adds typed deferred integer arithmetic expressions.
+/// Format 34 adds typed deferred integer arithmetic expressions.
 ///
 /// Format 33 adds typed keyed-list release effects.
 ///
@@ -933,7 +933,7 @@ pub struct PlanFile {
     evidence: ProviderEvidence,
 }
 
-/// Private format-35 wire representation.
+/// Private format-34 wire representation.
 ///
 /// Field order is intentionally identical to the historical `PlanFile`
 /// serialization order. Evidence is mandatory and is never defaulted.
@@ -1903,7 +1903,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 35;
+    pub const CURRENT_VERSION: u32 = 34;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -4209,7 +4209,7 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
-        // carina#4142: bumped 33→35 — saved plans can retain typed deferred
+        // carina#4142: bumped 33→34 — saved plans can retain typed deferred
         // integer arithmetic until apply-time reference resolution.
         // carina#4118: bumped 32→33 — keyed partial-update releases add a
         // serialized state-only Effect variant.

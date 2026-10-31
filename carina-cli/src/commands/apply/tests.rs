@@ -9599,16 +9599,16 @@ mod saved_plan_version_tests {
     }
 
     #[tokio::test]
-    async fn format_34_and_older_are_rejected_before_payload_decoding() {
+    async fn format_33_and_older_are_rejected_before_payload_decoding() {
         let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            35,
-            "carina#4142 uses saved-plan format 35",
+            34,
+            "carina#4142 uses saved-plan format 34",
         );
 
-        for older_version in [34, 33] {
+        for older_version in [33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,
