@@ -890,6 +890,7 @@ impl EvalValue {
                 ConcreteValue::List(_) | ConcreteValue::StringList(_) => "list",
                 ConcreteValue::Map(_) => "map",
             },
+            Self::Value(Value::Deferred(DeferredValue::ModuleIf(_))) => "module conditional",
             Self::Value(Value::Deferred(DeferredValue::Secret(_))) => "secret",
             Self::Value(Value::Deferred(DeferredValue::RedactedSecret { .. })) => "secret",
             Self::Value(Value::Deferred(DeferredValue::ResourceRef { .. })) => "resource reference",

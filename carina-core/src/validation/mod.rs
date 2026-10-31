@@ -743,6 +743,18 @@ fn deferred_value_mismatch(
     authored_binding: &str,
 ) -> Option<BindingResolutionError> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred.values()[1..].iter().find_map(|branch| {
+                deferred_value_mismatch(
+                    branch,
+                    target,
+                    inference_bindings,
+                    schemas,
+                    bindings,
+                    authored_binding,
+                )
+            })
+        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             reference_value_mismatch(ReferencePathRef::Access(path), target, bindings)
         }
@@ -1365,6 +1377,13 @@ fn visit_refs_with_sink_inner<'a>(
     ),
 ) {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let [condition, then_value, else_value] = deferred.values();
+            visit_refs_with_sink_inner(condition, None, usage, f);
+            for branch in [then_value, else_value] {
+                visit_refs_with_sink_inner(branch, sink, usage, f);
+            }
+        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             f(ReferencePathRef::Access(path), sink, usage, None)
         }
@@ -1467,6 +1486,13 @@ fn visit_computed_accesses_with_sink<'a>(
     f: &mut impl FnMut(&Value, Option<RefSink<'a>>),
 ) {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let [condition, then_value, else_value] = deferred.values();
+            visit_computed_accesses_with_sink(condition, None, f);
+            for branch in [then_value, else_value] {
+                visit_computed_accesses_with_sink(branch, sink, f);
+            }
+        }
         Value::Deferred(DeferredValue::Access(access)) => {
             if crate::resource::module_argument_reference_path(value).is_none() {
                 f(value, sink);
@@ -1762,6 +1788,24 @@ fn prove_integer_operand(
             prove_integer_operand(value, expression, side, bindings, schemas, binding_index)?;
             return prove_integer_operand(
                 default,
+                expression,
+                side,
+                bindings,
+                schemas,
+                binding_index,
+            );
+        }
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            prove_integer_operand(
+                deferred.then_value(),
+                expression,
+                side,
+                bindings,
+                schemas,
+                binding_index,
+            )?;
+            return prove_integer_operand(
+                deferred.else_value(),
                 expression,
                 side,
                 bindings,
@@ -2740,6 +2784,20 @@ fn validate_user_function_ref_types_inner<
         }
 
         match value {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                let [condition, then_value, else_value] = deferred.values();
+                check_function_calls(condition, None, context, bindings, unknown_policy, errors);
+                for branch in [then_value, else_value] {
+                    check_function_calls(
+                        branch,
+                        result_sink,
+                        context,
+                        bindings,
+                        unknown_policy,
+                        errors,
+                    );
+                }
+            }
             Value::Deferred(
                 DeferredValue::FunctionCall { name, args, .. }
                 | DeferredValue::Unavailable { name, args, .. },
@@ -3645,6 +3703,9 @@ fn deferred_iterable_shape(
     schemas: &SchemaRegistry,
 ) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            infer_type_from_value_to_iterable_shape(value, bindings, schemas)
+        }
         Value::Concrete(ConcreteValue::List(_items)) => Ok(DeferredIterableShape::List),
         Value::Concrete(ConcreteValue::Map(_entries)) => Ok(DeferredIterableShape::Map),
         Value::Concrete(
@@ -5080,7 +5141,8 @@ pub fn validate_no_exports_in_module<E>(parsed: &crate::parser::File<E>) -> Resu
 /// must still be checked. carina#3182.
 pub fn value_contains_unresolved_ref(value: &Value) -> bool {
     match value {
-        Value::Deferred(DeferredValue::ResourceRef { .. })
+        Value::Deferred(DeferredValue::ModuleIf(_))
+        | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Coalesce { .. })
         | Value::Deferred(DeferredValue::IntegerArithmetic(_))
@@ -6587,6 +6649,7 @@ fn module_call_label(call: &ModuleCall) -> String {
 
 fn module_call_value_is_context_free(value: &Value) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => false,
         Value::Concrete(ConcreteValue::String(_string)) => true,
         Value::Concrete(ConcreteValue::CanonicalEnum(_canonical)) => true,
         Value::Concrete(ConcreteValue::Int(_integer)) => true,

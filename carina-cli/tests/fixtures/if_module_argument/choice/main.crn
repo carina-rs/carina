@@ -1,0 +1,11 @@
+arguments {
+  flag: Bool
+}
+
+attributes {
+  value: String = if flag { "yes" } else { "no" }
+}
+
+let conditional = if flag {
+  mock.test.resource { name = "conditional" }
+}

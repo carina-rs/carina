@@ -2439,6 +2439,24 @@ impl StructuralOperand {
         }
     }
 
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::Value { value, access_base } => {
+                visit(value)?;
+                if let Some(access_base) = access_base {
+                    visit(access_base)?;
+                }
+            }
+            Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => {
+                visit(access_base)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn try_map<E>(
         &self,
         mut map: impl FnMut(&Value) -> Result<Value, E>,
@@ -2446,7 +2464,7 @@ impl StructuralOperand {
         Ok(match self {
             Self::Value { value, access_base } => Self::Value {
                 value: map(value)?,
-                access_base: access_base.as_ref().map(&mut map).transpose()?,
+                access_base: access_base.as_ref().map(map).transpose()?,
             },
             Self::Handle {
                 handle,
@@ -2518,6 +2536,13 @@ impl FunctionArgument {
 
     pub(crate) fn walker_value_mut(&mut self) -> &mut Value {
         self.operand.traversal_value_mut()
+    }
+
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.operand.try_visit_values(visit)
     }
 
     pub(crate) fn try_map_value<E>(
@@ -2672,6 +2697,10 @@ impl fmt::Display for UnavailableReason {
 /// (apply time, upstream load, function evaluation).
 #[derive(Clone)]
 pub enum DeferredValue {
+    /// Parser-only module-template conditional. Module expansion selects a
+    /// branch after argument substitution; this variant is rejected by serde
+    /// and by the expanded-contribution boundary.
+    ModuleIf(Box<crate::parser::DeferredValueIf>),
     /// Reference to another resource's attribute via an access path.
     ResourceRef { path: AccessPath },
     /// Reference to a binding without an attribute selector.
@@ -2751,6 +2780,7 @@ impl DeferredValue {
         &self,
     ) -> Option<(crate::builtins::BuiltinFunction, &[FunctionArgument])> {
         match self {
+            Self::ModuleIf(_) => None,
             Self::FunctionCall { name, args, .. } => Some((*name, args)),
             Self::Unavailable { name, args, .. } => Some((*name, args)),
             Self::ResourceRef { .. }
@@ -2927,7 +2957,8 @@ impl Value {
             )
             | Value::Deferred(DeferredValue::RedactedSecret { .. }) => true,
             Value::Deferred(
-                DeferredValue::ResourceRef { .. }
+                DeferredValue::ModuleIf(_)
+                | DeferredValue::ResourceRef { .. }
                 | DeferredValue::BindingRef { .. }
                 | DeferredValue::Coalesce { .. }
                 | DeferredValue::IntegerArithmetic(_)
@@ -2983,6 +3014,9 @@ impl Serialize for DeferredValue {
         }
 
         match self {
+            Self::ModuleIf(_) => Err(serde::ser::Error::custom(
+                "module-template conditional cannot be serialized before expansion",
+            )),
             Self::ResourceRef { path } => {
                 SerializableDeferredValue::ResourceRef { path }.serialize(serializer)
             }
@@ -3101,6 +3135,7 @@ impl<'de> Deserialize<'de> for DeferredValue {
 impl fmt::Debug for DeferredValue {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ModuleIf(deferred) => f.debug_tuple("ModuleIf").field(deferred).finish(),
             Self::ResourceRef { path } => {
                 f.debug_struct("ResourceRef").field("path", path).finish()
             }
@@ -3939,6 +3974,7 @@ impl ConcreteValue {
 /// Phase 1 of [RFC #2972](https://github.com/carina-rs/carina/issues/2972).
 #[derive(Debug, Clone, Copy)]
 pub enum DeferredValueRef<'a> {
+    ModuleIf(&'a crate::parser::DeferredValueIf),
     ResourceRef {
         path: &'a AccessPath,
     },
@@ -3977,6 +4013,10 @@ impl Value {
     /// plaintext must be excluded from diagnostics.
     pub(crate) fn contains_diagnostic_sensitive_string(&self) -> bool {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
+                .values()
+                .into_iter()
+                .any(Value::contains_diagnostic_sensitive_string),
             Value::Concrete(ConcreteValue::String(value)) => value.is_diagnostic_sensitive(),
             Value::Concrete(ConcreteValue::StringList(values)) => {
                 values.iter().any(ValueString::is_diagnostic_sensitive)
@@ -4075,6 +4115,7 @@ impl Value {
     pub fn as_deferred(&self) -> Option<DeferredValueRef<'_>> {
         match self {
             Value::Deferred(d) => Some(match d {
+                DeferredValue::ModuleIf(deferred) => DeferredValueRef::ModuleIf(deferred),
                 DeferredValue::ResourceRef { path } => DeferredValueRef::ResourceRef { path },
                 DeferredValue::BindingRef { binding } => DeferredValueRef::BindingRef { binding },
                 DeferredValue::Coalesce { value, default } => {
@@ -4278,6 +4319,10 @@ impl PartialEq for Value {
         }
 
         match (self, other) {
+            (
+                Value::Deferred(DeferredValue::ModuleIf(a)),
+                Value::Deferred(DeferredValue::ModuleIf(b)),
+            ) => a == b,
             (
                 Value::Deferred(DeferredValue::Unknown(a @ UnknownReason::ModuleArgument { .. })),
                 Value::Deferred(DeferredValue::Unknown(b @ UnknownReason::ModuleArgument { .. })),
@@ -4500,6 +4545,13 @@ impl Value {
     /// only has a `&mut Value` (e.g. inside `IndexMap::values_mut()`).
     pub fn canonicalize_in_place(&mut self) {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                **deferred = deferred.map(|value| {
+                    let mut value = value.clone();
+                    value.canonicalize_in_place();
+                    value
+                });
+            }
             Value::Concrete(ConcreteValue::List(items)) => {
                 for item in items {
                     item.canonicalize_in_place();
@@ -4628,6 +4680,11 @@ impl Value {
         f: &mut impl FnMut(&AccessPath, ResourceRefUsage),
     ) {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred.values().into_iter().for_each(|value| {
+                    value.visit_resource_refs_with_usage_inner(usage, f);
+                });
+            }
             Value::Deferred(DeferredValue::ResourceRef { path }) => f(path, usage),
             Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
@@ -4714,6 +4771,12 @@ impl Value {
     /// that needs both must call both — drift is visible at the call site.
     pub fn visit_binding_refs(&self, f: &mut impl FnMut(&str)) {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred
+                    .values()
+                    .into_iter()
+                    .for_each(|value| value.visit_binding_refs(f));
+            }
             Value::Deferred(DeferredValue::BindingRef { binding }) => f(binding),
             Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
@@ -4802,6 +4865,9 @@ pub fn contains_resource_ref(value: &Value) -> bool {
 /// `Value::Deferred(DeferredValue::Unknown)`.
 pub fn value_contains_unknown(value: &Value) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred.values().into_iter().any(value_contains_unknown)
+        }
         Value::Deferred(DeferredValue::Unknown(_)) => true,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(value_contains_unknown),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().any(value_contains_unknown),
@@ -4869,6 +4935,9 @@ pub(crate) fn find_unavailable_evaluation(
     )> {
         let recurse = |value| find(value, coalesce_policy, secret_policy, inside_secret);
         match value {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred.values().into_iter().find_map(recurse)
+            }
             Value::Deferred(DeferredValue::Unavailable {
                 name,
                 reason,
@@ -4962,6 +5031,12 @@ impl Value {
     fn hash_into(&self, hasher: &mut impl Hasher) {
         std::mem::discriminant(self).hash(hasher);
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred
+                    .values()
+                    .into_iter()
+                    .for_each(|value| value.hash_into(hasher));
+            }
             Value::Concrete(ConcreteValue::String(s)) => s.hash(hasher),
             Value::Concrete(ConcreteValue::EnumIdentifier(s)) => s.hash(hasher),
             Value::Concrete(ConcreteValue::CanonicalEnum(c)) => c.hash(hasher),
@@ -8059,6 +8134,9 @@ pub(crate) fn assert_value_fully_resolved(
 ) -> Result<(), crate::value::SerializationError> {
     let context = crate::value::SerializationContext::WasmBoundary;
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err(crate::value::SerializationError::UnexpandedModuleIf { context })
+        }
         Value::Concrete(ConcreteValue::List(items)) => {
             for item in items {
                 assert_value_fully_resolved(item)?;

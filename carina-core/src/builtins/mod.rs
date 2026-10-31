@@ -134,6 +134,10 @@ fn mark_secret_input_strings(value: Value) -> Value {
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
             Box::new(mark_secret_input_strings(*inner)),
         )),
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let deferred = deferred.map(|value| mark_secret_input_strings(value.clone()));
+            Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred)))
+        }
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
             let lhs = mark_secret_input_strings(expression.lhs().clone());
             let rhs = mark_secret_input_strings(expression.rhs().clone());
@@ -617,6 +621,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Concrete(ConcreteValue::List(_)) => "List",
         Value::Concrete(ConcreteValue::StringList(_)) => "StringList",
         Value::Concrete(ConcreteValue::Map(_)) => "Map",
+        Value::Deferred(DeferredValue::ModuleIf(_)) => "ModuleIf",
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "ResourceRef",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "BindingRef",
         Value::Deferred(DeferredValue::Coalesce { .. }) => "Coalesce",

@@ -6362,6 +6362,445 @@ fn parse_if_resource_ref_condition_errors() {
 }
 
 #[test]
+fn parse_if_module_argument_defers_value_selection() {
+    let parsed = parse(
+        r#"
+            arguments { flag: Bool }
+            let choice = if flag { "yes" } else { "no" }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a Bool module argument may select a value branch during expansion");
+    assert!(matches!(
+        parsed.variables.get("choice"),
+        Some(Value::Deferred(DeferredValue::ModuleIf(_)))
+    ));
+}
+
+#[test]
+fn parse_if_module_argument_defers_structural_selection() {
+    let parsed = parse(
+        r#"
+            arguments { flag: Bool }
+            let choice = if flag {
+                mock.test.Thing { name = "yes" }
+            } else {
+                mock.test.Thing { name = "no" }
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a Bool module argument may select a resource branch during expansion");
+    assert_eq!(parsed.deferred_module_ifs.len(), 1);
+    assert!(matches!(
+        parsed.deferred_module_ifs[0].then_branch(),
+        super::DeferredIfBody::Resource(_)
+    ));
+}
+
+#[test]
+fn parse_if_module_argument_defers_nested_value_carriers() {
+    let parsed = parse(
+        r#"
+            arguments { flag: Bool }
+
+            attributes {
+                selected: String = if flag { "yes" } else { "no" }
+            }
+
+            mock.test.Thing {
+                direct = if flag { "yes" } else { "no" }
+                nested = [
+                    { selected = if flag { "yes" } else { "no" } }
+                ]
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("deferred value conditionals may appear in every recursive value carrier");
+
+    assert!(matches!(
+        parsed.attribute_params[0].value,
+        Some(Value::Deferred(DeferredValue::ModuleIf(_)))
+    ));
+    assert!(matches!(
+        parsed.resources[0].get_attr("direct"),
+        Some(Value::Deferred(DeferredValue::ModuleIf(_)))
+    ));
+    let Some(Value::Concrete(ConcreteValue::List(items))) = parsed.resources[0].get_attr("nested")
+    else {
+        panic!("nested carrier was not parsed as a list")
+    };
+    let Value::Concrete(ConcreteValue::Map(item)) = &items[0] else {
+        panic!("nested carrier item was not parsed as a map")
+    };
+    assert!(matches!(
+        item.get("selected"),
+        Some(Value::Deferred(DeferredValue::ModuleIf(_)))
+    ));
+}
+
+#[test]
+fn parse_if_module_argument_through_pure_user_function_is_deferred() {
+    let parsed = parse(
+        r#"
+            arguments { flag: Bool }
+            fn identity(value: Bool): Bool { value }
+            let choice = if identity(flag) { "yes" } else { "no" }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a pure user function of a module argument remains module-dependent");
+    assert!(matches!(
+        parsed.variables.get("choice"),
+        Some(Value::Deferred(DeferredValue::ModuleIf(_)))
+    ));
+}
+
+#[test]
+fn parse_if_static_pure_function_with_handle_argument_keeps_head_behavior() {
+    let parsed = parse(
+        r#"
+            let source = mock.test.Thing { name = "source" }
+            fn always_true(value: mock.test.Thing): Bool { true }
+            let choice = if always_true(source) { "yes" } else { "no" }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("is_static_value-accepted handle arguments must remain valid in root conditions");
+
+    assert_eq!(
+        parsed.variables.get("choice"),
+        Some(&Value::Concrete(ConcreteValue::String("yes".into())))
+    );
+}
+
+#[test]
+fn parse_if_runtime_conditions_keep_static_parse_error() {
+    let cases = [
+        "if source.ready { \"yes\" } else { \"no\" }",
+        "if [source.ready][0] { \"yes\" } else { \"no\" }",
+        "if identity(source.ready) { \"yes\" } else { \"no\" }",
+    ];
+
+    for condition in cases {
+        let input = format!(
+            r#"
+                fn identity(value: Bool): Bool {{ value }}
+                let source = mock.test.Thing {{ name = "source" }}
+                let choice = {condition}
+            "#,
+        );
+        let error = parse(&input, &ProviderContext::default())
+            .expect_err("resource-dependent conditions must remain parse errors");
+        assert!(
+            error.to_string().contains(
+                "if condition depends on a runtime value; condition must be statically known at parse time"
+            ),
+            "runtime-condition wording changed for `{condition}`: {error}",
+        );
+    }
+}
+
+#[test]
+fn parse_if_user_function_body_with_runtime_reference_keeps_static_parse_error() {
+    let input = r#"
+        let source = mock.test.Thing { name = "source" }
+        fn selected(flag: Bool): Bool {
+            let ignored = flag
+            source.ready
+        }
+        arguments { flag: Bool }
+        let choice = if selected(flag) { "yes" } else { "no" }
+    "#;
+
+    let error = parse(input, &ProviderContext::default())
+        .expect_err("a runtime reference inside a function body must dominate its module argument");
+    assert!(
+        error.to_string().contains(
+            "if condition depends on a runtime value; condition must be statically known at parse time"
+        ),
+        "runtime-condition wording changed: {error}",
+    );
+}
+
+#[test]
+fn parse_if_runtime_condition_in_module_reports_condition_line() {
+    let source = r#"arguments { flag: Bool }
+let runtime = mock.test.Thing { name = "runtime" }
+let choice = if runtime.ready { "yes" } else { "no" }
+"#;
+
+    let error = super::parse_file(
+        source,
+        std::path::Path::new("module/main.crn"),
+        &ProviderContext::default(),
+    )
+    .expect_err("runtime conditions in module templates must still fail while parsing");
+
+    assert!(
+        matches!(
+            error,
+            super::ParseError::InvalidExpression { line: 3, ref message }
+                if message == "if condition depends on a runtime value; condition must be statically known at parse time"
+        ),
+        "unexpected module runtime-condition diagnostic: {error}",
+    );
+}
+
+#[test]
+fn parse_if_module_argument_value_without_else_is_rejected() {
+    let error = parse(
+        r#"
+            arguments { flag: Bool }
+            let choice = if flag { "yes" }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("value conditionals require an else branch");
+
+    assert!(
+        matches!(
+            error,
+            super::ParseError::InvalidExpression { line: 3, ref message }
+                if message == "an `if` that produces a value must have an `else` branch, because there is no value to use when the condition is false; add `else { <value> }`"
+        ),
+        "unexpected missing-else error: {error}",
+    );
+}
+
+#[test]
+fn parse_if_module_argument_resource_without_else_is_deferred() {
+    let parsed = parse(
+        r#"
+            arguments { flag: Bool }
+            let choice = if flag {
+                mock.test.Thing { name = "yes" }
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a false structural branch may contribute no resource");
+    assert_eq!(parsed.deferred_module_ifs.len(), 1);
+    assert!(parsed.deferred_module_ifs[0].else_branch().is_none());
+}
+
+#[test]
+fn parse_if_module_argument_rejects_mixed_value_and_structural_branches() {
+    let cases = [
+        (
+            r#"
+                arguments { flag: Bool }
+                let choice = if flag {
+                    mock.test.Thing { name = "yes" }
+                } else {
+                    "no"
+                }
+            "#,
+            "both branches of this `if` must be the same kind: the `then` branch declares resources/module calls but the `else` branch produces a value; make both branches values, or both branches resource/module declarations",
+        ),
+        (
+            r#"
+                arguments { flag: Bool }
+                let choice = if flag {
+                    "yes"
+                } else {
+                    mock.test.Thing { name = "no" }
+                }
+            "#,
+            "both branches of this `if` must be the same kind: the `then` branch produces a value but the `else` branch declares resources/module calls; make both branches values, or both branches resource/module declarations",
+        ),
+    ];
+
+    for (input, expected) in cases {
+        let error = parse(input, &ProviderContext::default())
+            .expect_err("a binding category cannot depend on a caller argument");
+        assert!(
+            matches!(
+                error,
+                super::ParseError::InvalidExpression { line: 3, ref message }
+                    if message == expected
+            ),
+            "unexpected mixed-branch error: {error}",
+        );
+    }
+}
+
+#[test]
+fn parse_if_static_value_without_else_is_rejected_in_statement_position() {
+    let expected = "an `if` that produces a value must have an `else` branch, because there is no value to use when the condition is false; add `else { <value> }`";
+    for condition in ["true", "false"] {
+        let input = format!("let choice = if {condition} {{ 'yes' }}\n");
+        let error = parse(&input, &ProviderContext::default())
+            .expect_err("statement-position value conditionals require an else branch");
+        assert!(
+            matches!(
+                error,
+                super::ParseError::InvalidExpression { line: 1, ref message }
+                    if message == expected
+            ),
+            "unexpected missing-else error for {condition}: {error}",
+        );
+    }
+}
+
+#[test]
+fn parse_if_static_rejects_mixed_value_and_structural_branches() {
+    let cases = [
+        (
+            r#"mock.test.Thing { name = "yes" }"#,
+            r#""no""#,
+            "both branches of this `if` must be the same kind: the `then` branch declares resources/module calls but the `else` branch produces a value; make both branches values, or both branches resource/module declarations",
+        ),
+        (
+            r#""yes""#,
+            r#"mock.test.Thing { name = "no" }"#,
+            "both branches of this `if` must be the same kind: the `then` branch produces a value but the `else` branch declares resources/module calls; make both branches values, or both branches resource/module declarations",
+        ),
+    ];
+    for condition in ["true", "false"] {
+        for (then_body, else_body, expected) in cases {
+            let input = format!(
+                r#"
+                    let choice = if {condition} {{
+                        {then_body}
+                    }} else {{
+                        {else_body}
+                    }}
+                "#,
+            );
+            let error = parse(&input, &ProviderContext::default())
+                .expect_err("a root binding category cannot depend on branch selection");
+            assert!(
+                matches!(
+                    error,
+                    super::ParseError::InvalidExpression { line: 2, ref message }
+                        if message == expected
+                ),
+                "unexpected mixed-branch error for {condition}: {error}",
+            );
+        }
+    }
+}
+
+#[test]
+fn parse_nested_structural_if_in_value_position_reports_the_structural_error() {
+    let expected = "resource expressions and module calls cannot be used in if value expressions; use a let binding instead";
+    let cases = [
+        (
+            "root",
+            r#"let nested = if true {
+  if true { mock.test.resource { name = "n" } }
+}
+"#,
+        ),
+        (
+            "module",
+            r#"arguments { flag: Bool }
+let nested = if flag {
+  if true { mock.test.resource { name = "n" } }
+}
+"#,
+        ),
+    ];
+
+    for (label, source) in cases {
+        let error = super::parse_file(
+            source,
+            std::path::Path::new("module/main.crn"),
+            &ProviderContext::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                super::ParseError::InvalidExpression { ref message, .. }
+                    if message == expected
+            ),
+            "{label} nested structural-if diagnostic was misleading: {error}",
+        );
+    }
+}
+
+#[test]
+fn parse_if_rejects_resource_producing_for_branches_for_static_conditions() {
+    let expected = "resource-producing `for` expressions cannot be used directly as `if` branches; condition the `for` iterable instead, for example `for item in (if flag { items } else { [] }) { ... }`";
+
+    for condition in ["true", "false"] {
+        let source = format!(
+            r#"let selected = if {condition} {{
+  for name in ["one", "two"] {{
+    mock.test.resource {{ name = name }}
+  }}
+}} else {{
+  mock.test.resource {{ name = "fallback" }}
+}}
+"#,
+        );
+        let error = parse(&source, &ProviderContext::default())
+            .expect_err("a resource-producing for cannot be an if branch");
+        assert!(
+            matches!(
+                error,
+                ParseError::InvalidExpression { line: 1, ref message }
+                    if message == expected
+            ),
+            "static `{condition}` reported the wrong diagnostic: {error}",
+        );
+        assert!(!error.to_string().contains("Internal parser error"));
+    }
+}
+
+#[test]
+fn parse_if_rejects_every_resource_producing_for_module_branch_shape() {
+    let expected = "resource-producing `for` expressions cannot be used directly as `if` branches; condition the `for` iterable instead, for example `for item in (if flag { items } else { [] }) { ... }`";
+    let cases = [
+        (
+            "for expressions in both branches",
+            r#"arguments { flag: Bool }
+let selected = if flag {
+  for name in ["then"] { mock.test.resource { name = name } }
+} else {
+  for name in ["else"] { mock.test.resource { name = name } }
+}
+"#,
+        ),
+        (
+            "a for expression paired with a resource",
+            r#"arguments { flag: Bool }
+let selected = if flag {
+  for name in ["then"] { mock.test.resource { name = name } }
+} else {
+  mock.test.resource { name = "else" }
+}
+"#,
+        ),
+        (
+            "a for expression without an else branch",
+            r#"arguments { flag: Bool }
+let selected = if flag {
+  for name in ["then"] { mock.test.resource { name = name } }
+}
+"#,
+        ),
+    ];
+
+    for (label, source) in cases {
+        let error = parse(source, &ProviderContext::default())
+            .expect_err("a resource-producing for cannot be an if branch");
+        assert!(
+            matches!(
+                error,
+                ParseError::InvalidExpression { line: 2, ref message }
+                    if message == expected
+            ),
+            "{label} reported the wrong diagnostic: {error}",
+        );
+        assert!(!error.to_string().contains("Internal parser error"));
+    }
+}
+
+#[test]
 fn parse_if_with_module_call() {
     let input = r#"
         let web = use { source = "modules/web" }
@@ -6450,21 +6889,21 @@ fn parse_if_else_value_expr_in_attribute_false() {
 }
 
 #[test]
-fn parse_if_value_expr_no_else_true() {
-    // When condition is true and no else, the value is used
+fn parse_if_value_expr_no_else_true_errors() {
+    // Value-producing conditionals always require an else branch (#1203),
+    // even when a literal condition would select the then branch eagerly.
     let input = r#"
         awscc.ec2.Vpc {
             cidr_block = if true { "10.0.0.0/16" }
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(result.resources.len(), 1);
-    assert_eq!(
-        result.resources[0].get_attr("cidr_block"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.0.0/16".into()
-        )))
+    let error = parse(input, &ProviderContext::default())
+        .expect_err("value if without else must be rejected")
+        .to_string();
+    assert!(
+        error.contains("an `if` that produces a value must have an `else` branch, because there is no value to use when the condition is false; add `else { <value> }`"),
+        "unexpected missing-else error: {error}"
     );
 }
 
@@ -6481,8 +6920,8 @@ fn parse_if_value_expr_no_else_false_errors() {
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("else"),
-        "Expected error about missing else clause, got: {}",
+        err.contains("an `if` that produces a value must have an `else` branch, because there is no value to use when the condition is false; add `else { <value> }`"),
+        "unexpected missing-else error: {}",
         err
     );
 }
@@ -10998,6 +11437,30 @@ let resources = for x in (
         panic!("expected one deferred loop")
     };
     assert_eq!(deferred.header, "for x in src.list ?? []");
+}
+
+#[test]
+fn deferred_for_header_uses_authored_module_if_iterable_expression() {
+    let parsed = parse(
+        r#"arguments {
+  flag: Bool
+  enabled: list(String)
+  disabled: list(String)
+}
+let names = if flag { enabled } else { disabled }
+let resources = for name in names {
+  mock.test.resource { name = name }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("a module-if iterable must remain a deferred for expression");
+
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
+        panic!("expected one deferred loop")
+    };
+    assert_eq!(deferred.header, "for name in names");
+    assert!(!deferred.header.contains("unresolved module argument"));
 }
 
 #[test]

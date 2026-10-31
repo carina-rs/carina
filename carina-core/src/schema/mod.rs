@@ -452,6 +452,20 @@ fn walk_custom_lookup_on_path<'a>(
     errors: &mut Vec<TypeError>,
     visited_refs: &mut Vec<&'a str>,
 ) {
+    if let Value::Deferred(DeferredValue::ModuleIf(deferred)) = value {
+        for branch in &deferred.values()[1..] {
+            walk_custom_lookup_on_path(
+                attr_type,
+                branch,
+                attr_name,
+                lookup,
+                defs,
+                errors,
+                visited_refs,
+            );
+        }
+        return;
+    }
     // `Secret` is a sensitivity wrapper, not an unresolved value. Providers
     // may validate the plaintext, but diagnostics crossing back out of this
     // boundary must discard every user-derived value/message.
@@ -499,6 +513,7 @@ fn walk_custom_lookup_on_path<'a>(
             | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
             | Value::Deferred(DeferredValue::Access(_))
             | Value::Deferred(DeferredValue::ResourceRef { .. })
+            | Value::Deferred(DeferredValue::IntegerArithmetic(_))
             | Value::Deferred(DeferredValue::Interpolation(_))
             | Value::Deferred(DeferredValue::Unknown(_))
     ) {
@@ -7007,6 +7022,7 @@ impl TypeError {
 impl Value {
     pub fn type_name(&self) -> String {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(_)) => "ModuleIf".to_string(),
             Value::Concrete(ConcreteValue::String(_)) => "String".to_string(),
             Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "EnumIdentifier".to_string(),
             Value::Concrete(ConcreteValue::CanonicalEnum(_)) => "CanonicalEnum".to_string(),

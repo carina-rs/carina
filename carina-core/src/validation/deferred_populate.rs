@@ -126,6 +126,19 @@ fn collect_unsynchronized_refs(
     out: &mut Vec<DeferredPopulateDiagnostic>,
 ) {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            for nested in deferred.values() {
+                collect_unsynchronized_refs(
+                    nested,
+                    attribute_key,
+                    holder_binding,
+                    by_binding,
+                    synchronized,
+                    schemas,
+                    out,
+                );
+            }
+        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             check_ref(
                 path,

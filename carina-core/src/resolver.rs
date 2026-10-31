@@ -291,6 +291,12 @@ fn stamp_unresolved_upstream(
     upstream_binding_names: &std::collections::HashSet<&str>,
 ) -> Result<Value, IntegerExpressionError> {
     Ok(match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let deferred = deferred.try_map(|value| {
+                stamp_unresolved_upstream(value.clone(), upstream_binding_names)
+            })?;
+            Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred)))
+        }
         Value::Deferred(DeferredValue::ResourceRef { path })
             if upstream_binding_names.contains(path.binding()) =>
         {
@@ -506,6 +512,9 @@ fn resolve_ref_value_status_inner(
     allow_absent_default: bool,
 ) -> Result<ValueResolution, String> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err("unresolved module-template conditional reached runtime resolver".to_string())
+        }
         Value::Deferred(DeferredValue::Coalesce {
             value: left,
             default,
@@ -670,6 +679,9 @@ fn resolve_ref_value_inner(
     config: Option<&crate::parser::ProviderContext>,
 ) -> Result<Value, String> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err("unresolved module-template conditional reached runtime resolver".to_string())
+        }
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             match resolve_ref_value_status_inner(value, bindings, config, false)? {
                 ValueResolution::Present(value) | ValueResolution::Unknown(value) => Ok(value),

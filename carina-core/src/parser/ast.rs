@@ -5,6 +5,7 @@
 //! Static-type states that cannot be represented by a sound [`TypeExpr`] live
 //! in [`crate::static_type`] rather than as a sentinel variant here.
 
+use super::deferred_if::DeferredIfBody;
 use super::display_string_literal;
 use super::error::{
     DeferredForBodyKind, DeferredForBodyUnsupportedError, DeferredForIterableResolution,
@@ -1020,6 +1021,15 @@ impl ValidationBlock {
     pub fn source_file(&self) -> &std::path::Path {
         &self.source.file
     }
+
+    pub(crate) fn condition_for_module_if_audit(&self) -> &ValidateExpr {
+        let Self {
+            condition,
+            error_message: _error_message,
+            source: _source,
+        } = self;
+        condition
+    }
 }
 
 // `CompareOp` lives in `expressions::validate_expr` (re-exported above).
@@ -1128,6 +1138,15 @@ impl RequireBlock {
     pub fn source_file(&self) -> &std::path::Path {
         &self.source.file
     }
+
+    pub(crate) fn condition_for_module_if_audit(&self) -> &ValidateExpr {
+        let Self {
+            condition,
+            error_message: _error_message,
+            source: _source,
+        } = self;
+        condition
+    }
 }
 
 /// Attribute parameter definition (in `attributes { ... }` block)
@@ -1172,6 +1191,18 @@ impl AttributeParameter {
 
     pub fn source_file(&self) -> &std::path::Path {
         &self.source.file
+    }
+}
+
+impl<T> AttributeParameter<T> {
+    pub(crate) fn value_for_module_if_audit(&self) -> Option<&Value> {
+        let Self {
+            name: _name,
+            static_type: _static_type,
+            value,
+            source: _source,
+        } = self;
+        value.as_ref()
     }
 }
 
@@ -1689,6 +1720,13 @@ impl ModuleArgument {
         self.operand.traversal_value()
     }
 
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.operand.try_visit_values(visit)
+    }
+
     pub(crate) fn try_rewrite<E>(
         &mut self,
         rewrite: impl FnMut(&Value) -> Result<Value, E>,
@@ -1932,6 +1970,46 @@ impl ParsedBindingUses {
 
     pub(crate) fn records(&self) -> &[ParsedBareBindingUse] {
         &self.records
+    }
+
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let Self {
+            records,
+            record_indices_by_owner: _record_indices_by_owner,
+        } = self;
+        for record in records {
+            match &record.source {
+                BareBindingSource::Value {
+                    value,
+                    declared_type: _declared_type,
+                } => visit(value)?,
+                BareBindingSource::Structural(_handle) => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_rewrite_values<E>(
+        &mut self,
+        mut rewrite: impl FnMut(&Value) -> Result<Value, E>,
+    ) -> Result<(), E> {
+        let Self {
+            records,
+            record_indices_by_owner: _record_indices_by_owner,
+        } = self;
+        for record in records {
+            if let BareBindingSource::Value {
+                value,
+                declared_type: _declared_type,
+            } = &mut record.source
+            {
+                *value = Arc::new(rewrite(value.as_ref())?);
+            }
+        }
+        Ok(())
     }
 
     pub fn uses(&self) -> impl ExactSizeIterator<Item = &BareBindingUse> {
@@ -2181,6 +2259,23 @@ impl ModuleCall {
 
     pub fn argument(&self, name: &str) -> Option<&ModuleArgument> {
         self.arguments.get(name).map(|argument| &argument.argument)
+    }
+
+    pub(crate) fn try_visit_values_for_module_if_audit<E>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let Self {
+            module_name: _module_name,
+            binding_name: _binding_name,
+            arguments,
+            source: _source,
+            loop_origin: _loop_origin,
+        } = self;
+        for argument in arguments.values() {
+            argument.argument.try_visit_values(visit)?;
+        }
+        Ok(())
     }
 
     pub fn authored_argument(&self, name: &str) -> Option<AuthoredArgumentRef<'_>> {
@@ -2470,6 +2565,7 @@ pub struct ParserBindingMetadata {
     structural_aliases: IndexMap<String, StructuralHandle>,
     value_structural_handles: IndexMap<String, StructuralHandleMetadata>,
     resource_source_files: HashMap<ResourceId, PathBuf>,
+    template_dependency_values: HashMap<ResourceId, IndexMap<String, Value>>,
     argument_type_sources: IndexMap<String, (SourceFileId, SourceSpan)>,
     pending_function_type_checks: Vec<PendingFunctionTypeCheck>,
 }
@@ -2523,6 +2619,21 @@ impl ParserBindingMetadata {
         self.resource_source_files.get(id).map(PathBuf::as_path)
     }
 
+    pub(crate) fn insert_template_dependency_values(
+        &mut self,
+        id: ResourceId,
+        values: IndexMap<String, Value>,
+    ) {
+        self.template_dependency_values.insert(id, values);
+    }
+
+    pub(crate) fn template_dependency_values(
+        &self,
+        id: &ResourceId,
+    ) -> Option<&IndexMap<String, Value>> {
+        self.template_dependency_values.get(id)
+    }
+
     pub(crate) fn insert_argument_type_source(
         &mut self,
         name: String,
@@ -2549,6 +2660,35 @@ impl ParserBindingMetadata {
         &self.pending_function_type_checks
     }
 
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let Self {
+            structural_handles: _structural_handles,
+            structural_aliases: _structural_aliases,
+            value_structural_handles,
+            resource_source_files: _resource_source_files,
+            template_dependency_values,
+            argument_type_sources: _argument_type_sources,
+            pending_function_type_checks,
+        } = self;
+        for metadata in value_structural_handles.values() {
+            metadata.try_visit_values(visit)?;
+        }
+        for values in template_dependency_values.values() {
+            for value in values.values() {
+                visit(value)?;
+            }
+        }
+        for check in pending_function_type_checks {
+            for argument in &check.arguments {
+                argument.try_visit_values(visit)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_pending_function_source_file(&mut self, path: &Path) {
         for check in &mut self.pending_function_type_checks {
             check.source_file = Some(path.to_path_buf());
@@ -2572,6 +2712,8 @@ impl ParserBindingMetadata {
             .extend(other.value_structural_handles);
         self.resource_source_files
             .extend(other.resource_source_files);
+        self.template_dependency_values
+            .extend(other.template_dependency_values);
         self.argument_type_sources
             .extend(other.argument_type_sources);
         for check in other.pending_function_type_checks {
@@ -3023,6 +3165,11 @@ pub trait DeferredForPhaseTraversal: deferred_for_phase_private::Sealed {
     fn deferred_line<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> usize;
 
     fn sync_deferred_attributes(attributes: Self::DeferredAttributesMut<'_>, resource: &Resource);
+
+    fn try_visit_values_for_module_if_audit<E>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+    ) -> Result<(), E>;
 }
 
 impl deferred_for_phase_private::Sealed for ParsedDeferredForPhase {}
@@ -3079,6 +3226,42 @@ impl DeferredForPhaseTraversal for ParsedDeferredForPhase {
         _resource: &Resource,
     ) {
     }
+
+    fn try_visit_values_for_module_if_audit<E>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for expression in &self.expressions {
+            let ParsedDeferredForExpression {
+                file: _file,
+                line: _line,
+                span: _span,
+                header: _header,
+                target: _target,
+                iterable,
+                iterable_state: _iterable_state,
+                binding: _binding,
+                body,
+            } = expression;
+            visit(iterable)?;
+            match body {
+                DeferredForBody::Resource(resource) => {
+                    for value in resource.attributes.values() {
+                        visit(value)?;
+                    }
+                }
+                DeferredForBody::Read(data_source) => {
+                    for value in data_source.attributes.values() {
+                        visit(value)?;
+                    }
+                }
+                DeferredForBody::ModuleCall(call) => {
+                    call.try_visit_values_for_module_if_audit(visit)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl deferred_for_phase_private::Sealed for ResolvedDeferredForPhase {}
@@ -3123,6 +3306,33 @@ impl DeferredForPhaseTraversal for ResolvedDeferredForPhase {
 
     fn sync_deferred_attributes(attributes: Self::DeferredAttributesMut<'_>, resource: &Resource) {
         *attributes = resource.attributes.clone().into_iter().collect();
+    }
+
+    fn try_visit_values_for_module_if_audit<E>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for expression in &self.expressions {
+            let DeferredForExpression {
+                file: _file,
+                line: _line,
+                header: _header,
+                resource_type: _resource_type,
+                attributes,
+                target: _target,
+                iterable,
+                binding: _binding,
+                template_resource,
+            } = expression;
+            for (_, value) in attributes {
+                visit(value)?;
+            }
+            visit(iterable)?;
+            for value in template_resource.attributes.values() {
+                visit(value)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3178,13 +3388,10 @@ pub struct File<E, D = ParsedDeferredForPhase> {
     #[doc(hidden)]
     pub parser_binding_metadata: ParserBindingMetadata,
     /// Bare binding provenance and typed pending value slots.
+    #[doc(hidden)]
     #[cfg(not(test))]
-    #[doc(hidden)]
     parsed_binding_uses: ParsedBindingUses,
-    /// Crate-local unit-test fixtures may initialize the otherwise-private
-    /// provenance channel.
     #[cfg(test)]
-    #[doc(hidden)]
     pub(crate) parsed_binding_uses: ParsedBindingUses,
     /// Non-fatal warnings collected during parsing.
     pub warnings: Vec<ParseWarning>,
@@ -3192,6 +3399,10 @@ pub struct File<E, D = ParsedDeferredForPhase> {
     /// [`ParsedDeferredForExpression`] bodies; module-resolved files carry
     /// only [`DeferredForExpression`] resource templates.
     pub(crate) deferred_for_phase: D,
+    /// Structural `if` templates whose condition depends on module arguments.
+    /// Module expansion must select or forward every entry before the final
+    /// root graph is constructed.
+    pub deferred_module_ifs: Vec<super::DeferredStructuralIf>,
     /// Plan-scoped lineage of leaf nodes back to the composition call
     /// sites that produced them (#3306).
     ///
@@ -3246,12 +3457,73 @@ impl<E> Default for File<E, ParsedDeferredForPhase> {
             parsed_binding_uses: ParsedBindingUses::default(),
             warnings: Vec::new(),
             deferred_for_phase: ParsedDeferredForPhase::default(),
+            deferred_module_ifs: Vec::new(),
             expansion_trace: crate::resource::ExpansionTrace::new(),
         }
     }
 }
 
 impl<E> File<E, ParsedDeferredForPhase> {
+    /// Preserve parser-authored values for dependency derivation across a
+    /// reusable-module boundary. Semantic reference resolution may fold a
+    /// direct reference to its current value; expansion still needs the
+    /// authored expression so it can derive dependency edges after selecting
+    /// any argument-dependent value branch.
+    pub(crate) fn capture_template_dependency_values(&mut self) {
+        fn capture_deferred(
+            deferred: &super::DeferredStructuralIf,
+            captured: &mut Vec<(ResourceId, IndexMap<String, Value>)>,
+        ) {
+            for branch in deferred.branches() {
+                match branch {
+                    DeferredIfBody::Resource(resource) => {
+                        captured.push((resource.id.clone(), resource.attributes.clone()));
+                    }
+                    DeferredIfBody::DataSource(data_source) => {
+                        captured.push((data_source.id.clone(), data_source.attributes.clone()));
+                    }
+                    DeferredIfBody::ModuleCall(_) => {}
+                    DeferredIfBody::ExpandedModuleCall(contribution) => {
+                        for nested in &contribution.deferred_module_ifs {
+                            capture_deferred(nested, captured);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut captured =
+            self.resources
+                .iter()
+                .map(|resource| (resource.id.clone(), resource.attributes.clone()))
+                .chain(
+                    self.data_sources.iter().map(|data_source| {
+                        (data_source.id.clone(), data_source.attributes.clone())
+                    }),
+                )
+                .chain(
+                    self.deferred_for_phase.expressions.iter().filter_map(
+                        |deferred| match &deferred.body {
+                            DeferredForBody::Resource(resource) => {
+                                Some((resource.id.clone(), resource.attributes.clone()))
+                            }
+                            DeferredForBody::Read(data_source) => {
+                                Some((data_source.id.clone(), data_source.attributes.clone()))
+                            }
+                            DeferredForBody::ModuleCall(_) => None,
+                        },
+                    ),
+                )
+                .collect::<Vec<_>>();
+        for deferred in &self.deferred_module_ifs {
+            capture_deferred(deferred, &mut captured);
+        }
+        for (id, values) in captured {
+            self.parser_binding_metadata
+                .insert_template_dependency_values(id, values);
+        }
+    }
+
     /// Parser-side deferred loops awaiting the module-resolution body seam.
     ///
     /// This slice is empty after successful resolution. Body-specific
@@ -3315,6 +3587,22 @@ impl<E> File<E, ParsedDeferredForPhase> {
                 DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => {}
             }
         }
+        for deferred in &mut self.deferred_module_ifs {
+            for branch in deferred.branches_mut() {
+                match branch {
+                    DeferredIfBody::Resource(resource) => resource
+                        .loop_provenance
+                        .set_binding_scope(std::sync::Arc::clone(&binding_scope)),
+                    DeferredIfBody::DataSource(_) => {}
+                    DeferredIfBody::ModuleCall(call) => {
+                        if let Some(origin) = call.loop_origin_mut() {
+                            origin.set_binding_scope(std::sync::Arc::clone(&binding_scope));
+                        }
+                    }
+                    DeferredIfBody::ExpandedModuleCall(_) => {}
+                }
+            }
+        }
     }
 
     pub(crate) fn empty_with_parsed_binding_uses(parsed_binding_uses: ParsedBindingUses) -> Self {
@@ -3350,6 +3638,7 @@ impl<E> File<E, ParsedDeferredForPhase> {
             parsed_binding_uses,
             warnings,
             deferred_for_phase,
+            deferred_module_ifs,
             expansion_trace,
         } = source;
 
@@ -3375,6 +3664,7 @@ impl<E> File<E, ParsedDeferredForPhase> {
         self.deferred_for_phase
             .expressions
             .extend(deferred_for_phase.expressions);
+        self.deferred_module_ifs.extend(deferred_module_ifs);
         for (leaf, call_sites) in expansion_trace.leaf_to_call_sites {
             self.expansion_trace.record(leaf, call_sites);
         }
@@ -3415,6 +3705,7 @@ impl<E> File<E, ParsedDeferredForPhase> {
             parsed_binding_uses,
             warnings,
             deferred_for_phase,
+            deferred_module_ifs,
             expansion_trace,
         } = self;
         let (expressions, auxiliary) = map(deferred_for_phase.expressions);
@@ -3443,6 +3734,7 @@ impl<E> File<E, ParsedDeferredForPhase> {
                 deferred_for_phase: ResolvedDeferredForPhase {
                     expressions: ResolvedDeferredForExpressions(expressions),
                 },
+                deferred_module_ifs,
                 expansion_trace,
             },
             auxiliary,
@@ -3453,6 +3745,45 @@ impl<E> File<E, ParsedDeferredForPhase> {
 impl<E, D> File<E, D> {
     pub fn bare_binding_uses(&self) -> &ParsedBindingUses {
         &self.parsed_binding_uses
+    }
+
+    pub(crate) fn try_visit_bare_binding_values<T>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), T>,
+    ) -> Result<(), T> {
+        self.parsed_binding_uses.try_visit_values(visit)
+    }
+
+    /// Compile-time forcing function for root-publication audits. The value
+    /// audit lives in the resolver, but this exhaustive destructure stays in
+    /// the owning module so bare-binding provenance remains private outside
+    /// tests.
+    pub(crate) fn assert_module_if_audit_classifies_every_field(&self) {
+        let File {
+            providers: _providers,
+            resources: _resources,
+            data_sources: _data_sources,
+            compositions: _compositions,
+            variables: _variables,
+            uses: _uses,
+            module_calls: _module_calls,
+            arguments: _arguments,
+            attribute_params: _attribute_params,
+            export_params: _export_params,
+            backend: _backend,
+            state_blocks: _state_blocks,
+            user_functions: _user_functions,
+            upstream_states: _upstream_states,
+            wait_bindings: _wait_bindings,
+            requires: _requires,
+            structural_bindings: _structural_bindings,
+            parser_binding_metadata: _parser_binding_metadata,
+            parsed_binding_uses: _parsed_binding_uses,
+            warnings: _warnings,
+            deferred_for_phase: _deferred_for_phase,
+            deferred_module_ifs: _deferred_module_ifs,
+            expansion_trace: _expansion_trace,
+        } = self;
     }
 
     /// Transform only the export-param phase (`File<E, D>` → `File<B, D>`),
@@ -3480,6 +3811,7 @@ impl<E, D> File<E, D> {
             parsed_binding_uses,
             warnings,
             deferred_for_phase,
+            deferred_module_ifs,
             expansion_trace,
         } = self;
 
@@ -3505,6 +3837,7 @@ impl<E, D> File<E, D> {
             parsed_binding_uses,
             warnings,
             deferred_for_phase,
+            deferred_module_ifs,
             expansion_trace,
         }
     }
@@ -3531,6 +3864,14 @@ impl<E, D> File<E, D> {
 }
 
 impl<E, D: DeferredForPhaseTraversal> File<E, D> {
+    pub(crate) fn try_visit_deferred_for_values_for_module_if_audit<T>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), T>,
+    ) -> Result<(), T> {
+        self.deferred_for_phase
+            .try_visit_values_for_module_if_audit(visit)
+    }
+
     /// Iterate every resource reachable from the file, preserving the
     /// deferred-loop phase in each deferred resource arm.
     pub fn iter_all_resources(&self) -> impl Iterator<Item = ResourceRef<'_, ModuleSource, D>> {
@@ -3540,6 +3881,20 @@ impl<E, D: DeferredForPhaseTraversal> File<E, D> {
             .chain(self.compositions.iter().map(ResourceRef::LiveComposition))
             .chain(self.data_sources.iter().map(ResourceRef::DataSource))
             .chain(self.deferred_for_phase.resource_refs())
+            .chain(
+                self.deferred_module_ifs
+                    .iter()
+                    .flat_map(|deferred| deferred.branches())
+                    .filter_map(|branch| match branch {
+                        DeferredIfBody::Resource(resource) => Some(ResourceRef::Resource(resource)),
+                        DeferredIfBody::DataSource(data_source) => {
+                            Some(ResourceRef::DataSource(data_source))
+                        }
+                        DeferredIfBody::ModuleCall(_) | DeferredIfBody::ExpandedModuleCall(_) => {
+                            None
+                        }
+                    }),
+            )
     }
 
     pub fn iter_all_resources_mut(&mut self) -> impl Iterator<Item = ResourceMut<'_, D>> {
@@ -3553,6 +3908,20 @@ impl<E, D: DeferredForPhaseTraversal> File<E, D> {
             )
             .chain(self.data_sources.iter_mut().map(ResourceMut::DataSource))
             .chain(self.deferred_for_phase.resource_muts())
+            .chain(
+                self.deferred_module_ifs
+                    .iter_mut()
+                    .flat_map(|deferred| deferred.branches_mut())
+                    .filter_map(|branch| match branch {
+                        DeferredIfBody::Resource(resource) => Some(ResourceMut::Resource(resource)),
+                        DeferredIfBody::DataSource(data_source) => {
+                            Some(ResourceMut::DataSource(data_source))
+                        }
+                        DeferredIfBody::ModuleCall(_) | DeferredIfBody::ExpandedModuleCall(_) => {
+                            None
+                        }
+                    }),
+            )
     }
 
     pub fn deferred_for_sites(&self) -> impl Iterator<Item = DeferredForSite<'_>> {
@@ -3605,6 +3974,12 @@ impl<E, D> File<E, D> {
             self.module_calls
                 .iter()
                 .filter_map(|c| c.binding_name.as_deref()),
+        );
+        names.extend(
+            self.deferred_module_ifs
+                .iter()
+                .flat_map(|deferred| deferred.branches())
+                .filter_map(DeferredIfBody::binding),
         );
         names.extend(self.upstream_states.iter().map(|u| u.binding.as_str()));
         names.extend(self.wait_bindings.iter().map(|w| w.binding.as_str()));
@@ -3925,6 +4300,7 @@ fn deferred_iterable_kind(value: &Value) -> &'static str {
         Value::Concrete(ConcreteValue::List(_)) => "list",
         Value::Concrete(ConcreteValue::StringList(_)) => "string list",
         Value::Concrete(ConcreteValue::Map(_)) => "map",
+        Value::Deferred(DeferredValue::ModuleIf(_)) => "deferred module conditional",
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "deferred resource reference",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "deferred binding reference",
         Value::Deferred(DeferredValue::Coalesce { .. }) => "deferred coalesce expression",
@@ -4183,6 +4559,13 @@ fn substitute_placeholder_with_policy(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             substitute_placeholder_with_policy(inner, index, key, value, miss_policy)?;
         }
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            **deferred = deferred.try_map(|nested| {
+                let mut nested = nested.clone();
+                substitute_placeholder_with_policy(&mut nested, index, key, value, miss_policy)?;
+                Ok::<_, PlaceholderAccessError>(nested)
+            })?;
+        }
         _ => {}
     }
     Ok(())
@@ -4284,6 +4667,13 @@ fn substitute_placeholder_lazily(
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
             substitute_placeholder_lazily(inner, index, key, item)?;
+        }
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            **deferred = deferred.try_map(|nested| {
+                let mut nested = nested.clone();
+                substitute_placeholder_lazily(&mut nested, index, key, item)?;
+                Ok::<_, PlaceholderAccessError>(nested)
+            })?;
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -4511,6 +4901,7 @@ mod substitute_placeholder_tests {
             parsed_binding_uses: _,
             warnings: _,
             deferred_for_phase: _,
+            deferred_module_ifs: _,
             expansion_trace: _,
         } = parsed;
     }

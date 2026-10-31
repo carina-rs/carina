@@ -343,6 +343,7 @@ impl Unsealer {
         }
 
         match value {
+            Value::Deferred(DeferredValue::ModuleIf(_)) => false,
             Value::Concrete(ConcreteValue::List(items)) => {
                 items.iter_mut().all(|item| self.restore_value(item))
             }
@@ -538,7 +539,8 @@ fn preserve_equal_json_subtrees(
                 | ConcreteValue::StringList(_),
             )
             | Value::Deferred(
-                DeferredValue::ResourceRef { .. }
+                DeferredValue::ModuleIf(_)
+                | DeferredValue::ResourceRef { .. }
                 | DeferredValue::BindingRef { .. }
                 | DeferredValue::Coalesce { .. }
                 | DeferredValue::IntegerArithmetic(_)

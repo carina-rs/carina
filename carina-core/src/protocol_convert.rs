@@ -1659,6 +1659,7 @@ pub fn try_core_to_protocol_value(value: &Value) -> Result<protocol::Value, Prot
 
 fn deferred_value_variant(value: &DeferredValue) -> &'static str {
     match value {
+        DeferredValue::ModuleIf(_) => "ModuleIf",
         DeferredValue::ResourceRef { path: _path } => "ResourceRef",
         DeferredValue::BindingRef { binding: _binding } => "BindingRef",
         DeferredValue::Coalesce {

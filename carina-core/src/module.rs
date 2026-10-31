@@ -121,6 +121,12 @@ impl DependencyGraph {
 /// Format a Value for display
 fn format_value(value: &Value) -> String {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => format!(
+            "if {} {{ {} }} else {{ {} }}",
+            format_value(deferred.condition().value()),
+            format_value(deferred.then_value()),
+            format_value(deferred.else_value())
+        ),
         Value::Concrete(ConcreteValue::String(s)) => {
             let (value, marker) =
                 crate::utils::truncate_chars_for_display(s.expose_plaintext(), 47);
@@ -477,6 +483,11 @@ impl RootConfigSignature {
         binding_types: &HashMap<String, ResourceTypePath>,
     ) {
         match value {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                for nested in deferred.values() {
+                    Self::collect_typed_dependencies(from, attr_key, nested, graph, binding_types);
+                }
+            }
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 let target_type = binding_types.get(path.binding()).cloned();
                 graph.add_edge(
@@ -1028,6 +1039,18 @@ impl ModuleSignature {
         argument_types: &HashMap<String, TypeExpr>,
     ) {
         match value {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                for nested in deferred.values() {
+                    Self::collect_typed_dependencies(
+                        from,
+                        attr_key,
+                        nested,
+                        graph,
+                        binding_types,
+                        argument_types,
+                    );
+                }
+            }
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 let binding_name = path.binding();
                 let target_type = if let Some(arg_type) = argument_types.get(binding_name) {
