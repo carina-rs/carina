@@ -9460,8 +9460,8 @@ mod apply_deferred_for_parity {
 #[cfg(test)]
 mod saved_plan_version_tests {
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 34 separates parser
-    //! and deferred-loop placeholders from post-expansion values. Version 33
+    //! `carina plan` is the supported migration. Version 37 adds typed
+    //! deferred-for templates and stage-specific placeholder types. Version 33
     //! adds typed keyed-list release effects. Version 32 adds mandatory
     //! provider-instance reference scopes and the create-outcome-unknown marker
     //! for provider protocol v13. Version 31 persists authored ignore paths;
@@ -9563,11 +9563,11 @@ mod saved_plan_version_tests {
     }
 
     #[tokio::test]
-    async fn previous_plan_version_is_rejected_before_payload_decoding() {
+    async fn previous_emitted_plan_version_is_rejected_before_payload_decoding() {
         let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("previous-plan.json");
-        let previous = crate::commands::plan::PlanFile::CURRENT_VERSION - 1;
+        let previous = 33;
         let old_plan = serde_json::json!({
             "version": previous,
             "timestamp": "2026-10-29T00:00:00Z",
@@ -9588,7 +9588,7 @@ mod saved_plan_version_tests {
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await
-        .expect_err("the previous format must be rejected before decoding its payload");
+        .expect_err("the previous emitted format must be rejected before decoding its payload");
 
         let crate::error::AppError::UnsupportedPlanVersion {
             found, expected, ..

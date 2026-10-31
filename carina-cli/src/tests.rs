@@ -66,6 +66,11 @@ fn loaded_provider_context() -> LoadedProviderContext {
 }
 
 #[test]
+fn saved_plan_version_is_37_for_deferred_value_stages() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 37);
+}
+
+#[test]
 fn skip_resource_validation_cannot_bypass_pending_bare_binding_uses() {
     let fixture = tempfile::tempdir().expect("pending binding fixture");
     std::fs::write(

@@ -597,8 +597,8 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 34 separates parser and deferred-loop placeholders from
-    /// post-expansion values.
+    /// Plan format 37 adds typed deferred-for templates and stage-specific
+    /// placeholder types.
     ///
     /// Plan format 33 adds the typed keyed-list release effect.
     ///
@@ -867,8 +867,8 @@ struct ProviderEvidence {
 /// inventory to match every referenced type exactly and the provider-artifact
 /// keys to match the providers implied by the saved provider configurations.
 ///
-/// Format 34 separates parser and deferred-loop placeholders from
-/// post-expansion values.
+/// Format 37 adds typed deferred-for templates and stage-specific placeholder
+/// types.
 ///
 /// Format 33 adds typed keyed-list release effects.
 ///
@@ -887,7 +887,7 @@ pub struct PlanFile {
     evidence: ProviderEvidence,
 }
 
-/// Private format-34 wire representation.
+/// Private format-37 wire representation.
 ///
 /// Field order is intentionally identical to the historical `PlanFile`
 /// serialization order. Evidence is mandatory and is never defaulted.
@@ -1857,7 +1857,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 34;
+    pub const CURRENT_VERSION: u32 = 37;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -4163,8 +4163,8 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
-        // carina#4094: bumped 33→34 — saved plans use stage-typed values, so
-        // parser and deferred-loop placeholders cannot enter expanded values.
+        // carina#4094: bumped 33→37 — saved plans use typed deferred-for
+        // templates and stage-specific placeholder types.
         // carina#4118: bumped 32→33 — keyed partial-update releases add a
         // serialized state-only Effect variant.
         // carina#4067: bumped 29→31 — saved plans retain authored
