@@ -11,7 +11,9 @@ use carina_core::name_override::{
     ApplyDecision, NameOverride, NameOverrideSource, should_apply_override,
 };
 use carina_core::parser::ModuleResolvedFile;
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, Value};
+use carina_core::resource::{
+    ConcreteValue, PendingResourceIdentityError, ResolvedResourceId, Resource, ResourceId, Value,
+};
 use carina_core::schema::{BlockNameConflict, SchemaRegistry};
 
 use super::ProjectedStateRead;
@@ -129,18 +131,8 @@ impl<E> CanonicalResourcePair<E> {
         &self.parsed
     }
 
-    /// Resolve every post-expansion handle output against the final managed
-    /// and data-source address set while the canonical file is still owned by
-    /// its validated pair.
-    pub(super) fn resolve_expanded_graph(
-        &mut self,
-        managed: &[Resource],
-        data_sources: &[carina_core::resource::DataSource],
-    ) -> Result<
-        carina_core::resolved_graph::ExpandedBindingIndex,
-        carina_core::resolved_graph::ExpandedGraphResolutionError,
-    > {
-        carina_core::resolved_graph::resolve_expanded_graph(&mut self.parsed, managed, data_sources)
+    pub(super) fn parsed_mut(&mut self) -> &mut ModuleResolvedFile<E> {
+        &mut self.parsed
     }
 
     pub fn unresolved(&self) -> &[Resource] {
@@ -318,9 +310,11 @@ impl<E> CanonicalResourcePair<E> {
 
 /// Two paired resources resolved to the same identity before execution.
 #[derive(Debug, thiserror::Error)]
-#[error("override-aware resources contain duplicate resolved id {id}")]
-pub struct DuplicateResolvedResourceIdError {
-    id: ResourceId,
+pub enum ResolvedResourceOriginIndexError {
+    #[error(transparent)]
+    PendingIdentity(#[from] PendingResourceIdentityError),
+    #[error("override-aware resources contain duplicate resolved id {id}")]
+    Duplicate { id: ResolvedResourceId },
 }
 
 /// Reference-resolution mode for an evaluated/authored resource pair.
@@ -509,7 +503,8 @@ impl OverrideAwareResources {
 
     pub fn unresolved_by_resolved_id(
         &self,
-    ) -> Result<HashMap<ResourceId, UnresolvedResource>, DuplicateResolvedResourceIdError> {
+    ) -> Result<HashMap<ResolvedResourceId, UnresolvedResource>, ResolvedResourceOriginIndexError>
+    {
         unresolved_map_from_paired(self.resources(), self.paired_unresolved_resources())
     }
 
@@ -564,7 +559,8 @@ impl OverrideAwareResources {
     pub fn unresolved_by_resolved_id_with_binding_sources(
         &self,
         binding_sources: &OverrideAwareResources,
-    ) -> Result<HashMap<ResourceId, UnresolvedResource>, DuplicateResolvedResourceIdError> {
+    ) -> Result<HashMap<ResolvedResourceId, UnresolvedResource>, ResolvedResourceOriginIndexError>
+    {
         let paired_unresolved =
             self.paired_unresolved_resources_with_binding_sources(binding_sources);
         unresolved_map_from_paired(self.resources(), paired_unresolved)
@@ -661,7 +657,7 @@ fn can_pair_by_binding(resource: &Resource, source: &Resource) -> bool {
 fn unresolved_map_from_paired(
     resources: &[Resource],
     paired_unresolved: Vec<Resource>,
-) -> Result<HashMap<ResourceId, UnresolvedResource>, DuplicateResolvedResourceIdError> {
+) -> Result<HashMap<ResolvedResourceId, UnresolvedResource>, ResolvedResourceOriginIndexError> {
     assert_eq!(
         resources.len(),
         paired_unresolved.len(),
@@ -669,10 +665,11 @@ fn unresolved_map_from_paired(
     );
     let mut by_id = HashMap::with_capacity(paired_unresolved.len());
     for (resource, unresolved) in resources.iter().zip(paired_unresolved) {
-        let id = resource.id.clone();
+        let id = ResolvedResourceId::try_new(resource.id.clone())
+            .ok_or_else(|| PendingResourceIdentityError::new(resource.id.clone()))?;
         let previous = by_id.insert(id.clone(), UnresolvedResource::from_pre_resolve(unresolved));
         if previous.is_some() {
-            return Err(DuplicateResolvedResourceIdError { id });
+            return Err(ResolvedResourceOriginIndexError::Duplicate { id });
         }
     }
     Ok(by_id)

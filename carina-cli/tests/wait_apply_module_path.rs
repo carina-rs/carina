@@ -44,7 +44,7 @@ use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, NoopNormalizer, Provider, ProviderFactory,
     ProviderNormalizer, ProviderResult, ReadOutcome,
 };
-use carina_core::resource::{Current, ResourceId, Value};
+use carina_core::resource::{Current, ResolvedResourceId, ResourceId, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 use indexmap::IndexMap;
 use std::sync::Mutex;
@@ -688,11 +688,11 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         plan.effects()
     );
 
-    let unresolved_resources: HashMap<ResourceId, _> = sorted_resources
+    let unresolved_resources: HashMap<ResolvedResourceId, _> = sorted_resources
         .iter()
         .map(|r| {
             (
-                r.id.clone(),
+                ResolvedResourceId::new(r.id.clone()),
                 UnresolvedResource::from_pre_resolve(r.clone()),
             )
         })

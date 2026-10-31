@@ -1943,9 +1943,10 @@ mod tests {
             summary: &summary,
         });
         let unresolved: HashMap<_, _> = fixture
-            .unresolved_resources
+            .desired_resources
             .iter()
-            .map(|resource| (resource.as_resource().id.clone(), resource))
+            .zip(&fixture.unresolved_resources)
+            .map(|(resolved, unresolved)| (resolved.resolved_id(), unresolved))
             .collect();
         let replacement_delete_indices: HashSet<_> = fixture
             .plan
@@ -1955,7 +1956,6 @@ mod tests {
         let scheduler_edges = carina_core::executor::build_plan_scheduler_dependency_edges(
             fixture.plan.effects(),
             &unresolved,
-            &fixture.compositions,
         );
         if fixture_name == "deferred_for_with_paired_destroy" {
             assert!(scheduler_edges.iter().any(|(from, to)| {

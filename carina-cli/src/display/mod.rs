@@ -601,6 +601,21 @@ fn append_destroy_ordering_warnings<S>(out: &mut String, plan: &Plan<S>) {
                     .unwrap();
                 }
             }
+            DestroyOrdering::UnresolvedPersistedDependencies { dependencies } => {
+                for dependency in dependencies.iter() {
+                    writeln!(
+                        out,
+                        "{}",
+                        format!(
+                            "Warning: destroy ordering for {} is partially unknown: persisted dependency `{}` no longer resolves.",
+                            notice.id(),
+                            dependency,
+                        )
+                        .yellow()
+                    )
+                    .unwrap();
+                }
+            }
         }
     }
 }

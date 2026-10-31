@@ -19,6 +19,22 @@ use carina_core::resource::{
 use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
+#[test]
+fn current_state_skips_legacy_dependency_projection_builder() {
+    let state = StateFile::new();
+    let mut called = false;
+
+    let projections = legacy_dependency_projections_for_state(Some(&state), || {
+        called = true;
+        Err::<carina_core::resolved_graph::LegacyDependencyProjectionIndex, _>(
+            "legacy projection should not run",
+        )
+    });
+
+    assert!(projections.is_ok());
+    assert!(!called, "v21 state must not build legacy projections");
+}
+
 fn comparison_provider_for_resources(
     schemas: &SchemaRegistry,
     resources: &[Resource],
@@ -8155,10 +8171,15 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .map(|resource| resource.as_resource().id.to_string())
         .collect();
 
-    let unresolved_resources: HashMap<ResourceId, UnresolvedResource> = plan_ctx
+    let unresolved_resources: HashMap<ResolvedResourceId, UnresolvedResource> = plan_ctx
         .unresolved_resources
         .iter()
-        .map(|resource| (resource.as_resource().id.clone(), resource.clone()))
+        .map(|resource| {
+            (
+                ResolvedResourceId::new(resource.as_resource().id.clone()),
+                resource.clone(),
+            )
+        })
         .collect();
     let sorted_resources: Vec<Resource> = plan_ctx
         .sorted_resources

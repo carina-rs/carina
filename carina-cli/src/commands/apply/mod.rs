@@ -28,7 +28,7 @@ use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, 
 use carina_core::resource::ConcreteValue;
 use carina_core::resource::{
     CompositionSourceIdentityResolver, Current, DataSource, ModuleSource, ResolvedResource,
-    Resource, ResourceId, SavedDataSource, SavedModuleSource, State, Value,
+    ResolvedResourceId, Resource, ResourceId, SavedDataSource, SavedModuleSource, State, Value,
 };
 use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
@@ -475,7 +475,7 @@ fn saved_plan_unresolved_by_resolved_id<S: Clone>(
     sorted_resources: &[carina_core::resource::Resource<S>],
     unresolved_resources: &[carina_core::resource::Resource<S>],
     apply_target: ApplyTarget<'_>,
-) -> Result<HashMap<ResourceId, UnresolvedResource<S>>, AppError> {
+) -> Result<HashMap<ResolvedResourceId, UnresolvedResource<S>>, AppError> {
     if sorted_resources.len() != unresolved_resources.len() {
         return Err(AppError::Config(format!(
             "Saved plan resource snapshot mismatch: {} sorted resources but {} unresolved resources. Re-run `{}`.",
@@ -501,11 +501,11 @@ fn saved_plan_unresolved_by_resolved_id<S: Clone>(
 
         let mut source = unresolved.clone();
         source.id = resolved.id.clone();
+        let resolved_id = ResolvedResourceId::try_new(resolved.id.clone()).ok_or_else(|| {
+            carina_core::resource::PendingResourceIdentityError::new(resolved.id.clone())
+        })?;
         if by_id
-            .insert(
-                resolved.id.clone(),
-                UnresolvedResource::from_pre_resolve(source),
-            )
+            .insert(resolved_id, UnresolvedResource::from_pre_resolve(source))
             .is_some()
         {
             return Err(AppError::Config(format!(
@@ -627,7 +627,7 @@ async fn execute_effects_with_observer(
     bindings: &mut ResolvedBindings,
     managed_current: &mut HashMap<ResourceId, Current>,
     data_source_values: ExecutableDataSourceValues,
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+    unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource>,
     data_source_origins: &[DataSource],
     compositions: &[carina_core::resource::LiveComposition],
     precompleted_success_count: usize,
@@ -682,7 +682,7 @@ async fn execute_rehydrated_saved_plan(
     bindings: &mut ResolvedBindings,
     managed_current: &mut HashMap<ResourceId, Current>,
     data_source_values: ExecutableDataSourceValues<SavedModuleSource>,
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<SavedModuleSource>>,
+    unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<SavedModuleSource>>,
     data_source_origins: &[SavedDataSource],
     compositions: &[carina_core::resource::SavedComposition],
     precompleted_success_count: usize,
@@ -3449,6 +3449,7 @@ async fn run_apply_from_plan_locked_owned(
                     .migrate_legacy_dependencies(
                         inspected_plan.legacy_dependency_projections(),
                         inspected_plan.sorted_resources(),
+                        &[],
                     )
                     .map_err(|error| AppError::Backend(error.into()))
             );

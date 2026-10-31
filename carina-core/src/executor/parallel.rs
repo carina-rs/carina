@@ -9,6 +9,8 @@ use crate::effect::Effect;
 use crate::effect::deps::UnresolvedResource;
 use crate::provider::{AppliedIdentifier, CancelledCreateReport, Provider, ProviderRouter};
 #[cfg(test)]
+use crate::resource::ResolvedResourceId;
+#[cfg(test)]
 use crate::resource::Resource;
 use crate::resource::{ResourceId, ResourceIdentity};
 use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
@@ -244,13 +246,11 @@ fn format_unresolved_read_inputs(unresolved: &[super::UnresolvedDataSourceInput]
 #[cfg(test)]
 pub(super) fn build_dependency_levels(
     effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
-    compositions: &[crate::resource::LiveComposition],
+    unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource>,
 ) -> Vec<Vec<usize>> {
     let deps_of = crate::effect::deps::build_effect_dependency_analysis(
         effects,
-        unresolved_resources,
-        compositions,
+        unresolved_resources.keys(),
         crate::effect::deps::ScheduleInputs::Apply,
     )
     .expect("dependency analysis must resolve")
@@ -352,7 +352,10 @@ pub(super) async fn execute_effects_sequential<
         .provider_check_inputs
         .resource_origins()
         .unwrap_or(&empty_resource_origins);
-    let mut desired_ids = resource_origins.keys().cloned().collect::<HashSet<_>>();
+    let mut desired_ids = resource_origins
+        .keys()
+        .map(|id| id.as_inner().clone())
+        .collect::<HashSet<_>>();
     for effect in &effects {
         if matches!(
             effect,
@@ -1488,11 +1491,11 @@ mod tests {
 
     fn dependency_after_relax(parent: Effect, child: Effect) -> HashSet<usize> {
         let effects = vec![parent, child];
-        let unresolved: HashMap<ResourceId, UnresolvedResource> = effects
+        let unresolved: HashMap<ResolvedResourceId, UnresolvedResource> = effects
             .iter()
             .filter_map(|effect| match effect {
                 Effect::Create(resource) | Effect::Update { to: resource, .. } => Some((
-                    resource.id.clone(),
+                    resource.resolved_id(),
                     UnresolvedResource::from_pre_resolve(resource.as_inner().clone()),
                 )),
                 Effect::DeferredReplace(_) => None,
@@ -1500,7 +1503,7 @@ mod tests {
             })
             .collect();
         let mut analysis =
-            build_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply)
+            build_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
                 .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         analysis.into_deps_of().remove(&1).unwrap()
@@ -1536,11 +1539,11 @@ mod tests {
 
         let unresolved = HashMap::from([
             (
-                cert.id.clone(),
+                ResolvedResourceId::new(cert.id.clone()),
                 UnresolvedResource::from_pre_resolve(cert.clone()),
             ),
             (
-                alb.id.clone(),
+                ResolvedResourceId::new(alb.id.clone()),
                 UnresolvedResource::from_pre_resolve(alb.clone()),
             ),
         ]);
@@ -1662,20 +1665,20 @@ mod tests {
 
         let unresolved = HashMap::from([
             (
-                cert.id.clone(),
+                ResolvedResourceId::new(cert.id.clone()),
                 UnresolvedResource::from_pre_resolve(cert.clone()),
             ),
             (
-                alb.id.clone(),
+                ResolvedResourceId::new(alb.id.clone()),
                 UnresolvedResource::from_pre_resolve(alb.clone()),
             ),
             (
-                listener_origin.id.clone(),
+                ResolvedResourceId::new(listener_origin.id.clone()),
                 UnresolvedResource::from_pre_resolve(listener_origin.clone()),
             ),
         ]);
         let deps =
-            build_dependency_analysis(plan.effects(), &unresolved, &[], ScheduleInputs::Apply)
+            build_dependency_analysis(plan.effects(), unresolved.keys(), ScheduleInputs::Apply)
                 .expect("dependency analysis must resolve")
                 .into_deps_of();
         assert!(
@@ -1858,17 +1861,21 @@ mod tests {
         ];
         let unresolved = HashMap::from([
             (
-                effects[0].resource_id().clone(),
+                ResolvedResourceId::new(effects[0].resource_id().clone()),
                 UnresolvedResource::from_pre_resolve(match &effects[0] {
                     Effect::Update { to, .. } => to.as_inner().clone(),
                     _ => unreachable!(),
                 }),
             ),
-            (child_id, UnresolvedResource::from_pre_resolve(child)),
+            (
+                ResolvedResourceId::new(child_id),
+                UnresolvedResource::from_pre_resolve(child),
+            ),
         ]);
 
-        let analysis = build_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply)
-            .expect("dependency analysis must resolve");
+        let analysis =
+            build_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve");
         assert!(
             analysis
                 .reads_for_edge(1, 0)
@@ -1910,32 +1917,6 @@ mod tests {
             Value::resource_ref("module", "parent_id", vec![]),
         );
 
-        let mut virt_attrs: indexmap::IndexMap<String, crate::resource::LiveCompositionAttribute> =
-            indexmap::IndexMap::new();
-        virt_attrs.insert(
-            "parent_id".to_string(),
-            crate::resource::LiveCompositionAttribute::from_value(
-                Value::resource_ref("parent", "id", vec![]),
-                None,
-            ),
-        );
-        let virt = LiveComposition {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
-                "_virtual", "_virtual", "module", None,
-            )),
-            signature: crate::resource::LiveCompositionSignature {
-                arguments: indexmap::IndexMap::new(),
-                attributes: virt_attrs,
-                pending_constraints: Vec::new(),
-            },
-            binding: Some("module".to_string()),
-            dependency_bindings: Default::default(),
-            module_name: "network".to_string(),
-            instance: "module".to_string(),
-            call_path: Default::default(),
-            quoted_string_attrs: std::collections::HashSet::new(),
-        };
-
         let child_id = child.id.clone();
         let effects = vec![
             parent,
@@ -1952,16 +1933,19 @@ mod tests {
         ];
         let unresolved = HashMap::from([
             (
-                effects[0].resource_id().clone(),
+                ResolvedResourceId::new(effects[0].resource_id().clone()),
                 UnresolvedResource::from_pre_resolve(match &effects[0] {
                     Effect::Update { to, .. } => to.as_inner().clone(),
                     _ => unreachable!(),
                 }),
             ),
-            (child_id, UnresolvedResource::from_pre_resolve(child)),
+            (
+                ResolvedResourceId::new(child_id),
+                UnresolvedResource::from_pre_resolve(child),
+            ),
         ]);
         let mut analysis =
-            build_dependency_analysis(&effects, &unresolved, &[virt], ScheduleInputs::Apply)
+            build_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
                 .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         let deps_of = analysis.into_deps_of();
@@ -1976,7 +1960,7 @@ mod tests {
     fn relax_update_update_edges_handles_empty_plan() {
         let effects: Vec<Effect> = Vec::new();
         let mut analysis =
-            build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply)
+            build_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply)
                 .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of().is_empty());
@@ -1987,7 +1971,7 @@ mod tests {
         let effect = update_effect("only", &[], &["tags"]);
         let effects = vec![effect];
         let mut analysis =
-            build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply)
+            build_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply)
                 .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of()[&0].is_empty());
@@ -2001,7 +1985,7 @@ mod tests {
             Effect::Create(resolved(child)),
         ];
         let mut analysis =
-            build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply)
+            build_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply)
                 .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of()[&0].is_empty());
@@ -2067,20 +2051,19 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("fixture resources resolve to typed dependencies");
 
-        let mut unresolved: HashMap<ResourceId, UnresolvedResource> = HashMap::new();
+        let mut unresolved: HashMap<ResolvedResourceId, UnresolvedResource> = HashMap::new();
         unresolved.insert(
-            role.id.clone(),
+            ResolvedResourceId::new(role.id.clone()),
             UnresolvedResource::from_pre_resolve(role.clone()),
         );
         unresolved.insert(
-            role_policy.id.clone(),
+            ResolvedResourceId::new(role_policy.id.clone()),
             UnresolvedResource::from_pre_resolve(role_policy),
         );
 
-        let deps_of =
-            build_dependency_analysis(&effects, &unresolved, &[virt], ScheduleInputs::Apply)
-                .expect("dependency analysis must resolve")
-                .into_deps_of();
+        let deps_of = build_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
+            .expect("dependency analysis must resolve")
+            .into_deps_of();
 
         assert!(
             deps_of[&1].contains(&0),

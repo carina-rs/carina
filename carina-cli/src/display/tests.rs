@@ -133,6 +133,51 @@ fn test_print_plan_with_external_dependency_does_not_panic() {
     .expect("display fixture must have an initialized provider route");
 }
 
+#[test]
+fn apply_plan_displays_missing_persisted_destroy_dependency_warning() {
+    let id = ResolvedResourceId::new(ResourceId::with_identity("test.resource", "orphan"));
+    let missing = ResolvedResourceId::new(ResourceId::with_identity("test.resource", "vanished"));
+    let generation = carina_core::effect::EffectGeneration::Current;
+    let mut plan = Plan::new();
+    plan.add(Effect::Delete {
+        id: id.clone(),
+        identifier: carina_core::provider::AppliedIdentifier::new("orphan-provider-id")
+            .expect("fixture provider identifier"),
+        generation: generation.clone(),
+        directives: Default::default(),
+        binding: Some("orphan".to_string()),
+        dependencies: std::iter::once(missing.clone()).collect(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+    });
+    plan.record_unresolvable_destroy_dependencies(
+        id,
+        generation,
+        std::iter::once(missing.clone()).collect(),
+    );
+
+    let output = strip_ansi(&format_plan_for_test(
+        &plan,
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+            &[],
+        ),
+        DetailLevel::Full,
+        &HashMap::new(),
+        None,
+        &HashMap::new(),
+        None,
+        None,
+    ));
+
+    assert!(output.contains("destroy ordering for test.resource.orphan is partially unknown"));
+    assert!(output.contains(&format!(
+        "persisted dependency `{missing}` no longer resolves"
+    )));
+}
+
 /// Test that print_plan handles the dependency graph correctly when
 /// dependents map is accessed with valid indices.
 #[test]

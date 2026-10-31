@@ -45,7 +45,8 @@ use carina_core::provider::{
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{
-    ConcreteValue, Current, PlanInputCurrent, ResolvedResource, Resource, ResourceId, State, Value,
+    ConcreteValue, Current, PlanInputCurrent, ResolvedResource, ResolvedResourceId, Resource,
+    ResourceId, State, Value,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, ValidatedConfigSchema,
@@ -431,11 +432,11 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         "create_plan must emit Effect::Wait for the prefixed wait binding"
     );
 
-    let unresolved_resources: HashMap<ResourceId, _> = sorted_resources
+    let unresolved_resources: HashMap<ResolvedResourceId, _> = sorted_resources
         .iter()
         .map(|r| {
             (
-                r.id.clone(),
+                ResolvedResourceId::new(r.id.clone()),
                 UnresolvedResource::from_pre_resolve(r.clone()),
             )
         })
@@ -605,11 +606,11 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         "create_plan must emit Effect::Wait for the doubly-prefixed binding"
     );
 
-    let unresolved_resources: HashMap<ResourceId, _> = sorted_resources
+    let unresolved_resources: HashMap<ResolvedResourceId, _> = sorted_resources
         .iter()
         .map(|r| {
             (
-                r.id.clone(),
+                ResolvedResourceId::new(r.id.clone()),
                 UnresolvedResource::from_pre_resolve(r.clone()),
             )
         })

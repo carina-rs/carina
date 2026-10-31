@@ -122,8 +122,9 @@ use carina_core::parser::{
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::provider::{
     self as provider_mod, AppliedIdentifier, InitializedProvider, LiftedSavedAttrs,
-    LoadedProviderSnapshot, NormalizerRouter, Provider, ProviderError, ProviderFactory,
-    ProviderLoadedSchemaRegistry, ProviderNormalizer, ProviderRouter,
+    LoadedProviderSnapshot, MetadataComparisonResolver, NormalizerRouter, Provider, ProviderError,
+    ProviderFactory, ProviderLoadedSchemaRegistry, ProviderNormalizer, ProviderRouter,
+    ResourceComparisonResolver,
 };
 use carina_core::provider_source::ProviderSource;
 use carina_core::resource::{
@@ -156,8 +157,8 @@ mod override_aware;
 
 pub use override_aware::{
     CanonicalResourceIdentityError, CanonicalResourcePair, DeferredForExpansionChoice,
-    DuplicateResolvedResourceIdError, OverrideAwareBuildMode, OverrideAwareResources,
-    RebuildBindingsInputs,
+    OverrideAwareBuildMode, OverrideAwareResources, RebuildBindingsInputs,
+    ResolvedResourceOriginIndexError,
 };
 
 static TRUSTED_LOCAL_GRANT_INPUTS: OnceLock<TrustedLocalGrantInputs> = OnceLock::new();
@@ -1705,10 +1706,6 @@ fn reconcile_evaluated_identities_with_ctx(
 }
 
 impl MigrationCheckConfig {
-    pub(crate) fn data_sources(&self) -> &[carina_core::resource::DataSource] {
-        &self.resources.data_sources
-    }
-
     /// Reconcile and expand the configuration using only values already
     /// present in the copied state being checked.
     ///
@@ -1718,11 +1715,11 @@ impl MigrationCheckConfig {
     /// offline and read-only, so it projects persisted managed and historical
     /// data-source rows into the same typed [`ResolvedBindings`] view without
     /// ever constructing a provider router.
-    pub(crate) fn prepare_from_copied_state(
+    fn prepare_from_copied_state(
         &mut self,
         state_file: &Option<StateFile>,
-    ) -> Result<(), AppError> {
-        reconcile_evaluated_identities_with_ctx(
+    ) -> Result<StateBlockClaims, AppError> {
+        let state_block_claims = reconcile_evaluated_identities_with_ctx(
             &self.context,
             &mut self.resources,
             state_file,
@@ -1731,7 +1728,7 @@ impl MigrationCheckConfig {
         self.canonicalize_and_compute_identifiers()?;
 
         let Some(state_file) = state_file.as_ref() else {
-            return Ok(());
+            return Ok(state_block_claims);
         };
 
         // Expansion can expose a binding consumed by another deferred loop.
@@ -1797,25 +1794,77 @@ impl MigrationCheckConfig {
             }
             self.canonicalize_and_compute_identifiers()?;
         }
-        Ok(())
+        Ok(state_block_claims)
+    }
+
+    /// Prepare and classify one copied legacy state through the same typed
+    /// graph/configuration/move input consumed by the plan path.
+    pub(crate) fn migrate_legacy_dependencies_from_copied_state(
+        mut self,
+        state: &mut StateFile,
+    ) -> Result<carina_state::LegacyDependencyMigrationReport, AppError> {
+        let state_view = Some(state.clone());
+        let state_block_claims = self.prepare_from_copied_state(&state_view)?;
+        state.remove_legacy_data_source_rows(&self.resources.data_sources);
+
+        let mut suppress_warning = |_: String| {};
+        let resolved_moves = resolve_explicit_moved_blocks(
+            &self.resources.state_blocks,
+            &state_view,
+            |to| {
+                find_desired_id(
+                    to,
+                    self.resources.resources.iter().map(|resource| &resource.id),
+                )
+            },
+            &mut suppress_warning,
+        )?;
+        let mut moved_pairs = resolved_moves
+            .into_iter()
+            .map(|resolved| resolved.resolved_move.into_parts())
+            .collect::<Vec<_>>();
+        let comparison = MetadataComparisonResolver::new(
+            self.resources.resources.iter().map(|resource| &resource.id),
+        );
+        let persisted_state = state_view
+            .as_ref()
+            .expect("copied-state migration always has state");
+        let automatic_moves = detect_late_anonymous_moves(LateAnonymousMoveDetectionInputs {
+            ctx: &self.context,
+            comparison: &comparison,
+            resources: &self.resources.resources,
+            data_sources: &self.resources.data_sources,
+            state_file: Some(persisted_state),
+            state_block_claims: &state_block_claims,
+            providers: &self.resources.providers,
+            initial_moved_pairs: &moved_pairs,
+        })?;
+        for resolved_move in automatic_moves {
+            let update = ResolvedMovePairUpdate::prepare(
+                &moved_pairs,
+                &resolved_move,
+                MoveOverlapPolicy::ComposeForward,
+            )?;
+            update.apply(&mut moved_pairs);
+        }
+        let configured = self.resources.resources.clone();
+        let data_sources = self.resources.data_sources.clone();
+        let input = build_legacy_dependency_migration_input(
+            &mut self.resources,
+            &configured,
+            &data_sources,
+            &moved_pairs,
+        )?;
+        input.migrate(state)
     }
 
     fn canonicalize_and_compute_identifiers(&mut self) -> Result<(), AppError> {
         let providers = self.resources.providers.clone();
-        let canonical = carina_core::value::canonicalize_resources_with_schemas(
-            &mut self.resources.resources,
-            self.context.schemas(),
-        )?;
-        compute_anonymous_identifiers_result_with_ctx(
+        resolve_late_anonymous_resource_ids(
             &self.context,
-            canonical,
+            &mut self.resources.resources,
             &providers,
-            identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
         )
-    }
-
-    pub(crate) fn into_resources(self) -> carina_core::parser::ModuleResolvedInferredFile {
-        self.resources
     }
 }
 
@@ -3101,7 +3150,7 @@ impl AnonymousReconciliationStateView {
 
 fn reconcile_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
-    comparison_provider: &ProviderRouter,
+    comparison_provider: &dyn ResourceComparisonResolver,
     resources: &[Resource],
     data_sources: &[DataSource],
     state_view: &AnonymousReconciliationStateView,
@@ -3120,7 +3169,7 @@ fn reconcile_anonymous_identifiers_with_ctx(
 
 fn detect_legacy_loop_moves_with_ctx(
     ctx: &WiringContext,
-    comparison_provider: &ProviderRouter,
+    comparison_provider: &dyn ResourceComparisonResolver,
     resources: &[Resource],
     state_view: &AnonymousReconciliationStateView,
     claims: &StateBlockClaims,
@@ -3139,7 +3188,7 @@ fn detect_legacy_loop_moves_with_ctx(
 
 fn detect_anonymous_to_named_moves_with_ctx(
     ctx: &WiringContext,
-    comparison_provider: &ProviderRouter,
+    comparison_provider: &dyn ResourceComparisonResolver,
     candidates: identifier::AnonymousToNamedCandidates<'_>,
     providers: &[ProviderConfig],
     state_view: &AnonymousReconciliationStateView,
@@ -3178,7 +3227,7 @@ fn detect_anonymous_to_named_moves_with_ctx(
 
 fn detect_anonymous_to_named_moves_to_fixed_point(
     ctx: &WiringContext,
-    comparison_provider: &ProviderRouter,
+    comparison_provider: &dyn ResourceComparisonResolver,
     resources: &[Resource],
     providers: &[ProviderConfig],
     state_file: &StateFile,
@@ -3276,64 +3325,83 @@ impl ResolvedDesiredIds {
     }
 }
 
+struct LateAnonymousMoveDetectionInputs<'a> {
+    ctx: &'a WiringContext,
+    comparison: &'a dyn ResourceComparisonResolver,
+    resources: &'a [Resource],
+    data_sources: &'a [DataSource],
+    state_file: Option<&'a StateFile>,
+    state_block_claims: &'a StateBlockClaims,
+    providers: &'a [ProviderConfig],
+    initial_moved_pairs: &'a [(ResolvedResourceId, ResolvedResourceId)],
+}
+
+fn detect_late_anonymous_moves(
+    inputs: LateAnonymousMoveDetectionInputs<'_>,
+) -> Result<Vec<ResolvedMove>, AppError> {
+    let Some(state_file) = inputs.state_file else {
+        return Ok(Vec::new());
+    };
+    let state_view =
+        AnonymousReconciliationStateView::new(inputs.ctx, state_file, inputs.initial_moved_pairs);
+    let mut moves = detect_legacy_loop_moves_with_ctx(
+        inputs.ctx,
+        inputs.comparison,
+        inputs.resources,
+        &state_view,
+        inputs.state_block_claims,
+        &[],
+    )?;
+    let mut projected_pairs = inputs.initial_moved_pairs.to_vec();
+    projected_pairs.extend(
+        moves
+            .iter()
+            .map(|migration| (migration.from().clone(), migration.to().clone())),
+    );
+    let state_view =
+        AnonymousReconciliationStateView::new(inputs.ctx, state_file, &projected_pairs);
+    moves.extend(reconcile_anonymous_identifiers_with_ctx(
+        inputs.ctx,
+        inputs.comparison,
+        inputs.resources,
+        inputs.data_sources,
+        &state_view,
+        inputs.state_block_claims,
+    )?);
+    projected_pairs = inputs.initial_moved_pairs.to_vec();
+    projected_pairs.extend(
+        moves
+            .iter()
+            .map(|resolved_move| (resolved_move.from().clone(), resolved_move.to().clone())),
+    );
+    moves.extend(detect_anonymous_to_named_moves_to_fixed_point(
+        inputs.ctx,
+        inputs.comparison,
+        inputs.resources,
+        inputs.providers,
+        state_file,
+        &projected_pairs,
+        inputs.state_block_claims,
+    )?);
+    Ok(moves)
+}
+
 pub(crate) fn reconcile_late_anonymous_identities(
     ctx: &WiringContext,
     inputs: LateAnonymousIdentityInputs<'_>,
 ) -> Result<ResolvedDesiredIds, AppError> {
-    let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
-        inputs.resources.resources_mut(),
-        ctx.schemas(),
-    )?;
-    compute_anonymous_identifiers_result_with_ctx(
-        ctx,
-        canonical_resources,
-        inputs.providers,
-        identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
-    )?;
+    resolve_late_anonymous_resource_ids(ctx, inputs.resources.resources_mut(), inputs.providers)?;
 
-    let mut moves = Vec::new();
-    if let Some(state_file) = inputs.state_file {
-        let state_view =
-            AnonymousReconciliationStateView::new(ctx, state_file, &inputs.addressed.moved_pairs);
-        moves = detect_legacy_loop_moves_with_ctx(
-            ctx,
-            inputs.comparison_provider,
-            inputs.resources.resources(),
-            &state_view,
-            inputs.state_block_claims,
-            &[],
-        )?;
-        let mut projected_pairs = inputs.addressed.moved_pairs.clone();
-        projected_pairs.extend(
-            moves
-                .iter()
-                .map(|migration| (migration.from().clone(), migration.to().clone())),
-        );
-        let state_view = AnonymousReconciliationStateView::new(ctx, state_file, &projected_pairs);
-        moves.extend(reconcile_anonymous_identifiers_with_ctx(
-            ctx,
-            inputs.comparison_provider,
-            inputs.resources.resources(),
-            inputs.data_sources,
-            &state_view,
-            inputs.state_block_claims,
-        )?);
-        let mut projected_pairs = inputs.addressed.moved_pairs.clone();
-        projected_pairs.extend(
-            moves
-                .iter()
-                .map(|resolved_move| (resolved_move.from().clone(), resolved_move.to().clone())),
-        );
-        moves.extend(detect_anonymous_to_named_moves_to_fixed_point(
-            ctx,
-            inputs.comparison_provider,
-            inputs.resources.resources(),
-            inputs.providers,
-            state_file,
-            &projected_pairs,
-            inputs.state_block_claims,
-        )?);
-    }
+    let moves = detect_late_anonymous_moves(LateAnonymousMoveDetectionInputs {
+        ctx,
+        comparison: inputs.comparison_provider,
+        resources: inputs.resources.resources(),
+        data_sources: inputs.data_sources,
+        state_file: inputs.state_file,
+        state_block_claims: inputs.state_block_claims,
+        providers: inputs.providers,
+        initial_moved_pairs: &inputs.addressed.moved_pairs,
+    })?;
 
     let unavailable_schema_errors = validation::validate_anonymous_resource_schemas(
         inputs.resources.resources(),
@@ -3364,6 +3432,21 @@ pub(crate) fn reconcile_late_anonymous_identities(
         MoveOverlapPolicy::ComposeForward,
     )?;
     Ok(desired)
+}
+
+fn resolve_late_anonymous_resource_ids(
+    ctx: &WiringContext,
+    resources: &mut [Resource],
+    providers: &[ProviderConfig],
+) -> Result<(), AppError> {
+    let canonical_resources =
+        carina_core::value::canonicalize_resources_with_schemas(resources, ctx.schemas())?;
+    compute_anonymous_identifiers_result_with_ctx(
+        ctx,
+        canonical_resources,
+        providers,
+        identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+    )
 }
 
 pub fn compute_anonymous_identifiers_with_ctx(
@@ -4808,16 +4891,26 @@ fn conflicting_move<'a>(
     })
 }
 
-fn apply_detected_resource_moves(
-    addressed: &mut AddressedState,
-    moves: Vec<ResolvedMove>,
-    state_file: Option<&StateFile>,
-    overlap_policy: MoveOverlapPolicy,
-) -> Result<(), AppError> {
-    for resolved_move in moves {
-        let conflicting_pair =
-            conflicting_move(&addressed.moved_pairs, &resolved_move, overlap_policy);
-        if let Some((existing_from, existing_to)) = conflicting_pair {
+enum ResolvedMovePairUpdate {
+    Compose {
+        index: usize,
+        to: ResolvedResourceId,
+    },
+    Append {
+        from: ResolvedResourceId,
+        to: ResolvedResourceId,
+    },
+}
+
+impl ResolvedMovePairUpdate {
+    fn prepare(
+        moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
+        resolved_move: &ResolvedMove,
+        overlap_policy: MoveOverlapPolicy,
+    ) -> Result<Self, AppError> {
+        if let Some((existing_from, existing_to)) =
+            conflicting_move(moved_pairs, resolved_move, overlap_policy)
+        {
             return Err(AppError::DetectedMoveConflict {
                 from: Box::new(resolved_move.from().clone()),
                 to: Box::new(resolved_move.to().clone()),
@@ -4825,6 +4918,41 @@ fn apply_detected_resource_moves(
                 existing_to: Box::new(existing_to.clone()),
             });
         }
+        if let Some(index) = moved_pairs.iter().position(|(origin, prior_target)| {
+            prior_target == resolved_move.projected_from() && origin == resolved_move.from()
+        }) {
+            Ok(Self::Compose {
+                index,
+                to: resolved_move.to().clone(),
+            })
+        } else {
+            Ok(Self::Append {
+                from: resolved_move.from().clone(),
+                to: resolved_move.to().clone(),
+            })
+        }
+    }
+
+    fn apply(self, moved_pairs: &mut Vec<(ResolvedResourceId, ResolvedResourceId)>) {
+        match self {
+            Self::Compose { index, to } => moved_pairs[index].1 = to,
+            Self::Append { from, to } => moved_pairs.push((from, to)),
+        }
+    }
+}
+
+fn apply_detected_resource_moves(
+    addressed: &mut AddressedState,
+    moves: Vec<ResolvedMove>,
+    state_file: Option<&StateFile>,
+    overlap_policy: MoveOverlapPolicy,
+) -> Result<(), AppError> {
+    for resolved_move in moves {
+        let pair_update = ResolvedMovePairUpdate::prepare(
+            &addressed.moved_pairs,
+            &resolved_move,
+            overlap_policy,
+        )?;
         let authority = resolved_move.authority();
         let transfer = promote_orphan_or_move_current_state(
             &mut addressed.managed_current,
@@ -4847,17 +4975,7 @@ fn apply_detected_resource_moves(
         addressed
             .saved_attrs
             .remap_resource_id(authority.from(), authority.to().clone());
-        let projected_from = resolved_move.projected_from().clone();
-        let (from, to) = resolved_move.into_parts();
-        if let Some((_origin, prior_target)) = addressed
-            .moved_pairs
-            .iter_mut()
-            .find(|(origin, prior_target)| prior_target == &projected_from && origin == &from)
-        {
-            *prior_target = to;
-        } else {
-            addressed.moved_pairs.push((from, to));
-        }
+        pair_update.apply(&mut addressed.moved_pairs);
     }
     Ok(())
 }
@@ -5631,14 +5749,18 @@ impl<E> ExpandedCanonicalResources<E> {
         &self.resources
     }
 
-    fn resolve_expanded_graph(
+    fn legacy_dependency_migration_input<'a>(
         &mut self,
-        managed: &[Resource],
+        configured: &'a [Resource],
         data_sources: &[DataSource],
-    ) -> Result<carina_core::resolved_graph::ExpandedBindingIndex, AppError> {
-        self.resources
-            .resolve_expanded_graph(managed, data_sources)
-            .map_err(AppError::from)
+        moved_pairs: &'a [(ResolvedResourceId, ResolvedResourceId)],
+    ) -> Result<LegacyDependencyMigrationInput<'a>, AppError> {
+        build_legacy_dependency_migration_input(
+            self.resources.parsed_mut(),
+            configured,
+            data_sources,
+            moved_pairs,
+        )
     }
 
     async fn prepare_desired_side_for_plan(
@@ -5963,8 +6085,64 @@ pub(crate) struct PostExpansionApplyResources {
     /// boundary so an invalid execution map cannot mask plan diagnostics or
     /// affect the export-only fast path.
     pub unresolved_by_resolved_id:
-        Result<HashMap<ResourceId, UnresolvedResource>, DuplicateResolvedResourceIdError>,
+        Result<HashMap<ResolvedResourceId, UnresolvedResource>, ResolvedResourceOriginIndexError>,
     pub bindings: ResolvedBindings,
+}
+
+/// The complete, post-identity input for the v20 → v21 dependency
+/// transition. Both planning and `state migrate --check` obtain this value
+/// through [`build_legacy_dependency_migration_input`], so graph construction
+/// cannot be detached from the configured IDs and move projection used to
+/// classify rows.
+struct LegacyDependencyMigrationInput<'a> {
+    graph: carina_core::resolved_graph::ExpandedBindingIndex,
+    configured: &'a [Resource],
+    moved_pairs: &'a [(ResolvedResourceId, ResolvedResourceId)],
+}
+
+impl LegacyDependencyMigrationInput<'_> {
+    fn migrate(
+        &self,
+        state: &mut StateFile,
+    ) -> Result<carina_state::LegacyDependencyMigrationReport, AppError> {
+        state
+            .migrate_legacy_dependencies(&self.graph, self.configured, self.moved_pairs)
+            .map_err(|error| AppError::Backend(error.into()))
+    }
+
+    fn graph(&self) -> &carina_core::resolved_graph::ExpandedBindingIndex {
+        &self.graph
+    }
+
+    fn into_graph(self) -> carina_core::resolved_graph::ExpandedBindingIndex {
+        self.graph
+    }
+}
+
+fn build_legacy_dependency_migration_input<'a, E>(
+    parsed: &mut carina_core::parser::ModuleResolvedFile<E>,
+    configured: &'a [Resource],
+    data_sources: &[DataSource],
+    moved_pairs: &'a [(ResolvedResourceId, ResolvedResourceId)],
+) -> Result<LegacyDependencyMigrationInput<'a>, AppError> {
+    let graph =
+        carina_core::resolved_graph::resolve_expanded_graph(parsed, configured, data_sources)?;
+    Ok(LegacyDependencyMigrationInput {
+        graph,
+        configured,
+        moved_pairs,
+    })
+}
+
+fn legacy_dependency_projections_for_state<E>(
+    state_file: Option<&StateFile>,
+    build: impl FnOnce() -> Result<carina_core::resolved_graph::LegacyDependencyProjectionIndex, E>,
+) -> Result<carina_core::resolved_graph::LegacyDependencyProjectionIndex, E> {
+    if state_file.is_some_and(StateFile::has_legacy_dependency_names) {
+        build()
+    } else {
+        Ok(Default::default())
+    }
 }
 
 impl PostExpansionMode for PlanMode {
@@ -6319,9 +6497,15 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     // operands to complete scheduler addresses. It deliberately runs after
     // late anonymous identity reconciliation and before any differ input is
     // constructed.
-    let expanded_graph = expanded_resources
-        .resolve_expanded_graph(override_aware_resources.resources(), &data_sources_for_plan)?;
-    let legacy_dependency_projections = expanded_graph.legacy_dependency_projection_index()?;
+    let migration_input = expanded_resources.legacy_dependency_migration_input(
+        override_aware_resources.resources(),
+        &data_sources_for_plan,
+        &addressed.moved_pairs,
+    )?;
+    let legacy_dependency_projections =
+        legacy_dependency_projections_for_state(state_file.as_ref(), || {
+            migration_input.graph().legacy_dependency_projection_index()
+        })?;
     let (migrated_legacy_state, legacy_dependency_migration) = if state_file
         .as_ref()
         .is_some_and(StateFile::requires_legacy_dependency_migration)
@@ -6330,14 +6514,15 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             .as_ref()
             .expect("checked legacy state presence")
             .clone();
-        let report = migrated
-            .migrate_legacy_dependencies(&expanded_graph, override_aware_resources.resources())
-            .map_err(|error| AppError::Backend(error.into()))?;
-        addressed.refresh_destroy_metadata_from_state(&migrated);
+        let report = migration_input.migrate(&mut migrated)?;
         (Some(migrated), report)
     } else {
         (None, Default::default())
     };
+    let expanded_graph = migration_input.into_graph();
+    if let Some(migrated) = migrated_legacy_state.as_ref() {
+        addressed.refresh_destroy_metadata_from_state(migrated);
+    }
     let state_file = if migrated_legacy_state.is_some() {
         &migrated_legacy_state
     } else {
@@ -6491,6 +6676,17 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         state_block_upstream_bindings,
     );
     add_deferred_create_effects(&mut plan, &deferred_create_targets);
+
+    let dependency_analysis = carina_core::effect::deps::build_effect_dependency_analysis(
+        plan.effects(),
+        resolved_desired_ids.ids.iter(),
+        carina_core::effect::deps::ScheduleInputs::Apply,
+    );
+    let dependency_analysis = match dependency_analysis {
+        Ok(analysis) => analysis,
+        Err(failure) => failure.into_parts().0,
+    };
+    plan.record_unresolved_delete_ordering_analysis(&dependency_analysis);
 
     let moved_origins = addressed
         .moved_pairs
@@ -7878,6 +8074,68 @@ fn resolved_state_row_id(
     )
 }
 
+/// One operator-authored move whose state source and desired destination have
+/// both been resolved to scheduler addresses.
+///
+/// Keeping destination membership with the validated move lets the mutating
+/// plan path transfer state while read-only migration consumers reuse the
+/// exact same address resolution without fabricating a move pair themselves.
+struct ResolvedExplicitMove {
+    resolved_move: ResolvedMove,
+    target_is_desired: bool,
+}
+
+fn resolve_explicit_moved_blocks(
+    state_blocks: &[StateBlock],
+    state_file: &Option<StateFile>,
+    mut desired_id: impl FnMut(&StateBlockAddress) -> Option<ResolvedResourceId>,
+    warn_missing: &mut dyn FnMut(String),
+) -> Result<Vec<ResolvedExplicitMove>, AppError> {
+    let mut resolved = Vec::new();
+
+    for block in state_blocks {
+        let StateBlock::Moved { addresses } = block else {
+            continue;
+        };
+        let from = addresses.from();
+        let to = addresses.to();
+        // `from`/`to` syntax has no provider-instance slot. Recover source
+        // routing from state and destination routing from the finalized
+        // desired resource set before minting the typed move.
+        let resolved_from = state_file.as_ref().and_then(|state| {
+            state
+                .find_resource_by_state_block_address(&from)
+                .map(|row| resolved_state_row_id(row, row.directives.provider_instance.clone()))
+        });
+        let Some(resolved_from) = resolved_from else {
+            let to_exists = state_file
+                .as_ref()
+                .is_some_and(|state| state.find_resource_by_state_block_address(&to).is_some());
+            if !to_exists {
+                warn_missing(format!(
+                    "warning: moved block from {} '{}' to {} '{}' was not applied: {} not found in state",
+                    from.display_type(),
+                    from.name_str(),
+                    to.display_type(),
+                    to.name_str(),
+                    from.name_str()
+                ));
+            }
+            continue;
+        };
+        let desired_to = desired_id(&to);
+        let target_is_desired = desired_to.is_some();
+        let resolved_to = desired_to.unwrap_or_else(|| to.to_unrouted_resource_id());
+        let resolved_move = ResolvedMove::from_moved_block(addresses, resolved_from, resolved_to)?;
+        resolved.push(ResolvedExplicitMove {
+            resolved_move,
+            target_is_desired,
+        });
+    }
+
+    Ok(resolved)
+}
+
 /// Pre-process moved blocks by transferring the typed orphan/current state,
 /// `prev_explicit`, and `saved_attrs` from the old resource name to the new
 /// name.
@@ -7922,94 +8180,56 @@ fn materialize_moved_states_with_warning_sink(
     warn_missing: &mut dyn FnMut(String),
 ) -> Result<Vec<(ResolvedResourceId, ResolvedResourceId)>, AppError> {
     let mut moved_pairs = Vec::new();
+    let resolved_moves = resolve_explicit_moved_blocks(
+        state_blocks,
+        state_file,
+        |to| find_desired_id(to, managed_current.keys()),
+        warn_missing,
+    )?;
 
-    for block in state_blocks {
-        if let StateBlock::Moved { addresses } = block {
-            let from = addresses.from();
-            let to = addresses.to();
-            // carina#3324: `from`/`to` are parsed from
-            // `moved { from = X 'a', to = X 'b' }`, which has no
-            // syntax for `provider_instance`. The state-resident
-            // `from` may carry routing from its original
-            // `directives { provider = ... }`, and the desired-state
-            // `to` may similarly carry routing from the new let-bound
-            // resource's directives. Resolve both to their full ids
-            // so map lookups (which include `provider_instance` in
-            // `Hash`/`Eq`) hit the right keys and the emitted
-            // `(from, to)` pair matches every downstream consumer's
-            // address shape.
-            let resolved_from = state_file.as_ref().and_then(|sf| {
-                sf.find_resource_by_state_block_address(&from)
-                    .map(|rs| resolved_state_row_id(rs, rs.directives.provider_instance.clone()))
-            });
-            let Some(resolved_from) = resolved_from else {
-                let to_exists = state_file
-                    .as_ref()
-                    .is_some_and(|sf| sf.find_resource_by_state_block_address(&to).is_some());
-                if !to_exists {
-                    warn_missing(format!(
-                        "warning: moved block from {} '{}' to {} '{}' was not applied: {} not found in state",
-                        from.display_type(),
-                        from.name_str(),
-                        to.display_type(),
-                        to.name_str(),
-                        from.name_str()
-                    ));
-                }
-                continue;
-            };
-            // For `to`, look up the destination key by
-            // `(provider, resource_type, name)` in the desired-state map.
-            // Phase 1 inserts an entry (including `not_found`) for every
-            // desired resource, so this both resolves provider routing and
-            // tells us whether to promote an orphan into desired state or
-            // re-key the complete orphan value for a still-undeclared target.
-            let desired_to = find_desired_id(&to, managed_current.keys());
-            let target_is_desired = desired_to.is_some();
-            let resolved_to = desired_to.unwrap_or_else(|| to.to_unrouted_resource_id());
-            let resolved_move =
-                ResolvedMove::from_moved_block(addresses, resolved_from, resolved_to)?;
-            let authority = resolved_move.authority();
+    for ResolvedExplicitMove {
+        resolved_move,
+        target_is_desired,
+    } in resolved_moves
+    {
+        let authority = resolved_move.authority();
 
-            // Transfer state from the old name to the new name so the
-            // differ compares desired(to) against actual(from).
-            let transfer = if target_is_desired {
-                promote_orphan_or_move_current_state(
-                    managed_current,
-                    orphans,
-                    &authority,
-                    state_file.as_ref(),
-                )?
-            } else if orphans.rekey(&authority)
-                || rekey_current_for_move(managed_current, &authority)?
-            {
-                MoveTransferOutcome::Transferred
-            } else {
-                classify_unloaded_move_source(state_file.as_ref(), authority.from())
-            };
-            match transfer {
-                MoveTransferOutcome::Transferred
-                | MoveTransferOutcome::SourceHasNoCurrentInstance => {}
-                MoveTransferOutcome::NotLoaded => {
-                    return Err(AppError::MoveSourceNotLoaded {
-                        from: Box::new(resolved_move.from().clone()),
-                        to: Box::new(resolved_move.to().clone()),
-                    });
-                }
+        // Transfer state from the old name to the new name so the
+        // differ compares desired(to) against actual(from).
+        let transfer = if target_is_desired {
+            promote_orphan_or_move_current_state(
+                managed_current,
+                orphans,
+                &authority,
+                state_file.as_ref(),
+            )?
+        } else if orphans.rekey(&authority) || rekey_current_for_move(managed_current, &authority)?
+        {
+            MoveTransferOutcome::Transferred
+        } else {
+            classify_unloaded_move_source(state_file.as_ref(), authority.from())
+        };
+        match transfer {
+            MoveTransferOutcome::Transferred | MoveTransferOutcome::SourceHasNoCurrentInstance => {}
+            MoveTransferOutcome::NotLoaded => {
+                return Err(AppError::MoveSourceNotLoaded {
+                    from: Box::new(resolved_move.from().clone()),
+                    to: Box::new(resolved_move.to().clone()),
+                });
             }
-
-            // Transfer prev_explicit so the differ detects attribute
-            // removals under the new resource name.
-            if let Some(keys) = prev_explicit.remove(authority.from()) {
-                prev_explicit.insert(authority.to().clone(), keys);
-            }
-
-            // Transfer saved_attrs so create_plan can look up saved
-            // attributes under the new resource name.
-            saved_attrs.remap_resource_id(authority.from(), authority.to().clone());
-
-            moved_pairs.push(resolved_move.into_parts());
         }
+
+        // Transfer prev_explicit so the differ detects attribute
+        // removals under the new resource name.
+        if let Some(keys) = prev_explicit.remove(authority.from()) {
+            prev_explicit.insert(authority.to().clone(), keys);
+        }
+
+        // Transfer saved_attrs so create_plan can look up saved
+        // attributes under the new resource name.
+        saved_attrs.remap_resource_id(authority.from(), authority.to().clone());
+
+        moved_pairs.push(resolved_move.into_parts());
     }
 
     Ok(moved_pairs)

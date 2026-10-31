@@ -241,3 +241,128 @@ let consumer = mock.test.resource {
     );
     assert!(!project.join("unused-backend-state.json").exists());
 }
+
+#[test]
+fn migration_check_classifies_explicitly_moved_row_as_configured() {
+    let temp = tempfile::tempdir().expect("create moved migration-check project");
+    let project = temp.path();
+    fs::write(project.join("providers.crn"), "provider mock {}\n")
+        .expect("write built-in provider declaration");
+    fs::write(
+        project.join("main.crn"),
+        r#"let renamed = mock.test.resource { name = "renamed" }
+
+moved {
+  from = mock.test.resource 'old'
+  to = mock.test.resource 'renamed'
+}
+"#,
+    )
+    .expect("write moved resource configuration");
+    fs::write(
+        project.join("backend.crn"),
+        "backend local { path = \"unused-backend-state.json\" }\n",
+    )
+    .expect("write backend declaration");
+
+    let state = project.join("copied-v20-state.json");
+    fs::write(
+        &state,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 20,
+            "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+            "serial": 3,
+            "lineage": "migration-check-moved-row",
+            "carina_version": "legacy",
+            "resources": [{
+                "resource_type": "test.resource",
+                "identity": "old",
+                "provider": "mock",
+                "current": {
+                    "kind": "applied",
+                    "identifier": "old-provider-id",
+                    "attributes": {"name": "renamed"},
+                    "nested_write_only": {}
+                },
+                "binding": "old",
+                "dependency_bindings": ["gone_dependency"]
+            }],
+            "exports": {}
+        }))
+        .expect("encode moved v20 state"),
+    )
+    .expect("write moved v20 state");
+
+    let output = run_builtin_check(project, &state);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert!(
+        !output.status.success(),
+        "the moved row is configured and its missing dependency must be strict:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("gone_dependency") && rendered.contains("dependency_bindings"),
+        "check must report the same configured-row migration error as apply:\n{rendered}"
+    );
+}
+
+#[test]
+fn migration_check_classifies_reconciled_legacy_loop_row_as_configured() {
+    let temp = tempfile::tempdir().expect("create legacy-loop migration-check project");
+    let project = temp.path();
+    fs::write(project.join("providers.crn"), "provider mock {}\n")
+        .expect("write built-in provider declaration");
+    fs::write(
+        project.join("main.crn"),
+        "for name in ['stable'] {\n  mock.test.resource { name = name }\n}\n",
+    )
+    .expect("write anonymous loop configuration");
+
+    let state = project.join("copied-v20-state.json");
+    fs::write(
+        &state,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 20,
+            "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+            "serial": 4,
+            "lineage": "migration-check-legacy-loop-row",
+            "carina_version": "legacy",
+            "resources": [{
+                "resource_type": "test.resource",
+                "identity": "_for0[0]",
+                "provider": "mock",
+                "current": {
+                    "kind": "applied",
+                    "identifier": "legacy-loop-provider-id",
+                    "attributes": {"name": "stable"},
+                    "nested_write_only": {}
+                },
+                "binding": "_for0[0]",
+                "dependency_bindings": ["gone_dependency"]
+            }],
+            "exports": {}
+        }))
+        .expect("encode legacy-loop v20 state"),
+    )
+    .expect("write legacy-loop v20 state");
+
+    let output = run_builtin_check(project, &state);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert!(
+        !output.status.success(),
+        "the reconciled loop row is configured and must be strict:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("gone_dependency") && rendered.contains("dependency_bindings"),
+        "check must use the same late anonymous move as apply:\n{rendered}"
+    );
+}

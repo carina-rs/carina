@@ -284,12 +284,12 @@ fn anonymous_deferred_collision_fixture() -> (
 
 #[test]
 fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
-    fn origins(resources: &[Resource]) -> HashMap<ResourceId, UnresolvedResource> {
+    fn origins(resources: &[Resource]) -> HashMap<ResolvedResourceId, UnresolvedResource> {
         resources
             .iter()
             .map(|resource| {
                 (
-                    resource.id.clone(),
+                    ResolvedResourceId::new(resource.id.clone()),
                     UnresolvedResource::from_pre_resolve(resource.clone()),
                 )
             })
@@ -299,14 +299,14 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
     fn assert_matches_executor(
         case: &str,
         effects: Vec<Effect>,
-        unresolved: HashMap<ResourceId, UnresolvedResource>,
+        unresolved: HashMap<ResolvedResourceId, UnresolvedResource>,
         expected: BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)>,
     ) -> BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)> {
         let borrowed: HashMap<_, _> = unresolved
             .iter()
             .map(|(id, resource)| (id.clone(), resource))
             .collect();
-        let actual = build_plan_scheduler_dependency_edges(&effects, &borrowed, &[]);
+        let actual = build_plan_scheduler_dependency_edges(&effects, &borrowed);
 
         assert_eq!(actual, expected, "scheduler-edge export drifted for {case}");
         actual
@@ -2984,7 +2984,7 @@ async fn invalid_secret_create_value_is_masked_and_never_reaches_provider() {
     );
     let id = resource.id.clone();
     let unresolved = HashMap::from([(
-        id.clone(),
+        ResolvedResourceId::new(id.clone()),
         UnresolvedResource::from_pre_resolve(resource.clone()),
     )]);
     let mut bindings = ResolvedBindings::default();
@@ -3605,11 +3605,11 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
     let plan = create_plan_from_fixture_resources(vec![producer.clone(), consumer.clone()]);
     let unresolved = HashMap::from([
         (
-            producer.id.clone(),
+            ResolvedResourceId::new(producer.id.clone()),
             UnresolvedResource::from_pre_resolve(producer.clone()),
         ),
         (
-            consumer.id.clone(),
+            ResolvedResourceId::new(consumer.id.clone()),
             UnresolvedResource::from_pre_resolve(consumer.clone()),
         ),
     ]);
@@ -3712,11 +3712,11 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
     });
     let unresolved = HashMap::from([
         (
-            producer.id.clone(),
+            ResolvedResourceId::new(producer.id.clone()),
             UnresolvedResource::from_pre_resolve(producer.clone()),
         ),
         (
-            consumer_id,
+            ResolvedResourceId::new(consumer_id),
             UnresolvedResource::from_pre_resolve(unresolved_consumer.clone()),
         ),
     ]);
@@ -3962,7 +3962,7 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
     let executable_data_source_values =
         executable_deferred_data_source_values(std::slice::from_ref(&data_source));
     let resource_origins = HashMap::from([(
-        upstream.id.clone(),
+        ResolvedResourceId::new(upstream.id.clone()),
         UnresolvedResource::from_pre_resolve(upstream.clone()),
     )]);
     let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
@@ -4149,7 +4149,7 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
     let executable_data_source_values =
         executable_deferred_data_source_values(std::slice::from_ref(&data_source));
     let resource_origins = HashMap::from([(
-        upstream.id.clone(),
+        ResolvedResourceId::new(upstream.id.clone()),
         UnresolvedResource::from_pre_resolve(upstream.clone()),
     )]);
     let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
@@ -4956,7 +4956,7 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
     let target_id = ResourceId::with_identity("test", "wait-target");
     let target_origin = make_resource("wait-target", &[]);
     let resource_origins = HashMap::from([(
-        target_origin.id.clone(),
+        ResolvedResourceId::new(target_origin.id.clone()),
         UnresolvedResource::from_pre_resolve(target_origin),
     )]);
     let pending_state = State::existing(
@@ -5757,7 +5757,10 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
     plan.add(create_effect(planned));
     provider.push_create(Ok(ok_state(&id)));
 
-    let unresolved = HashMap::from([(id.clone(), UnresolvedResource::from_pre_resolve(source))]);
+    let unresolved = HashMap::from([(
+        ResolvedResourceId::new(id.clone()),
+        UnresolvedResource::from_pre_resolve(source),
+    )]);
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
@@ -5956,7 +5959,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
         wait_aliases: &[],
     });
     let resource_origins = HashMap::from([(
-        producer_id.clone(),
+        ResolvedResourceId::new(producer_id.clone()),
         UnresolvedResource::from_pre_resolve(producer.clone()),
     )]);
     let data_source_origins = [authored];
@@ -7430,7 +7433,7 @@ fn test_build_dependency_levels() {
 
     let plan = create_plan_from_fixture_resources(vec![a, b, c, d]);
 
-    let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
+    let levels = build_dependency_levels(plan.effects(), &HashMap::new());
 
     // Level 0: a (index 0)
     // Level 1: b (index 1), c (index 2)
@@ -7502,7 +7505,7 @@ fn test_build_dependency_levels_transitive_ref_preserves_direct_dep() {
         ));
     }
 
-    let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
+    let levels = build_dependency_levels(plan.effects(), &HashMap::new());
 
     // Find the level of tgw_attach (idx 3) and route (idx 5)
     let tgw_attach_level = levels.iter().position(|group| group.contains(&3)).unwrap();
@@ -7849,11 +7852,11 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
         });
     }
 
-    let unresolved_resources: HashMap<ResourceId, UnresolvedResource> = resources
+    let unresolved_resources: HashMap<ResolvedResourceId, UnresolvedResource> = resources
         .iter()
         .map(|resource| {
             (
-                resource.id.clone(),
+                ResolvedResourceId::new(resource.id.clone()),
                 UnresolvedResource::from_pre_resolve(resource.clone()),
             )
         })
@@ -7934,11 +7937,11 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
         });
     }
 
-    let unresolved_resources: HashMap<ResourceId, UnresolvedResource> = resources
+    let unresolved_resources: HashMap<ResolvedResourceId, UnresolvedResource> = resources
         .iter()
         .map(|resource| {
             (
-                resource.id.clone(),
+                ResolvedResourceId::new(resource.id.clone()),
                 UnresolvedResource::from_pre_resolve(resource.clone()),
             )
         })
@@ -8132,7 +8135,7 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
         blocked_by_updates: Default::default(),
     });
 
-    let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
+    let levels = build_dependency_levels(plan.effects(), &HashMap::new());
 
     // Find levels for each effect
     let vpc_level = levels.iter().position(|group| group.contains(&0)).unwrap();
@@ -8219,7 +8222,7 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
         &std::iter::once(test_resolved_id("test.Consumer", "consumer")).collect()
     );
 
-    let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
+    let levels = build_dependency_levels(plan.effects(), &HashMap::new());
     let update_level = levels
         .iter()
         .position(|level| level.contains(&update_idx))
@@ -8248,9 +8251,9 @@ fn test_build_dependency_levels_consistent_with_dependency_map() {
 
     let plan = create_plan_from_fixture_resources(vec![a, b, c, d]);
 
-    let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
+    let levels = build_dependency_levels(plan.effects(), &HashMap::new());
     let dep_map =
-        build_dependency_analysis(plan.effects(), &HashMap::new(), &[], ScheduleInputs::Apply)
+        build_dependency_analysis(plan.effects(), std::iter::empty(), ScheduleInputs::Apply)
             .expect("dependency analysis must resolve")
             .into_deps_of();
 
@@ -8358,10 +8361,9 @@ fn test_dependency_analysis_respects_delete_dependencies() {
         blocked_by_updates: Default::default(),
     });
 
-    let deps =
-        build_dependency_analysis(plan.effects(), &HashMap::new(), &[], ScheduleInputs::Apply)
-            .expect("dependency analysis must resolve")
-            .into_deps_of();
+    let deps = build_dependency_analysis(plan.effects(), std::iter::empty(), ScheduleInputs::Apply)
+        .expect("dependency analysis must resolve")
+        .into_deps_of();
 
     // vpc delete (idx 0) must depend on subnet delete (idx 1)
     // because subnet must be deleted before vpc (reverse dependency)
@@ -8817,7 +8819,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         .cloned()
         .map(|resource| {
             (
-                resource.id.clone(),
+                ResolvedResourceId::new(resource.id.clone()),
                 UnresolvedResource::from_pre_resolve(resource),
             )
         })
@@ -8846,8 +8848,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
 
     let deps = build_dependency_analysis(
         plan.effects(),
-        &unresolved_resources,
-        &[],
+        unresolved_resources.keys(),
         ScheduleInputs::Apply,
     )
     .expect("dependency analysis must resolve")
@@ -10765,8 +10766,14 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     })));
 
     let unresolved = HashMap::from([
-        (cert_id, UnresolvedResource::from_pre_resolve(cert.clone())),
-        (alb.id.clone(), UnresolvedResource::from_pre_resolve(alb)),
+        (
+            ResolvedResourceId::new(cert_id),
+            UnresolvedResource::from_pre_resolve(cert.clone()),
+        ),
+        (
+            ResolvedResourceId::new(alb.id.clone()),
+            UnresolvedResource::from_pre_resolve(alb),
+        ),
     ]);
     let input = ExecutionInput {
         plan: &plan,

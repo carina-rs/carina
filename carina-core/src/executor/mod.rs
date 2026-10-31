@@ -60,8 +60,7 @@ pub struct PlanSchedulerEndpoint {
 /// scheduler's behavior for unaffected effects.
 pub fn build_plan_scheduler_dependency_edges(
     plan_effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, &UnresolvedResource>,
-    compositions: &[crate::resource::LiveComposition],
+    unresolved_resources: &HashMap<ResolvedResourceId, &UnresolvedResource>,
 ) -> BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)> {
     let parallel::ExpandedEffects {
         effects,
@@ -75,7 +74,6 @@ pub fn build_plan_scheduler_dependency_edges(
     let scheduler::SchedulerDeps { deps_of, .. } = scheduler::build_scheduler_deps_from_resources(
         &effects,
         unresolved_resources,
-        compositions,
         &deferred_replace_delete_deps,
     );
 
@@ -120,7 +118,8 @@ use crate::provider::{
 };
 use crate::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart, ModuleSource,
-    ResolvedResource, Resource, ResourceId, SavedModuleSource, State, UnknownReason, Value,
+    ResolvedResource, ResolvedResourceId, Resource, ResourceId, SavedModuleSource, State,
+    UnknownReason, Value,
 };
 use crate::wait::WaitObservation;
 
@@ -514,23 +513,11 @@ impl RuntimeCompositions<'_> {
     fn scheduler_dependencies<S>(
         self,
         effects: &[Effect<S>],
-        unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
+        unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<S>>,
         deferred_replace_delete_deps: &[(usize, usize)],
     ) -> scheduler::SchedulerDeps {
-        match self {
-            Self::Live(compositions) => scheduler::build_scheduler_deps(
-                effects,
-                unresolved_resources,
-                compositions,
-                deferred_replace_delete_deps,
-            ),
-            Self::Saved(compositions) => scheduler::build_saved_scheduler_deps(
-                effects,
-                unresolved_resources,
-                compositions,
-                deferred_replace_delete_deps,
-            ),
-        }
+        let _ = self;
+        scheduler::build_scheduler_deps(effects, unresolved_resources, deferred_replace_delete_deps)
     }
 }
 
@@ -639,13 +626,13 @@ impl<'a> From<SavedExecutionInput<'a>> for RuntimeExecutionInput<'a, SavedModule
 pub enum ProviderCheckInputs<'a, S = ModuleSource> {
     Authored,
     PlanNormalized {
-        resource_origins: &'a HashMap<ResourceId, UnresolvedResource<S>>,
+        resource_origins: &'a HashMap<ResolvedResourceId, UnresolvedResource<S>>,
         data_source_origins: &'a [DataSource<S>],
     },
 }
 
 impl<S: Clone> ProviderCheckInputs<'_, S> {
-    fn resource_origins(&self) -> Option<&HashMap<ResourceId, UnresolvedResource<S>>> {
+    fn resource_origins(&self) -> Option<&HashMap<ResolvedResourceId, UnresolvedResource<S>>> {
         match self {
             Self::Authored => None,
             Self::PlanNormalized {

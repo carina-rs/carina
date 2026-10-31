@@ -3,15 +3,14 @@ use std::collections::{HashMap, HashSet};
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::parser::DeferredForExpression;
-use crate::resource::{ResolvedDependencies, ResourceId};
+use crate::resource::{ResolvedDependencies, ResolvedResourceId};
 
 use super::UnresolvedResource;
 use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
 use super::parallel::apply_deferred_replace_delete_deps;
 use crate::effect::deps::{
     DependencyAnalysis, DependencyAnalysisFailure, ScheduleInputs, UnresolvedRequiredDependency,
-    build_effect_dependency_analysis, build_effect_dependency_analysis_from_resources,
-    relax_update_update_edges,
+    build_effect_dependency_analysis, relax_update_update_edges,
 };
 
 pub(super) struct SchedulerDeps {
@@ -104,34 +103,14 @@ pub(super) fn failure_display_name<S>(effect: &Effect<S>) -> Option<String> {
 
 pub(super) fn build_scheduler_deps<S>(
     effects: &[Effect<S>],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
-    compositions: &[crate::resource::LiveComposition],
+    unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<S>>,
     deferred_replace_delete_deps: &[(usize, usize)],
 ) -> SchedulerDeps {
     finish_scheduler_deps(
         effects,
         build_effect_dependency_analysis(
             effects,
-            unresolved_resources,
-            compositions,
-            ScheduleInputs::Apply,
-        ),
-        deferred_replace_delete_deps,
-    )
-}
-
-pub(super) fn build_saved_scheduler_deps<S>(
-    effects: &[Effect<S>],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
-    compositions: &[crate::resource::SavedComposition],
-    deferred_replace_delete_deps: &[(usize, usize)],
-) -> SchedulerDeps {
-    finish_scheduler_deps(
-        effects,
-        crate::effect::deps::build_saved_effect_dependency_analysis(
-            effects,
-            unresolved_resources,
-            compositions,
+            unresolved_resources.keys(),
             ScheduleInputs::Apply,
         ),
         deferred_replace_delete_deps,
@@ -140,17 +119,15 @@ pub(super) fn build_saved_scheduler_deps<S>(
 
 pub(super) fn build_scheduler_deps_from_resources(
     effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, &UnresolvedResource>,
-    compositions: &[crate::resource::LiveComposition],
+    unresolved_resources: &HashMap<ResolvedResourceId, &UnresolvedResource>,
     deferred_replace_delete_deps: &[(usize, usize)],
 ) -> SchedulerDeps {
     let effect_refs: Vec<_> = effects.iter().collect();
     finish_scheduler_deps(
         effects,
-        build_effect_dependency_analysis_from_resources(
+        build_effect_dependency_analysis(
             &effect_refs,
-            unresolved_resources,
-            compositions,
+            unresolved_resources.keys(),
             ScheduleInputs::Apply,
         ),
         deferred_replace_delete_deps,
@@ -283,6 +260,7 @@ impl<'a, S> FailureView<'a, S> {
 mod tests {
     use super::*;
     use crate::effect::EffectGeneration;
+    use crate::resource::ResourceId;
 
     #[test]
     fn cross_phase_unbound_failure_uses_source_location_not_scheduler_key() {

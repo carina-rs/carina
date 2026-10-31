@@ -611,6 +611,7 @@ pub struct IgnoredChangeSummary {
 pub enum DestroyOrdering {
     Known,
     PartiallyUnknown { legacy_names: BTreeSet<String> },
+    UnresolvedPersistedDependencies { dependencies: ResolvedDependencies },
 }
 
 /// Typed association between a Delete generation and its ordering status.
@@ -914,6 +915,51 @@ impl<S> Plan<S> {
             generation,
             ordering: DestroyOrdering::PartiallyUnknown { legacy_names },
         });
+    }
+
+    pub fn record_unresolvable_destroy_dependencies(
+        &mut self,
+        id: ResolvedResourceId,
+        generation: EffectGeneration,
+        dependencies: ResolvedDependencies,
+    ) {
+        if dependencies.is_empty() {
+            return;
+        }
+        self.destroy_ordering_notices.push(DestroyOrderingNotice {
+            id,
+            generation,
+            ordering: DestroyOrdering::UnresolvedPersistedDependencies { dependencies },
+        });
+    }
+
+    pub fn record_unresolved_delete_ordering_analysis(
+        &mut self,
+        analysis: &crate::effect::deps::DependencyAnalysis,
+    ) {
+        let mut notices: Vec<(ResolvedResourceId, EffectGeneration, ResolvedDependencies)> =
+            Vec::new();
+        for warning in analysis.unresolved_delete_ordering() {
+            if let Some((_, _, dependencies)) =
+                notices
+                    .iter_mut()
+                    .find(|(notice_id, notice_generation, _)| {
+                        notice_id == warning.delete_id()
+                            && notice_generation == warning.generation()
+                    })
+            {
+                dependencies.insert(warning.dependency().clone());
+            } else {
+                notices.push((
+                    warning.delete_id().clone(),
+                    warning.generation().clone(),
+                    std::iter::once(warning.dependency().clone()).collect(),
+                ));
+            }
+        }
+        for (id, generation, dependencies) in notices {
+            self.record_unresolvable_destroy_dependencies(id, generation, dependencies);
+        }
     }
 
     pub fn destroy_ordering_notices(&self) -> &[DestroyOrderingNotice] {

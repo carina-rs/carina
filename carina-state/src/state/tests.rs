@@ -1,5 +1,8 @@
 use super::*;
-use carina_core::resource::{DeferredValue, PendingReRead, ReReadReason, ResolvedDependencies};
+use carina_core::resource::{
+    DeferredValue, PendingReRead, ReReadReason, ResolvedDependencies, SavedModuleSource,
+    SavedResource,
+};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -79,7 +82,7 @@ fn migrate_legacy_with_config(
     let mut parsed: carina_core::parser::ParsedFile = Default::default();
     let graph = carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, resources, &[])
         .expect("legacy migration fixture graph must resolve");
-    let report = state.migrate_legacy_dependencies(&graph, resources)?;
+    let report = state.migrate_legacy_dependencies(&graph, resources, &[])?;
     Ok((state, report))
 }
 
@@ -5959,6 +5962,19 @@ fn fixture_persisted_dependencies<const N: usize>(
 }
 
 #[test]
+fn legacy_dependency_spellings_do_not_double_an_existing_scope_prefix() {
+    assert_eq!(
+        legacy_dependency_spellings(Some("module_instance"), "module_instance.target"),
+        vec!["module_instance.target"],
+    );
+    assert_eq!(
+        legacy_dependency_spellings(Some("module_instance"), "target"),
+        vec!["module_instance.target", "target"],
+    );
+    assert_eq!(legacy_dependency_spellings(None, "target"), vec!["target"],);
+}
+
+#[test]
 fn v20_without_dependency_names_can_complete_before_a_mutating_command_early_write() {
     let json = state_json_with_resources(
         20,
@@ -6082,6 +6098,65 @@ fn v20_dependency_migration_rejects_missing_target_with_row_and_text() {
             && location == "resources[0].dependency_bindings"
             && dependency == "gone_target"
     ));
+}
+
+#[test]
+fn v20_dependency_migration_classifies_moved_row_as_configured() {
+    let mut target = persisted_resource("mock", "test.Target", "module_instance.target");
+    target["binding"] = serde_json::json!("module_instance.target");
+    let mut consumer = persisted_resource("mock", "test.Consumer", "old_consumer");
+    consumer["binding"] = serde_json::json!("old_consumer");
+    consumer["dependency_bindings"] = serde_json::json!(["target"]);
+    let json = state_json_with_resources(20, vec![target, consumer]);
+    let mut state = check_and_migrate(&json)
+        .expect("moved-row fixture must load as pending migration")
+        .into_state();
+
+    let target: SavedResource =
+        Resource::with_provider("mock", "test.Target", "module_instance.target", None)
+            .with_binding("module_instance.target")
+            .into();
+    let mut configured_consumer: SavedResource =
+        Resource::with_provider("mock", "test.Consumer", "module_instance.consumer", None)
+            .with_binding("module_instance.consumer")
+            .into();
+    configured_consumer.module_source = Some(SavedModuleSource::Module {
+        name: "consumer_module".to_string(),
+        instance: "module_instance".to_string(),
+        scope_key: Some("module_instance".to_string()),
+        scope_description: None,
+    });
+    let resources = vec![target, configured_consumer];
+    let graph_resources: Vec<Resource> = vec![
+        Resource::with_provider("mock", "test.Target", "module_instance.target", None)
+            .with_binding("module_instance.target"),
+        Resource::with_provider("mock", "test.Consumer", "module_instance.consumer", None)
+            .with_binding("module_instance.consumer"),
+    ];
+    let mut parsed: carina_core::parser::ParsedFile = Default::default();
+    let graph =
+        carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, &graph_resources, &[])
+            .expect("moved-row graph resolves");
+    let from = resolved_dependency("mock", "test.Consumer", "old_consumer", None);
+    let to = resolved_dependency("mock", "test.Consumer", "module_instance.consumer", None);
+
+    let report = state
+        .migrate_legacy_dependencies(&graph, &resources, &[(from, to)])
+        .expect("the moved row must use its configured destination scope");
+
+    assert!(report.warnings().is_empty());
+    let row = state
+        .find_resource("mock", "test.Consumer", "old_consumer")
+        .expect("migration classifies but does not itself move the row");
+    assert_eq!(
+        row.dependency_bindings,
+        PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
+            "mock",
+            "test.Target",
+            "module_instance.target",
+            None,
+        )])
+    );
 }
 
 #[test]

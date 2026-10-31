@@ -62,6 +62,16 @@ impl Scenario {
         .expect("write resource configuration with peer");
     }
 
+    fn write_resources_with_dependent_peer(&self, name: &str) {
+        fs::write(
+            self.project.join("resources.crn"),
+            format!(
+                "let account = mock.test.default_prevent_destroy {{\n  name = \"{name}\"\n}}\n\nlet peer = mock.test.resource {{\n  name = \"peer\"\n  parent = account.name\n}}\n"
+            ),
+        )
+        .expect("write protected resource with dependent peer");
+    }
+
     fn write_resources_with_tagged_peer(&self, name: &str, setting: Option<bool>, peer_tag: &str) {
         let directives = setting.map_or_else(String::new, |value| {
             format!("  directives {{ prevent_destroy = {value} }}\n")
@@ -241,6 +251,25 @@ fn schema_default_protects_remove_replace_and_destroy_until_explicit_opt_out() {
     assert_success(
         "opted-out destroy",
         &scenario.run(&["destroy", ".", "--auto-approve", "--lock=false"]),
+    );
+}
+
+#[test]
+fn destroy_dependency_on_kept_prevent_destroy_target_reaches_typed_refusal() {
+    let scenario = Scenario::new();
+    scenario.write_resources_with_dependent_peer("account-v1");
+    assert_success("carina init", &scenario.run(&["init", "."]));
+    assert_success(
+        "initial apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+
+    let destroy = scenario.run(&["destroy", ".", "--auto-approve", "--lock=false"]);
+    assert_schema_default_refusal("destroy with kept dependency target", &destroy);
+    assert!(
+        !output_text(&destroy).contains("Failed to analyze destroy dependencies"),
+        "a dependency on an existing kept target is not missing:\n{}",
+        output_text(&destroy)
     );
 }
 

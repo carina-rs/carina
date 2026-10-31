@@ -477,25 +477,13 @@ async fn run_state_migration_check(
         base_dir,
         &provider_schema_overrides,
     )?;
-    let mut validated =
+    let validated =
         providers.validate_evaluated_config(parsed, base_dir, &duplicate_declarations)?;
 
-    // Match mutating commands' parser-aware cleanup, but only on this
-    // in-memory copy. Historical identifier-less read rows are not managed
-    // destroy targets and cannot participate in the classifier.
-    let state_view = Some(state.clone());
-    validated.prepare_from_copied_state(&state_view)?;
-    state.remove_legacy_data_source_rows(validated.data_sources());
-    let parsed = validated.into_resources();
-    let mut graph_file = parsed.clone();
-    let graph = carina_core::resolved_graph::resolve_expanded_graph(
-        &mut graph_file,
-        &parsed.resources,
-        &parsed.data_sources,
-    )?;
-    let report = state
-        .migrate_legacy_dependencies(&graph, &parsed.resources)
-        .map_err(|error| AppError::Backend(error.into()))?;
+    // The owner performs parser-aware cleanup, late identity preparation,
+    // moved-address projection, and graph construction as one transition.
+    // Historical identifier-less read rows are removed only from this copy.
+    let report = validated.migrate_legacy_dependencies_from_copied_state(&mut state)?;
 
     for warning in report.warnings() {
         for legacy_name in &warning.legacy_names {
@@ -664,6 +652,41 @@ pub async fn run_state_forget(
     release
 }
 
+struct StateForgetWriteState(StateFile);
+
+impl StateForgetWriteState {
+    fn from_loaded(state: StateFile, project_dir: &Path) -> Result<Self, AppError> {
+        if state.requires_legacy_dependency_migration() {
+            let forget = ProjectCommand::new("state forget", project_dir);
+            let refresh = ProjectCommand::new("state refresh", project_dir);
+            return Err(AppError::Config(format!(
+                "Cannot run `{forget}` while state contains unmigrated pre-v21 dependency names. Run `{refresh}` first; state refresh classifies those names without discarding create-outcome-unknown recovery rows."
+            )));
+        }
+        Ok(Self(state))
+    }
+}
+
+impl std::ops::Deref for StateForgetWriteState {
+    type Target = StateFile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for StateForgetWriteState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl AsMut<StateFile> for StateForgetWriteState {
+    fn as_mut(&mut self) -> &mut StateFile {
+        &mut self.0
+    }
+}
+
 async fn run_state_forget_locked<R>(
     backend: &dyn StateBackend,
     lock: &LockInfo,
@@ -676,10 +699,11 @@ async fn run_state_forget_locked<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    let mut state =
+    let state =
         crate::commands::apply::load_state_persist_if_migrated(backend, StateLockRef::Held(lock))
             .await?
             .unwrap_or_default();
+    let mut state = StateForgetWriteState::from_loaded(state, project_dir)?;
     let row = state
         .find_outcome_unknown(address)
         .map_err(|source| AppError::from_state_forget(source, project_dir))?;
@@ -696,7 +720,7 @@ where
             StateFile::forget(row);
         }
     }
-    crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
+    crate::commands::apply::save_state_locked(backend, lock, state.as_mut()).await?;
     println!(
         "{} {}",
         "Forgot create-outcome-unknown current instance:"
@@ -1959,7 +1983,7 @@ pub(crate) async fn run_state_refresh_locked(
         let migration = state_file
             .as_mut()
             .expect("checked legacy state presence")
-            .migrate_legacy_dependencies(&expanded_graph, &sorted_resources)
+            .migrate_legacy_dependencies(&expanded_graph, &sorted_resources, &[])
             .map_err(|error| AppError::Backend(error.into()))?;
         if let Some(state) = state_file.as_ref() {
             for (id, current) in &mut managed_current {
@@ -2892,7 +2916,10 @@ mod tests {
     use indexmap::IndexMap;
     use serde_json::json;
     use std::path::{Path, PathBuf};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
 
     const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
 
@@ -4028,6 +4055,73 @@ mod tests {
         )
         .expect("outcome-unknown fixture must decode")
         .into_state()
+    }
+
+    fn legacy_outcome_unknown_state_fixture() -> StateFile {
+        carina_state::check_and_migrate(
+            &serde_json::json!({
+                "version": 20,
+                "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+                "serial": 4,
+                "lineage": "legacy-state-forget-test",
+                "carina_version": "test",
+                "resources": [{
+                    "resource_type": "test.Resource",
+                    "identity": "unknown",
+                    "provider": "mock",
+                    "current": {
+                        "kind": "create_outcome_unknown",
+                        "started_at": "2026-10-30T03:00:00Z"
+                    },
+                    "dependency_bindings": ["removed_dependency"]
+                }],
+                "exports": {}
+            })
+            .to_string(),
+        )
+        .expect("legacy outcome-unknown fixture must decode")
+        .into_state()
+    }
+
+    struct ReadProbe(Arc<AtomicBool>);
+
+    impl tokio::io::AsyncRead for ReadProbe {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.0.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn state_forget_rejects_legacy_dependencies_before_prompting() {
+        let state = legacy_outcome_unknown_state_fixture();
+        assert!(state.requires_legacy_dependency_migration());
+        let backend = ModuleConstraintRefreshBackend { state };
+        let read = Arc::new(AtomicBool::new(false));
+
+        let error = run_state_forget_locked(
+            &backend,
+            &LockInfo::for_test("state forget"),
+            &StateBlockAddress::new("mock", "test.Resource", "unknown"),
+            Path::new("infra/project"),
+            false,
+            tokio::io::BufReader::new(ReadProbe(Arc::clone(&read))),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect_err("legacy dependency names must be rejected before confirmation");
+
+        assert!(!read.load(Ordering::SeqCst), "confirmation input was read");
+        assert!(
+            error
+                .to_string()
+                .contains("carina state refresh infra/project"),
+            "the recovery must name the graph-aware migration command: {error}"
+        );
     }
 
     fn outcome_unknown_state_with_deposed_fixture() -> StateFile {

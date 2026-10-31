@@ -9,7 +9,7 @@ use crate::differ::ComparisonContext;
 use crate::effect::ResolvedMove;
 use crate::parser::ProviderConfig;
 use crate::parser::{SourceSpan, StateBlock, StateBlockAddress};
-use crate::provider::{ComparisonResolutionError, ProviderFactory, ProviderRouter};
+use crate::provider::{ComparisonResolutionError, ProviderFactory, ResourceComparisonResolver};
 use crate::resource::{
     AnonymousIdentityModuleSource, ConcreteValue, DataSource, DeferredValue, LegacyLoopAddress,
     LoopElementOrigin, PendingReRead, ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
@@ -2236,7 +2236,7 @@ fn legacy_row_stable_identity_matches(
     candidate: &LegacyLoopMoveCandidate<'_>,
     state_entry: &AnonymousIdStateInfo,
     registry: &SchemaRegistry,
-    comparison_provider: &ProviderRouter,
+    comparison_provider: &dyn ResourceComparisonResolver,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
 ) -> Result<Option<bool>, ComparisonResolutionError> {
     let Some(schema) = registry.get_for(candidate.resource) else {
@@ -2292,7 +2292,7 @@ struct LegacyLoopMoveCandidate<'a> {
 pub fn detect_legacy_loop_address_moves(
     resources: &[Resource],
     registry: &SchemaRegistry,
-    comparison_provider: &ProviderRouter,
+    comparison_provider: &dyn ResourceComparisonResolver,
     find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     claims: &StateBlockClaims,
@@ -2848,7 +2848,7 @@ pub fn reconcile_anonymous_identifiers(
     resources: &[Resource],
     data_sources: &[DataSource],
     registry: &SchemaRegistry,
-    comparison_provider: &ProviderRouter,
+    comparison_provider: &dyn ResourceComparisonResolver,
     find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     claims: &StateBlockClaims,
@@ -3161,7 +3161,7 @@ impl<'a> AnonymousToNamedStateLookup<'a> {
 pub fn detect_anonymous_to_named_renames(
     candidates: AnonymousToNamedCandidates<'_>,
     registry: &SchemaRegistry,
-    comparison_provider: &ProviderRouter,
+    comparison_provider: &dyn ResourceComparisonResolver,
     state_lookup: AnonymousToNamedStateLookup<'_>,
     providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,

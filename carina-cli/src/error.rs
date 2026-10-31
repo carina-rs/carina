@@ -852,9 +852,9 @@ pub enum AppError {
     #[error(transparent)]
     DestroyDependencyAnalysis(#[from] DestroyDependencyAnalysisError),
 
-    /// Distinct desired resources resolved to the same execution identity.
+    /// Authored resource origins could not be indexed by resolved identity.
     #[error(transparent)]
-    DuplicateResolvedResourceId(#[from] crate::wiring::DuplicateResolvedResourceIdError),
+    ResolvedResourceOriginIndex(#[from] crate::wiring::ResolvedResourceOriginIndexError),
 
     /// A provider-boundary check failed for a resource before dispatch.
     #[error(transparent)]
@@ -1206,16 +1206,12 @@ mod tests {
     use super::*;
 
     fn dependency_analysis_failure() -> carina_core::effect::deps::DependencyAnalysisFailure {
-        use std::collections::HashMap;
-
-        use carina_core::effect::deps::{
-            ScheduleInputs, UnresolvedResource, build_effect_dependency_analysis,
-        };
+        use carina_core::effect::deps::{ScheduleInputs, build_effect_dependency_analysis};
         use carina_core::effect::{Effect, EffectGeneration};
         use carina_core::resource::ResolvedResourceId;
 
         let id = ResourceId::with_provider_identity("mock", "test.Widget", "example", None);
-        let effect = Effect::Delete {
+        let effect: Effect = Effect::Delete {
             id: ResolvedResourceId::try_new(id).expect("fixture identity is resolved"),
             identifier: carina_core::provider::AppliedIdentifier::new("provider-id")
                 .expect("fixture provider identifier is non-empty"),
@@ -1230,13 +1226,8 @@ mod tests {
             ))
             .collect(),
         };
-        build_effect_dependency_analysis(
-            &[effect],
-            &HashMap::<ResourceId, UnresolvedResource>::new(),
-            &[],
-            ScheduleInputs::Apply,
-        )
-        .expect_err("missing required target must fail dependency analysis")
+        build_effect_dependency_analysis(&[effect], std::iter::empty(), ScheduleInputs::Apply)
+            .expect_err("missing required target must fail dependency analysis")
     }
 
     #[test]

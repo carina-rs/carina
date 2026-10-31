@@ -5420,6 +5420,71 @@ impl<'a> ResolvedComparison<'a> {
     }
 }
 
+/// Resolve the schema and comparison context for a resource without exposing
+/// provider CRUD. Runtime planning implements this with initialized providers;
+/// metadata-only workflows use [`MetadataComparisonResolver`] so identity
+/// reconciliation cannot accidentally initialize or dispatch a provider.
+pub trait ResourceComparisonResolver {
+    fn comparison_for<'a>(
+        &'a self,
+        registry: &'a SchemaRegistry,
+        id: &ResourceId,
+    ) -> Result<ResolvedComparison<'a>, ComparisonResolutionError>;
+}
+
+/// Comparison resolver for schema-only, provider-I/O-free workflows.
+///
+/// Provider routes are admitted explicitly from the finalized resource set.
+/// Reference scope remains unavailable because obtaining account/region scope
+/// may require provider initialization; ordinary typed and transformed values
+/// still use the same production comparison implementation.
+pub struct MetadataComparisonResolver {
+    routes: HashSet<ProviderInstanceKey>,
+    reference_scope: ReferenceScope,
+}
+
+impl MetadataComparisonResolver {
+    pub fn new<'a>(ids: impl IntoIterator<Item = &'a ResourceId>) -> Self {
+        Self {
+            routes: ids.into_iter().map(ProviderInstanceKey::from).collect(),
+            reference_scope: ReferenceScope::Unavailable,
+        }
+    }
+}
+
+impl ResourceComparisonResolver for MetadataComparisonResolver {
+    fn comparison_for<'a>(
+        &'a self,
+        registry: &'a SchemaRegistry,
+        id: &ResourceId,
+    ) -> Result<ResolvedComparison<'a>, ComparisonResolutionError> {
+        let schema = registry
+            .get(
+                &id.provider,
+                &id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .ok_or_else(|| ComparisonResolutionError::MissingResourceSchema { id: id.clone() })?;
+        let route = ProviderInstanceKey::from(id);
+        if !self.routes.contains(&route) {
+            return Err(ComparisonResolutionError::UnknownProviderInstance { instance: route });
+        }
+        if route.provider() != schema.owner() {
+            return Err(ComparisonResolutionError::SchemaOwnerMismatch {
+                id: id.clone(),
+                owner: schema.owner().to_string(),
+            });
+        }
+        Ok(ResolvedComparison {
+            owner_schema: schema,
+            context: crate::differ::ComparisonContext::from_scope_and_forms(
+                &self.reference_scope,
+                schema.reference_forms(),
+            ),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ResolvedComparisonKey {
     instance: ProviderInstanceKey,
@@ -5770,6 +5835,16 @@ impl ProviderRouter {
             owner_schema: schema,
             context: crate::differ::ComparisonContext::from_initialized_provider(provider, schema),
         })
+    }
+}
+
+impl ResourceComparisonResolver for ProviderRouter {
+    fn comparison_for<'a>(
+        &'a self,
+        registry: &'a SchemaRegistry,
+        id: &ResourceId,
+    ) -> Result<ResolvedComparison<'a>, ComparisonResolutionError> {
+        ProviderRouter::comparison_for(self, registry, id)
     }
 }
 

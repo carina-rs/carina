@@ -15,7 +15,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::effect::deps::{
-    DependencyAnalysis, DestroyWaitAlias, ScheduleInputs, UnresolvedResource,
+    DependencyAnalysis, DestroyWaitAlias, KeptDestroyTargets, ScheduleInputs,
     build_effect_dependency_analysis,
 };
 use carina_core::effect::{Effect, EffectGeneration};
@@ -585,7 +585,7 @@ async fn run_destroy_locked_owned(
         let report = state_file
             .as_mut()
             .expect("checked legacy state presence")
-            .migrate_legacy_dependencies(&destroy_graph, &parsed.resources)
+            .migrate_legacy_dependencies(&destroy_graph, &parsed.resources, &[])
             .map_err(|error| AppError::Backend(error.into()))?;
         if let Some(state) = state_file.as_ref() {
             for (id, current) in &mut managed_current {
@@ -607,14 +607,6 @@ async fn run_destroy_locked_owned(
     } else {
         Default::default()
     };
-    let known_non_effect_targets: ResolvedDependencies = parsed
-        .data_sources
-        .iter()
-        .map(|data_source| {
-            ResolvedResourceId::try_new(data_source.id.clone())
-                .expect("destroy graph construction proved data-source identities are resolved")
-        })
-        .collect();
     let resolved_wait_bindings = destroy_graph_file
         .wait_bindings
         .iter()
@@ -695,6 +687,21 @@ async fn run_destroy_locked_owned(
         .iter()
         .map(|resource| destroy_graph.resolve_resource((*resource).clone(), ctx.schemas()))
         .collect::<Result<Vec<_>, _>>()?;
+    let destroyed_ids: HashSet<_> = resolved_resources_to_destroy
+        .iter()
+        .map(ResolvedResource::resolved_id)
+        .collect();
+    let kept_targets: KeptDestroyTargets = parsed
+        .data_sources
+        .iter()
+        .filter_map(|data_source| ResolvedResourceId::try_new(data_source.id.clone()))
+        .chain(
+            all_resources
+                .iter()
+                .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone())),
+        )
+        .filter(|id| !destroyed_ids.contains(id))
+        .collect();
     let (delete_effects, identifier_errors) = build_destroy_delete_effects(
         &resolved_resources_to_destroy,
         &managed_current,
@@ -712,11 +719,10 @@ async fn run_destroy_locked_owned(
     let wait_aliases = build_destroy_wait_aliases(&resolved_wait_bindings, &delete_effects);
     let dependency_analysis = build_effect_dependency_analysis(
         &delete_effects,
-        &HashMap::<ResourceId, UnresolvedResource>::new(),
-        &[],
+        std::iter::empty(),
         ScheduleInputs::Destroy {
             aliases: &wait_aliases,
-            known_non_effect_targets: &known_non_effect_targets,
+            kept_targets: &kept_targets,
         },
     )
     .map_err(DestroyDependencyAnalysisError::new)?;
@@ -752,6 +758,7 @@ async fn run_destroy_locked_owned(
     for idx in &display_order {
         destroy_plan.add(delete_effects[*idx].clone());
     }
+    destroy_plan.record_unresolved_delete_ordering_analysis(&dependency_analysis);
     for warning in legacy_dependency_migration.warnings() {
         let generation = warning.generation.as_ref().map_or(
             EffectGeneration::Current,
@@ -3173,7 +3180,6 @@ mod tests {
     #[test]
     fn orphan_destroy_uses_row_binding_and_depends_on_for_delete_ordering() {
         use carina_state::ResourceState;
-        use std::collections::HashMap;
 
         let mut parent = ResourceState::try_applied("test.Parent", "parent", "mock", "parent-123")
             .expect("fixture identifier is non-empty");
@@ -3229,11 +3235,10 @@ mod tests {
 
         let analysis = build_effect_dependency_analysis(
             &effects,
-            &HashMap::<ResourceId, UnresolvedResource>::new(),
-            &[],
+            std::iter::empty(),
             ScheduleInputs::Destroy {
                 aliases: &[],
-                known_non_effect_targets: &ResolvedDependencies::default(),
+                kept_targets: &KeptDestroyTargets::default(),
             },
         )
         .expect("destroy dependency analysis must resolve");

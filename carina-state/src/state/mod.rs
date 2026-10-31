@@ -34,6 +34,7 @@ use carina_core::value::{
     union_secret_shapes_after_resolution,
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::backend::{BackendError, InvalidResourceIdentityError};
@@ -1152,6 +1153,11 @@ impl StateFile {
         self.version < Self::CURRENT_VERSION
     }
 
+    /// Whether graph projection is needed to classify any pre-v21 names.
+    pub fn has_legacy_dependency_names(&self) -> bool {
+        !self.legacy_dependencies.is_empty()
+    }
+
     /// Complete the v20 → v21 transition when the old state contained no
     /// dependency names at all.
     ///
@@ -1192,17 +1198,19 @@ impl StateFile {
         &mut self,
         graph: &impl carina_core::resolved_graph::LegacyDependencyProjector,
         managed: &[Resource<S>],
+        moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
     ) -> Result<LegacyDependencyMigrationReport, LegacyDependencyMigrationError>
     where
         S: carina_core::resource::LegacyDependencyModuleSource,
     {
-        self.migrate_legacy_dependencies_with(graph, managed)
+        self.migrate_legacy_dependencies_with(graph, managed, moved_pairs)
     }
 
     fn migrate_legacy_dependencies_with<P, S>(
         &mut self,
         graph: &P,
         managed: &[Resource<S>],
+        moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
     ) -> Result<LegacyDependencyMigrationReport, LegacyDependencyMigrationError>
     where
         P: carina_core::resolved_graph::LegacyDependencyProjector + ?Sized,
@@ -1257,7 +1265,11 @@ impl StateFile {
             let Some(legacy) = self.legacy_dependencies.get(&row_id) else {
                 continue;
             };
-            let configured_resource = configured.get(&row_id).copied();
+            let classified_id = moved_pairs
+                .iter()
+                .find_map(|(from, to)| (from == &row_id).then_some(to))
+                .unwrap_or(&row_id);
+            let configured_resource = configured.get(classified_id).copied();
             let scope = configured_resource
                 .and_then(|resource| resource.module_source.as_ref())
                 .and_then(
@@ -1300,7 +1312,7 @@ impl StateFile {
                 .collect::<BTreeSet<_>>();
             if !current_unknown.is_empty() {
                 warnings.push(LegacyDestroyOrderingWarning {
-                    row: row_id.clone(),
+                    row: classified_id.clone(),
                     generation: None,
                     legacy_names: current_unknown,
                 });
@@ -1325,7 +1337,7 @@ impl StateFile {
                 deposed_dependencies.insert(key.clone(), known);
                 if !unknown.is_empty() {
                     warnings.push(LegacyDestroyOrderingWarning {
-                        row: row_id.clone(),
+                        row: classified_id.clone(),
                         generation: Some(key.clone()),
                         legacy_names: unknown,
                     });
@@ -2480,6 +2492,24 @@ struct LegacyNameClassificationContext<'a> {
     location: String,
 }
 
+fn legacy_dependency_spellings<'a>(scope: Option<&str>, dependency: &'a str) -> Vec<Cow<'a, str>> {
+    match scope {
+        Some(scope)
+            if dependency == scope
+                || dependency
+                    .strip_prefix(scope)
+                    .is_some_and(|suffix| suffix.starts_with('.')) =>
+        {
+            vec![Cow::Borrowed(dependency)]
+        }
+        Some(scope) => vec![
+            Cow::Owned(format!("{scope}.{dependency}")),
+            Cow::Borrowed(dependency),
+        ],
+        None => vec![Cow::Borrowed(dependency)],
+    }
+}
+
 fn classify_legacy_names<P>(
     graph: &P,
     names: &LegacyDependencyNames,
@@ -2502,17 +2532,9 @@ where
     let mut known = PersistedDestroyDependencies::default();
     let mut unknown = BTreeSet::new();
     for dependency in names.iter() {
-        let mut spellings = Vec::new();
-        if let Some(scope) = scope {
-            spellings.push(format!("{scope}.{dependency}"));
-        }
-        if spellings.last().is_none_or(|scoped| scoped != dependency) {
-            spellings.push(dependency.to_string());
-        }
-
         let mut classified = None;
-        for spelling in spellings {
-            if let Some(candidates) = state_candidates.get(&spelling) {
+        for spelling in legacy_dependency_spellings(scope, dependency) {
+            if let Some(candidates) = state_candidates.get(spelling.as_ref()) {
                 match candidates.as_slice() {
                     [candidate] => {
                         classified = Some(PersistedDestroyDependencyProjection::Managed(
@@ -2543,7 +2565,7 @@ where
                     }
                 }
             }
-            match graph.project_legacy_dependency(&spelling, row) {
+            match graph.project_legacy_dependency(spelling.as_ref(), row) {
                 Ok(projection) => {
                     classified = Some(projection);
                     break;

@@ -10,7 +10,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use carina_core::data_source_value::DataSourceValues;
-use carina_core::effect::{DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration};
+use carina_core::effect::{
+    DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration,
+    PriorInstanceDestroyDependencies,
+};
 use carina_core::executor::{AcceptedRequest, Applied, ExecutionResult};
 use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesForStateWriteback};
 #[cfg(test)]
@@ -1015,6 +1018,7 @@ struct ReplacementDeleteInput<'a> {
     provider_instance: Option<String>,
     generation: &'a EffectGeneration,
     previous_attributes: Option<ReplacementPreviousAttributesForStateWriteback<'a>>,
+    prior_dependencies: PriorInstanceDestroyDependencies,
 }
 
 static CURRENT_GENERATION: EffectGeneration = EffectGeneration::Current;
@@ -1183,10 +1187,15 @@ fn planned_depose<S>(
         }
     };
 
+    let refreshed_dependencies = current_state
+        .map(PriorInstanceDestroyDependencies::from_refreshed_state)
+        .map(PriorInstanceDestroyDependencies::into_persisted)
+        .filter(|bindings| !bindings.is_empty());
     let dependency_bindings = existing
         .map(|rs| rs.dependency_bindings.clone())
         .filter(|bindings| !bindings.is_empty())
-        .unwrap_or_else(|| desired_resource.persisted_destroy_dependencies());
+        .or(refreshed_dependencies)
+        .unwrap_or_else(|| delete.prior_dependencies.into_persisted());
 
     PlannedDepose {
         id: delete.id.clone(),
@@ -1204,6 +1213,7 @@ fn delete_input_from_effect<'a, S>(
     effect: &'a Effect<S>,
     previous_attributes: Option<ReplacementPreviousAttributesForStateWriteback<'a>>,
 ) -> Option<ReplacementDeleteInput<'a>> {
+    let prior_dependencies = effect.prior_instance_destroy_dependencies()?;
     let Effect::Delete {
         id,
         identifier,
@@ -1219,6 +1229,7 @@ fn delete_input_from_effect<'a, S>(
         provider_instance: id.as_inner().provider_instance.clone(),
         generation,
         previous_attributes,
+        prior_dependencies,
     })
 }
 
@@ -1229,6 +1240,7 @@ fn delete_input_from_deferred(delete: &DeferredReplaceDelete) -> ReplacementDele
         provider_instance: delete.id.as_inner().provider_instance.clone(),
         generation: &CURRENT_GENERATION,
         previous_attributes: None,
+        prior_dependencies: delete.prior_instance_destroy_dependencies(),
     }
 }
 
@@ -1328,6 +1340,7 @@ fn plan_displaced_identifier_deposes<S>(
                 provider_instance: existing.directives.provider_instance.clone(),
                 generation: &EffectGeneration::Current,
                 previous_attributes: None,
+                prior_dependencies: PriorInstanceDestroyDependencies::default(),
             },
             upsert.resource,
             input
@@ -6293,6 +6306,71 @@ mod apply_state_save_tests {
             second_plan.mutation_count(),
             0,
             "second plan after write-only secret-to-plain demotion must be empty"
+        );
+    }
+
+    #[test]
+    fn cbd_deposed_generation_keeps_old_dependencies_in_precedence_order() {
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "main", None);
+        let old_dependency =
+            ResolvedResourceId::with_provider_identity("mock", "test.resource", "a", None);
+        let new_dependency =
+            ResolvedResourceId::with_provider_identity("mock", "test.resource", "b", None);
+        let desired = resolved(
+            Resource::with_provider("mock", "test.resource", "main", None).with_binding("main"),
+        )
+        .with_saved_destroy_dependencies(
+            PersistedDestroyDependencies::from_test_dependencies([new_dependency]),
+            PersistedDestroyDependencies::default(),
+        );
+        let existing =
+            ResourceState::try_applied("test.resource", "main", "mock", "old-provider-id")
+                .expect("fixture identifier");
+        let mut state_file = StateFile::new();
+        state_file
+            .upsert_resource(existing)
+            .expect("old row is unique");
+        let delete: Effect = Effect::Delete {
+            id: ResolvedResourceId::new(id.clone()),
+            identifier: crate::fixture_applied_identifier("old-provider-id"),
+            generation: EffectGeneration::Current,
+            directives: Default::default(),
+            binding: Some("main".to_string()),
+            dependencies: std::iter::once(old_dependency.clone()).collect(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+        };
+        let plan = Plan::new();
+        let moved_origins = MovedOrigins::from_plan(&plan);
+        let expected =
+            PersistedDestroyDependencies::from_test_dependencies([old_dependency.clone()]);
+
+        let refreshed = State::existing(id.clone(), HashMap::new())
+            .with_identifier("old-provider-id")
+            .with_dependency_bindings(std::iter::once(old_dependency).collect());
+        let managed_current =
+            crate::managed_current_from_states(HashMap::from([(id.clone(), refreshed)]));
+        let from_refreshed = planned_depose(
+            delete_input_from_effect(&delete, None).expect("delete input"),
+            &desired,
+            None,
+            &state_file,
+            &managed_current,
+            &moved_origins,
+        );
+        assert_eq!(from_refreshed.instance.dependency_bindings, expected);
+
+        let from_delete = planned_depose(
+            delete_input_from_effect(&delete, None).expect("delete input"),
+            &desired,
+            None,
+            &state_file,
+            &HashMap::new(),
+            &moved_origins,
+        );
+        assert_eq!(
+            from_delete.instance.dependency_bindings, expected,
+            "the new generation's B dependency must never replace old-generation A"
         );
     }
 

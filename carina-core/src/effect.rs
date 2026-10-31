@@ -22,9 +22,10 @@ use crate::provider::AppliedIdentifier;
 #[cfg(test)]
 use crate::resource::{DataSource, DeferredValue, Resource};
 use crate::resource::{
-    DeposedKey, Directives, LoopElementOrigin, ModuleSource, ResolvedDataSource,
-    ResolvedDependencies, ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity,
-    SavedModuleSource, SchemaUnresolvedResource, State, Value, resolve_resource_ignore_changes,
+    DeposedKey, Directives, LoopElementOrigin, ModuleSource, PersistedDestroyDependencies,
+    ResolvedDataSource, ResolvedDependencies, ResolvedResource, ResolvedResourceId, ResourceId,
+    ResourceIdentity, SavedModuleSource, SchemaUnresolvedResource, State, Value,
+    resolve_resource_ignore_changes,
 };
 use crate::schema::FieldName;
 use crate::wait::ManagedWaitTarget;
@@ -208,7 +209,36 @@ pub struct DeferredReplaceDelete {
     pub blocked_by_updates: ResolvedDependencies,
 }
 
+/// Destroy-ordering edges known to belong to an old resource generation.
+///
+/// The private field deliberately prevents a desired replacement resource's
+/// dependencies from being substituted for the generation being deposed.
+/// Non-empty values can only be recovered from refreshed prior state or a
+/// planned Delete, both of which already carry projected state-row edges.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PriorInstanceDestroyDependencies(PersistedDestroyDependencies);
+
+impl PriorInstanceDestroyDependencies {
+    fn from_resolved(dependencies: &ResolvedDependencies) -> Self {
+        Self(PersistedDestroyDependencies::from_graph_projection(
+            dependencies.iter().cloned(),
+        ))
+    }
+
+    pub fn from_refreshed_state(state: &State) -> Self {
+        Self::from_resolved(&state.dependency_bindings)
+    }
+
+    pub fn into_persisted(self) -> PersistedDestroyDependencies {
+        self.0
+    }
+}
+
 impl DeferredReplaceDelete {
+    pub fn prior_instance_destroy_dependencies(&self) -> PriorInstanceDestroyDependencies {
+        PriorInstanceDestroyDependencies::from_resolved(&self.dependencies)
+    }
+
     pub fn to_delete_effect<S>(&self) -> Effect<S> {
         Effect::Delete {
             id: self.id.clone(),
@@ -1305,6 +1335,17 @@ impl<'a, S> BasicEffect<'a, S> {
 }
 
 impl<S> EffectWithSource<S> {
+    /// Recover the projected destroy dependencies carried by a Delete's old
+    /// generation. Other effect variants have no prior instance to depose.
+    pub fn prior_instance_destroy_dependencies(&self) -> Option<PriorInstanceDestroyDependencies> {
+        let Self::Delete { dependencies, .. } = self else {
+            return None;
+        };
+        Some(PriorInstanceDestroyDependencies::from_resolved(
+            dependencies,
+        ))
+    }
+
     /// Loop element shown beside this effect in human-facing plan renderers.
     pub fn loop_origin(&self) -> Option<&LoopElementOrigin> {
         match self {
