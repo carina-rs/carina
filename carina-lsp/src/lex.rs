@@ -97,6 +97,7 @@ pub(crate) struct InterpolationSpan {
 }
 
 impl InterpolationSpan {
+    #[allow(dead_code)]
     pub(crate) fn is_inline_empty(self) -> bool {
         self.end.is_some() && self.only_inline_whitespace
     }
@@ -120,6 +121,7 @@ impl LexedDocument {
         &self.lines
     }
 
+    #[allow(dead_code)]
     pub(crate) fn interpolations(&self) -> &[InterpolationSpan] {
         &self.interpolations
     }

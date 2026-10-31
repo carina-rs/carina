@@ -1183,7 +1183,7 @@ impl ModuleSignature {
                 crate::resource::ParserPlaceholder::FnParam { .. }
                 | crate::resource::ParserPlaceholder::FnLocal { .. }
                 | crate::resource::ParserPlaceholder::Loop(_)
-                | crate::resource::ParserPlaceholder::EmptyInterpolation,
+                | crate::resource::ParserPlaceholder::EmptyInterpolation { .. },
             )) => {}
             Value::Deferred(DeferredValue::Unknown(_)) => {
                 // Other unknowns are upstream-deferred and carry no

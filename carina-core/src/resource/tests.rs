@@ -72,7 +72,9 @@ fn into_expanded_rejects_leftover_module_argument() {
 #[test]
 fn into_expanded_rejects_empty_interpolation_with_existing_wording() {
     let value = ParserValue::Deferred(ParserDeferredValue::Placeholder(
-        ParserPlaceholder::EmptyInterpolation,
+        ParserPlaceholder::EmptyInterpolation {
+            source: Default::default(),
+        },
     ));
 
     let error = value
@@ -246,6 +248,64 @@ fn module_argument_source_location_is_not_value_data() {
         !encoded.contains("source_line") && !encoded.contains("17"),
         "diagnostic location leaked into Value serialization: {encoded}",
     );
+}
+
+#[test]
+fn empty_interpolation_source_location_is_not_value_data_or_hash_material() {
+    let located_at = |file: &str, line: usize, start_column: usize, end_column: usize| {
+        let source = DiagnosticSourceSpan::authored(
+            std::path::PathBuf::from(file),
+            line,
+            start_column,
+            line,
+            end_column,
+        );
+        ParserValue::Deferred(ParserDeferredValue::Placeholder(
+            ParserPlaceholder::EmptyInterpolation { source },
+        ))
+    };
+    let first = located_at("first.crn", 17, 3, 6);
+    let second = located_at("second.crn", 23, 9, 12);
+
+    assert_eq!(first, second);
+    let encoded = serde_json::to_string(&first).expect("serialize parser placeholder");
+    assert!(
+        !encoded.contains("first.crn") && !encoded.contains("17"),
+        "diagnostic location leaked into Value serialization: {encoded}",
+    );
+    let decoded: ParserValue =
+        serde_json::from_str(&encoded).expect("deserialize parser placeholder");
+    let ParserValue::Deferred(ParserDeferredValue::Placeholder(
+        ParserPlaceholder::EmptyInterpolation { source },
+    )) = decoded
+    else {
+        panic!("expected an empty-interpolation placeholder");
+    };
+    assert!(
+        source.authored_location().is_none(),
+        "deserialized parser metadata must be synthetic",
+    );
+
+    assert_eq!(
+        crate::value::canonical_secret_hash_material(&first)
+            .expect("first placeholder hash material"),
+        crate::value::canonical_secret_hash_material(&second)
+            .expect("second placeholder hash material"),
+        "diagnostic provenance must not affect canonical secret hash material",
+    );
+
+    let source_hash = |value: &ParserValue| {
+        let ParserValue::Deferred(ParserDeferredValue::Placeholder(
+            ParserPlaceholder::EmptyInterpolation { source },
+        )) = value
+        else {
+            unreachable!("fixture is an empty-interpolation placeholder")
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hasher);
+        hasher.finish()
+    };
+    assert_eq!(source_hash(&first), source_hash(&second));
 }
 
 #[test]

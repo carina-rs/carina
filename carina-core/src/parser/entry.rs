@@ -493,11 +493,17 @@ fn resolve_top_level_user_functions(
     while !pending.is_empty() {
         let mut made_progress = false;
         for (source_index, (path, input)) in sources.iter().enumerate() {
-            let preprocessed_file = super::preprocess_file(input)
-                .map_err(|error| locate_function_error(error, *path))?;
+            let preprocessed_file = Arc::new(
+                super::preprocess_file(input)
+                    .map_err(|error| locate_function_error(error, *path))?,
+            );
             let pairs = preprocessed_file
                 .parse()
                 .map_err(|error| locate_function_error(error, *path))?;
+            ctx.set_source_scope(
+                path.unwrap_or_else(|| Path::new("test.crn")),
+                Arc::clone(&preprocessed_file),
+            );
             for pair in pairs {
                 if pair.as_rule() != Rule::file {
                     continue;
@@ -623,7 +629,7 @@ fn parse_with_seeded_bindings_inner(
     bindings_fully_classified: bool,
     source_file: &std::path::Path,
 ) -> Result<ParsedFile, ParseError> {
-    let preprocessed_file = super::preprocess_file(input)?;
+    let preprocessed_file = Arc::new(super::preprocess_file(input)?);
     let pairs = preprocessed_file.parse()?;
     // Bootstrap passes use provisional sibling names and exist only to
     // classify declarations. The final pass both emits source warnings and
@@ -635,7 +641,7 @@ fn parse_with_seeded_bindings_inner(
     };
 
     let mut ctx = ParseContext::new(config);
-    ctx.set_source_scope(source_file);
+    ctx.set_source_scope(source_file, Arc::clone(&preprocessed_file));
     ctx.defer_provisional_static_conditions = !bindings_fully_classified;
     ctx.warnings.extend(single_quote_warnings);
     seed_bindings(&mut ctx, seeds);

@@ -3735,7 +3735,7 @@ impl<E: IntoExpandedExportParam> File<E, ParserPlaceholder, ParserPlaceholder> {
         for (name, value) in variables {
             value.collect_leftover_placeholders(
                 LeftoverPlaceholderContext::Variable { name: name.clone() },
-                reject_all,
+                module_expansion_field,
                 &mut errors,
             );
         }

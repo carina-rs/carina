@@ -2065,7 +2065,9 @@ mod provider_config_tests {
         let attributes = IndexMap::from([(
             "region".to_string(),
             Value::Deferred(DeferredValue::Placeholder(
-                ParserPlaceholder::EmptyInterpolation,
+                ParserPlaceholder::EmptyInterpolation {
+                    source: Default::default(),
+                },
             )),
         )]);
 

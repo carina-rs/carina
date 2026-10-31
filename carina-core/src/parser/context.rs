@@ -15,7 +15,8 @@ use super::{ParserProviderConfig as ProviderConfig, ParserWaitBinding as WaitBin
 use super::{ProviderContext, Rule};
 use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
 use crate::resource::{
-    ModuleSource, ParserPlaceholder, Resource as GenericResource, ResourceId, Value as GenericValue,
+    DiagnosticSourceSpan, ModuleSource, ParserPlaceholder, Resource as GenericResource, ResourceId,
+    Value as GenericValue,
 };
 use indexmap::IndexMap;
 use std::cell::{Cell, OnceCell, RefCell};
@@ -27,6 +28,12 @@ type Value = GenericValue<ParserPlaceholder>;
 type Resource = GenericResource<ModuleSource, ParserPlaceholder>;
 type DeferredForExpression =
     GenericDeferredForExpression<ModuleSource, ParserPlaceholder, ParserPlaceholder>;
+
+#[derive(Clone)]
+struct DiagnosticSource {
+    path: std::path::PathBuf,
+    file: Arc<super::PreprocessedFile>,
+}
 
 /// Parser-local lexical binding kind.
 ///
@@ -123,6 +130,7 @@ pub(crate) struct ParseContext<'cfg> {
     pub(super) parsed_binding_uses: Rc<RefCell<ParsedBindingUses>>,
     pub(super) binding_scope: BindingScopeId,
     binding_scope_source_file: std::path::PathBuf,
+    diagnostic_source: Option<DiagnosticSource>,
     next_binding_scope: Rc<Cell<u64>>,
 }
 
@@ -149,13 +157,46 @@ impl<'cfg> ParseContext<'cfg> {
             parsed_binding_uses: Rc::new(RefCell::new(ParsedBindingUses::default())),
             binding_scope: BindingScopeId::root(std::path::Path::new("test.crn")),
             binding_scope_source_file: std::path::PathBuf::from("test.crn"),
+            diagnostic_source: None,
             next_binding_scope: Rc::new(Cell::new(1)),
         }
     }
 
-    pub(super) fn set_source_scope(&mut self, source_file: &std::path::Path) {
+    pub(super) fn set_source_scope(
+        &mut self,
+        source_file: &std::path::Path,
+        preprocessed_file: Arc<super::PreprocessedFile>,
+    ) {
         self.binding_scope = BindingScopeId::root(source_file);
         self.binding_scope_source_file = source_file.to_path_buf();
+        self.diagnostic_source = Some(DiagnosticSource {
+            path: source_file.to_path_buf(),
+            file: preprocessed_file,
+        });
+    }
+
+    pub(super) fn inherit_diagnostic_source(&mut self, source: &Self) {
+        self.diagnostic_source = source.diagnostic_source.clone();
+    }
+
+    pub(super) fn diagnostic_source_span(
+        &self,
+        pair: &pest::iterators::Pair<'_, super::Rule>,
+    ) -> DiagnosticSourceSpan {
+        let Some(source) = self.diagnostic_source.as_ref() else {
+            return DiagnosticSourceSpan::synthetic();
+        };
+        let span = pair.as_span();
+        let start = source.file.original_position(span.start());
+        let end = source.file.original_position(span.end().saturating_sub(1));
+        debug_assert_eq!(pair.as_str().chars().last(), Some('}'));
+        DiagnosticSourceSpan::authored(
+            source.path.clone(),
+            start.line,
+            start.column,
+            end.line,
+            end.column + 1,
+        )
     }
 
     pub(super) fn child_scope(&self) -> Self {

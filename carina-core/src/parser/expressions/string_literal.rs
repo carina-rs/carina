@@ -166,6 +166,7 @@ pub(crate) fn parse_string_value(
                 }
                 Rule::interpolation => {
                     has_interpolation = true;
+                    let source = ctx.diagnostic_source_span(&inner);
                     // Grammar makes the inner expression optional so
                     // mid-edit `${}` doesn't poison the AST. An empty
                     // interpolation lands as `Value::Deferred(DeferredValue::Placeholder(EmptyInterpolation))`
@@ -181,7 +182,7 @@ pub(crate) fn parse_string_value(
                             parse_expression(expr_pair, ctx)?
                         }
                         None => Value::Deferred(DeferredValue::Placeholder(
-                            ParserPlaceholder::EmptyInterpolation,
+                            ParserPlaceholder::EmptyInterpolation { source },
                         )),
                     };
                     parts.push(InterpolationPart::Expr(value));

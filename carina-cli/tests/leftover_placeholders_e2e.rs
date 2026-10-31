@@ -258,15 +258,25 @@ fn module_definition_allows_argument_reference_in_resource() {
 }
 
 #[test]
-fn module_definition_rejects_argument_reference_in_unpropagated_variable() {
+fn module_definition_allows_derived_argument_variable_used_in_sibling_resource() {
     let scenario = ModuleScenario::new();
-    scenario.write("locals.crn", "let leaked = input\n");
+    scenario.write(
+        "arguments.crn",
+        "arguments {\n  environment: 'dev' | 'prod'\n}\n",
+    );
+    scenario.write(
+        "locals.crn",
+        "let state_bucket_name = \"carina-registry-state-${environment}\"\n",
+    );
+    scenario.write(
+        "resources.crn",
+        "mock.test.resource {\n  name = state_bucket_name\n}\n",
+    );
 
     let output = scenario.validate();
-    let text = assert_failure("carina validate module", &output);
-
     assert!(
-        text.contains("let `leaked`: unresolved module argument: input"),
-        "a module argument in a field expansion does not propagate must fail in place:\n{text}",
+        output.status.success(),
+        "a derived module local is inlined and substituted in its sibling resource:\n{}",
+        output_text(&output),
     );
 }

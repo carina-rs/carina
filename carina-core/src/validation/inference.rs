@@ -1652,7 +1652,9 @@ mod tests {
 
         let value = apply_postfix_access(
             ParserValue::Deferred(ParserDeferredValue::Placeholder(
-                crate::resource::ParserPlaceholder::EmptyInterpolation,
+                crate::resource::ParserPlaceholder::EmptyInterpolation {
+                    source: Default::default(),
+                },
             )),
             PathSegment::Subscript {
                 index: Subscript::Int { index: 0 },

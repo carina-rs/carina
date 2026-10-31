@@ -69,7 +69,9 @@ fn file_into_expanded_collects_every_leftover_with_locations() {
 fn file_into_expanded_collects_multiple_leftovers_inside_one_value() {
     let empty = || {
         Value::Deferred(DeferredValue::Placeholder(
-            ParserPlaceholder::EmptyInterpolation,
+            ParserPlaceholder::EmptyInterpolation {
+                source: Default::default(),
+            },
         ))
     };
     let mut file = ParsedFile::default();
@@ -96,7 +98,9 @@ fn file_into_expanded_collects_multiple_leftovers_inside_one_value() {
 fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
     let empty = || {
         Value::Deferred(DeferredValue::Placeholder(
-            ParserPlaceholder::EmptyInterpolation,
+            ParserPlaceholder::EmptyInterpolation {
+                source: Default::default(),
+            },
         ))
     };
     let mut file = ParsedFile::default();
@@ -229,13 +233,41 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
 }
 
 #[test]
+fn module_argument_in_variable_is_allowed_only_at_module_definition_boundary() {
+    let mut file = ParsedFile::default();
+    file.variables.insert(
+        "derived".to_string(),
+        Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::ModuleArgument {
+                name: "environment".to_string(),
+                source_line: 1.into(),
+                diagnostic_name: None,
+            },
+        )),
+    );
+
+    file.validate_expansion_boundary(ParserPlaceholderBoundary::ModuleDefinition)
+        .expect("a module local is inlined into consumers before argument substitution");
+    let error = file
+        .validate_expansion_boundary(ParserPlaceholderBoundary::ExpandedFile)
+        .expect_err("no module argument may remain after module expansion")
+        .to_string();
+    assert!(
+        error.contains("let `derived`: unresolved module argument: environment"),
+        "the expanded-file boundary must retain the variable context: {error}",
+    );
+}
+
+#[test]
 fn expansion_boundary_checks_canonical_deferred_template_resource_attributes() {
     let mut template_resource =
         Resource::<ModuleSource, ParserPlaceholder>::pending("mock.test.resource");
     template_resource.attributes.insert(
         "name".to_string(),
         Value::Deferred(DeferredValue::Placeholder(
-            ParserPlaceholder::EmptyInterpolation,
+            ParserPlaceholder::EmptyInterpolation {
+                source: Default::default(),
+            },
         )),
     );
     let mut file = ParsedFile::default();
@@ -4094,7 +4126,7 @@ fn parse_empty_interpolation_accepted_as_unknown() {
         matches!(
             p,
             crate::resource::InterpolationPart::Expr(Value::Deferred(DeferredValue::Placeholder(
-                ParserPlaceholder::EmptyInterpolation
+                ParserPlaceholder::EmptyInterpolation { .. }
             )))
         )
     });
@@ -4131,7 +4163,7 @@ fn parse_whitespace_only_interpolation_accepted_as_unknown() {
         matches!(
             p,
             crate::resource::InterpolationPart::Expr(Value::Deferred(DeferredValue::Placeholder(
-                ParserPlaceholder::EmptyInterpolation
+                ParserPlaceholder::EmptyInterpolation { .. }
             )))
         )
     });
@@ -4140,6 +4172,45 @@ fn parse_whitespace_only_interpolation_accepted_as_unknown() {
         "whitespace-only `${{}}` must stamp EmptyInterpolation; got {:?}",
         parts
     );
+}
+
+#[test]
+fn empty_interpolation_retains_authored_file_and_original_range() {
+    let input = "let a = \"x${}\"\nlet b = <<EOT\nprefix ${}\nEOT\n";
+    let source_file = std::path::Path::new("locations.crn");
+    let parsed = parse_file(input, source_file, &ProviderContext::default())
+        .expect("empty interpolations must retain parser provenance");
+
+    let location = |name: &str| {
+        let mut locations = Vec::new();
+        parsed
+            .variables
+            .get(name)
+            .unwrap_or_else(|| panic!("missing variable {name}"))
+            .visit_placeholders(&mut |placeholder| {
+                if let ParserPlaceholder::EmptyInterpolation { source } = placeholder
+                    && let Some((file, range)) = source.authored_location()
+                {
+                    locations.push((file.to_path_buf(), range));
+                }
+            });
+        assert_eq!(locations.len(), 1, "expected one location for {name}");
+        locations.pop().expect("one collected location")
+    };
+
+    let (file, inline) = location("a");
+    assert_eq!(file, source_file);
+    assert_eq!(inline.start_line(), 1);
+    assert_eq!(inline.start_column(), 11);
+    assert_eq!(inline.end_line(), 1);
+    assert_eq!(inline.end_column(), 14);
+
+    let (file, heredoc) = location("b");
+    assert_eq!(file, source_file);
+    assert_eq!(heredoc.start_line(), 3);
+    assert_eq!(heredoc.start_column(), 8);
+    assert_eq!(heredoc.end_line(), 3);
+    assert_eq!(heredoc.end_column(), 11);
 }
 
 #[test]

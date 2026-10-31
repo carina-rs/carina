@@ -19,6 +19,7 @@ use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -2740,6 +2741,93 @@ impl PartialEq for DiagnosticSourceLine {
 
 impl Eq for DiagnosticSourceLine {}
 
+/// Authored parser span attached to a value-shaped node for diagnostics.
+///
+/// The file and range travel with a placeholder when directory parsing
+/// inlines a sibling value. They are deliberately excluded from equality,
+/// hashing, and serialization by [`DiagnosticSourceSpan`], so source
+/// provenance can never become value identity or secret-hash material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DiagnosticSourceRange {
+    start_line: NonZeroUsize,
+    start_column: NonZeroUsize,
+    end_line: NonZeroUsize,
+    end_column: NonZeroUsize,
+}
+
+impl DiagnosticSourceRange {
+    pub const fn start_line(self) -> usize {
+        self.start_line.get()
+    }
+
+    pub const fn start_column(self) -> usize {
+        self.start_column.get()
+    }
+
+    pub const fn end_line(self) -> usize {
+        self.end_line.get()
+    }
+
+    pub const fn end_column(self) -> usize {
+        self.end_column.get()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AuthoredDiagnosticSourceSpan {
+    source_file: PathBuf,
+    range: DiagnosticSourceRange,
+}
+
+/// Diagnostic-only source identity and range.
+///
+/// `None` represents a synthetic or deserialized node. As with
+/// [`DiagnosticSourceLine`], every instance compares equal and hashes to the
+/// same value because authored location is not semantic value data.
+#[derive(Debug, Clone, Default)]
+pub struct DiagnosticSourceSpan(Option<AuthoredDiagnosticSourceSpan>);
+
+impl DiagnosticSourceSpan {
+    pub(crate) fn authored(
+        source_file: PathBuf,
+        start_line: usize,
+        start_column: usize,
+        end_line: usize,
+        end_column: usize,
+    ) -> Self {
+        let range = DiagnosticSourceRange {
+            start_line: NonZeroUsize::new(start_line).expect("parser source lines are one-based"),
+            start_column: NonZeroUsize::new(start_column)
+                .expect("parser source columns are one-based"),
+            end_line: NonZeroUsize::new(end_line).expect("parser source lines are one-based"),
+            end_column: NonZeroUsize::new(end_column).expect("parser source columns are one-based"),
+        };
+        Self(Some(AuthoredDiagnosticSourceSpan { source_file, range }))
+    }
+
+    pub const fn synthetic() -> Self {
+        Self(None)
+    }
+
+    pub fn authored_location(&self) -> Option<(&Path, DiagnosticSourceRange)> {
+        self.0
+            .as_ref()
+            .map(|source| (source.source_file.as_path(), source.range))
+    }
+}
+
+impl PartialEq for DiagnosticSourceSpan {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DiagnosticSourceSpan {}
+
+impl Hash for DiagnosticSourceSpan {
+    fn hash<H: Hasher>(&self, _state: &mut H) {}
+}
+
 /// Diagnostic-safe explanation retained after a built-in was attempted and
 /// failed during permissive resolution.
 ///
@@ -4566,7 +4654,12 @@ pub enum ParserPlaceholder {
     /// access nodes, never identity.
     Loop(LoopSlot),
     /// Mid-edit empty `${}` interpolation.
-    EmptyInterpolation,
+    EmptyInterpolation {
+        /// Authored file and interpolation range. This metadata follows
+        /// inlined values but is never serialized as value data.
+        #[serde(skip, default)]
+        source: DiagnosticSourceSpan,
+    },
 }
 
 /// Placeholder available only inside a deferred for-loop template.
@@ -4856,7 +4949,7 @@ impl std::fmt::Display for ParserPlaceholder {
                 write!(formatter, "unresolved module argument: {name}")
             }
             Self::Loop(slot) => slot.fmt(formatter),
-            Self::EmptyInterpolation => formatter
+            Self::EmptyInterpolation { .. } => formatter
                 .write_str("empty interpolation `${}` — fill in the expression or remove it"),
         }
     }
@@ -4939,7 +5032,7 @@ impl PlaceholderKind for ParserPlaceholder {
             Self::FnParam { .. }
             | Self::FnLocal { .. }
             | Self::Loop(_)
-            | Self::EmptyInterpolation => None,
+            | Self::EmptyInterpolation { .. } => None,
         }
     }
 
@@ -4949,7 +5042,7 @@ impl PlaceholderKind for ParserPlaceholder {
             Self::FnParam { .. }
             | Self::ModuleArgument { .. }
             | Self::FnLocal { .. }
-            | Self::EmptyInterpolation => None,
+            | Self::EmptyInterpolation { .. } => None,
         }
     }
 
@@ -4965,7 +5058,7 @@ impl PlaceholderKind for ParserPlaceholder {
                 format!("(unresolved module argument: {name})")
             }
             Self::Loop(slot) => slot.render(),
-            Self::EmptyInterpolation => "(empty interpolation)".to_string(),
+            Self::EmptyInterpolation { .. } => "(empty interpolation)".to_string(),
         }
     }
 
@@ -5206,7 +5299,7 @@ impl Value<ParserPlaceholder> {
                 }
                 ParserPlaceholder::FnParam { .. }
                 | ParserPlaceholder::FnLocal { .. }
-                | ParserPlaceholder::EmptyInterpolation => false,
+                | ParserPlaceholder::EmptyInterpolation { .. } => false,
             };
             if allowed {
                 return;

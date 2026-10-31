@@ -10749,34 +10749,32 @@ fn check_attributes_blocks_still_warns_when_truly_undefined() {
 // =====================================================================
 
 #[test]
-fn module_definition_boundary_reports_unpropagated_argument_from_sibling_file() {
+fn module_definition_boundary_allows_derived_argument_variable_used_in_sibling_resource() {
     let temp = tempfile::tempdir().expect("create multi-file module fixture");
     std::fs::write(
         temp.path().join("arguments.crn"),
-        "arguments {\n  input: String\n}\n",
+        "arguments {\n  environment: 'dev' | 'prod'\n}\n",
     )
     .expect("write module arguments");
-    let source = "let leaked = input\n";
+    let source = "let state_bucket_name = \"carina-registry-state-${environment}\"\n";
     let path = temp.path().join("locals.crn");
     std::fs::write(&path, source).expect("write module local");
+    std::fs::write(
+        temp.path().join("resources.crn"),
+        "mock.test.resource {\n  name = state_bucket_name\n}\n",
+    )
+    .expect("write sibling module resource");
 
     let diagnostics = test_engine().analyze(
         &create_document_at(source, path.clone()),
         Some(path.as_path()),
     );
-    let leftover = diagnostics
-        .iter()
-        .find(|diagnostic| {
-            diagnostic
-                .message
-                .contains("let `leaked`: unresolved module argument: input")
-        })
-        .unwrap_or_else(|| {
-            panic!("the LSP must report the shared expansion-boundary error: {diagnostics:#?}")
-        });
-
-    assert_eq!(leftover.severity, Some(DiagnosticSeverity::ERROR));
-    assert_eq!(leftover.range.start.line, 0);
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .contains("unresolved module argument: environment")),
+        "the derived local is inlined into and substituted in the sibling resource: {diagnostics:#?}",
+    );
 }
 
 #[test]
@@ -10812,7 +10810,7 @@ fn multiline_interpolation_expression_has_no_spurious_diagnostic() {
 }
 
 #[test]
-fn empty_interpolation_after_multiline_interpolation_still_warns() {
+fn empty_interpolation_after_multiline_interpolation_still_errors() {
     let engine = test_engine();
     let buffer = "let x = 'a'\nlet value = \"a-${\n  x\n} ${}\"\n";
     let diagnostics = engine.analyze(&create_document(buffer), None);
@@ -10829,9 +10827,13 @@ fn empty_interpolation_after_multiline_interpolation_still_warns() {
     assert_eq!(
         empty_diagnostics.len(),
         1,
-        "the same string's trailing `${{}}` must still produce a warning: {diagnostics:#?}"
+        "the same string's trailing `${{}}` must still produce an error: {diagnostics:#?}"
     );
     assert_eq!(empty_diagnostics[0].range.start.line, 3);
+    assert_eq!(
+        empty_diagnostics[0].severity,
+        Some(DiagnosticSeverity::ERROR)
+    );
 }
 
 #[test]
@@ -10850,7 +10852,7 @@ fn interpolation_like_text_inside_line_comment_does_not_warn() {
 }
 
 #[test]
-fn inline_whitespace_only_interpolations_emit_warnings() {
+fn inline_whitespace_only_interpolations_emit_errors() {
     let engine = test_engine();
     let buffer = "let value = \"${} / ${ }\"\n";
     let diagnostics = engine.analyze(&create_document(buffer), None);
@@ -10867,18 +10869,18 @@ fn inline_whitespace_only_interpolations_emit_warnings() {
     assert_eq!(
         empty_diagnostics.len(),
         2,
-        "both `${{}}` and `${{ }}` must produce an empty-interpolation warning: {diagnostics:#?}"
+        "both `${{}}` and `${{ }}` must produce an empty-interpolation error: {diagnostics:#?}"
     );
     assert!(
         empty_diagnostics
             .iter()
-            .all(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::WARNING)),
-        "both empty-interpolation diagnostics must be warnings: {empty_diagnostics:#?}"
+            .all(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)),
+        "both empty-interpolation diagnostics must be errors: {empty_diagnostics:#?}"
     );
 }
 
 #[test]
-fn empty_interpolation_after_heredoc_body_punctuation_still_warns() {
+fn empty_interpolation_after_heredoc_body_punctuation_still_errors() {
     let engine = test_engine();
 
     for body in ["it's", "rm -rf /tmp/*"] {
@@ -10902,7 +10904,7 @@ fn empty_interpolation_after_heredoc_body_punctuation_still_warns() {
 }
 
 #[test]
-fn backslash_prefixed_empty_interpolation_in_heredoc_warns() {
+fn backslash_prefixed_empty_interpolation_in_heredoc_errors() {
     let engine = test_engine();
     let buffer = "let value = <<EOT\n\\${}\nEOT\n";
     let diagnostics = engine.analyze(&create_document(buffer), None);
@@ -10914,7 +10916,7 @@ fn backslash_prefixed_empty_interpolation_in_heredoc_warns() {
                 .to_lowercase()
                 .contains("empty interpolation")
         })
-        .unwrap_or_else(|| panic!("`\\${{}}` in an unquoted heredoc must warn: {diagnostics:#?}"));
+        .unwrap_or_else(|| panic!("`\\${{}}` in an unquoted heredoc must error: {diagnostics:#?}"));
 
     assert_eq!(empty.range.start.line, 1);
     assert_eq!(empty.range.start.character, 1);
@@ -10959,6 +10961,106 @@ fn empty_interpolation_emits_diagnostic_at_span() {
         "diagnostic end should be just after `}}`; got: {:?}",
         empty.range
     );
+}
+
+#[test]
+fn empty_interpolations_use_their_authored_locations_not_collection_order() {
+    let buffer = "let a = \"x${}\"\nmock.test.resource { name = \"${}\" }\n";
+    let diagnostics = test_engine().analyze(&create_document(buffer), None);
+    let empty_diagnostics = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .to_lowercase()
+                .contains("empty interpolation")
+        })
+        .collect::<Vec<_>>();
+
+    let local = empty_diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("let `a`"))
+        .unwrap_or_else(|| panic!("missing located `let a` diagnostic: {diagnostics:#?}"));
+    let resource = empty_diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("attribute `name`"))
+        .unwrap_or_else(|| panic!("missing located resource diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(local.range.start.line, 0, "{local:#?}");
+    assert_eq!(resource.range.start.line, 1, "{resource:#?}");
+    assert_eq!(local.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(resource.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn inlined_empty_interpolation_keeps_one_authored_span_for_every_leftover() {
+    let buffer = "let a = \"x${}\"\nmock.test.resource { name = a }\n";
+    let diagnostics = test_engine().analyze(&create_document(buffer), None);
+    let empty_diagnostics = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .to_lowercase()
+                .contains("empty interpolation")
+        })
+        .collect::<Vec<_>>();
+    let expected_start = buffer.lines().next().unwrap().find("${}").unwrap() as u32;
+    let expected_end = expected_start + 3;
+
+    assert_eq!(empty_diagnostics.len(), 2, "{diagnostics:#?}");
+    assert!(
+        empty_diagnostics.iter().all(|diagnostic| {
+            diagnostic.range.start.line == 0
+                && diagnostic.range.start.character == expected_start
+                && diagnostic.range.end.line == 0
+                && diagnostic.range.end.character == expected_end
+                && diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+        }),
+        "both collected leftovers must retain the authored interpolation span: {empty_diagnostics:#?}",
+    );
+}
+
+#[test]
+fn sibling_empty_interpolation_is_not_misattributed_to_current_buffer() {
+    let temp = tempfile::tempdir().expect("create multi-file fixture");
+    let sibling_source = "let broken = \"${}\"\n";
+    let sibling_path = temp.path().join("locals.crn");
+    std::fs::write(&sibling_path, sibling_source).expect("write sibling local");
+    let current_source = "mock.test.resource { name = broken }\n";
+    let current_path = temp.path().join("main.crn");
+    std::fs::write(&current_path, current_source).expect("write current resource");
+
+    let engine = test_engine();
+    let current_diagnostics = engine.analyze(
+        &create_document_at(current_source, current_path.clone()),
+        Some(current_path.as_path()),
+    );
+    assert!(
+        current_diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .to_lowercase()
+            .contains("empty interpolation")),
+        "a sibling-authored interpolation must not be anchored in the current buffer: {current_diagnostics:#?}",
+    );
+
+    let sibling_diagnostics = engine.analyze(
+        &create_document_at(sibling_source, sibling_path.clone()),
+        Some(sibling_path.as_path()),
+    );
+    let sibling_empty = sibling_diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .to_lowercase()
+                .contains("empty interpolation")
+        })
+        .unwrap_or_else(|| {
+            panic!("the authored sibling must retain its own diagnostic: {sibling_diagnostics:#?}")
+        });
+    assert_eq!(sibling_empty.range.start.line, 0);
+    assert_eq!(sibling_empty.severity, Some(DiagnosticSeverity::ERROR));
 }
 
 #[test]
@@ -11033,7 +11135,7 @@ fn empty_interpolation_does_not_misfire_on_escape_inside_braces() {
 }
 
 #[test]
-fn empty_interpolation_diagnostic_is_warning_not_error() {
+fn empty_interpolation_diagnostic_is_error() {
     let engine = test_engine();
     let buffer = "let x = aws.s3.Bucket {\n    name = \"prefix-${}\"\n}\n";
     let doc = create_document(buffer);
@@ -11045,8 +11147,8 @@ fn empty_interpolation_diagnostic_is_warning_not_error() {
         .expect("expected an EmptyInterpolation diagnostic");
     assert_eq!(
         empty.severity,
-        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING),
-        "empty interpolation is a mid-edit hint, not a hard error"
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+        "the LSP must agree with the CLI expansion-boundary error"
     );
 }
 

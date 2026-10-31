@@ -2095,7 +2095,7 @@ fn substitute_arguments_with_position(
             crate::resource::ParserPlaceholder::FnParam { .. }
             | crate::resource::ParserPlaceholder::FnLocal { .. }
             | crate::resource::ParserPlaceholder::Loop(_)
-            | crate::resource::ParserPlaceholder::EmptyInterpolation,
+            | crate::resource::ParserPlaceholder::EmptyInterpolation { .. },
         )) => value.clone(),
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             let Some(argument) = arguments.arguments.get(binding) else {

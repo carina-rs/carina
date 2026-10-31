@@ -56,6 +56,7 @@ pub(super) fn parse_fn_def(
                         _ => {
                             // This is the default expression
                             let mut default_ctx = ParseContext::new(ctx.config);
+                            default_ctx.inherit_diagnostic_source(ctx);
                             default_ctx
                                 .replace_shared_user_functions(Arc::clone(&ctx.user_functions));
                             default_ctx
@@ -99,6 +100,7 @@ pub(super) fn parse_fn_def(
     // Create a context where parameters are registered as variables
     // so that param references in the body are resolved as variable refs
     let mut body_ctx = ParseContext::new(ctx.config);
+    body_ctx.inherit_diagnostic_source(ctx);
     body_ctx.replace_shared_user_functions(Arc::clone(&ctx.user_functions));
     body_ctx
         .seeded_user_functions
@@ -378,7 +380,7 @@ fn contains_module_argument(value: &Value) -> bool {
             ParserPlaceholder::FnParam { .. }
             | ParserPlaceholder::FnLocal { .. }
             | ParserPlaceholder::Loop(_)
-            | ParserPlaceholder::EmptyInterpolation,
+            | ParserPlaceholder::EmptyInterpolation { .. },
         )) => false,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_module_argument),
         Value::Concrete(ConcreteValue::Map(entries)) => {
@@ -1170,7 +1172,7 @@ fn substitute_fn_params_with_position(
         | Value::Deferred(DeferredValue::Placeholder(
             ParserPlaceholder::ModuleArgument { .. }
             | ParserPlaceholder::Loop(_)
-            | ParserPlaceholder::EmptyInterpolation,
+            | ParserPlaceholder::EmptyInterpolation { .. },
         ))
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })

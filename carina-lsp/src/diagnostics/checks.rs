@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
@@ -2918,10 +2918,6 @@ impl DiagnosticEngine {
     }
 
     /// Run the same typed parser-placeholder boundary as CLI validation.
-    ///
-    /// `EmptyInterpolation` does not retain a parser span today, so the lexer
-    /// is used only to project already-confirmed boundary errors onto their
-    /// exact `${}` ranges. It is not an independent diagnostic source.
     pub(super) fn check_expansion_boundary(
         &self,
         doc: &Document,
@@ -2931,28 +2927,41 @@ impl DiagnosticEngine {
         let Err(leftovers) = parsed.validate_expansion_boundary(boundary) else {
             return Vec::new();
         };
-        let mut empty_ranges = crate::lex::lex(&doc.text())
-            .interpolations()
-            .iter()
-            .copied()
-            .filter(|span| span.is_inline_empty())
-            .filter_map(|span| {
-                let end = span.end?;
-                debug_assert_eq!(span.start.line, end.line);
-                Some((span.start.line, span.start.character, end.character))
-            })
-            .collect::<VecDeque<_>>();
         let text = doc.text();
 
         leftovers
             .into_errors()
             .into_iter()
-            .map(|error| {
-                let (line, start_col, end_col, severity) = match error.placeholder() {
-                    ParserPlaceholder::EmptyInterpolation => {
-                        let (line, start_col, end_col) =
-                            empty_ranges.pop_front().unwrap_or((0, 0, 0));
-                        (line, start_col, end_col, DiagnosticSeverity::WARNING)
+            .filter_map(|error| {
+                let message = error.to_string();
+                match error.placeholder() {
+                    ParserPlaceholder::EmptyInterpolation { source } => {
+                        let Some((source_file, range)) = source.authored_location() else {
+                            return Some(carina_diagnostic(
+                                0,
+                                0,
+                                0,
+                                DiagnosticSeverity::ERROR,
+                                message,
+                            ));
+                        };
+                        if source_file != doc.source_file() {
+                            return None;
+                        }
+                        Some(carina_diagnostic_range(
+                            Range {
+                                start: Position {
+                                    line: range.start_line().saturating_sub(1) as u32,
+                                    character: range.start_column().saturating_sub(1) as u32,
+                                },
+                                end: Position {
+                                    line: range.end_line().saturating_sub(1) as u32,
+                                    character: range.end_column().saturating_sub(1) as u32,
+                                },
+                            },
+                            DiagnosticSeverity::ERROR,
+                            message,
+                        ))
                     }
                     ParserPlaceholder::ModuleArgument { source_line, .. } => {
                         let line = source_line.get().unwrap_or(1).saturating_sub(1) as u32;
@@ -2961,13 +2970,24 @@ impl DiagnosticEngine {
                             .nth(line as usize)
                             .map(|line| line.chars().count() as u32)
                             .unwrap_or(0);
-                        (line, 0, end_col, DiagnosticSeverity::ERROR)
+                        Some(carina_diagnostic(
+                            line,
+                            0,
+                            end_col,
+                            DiagnosticSeverity::ERROR,
+                            message,
+                        ))
                     }
                     ParserPlaceholder::FnParam { .. }
                     | ParserPlaceholder::FnLocal { .. }
-                    | ParserPlaceholder::Loop(_) => (0, 0, 0, DiagnosticSeverity::ERROR),
-                };
-                carina_diagnostic(line, start_col, end_col, severity, error.to_string())
+                    | ParserPlaceholder::Loop(_) => Some(carina_diagnostic(
+                        0,
+                        0,
+                        0,
+                        DiagnosticSeverity::ERROR,
+                        message,
+                    )),
+                }
             })
             .collect()
     }
