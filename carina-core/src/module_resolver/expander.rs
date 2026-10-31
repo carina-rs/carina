@@ -816,6 +816,7 @@ fn source_argument_name(value: &Value, argument_values: &HashMap<String, Value>)
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 Some(path.binding().to_string())
             }
+            Value::Deferred(DeferredValue::IntegerArithmetic(_)) => None,
             _ => None,
         })?;
     argument_values
@@ -1228,6 +1229,29 @@ fn bind_constraint_expression(
                 source_file,
             )?),
         },
+        ValidateExpr::IntegerArithmetic {
+            lhs,
+            op,
+            rhs,
+            operator_span,
+        } => ValidateExpr::IntegerArithmetic {
+            lhs: Box::new(bind_constraint_expression(
+                lhs,
+                arguments,
+                resolved_bindings,
+                line,
+                source_file,
+            )?),
+            op: *op,
+            rhs: Box::new(bind_constraint_expression(
+                rhs,
+                arguments,
+                resolved_bindings,
+                line,
+                source_file,
+            )?),
+            operator_span: *operator_span,
+        },
         ValidateExpr::And(lhs, rhs) => ValidateExpr::And(
             Box::new(bind_constraint_expression(
                 lhs,
@@ -1336,6 +1360,29 @@ fn prefix_constraint_expression(
                 arguments,
                 resolved_bindings,
             )?),
+        },
+        ValidateExpr::IntegerArithmetic {
+            lhs,
+            op,
+            rhs,
+            operator_span,
+        } => ValidateExpr::IntegerArithmetic {
+            lhs: Box::new(prefix_constraint_expression(
+                lhs,
+                instance_prefix,
+                intra_module_bindings,
+                arguments,
+                resolved_bindings,
+            )?),
+            op: *op,
+            rhs: Box::new(prefix_constraint_expression(
+                rhs,
+                instance_prefix,
+                intra_module_bindings,
+                arguments,
+                resolved_bindings,
+            )?),
+            operator_span: *operator_span,
         },
         ValidateExpr::And(lhs, rhs) => ValidateExpr::And(
             Box::new(prefix_constraint_expression(
@@ -2189,6 +2236,29 @@ fn substitute_arguments_with_position(
                 })
             }
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = substitute_arguments_with_position(
+                expression.lhs(),
+                arguments,
+                ArgumentSubstitutionPosition::Value,
+            )?;
+            let rhs = substitute_arguments_with_position(
+                expression.rhs(),
+                arguments,
+                ArgumentSubstitutionPosition::Value,
+            )?;
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| ArgumentSubstitutionError {
+                    source_file: None,
+                    line: expression
+                        .operator_span()
+                        .line()
+                        .unwrap_or(arguments.default_line),
+                    message: error.to_string(),
+                    parse_error: None,
+                })?
+        }
         Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
                 .iter()
@@ -2446,6 +2516,15 @@ pub(super) fn rewrite_intra_module_refs(
                     intra_module_bindings,
                 )),
             })
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs =
+                rewrite_intra_module_refs(expression.lhs(), instance_prefix, intra_module_bindings);
+            let rhs =
+                rewrite_intra_module_refs(expression.rhs(), instance_prefix, intra_module_bindings);
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .unwrap_or_else(|_| value.clone())
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -2885,6 +2964,13 @@ fn rewrite_ref_prefixes(
                 value: Box::new(rewrite_ref_prefixes(value, remap)),
                 default: Box::new(rewrite_ref_prefixes(default, remap)),
             })
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = rewrite_ref_prefixes(expression.lhs(), remap);
+            let rhs = rewrite_ref_prefixes(expression.rhs(), remap);
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .unwrap_or_else(|_| value.clone())
         }
         _ => value.clone(),
     }

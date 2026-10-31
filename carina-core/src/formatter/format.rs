@@ -212,6 +212,7 @@ impl Formatter {
             NodeKind::ExportsParam => self.format_attributes_param(node, 0), // same format as attributes
             NodeKind::PipeExpr => self.format_pipe_expr(node),
             NodeKind::ComposeExpr => self.format_compose_expr(node),
+            NodeKind::ValidateExpr => self.format_validate_expr(node),
             NodeKind::PostfixExpr | NodeKind::Primary => self.format_default(node),
             NodeKind::FunctionCall => self.format_function_call(node),
             NodeKind::VariableRef => self.format_variable_ref(node),
@@ -270,7 +271,7 @@ impl Formatter {
                 CstChild::Node(n) => {
                     self.format_node(n);
                 }
-                CstChild::Trivia(_) => {}
+                CstChild::Trivia(trivia) => self.format_expression_trivia(trivia),
             }
         }
     }
@@ -301,6 +302,61 @@ impl Formatter {
             Trivia::LineComment(s) | Trivia::BlockComment(s) => self.write(s),
             Trivia::Newline => self.write_newline(),
             Trivia::Whitespace(s) => self.write(s),
+        }
+    }
+
+    /// Preserve comments embedded in an expression while leaving whitespace
+    /// normalization to the surrounding expression formatter.
+    pub(in crate::formatter) fn format_expression_trivia(&mut self, trivia: &Trivia) {
+        match trivia {
+            Trivia::Whitespace(_) | Trivia::Newline => {}
+            Trivia::BlockComment(comment) => {
+                self.ensure_inline_space();
+                self.write(comment);
+                self.ensure_inline_space();
+            }
+            Trivia::LineComment(comment) => {
+                self.ensure_inline_space();
+                self.write(comment);
+                if !self.output.ends_with('\n') {
+                    self.write_newline();
+                }
+                self.write_continuation_indent();
+            }
+        }
+    }
+
+    fn write_continuation_indent(&mut self) {
+        let indent = self
+            .config
+            .indent_string()
+            .repeat(self.current_indent.saturating_add(1));
+        self.output.push_str(&indent);
+    }
+
+    pub(in crate::formatter) fn write_binary_operator(&mut self, operator: &str) {
+        let line_start = self.output.rfind('\n').map_or(0, |index| index + 1);
+        let line_has_content = self.output[line_start..]
+            .chars()
+            .any(|ch| !matches!(ch, ' ' | '\t'));
+
+        if line_has_content {
+            while matches!(self.output.as_bytes().last(), Some(b' ' | b'\t')) {
+                self.output.pop();
+            }
+            self.write(" ");
+        }
+        self.write(operator);
+        self.write(" ");
+    }
+
+    fn ensure_inline_space(&mut self) {
+        let line_start = self.output.rfind('\n').map_or(0, |index| index + 1);
+        let line_has_content = self.output[line_start..]
+            .chars()
+            .any(|ch| !matches!(ch, ' ' | '\t'));
+        if line_has_content && !matches!(self.output.as_bytes().last(), Some(b' ' | b'\t')) {
+            self.write(" ");
         }
     }
 
@@ -1463,7 +1519,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: formatter doesn't handle validation { ... } block yet
     fn format_arguments_block_form_with_validation_block() {
         let input = r#"arguments {
   port: Int {
@@ -1476,9 +1531,50 @@ mod tests {
   }
 }
 "#;
+        let expected = r#"arguments {
+  port: Int {
+    description = 'Web server port'
+    default     = 8080
+    validation {
+      condition     = port >= 1 && port <= 65535
+      error_message = 'Port must be between 1 and 65535'
+    }
+  }
+}
+"#;
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
-        assert_eq!(result, input);
+        assert_eq!(result, expected);
+        assert_eq!(format(&result, &config).unwrap(), result);
+    }
+
+    #[test]
+    fn format_validation_block_preserves_leading_and_trailing_comments() {
+        let input = r#"arguments {
+  port: Int {
+    validation {
+      // keep me
+      condition     = port >= 1 && port <= 65535 // trailing
+      error_message = "x"
+    }
+  }
+}
+"#;
+        let expected = r#"arguments {
+  port: Int {
+    validation {
+      // keep me
+      condition     = port >= 1 && port <= 65535  // trailing
+      error_message = 'x'
+    }
+  }
+}
+"#;
+        let config = FormatConfig::default();
+
+        let first = format(input, &config).unwrap();
+        assert_eq!(first, expected);
+        assert_eq!(format(&first, &config).unwrap(), first);
     }
 
     #[test]
@@ -1610,13 +1706,81 @@ require   port >= 1 && port <= 65535  , "port must be valid"
 "#;
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
-        // The formatter normalizes spacing around "require" keyword and comma,
-        // but preserves validate expression content as-is (opaque)
         assert!(
             result.contains("require port >= 1 && port <= 65535, 'port must be valid'"),
             "Unexpected output:\n{}",
             result
         );
+
+        let compact = format("require count>=1, \"p\"\n", &config).unwrap();
+        assert_eq!(compact, "require count >= 1, 'p'\n");
+    }
+
+    #[test]
+    fn format_integer_arithmetic_spacing_parentheses_comments_and_idempotence() {
+        let input = "let value=(1+2)*3-8/* outer /* nested */ comment *//2%3\n";
+        let expected = "let value = (1 + 2) * 3 - 8 /* outer /* nested */ comment */ / 2 % 3\n";
+        let config = FormatConfig::default();
+
+        let first = format(input, &config).unwrap();
+        assert_eq!(first, expected);
+        assert_eq!(format(&first, &config).unwrap(), first);
+
+        let line_comments = "let slash=6/ // divide\n2\nlet hash=8% # remainder\n3\n";
+        let formatted = format(line_comments, &config).unwrap();
+        assert!(formatted.contains("6 / // divide\n"), "{formatted}");
+        assert!(formatted.contains("8 % # remainder\n"), "{formatted}");
+        assert_eq!(format(&formatted, &config).unwrap(), formatted);
+    }
+
+    #[test]
+    fn format_integer_arithmetic_line_comment_continuations_are_indented() {
+        let input = r#"let c = (a // why
+  + 1)
+exports {
+  x: Int = a // lead
+    * 2
+}
+"#;
+        let expected = r#"let c = (a // why
+  + 1)
+
+exports {
+  x: Int = a // lead
+    * 2
+}
+"#;
+        let config = FormatConfig::default();
+
+        let first = format(input, &config).unwrap();
+        assert_eq!(first, expected);
+        assert_eq!(format(&first, &config).unwrap(), first);
+    }
+
+    #[test]
+    fn format_integer_arithmetic_in_require_and_argument_validation() {
+        let input = r#"arguments {
+  limit: Int {
+    validation {
+      condition=(limit+1)*2>=4
+      error_message='invalid'
+    }
+  }
+}
+require limit/2%3==1,"invalid"
+"#;
+        let config = FormatConfig::default();
+        let formatted = format(input, &config).unwrap();
+
+        assert!(
+            formatted.contains("condition     = (limit + 1) * 2 >= 4"),
+            "unexpected output:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("require limit / 2 % 3 == 1, 'invalid'"),
+            "unexpected output:\n{formatted}"
+        );
+        assert_eq!(format(&formatted, &config).unwrap(), formatted);
     }
 
     #[test]

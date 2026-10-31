@@ -198,6 +198,26 @@ fn snapshot_postfix_access() {
 }
 
 #[test]
+fn snapshot_deferred_integer_arithmetic_is_structural() {
+    let expression = carina_core::integer_arithmetic::evaluate_integer_values(
+        carina_core::resource::Value::Deferred(carina_core::resource::DeferredValue::Unknown(
+            carina_core::resource::UnknownReason::ForValue,
+        )),
+        carina_core::integer_arithmetic::IntegerOp::Divide,
+        carina_core::resource::Value::Concrete(carina_core::resource::ConcreteValue::Int(60)),
+        carina_core::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+    )
+    .expect("deferred Int arithmetic must be structurally valid");
+    let rendered = carina_core::plan_tree::render_deferred_for_template_value(
+        &expression,
+        "source",
+        "applies",
+    );
+
+    insta::assert_snapshot!(rendered.plain(), @"(known after source applies) / 60");
+}
+
+#[test]
 fn snapshot_iam_preflight_warning_appears_after_plan_summary() {
     let (plan, schemas, _moved) = build_plan_from_fixture("depends_on");
     let mut output = strip_ansi(&format_plan(

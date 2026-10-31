@@ -10,10 +10,7 @@
     { "include": "#resource-types" },
     { "include": "#types" },
     { "include": "#strings" },
-    { "include": "#numbers" },
-    { "include": "#booleans" },
-    { "include": "#operators" },
-    { "include": "#functions" },
+    { "include": "#expression" },
     { "include": "#properties" },
     { "include": "#variables" }
   ],
@@ -23,6 +20,34 @@
         {
           "name": "comment.line.number-sign.carina",
           "match": "#.*$"
+        },
+        {
+          "name": "comment.line.double-slash.carina",
+          "match": "//.*$"
+        },
+        {
+          "include": "#block-comment"
+        }
+      ]
+    },
+    "block-comment": {
+      "name": "comment.block.carina",
+      "begin": "/\\*",
+      "end": "\\*/",
+      "patterns": [
+        { "include": "#block-comment" }
+      ]
+    },
+    "expression": {
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#numbers" },
+        { "include": "#booleans" },
+        { "include": "#operators" },
+        { "include": "#functions" },
+        {
+          "name": "punctuation.accessor.carina",
+          "match": "\\."
         }
       ]
     },
@@ -117,13 +142,10 @@
                 "0": { "name": "punctuation.section.embedded.end.carina" }
               },
               "patterns": [
+                { "include": "#expression" },
                 {
                   "name": "variable.other.carina",
                   "match": "[A-Za-z_][A-Za-z0-9_]*"
-                },
-                {
-                  "name": "punctuation.accessor.carina",
-                  "match": "\\."
                 }
               ]
             }
@@ -149,13 +171,10 @@
                 "0": { "name": "punctuation.section.embedded.end.carina" }
               },
               "patterns": [
+                { "include": "#expression" },
                 {
                   "name": "variable.other.carina",
                   "match": "[A-Za-z_][A-Za-z0-9_]*"
-                },
-                {
-                  "name": "punctuation.accessor.carina",
-                  "match": "\\."
                 }
               ]
             }
@@ -198,7 +217,23 @@
       "patterns": [
         {
           "name": "keyword.operator.assignment.carina",
-          "match": "="
+          "match": "(?<![=!<>])=(?!=)"
+        },
+        {
+          "name": "keyword.operator.arithmetic.carina",
+          "match": "[+\\-*/%]"
+        },
+        {
+          "name": "keyword.operator.expression.carina",
+          "match": "\\?\\?|\\|>|>>"
+        },
+        {
+          "name": "keyword.operator.logical.carina",
+          "match": "&&|\\|\\||!"
+        },
+        {
+          "name": "keyword.operator.comparison.carina",
+          "match": "==|!=|>=|<=|>|<"
         }
       ]
     },
