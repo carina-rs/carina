@@ -570,6 +570,47 @@ fn test_substitute_arguments_nested() {
 }
 
 #[test]
+fn module_argument_substitution_folds_and_checks_integer_arithmetic() {
+    let divisor = Value::Deferred(DeferredValue::Unknown(
+        crate::resource::UnknownReason::ModuleArgument {
+            name: "divisor".to_string(),
+            source_line: 1.into(),
+            diagnostic_name: None,
+        },
+    ));
+    let value = crate::integer_arithmetic::evaluate_integer_values(
+        Value::Concrete(ConcreteValue::Int(10)),
+        crate::integer_arithmetic::IntegerOp::Divide,
+        divisor,
+        crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+    )
+    .expect("typed module argument is a structurally valid parser-stage operand");
+
+    assert_eq!(
+        substitute_arguments(
+            &value,
+            &HashMap::from([(
+                "divisor".to_string(),
+                Value::Concrete(ConcreteValue::Int(2)),
+            )]),
+        )
+        .expect("known operands must fold during substitution"),
+        Value::Concrete(ConcreteValue::Int(5)),
+    );
+
+    let error = substitute_arguments(
+        &value,
+        &HashMap::from([(
+            "divisor".to_string(),
+            Value::Concrete(ConcreteValue::Int(0)),
+        )]),
+    )
+    .expect_err("a known zero module argument must fail during substitution");
+    let error = format!("{error:?}");
+    assert!(error.contains("division by zero"), "{error}");
+}
+
+#[test]
 fn test_substitute_arguments_recurses_into_residual_coalesce() {
     let inputs = HashMap::from([(
         "fallback".to_string(),
@@ -5707,6 +5748,66 @@ let prod = outer {
     assert!(
         error.to_string().contains("cannot assign Int to 'name'"),
         "{error}"
+    );
+}
+
+#[test]
+fn integer_arithmetic_crosses_a_module_argument_boundary_as_typed_int() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("modules/child");
+    fs::create_dir_all(&module_dir).expect("module directory");
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"
+arguments { count: Int }
+let target = mock.test.Target { count = count }
+"#,
+    )
+    .expect("module source");
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).expect("root directory");
+    let root_source = r#"
+let source = mock.test.Source {}
+let child = use { source = "../modules/child" }
+let instance = child { count = source.count + 1 }
+"#;
+    fs::write(root_dir.join("main.crn"), root_source).expect("root source");
+
+    let mut config = ProviderContext::default();
+    for resource_type in ["test.Source", "test.Target"] {
+        config
+            .resource_types
+            .insert(("mock".to_string(), resource_type.to_string()));
+    }
+    let mut schemas = crate::schema::SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Source")
+            .attribute(AttributeSchema::provider_populated("count", AttributeType::int()).build())
+            .validate()
+            .expect("source schema"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Target")
+            .attribute(AttributeSchema::required("count", AttributeType::int()).build())
+            .validate()
+            .expect("target schema"),
+    );
+
+    let parsed = crate::parser::parse(root_source, &config).expect("root parse");
+    let parsed = resolve_modules_with_config(parsed, &root_dir, &config, &schemas)
+        .expect("typed arithmetic module argument must expand");
+    let count = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("instance.target"))
+        .and_then(|resource| resource.get_attr("count"))
+        .expect("expanded target count");
+    assert!(
+        matches!(count, Value::Deferred(DeferredValue::IntegerArithmetic(_))),
+        "module substitution must preserve typed arithmetic, got {count:?}",
     );
 }
 

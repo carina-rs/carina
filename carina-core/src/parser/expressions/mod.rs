@@ -8,6 +8,7 @@
 
 pub(super) mod for_expr;
 pub(super) mod if_expr;
+pub(super) mod integer_arithmetic;
 pub(super) mod pipe;
 pub(super) mod primary;
 pub(super) mod string_literal;

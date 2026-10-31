@@ -279,6 +279,10 @@ fn unresolved_enum_identifier(value: &Value) -> Option<&str> {
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             unresolved_enum_identifier(value).or_else(|| unresolved_enum_identifier(default))
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            unresolved_enum_identifier(expression.lhs())
+                .or_else(|| unresolved_enum_identifier(expression.rhs()))
+        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::CanonicalEnum(_)

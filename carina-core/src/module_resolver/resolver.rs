@@ -283,6 +283,12 @@ impl ResidualModuleResolutionError {
                     line: _,
                     message: _,
                 }
+                | ParseError::IntegerArithmetic {
+                    line: _,
+                    column: _,
+                    end_column: _,
+                    message: _,
+                }
                 | ParseError::UnboundLoopRead {
                     kind: _,
                     line: _,

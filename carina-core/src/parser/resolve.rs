@@ -1108,6 +1108,10 @@ fn collect_reference_roots(
             collect_reference_roots(value, variables, structural, roots);
             collect_reference_roots(default, variables, structural, roots);
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            collect_reference_roots(expression.lhs(), variables, structural, roots);
+            collect_reference_roots(expression.rhs(), variables, structural, roots);
+        }
         Value::Concrete(
             ConcreteValue::Int(_)
             | ConcreteValue::Float(_)
@@ -1359,6 +1363,26 @@ fn resolve_value_with_config(
                     default: Box::new(default),
                 }))
             }
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = resolve_value_with_config(
+                expression.lhs(),
+                binding_map,
+                fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
+            let rhs = resolve_value_with_config(
+                expression.rhs(),
+                binding_map,
+                fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
+            let span = expression.operator_span();
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| ParseError::integer_arithmetic(span, 0, error))
         }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             // A suffix is part of the authored reference, not decoration on
@@ -1650,7 +1674,8 @@ fn resolve_function_calls_only(
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
-            | DeferredValue::Coalesce { .. },
+            | DeferredValue::Coalesce { .. }
+            | DeferredValue::IntegerArithmetic(_),
         ) => resolve_value_with_config(
             value,
             binding_map,

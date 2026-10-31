@@ -386,6 +386,26 @@ pub(crate) fn parse_primary_eval_with_mode(
         pair
     };
 
+    if matches!(
+        inner.as_rule(),
+        Rule::read_resource_expr
+            | Rule::wait_expr
+            | Rule::upstream_state_expr
+            | Rule::provider_expr
+            | Rule::resource_expr
+            | Rule::for_expr
+            | Rule::if_expr
+            | Rule::module_call
+    ) && let Some(operand) = mode.integer_operand_context()
+    {
+        return crate::parser::let_binding::parse_integer_operand_primary(
+            inner,
+            ctx,
+            operand.preprocessed_file,
+            operand.source_file,
+        );
+    }
+
     match inner.as_rule() {
         Rule::resource_expr => {
             // Resource expressions cannot be used as attribute values (only valid in top-level let bindings)
@@ -838,8 +858,21 @@ pub(crate) fn parse_primary_eval_with_mode(
         }
         Rule::if_expr => parse_if_value_expr_with_mode(inner, ctx, mode),
         Rule::expression => parse_expression_eval_with_mode(inner, ctx, mode),
-        _ => Ok(EvalValue::from_value(Value::Concrete(
-            ConcreteValue::String(inner.as_str().to_string().into()),
-        ))),
+        Rule::read_resource_expr
+        | Rule::wait_expr
+        | Rule::upstream_state_expr
+        | Rule::provider_expr
+        | Rule::for_expr
+        | Rule::module_call => Err(ParseError::InvalidExpression {
+            line: ctx.original_position(&inner)?.line(),
+            message: format!(
+                "structural {:?} expression reached ordinary value lowering",
+                inner.as_rule()
+            ),
+        }),
+        other => Err(ParseError::InternalError {
+            expected: "a supported primary value".to_string(),
+            context: format!("primary expression contained {other:?}"),
+        }),
     }
 }

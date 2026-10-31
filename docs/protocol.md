@@ -63,6 +63,13 @@ and its `started_at` timestamp, never an identifier or continuation token.
 Apply reloads that marker under the state lock and rejects any lifecycle or
 timestamp change before provider effects run.
 
+Saved-plan format 33 adds typed keyed-list release effects. Saved-plan format
+34 is assigned to carina#3803 and is not emitted by this change. Saved-plan
+format 35 adds the structural `IntegerArithmetic` deferred value so an Int
+expression whose operands become known during apply is preserved without
+lowering to a builtin or string. Older plans are rejected with the standard
+replan guidance; the state format is unchanged.
+
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host
 validates and preserves that continuation through the same typestate path as
