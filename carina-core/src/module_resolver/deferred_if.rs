@@ -384,7 +384,7 @@ fn first_dropped_reference(
         }
     }
     for parameter in &file.attribute_params {
-        if let Some(binding) = parameter.value.as_ref().and_then(&find) {
+        if let Some(binding) = parameter.value.as_ref().and_then(find) {
             return Some(binding);
         }
     }

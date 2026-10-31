@@ -2464,7 +2464,7 @@ impl StructuralOperand {
         Ok(match self {
             Self::Value { value, access_base } => Self::Value {
                 value: map(value)?,
-                access_base: access_base.as_ref().map(&mut map).transpose()?,
+                access_base: access_base.as_ref().map(map).transpose()?,
             },
             Self::Handle {
                 handle,
