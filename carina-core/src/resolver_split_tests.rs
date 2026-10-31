@@ -19,18 +19,21 @@ use crate::resolver::{
     resolve_live_composition_refs_post_apply, resolve_managed_refs_with_state_and_remote,
 };
 use crate::resource::{
-    AccessPath, ConcreteValue, DeferredValue, LiveComposition, LiveCompositionSignature, Resource,
-    ResourceId, State, Value,
+    ConcreteValue, LiveComposition, LiveCompositionSignature, RelativeBindingName, Resource,
+    ResourceId, RootScope, State, Value,
 };
+
+fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+    RootScope::new().resolve(RelativeBindingName::new(binding))
+}
 
 fn s(s: &str) -> Value {
     Value::Concrete(ConcreteValue::String(s.into()))
 }
 
 fn ref_to(binding: &str, attr: &str) -> Value {
-    Value::Deferred(DeferredValue::ResourceRef {
-        path: AccessPath::new(binding, attr),
-    })
+    crate::resource::AuthoredValue::resource_ref(binding, attr, Vec::new())
+        .resolve_root(&RootScope::new())
 }
 
 fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
@@ -43,7 +46,7 @@ fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
         attributes,
         directives: Default::default(),
         prefixes: HashMap::new(),
-        binding: Some(binding.into()),
+        binding: Some(absolute_binding(binding)),
         dependency_bindings: BTreeSet::new(),
         module_source: None,
         default_tag_keys: Default::default(),
@@ -71,7 +74,7 @@ fn make_virtual(binding: &'static str, attrs: &[(&str, Value)]) -> LiveCompositi
             attributes,
             pending_constraints: Vec::new(),
         },
-        binding: Some(binding.into()),
+        binding: Some(absolute_binding(binding)),
         dependency_bindings: BTreeSet::new(),
         module_name: "m".into(),
         instance: binding.into(),
@@ -125,7 +128,9 @@ fn resolve_managed_refs_records_dependency_bindings() {
     .expect("resolve managed");
 
     assert!(
-        managed[1].dependency_bindings.contains("a"),
+        managed[1]
+            .dependency_bindings
+            .contains(&absolute_binding("a")),
         "expected dependency on `a`, got {:?}",
         managed[1].dependency_bindings,
     );

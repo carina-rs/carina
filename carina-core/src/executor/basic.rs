@@ -417,9 +417,9 @@ fn assert_fully_resolved(
         Value::Deferred(DeferredValue::BindingRef { binding }) => Err(unresolved_binding_message(
             attribute_key,
             UnresolvedSite::Ref {
-                path: binding.clone(),
+                path: binding.to_string(),
             },
-            binding,
+            binding.as_str(),
             bindings,
         )),
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
@@ -814,7 +814,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             resource_id: resource.id.clone(),
                             diagnostic,
                             resolved_attrs: Some(resolved_attrs),
-                            binding: resource.binding.clone(),
+                            binding: resource.binding.as_ref().map(ToString::to_string),
                         }
                     } else {
                         BasicEffectResult::Success {
@@ -824,7 +824,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             },
                             resource_id: resource.id.clone(),
                             resolved_attrs: Some(resolved_attrs),
-                            binding: resource.binding.clone(),
+                            binding: resource.binding.as_ref().map(ToString::to_string),
                         }
                     }
                 }
@@ -921,7 +921,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         completed,
                         resource_id: resource.id.clone(),
                         resolved_attrs,
-                        binding: resource.binding.clone(),
+                        binding: resource.binding.as_ref().map(ToString::to_string),
                     }
                 }
                 Ok(ResumeOutcomeKind::Resent(outcome)) => {
@@ -936,7 +936,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             resource_id: resource.id.clone(),
                             diagnostic,
                             resolved_attrs: Some(resolved_attrs),
-                            binding: resource.binding.clone(),
+                            binding: resource.binding.as_ref().map(ToString::to_string),
                         }
                     } else {
                         BasicEffectResult::Success {
@@ -946,7 +946,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             },
                             resource_id: resource.id.clone(),
                             resolved_attrs: Some(resolved_attrs),
-                            binding: resource.binding.clone(),
+                            binding: resource.binding.as_ref().map(ToString::to_string),
                         }
                     }
                 }
@@ -1101,7 +1101,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             resource_id: id.clone(),
                             diagnostic,
                             resolved_attrs: Some(resolved_desired_attributes),
-                            binding: to.binding.clone(),
+                            binding: to.binding.as_ref().map(ToString::to_string),
                         }
                     } else {
                         BasicEffectResult::Success {
@@ -1111,7 +1111,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             },
                             resource_id: id.clone(),
                             resolved_attrs: Some(resolved_desired_attributes),
-                            binding: to.binding.clone(),
+                            binding: to.binding.as_ref().map(ToString::to_string),
                         }
                     }
                 }
@@ -1239,7 +1239,7 @@ mod process_basic_result_tests {
 
     #[test]
     fn partial_success_records_state_and_diagnostic() {
-        let resource = Resource::with_provider("mock", "test.resource", "r1", None);
+        let resource: Resource = Resource::with_provider("mock", "test.resource", "r1", None);
         let id = resource.id.clone();
         let state = State::existing(id.clone(), HashMap::new()).with_identifier("mock-id");
         let diagnostic = PartialReadDiagnostic::new(
@@ -1325,7 +1325,7 @@ mod assert_fully_resolved_tests {
     };
 
     fn dvo_chained_ref() -> Value {
-        let path = AccessPath::with_segments(
+        let path = AccessPath::root_with_segments(
             "cert",
             "domain_validation_options",
             vec![
@@ -1432,7 +1432,7 @@ mod assert_fully_resolved_tests {
     #[test]
     fn binding_ref_is_rejected() {
         let v = Value::Deferred(DeferredValue::BindingRef {
-            binding: "vpc".to_string(),
+            binding: crate::resource::RootScope::new().resolve("vpc".into()),
         });
         let err = assert_fully_resolved(&v, "vpc_id", &empty_bindings())
             .expect_err("bare BindingRef must be rejected");
@@ -1477,7 +1477,7 @@ mod assert_fully_resolved_tests {
                 name: crate::builtins::BuiltinFunction::split,
                 args: vec![
                     Value::Concrete(ConcreteValue::String("-".into())).into(),
-                    Value::resource_ref("q", "identifier", vec![]).into(),
+                    Value::root_resource_ref("q", "identifier", vec![]).into(),
                 ],
                 source_line: (0).into(),
             }),
@@ -1517,7 +1517,7 @@ mod assert_fully_resolved_tests {
     /// stack first", not at `wait`.
     #[test]
     fn resource_ref_to_upstream_state_binding_does_not_suggest_wait() {
-        let path = AccessPath::with_segments("infra", "cloudfront_distribution_id", vec![]);
+        let path = AccessPath::root_with_segments("infra", "cloudfront_distribution_id", vec![]);
         let v = Value::Deferred(DeferredValue::ResourceRef { path });
         let bindings = bindings_with("infra", BindingValueSource::Upstream);
 
@@ -1545,7 +1545,7 @@ mod assert_fully_resolved_tests {
     /// `let` chain.
     #[test]
     fn interpolation_into_upstream_state_binding_does_not_suggest_wait() {
-        let path = AccessPath::with_segments("infra", "cloudfront_distribution_id", vec![]);
+        let path = AccessPath::root_with_segments("infra", "cloudfront_distribution_id", vec![]);
         let v = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("arn:aws:cloudfront::123:distribution/".into()),
             InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef { path })),
@@ -1572,7 +1572,7 @@ mod assert_fully_resolved_tests {
     #[test]
     fn binding_ref_to_upstream_state_binding_does_not_suggest_wait() {
         let v = Value::Deferred(DeferredValue::BindingRef {
-            binding: "infra".to_string(),
+            binding: crate::resource::RootScope::new().resolve("infra".into()),
         });
         let bindings = bindings_with("infra", BindingValueSource::Upstream);
 
@@ -1597,9 +1597,10 @@ mod assert_fully_resolved_tests {
     /// and `wait` (the local-binding remediation) cannot fix it.
     #[test]
     fn interpolation_with_mixed_bindings_prefers_upstream_state_remediation() {
-        let local_path = AccessPath::with_segments("cert", "domain_validation_options", vec![]);
+        let local_path =
+            AccessPath::root_with_segments("cert", "domain_validation_options", vec![]);
         let upstream_path =
-            AccessPath::with_segments("infra", "cloudfront_distribution_id", vec![]);
+            AccessPath::root_with_segments("infra", "cloudfront_distribution_id", vec![]);
         let v = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
                 path: local_path,
@@ -1633,7 +1634,7 @@ mod assert_fully_resolved_tests {
     /// the kind-aware branch only kicks in for `Upstream`.
     #[test]
     fn local_binding_keeps_existing_wait_block_hint() {
-        let path = AccessPath::with_segments("cert", "domain_validation_options", vec![]);
+        let path = AccessPath::root_with_segments("cert", "domain_validation_options", vec![]);
         let v = Value::Deferred(DeferredValue::ResourceRef { path });
         let bindings = bindings_with("cert", BindingValueSource::Local);
 

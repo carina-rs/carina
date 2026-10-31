@@ -26,10 +26,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use carina_cli::commands::validate_and_resolve_errors;
 use carina_cli::wiring::{
     OverrideAwareBuildMode, OverrideAwareResources, PlanPreprocessor, ProviderLoad,
-    resolve_config_block_names_for_test,
+    resolve_expanded_config_block_names_for_test,
 };
 use carina_core::binding_index::ResolvedBindings;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
@@ -314,7 +313,7 @@ fn apply_path_propagates_module_wait_binding() {
     .expect("load_configuration_with_config should succeed");
 
     let inference_errors = loaded.inference_errors;
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
     let providers = ProviderLoad::for_test(
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
@@ -323,30 +322,26 @@ fn apply_path_propagates_module_wait_binding() {
         &parsed.providers,
     );
 
-    let errors = validate_and_resolve_errors(
-        &mut parsed,
-        base_dir,
-        &providers,
-        // `skip_resource_validation = true` is a real apply-path mode
-        // (run_apply's backend-seed re-load uses it,
-        // apply/mod.rs:635). It still runs the *same* module
-        // expansion — `resolve_modules_with_config` at
-        // commands/mod.rs:285 is gated only on the non-resource
-        // checks, not on this flag. Using it here isolates
-        // wait-binding propagation from full nested-schema
-        // validation (we are not testing the awscc Distribution
-        // schema, only that the module's `wait` survives apply
-        // expansion).
-        true,
-        &inference_errors,
-        &[],
-    );
-    assert!(
-        errors.is_empty(),
-        "apply-path validate/resolve must succeed for the valid \
-         module fixture; got: {:?}",
-        errors.iter().map(ToString::to_string).collect::<Vec<_>>()
-    );
+    let wiring = providers
+        .validate_evaluated_config(
+            parsed,
+            base_dir,
+            // `skip_resource_validation = true` is a real apply-path mode
+            // (run_apply's backend-seed re-load uses it,
+            // apply/mod.rs:635). It still runs the *same* module
+            // expansion — `resolve_modules_with_config` at
+            // commands/mod.rs:285 is gated only on the non-resource
+            // checks, not on this flag. Using it here isolates
+            // wait-binding propagation from full nested-schema
+            // validation (we are not testing the awscc Distribution
+            // schema, only that the module's `wait` survives apply
+            // expansion).
+            true,
+            &inference_errors,
+            &[],
+        )
+        .expect("apply-path validate/resolve must succeed for the valid module fixture");
+    let parsed = wiring.evaluated_resources_for_test();
 
     // The module's `wait cert` lives two levels in. After the apply
     // path's expansion it MUST reach the caller, instance-prefixed.
@@ -379,7 +374,9 @@ fn apply_path_propagates_module_wait_binding() {
         carina_core::parser::ResourceRef::Resource(dist),
     );
     assert!(
-        deps.contains("r.cert_issued"),
+        deps.contains(&carina_core::resource::absolute_binding_address_for_test(
+            "r.cert_issued",
+        )),
         "expanded Distribution must depend on the prefixed wait \
          binding `r.cert_issued`; deps were {deps:?}"
     );
@@ -418,7 +415,7 @@ fn apply_path_propagates_module_wait_binding() {
     let composition_r = parsed
         .compositions
         .iter()
-        .any(|r| r.binding.as_deref() == Some("r"));
+        .any(|r| r.binding.as_ref().map(|binding| binding.as_str()) == Some("r"));
     // This assertion encodes the hypothesis. If it FAILS showing
     // binding="r", we've found the apply-path root cause: the nested
     // ref binds to the composition module proxy, not the wait binding.
@@ -442,7 +439,7 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
     .expect("load_configuration_with_config should succeed");
 
     let inference_errors = loaded.inference_errors;
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
     let providers = ProviderLoad::for_test(
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
@@ -450,20 +447,12 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
         ]),
         &parsed.providers,
     );
-    let errors = validate_and_resolve_errors(
-        &mut parsed,
-        base_dir,
-        &providers,
-        false,
-        &inference_errors,
-        &[],
-    );
-
-    assert!(
-        errors.is_empty(),
-        "full validation must accept a module-internal wait after expansion prefixes its managed-resource target: {:?}",
-        errors.iter().map(ToString::to_string).collect::<Vec<_>>(),
-    );
+    let wiring = providers
+        .validate_evaluated_config(parsed, base_dir, false, &inference_errors, &[])
+        .expect(
+            "full validation must accept a module-internal wait after expansion prefixes its managed-resource target",
+        );
+    let parsed = wiring.evaluated_resources_for_test();
     assert!(
         parsed.wait_bindings.iter().any(|wait| {
             wait.binding.as_str() == "r.cert_issued" && wait.target.as_str() == "r.cert"
@@ -562,12 +551,12 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .expect("resolve_refs");
 
     let resource_origins = sorted_resources.clone();
-    let mut unresolved_for_plan = carina_core::parser::ParsedFile::default();
+    let mut unresolved_for_plan = carina_core::parser::ExpandedParsedFile::default();
     unresolved_for_plan.resources = resources_for_plan.clone();
     let canonical_for_plan = unresolved_for_plan.clone();
-    let canonical_unresolved = resolve_config_block_names_for_test(
+    let canonical_unresolved = resolve_expanded_config_block_names_for_test(
         canonical_for_plan,
-        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved_for_plan),
+        unresolved_for_plan,
         ctx.schemas(),
     )
     .expect("block-name resolution");

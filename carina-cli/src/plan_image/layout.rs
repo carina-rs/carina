@@ -1750,21 +1750,26 @@ mod tests {
     use carina_core::provider::AppliedIdentifier;
     use carina_core::resource::{
         CallSite, ExpansionTrace, PersistentId, ResolvedResource, ResolvedResourceId, Resource,
-        ResourceId, State, Value,
+        ResourceId, State,
     };
 
     use super::*;
     use crate::plan_image::model::{PlanImageInput, build_model};
 
+    fn absolute_binding(name: impl Into<String>) -> carina_core::resource::AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(name)
+    }
+
     fn resource(binding: &str, dependencies: &[&str]) -> Resource {
         let identity = carina_core::resource::ResourceIdentity::try_from(binding.to_string())
             .expect("fixture identity");
         let mut resource = Resource::new("test.Widget", identity);
-        resource.binding = Some(binding.to_string());
+        resource.binding = Some(absolute_binding(binding));
         for dependency in dependencies {
             resource.set_attr(
                 format!("ref_{dependency}"),
-                Value::resource_ref((*dependency).to_string(), "id".to_string(), vec![]),
+                carina_core::resource::AuthoredValue::resource_ref(*dependency, "id", vec![])
+                    .resolve_root_for_test(),
             );
         }
         resource
@@ -1883,7 +1888,11 @@ mod tests {
             from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
             identifier: AppliedIdentifier::new(format!(
                 "{}-id",
-                resource.binding.as_deref().expect("test resource is bound")
+                resource
+                    .binding
+                    .as_ref()
+                    .expect("test resource is bound")
+                    .as_str()
             ))
             .unwrap(),
             to: ResolvedResource::new(resource),
@@ -2609,8 +2618,8 @@ mod tests {
                 identifier: AppliedIdentifier::new(format!("{binding}-id")).unwrap(),
                 generation: EffectGeneration::Current,
                 directives: Default::default(),
-                binding: Some(binding.to_string()),
-                dependencies: dependencies.into_iter().map(str::to_string).collect(),
+                binding: Some(absolute_binding(binding)),
+                dependencies: dependencies.into_iter().map(absolute_binding).collect(),
                 explicit_dependencies: HashSet::new(),
                 blocked_by_updates: HashSet::new(),
             });

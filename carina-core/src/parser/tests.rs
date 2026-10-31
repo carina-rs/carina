@@ -2,12 +2,31 @@ use super::*;
 use crate::binding_index::{IterableBindings, LivePreDataSourceReadInputs, ResolvedBindings};
 use crate::resolver::resolve_refs_for_plan;
 use crate::resource::{
-    ConcreteValue, DeferredValue, ForLoopElement, InterpolationPart, LoopKind, LoopOriginKind,
-    Resource, UnknownReason, Value,
+    AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
+    AuthoredInterpolationPart as InterpolationPart, AuthoredUnknownReason as UnknownReason,
+    AuthoredValue as Value, ExpandedConcreteValue, ExpandedDeferredValue,
+    ExpandedInterpolationPart, ExpandedResource, ExpandedUnknownReason, ExpandedValue,
+    ForLoopElement, LoopKind, LoopOriginKind, RootScope,
 };
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
+
+fn resolve_remote_bindings(
+    remote: HashMap<String, HashMap<String, Value>>,
+) -> HashMap<String, HashMap<String, ExpandedValue>> {
+    let scope = RootScope::new();
+    remote
+        .into_iter()
+        .map(|(binding, attributes)| {
+            let attributes = attributes
+                .into_iter()
+                .map(|(name, value)| (name, value.resolve_root(&scope)))
+                .collect();
+            (binding, attributes)
+        })
+        .collect()
+}
 
 #[test]
 fn parse_and_resolve_returns_value_only_no_closure() {
@@ -2989,14 +3008,16 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
 
     // Build a `remote_bindings` shape mirroring what `load_upstream_states`
     // produces at plan/apply time.
-    let mut mgmt_attrs: HashMap<String, Value> = HashMap::new();
+    let parsed = parsed.resolve_root(&crate::resource::RootScope::new());
+    let mut mgmt_attrs: HashMap<String, crate::resource::ExpandedValue> = HashMap::new();
     mgmt_attrs.insert(
         "role_arn".to_string(),
-        Value::Concrete(ConcreteValue::String(
+        crate::resource::ExpandedValue::Concrete(crate::resource::ExpandedConcreteValue::String(
             "arn:aws:iam::123456789012:role/writer".into(),
         )),
     );
-    let mut remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    let mut remote: HashMap<String, HashMap<String, crate::resource::ExpandedValue>> =
+        HashMap::new();
     remote.insert("mgmt".to_string(), mgmt_attrs);
 
     let resolved =
@@ -3010,23 +3031,29 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
         .attributes()
         .get("assume_role")
         .unwrap();
-    let Value::Concrete(ConcreteValue::Map(m)) = assume_role else {
+    let crate::resource::ExpandedValue::Concrete(crate::resource::ExpandedConcreteValue::Map(m)) =
+        assume_role
+    else {
         panic!("expected Map for assume_role post-resolve, got: {assume_role:?}");
     };
     assert_eq!(
         m.get("role_arn"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "arn:aws:iam::123456789012:role/writer".into()
-        ))),
+        Some(&crate::resource::ExpandedValue::Concrete(
+            crate::resource::ExpandedConcreteValue::String(
+                "arn:aws:iam::123456789012:role/writer".into()
+            ),
+        )),
         "role_arn must be substituted from remote_bindings; got: {m:?}",
     );
     assert_eq!(
         m.get("session_name"),
-        Some(&Value::Concrete(ConcreteValue::String("downstream".into()))),
+        Some(&crate::resource::ExpandedValue::Concrete(
+            crate::resource::ExpandedConcreteValue::String("downstream".into()),
+        )),
         "literal sibling must be preserved",
     );
 
-    let Value::Concrete(ConcreteValue::Map(raw)) =
+    let crate::resource::ExpandedValue::Concrete(crate::resource::ExpandedConcreteValue::Map(raw)) =
         parsed.providers[0].attributes.get("assume_role").unwrap()
     else {
         panic!("expected raw provider map to remain intact");
@@ -3034,7 +3061,9 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
     assert!(
         matches!(
             raw.get("role_arn"),
-            Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+            Some(crate::resource::ExpandedValue::Deferred(
+                crate::resource::ExpandedDeferredValue::ResourceRef { .. }
+            ))
         ),
         "resolution must not create a second mutable source of truth in parsed.providers"
     );
@@ -3061,8 +3090,10 @@ fn resolve_provider_attributes_with_remote_rejects_unknown_refs() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
-    let empty: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    let parsed = parse(input, &ProviderContext::default())
+        .unwrap()
+        .resolve_root(&crate::resource::RootScope::new());
+    let empty: HashMap<String, HashMap<String, crate::resource::ExpandedValue>> = HashMap::new();
 
     let error =
         resolve_provider_attributes_with_remote(&parsed, &empty, &ProviderContext::default())
@@ -3093,7 +3124,9 @@ fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
     )
     .unwrap();
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default()).unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .unwrap()
+        .resolve_root(&crate::resource::RootScope::new());
     let resolved = resolve_provider_attributes_with_remote(
         &parsed,
         &HashMap::new(),
@@ -3102,9 +3135,9 @@ fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
     .expect("provider attributes should use the merged user-function scope");
     assert_eq!(
         resolved.as_provider_configs()[0].attributes.get("region"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "ap-northeast-1".into()
-        ))),
+        Some(&crate::resource::ExpandedValue::Concrete(
+            crate::resource::ExpandedConcreteValue::String("ap-northeast-1".into()),
+        )),
     );
 }
 
@@ -3128,7 +3161,9 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
     )
     .unwrap();
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default()).unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .unwrap()
+        .resolve_root(&crate::resource::RootScope::new());
     let error = resolve_provider_attributes_with_remote(
         &parsed,
         &HashMap::new(),
@@ -3148,7 +3183,7 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
 #[test]
 fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them() {
     use crate::parser::resolve_provider_attributes_with_remote;
-    use crate::resource::AccessPath;
+    use crate::resource::AuthoredAccessPath as AccessPath;
 
     let mut parsed = InferredFile::default();
     parsed.providers.push(ProviderConfig {
@@ -3167,10 +3202,11 @@ fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them(
         binding: None,
     });
     parsed.upstream_states.push(UpstreamState {
-        binding: "mgmt".to_string(),
+        binding: "mgmt".into(),
         source: "../mgmt".into(),
     });
-    let remote = HashMap::new();
+    let parsed = parsed.resolve_root(&crate::resource::RootScope::new());
+    let remote: HashMap<String, HashMap<String, crate::resource::ExpandedValue>> = HashMap::new();
 
     let resolved =
         resolve_provider_attributes_with_remote(&parsed, &remote, &ProviderContext::default())
@@ -3178,7 +3214,9 @@ fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them(
     let saved = SavedProviderConfigs::from(&resolved);
     assert!(matches!(
         saved.as_provider_configs()[0].default_tags.get("Owner"),
-        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+        Some(crate::resource::ExpandedValue::Deferred(
+            crate::resource::ExpandedDeferredValue::ResourceRef { .. }
+        ))
     ));
     assert_eq!(
         serde_json::to_value(&saved).unwrap(),
@@ -3239,9 +3277,9 @@ fn saved_plan_provider_configs_accept_fully_resolved_attributes() {
 
     assert_eq!(
         resolved.iter().next().unwrap().attributes().get("region"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "ap-northeast-1".into()
-        )))
+        Some(&crate::resource::ExpandedValue::Concrete(
+            crate::resource::ExpandedConcreteValue::String("ap-northeast-1".into()),
+        ))
     );
 }
 
@@ -3250,7 +3288,7 @@ fn provider_config_carries_unresolved_attributes_field() {
     use crate::parser::ast::ProviderConfig;
     use indexmap::IndexMap;
 
-    let pc = ProviderConfig {
+    let pc: ProviderConfig = ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
@@ -3593,7 +3631,7 @@ fn parse_let_binding_module_call() {
 
     let call = &result.module_calls[0];
     assert_eq!(call.module_name, "web_tier");
-    assert_eq!(call.binding_name, Some("web".to_string()));
+    assert_eq!(call.binding_name.as_deref(), Some("web"));
     assert_eq!(
         call.argument("vpc").and_then(ModuleArgument::value),
         Some(&Value::Concrete(ConcreteValue::String("vpc-123".into())))
@@ -8365,7 +8403,7 @@ fn parse_env_resource_keeps_runtime_plan_and_state_plaintext() {
     assert_eq!(crate::ValueDescription::of(value).to_string(), "string");
     assert_eq!(crate::value::format_value(value), "'hunter2SECRET'");
     assert_eq!(
-        crate::value::value_to_json(value).unwrap(),
+        crate::value::value_to_json(&value.clone().resolve_root(&RootScope::new())).unwrap(),
         serde_json::json!(plaintext)
     );
 }
@@ -8418,7 +8456,7 @@ fn env_derived_subscript_is_redacted_in_unresolved_reference_diagnostic() {
         .variables
         .get("unresolved")
         .expect("unresolved binding");
-    let message = crate::value::value_to_json(value)
+    let message = crate::value::value_to_json(&value.clone().resolve_root(&RootScope::new()))
         .expect_err("reference remains unresolved")
         .to_string();
 
@@ -8448,7 +8486,7 @@ fn env_derived_pre_field_subscript_is_redacted_in_unresolved_reference_diagnosti
         .variables
         .get("unresolved")
         .expect("unresolved binding");
-    let message = crate::value::value_to_json(value)
+    let message = crate::value::value_to_json(&value.clone().resolve_root(&RootScope::new()))
         .expect_err("reference remains unresolved")
         .to_string();
 
@@ -8490,7 +8528,8 @@ fn parse_decrypt_uses_config_decryptor() {
         "secret(decrypt(...)) must be idempotent"
     );
     assert_eq!(crate::value::format_value(secret_val), "(secret)");
-    let state_value = crate::value::value_to_json(secret_val).unwrap();
+    let state_value =
+        crate::value::value_to_json(&secret_val.clone().resolve_root(&RootScope::new())).unwrap();
     let digest = state_value[crate::value::PERSISTED_SECRET_KEY]
         .as_str()
         .expect("Argon2id secret digest");
@@ -8523,7 +8562,8 @@ fn decrypt_inside_interpolation_resolves_to_a_secret_string() {
         ))))
     );
     assert_eq!(crate::value::format_value(value), "(secret)");
-    let state_value = crate::value::value_to_json(value).unwrap();
+    let state_value =
+        crate::value::value_to_json(&value.clone().resolve_root(&RootScope::new())).unwrap();
     let digest = state_value[crate::value::PERSISTED_SECRET_KEY]
         .as_str()
         .expect("Argon2id secret digest");
@@ -8702,9 +8742,15 @@ fn provider_context_validator_receives_canonical_numeric_text() {
             )]),
             Box::new(move |_owned, value| {
                 let observed_value = match value {
-                    Value::Concrete(ConcreteValue::Int(value)) => format!("int:{value}"),
-                    Value::Concrete(ConcreteValue::Float(value)) => format!("float:{value}"),
-                    Value::Concrete(ConcreteValue::String(value)) => {
+                    crate::resource::ExpandedValue::Concrete(
+                        crate::resource::ExpandedConcreteValue::Int(value),
+                    ) => format!("int:{value}"),
+                    crate::resource::ExpandedValue::Concrete(
+                        crate::resource::ExpandedConcreteValue::Float(value),
+                    ) => format!("float:{value}"),
+                    crate::resource::ExpandedValue::Concrete(
+                        crate::resource::ExpandedConcreteValue::String(value),
+                    ) => {
                         format!("string:{}", value.expose_plaintext())
                     }
                     other => format!("unexpected:{other:?}"),
@@ -8748,12 +8794,12 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
                         identity,
                         None,
                         legacy_validator(move |value| match value {
-                            Value::Concrete(ConcreteValue::Int(value)) if *value == accepted => {
-                                Ok(())
-                            }
-                            Value::Concrete(ConcreteValue::Int(value)) => {
-                                Err(format!("expected {accepted}, got {value}"))
-                            }
+                            crate::resource::ExpandedValue::Concrete(
+                                crate::resource::ExpandedConcreteValue::Int(value),
+                            ) if *value == accepted => Ok(()),
+                            crate::resource::ExpandedValue::Concrete(
+                                crate::resource::ExpandedConcreteValue::Int(value),
+                            ) => Err(format!("expected {accepted}, got {value}")),
                             _ => Err("Expected integer".to_string()),
                         }),
                     ),
@@ -8864,7 +8910,10 @@ fn parse_custom_validator_rejects_invalid() {
                 if target.identity() != &validator_identity {
                     return Ok(());
                 }
-                let Value::Concrete(ConcreteValue::String(s)) = value else {
+                let crate::resource::ExpandedValue::Concrete(
+                    crate::resource::ExpandedConcreteValue::String(s),
+                ) = value
+                else {
                     return Err(crate::parser::fixture_custom_type_rejection(
                         target,
                         "Expected string",
@@ -10165,9 +10214,10 @@ fn expand_deferred_for_with_remote_bindings() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
     assert_eq!(parsed.resources.len(), 0, "no resources before expansion"); // allow: direct — fixture test inspection
+    let mut parsed = parsed.resolve_root(&RootScope::new());
 
     // Simulate loading upstream_state with actual values
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -10183,7 +10233,9 @@ fn expand_deferred_for_with_remote_bindings() {
 
     // Expand deferred for-expressions
     parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
+            resolve_remote_bindings(remote_bindings),
+        ))
         .unwrap();
 
     // Deferred should be resolved
@@ -10211,7 +10263,7 @@ fn expand_deferred_for_with_remote_bindings() {
     let target_id_0 = r0.get_attr("target_id");
     assert_eq!(
         target_id_0,
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
             "111111111111".into()
         ))),
         "target_id should be substituted with actual account ID"
@@ -10221,7 +10273,7 @@ fn expand_deferred_for_with_remote_bindings() {
     let target_id_1 = r1.get_attr("target_id");
     assert_eq!(
         target_id_1,
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
             "222222222222".into()
         ))),
     );
@@ -10241,11 +10293,12 @@ fn expand_deferred_for_no_remote_data_stays_deferred() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    let mut parsed = parsed.resolve_root(&RootScope::new());
 
     // Empty remote_bindings — upstream hasn't been applied yet
-    let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    let remote_bindings: HashMap<String, HashMap<String, ExpandedValue>> = HashMap::new();
     parsed
         .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
         .unwrap();
@@ -10276,8 +10329,9 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    let mut parsed = parsed.resolve_root(&RootScope::new());
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut accounts: IndexMap<String, Value> = IndexMap::new();
@@ -10297,30 +10351,34 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
+            resolve_remote_bindings(remote_bindings),
+        ))
         .unwrap();
 
     assert_eq!(parsed.deferred_for_expressions.len(), 0);
     assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
 
     // Verify both key and value are substituted.
-    let mut by_name: HashMap<String, &Resource> = HashMap::new();
+    let mut by_name: HashMap<String, &ExpandedResource> = HashMap::new();
     for r in &parsed.resources {
-        if let Some(Value::Concrete(ConcreteValue::String(s))) = r.get_attr("target_name") {
+        if let Some(ExpandedValue::Concrete(ExpandedConcreteValue::String(s))) =
+            r.get_attr("target_name")
+        {
             by_name.insert(s.expose_plaintext().to_owned(), r);
         }
     }
     let prod = by_name.get("prod").expect("prod entry");
     assert_eq!(
         prod.get_attr("target_id"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
             "111111111111".into()
         )))
     );
     let dev = by_name.get("dev").expect("dev entry");
     assert_eq!(
         dev.get_attr("target_id"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
             "222222222222".into()
         )))
     );
@@ -10344,8 +10402,9 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    let mut parsed = parsed.resolve_root(&RootScope::new());
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10359,30 +10418,32 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
+            resolve_remote_bindings(remote_bindings),
+        ))
         .unwrap();
 
     assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
     assert_eq!(
         parsed.resources[0].get_attr("target_id"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
             "111111111111".into()
         )))
     );
     assert_eq!(
         parsed.resources[0].get_attr("position"),
-        Some(&Value::Concrete(ConcreteValue::Int(0))),
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::Int(0))),
         "index should be 0, not the item value"
     );
     assert_eq!(
         parsed.resources[1].get_attr("target_id"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
             "222222222222".into()
         )))
     );
     assert_eq!(
         parsed.resources[1].get_attr("position"),
-        Some(&Value::Concrete(ConcreteValue::Int(1)))
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::Int(1)))
     );
 }
 
@@ -10414,8 +10475,9 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 3);
+    let mut parsed = parsed.resolve_root(&RootScope::new());
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10437,14 +10499,19 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
+            resolve_remote_bindings(remote_bindings),
+        ))
         .unwrap();
 
     assert_eq!(parsed.deferred_for_expressions.len(), 0);
     assert_eq!(parsed.resources.len(), 3); // allow: direct — fixture test inspection
     for resource in &parsed.resources {
         assert!(
-            resource.dependency_bindings.contains("orgs"),
+            resource
+                .dependency_bindings
+                .iter()
+                .any(|binding| binding.as_str() == "orgs"),
             "expanded deferred-for child {} should depend on iterable binding `orgs`, got {:?}",
             resource.id,
             resource.dependency_bindings
@@ -10470,8 +10537,9 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    let mut parsed = parsed.resolve_root(&RootScope::new());
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10488,6 +10556,7 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
         Value::Concrete(ConcreteValue::String("anchor".into())),
     );
     remote_bindings.insert("anchor".to_string(), anchor_attrs);
+    let remote_bindings = resolve_remote_bindings(remote_bindings);
 
     parsed
         .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
@@ -10510,7 +10579,10 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
 
     let child = &parsed.resources[0];
     assert!(
-        child.dependency_bindings.contains("orgs"),
+        child
+            .dependency_bindings
+            .iter()
+            .any(|binding| binding.as_str() == "orgs"),
         "resolve_refs_for_plan must preserve deferred-for iterable dependency binding, got {:?}",
         child.dependency_bindings
     );
@@ -10534,8 +10606,9 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    let mut parsed = parsed.resolve_root(&RootScope::new());
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10548,29 +10621,31 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
+            resolve_remote_bindings(remote_bindings),
+        ))
         .unwrap();
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
     // label must have the placeholder substituted in the interpolation.
     let label = parsed.resources[0].get_attr("label");
     let rendered = match label {
-        Some(Value::Deferred(DeferredValue::Interpolation(parts))) => {
+        Some(ExpandedValue::Deferred(ExpandedDeferredValue::Interpolation(parts))) => {
             let mut s = String::new();
             for p in parts {
                 match p {
-                    crate::resource::InterpolationPart::Literal(lit) => {
-                        s.push_str(lit.expose_plaintext())
-                    }
-                    crate::resource::InterpolationPart::Expr(Value::Concrete(
-                        ConcreteValue::String(v),
+                    ExpandedInterpolationPart::Literal(lit) => s.push_str(lit.expose_plaintext()),
+                    ExpandedInterpolationPart::Expr(ExpandedValue::Concrete(
+                        ExpandedConcreteValue::String(v),
                     )) => s.push_str(v.expose_plaintext()),
                     _ => s.push_str("<expr>"),
                 }
             }
             s
         }
-        Some(Value::Concrete(ConcreteValue::String(s))) => s.expose_plaintext().to_owned(),
+        Some(ExpandedValue::Concrete(ExpandedConcreteValue::String(s))) => {
+            s.expose_plaintext().to_owned()
+        }
         other => panic!("unexpected label shape: {:?}", other),
     };
     assert!(
@@ -10581,22 +10656,35 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
     // After expansion no `Value::Deferred(DeferredValue::Unknown(ForValue))` placeholder must
     // remain in the resource tree — every for-binding occurrence is
     // replaced by the resolved iterable element. RFC #2371 stage 3.
-    fn contains_for_unknown(v: &Value) -> bool {
-        use crate::resource::{InterpolationPart, UnknownReason};
+    fn contains_for_unknown(v: &ExpandedValue) -> bool {
         match v {
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue))
-            | Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey))
-            | Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)) => true,
-            Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_for_unknown),
-            Value::Concrete(ConcreteValue::Map(m)) => m.values().any(contains_for_unknown),
-            Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|p| match p {
-                InterpolationPart::Expr(inner) => contains_for_unknown(inner),
-                InterpolationPart::Literal(_) => false,
-            }),
-            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => args
+            ExpandedValue::Deferred(ExpandedDeferredValue::Unknown(
+                ExpandedUnknownReason::ForValue,
+            ))
+            | ExpandedValue::Deferred(ExpandedDeferredValue::Unknown(
+                ExpandedUnknownReason::ForKey,
+            ))
+            | ExpandedValue::Deferred(ExpandedDeferredValue::Unknown(
+                ExpandedUnknownReason::ForIndex,
+            )) => true,
+            ExpandedValue::Concrete(ExpandedConcreteValue::List(items)) => {
+                items.iter().any(contains_for_unknown)
+            }
+            ExpandedValue::Concrete(ExpandedConcreteValue::Map(m)) => {
+                m.values().any(contains_for_unknown)
+            }
+            ExpandedValue::Deferred(ExpandedDeferredValue::Interpolation(parts)) => {
+                parts.iter().any(|p| match p {
+                    ExpandedInterpolationPart::Expr(inner) => contains_for_unknown(inner),
+                    ExpandedInterpolationPart::Literal(_) => false,
+                })
+            }
+            ExpandedValue::Deferred(ExpandedDeferredValue::FunctionCall { args, .. }) => args
                 .iter()
                 .any(|argument| contains_for_unknown(argument.walker_value())),
-            Value::Deferred(DeferredValue::Secret(inner)) => contains_for_unknown(inner),
+            ExpandedValue::Deferred(ExpandedDeferredValue::Secret(inner)) => {
+                contains_for_unknown(inner)
+            }
             _ => false,
         }
     }
@@ -10626,7 +10714,9 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed = parse(input, &ProviderContext::default())
+        .unwrap()
+        .resolve_root(&RootScope::new());
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut accounts: IndexMap<String, Value> = IndexMap::new();
@@ -10642,7 +10732,9 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
+            resolve_remote_bindings(remote_bindings),
+        ))
         .unwrap();
 
     assert_eq!(
@@ -10677,7 +10769,9 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed = parse(input, &ProviderContext::default())
+        .unwrap()
+        .resolve_root(&RootScope::new());
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10691,7 +10785,9 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
+        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
+            resolve_remote_bindings(remote_bindings),
+        ))
         .unwrap();
 
     // Mismatch: should NOT expand silently with numeric indices
@@ -11584,7 +11680,7 @@ fn type_expr_unknown_serde_round_trips() {
 
 #[test]
 fn parsed_export_param_keeps_optional_type_expr() {
-    let p = ParsedExportParam::dummy("vpc_id".to_string(), None, None);
+    let p: ParsedExportParam = ParsedExportParam::dummy("vpc_id".to_string(), None, None);
     assert!(p.type_expr.is_none());
 }
 
@@ -11909,7 +12005,7 @@ fn reject_cyclic_let_bindings_detects_secret_value_cycle() {
         "A".to_string(),
         Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
             DeferredValue::BindingRef {
-                binding: "B".to_string(),
+                binding: "B".into(),
             },
         )))),
     );
@@ -11917,7 +12013,7 @@ fn reject_cyclic_let_bindings_detects_secret_value_cycle() {
         "B".to_string(),
         Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
             DeferredValue::BindingRef {
-                binding: "A".to_string(),
+                binding: "A".into(),
             },
         )))),
     );
@@ -12032,9 +12128,9 @@ fn parse_directory_preserves_module_arg_dotted_string_literal() {
     )
     .unwrap();
 
-    let mut parsed = parse_directory(tmp.path(), &ProviderContext::default())
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
         .expect("directory fixture must parse");
-    resolve_modules(&mut parsed, tmp.path()).expect("module expansion must succeed");
+    let parsed = resolve_modules(parsed, tmp.path()).expect("module expansion must succeed");
     let record = parsed
         .resources
         .iter()
@@ -12043,7 +12139,7 @@ fn parse_directory_preserves_module_arg_dotted_string_literal() {
 
     assert_eq!(
         record.attributes.get("domain_name"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
             "publish.example.com".into()
         )))
     );
@@ -13467,7 +13563,7 @@ fn parse_provider_expr_with_discard_pattern() {
 #[test]
 fn provider_config_named_instance_serde_round_trip() {
     use crate::parser::ast::ProviderConfig;
-    let original = ProviderConfig {
+    let original: ProviderConfig = ProviderConfig {
         name: "aws".to_string(),
         attributes: {
             let mut m = IndexMap::new();
@@ -13525,7 +13621,7 @@ fn provider_config_deserializes_legacy_plan_instance_shapes() {
 #[test]
 fn provider_config_default_instance_serde_round_trip() {
     use crate::parser::ast::ProviderConfig;
-    let original = ProviderConfig {
+    let original: ProviderConfig = ProviderConfig {
         name: "aws".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
@@ -14163,8 +14259,8 @@ fn access_path_serde_round_trips_mixed_segments() {
     // State files persist `AccessPath` as JSON. A path with mixed
     // segments (the chained-access shape) must round-trip structurally
     // so reloaded state preserves source-order semantics.
-    use crate::resource::{AccessPath, PathSegment, Subscript};
-    let original = AccessPath::with_segments(
+    use crate::resource::{AuthoredAccessPath, PathSegment, Subscript};
+    let original = AuthoredAccessPath::with_segments(
         "cert",
         "domain_validation_options",
         vec![
@@ -14182,7 +14278,7 @@ fn access_path_serde_round_trips_mixed_segments() {
         ],
     );
     let json = serde_json::to_string(&original).unwrap();
-    let reloaded: AccessPath = serde_json::from_str(&json).unwrap();
+    let reloaded: AuthoredAccessPath = serde_json::from_str(&json).unwrap();
     assert_eq!(original, reloaded);
 }
 
@@ -15313,7 +15409,7 @@ fn postfix_access_reference_roots_are_canonical_reference_paths() {
     assert_eq!(
         parsed.variables.get("r0"),
         Some(&Value::Deferred(DeferredValue::BindingRef {
-            binding: "roles[0]".to_string(),
+            binding: "roles[0]".into(),
         })),
         "an indexed address is a typed reference, not a lowered handle string",
     );
@@ -15640,7 +15736,7 @@ mod loop_var_field_access_matrix {
                 aws.ec2.Subnet { name = o.k }
             }
         "#;
-        let mut p = parse(src, &ProviderContext::default()).expect("parse");
+        let p = parse(src, &ProviderContext::default()).expect("parse");
         assert_eq!(p.deferred_for_expressions.len(), 1, "loop deferred");
         // The template body must carry the deferred postfix operation, not a
         // resource ResourceRef (which would never resolve for a loop var) and
@@ -15663,6 +15759,7 @@ mod loop_var_field_access_matrix {
             "deferred template must carry postfix Access; got {:?}",
             tmpl.get_attr("name")
         );
+        let mut p = p.resolve_root(&RootScope::new());
 
         let mut items = IndexMap::new();
         items.insert(
@@ -15678,13 +15775,17 @@ mod loop_var_field_access_matrix {
         );
         let mut remote = HashMap::new();
         remote.insert("up".to_string(), up_attrs);
-        p.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote))
-            .unwrap();
+        p.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
+            resolve_remote_bindings(remote),
+        ))
+        .unwrap();
 
         assert_eq!(p.deferred_for_expressions.len(), 0, "loop expanded");
         assert_eq!(
             p.resources.first().expect("one resource").get_attr("name"),
-            Some(&Value::Concrete(ConcreteValue::String("resolved".into()))),
+            Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                "resolved".into()
+            ))),
             "postfix Access must select from the resolved element"
         );
     }
@@ -15697,7 +15798,9 @@ mod loop_var_field_access_matrix {
                 mock.test.Thing { name = item["missing"] }
             }
         "#;
-        let mut parsed = parse(src, &ProviderContext::default()).expect("parse deferred loop");
+        let mut parsed = parse(src, &ProviderContext::default())
+            .expect("parse deferred loop")
+            .resolve_root(&RootScope::new());
         let item = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "present".to_string(),
             Value::Concrete(ConcreteValue::String("value".into())),
@@ -15711,7 +15814,9 @@ mod loop_var_field_access_matrix {
         remote.insert("up".to_string(), attrs);
 
         let error = parsed
-            .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote))
+            .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
+                resolve_remote_bindings(remote),
+            ))
             .expect_err("known missing keys must fail during deferred-for expansion");
         assert!(
             error.to_string().contains("key 'missing' not found"),
@@ -15727,15 +15832,17 @@ mod loop_var_field_access_matrix {
                 mock.test.Thing { name = r.missing }
             }
         "#;
-        let mut parsed = parse(src, &ProviderContext::default()).expect("parse deferred loop");
-        let item = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        let mut parsed = parse(src, &ProviderContext::default())
+            .expect("parse deferred loop")
+            .resolve_root(&RootScope::new());
+        let item = ExpandedValue::Concrete(ExpandedConcreteValue::Map(IndexMap::from([(
             "present".to_string(),
-            Value::Concrete(ConcreteValue::String("value".into())),
+            ExpandedValue::Concrete(ExpandedConcreteValue::String("value".into())),
         )])));
         let mut attrs = HashMap::new();
         attrs.insert(
             "rules".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![item.clone()])),
+            ExpandedValue::Concrete(ExpandedConcreteValue::List(vec![item.clone()])),
         );
         let mut resolved = ResolvedBindings::default();
         resolved.set("q", attrs, crate::binding_index::BindingValueSource::Local);
@@ -15747,15 +15854,17 @@ mod loop_var_field_access_matrix {
         let name = parsed
             .resources
             .iter()
-            .find(|resource| resource.binding.as_deref() == Some("children[0]"))
+            .find(|resource| {
+                resource.binding.as_ref().map(|binding| binding.as_str()) == Some("children[0]")
+            })
             .and_then(|resource| resource.get_attr("name"))
             .expect("expanded child name");
         assert!(matches!(
             name,
-            Value::Deferred(DeferredValue::Access(access)) if matches!(
+            ExpandedValue::Deferred(ExpandedDeferredValue::Access(access)) if matches!(
                 access.base(),
-                Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ForValue
+                ExpandedValue::Deferred(ExpandedDeferredValue::Unknown(
+                    ExpandedUnknownReason::ForValue
                 ))
             ) && matches!(
                 access.step(),

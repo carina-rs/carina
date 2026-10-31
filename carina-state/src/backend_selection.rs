@@ -7,7 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
-use carina_core::parser::BackendConfig as ParserBackendConfig;
+use carina_core::parser::{
+    BackendConfig as ParserBackendConfig, ExpandedBackendConfig as ExpandedParserBackendConfig,
+};
 use thiserror::Error;
 
 use crate::backend::{BackendError, BackendResult};
@@ -254,8 +256,20 @@ impl BackendSelection {
         project_dir: &Path,
         configured: Option<&ParserBackendConfig>,
     ) -> BackendResult<ReadBackendSelection> {
-        let project_dir = canonical_project_dir(project_dir);
-        let inspection = inspect(&project_dir, configured)?;
+        let inspection = inspect(&canonical_project_dir(project_dir), configured)?;
+        Self::for_read_inspection(inspection)
+    }
+
+    /// Expanded-config counterpart of [`BackendSelection::for_read`].
+    pub fn for_read_expanded(
+        project_dir: &Path,
+        configured: Option<&ExpandedParserBackendConfig>,
+    ) -> BackendResult<ReadBackendSelection> {
+        let inspection = inspect_expanded(&canonical_project_dir(project_dir), configured)?;
+        Self::for_read_inspection(inspection)
+    }
+
+    fn for_read_inspection(inspection: BackendInspection) -> BackendResult<ReadBackendSelection> {
         let lock_present = !matches!(inspection.status, BackendDriftStatus::Fresh);
         let (selected_config, drift) = match inspection.status {
             BackendDriftStatus::Drifted(drift) => {
@@ -280,8 +294,22 @@ impl BackendSelection {
         project_dir: &Path,
         configured: Option<&ParserBackendConfig>,
     ) -> BackendResult<MutationBackendSelection> {
-        let project_dir = canonical_project_dir(project_dir);
-        let inspection = inspect(&project_dir, configured)?;
+        let inspection = inspect(&canonical_project_dir(project_dir), configured)?;
+        Self::verified_for_mutation_inspection(inspection)
+    }
+
+    /// Expanded-config counterpart of [`BackendSelection::verified_for_mutation`].
+    pub fn verified_for_mutation_expanded(
+        project_dir: &Path,
+        configured: Option<&ExpandedParserBackendConfig>,
+    ) -> BackendResult<MutationBackendSelection> {
+        let inspection = inspect_expanded(&canonical_project_dir(project_dir), configured)?;
+        Self::verified_for_mutation_inspection(inspection)
+    }
+
+    fn verified_for_mutation_inspection(
+        inspection: BackendInspection,
+    ) -> BackendResult<MutationBackendSelection> {
         match inspection.status {
             BackendDriftStatus::Fresh => Ok(MutationBackendSelection::MissingLock {
                 path: BackendLock::lock_path(&inspection.project_dir),
@@ -389,11 +417,29 @@ fn inspect(
     project_dir: &Path,
     configured: Option<&ParserBackendConfig>,
 ) -> BackendResult<BackendInspection> {
-    let project_dir = project_dir.to_path_buf();
     let configured = configured
         .map(BackendConfig::try_from)
         .transpose()
         .map_err(BackendError::from)?;
+    inspect_resolved(project_dir, configured)
+}
+
+fn inspect_expanded(
+    project_dir: &Path,
+    configured: Option<&ExpandedParserBackendConfig>,
+) -> BackendResult<BackendInspection> {
+    let configured = configured
+        .map(BackendConfig::try_from)
+        .transpose()
+        .map_err(BackendError::from)?;
+    inspect_resolved(project_dir, configured)
+}
+
+fn inspect_resolved(
+    project_dir: &Path,
+    configured: Option<BackendConfig>,
+) -> BackendResult<BackendInspection> {
+    let project_dir = project_dir.to_path_buf();
     let configured_lock = configured
         .as_ref()
         .map(BackendLock::from_config)

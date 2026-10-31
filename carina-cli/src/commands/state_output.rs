@@ -90,7 +90,11 @@ impl StateShowDocument {
 
 impl StateShowResource {
     pub(crate) fn from_row(row: &ResourceState) -> Result<Self, StateShowOutputError> {
-        let resource = row.binding.as_deref().unwrap_or(row.identity.as_str());
+        let resource = row
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str())
+            .unwrap_or(row.identity.as_str());
         let current = match row.current() {
             CurrentInstance::None => StateShowCurrent {
                 kind: StateShowCurrentKind::None,
@@ -138,7 +142,7 @@ impl StateShowResource {
         };
 
         Ok(Self {
-            binding: row.binding.clone(),
+            binding: row.binding.as_ref().map(ToString::to_string),
             identity: row.identity.as_str().to_string(),
             provider: row.provider.clone(),
             resource_type: row.resource_type.clone(),
@@ -311,6 +315,10 @@ mod tests {
 
     use super::*;
 
+    fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(name)
+    }
+
     fn deposed_key(raw: &str) -> DeposedKey {
         serde_json::from_value(json!(raw)).expect("test deposed key must be valid")
     }
@@ -363,7 +371,7 @@ mod tests {
         .with_attribute("secret", json!({"$secret": digest}))
         .with_attribute("write_only", json!("accepted-plaintext"))
         .with_protected(true);
-        applied.binding = Some("bound".to_string());
+        applied.binding = Some(absolute_binding("bound"));
         applied.deposed.push(DeposedInstance::from_persisted_json(
             deposed_key("old-generation"),
             "mock-deposed-id".to_string(),
@@ -380,7 +388,8 @@ mod tests {
 
         let pending_id =
             ResourceId::with_provider_identity("mock", "test.resource", "pending-resource", None);
-        let pending_resource = ResolvedResource::new(Resource::from_id(pending_id.clone()));
+        let pending_resource: ResolvedResource =
+            ResolvedResource::new(Resource::from_id(pending_id.clone()));
         let pending = crate::fixture_in_flight_create(
             &pending_id,
             "resume-token",
@@ -390,7 +399,7 @@ mod tests {
         let mut pending =
             ResourceState::from_in_flight(&pending_resource, &pending, None, None, None)
                 .expect("in-flight fixture must be encodable");
-        pending.binding = Some("pending".to_string());
+        pending.binding = Some(absolute_binding("pending"));
 
         let missing = ResourceState::new("test.resource", "anonymous-resource", "mock")
             .with_attribute("reason", json!("legacy"));

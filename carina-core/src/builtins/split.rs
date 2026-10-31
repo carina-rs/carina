@@ -1,6 +1,6 @@
 //! `split(separator, string)` built-in function
 
-use crate::resource::{ConcreteValue, Value, ValueString};
+use crate::resource::{BindingAddress, ConcreteValue, Value, ValueString};
 
 use super::value_type_name;
 
@@ -15,7 +15,7 @@ use super::value_type_name;
 /// split("-", "a-b-c")  // => ["a", "b", "c"]
 /// "a-b-c" |> split("-") // => ["a", "b", "c"] (pipe form)
 /// ```
-pub(crate) fn builtin_split(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_split<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
     if args.len() != 2 {
         return Err(format!(
             "split() expects 2 arguments (separator, string), got {}",
@@ -43,7 +43,7 @@ pub(crate) fn builtin_split(args: &[Value]) -> Result<Value, String> {
         }
     };
 
-    let parts: Vec<Value> = input
+    let parts: Vec<Value<B>> = input
         .expose_plaintext()
         .split(separator.expose_plaintext())
         .map(|part| {
@@ -60,7 +60,7 @@ pub(crate) fn builtin_split(args: &[Value]) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::{ConcreteValue, Value};
+    use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
 
     #[test]
     fn split_basic() {

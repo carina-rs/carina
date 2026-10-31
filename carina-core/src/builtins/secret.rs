@@ -1,6 +1,6 @@
 //! `secret(value)` built-in function
 
-use crate::resource::{DeferredValue, Value};
+use crate::resource::{BindingAddress, DeferredValue, Value};
 
 /// `secret(value)` - Mark a value as secret.
 ///
@@ -12,7 +12,7 @@ use crate::resource::{DeferredValue, Value};
 /// secret("my-password")       // => Value::Deferred(DeferredValue::Secret(Value::String("my-password")))
 /// secret(env("DB_PASSWORD"))  // => Value::Deferred(DeferredValue::Secret(Value::String(<env value>)))
 /// ```
-pub(crate) fn builtin_secret(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_secret<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
     if args.len() != 1 {
         return Err(format!("secret() expects 1 argument, got {}", args.len()));
     }
@@ -28,7 +28,10 @@ pub(crate) fn builtin_secret(args: &[Value]) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::{ConcreteValue, DeferredValue, Value};
+    use crate::resource::{
+        ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
+        ExpandedValue as Value,
+    };
 
     #[test]
     fn secret_wraps_string_value() {
@@ -67,7 +70,7 @@ mod tests {
 
     #[test]
     fn secret_error_on_no_args() {
-        let args = vec![];
+        let args: Vec<Value> = vec![];
         let result = evaluate_builtin("secret", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 1 argument"));

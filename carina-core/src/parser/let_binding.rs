@@ -22,8 +22,11 @@ use super::expressions::wait_expr::parse_wait_expr;
 use super::grammar::PreprocessedFile;
 use super::parse_expression_eval;
 use super::util::eval_type_name;
-use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
-use crate::resource::{DataSource, Resource};
+use crate::eval_value::{
+    AuthoredEvalValue as EvalValue, AuthoredStructuralHandle as StructuralHandle,
+    StructuralHandleKind,
+};
+use crate::resource::{AuthoredDataSource as DataSource, AuthoredResource as Resource};
 
 /// Tuple returned by the let-binding parser. The RHS is `EvalValue`
 /// rather than `Value` so partial applications (closures) can survive
@@ -408,13 +411,13 @@ fn parse_primary_with_resource_or_module(
         Rule::upstream_state_expr => {
             let (line, _) = inner.as_span().start_pos().line_col();
             let us = parse_upstream_state_expr(inner, binding_name)?;
-            if ctx.upstream_states.contains_key(&us.binding) {
+            if ctx.upstream_states.contains_key(us.binding.as_str()) {
                 return Err(ParseError::DuplicateBinding {
-                    name: us.binding,
+                    name: us.binding.to_string(),
                     line,
                 });
             }
-            ctx.upstream_states.insert(us.binding.clone(), us);
+            ctx.upstream_states.insert(us.binding.to_string(), us);
             Ok((
                 upstream_state_structural_handle(binding_name),
                 vec![],

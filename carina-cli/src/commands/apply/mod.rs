@@ -34,7 +34,9 @@ use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
 
-use carina_core::parser::{ProviderConfig, ProviderContext, ResolvedProviderConfigs};
+use carina_core::parser::{
+    ExpandedInferredFile, ExpandedProviderConfig, ProviderContext, ResolvedProviderConfigs,
+};
 
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
@@ -181,7 +183,7 @@ fn format_total_apply_line(elapsed: Duration) -> String {
 
 struct BootstrapCreateContext<'a> {
     backend: &'a dyn StateBackend,
-    parsed: &'a carina_core::parser::InferredFile,
+    parsed: &'a ExpandedInferredFile,
     provider_configs: &'a ResolvedProviderConfigs,
     normalizer: &'a dyn ProviderNormalizer,
     factories: &'a [Box<dyn carina_core::provider::ProviderFactory>],
@@ -327,7 +329,7 @@ fn format_partial_state_bucket_create_warning(
     )
 }
 
-fn bootstrap_resolved_bindings(parsed: &carina_core::parser::InferredFile) -> ResolvedBindings {
+fn bootstrap_resolved_bindings(parsed: &ExpandedInferredFile) -> ResolvedBindings {
     let managed_current = HashMap::new();
     let remote_bindings = HashMap::new();
     let wait_aliases: Vec<WaitAliasSpec> = parsed
@@ -564,7 +566,7 @@ async fn execute_effects_with_observer(
     plan: &Plan,
     provider: &dyn Provider,
     normalizer: &dyn ProviderNormalizer,
-    provider_configs: &[ProviderConfig],
+    provider_configs: &[ExpandedProviderConfig],
     factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
     bindings: &mut ResolvedBindings,
@@ -619,7 +621,7 @@ async fn execute_rehydrated_saved_plan(
     plan_file: &ExecutablePlanFile,
     provider: &dyn Provider,
     normalizer: &dyn ProviderNormalizer,
-    provider_configs: &[ProviderConfig],
+    provider_configs: &[ExpandedProviderConfig],
     factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
     bindings: &mut ResolvedBindings,
@@ -675,13 +677,14 @@ async fn verify_upstream_snapshot(
 ) -> Result<(), AppError> {
     use carina_core::parser::UpstreamState;
     let project_dir = apply_target.source_dir();
-    let upstream_states: Vec<UpstreamState> = sources
-        .iter()
-        .map(|s| UpstreamState {
-            binding: s.binding.clone(),
-            source: s.source.clone(),
-        })
-        .collect();
+    let upstream_states: Vec<UpstreamState<carina_core::resource::AbsoluteBindingAddress>> =
+        sources
+            .iter()
+            .map(|s| UpstreamState {
+                binding: s.binding.clone(),
+                source: s.source.clone(),
+            })
+            .collect();
     let provider_context = ProviderContext::default();
     let mut cycle_guard = super::plan::seed_cycle_guard(project_dir);
     let current = super::plan::load_upstream_states(
@@ -1078,7 +1081,7 @@ pub(crate) async fn persist_exports_only(
     data_source_values: &DataSourceValues,
     pre_resolve_compositions: &[carina_core::resource::LiveComposition],
     export_params: &carina_core::validation::ExportsCheckedPreApply<
-        carina_core::parser::InferredExportParam,
+        carina_core::parser::ExpandedInferredExportParam,
     >,
     schemas: &carina_core::schema::SchemaRegistry,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
@@ -1644,7 +1647,7 @@ fn reload_apply_configuration_after_bootstrap(
 }
 
 async fn load_apply_provider_inputs<E>(
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::File<E, carina_core::resource::AbsoluteBindingAddress>,
     base_dir: &Path,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedProviderInputs, AppError> {
@@ -1678,8 +1681,9 @@ async fn create_state_bucket_bootstrap_provider<R>(
     Ok((provider, normalizer))
 }
 
-type CheckedApplyExports =
-    carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam>;
+type CheckedApplyExports = carina_core::validation::ExportsCheckedPreApply<
+    carina_core::parser::ExpandedInferredExportParam,
+>;
 
 enum SourceApplyAfterHeartbeat {
     Done(Option<Duration>),
@@ -1689,7 +1693,7 @@ enum SourceApplyAfterHeartbeat {
 
 struct SourceApplyPersistExports {
     validated_config: ValidatedConfig<
-        crate::wiring::ExpandedCanonicalResources<carina_core::parser::InferredExportParam>,
+        crate::wiring::ExpandedCanonicalResources<carina_core::parser::ExpandedInferredExportParam>,
     >,
     state_file: Option<StateFile>,
     resources: Vec<Resource>,
@@ -2417,12 +2421,14 @@ async fn run_apply_locked_canonical(
 }
 
 fn ensure_saved_plan_backend_matches_current(
-    plan_backend_config: Option<&carina_core::parser::BackendConfig>,
-    current_backend_config: Option<&carina_core::parser::BackendConfig>,
+    plan_backend_config: Option<&carina_core::parser::ExpandedBackendConfig>,
+    current_backend_config: Option<&carina_core::parser::ExpandedBackendConfig>,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
-    let planned = BackendLock::for_config(plan_backend_config).map_err(AppError::Backend)?;
-    let current = BackendLock::for_config(current_backend_config).map_err(AppError::Backend)?;
+    let planned =
+        BackendLock::for_expanded_config(plan_backend_config).map_err(AppError::Backend)?;
+    let current =
+        BackendLock::for_expanded_config(current_backend_config).map_err(AppError::Backend)?;
 
     if planned == current {
         Ok(())
@@ -2449,7 +2455,7 @@ impl<S> SavedPlanResourceLike for carina_core::resource::Resource<S> {
     }
 
     fn binding(&self) -> Option<&str> {
-        self.binding.as_deref()
+        self.binding.as_ref().map(|binding| binding.as_str())
     }
 
     fn attributes(&self) -> &indexmap::IndexMap<String, Value> {
@@ -2463,7 +2469,7 @@ impl<S> SavedPlanResourceLike for carina_core::resource::DataSource<S> {
     }
 
     fn binding(&self) -> Option<&str> {
-        self.binding.as_deref()
+        self.binding.as_ref().map(|binding| binding.as_str())
     }
 
     fn attributes(&self) -> &indexmap::IndexMap<String, Value> {
@@ -2519,7 +2525,7 @@ where
 
 fn import_identifiers_from_current_config<S>(
     plan: &carina_core::plan::Plan<S>,
-    parsed: &carina_core::parser::InferredFile,
+    parsed: &ExpandedInferredFile,
 ) -> HashMap<ResourceId, Value> {
     let mut identifiers = HashMap::new();
     let bindings = bootstrap_resolved_bindings(parsed);
@@ -2644,7 +2650,7 @@ fn rehydrate_desired_plan_file(
 
 fn rehydrate_desired_plan_file_from_parts(
     plan_file: &mut ReloadedPlanFile,
-    parsed: &carina_core::parser::InferredFile,
+    parsed: &ExpandedInferredFile,
     provider_inputs: &ResolvedProviderInputs,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
@@ -2971,9 +2977,9 @@ async fn run_apply_from_plan_with_observer_factory(
     );
     let (inspected_plan, parsed_backend) = match inspected_plan {
         InspectedPlanFile::Verified(plan) => {
-            let parsed_backend = loaded_current_config
-                .ok()
-                .map(|config| config.parsed.backend);
+            let parsed_backend = loaded_current_config.ok().map(|config| {
+                carina_core::module_resolver::expand_root_directory_file(config.parsed).backend
+            });
             (
                 ProviderBoundPlanFile::verified(plan, providers),
                 parsed_backend,
@@ -2983,7 +2989,6 @@ async fn run_apply_from_plan_with_observer_factory(
             let current_config = loaded_current_config.map_err(|source| {
                 saved_plan_secret_evaluation_error(AppError::Config(source), apply_target)
             })?;
-            let parsed_backend = Some(current_config.parsed.backend.clone());
             let parsed = current_config.parsed;
             let unresolved = current_config.unresolved_parsed;
             let inference_errors = current_config.inference_errors;
@@ -2998,6 +3003,7 @@ async fn run_apply_from_plan_with_observer_factory(
                     &duplicate_declarations,
                 )
                 .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
+            let parsed_backend = Some(providers.parsed().backend.clone());
             (
                 ProviderBoundPlanFile::needs_secret_verification(plan, providers),
                 parsed_backend,
@@ -3303,8 +3309,8 @@ async fn run_apply_from_plan_locked_owned(
                     .wait_bindings()
                     .iter()
                     .map(|wb| WaitAliasSpec {
-                        binding: carina_core::parser::BindingName::new(wb.binding.clone()),
-                        target: carina_core::parser::BindingName::new(wb.target.clone()),
+                        binding: wb.binding.clone(),
+                        target: wb.target.clone(),
                     })
                     .collect();
                 let terminal_input_current = carina_core::resource::into_plan_input_current_map(
@@ -3372,14 +3378,14 @@ async fn run_apply_from_plan_locked_owned(
             // `(binding, target)` pairs so `apply --plan`'s cascade
             // re-resolution resolves `<wait-binding>.<attr>` exactly as the
             // plan path did (carina#3085). `PlanWaitBinding` (String) →
-            // `WaitAliasSpec` (typed `BindingName`); the parser `WaitBinding`
+            // `WaitAliasSpec` (typed `AbsoluteBindingAddress`); the parser `WaitBinding`
             // is not serializable so it is reconstructed here, not deserialized.
             let wait_aliases: Vec<WaitAliasSpec> = rehydrated_plan_file
                 .wait_bindings()
                 .iter()
                 .map(|wb| WaitAliasSpec {
-                    binding: carina_core::parser::BindingName::new(wb.binding.clone()),
-                    target: carina_core::parser::BindingName::new(wb.target.clone()),
+                    binding: wb.binding.clone(),
+                    target: wb.target.clone(),
                 })
                 .collect();
             // carina#3248: saved plans (version 4) persist both

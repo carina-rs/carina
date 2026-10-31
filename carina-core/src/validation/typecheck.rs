@@ -4,18 +4,25 @@ use std::fmt;
 
 use crate::ValueDescription;
 use crate::parser::{ProviderContext, TypeExpr, validate_custom_type, validate_schema_custom_type};
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, Value};
 
 /// Static authority available while checking deferred computed values.
 /// Callers without a binding/schema view must say so explicitly rather than
 /// passing empty registries that look authoritative.
-#[derive(Clone, Copy)]
-pub enum TypecheckInference<'a> {
+pub enum TypecheckInference<'a, B: BindingAddress> {
     Available {
-        bindings: &'a super::inference::InferenceBindings,
+        bindings: &'a super::inference::InferenceBindings<B>,
         schemas: &'a crate::schema::SchemaRegistry,
     },
     Unavailable,
+}
+
+impl<B: BindingAddress> Copy for TypecheckInference<'_, B> {}
+
+impl<B: BindingAddress> Clone for TypecheckInference<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 /// One step from the checked value's root to the mismatched leaf.
@@ -134,11 +141,11 @@ impl fmt::Display for TypeExprValueError {
 ///
 /// Unresolved values defer until the binding/reference validation or
 /// evaluation phase that has their types.
-pub fn check_type_expr_value(
+pub fn check_type_expr_value<B: BindingAddress>(
     expected: &TypeExpr,
-    value: &Value,
+    value: &Value<B>,
     config: &ProviderContext,
-    inference: TypecheckInference<'_>,
+    inference: TypecheckInference<'_, B>,
 ) -> Result<(), TypeExprValueError> {
     if matches!(expected, TypeExpr::Unknown) {
         return Ok(());
@@ -252,7 +259,7 @@ pub fn check_type_expr_value(
             }
             Value::Concrete(ConcreteValue::StringList(items)) => {
                 for (index, item) in items.iter().enumerate() {
-                    let item = Value::Concrete(ConcreteValue::String(item.clone()));
+                    let item: Value<B> = Value::Concrete(ConcreteValue::String(item.clone()));
                     check_type_expr_value(inner, &item, config, inference).map_err(|error| {
                         error.prepend(TypeExprValuePathSegment::ListIndex(index))
                     })?;
@@ -356,7 +363,7 @@ pub fn check_type_expr_value(
     }
 }
 
-fn mismatch(expected: &TypeExpr, value: &Value) -> TypeExprValueError {
+fn mismatch<B: BindingAddress>(expected: &TypeExpr, value: &Value<B>) -> TypeExprValueError {
     let hint = matches!(
         (expected, value),
         (TypeExpr::Bool, Value::Concrete(ConcreteValue::String(_)))
@@ -371,7 +378,11 @@ fn mismatch(expected: &TypeExpr, value: &Value) -> TypeExprValueError {
     }
 }
 
-fn validation_mismatch(expected: &TypeExpr, value: &Value, message: String) -> TypeExprValueError {
+fn validation_mismatch<B: BindingAddress>(
+    expected: &TypeExpr,
+    value: &Value<B>,
+    message: String,
+) -> TypeExprValueError {
     TypeExprValueError::Mismatch {
         path: Vec::new(),
         expected: Box::new(expected.clone()),
@@ -382,9 +393,9 @@ fn validation_mismatch(expected: &TypeExpr, value: &Value, message: String) -> T
     }
 }
 
-fn custom_type_validation_mismatch(
+fn custom_type_validation_mismatch<B: BindingAddress>(
     expected: &TypeExpr,
-    value: &Value,
+    value: &Value<B>,
     error: crate::parser::CustomTypeValidationError,
 ) -> TypeExprValueError {
     TypeExprValueError::CustomTypeValidation {
@@ -395,9 +406,9 @@ fn custom_type_validation_mismatch(
     }
 }
 
-fn identified_scalar_shape_is_supported(
+fn identified_scalar_shape_is_supported<B: BindingAddress>(
     identity: &crate::schema::TypeIdentity,
-    value: &Value,
+    value: &Value<B>,
     config: &ProviderContext,
     owner_routed: bool,
 ) -> bool {
@@ -497,7 +508,11 @@ mod tests {
 
     use super::*;
     use crate::parser::ResourceTypePath;
-    use crate::resource::{CanonicalEnumValue, InterpolationPart, UnknownReason};
+    use crate::resource::{
+        AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
+        AuthoredInterpolationPart as InterpolationPart, AuthoredUnknownReason as UnknownReason,
+        AuthoredValue as Value, CanonicalEnumValue,
+    };
     use crate::schema::TypeIdentity;
 
     fn check(expected: &TypeExpr, value: &Value) -> Result<(), TypeExprValueError> {
@@ -750,7 +765,7 @@ mod tests {
         });
         let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
         let untyped_binding = Value::Deferred(DeferredValue::BindingRef {
-            binding: "outside".to_string(),
+            binding: "outside".into(),
         });
 
         for expected in all_type_shapes() {
@@ -863,9 +878,15 @@ mod tests {
                         return Ok(());
                     }
                     let text = match value {
-                        Value::Concrete(ConcreteValue::String(value)) => value.expose_plaintext(),
-                        Value::Concrete(ConcreteValue::EnumIdentifier(value)) => value.as_str(),
-                        Value::Concrete(ConcreteValue::CanonicalEnum(value)) => value.api_value(),
+                        crate::resource::ExpandedValue::Concrete(
+                            crate::resource::ExpandedConcreteValue::String(value),
+                        ) => value.expose_plaintext(),
+                        crate::resource::ExpandedValue::Concrete(
+                            crate::resource::ExpandedConcreteValue::EnumIdentifier(value),
+                        ) => value.as_str(),
+                        crate::resource::ExpandedValue::Concrete(
+                            crate::resource::ExpandedConcreteValue::CanonicalEnum(value),
+                        ) => value.api_value(),
                         _ => {
                             return Err(crate::parser::fixture_custom_type_rejection(
                                 target,
@@ -990,7 +1011,12 @@ mod tests {
                 Default::default(),
                 Box::new(|target, value| {
                     if target.identity().kind == "PositiveInt"
-                        && matches!(value, Value::Concrete(ConcreteValue::Int(value)) if *value > 0)
+                        && matches!(
+                            value,
+                            crate::resource::ExpandedValue::Concrete(
+                                crate::resource::ExpandedConcreteValue::Int(value)
+                            ) if *value > 0
+                        )
                     {
                         Ok(())
                     } else {
@@ -1036,14 +1062,12 @@ mod tests {
                             identity,
                             None,
                             legacy_validator(move |value| match value {
-                                Value::Concrete(ConcreteValue::Int(value))
-                                    if *value == accepted =>
-                                {
-                                    Ok(())
-                                }
-                                Value::Concrete(ConcreteValue::Int(value)) => {
-                                    Err(format!("expected {accepted}, got {value}"))
-                                }
+                                crate::resource::ExpandedValue::Concrete(
+                                    crate::resource::ExpandedConcreteValue::Int(value),
+                                ) if *value == accepted => Ok(()),
+                                crate::resource::ExpandedValue::Concrete(
+                                    crate::resource::ExpandedConcreteValue::Int(value),
+                                ) => Err(format!("expected {accepted}, got {value}")),
                                 _ => Err("Expected integer".to_string()),
                             }),
                         ),

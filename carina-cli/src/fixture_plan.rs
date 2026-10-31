@@ -230,10 +230,11 @@ pub struct FixturePlan {
     pub state_file: Option<StateFile>,
     pub schemas: SchemaRegistry,
     pub moved_origins: HashMap<ResourceId, ResourceId>,
-    pub deferred_for_expressions: Vec<carina_core::parser::DeferredForExpression>,
-    pub export_params: Vec<carina_core::parser::InferredExportParam>,
-    pub resolved_export_params:
-        carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam>,
+    pub deferred_for_expressions: Vec<carina_core::parser::ExpandedDeferredForExpression>,
+    pub export_params: Vec<carina_core::parser::ExpandedInferredExportParam>,
+    pub resolved_export_params: carina_core::validation::ExportsCheckedPreApply<
+        carina_core::parser::ExpandedInferredExportParam,
+    >,
     /// Per-resource user-authoring trees lifted from the fixture's
     /// `carina.state.json`. Forwarded to `format_plan` so server-side
     /// default fields the user never wrote do not surface in plan
@@ -406,7 +407,7 @@ where
             .and_then(|bytes| PublishedExports::from_state_bytes(&bytes).ok())
             .map(|exports| exports.build_remote_bindings())
             .unwrap_or_default();
-        remote_bindings.insert(us.binding.clone(), bindings);
+        remote_bindings.insert(us.binding.to_string(), bindings);
     }
     let resolved_provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
         parsed,
@@ -500,11 +501,12 @@ where
     // a display residual instead of turning it into an executable deferred
     // create. This stays fixture-only because production must retain those
     // deferred creates for apply-time expansion.
-    let managed_bindings: HashSet<String> = expansion_prelude
-        .sorted_resources()
-        .iter()
-        .filter_map(|resource| resource.binding.clone())
-        .collect();
+    let managed_bindings: HashSet<carina_core::resource::AbsoluteBindingAddress> =
+        expansion_prelude
+            .sorted_resources()
+            .iter()
+            .filter_map(|resource| resource.binding.clone())
+            .collect();
     let non_managed_deferred_for = parsed
         .deferred_for_expressions
         .iter()

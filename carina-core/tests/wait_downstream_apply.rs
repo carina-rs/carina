@@ -226,10 +226,10 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let mut caller = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     caller.push("tests/fixtures/wait/module_wait_downstream/caller");
 
-    let mut parsed = parse_directory(&caller, &ProviderContext::default())
+    let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed for the caller fixture");
 
-    resolve_modules(&mut parsed, &caller).expect("module resolution should succeed");
+    let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
 
     // ---- Root-cause assertion #1: the module's wait binding survived
     // expansion, instance-prefixed with the module-call binding (`r`).
@@ -246,21 +246,25 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     );
     let wb = &parsed.wait_bindings[0];
     assert_eq!(
-        wb.binding, "r.cert_issued",
+        wb.binding.as_str(),
+        "r.cert_issued",
         "wait binding must be instance-prefixed (r.cert_issued)"
     );
     assert_eq!(
-        wb.target, "r.cert",
+        wb.target.as_str(),
+        "r.cert",
         "wait target must be instance-prefixed (r.cert)"
     );
     assert_eq!(
-        wb.until_predicate.lhs_segments.first().map(String::as_str),
-        Some("r.cert"),
+        wb.until_predicate.root.as_str(),
+        "r.cert",
         "until predicate LHS root must be instance-prefixed; got {:?}",
-        wb.until_predicate.lhs_segments
+        wb.until_predicate.root
     );
     assert!(
-        wb.depends_on.iter().any(|d| d == "r.validation_record"),
+        wb.depends_on
+            .iter()
+            .any(|dependency| dependency.as_str() == "r.validation_record"),
         "depends_on entries must be instance-prefixed; got {:?}",
         wb.depends_on
     );
@@ -277,7 +281,8 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         carina_core::deps::get_resource_value_ref_dependencies(
             carina_core::parser::ResourceRef::Resource(dist)
         )
-        .contains("r.cert_issued"),
+        .iter()
+        .any(|dependency| dependency.as_str() == "r.cert_issued"),
         "Distribution must depend on the prefixed wait binding \
          `r.cert_issued`; deps were {:?}",
         carina_core::deps::get_resource_value_ref_dependencies(
@@ -418,10 +423,10 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     root.push("tests/fixtures/wait/module_wait_nested/root");
 
-    let mut parsed = parse_directory(&root, &ProviderContext::default())
+    let parsed = parse_directory(&root, &ProviderContext::default())
         .expect("parse_directory should succeed for the nested root fixture");
 
-    resolve_modules(&mut parsed, &root).expect("nested module resolution should succeed");
+    let parsed = resolve_modules(parsed, &root).expect("nested module resolution should succeed");
 
     // The two-level-deep wait binding survived, doubly instance-prefixed
     // (outer call binding `o`, inner call binding `c`).
@@ -436,13 +441,13 @@ async fn nested_module_wait_binding_survives_two_expansions() {
             .collect::<Vec<_>>()
     );
     let wb = &parsed.wait_bindings[0];
-    assert_eq!(wb.binding, "o.c.cert_issued");
-    assert_eq!(wb.target, "o.c.cert");
+    assert_eq!(wb.binding.as_str(), "o.c.cert_issued");
+    assert_eq!(wb.target.as_str(), "o.c.cert");
     assert_eq!(
-        wb.until_predicate.lhs_segments.first().map(String::as_str),
-        Some("o.c.cert"),
+        wb.until_predicate.root.as_str(),
+        "o.c.cert",
         "until LHS root must be doubly-prefixed; got {:?}",
-        wb.until_predicate.lhs_segments
+        wb.until_predicate.root
     );
 
     // The inner Distribution's nested ref was doubly-rewritten to match.
@@ -455,7 +460,8 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         carina_core::deps::get_resource_value_ref_dependencies(
             carina_core::parser::ResourceRef::Resource(dist)
         )
-        .contains("o.c.cert_issued"),
+        .iter()
+        .any(|dependency| dependency.as_str() == "o.c.cert_issued"),
         "Distribution must depend on the doubly-prefixed wait binding \
          `o.c.cert_issued`; deps were {:?}",
         carina_core::deps::get_resource_value_ref_dependencies(
@@ -596,9 +602,9 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     let mut caller = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     caller.push("tests/fixtures/wait/module_wait_downstream/caller");
 
-    let mut parsed = parse_directory(&caller, &ProviderContext::default())
+    let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed");
-    resolve_modules(&mut parsed, &caller).expect("module resolution should succeed");
+    let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
 
     let sorted_resources =
         sort_resources_by_dependencies(&parsed.resources).expect("topological sort");

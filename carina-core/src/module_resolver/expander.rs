@@ -9,14 +9,15 @@ use crate::binding_index::{BindingIndex, RefType, RefTypeError};
 use crate::eval_value::{BareStructuralHandle, StructuralHandleKind};
 use crate::identifier::SimHash;
 use crate::parser::{
-    ArgumentOrigin, BindingName, DeferredForExpression, ModuleArgument, ModuleCall, ParseError,
-    ParsedFile, WaitBinding,
+    ArgumentOrigin, BareBindingSource, DeferredForExpression, ModuleArgument, ModuleCall,
+    ParseError, ParsedBindingUses, ParsedFile, RelativeBindingName, WaitBinding,
 };
 use crate::resource::{
-    AccessMissPolicy, CompositionCall, CompositionCallPath, ConcreteValue, DataSource,
-    DeferredValue, LegacyLoopAddress, LiveComposition, ModuleInstanceScope, ModuleSource,
-    PathSegment, Resource, ResourceId, ResourceIdentity, ResourceIdentityState,
-    StructuralOperandRef, Value, ValuePathSegmentResult, apply_value_path_segment,
+    AbsoluteBindingAddress, AccessMissPolicy, AuthoredDataSource as DataSource,
+    AuthoredDeferredValue as DeferredValue, AuthoredResource as Resource, AuthoredValue as Value,
+    BindingAddress, ExpandedValue, LegacyLoopAddress, ModuleInstanceScope, ModuleSource,
+    PathSegment, ResourceId, ResourceIdentity, ResourceIdentityState, StructuralOperandRef,
+    ValuePathSegmentResult, apply_value_path_segment,
 };
 
 use super::error::ModuleError;
@@ -28,10 +29,71 @@ use super::validation::{
     ConstraintEvaluation, ModuleConstraintKind, ModuleConstraints, evaluate_module_constraints,
 };
 
+fn intra_module_binding_names(module: &ParsedFile) -> HashSet<RelativeBindingName> {
+    module
+        .resources
+        .iter()
+        .filter_map(|resource| resource.binding.clone())
+        .chain(
+            module
+                .data_sources
+                .iter()
+                .filter_map(|data_source| data_source.binding.clone()),
+        )
+        .chain(module.wait_bindings.iter().map(|wait| wait.binding.clone()))
+        .chain(
+            module
+                .module_calls
+                .iter()
+                .filter_map(|call| call.binding_name.clone()),
+        )
+        // Nested compositions may already carry a multi-segment binding
+        // (`middle.inner`). The outer expansion owns the final scope lift.
+        .chain(
+            module
+                .compositions
+                .iter()
+                .filter_map(|composition| composition.binding.clone()),
+        )
+        .chain(module.deferred_for_expressions.iter().filter_map(
+            |deferred| match &deferred.target {
+                crate::parser::DeferredForTarget::Bound { binding } => Some(binding.clone()),
+                crate::parser::DeferredForTarget::Unbound { template: _ } => None,
+            },
+        ))
+        .chain(
+            module
+                .deferred_for_expressions
+                .iter()
+                .filter_map(|deferred| deferred.template_resource.binding.clone()),
+        )
+        .collect()
+}
+
+struct ModuleExpansionSource<'a> {
+    module: Option<&'a ParsedFile>,
+    source: Option<&'a str>,
+    directory: Option<&'a std::path::Path>,
+    scope: Option<&'a ModuleInstanceScope>,
+    parent_call_path: Option<&'a crate::resource::ExpandedCompositionCallPath>,
+}
+
+impl ModuleExpansionSource<'_> {
+    fn imported() -> Self {
+        Self {
+            module: None,
+            source: None,
+            directory: None,
+            scope: None,
+            parent_call_path: None,
+        }
+    }
+}
+
 impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
     /// Expand a module call into resources.
     ///
-    /// Every module call creates a [`LiveComposition`]. Bound calls expose module
+    /// Every module call creates a [`crate::resource::LiveComposition`]. Bound calls expose module
     /// outputs through it; all calls retain their typed argument boundary for
     /// one post-expansion validation pass. Virtual resources are skipped by
     /// the differ.
@@ -61,35 +123,53 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
     /// (`resolve_nested_modules`) merges directly.
     pub(super) fn expand_module_call_checked(
         &self,
-        call: &ModuleCall,
+        authored_call: &ModuleCall,
+        call: &crate::parser::ModuleCall<AbsoluteBindingAddress>,
         instance_prefix: &str,
         ref_check: &super::resolver::RefCheckWitness,
         binding_index: Option<&BindingIndex<'_>>,
         resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
-    ) -> Result<ParsedFile, ModuleError> {
+    ) -> Result<crate::parser::ExpandedParsedFile, ModuleError> {
+        match ref_check {
+            super::resolver::RefCheckWitness(()) => {}
+        }
         self.expand_module_call_inner(
+            authored_call,
             call,
             instance_prefix,
-            ref_check,
             binding_index,
             resolved_bindings,
+            ModuleExpansionSource::imported(),
         )
         .map_err(|error| error.with_failing_call(call.id().clone()))
     }
 
     fn expand_module_call_inner(
         &self,
-        call: &ModuleCall,
+        authored_call: &ModuleCall,
+        call: &crate::parser::ModuleCall<AbsoluteBindingAddress>,
         instance_prefix: &str,
-        _ref_check: &super::resolver::RefCheckWitness,
         binding_index: Option<&BindingIndex<'_>>,
         resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
-    ) -> Result<ParsedFile, ModuleError> {
-        let module = self
-            .imported_modules
-            .get(&call.module_name)
-            .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?;
+        expansion_source: ModuleExpansionSource<'_>,
+    ) -> Result<crate::parser::ExpandedParsedFile, ModuleError> {
+        let module = match expansion_source.module {
+            Some(module) => module,
+            None => self
+                .imported_modules
+                .get(&call.module_name)
+                .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?,
+        };
         let call_source_file = call.source_file();
+        let module_instance_scope = expansion_source.scope.cloned().unwrap_or_else(|| {
+            ModuleInstanceScope::for_call(
+                &call.module_name,
+                call.binding_name
+                    .as_ref()
+                    .map(AbsoluteBindingAddress::as_str),
+                instance_prefix,
+            )
+        });
         let call_source_path = crate::utils::normalize_source_path(call_source_file)
             .display()
             .to_string();
@@ -164,6 +244,13 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // per argument plus one) bounds genuinely cyclic shapes
         // (`a = b`, `b = a`); leftover unresolved refs surface to the
         // post-merge scope check as undefined identifiers. #2817.
+        let authored_argument_references = authored_call
+            .arguments()
+            .filter_map(|(name, argument)| {
+                authored_argument_reference_path(argument)
+                    .map(|reference| (name.to_string(), reference))
+            })
+            .collect::<HashMap<_, _>>();
         let mut resolved_arguments: HashMap<String, ResolvedArgument> = HashMap::new();
         let call_line = call.source_span().start_line();
         for arg in &module.arguments {
@@ -174,14 +261,17 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                         key_span: authored.key_span(),
                         value_span: authored.value_span(),
                     },
+                    caller_reference: authored_argument_references.get(&arg.name).cloned(),
                 },
                 None => ResolvedArgument {
                     argument: ModuleArgument::new(
                         arg.default
                             .clone()
-                            .expect("required arguments were checked above"),
+                            .expect("required arguments were checked above")
+                            .resolve_module(&module_instance_scope),
                     ),
                     origin: ArgumentOrigin::Defaulted,
+                    caller_reference: None,
                 },
             };
             resolved_arguments.insert(arg.name.clone(), argument);
@@ -245,12 +335,25 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                         .map_err(contextualize_access_error)?
                 };
                 let next = ModuleArgument::from_parts(next, next_access);
-                if next != current.argument {
+                let caller_reference = current.caller_reference.clone().or_else(|| {
+                    module_parameter_postfix(current.walker_value(), &snapshot).and_then(
+                        |(source, postfix)| {
+                            snapshot.get(&source).and_then(|source_argument| {
+                                source_argument
+                                    .caller_reference
+                                    .clone()
+                                    .map(|reference| append_reference_path(reference, &postfix))
+                            })
+                        },
+                    )
+                });
+                if next != current.argument || caller_reference != current.caller_reference {
                     resolved_arguments.insert(
                         arg.name.clone(),
                         ResolvedArgument {
                             argument: next,
                             origin: current.origin,
+                            caller_reference,
                         },
                     );
                     changed = true;
@@ -267,7 +370,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             binding_index,
             config: self.config,
         };
-        let argument_values: HashMap<String, Value> = resolved_arguments
+        let argument_values: HashMap<String, ExpandedValue> = resolved_arguments
             .iter()
             .map(|(name, argument)| {
                 let value = argument.walker_value();
@@ -365,7 +468,9 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                                         .module_diagnostic(
                                             &call.module_name,
                                             instance_prefix,
-                                            call.binding_name.as_deref(),
+                                            call.binding_name
+                                                .as_ref()
+                                                .map(AbsoluteBindingAddress::as_str),
                                             Some(call.id()),
                                         )
                                         .expect("concrete outcome has a diagnostic"),
@@ -399,7 +504,9 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                         .module_error(
                             &call.module_name,
                             instance_prefix,
-                            call.binding_name.as_deref(),
+                            call.binding_name
+                                .as_ref()
+                                .map(AbsoluteBindingAddress::as_str),
                             Some(call.id()),
                         )
                         .expect("concrete constraint failure has a resolver error"));
@@ -407,83 +514,102 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             }
         }
 
-        // Collect intra-module binding names so we can rewrite
-        // ResourceRefs. Wait-binding names are included alongside
-        // resource bindings so a downstream resource referencing
-        // `<wait_binding>.<attr>` is instance-prefixed the same way —
-        // otherwise its dependency edge to the wait is lost
-        // (carina#3061; see `prefix_wait_binding`). Module-call bindings
-        // (`let x = inner { ... }`) need the same treatment so a sibling
-        // resource referencing `x.<attr>` lines up with the
-        // `_virtual.<prefix>.x` row produced by the inner expansion
-        // (carina#3243).
-        let intra_module_bindings: HashSet<String> = module
-            .resources
-            .iter()
-            .filter_map(|r| r.binding.clone())
-            .chain(module.data_sources.iter().filter_map(|d| d.binding.clone()))
-            .chain(
-                module
-                    .wait_bindings
-                    .iter()
-                    .map(|w| w.binding.as_str().to_string()),
-            )
-            .chain(
-                module
-                    .module_calls
-                    .iter()
-                    .filter_map(|c| c.binding_name.clone()),
-            )
-            // Nested compositions may already carry a multi-segment binding
-            // (`middle.inner`). When this module is itself expanded, refs to
-            // that exact binding must gain the new outer prefix as well.
-            .chain(module.compositions.iter().filter_map(|c| c.binding.clone()))
-            .collect();
-        let module_source = self.module_paths.get(&call.module_name).cloned();
-        let module_directory = module_source.as_deref().map(|source| {
-            let source = std::path::Path::new(source);
-            let path = if source.is_absolute() {
-                source.to_path_buf()
-            } else {
-                self.base_dir.join(source)
-            };
-            path.canonicalize().unwrap_or(path)
-        });
-        let expanded_call = CompositionCall {
+        // Collect every binding declared by this module. The shared scope
+        // resolver accepts exactly these locals, substitutes declared
+        // arguments with caller-expanded values, and rejects every other
+        // relative name.
+        let intra_module_bindings = intra_module_binding_names(module);
+        let module_source = expansion_source
+            .source
+            .map(str::to_string)
+            .or_else(|| self.module_paths.get(&call.module_name).cloned());
+        let module_directory = expansion_source
+            .directory
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| {
+                module_source.as_deref().map(|source| {
+                    let source = std::path::Path::new(source);
+                    let path = if source.is_absolute() {
+                        source.to_path_buf()
+                    } else {
+                        self.base_dir.join(source)
+                    };
+                    path.canonicalize().unwrap_or(path)
+                })
+            });
+        let expanded_call = crate::resource::ExpandedCompositionCall {
             id: call.id().clone(),
             module_name: call.module_name.clone(),
             binding: call.binding_name.clone(),
             instance: instance_prefix.to_string(),
             module_source: module_source.clone(),
-            module_directory,
+            module_directory: module_directory.clone(),
             loop_origin: call.loop_origin().cloned().map(Box::new),
         };
-        let module_instance_scope = ModuleInstanceScope::for_call(
-            &call.module_name,
-            call.binding_name.as_deref(),
-            instance_prefix,
-        );
+        let expanded_call_path = match expansion_source.parent_call_path {
+            Some(parent) => parent.clone().append(expanded_call.clone()),
+            None => crate::resource::CompositionCallPath::direct(expanded_call.clone()),
+        };
+        let module_scope_resolver = ModuleScopeResolver {
+            scope: &module_instance_scope,
+            local_bindings: &intra_module_bindings,
+            arguments: argument_substitutions,
+            call_path: &expanded_call_path,
+        };
+
+        let nested_binding_index = BindingIndex::from_parsed(module, self.schemas);
+        let mut nested_contributions = Vec::new();
+        for nested_call in &module.module_calls {
+            let local_prefix = instance_prefix_for_call(nested_call);
+            let local_scope = ModuleInstanceScope::for_call(
+                &nested_call.module_name,
+                nested_call
+                    .binding_name
+                    .as_ref()
+                    .map(RelativeBindingName::as_str),
+                &local_prefix,
+            );
+            let child_scope = module_instance_scope.with_child(&local_scope);
+            let expanded_nested_call =
+                resolve_nested_module_call(nested_call, &module_scope_resolver)
+                    .map_err(contextualize_access_error)?;
+            let (child_module, child_source, child_directory) =
+                self.nested_module_definition(module, module_directory.as_deref(), nested_call)?;
+            let expanded = self
+                .expand_module_call_inner(
+                    nested_call,
+                    &expanded_nested_call,
+                    child_scope.key(),
+                    Some(&nested_binding_index),
+                    resolved_bindings,
+                    ModuleExpansionSource {
+                        module: Some(child_module),
+                        source: Some(&child_source),
+                        directory: Some(&child_directory),
+                        scope: Some(&child_scope),
+                        parent_call_path: Some(&expanded_call_path),
+                    },
+                )
+                .map_err(|error| error.with_failing_call(nested_call.id().clone()))?;
+            nested_contributions.push(expanded);
+        }
 
         // Expand managed resources with substituted values.
-        let mut resources: Vec<Resource> = Vec::new();
-        let mut expanded_parser_metadata = crate::parser::ParserBindingMetadata::default();
-        let mut expanded_binding_uses = module.bare_binding_uses().clone();
+        let mut resources: Vec<crate::resource::ExpandedResource> = Vec::new();
+        let mut expanded_parser_metadata: crate::parser::ParserBindingMetadata<
+            AbsoluteBindingAddress,
+        > = crate::parser::ParserBindingMetadata::default();
+        let mut expanded_binding_uses =
+            resolve_module_binding_uses(module.bare_binding_uses(), &module_scope_resolver)
+                .map_err(contextualize_access_error)?;
         for resource in &module.resources {
             let source_file = module
                 .parser_binding_metadata
                 .resource_source_file(&resource.id);
-            let expanded = prefix_module_resource(
-                resource,
-                instance_prefix,
-                &call.module_name,
-                &module_instance_scope,
-                &expanded_call,
-                &intra_module_bindings,
-                argument_substitutions,
-            )
-            .map_err(|error| {
-                contextualize_access_error(error.with_optional_source_file(source_file))
-            })?;
+            let expanded = expand_module_resource(resource, &expanded_call, &module_scope_resolver)
+                .map_err(|error| {
+                    contextualize_access_error(error.with_optional_source_file(source_file))
+                })?;
             if let Some(source_file) = source_file {
                 expanded_parser_metadata
                     .insert_resource_source_file(expanded.id.clone(), source_file.to_path_buf());
@@ -493,23 +619,14 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         }
 
         // Expand data sources with substituted values.
-        let mut data_sources: Vec<DataSource> = Vec::new();
+        let mut data_sources: Vec<crate::resource::ExpandedDataSource> = Vec::new();
         for data_source in &module.data_sources {
             let source_file = module
                 .parser_binding_metadata
                 .resource_source_file(&data_source.id);
-            let expanded = prefix_module_data_source(
-                data_source,
-                instance_prefix,
-                &call.module_name,
-                &module_instance_scope,
-                &expanded_call,
-                &intra_module_bindings,
-                argument_substitutions,
-            )
-            .map_err(|error| {
-                contextualize_access_error(error.with_optional_source_file(source_file))
-            })?;
+            let expanded = expand_module_data_source(data_source, &module_scope_resolver).map_err(
+                |error| contextualize_access_error(error.with_optional_source_file(source_file)),
+            )?;
             if let Some(source_file) = source_file {
                 expanded_parser_metadata
                     .insert_resource_source_file(expanded.id.clone(), source_file.to_path_buf());
@@ -518,35 +635,23 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             data_sources.push(expanded);
         }
 
-        // Propagate the module's own composition resources (synthesized by
-        // nested module-call expansion), instance-prefixed.
-        let mut compositions: Vec<LiveComposition> = Vec::new();
-        for composition in &module.compositions {
-            let mut expanded = prefix_module_composition(
-                composition,
-                instance_prefix,
-                &intra_module_bindings,
-                argument_substitutions,
-                &expanded_call,
-                self.config,
-                resolved_bindings,
-            )
+        let mut compositions: Vec<crate::resource::ExpandedLiveComposition> = module
+            .compositions
+            .iter()
+            .map(|composition| {
+                expand_module_composition(composition, &expanded_call, &module_scope_resolver)
+            })
+            .collect::<Result<_, _>>()
             .map_err(contextualize_access_error)?;
-            if let Some(report) = settle_prefixed_composition_constraints(
-                &mut expanded,
-                self.records_constraint_reports(),
-            )? {
-                self.record_constraint_report(report);
-            }
-            compositions.push(expanded);
-        }
 
         // Every call becomes a composition, including calls with no outputs
         // and anonymous calls. Besides exposing outputs for bound calls, the
         // node is the post-expansion record of the call boundary itself.
         {
-            let mut composition_attrs: IndexMap<String, crate::resource::LiveCompositionAttribute> =
-                IndexMap::new();
+            let mut composition_attrs: IndexMap<
+                String,
+                crate::resource::LiveCompositionAttribute<AbsoluteBindingAddress>,
+            > = IndexMap::new();
 
             // Copy attribute values from the module definition.
             // Each value is classified into `Forwarded` (single-hop
@@ -564,20 +669,12 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                                 .map(|argument| argument.type_expr.clone())
                         })
                     });
-                    // Rewrite intra-module refs and substitute arguments
-                    let rewritten =
-                        rewrite_intra_module_refs(value, instance_prefix, &intra_module_bindings);
-                    let mut substituted = substitute_arguments_with_position(
-                        &rewritten,
-                        argument_substitutions,
-                        ArgumentSubstitutionPosition::Value,
-                    )
-                    .map_err(|error| {
-                        contextualize_access_error(error.with_source_file(attr_param.source_file()))
-                    })?;
-                    // Same post-substitution canonicalize as the
-                    // resource-attribute path above (#2815 / #2817).
-                    substituted.canonicalize_in_place();
+                    let substituted =
+                        resolve_module_value(value, &module_scope_resolver).map_err(|error| {
+                            contextualize_access_error(
+                                error.with_source_file(attr_param.source_file()),
+                            )
+                        })?;
                     composition_attrs.insert(
                         attr_param.name.clone(),
                         crate::resource::LiveCompositionAttribute::from_value(
@@ -596,7 +693,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             // call-site argument was a value or a structural handle.
             let mut signature_arguments: IndexMap<
                 String,
-                crate::resource::LiveCompositionArgument,
+                crate::resource::LiveCompositionArgument<AbsoluteBindingAddress>,
             > = IndexMap::new();
             for arg in &module.arguments {
                 if let Some(argument) = resolved_arguments.get(&arg.name) {
@@ -629,7 +726,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 }
             }
 
-            let composition = LiveComposition {
+            let composition = crate::resource::LiveComposition {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "_virtual",
                     crate::resource::ResourceIdentity::new(instance_prefix.to_string()),
@@ -643,20 +740,22 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 dependency_bindings: BTreeSet::new(),
                 module_name: call.module_name.clone(),
                 instance: instance_prefix.to_string(),
-                call_path: CompositionCallPath::direct(expanded_call.clone()),
+                call_path: expanded_call_path.clone(),
                 quoted_string_attrs: HashSet::new(),
             };
             compositions.push(composition);
         }
 
-        // Propagate the module's `wait` declarations, instance-prefixed
-        // (see `prefix_wait_binding`), so a module-internal `wait`
-        // reaches the caller's plan (carina#3061).
-        let expanded_wait_bindings: Vec<WaitBinding> = module
-            .wait_bindings
-            .iter()
-            .map(|wb| prefix_wait_binding(wb, instance_prefix))
-            .collect();
+        // Propagate the module's `wait` declarations through the same typed
+        // module-scope conversion so a module-internal wait reaches the
+        // caller's plan (carina#3061).
+        let expanded_wait_bindings: Vec<crate::parser::WaitBinding<AbsoluteBindingAddress>> =
+            module
+                .wait_bindings
+                .iter()
+                .map(|wait| resolve_wait_binding(wait, &module_scope_resolver))
+                .collect::<Result<_, _>>()
+                .map_err(contextualize_access_error)?;
 
         // carina#3126: propagate the module's deferred for-expressions
         // (previously dropped at this boundary). Each entry is
@@ -664,26 +763,19 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // the loop resolves against the prefixed module bindings and
         // its generated resources are isolated per module instance
         // (carina#3126 PR-B).
-        let expanded_deferred_for_expressions: Vec<DeferredForExpression> = module
-            .deferred_for_expressions
-            .iter()
-            .map(|d| {
-                let source_file = module
-                    .parser_binding_metadata
-                    .resource_source_file(&d.template_resource.id);
-                prefix_deferred_for_expression(
-                    d,
-                    instance_prefix,
-                    &call.module_name,
-                    &module_instance_scope,
-                    &expanded_call,
-                    &intra_module_bindings,
-                    argument_substitutions,
-                )
-                .map_err(|error| error.with_optional_source_file(source_file))
-            })
-            .collect::<Result<_, _>>()
-            .map_err(contextualize_access_error)?;
+        let expanded_deferred_for_expressions: Vec<crate::parser::ExpandedDeferredForExpression> =
+            module
+                .deferred_for_expressions
+                .iter()
+                .map(|d| {
+                    let source_file = module
+                        .parser_binding_metadata
+                        .resource_source_file(&d.template_resource.id);
+                    expand_deferred_for_expression(d, &expanded_call, &module_scope_resolver)
+                        .map_err(|error| error.with_optional_source_file(source_file))
+                })
+                .collect::<Result<_, _>>()
+                .map_err(contextualize_access_error)?;
 
         // carina#3181: managed resources, data sources, and composition
         // resources are collected into separate typed `Vec`s above —
@@ -702,10 +794,16 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // that bypass `process_imports`; real expansions always have
         // a recorded path.
         let source_path = module_source.as_deref();
+        let mut nested_trace = crate::resource::ExpansionTrace::new();
+        for nested in &nested_contributions {
+            for (leaf, call_sites) in nested.expansion_trace.iter() {
+                nested_trace.record(leaf.clone(), call_sites.clone());
+            }
+        }
         let expansion_trace = build_expansion_trace(
             instance_prefix,
             source_path,
-            &module.expansion_trace,
+            &nested_trace,
             &resources,
             &data_sources,
         );
@@ -714,7 +812,9 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // graph. Module-local declarations and boundary inputs remain empty
         // on `ParsedFile::default()` because they were consumed above or are
         // rejected while loading the module.
-        let mut contribution = ParsedFile::empty_with_parsed_binding_uses(expanded_binding_uses);
+        let mut contribution = crate::parser::ExpandedParsedFile::empty_with_parsed_binding_uses(
+            expanded_binding_uses,
+        );
         contribution.resources = resources;
         contribution.data_sources = data_sources;
         contribution.compositions = compositions;
@@ -722,8 +822,36 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         contribution.deferred_for_expressions = expanded_deferred_for_expressions;
         contribution.parser_binding_metadata = expanded_parser_metadata;
         contribution.warnings = module.warnings.clone();
+        for nested in nested_contributions {
+            contribution.merge_from(nested);
+        }
         contribution.expansion_trace = expansion_trace;
         Ok(contribution)
+    }
+
+    fn nested_module_definition<'a>(
+        &'a self,
+        owner: &ParsedFile,
+        owner_directory: Option<&std::path::Path>,
+        call: &ModuleCall,
+    ) -> Result<(&'a ParsedFile, String, std::path::PathBuf), ModuleError> {
+        let import = owner
+            .uses
+            .iter()
+            .find(|import| import.alias == call.module_name)
+            .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?;
+        let source = std::path::Path::new(&import.path);
+        let directory = if source.is_absolute() {
+            source.to_path_buf()
+        } else {
+            owner_directory.unwrap_or(&self.base_dir).join(source)
+        };
+        let canonical = directory.canonicalize()?;
+        let module = self
+            .module_cache
+            .get(&canonical)
+            .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?;
+        Ok((module, import.path.clone(), canonical))
     }
 
     /// Unit tests exercise isolated expansion mechanics with synthetic module
@@ -731,11 +859,16 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
     #[cfg(test)]
     pub(super) fn expand_module_call(
         &self,
-        call: &ModuleCall,
+        call: &crate::parser::ModuleCall,
         instance_prefix: &str,
-    ) -> Result<ParsedFile, ModuleError> {
+    ) -> Result<crate::parser::ExpandedParsedFile, ModuleError> {
+        let root = crate::resource::RootScope::new();
+        let expanded_call = call
+            .clone()
+            .resolve_bindings(&mut |binding| root.resolve(binding));
         self.expand_module_call_checked(
             call,
+            &expanded_call,
             instance_prefix,
             &super::resolver::RefCheckWitness(()),
             None,
@@ -750,11 +883,16 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
 /// BindingRef/ResourceRef arms keep constructed and pre-expansion values on
 /// the same metadata path. One helper owns the classification so declared
 /// output types and duplicate-diagnostic suppression cannot drift by shape.
-fn source_argument_name(value: &Value, argument_values: &HashMap<String, Value>) -> Option<String> {
+fn source_argument_name<B: BindingAddress, C: BindingAddress>(
+    value: &crate::resource::Value<B>,
+    argument_values: &HashMap<String, crate::resource::Value<C>>,
+) -> Option<String> {
+    use crate::resource::{DeferredValue, Value};
+
     let candidate = crate::resource::module_argument_reference_path(value)
         .map(|path| path.as_ref().binding().to_string())
         .or_else(|| match value {
-            Value::Deferred(DeferredValue::BindingRef { binding }) => Some(binding.clone()),
+            Value::Deferred(DeferredValue::BindingRef { binding }) => Some(binding.to_string()),
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 Some(path.binding().to_string())
             }
@@ -763,6 +901,90 @@ fn source_argument_name(value: &Value, argument_values: &HashMap<String, Value>)
     argument_values
         .contains_key(&candidate)
         .then_some(candidate)
+}
+
+fn resolve_nested_module_call(
+    call: &ModuleCall,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<crate::parser::ModuleCall<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+    let mut resolve_binding =
+        |binding: RelativeBindingName| resolver.resolve_declared_binding(&binding);
+    let mut resolve_argument = |argument: ModuleArgument| match argument.value_ref() {
+        StructuralOperandRef::Value(value) => {
+            let forwarded_name = match value {
+                Value::Deferred(DeferredValue::BindingRef { binding }) => Some(binding.as_str()),
+                Value::Deferred(DeferredValue::Unknown(
+                    crate::resource::UnknownReason::ModuleArgument { name, .. },
+                )) => Some(name.as_str()),
+                Value::Concrete(_)
+                | Value::Deferred(
+                    DeferredValue::ResourceRef { .. }
+                    | DeferredValue::Coalesce { .. }
+                    | DeferredValue::Interpolation(_)
+                    | DeferredValue::FunctionCall { .. }
+                    | DeferredValue::ResolvedFunctionCall { .. }
+                    | DeferredValue::Unavailable { .. }
+                    | DeferredValue::Access(_)
+                    | DeferredValue::Secret(_)
+                    | DeferredValue::RedactedSecret { .. }
+                    | DeferredValue::Unknown(_),
+                ) => None,
+            };
+            if let Some(binding) = forwarded_name
+                && let Some(forwarded) = resolver.arguments.arguments.get(binding)
+            {
+                match forwarded.value_ref() {
+                    StructuralOperandRef::Handle { handle, .. } => {
+                        return Ok(ModuleArgument::from_handle(
+                            handle.clone().with_alias(binding),
+                        ));
+                    }
+                    StructuralOperandRef::Parameter {
+                        name,
+                        access_base: _access_base,
+                    } => {
+                        return resolver
+                            .arguments
+                            .arguments
+                            .get(name)
+                            .map(|argument| argument.argument.clone())
+                            .ok_or_else(|| resolver.unknown_binding(name));
+                    }
+                    StructuralOperandRef::Value(_forwarded_value) => {}
+                }
+            }
+            let value = resolver.resolve_value(value, ArgumentSubstitutionPosition::Value)?;
+            let access_base = argument
+                .access_base()
+                .map(|base| resolver.resolve_value(base, ArgumentSubstitutionPosition::AccessBase))
+                .transpose()?;
+            Ok(ModuleArgument::from_parts(value, access_base))
+        }
+        StructuralOperandRef::Handle { handle, .. } => {
+            resolver.resolve_declared_binding(handle.canonical_binding())?;
+            let handle = handle
+                .clone()
+                .resolve_bindings(&mut |binding| resolver.scope.resolve(binding));
+            Ok(ModuleArgument::from_handle(handle))
+        }
+        StructuralOperandRef::Parameter { name, .. } => {
+            let forwarded = resolver
+                .arguments
+                .arguments
+                .get(name)
+                .ok_or_else(|| resolver.unknown_binding(name))?;
+            match forwarded.value_ref() {
+                StructuralOperandRef::Handle { handle, .. } => {
+                    Ok(ModuleArgument::from_handle(handle.clone().with_alias(name)))
+                }
+                StructuralOperandRef::Value(_) | StructuralOperandRef::Parameter { .. } => {
+                    Ok(forwarded.argument.clone())
+                }
+            }
+        }
+    };
+    call.clone()
+        .try_resolve_bindings(&mut resolve_binding, &mut resolve_argument)
 }
 
 /// Build an [`ExpansionTrace`](crate::resource::ExpansionTrace) for one
@@ -777,8 +999,8 @@ pub(crate) fn build_expansion_trace(
     instance_prefix: &str,
     source_path: Option<&str>,
     inner_trace: &crate::resource::ExpansionTrace,
-    leaf_resources: &[Resource],
-    leaf_data_sources: &[DataSource],
+    leaf_resources: &[crate::resource::ExpandedResource],
+    leaf_data_sources: &[crate::resource::ExpandedDataSource],
 ) -> crate::resource::ExpansionTrace {
     let id = crate::resource::EphemeralId::new(crate::resource::ResolvedResourceId::new(
         crate::resource::ResourceId::with_identity(
@@ -814,141 +1036,62 @@ pub(crate) fn build_expansion_trace(
     out
 }
 
-/// Join a module-call `instance_prefix` to an intra-module binding name
-/// (`<prefix>.<name>`, dot-separated instance path).
-///
-/// This is the *single* definition of the instance-prefix spelling.
-/// Every site that prefixes a binding — resource ids, resource
-/// bindings, dependency bindings, `rewrite_intra_module_refs`, and
-/// [`prefix_wait_binding`] — routes through here so the format can never
-/// drift between binding kinds (the carina#3061 class of bug was a binding
-/// kind that was *not* prefixed at all; keeping one spelling makes "is this
-/// kind prefixed?" a single, greppable call site per kind).
-fn apply_instance_prefix(instance_prefix: &str, name: &str) -> String {
+/// Join a module-instance path to a system-assigned resource identity.
+/// Binding addresses never use this string helper; they cross the phase
+/// boundary only through [`ModuleInstanceScope`].
+fn prefix_resource_identity(instance_prefix: &str, name: &str) -> String {
     format!("{instance_prefix}.{name}")
 }
 
-/// Prefix dependency metadata that names bindings owned by this module.
-///
-/// Argument names and caller/outer-scope bindings are deliberately left
-/// unchanged: they are not members of `intra_module_bindings`, matching the
-/// discrimination used by [`rewrite_intra_module_refs`] for value-shaped
-/// references.
-fn prefix_directive_dependency(
-    binding: &str,
-    instance_prefix: &str,
-    intra_module_bindings: &HashSet<String>,
-    arguments: ArgumentSubstitutions<'_>,
-) -> Result<String, ArgumentSubstitutionError> {
-    if let Some(argument) = arguments.arguments.get(binding) {
-        return match argument.value_ref() {
-            StructuralOperandRef::Handle { handle, .. } => {
-                if handle.kind().is_dependency_target() {
-                    Ok(handle.canonical_binding_name().to_string())
-                } else {
-                    Err(ArgumentSubstitutionError {
-                        source_file: Some(arguments.caller_source_file.to_path_buf()),
-                        line: argument.source_line(arguments.default_line),
-                        message: format!(
-                            "directives.depends_on: '{}' is {} and cannot be used as a dependency target",
-                            handle
-                                .alias_name()
-                                .unwrap_or_else(|| handle.canonical_binding_name()),
-                            handle.kind().description(),
-                        ),
-                        parse_error: None,
-                    })
-                }
-            }
-            StructuralOperandRef::Value(_) => Err(ArgumentSubstitutionError {
-                source_file: Some(arguments.caller_source_file.to_path_buf()),
-                line: argument.source_line(arguments.default_line),
-                message: format!(
-                    "directives.depends_on parameter '{binding}' received a value, not a resource handle"
-                ),
-                parse_error: None,
-            }),
-            StructuralOperandRef::Parameter { name, .. } => Ok(name.to_string()),
-        };
-    }
-    if intra_module_bindings.contains(binding) {
-        Ok(apply_instance_prefix(instance_prefix, binding))
-    } else {
-        Ok(binding.to_string())
-    }
-}
-
-fn prefix_dependency_bindings(
-    dependency_bindings: &BTreeSet<String>,
-    instance_prefix: &str,
-    intra_module_bindings: &HashSet<String>,
-    arguments: ArgumentSubstitutions<'_>,
-) -> Result<BTreeSet<String>, ArgumentSubstitutionError> {
-    let mut rewritten = BTreeSet::new();
+fn resolve_dependency_bindings(
+    dependency_bindings: &BTreeSet<RelativeBindingName>,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<BTreeSet<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+    let mut resolved = BTreeSet::new();
     for binding in dependency_bindings {
-        if let Some(argument) = arguments.arguments.get(binding) {
+        if let Some(argument) = resolver.arguments.arguments.get(binding.as_str()) {
             match argument.value_ref() {
                 StructuralOperandRef::Handle { handle, .. } => {
-                    rewritten.insert(handle.canonical_binding_name().to_string());
+                    resolved.insert(handle.canonical_binding().clone());
                 }
                 StructuralOperandRef::Value(value) => {
                     let mut dependencies = HashSet::new();
                     crate::deps::collect_dependencies(value, &mut dependencies);
-                    rewritten.extend(dependencies);
+                    resolved.extend(dependencies);
                 }
-                StructuralOperandRef::Parameter { name, .. } => {
-                    rewritten.insert(name.to_string());
+                StructuralOperandRef::Parameter { name, access_base } => {
+                    // A standalone module has no concrete caller operand yet.
+                    // It therefore contributes no concrete dependency edge;
+                    // a real outer call will substitute the handle before
+                    // this expansion boundary is crossed.
+                    let _pending_parameter = (name, access_base);
                 }
             }
-        } else if intra_module_bindings.contains(binding) {
-            rewritten.insert(apply_instance_prefix(instance_prefix, binding));
         } else {
-            rewritten.insert(binding.clone());
+            resolved.insert(resolver.resolve_declared_binding(binding)?);
         }
     }
-    Ok(rewritten)
+    Ok(resolved)
 }
 
-fn prefix_directive_dependencies(
-    dependencies: &[String],
-    instance_prefix: &str,
-    intra_module_bindings: &HashSet<String>,
-    arguments: ArgumentSubstitutions<'_>,
-) -> Result<Vec<String>, ArgumentSubstitutionError> {
+fn resolve_directive_dependencies(
+    dependencies: &[RelativeBindingName],
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<Vec<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
     dependencies
         .iter()
-        .map(|binding| {
-            prefix_directive_dependency(binding, instance_prefix, intra_module_bindings, arguments)
+        .filter_map(|binding| {
+            resolver
+                .resolve_optional_dependency_binding(binding, "directives.depends_on")
+                .transpose()
         })
         .collect()
 }
 
-/// `BindingName`-typed instance-prefix: the wait path's binding-name
-/// fields are `BindingName`, so prefixing them is a typed
-/// `BindingName -> BindingName` transition (a raw `String` can't slip
-/// into a binding-name position). Delegates to [`apply_instance_prefix`]
-/// for the single spelling.
-fn prefix_binding_name(instance_prefix: &str, name: &BindingName) -> BindingName {
-    BindingName::new(apply_instance_prefix(instance_prefix, name.as_str()))
-}
-
-/// Instance-prefix every binding-name field of a [`WaitBinding`] so a
-/// module-internal `wait` keeps referring to the same (now prefixed)
-/// target / dependencies after expansion.
-///
-/// The `WaitBinding` is **destructured exhaustively** rather than
-/// field-accessed: if a future field is added, this stops compiling
-/// until someone decides whether that field is a binding name (prefix
-/// it) or value/provenance (pass through). That compile-time forcing
-/// function is the carina#3061 guard — the original bug was a
-/// binding-carrying structure whose propagation silently skipped a
-/// part. Today: `binding`, `target`, the predicate LHS root segment
-/// (`lhs_segments[0]`, pinned to the target binding by
-/// `parse_wait_expr`), and every `depends_on` entry are prefixed;
-/// `until_raw` (verbatim user surface text), `until_predicate.rhs` (a
-/// comparison value), `timeout_secs`, and `line` are not binding names
-/// and pass through unchanged.
-fn prefix_wait_binding(wb: &WaitBinding, instance_prefix: &str) -> WaitBinding {
+fn resolve_wait_binding(
+    wb: &WaitBinding,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<crate::parser::WaitBinding<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
     let WaitBinding {
         binding,
         target,
@@ -958,43 +1101,159 @@ fn prefix_wait_binding(wb: &WaitBinding, instance_prefix: &str) -> WaitBinding {
         depends_on,
         line,
     } = wb;
-    let prefixed_name = |n: &BindingName| prefix_binding_name(instance_prefix, n);
-
-    let mut until_predicate = until_predicate.clone();
-    // `lhs_segments[0]` is the (string) target-binding segment of a
-    // mixed path `[target, attr, ...]`; only that head is a binding
-    // name, so it takes the string-level prefix spelling, not the
-    // `BindingName` wrapper (the rest are attribute path segments).
-    if let Some(root) = until_predicate.lhs_segments.first_mut() {
-        *root = apply_instance_prefix(instance_prefix, root);
-    }
-
-    WaitBinding {
-        binding: prefixed_name(binding),
-        target: prefixed_name(target),
+    Ok(crate::parser::WaitBinding {
+        binding: resolver.resolve_declared_binding(binding)?,
+        target: resolver.resolve_dependency_binding(target, "wait target")?,
         until_raw: until_raw.clone(),
-        until_predicate,
+        until_predicate: crate::parser::UntilPredicateAst {
+            root: resolver
+                .resolve_dependency_binding(&until_predicate.root, "wait predicate root")?,
+            attribute_segments: until_predicate.attribute_segments.clone(),
+            rhs: resolver
+                .resolve_value(&until_predicate.rhs, ArgumentSubstitutionPosition::Value)?,
+        },
         timeout_secs: *timeout_secs,
-        depends_on: depends_on.iter().map(prefixed_name).collect(),
+        depends_on: depends_on
+            .iter()
+            .map(|binding| resolver.resolve_dependency_binding(binding, "wait depends_on"))
+            .collect::<Result<_, _>>()?,
         line: *line,
+    })
+}
+
+fn authored_value_reference_path(value: &Value) -> Option<crate::resource::AuthoredReferencePath> {
+    match value {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            Some(crate::resource::ReferencePath::Access(path.clone()))
+        }
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            Some(crate::resource::ReferencePath::Binding(binding.clone()))
+        }
+        Value::Concrete(_)
+        | Value::Deferred(
+            DeferredValue::Coalesce { .. }
+            | DeferredValue::Interpolation(_)
+            | DeferredValue::FunctionCall { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::Unavailable { .. }
+            | DeferredValue::Access(_)
+            | DeferredValue::Secret(_)
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        ) => crate::resource::module_argument_reference_path(value),
     }
+}
+
+fn authored_argument_reference_path(
+    argument: &ModuleArgument,
+) -> Option<crate::resource::AuthoredReferencePath> {
+    match argument.value_ref() {
+        StructuralOperandRef::Value(value) => authored_value_reference_path(value),
+        StructuralOperandRef::Handle { handle, .. } => Some(
+            crate::resource::ReferencePath::Binding(handle.canonical_binding().clone()),
+        ),
+        StructuralOperandRef::Parameter { access_base, .. } => {
+            authored_value_reference_path(access_base)
+        }
+    }
+}
+
+fn append_reference_path(
+    reference: crate::resource::AuthoredReferencePath,
+    postfix: &[PathSegment],
+) -> crate::resource::AuthoredReferencePath {
+    match reference {
+        crate::resource::ReferencePath::Access(path) => crate::resource::ReferencePath::Access(
+            postfix
+                .iter()
+                .cloned()
+                .fold(path, crate::resource::AccessPath::with_appended_segment),
+        ),
+        crate::resource::ReferencePath::Binding(binding) => {
+            crate::resource::ReferencePath::BindingAccess {
+                binding,
+                segments: postfix.to_vec(),
+            }
+        }
+        crate::resource::ReferencePath::BindingAccess {
+            binding,
+            mut segments,
+        } => {
+            segments.extend_from_slice(postfix);
+            crate::resource::ReferencePath::BindingAccess { binding, segments }
+        }
+    }
+}
+
+fn module_parameter_postfix<B: BindingAddress>(
+    value: &crate::resource::Value<B>,
+    arguments: &HashMap<String, ResolvedArgument<B>>,
+) -> Option<(String, Vec<PathSegment>)> {
+    use crate::resource::{DeferredValue, Value};
+
+    fn collect<B: BindingAddress>(
+        value: &crate::resource::Value<B>,
+        arguments: &HashMap<String, ResolvedArgument<B>>,
+    ) -> Option<(String, Vec<PathSegment>)> {
+        match value {
+            Value::Deferred(DeferredValue::Unknown(
+                crate::resource::UnknownReason::ModuleArgument { name, .. },
+            )) if arguments.contains_key(name) => Some((name.clone(), Vec::new())),
+            Value::Deferred(DeferredValue::Access(access)) => {
+                let (argument, mut postfix) = collect(access.base(), arguments)?;
+                postfix.push(access.step().clone());
+                Some((argument, postfix))
+            }
+            Value::Deferred(DeferredValue::ResourceRef { path })
+                if arguments.contains_key(path.binding()) =>
+            {
+                let mut postfix = Vec::with_capacity(path.segments().len() + 1);
+                postfix.push(PathSegment::Field {
+                    name: path.attribute().to_string(),
+                });
+                postfix.extend_from_slice(path.segments());
+                Some((path.binding().to_string(), postfix))
+            }
+            Value::Deferred(DeferredValue::BindingRef { binding })
+                if arguments.contains_key(binding.as_str()) =>
+            {
+                Some((binding.as_str().to_string(), Vec::new()))
+            }
+            Value::Concrete(_)
+            | Value::Deferred(
+                DeferredValue::ResourceRef { .. }
+                | DeferredValue::BindingRef { .. }
+                | DeferredValue::Coalesce { .. }
+                | DeferredValue::Interpolation(_)
+                | DeferredValue::FunctionCall { .. }
+                | DeferredValue::ResolvedFunctionCall { .. }
+                | DeferredValue::Unavailable { .. }
+                | DeferredValue::Secret(_)
+                | DeferredValue::RedactedSecret { .. }
+                | DeferredValue::Unknown(_),
+            ) => None,
+        }
+    }
+
+    collect(value, arguments)
 }
 
 #[derive(Clone)]
-struct ResolvedArgument {
-    argument: ModuleArgument,
+struct ResolvedArgument<B: BindingAddress = AbsoluteBindingAddress> {
+    argument: ModuleArgument<B>,
     origin: ArgumentOrigin,
+    caller_reference: Option<crate::resource::AuthoredReferencePath>,
 }
 
-impl std::ops::Deref for ResolvedArgument {
-    type Target = ModuleArgument;
+impl<B: BindingAddress> std::ops::Deref for ResolvedArgument<B> {
+    type Target = ModuleArgument<B>;
 
     fn deref(&self) -> &Self::Target {
         &self.argument
     }
 }
 
-impl ResolvedArgument {
+impl<B: BindingAddress> ResolvedArgument<B> {
     fn source_line(&self, default_line: usize) -> usize {
         match self.origin {
             ArgumentOrigin::Authored { value_span, .. } => value_span.start_line(),
@@ -1006,7 +1265,7 @@ impl ResolvedArgument {
         &self,
         name: &str,
         position: ArgumentSubstitutionPosition,
-    ) -> Result<StructuralOperandRef<'_>, String> {
+    ) -> Result<StructuralOperandRef<'_, B>, String> {
         match (position, self.value_ref()) {
             (ArgumentSubstitutionPosition::Value, StructuralOperandRef::Value(value)) => {
                 Ok(StructuralOperandRef::Value(value))
@@ -1022,18 +1281,280 @@ impl ResolvedArgument {
                 ArgumentSubstitutionPosition::Value,
                 operand @ StructuralOperandRef::Parameter { .. },
             ) => Ok(operand),
-            (ArgumentSubstitutionPosition::AccessBase, _) => Ok(self.access_ref()),
+            (ArgumentSubstitutionPosition::AccessBase, StructuralOperandRef::Value(value)) => {
+                Ok(StructuralOperandRef::Value(value))
+            }
+            (
+                ArgumentSubstitutionPosition::AccessBase,
+                StructuralOperandRef::Handle {
+                    handle,
+                    access_base,
+                },
+            ) => Ok(StructuralOperandRef::Handle {
+                handle,
+                access_base,
+            }),
+            (
+                ArgumentSubstitutionPosition::AccessBase,
+                StructuralOperandRef::Parameter { name, access_base },
+            ) => Ok(StructuralOperandRef::Parameter { name, access_base }),
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct ArgumentSubstitutions<'a> {
-    arguments: &'a HashMap<String, ResolvedArgument>,
+struct ArgumentSubstitutions<'a, B: BindingAddress = AbsoluteBindingAddress> {
+    arguments: &'a HashMap<String, ResolvedArgument<B>>,
     default_line: usize,
     caller_source_file: &'a std::path::Path,
     binding_index: Option<&'a BindingIndex<'a>>,
     config: &'a crate::parser::ProviderContext,
+}
+
+impl<B: BindingAddress> Copy for ArgumentSubstitutions<'_, B> {}
+
+impl<B: BindingAddress> Clone for ArgumentSubstitutions<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+struct ModuleScopeResolver<'a> {
+    scope: &'a ModuleInstanceScope,
+    local_bindings: &'a HashSet<RelativeBindingName>,
+    arguments: ArgumentSubstitutions<'a>,
+    call_path: &'a crate::resource::ExpandedCompositionCallPath,
+}
+
+impl ModuleScopeResolver<'_> {
+    fn resolve_declared_binding(
+        &self,
+        binding: &RelativeBindingName,
+    ) -> Result<AbsoluteBindingAddress, ArgumentSubstitutionError> {
+        if self.local_bindings.contains(binding) {
+            Ok(self.scope.resolve(binding.clone()))
+        } else {
+            Err(self.unknown_binding(binding.as_str()))
+        }
+    }
+
+    fn resolve_dependency_binding(
+        &self,
+        binding: &RelativeBindingName,
+        context: &str,
+    ) -> Result<AbsoluteBindingAddress, ArgumentSubstitutionError> {
+        if let Some(argument) = self.arguments.arguments.get(binding.as_str()) {
+            return match argument.value_ref() {
+                StructuralOperandRef::Handle { handle, .. }
+                    if handle.kind().is_dependency_target() =>
+                {
+                    Ok(handle.canonical_binding().clone())
+                }
+                StructuralOperandRef::Handle { handle, .. } => Err(ArgumentSubstitutionError {
+                    source_file: Some(self.arguments.caller_source_file.to_path_buf()),
+                    line: argument.source_line(self.arguments.default_line),
+                    message: format!(
+                        "{context}: '{}' is {} and cannot be used as a dependency target",
+                        handle
+                            .alias_name()
+                            .unwrap_or_else(|| handle.canonical_binding_name()),
+                        handle.kind().description(),
+                    ),
+                    parse_error: None,
+                }),
+                StructuralOperandRef::Value(_) => Err(ArgumentSubstitutionError {
+                    source_file: Some(self.arguments.caller_source_file.to_path_buf()),
+                    line: argument.source_line(self.arguments.default_line),
+                    message: format!(
+                        "{context} parameter '{binding}' received a value, not a resource handle"
+                    ),
+                    parse_error: None,
+                }),
+                StructuralOperandRef::Parameter { name, .. } => Err(ArgumentSubstitutionError {
+                    source_file: Some(self.arguments.caller_source_file.to_path_buf()),
+                    line: argument.source_line(self.arguments.default_line),
+                    message: format!("unresolved forwarded module parameter '{name}'"),
+                    parse_error: None,
+                }),
+            };
+        }
+        self.resolve_declared_binding(binding)
+    }
+
+    fn resolve_optional_dependency_binding(
+        &self,
+        binding: &RelativeBindingName,
+        context: &str,
+    ) -> Result<Option<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+        if let Some(argument) = self.arguments.arguments.get(binding.as_str())
+            && let StructuralOperandRef::Parameter { name, access_base } = argument.value_ref()
+        {
+            // This is a valid but not-yet-instantiated forwarded dependency.
+            // There is no absolute address to emit until an outer call supplies
+            // the concrete handle.
+            let _pending_parameter = (name, access_base);
+            return Ok(None);
+        }
+        self.resolve_dependency_binding(binding, context).map(Some)
+    }
+
+    fn resolve_value(
+        &self,
+        value: &Value,
+        position: ArgumentSubstitutionPosition,
+    ) -> Result<ExpandedValue, ArgumentSubstitutionError> {
+        let placeholders = self
+            .arguments
+            .arguments
+            .keys()
+            .map(|name| {
+                let placeholder = Value::Deferred(DeferredValue::Unknown(
+                    crate::resource::UnknownReason::ModuleArgument {
+                        name: name.clone(),
+                        source_line: self.arguments.default_line.into(),
+                        diagnostic_name: None,
+                    },
+                ));
+                (
+                    name.clone(),
+                    ResolvedArgument::<RelativeBindingName> {
+                        argument: ModuleArgument::new(placeholder),
+                        origin: ArgumentOrigin::Defaulted,
+                        caller_reference: None,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let normalized = substitute_arguments_with_position(
+            value,
+            ArgumentSubstitutions {
+                arguments: &placeholders,
+                default_line: self.arguments.default_line,
+                caller_source_file: self.arguments.caller_source_file,
+                binding_index: None,
+                config: self.arguments.config,
+            },
+            position,
+        )?;
+        for binding in normalized.root_bindings() {
+            if !self.local_bindings.contains(&binding) {
+                return Err(self.unknown_binding(binding.as_str()));
+            }
+        }
+        let expanded = normalized.resolve_module(self.scope);
+        let substituted = substitute_arguments_with_position(&expanded, self.arguments, position)?;
+        evaluate_expanded_module_functions(&substituted, self.arguments.config)
+    }
+
+    fn resolve_structural_handle(
+        &self,
+        handle: &crate::eval_value::StructuralHandle<RelativeBindingName>,
+    ) -> Result<
+        crate::eval_value::StructuralHandle<AbsoluteBindingAddress>,
+        ArgumentSubstitutionError,
+    > {
+        let binding = handle.canonical_binding();
+        if let Some(argument) = self.arguments.arguments.get(binding.as_str()) {
+            return match argument.value_ref() {
+                StructuralOperandRef::Handle { handle, .. } => Ok(handle.clone()),
+                StructuralOperandRef::Value(_) => Err(ArgumentSubstitutionError {
+                    source_file: Some(self.arguments.caller_source_file.to_path_buf()),
+                    line: argument.source_line(self.arguments.default_line),
+                    message: format!(
+                        "structural parameter '{binding}' received a value, not a handle"
+                    ),
+                    parse_error: None,
+                }),
+                StructuralOperandRef::Parameter { name, .. } => Err(ArgumentSubstitutionError {
+                    source_file: Some(self.arguments.caller_source_file.to_path_buf()),
+                    line: argument.source_line(self.arguments.default_line),
+                    message: format!("unresolved forwarded module parameter '{name}'"),
+                    parse_error: None,
+                }),
+            };
+        }
+        self.resolve_declared_binding(binding)?;
+        Ok(handle
+            .clone()
+            .resolve_bindings(&mut |binding| self.scope.resolve(binding)))
+    }
+
+    fn unknown_binding(&self, binding: &str) -> ArgumentSubstitutionError {
+        ArgumentSubstitutionError {
+            source_file: None,
+            line: self.arguments.default_line,
+            message: format!(
+                "unknown binding '{binding}' in {}",
+                self.scope.description()
+            ),
+            parse_error: None,
+        }
+    }
+}
+
+fn resolve_module_binding_uses(
+    uses: &ParsedBindingUses,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<ParsedBindingUses<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+    let mut resolved = ParsedBindingUses::default();
+    for record in uses.records() {
+        let source = match &record.source {
+            BareBindingSource::Value {
+                value,
+                declared_type,
+            } => {
+                let parameter = if let Value::Deferred(DeferredValue::Unknown(
+                    crate::resource::UnknownReason::ModuleArgument { name, .. },
+                )) = value.as_ref()
+                {
+                    resolver.arguments.arguments.get(name)
+                } else {
+                    None
+                };
+                match parameter.map(|argument| argument.value_ref()) {
+                    Some(StructuralOperandRef::Value(value)) => BareBindingSource::Value {
+                        value: std::sync::Arc::new(value.clone()),
+                        declared_type: declared_type.clone(),
+                    },
+                    Some(StructuralOperandRef::Handle { handle, .. }) => {
+                        BareBindingSource::Structural(
+                            handle.clone().with_alias(record.authored.name.clone()),
+                        )
+                    }
+                    Some(StructuralOperandRef::Parameter { name, access_base }) => {
+                        let _forwarded_name = name;
+                        BareBindingSource::Value {
+                            value: std::sync::Arc::new(access_base.clone()),
+                            declared_type: declared_type.clone(),
+                        }
+                    }
+                    None => BareBindingSource::Value {
+                        value: std::sync::Arc::new(resolve_module_value(value, resolver)?),
+                        declared_type: declared_type.clone(),
+                    },
+                }
+            }
+            BareBindingSource::Structural(handle) => match resolver
+                .arguments
+                .arguments
+                .get(handle.canonical_binding().as_str())
+                .map(|argument| argument.value_ref())
+            {
+                Some(StructuralOperandRef::Parameter { name, access_base }) => {
+                    let _forwarded_name = name;
+                    BareBindingSource::Value {
+                        value: std::sync::Arc::new(access_base.clone()),
+                        declared_type: None,
+                    }
+                }
+                Some(StructuralOperandRef::Value(_) | StructuralOperandRef::Handle { .. })
+                | None => {
+                    BareBindingSource::Structural(resolver.resolve_structural_handle(handle)?)
+                }
+            },
+        };
+        resolved.record(record.authored.clone(), source, record.pending_slot.clone());
+    }
+    Ok(resolved)
 }
 
 #[derive(Clone, Copy)]
@@ -1046,7 +1567,10 @@ fn bind_module_constraints(
     module: &ParsedFile,
     arguments: ArgumentSubstitutions<'_>,
     resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
-) -> Result<Vec<crate::resource::PendingModuleConstraint>, ArgumentSubstitutionError> {
+) -> Result<
+    Vec<crate::resource::PendingModuleConstraint<AbsoluteBindingAddress>>,
+    ArgumentSubstitutionError,
+> {
     let mut constraints = Vec::new();
     for parameter in &module.arguments {
         for (ordinal, validation) in parameter.validations.iter().enumerate() {
@@ -1094,65 +1618,90 @@ fn bind_constraint_expression(
     resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
     line: usize,
     source_file: &std::path::Path,
-) -> Result<crate::parser::ValidateExpr, ArgumentSubstitutionError> {
+) -> Result<crate::parser::ValidateExpr<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
     use crate::parser::ValidateExpr;
 
-    let bind_value = |argument: &str,
-                      position: ArgumentSubstitutionPosition,
-                      path: &[PathSegment]|
-     -> Result<ValidateExpr, ArgumentSubstitutionError> {
-        let Some(resolved_argument) = arguments.arguments.get(argument) else {
-            return Ok(expression.clone());
+    let bind_value =
+        |argument: &str,
+         position: ArgumentSubstitutionPosition,
+         path: &[PathSegment]|
+         -> Result<ValidateExpr<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+            let Some(resolved_argument) = arguments.arguments.get(argument) else {
+                return Err(ArgumentSubstitutionError {
+                    source_file: Some(source_file.to_path_buf()),
+                    line,
+                    message: format!("unknown module argument '{argument}'"),
+                    parse_error: None,
+                });
+            };
+            let substitution =
+                resolved_argument
+                    .substitution(argument, position)
+                    .map_err(|message| ArgumentSubstitutionError {
+                        source_file: Some(source_file.to_path_buf()),
+                        line,
+                        message,
+                        parse_error: None,
+                    })?;
+            let mut value = substitution.value().clone();
+            for step in path {
+                value =
+                    apply_value_path_segment(value, step.clone(), line, AccessMissPolicy::Error)
+                        .and_then(ValuePathSegmentResult::into_value)
+                        .map_err(|error| ArgumentSubstitutionError {
+                            source_file: Some(source_file.to_path_buf()),
+                            line,
+                            message: error.to_string(),
+                            parse_error: None,
+                        })?;
+            }
+            if let Some(bindings) = resolved_bindings
+                && let Ok(resolved) = crate::resolver::resolve_ref_value(&value, bindings)
+            {
+                value = resolved;
+            }
+            Ok(ValidateExpr::BoundArgument {
+                argument: argument.to_string(),
+                operand: path.iter().fold(argument.to_string(), |mut operand, step| {
+                    operand.push_str(&step.to_dot_string());
+                    operand
+                }),
+                value,
+            })
         };
-        let substitution =
-            resolved_argument
-                .substitution(argument, position)
-                .map_err(|message| ArgumentSubstitutionError {
-                    source_file: Some(source_file.to_path_buf()),
-                    line,
-                    message,
-                    parse_error: None,
-                })?;
-        let mut value = substitution.value().clone();
-        for step in path {
-            value = apply_value_path_segment(value, step.clone(), line, AccessMissPolicy::Error)
-                .and_then(ValuePathSegmentResult::into_value)
-                .map_err(|error| ArgumentSubstitutionError {
-                    source_file: Some(source_file.to_path_buf()),
-                    line,
-                    message: error.to_string(),
-                    parse_error: None,
-                })?;
-        }
-        if let Some(bindings) = resolved_bindings
-            && let Ok(resolved) = crate::resolver::resolve_ref_value(&value, bindings)
-        {
-            value = resolved;
-        }
-        Ok(ValidateExpr::BoundArgument {
-            argument: argument.to_string(),
-            operand: path.iter().fold(argument.to_string(), |mut operand, step| {
-                operand.push_str(&step.to_dot_string());
-                operand
-            }),
-            value,
-        })
-    };
 
     Ok(match expression {
-        ValidateExpr::Var(argument) => {
-            return bind_value(argument, ArgumentSubstitutionPosition::Value, &[]);
-        }
+        ValidateExpr::Var(argument) => match arguments.arguments.contains_key(argument) {
+            true => return bind_value(argument, ArgumentSubstitutionPosition::Value, &[]),
+            false => ValidateExpr::Var(argument.clone()),
+        },
         ValidateExpr::Access { argument, path } => {
-            return bind_value(argument, ArgumentSubstitutionPosition::AccessBase, path);
+            match arguments.arguments.contains_key(argument) {
+                true => {
+                    return bind_value(argument, ArgumentSubstitutionPosition::AccessBase, path);
+                }
+                false => ValidateExpr::Access {
+                    argument: argument.clone(),
+                    path: path.clone(),
+                },
+            }
         }
-        ValidateExpr::BoundArgument { .. }
-        | ValidateExpr::Bool(_)
-        | ValidateExpr::Int(_)
-        | ValidateExpr::Float(_)
-        | ValidateExpr::Duration(_)
-        | ValidateExpr::String(_)
-        | ValidateExpr::Null => expression.clone(),
+        ValidateExpr::BoundArgument { argument, .. } => {
+            return Err(ArgumentSubstitutionError {
+                source_file: Some(source_file.to_path_buf()),
+                line,
+                message: format!(
+                    "module constraint for '{argument}' crossed its expansion boundary twice"
+                ),
+                parse_error: None,
+            });
+        }
+        ValidateExpr::Bool(value) => ValidateExpr::Bool(*value),
+        ValidateExpr::Int(value) => ValidateExpr::Int(*value),
+        ValidateExpr::Float(value) => ValidateExpr::Float(*value),
+        ValidateExpr::Duration(value) => ValidateExpr::Duration(*value),
+        ValidateExpr::String(value) => ValidateExpr::String(value.clone()),
+        ValidateExpr::Null => ValidateExpr::Null,
         ValidateExpr::Compare { lhs, op, rhs } => ValidateExpr::Compare {
             lhs: Box::new(bind_constraint_expression(
                 lhs,
@@ -1227,202 +1776,162 @@ fn bind_constraint_expression(
     })
 }
 
-/// Rewrite values already bound into a nested module constraint while that
-/// composition crosses its next module boundary. This is the constraint
-/// counterpart of [`prefix_attr_value`]: local resource references gain the
-/// outer instance prefix, and accesses rooted at an outer module parameter
-/// are substituted from the same typed argument map as resource attributes.
-/// The constraint's argument name remains local to the nested module so
-/// diagnostics and actual-value reporting retain the authored boundary.
-fn prefix_constraint_expression(
-    expression: &crate::parser::ValidateExpr,
-    instance_prefix: &str,
-    intra_module_bindings: &HashSet<String>,
-    arguments: ArgumentSubstitutions<'_>,
-    resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
-) -> Result<crate::parser::ValidateExpr, ArgumentSubstitutionError> {
-    use crate::parser::ValidateExpr;
+fn resolve_module_value(
+    value: &Value,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<ExpandedValue, ArgumentSubstitutionError> {
+    let mut resolved = resolver.resolve_value(value, ArgumentSubstitutionPosition::Value)?;
+    resolved.canonicalize_in_place();
+    Ok(resolved)
+}
 
-    Ok(match expression {
-        ValidateExpr::BoundArgument {
-            argument,
-            operand,
-            value,
-        } => {
-            let mut value =
-                prefix_attr_value(value, instance_prefix, intra_module_bindings, arguments)?;
-            if let Some(bindings) = resolved_bindings
-                && let Ok(resolved) = crate::resolver::resolve_ref_value(&value, bindings)
-            {
-                value = resolved;
-            }
-            ValidateExpr::BoundArgument {
-                argument: argument.clone(),
-                operand: operand.clone(),
-                value,
-            }
+fn evaluate_expanded_module_functions(
+    value: &ExpandedValue,
+    config: &crate::parser::ProviderContext,
+) -> Result<ExpandedValue, ArgumentSubstitutionError> {
+    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
+
+    Ok(match value {
+        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
+            items
+                .iter()
+                .map(|item| evaluate_expanded_module_functions(item, config))
+                .collect::<Result<_, _>>()?,
+        )),
+        Value::Concrete(ConcreteValue::Map(entries)) => Value::Concrete(ConcreteValue::Map(
+            entries
+                .iter()
+                .map(|(name, item)| {
+                    Ok((
+                        name.clone(),
+                        evaluate_expanded_module_functions(item, config)?,
+                    ))
+                })
+                .collect::<Result<_, ArgumentSubstitutionError>>()?,
+        )),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(evaluate_expanded_module_functions(value, config)?),
+                default: Box::new(evaluate_expanded_module_functions(default, config)?),
+            })
         }
-        ValidateExpr::Compare { lhs, op, rhs } => ValidateExpr::Compare {
-            lhs: Box::new(prefix_constraint_expression(
-                lhs,
-                instance_prefix,
-                intra_module_bindings,
-                arguments,
-                resolved_bindings,
-            )?),
-            op: op.clone(),
-            rhs: Box::new(prefix_constraint_expression(
-                rhs,
-                instance_prefix,
-                intra_module_bindings,
-                arguments,
-                resolved_bindings,
-            )?),
-        },
-        ValidateExpr::And(lhs, rhs) => ValidateExpr::And(
-            Box::new(prefix_constraint_expression(
-                lhs,
-                instance_prefix,
-                intra_module_bindings,
-                arguments,
-                resolved_bindings,
-            )?),
-            Box::new(prefix_constraint_expression(
-                rhs,
-                instance_prefix,
-                intra_module_bindings,
-                arguments,
-                resolved_bindings,
-            )?),
-        ),
-        ValidateExpr::Or(lhs, rhs) => ValidateExpr::Or(
-            Box::new(prefix_constraint_expression(
-                lhs,
-                instance_prefix,
-                intra_module_bindings,
-                arguments,
-                resolved_bindings,
-            )?),
-            Box::new(prefix_constraint_expression(
-                rhs,
-                instance_prefix,
-                intra_module_bindings,
-                arguments,
-                resolved_bindings,
-            )?),
-        ),
-        ValidateExpr::Not(inner) => ValidateExpr::Not(Box::new(prefix_constraint_expression(
-            inner,
-            instance_prefix,
-            intra_module_bindings,
-            arguments,
-            resolved_bindings,
-        )?)),
-        ValidateExpr::FunctionCall { name, args } => ValidateExpr::FunctionCall {
-            name: name.clone(),
-            args: args
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            Value::Deferred(DeferredValue::Interpolation(
+                parts
+                    .iter()
+                    .map(|part| match part {
+                        InterpolationPart::Literal(literal) => {
+                            Ok(InterpolationPart::Literal(literal.clone()))
+                        }
+                        InterpolationPart::Expr(expression) => Ok(InterpolationPart::Expr(
+                            evaluate_expanded_module_functions(expression, config)?,
+                        )),
+                    })
+                    .collect::<Result<_, ArgumentSubstitutionError>>()?,
+            ))
+        }
+        Value::Deferred(DeferredValue::FunctionCall { .. } | DeferredValue::Unavailable { .. }) => {
+            let mut evaluated = value.clone();
+            let Value::Deferred(
+                DeferredValue::FunctionCall { args, .. } | DeferredValue::Unavailable { args, .. },
+            ) = &mut evaluated
+            else {
+                unreachable!("matched a built-in call")
+            };
+            *args = args
                 .iter()
                 .map(|argument| {
-                    prefix_constraint_expression(
-                        argument,
-                        instance_prefix,
-                        intra_module_bindings,
-                        arguments,
-                        resolved_bindings,
-                    )
+                    argument
+                        .try_map_value(|value| evaluate_expanded_module_functions(value, config))
                 })
-                .collect::<Result<_, _>>()?,
-        },
-        ValidateExpr::Var(_)
-        | ValidateExpr::Access { .. }
-        | ValidateExpr::Bool(_)
-        | ValidateExpr::Int(_)
-        | ValidateExpr::Float(_)
-        | ValidateExpr::Duration(_)
-        | ValidateExpr::String(_)
-        | ValidateExpr::Null => expression.clone(),
+                .collect::<Result<_, _>>()?;
+            evaluated
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) => {
+            let args = args
+                .iter()
+                .map(|argument| {
+                    argument
+                        .try_map_value(|value| evaluate_expanded_module_functions(value, config))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let line = source_line.get().unwrap_or(function.body.source_line);
+            crate::resolver::evaluate_module_resolved_user_function(
+                function, functions, &args, config, line,
+            )
+            .map_err(|error| function_substitution_error(error, line))?
+        }
+        Value::Deferred(DeferredValue::Access(access)) => access
+            .rebuild_with_base(
+                evaluate_expanded_module_functions(access.base(), config)?,
+                crate::resource::AccessMissPolicy::Error,
+            )
+            .map_err(|error| ArgumentSubstitutionError {
+                source_file: None,
+                line: access.source_line(),
+                message: error.to_string(),
+                parse_error: None,
+            })?,
+        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
+            Box::new(evaluate_expanded_module_functions(inner, config)?),
+        )),
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        ) => value.clone(),
     })
 }
 
-/// Expand one attribute value crossing the module boundary:
-/// `rewrite_intra_module_refs` (prefix intra-module refs; a
-/// caller-provided ref that coincidentally shares a binding name is
-/// left alone) → `substitute_arguments` → `canonicalize_in_place`
-/// (collapse a fully-literal `Interpolation` back to a flat `String`,
-/// #2815 / #2817).
-///
-/// The single definition of "expand a module attribute value", shared
-/// by [`prefix_module_resource`] (a module resource's attrs) and
-/// [`prefix_deferred_for_expression`] (a loop body's attrs) so the two
-/// carriers can never drift — the exact carina#3126 bug class.
-fn prefix_attr_value(
-    value: &Value,
-    instance_prefix: &str,
-    intra_module_bindings: &HashSet<String>,
-    arguments: ArgumentSubstitutions<'_>,
-) -> Result<Value, ArgumentSubstitutionError> {
-    let rewritten = rewrite_intra_module_refs(value, instance_prefix, intra_module_bindings);
-    let mut substituted = substitute_arguments_with_position(
-        &rewritten,
-        arguments,
-        ArgumentSubstitutionPosition::Value,
-    )?;
-    substituted.canonicalize_in_place();
-    Ok(substituted)
+fn function_substitution_error(
+    error: crate::parser::ParseError,
+    fallback_line: usize,
+) -> ArgumentSubstitutionError {
+    ArgumentSubstitutionError {
+        source_file: error.source_file().map(std::path::Path::to_path_buf),
+        line: fallback_line,
+        message: error.to_string(),
+        parse_error: Some(Box::new(error)),
+    }
 }
 
-/// Instance-prefix one module resource: `Bound` id name, binding, and
-/// intra-module dependency metadata take the instance prefix, typed
-/// module-source is stamped, and every attribute is
-/// `rewrite_intra_module_refs` → `substitute_arguments` →
-/// `canonicalize_in_place` (the #2222 / #2815 / #2817 sequence).
-///
-/// The single definition of "expand a module resource", shared by the
-/// `module.resources` loop and `prefix_deferred_for_expression`'s
-/// `template_resource` so a loop body inside a module is prefixed
-/// identically to a top-level module resource (carina#3126 PR-B).
-fn prefix_module_resource(
+fn expand_module_resource(
     resource: &Resource,
-    instance_prefix: &str,
-    module_name: &str,
-    module_instance_scope: &ModuleInstanceScope,
-    module_call: &CompositionCall,
-    intra_module_bindings: &HashSet<String>,
-    arguments: ArgumentSubstitutions<'_>,
-) -> Result<Resource, ArgumentSubstitutionError> {
-    let instance_identity = ResourceIdentity::try_from(instance_prefix.to_string())
+    module_call: &crate::resource::ExpandedCompositionCall,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<crate::resource::ExpandedResource, ArgumentSubstitutionError> {
+    let instance_identity = ResourceIdentity::try_from(resolver.scope.key().to_string())
         .expect("module instance prefix is non-empty");
-    prefix_module_resource_with_identity(
-        resource,
-        instance_prefix,
-        &instance_identity,
-        module_name,
-        module_instance_scope,
-        module_call,
-        intra_module_bindings,
-        arguments,
-    )
+    expand_module_resource_with_identity(resource, &instance_identity, module_call, resolver)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn prefix_module_resource_with_identity(
+fn expand_module_resource_with_identity(
     resource: &Resource,
-    instance_prefix: &str,
     instance_identity: &ResourceIdentity,
-    module_name: &str,
-    module_instance_scope: &ModuleInstanceScope,
-    module_call: &CompositionCall,
-    intra_module_bindings: &HashSet<String>,
-    arguments: ArgumentSubstitutions<'_>,
-) -> Result<Resource, ArgumentSubstitutionError> {
-    // Only assigned identities take the prefix here. Anonymous resources
-    // stay pending so `compute_anonymous_identifiers` can later attach both
-    // the hash and the instance prefix in one shot (#2516). Each module
-    // instance receives a distinct pending token.
+    module_call: &crate::resource::ExpandedCompositionCall,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<crate::resource::ExpandedResource, ArgumentSubstitutionError> {
+    let instance_prefix = resolver.scope.key();
     let mut new_resource = match resource.id.identity_state() {
         ResourceIdentityState::Pending(_) => resource.instantiate(),
         ResourceIdentityState::Resolved(identity) => resource.instantiate_with_identity(
-            ResourceIdentity::new(apply_instance_prefix(instance_prefix, identity.as_str())),
+            ResourceIdentity::new(prefix_resource_identity(instance_prefix, identity.as_str())),
         ),
     };
 
@@ -1439,400 +1948,364 @@ fn prefix_module_resource_with_identity(
         );
     }
 
-    if let Some(ref binding) = new_resource.binding {
-        new_resource.binding = Some(apply_instance_prefix(instance_prefix, binding));
-    }
-    new_resource.directives.depends_on = prefix_directive_dependencies(
-        &new_resource.directives.depends_on,
-        instance_prefix,
-        intra_module_bindings,
-        arguments,
-    )?;
-    new_resource.dependency_bindings = prefix_dependency_bindings(
-        &new_resource.dependency_bindings,
-        instance_prefix,
-        intra_module_bindings,
-        arguments,
-    )?;
+    let crate::resource::Resource {
+        id,
+        attributes,
+        directives,
+        prefixes,
+        binding,
+        dependency_bindings,
+        module_source: _,
+        default_tag_keys,
+        loop_provenance,
+        quoted_string_attrs,
+    } = new_resource;
+    let crate::resource::Directives {
+        force_delete,
+        create_before_destroy,
+        prevent_destroy,
+        depends_on,
+        provider_instance,
+    } = directives;
 
-    let (scope, call_path) = match new_resource.module_source.as_ref() {
-        Some(ModuleSource::Module(child)) => (
-            module_instance_scope.with_child(child.identity_scope()),
-            child
-                .module_call_path()
-                .clone()
-                .prepend(module_call.clone()),
-        ),
-        Some(ModuleSource::Root) | None => (
-            module_instance_scope.clone(),
-            CompositionCallPath::direct(module_call.clone()),
-        ),
-    };
-    new_resource.module_source = Some(ModuleSource::expanded_module(
-        module_name,
-        instance_prefix,
-        scope,
-        call_path,
-    ));
-
-    // `IndexMap` preserves authored attribute order across expansion
-    // (#2222); each value goes through the shared `prefix_attr_value`.
-    let mut substituted_attrs: IndexMap<String, Value> = IndexMap::new();
-    for (key, expr) in &new_resource.attributes {
-        substituted_attrs.insert(
-            key.clone(),
-            prefix_attr_value(expr, instance_prefix, intra_module_bindings, arguments)?,
-        );
-    }
-    new_resource.attributes = substituted_attrs;
-
-    Ok(new_resource)
+    Ok(crate::resource::Resource {
+        id,
+        attributes: attributes
+            .into_iter()
+            .map(|(name, value)| Ok((name, resolve_module_value(&value, resolver)?)))
+            .collect::<Result<_, ArgumentSubstitutionError>>()?,
+        directives: crate::resource::Directives {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            depends_on: resolve_directive_dependencies(&depends_on, resolver)?,
+            provider_instance,
+        },
+        prefixes,
+        binding: binding
+            .as_ref()
+            .map(|binding| resolver.resolve_declared_binding(binding))
+            .transpose()?,
+        dependency_bindings: resolve_dependency_bindings(&dependency_bindings, resolver)?,
+        module_source: Some(ModuleSource::expanded_module(
+            &resolver.call_path.root().module_name,
+            &resolver.call_path.root().instance,
+            resolver.scope.clone(),
+            resolver.call_path.clone(),
+        )),
+        default_tag_keys,
+        loop_provenance,
+        quoted_string_attrs,
+    })
 }
 
-/// Instance-prefix one module data source — the [`DataSource`] analogue
-/// of [`prefix_module_resource`]. A `DataSource` carries no `prefixes`
-/// field, so its assigned identity, `binding`, intra-module dependency
-/// metadata, `module_source`, and attributes take the module-boundary
-/// treatment.
-fn prefix_module_data_source(
+fn expand_module_data_source(
     data_source: &DataSource,
-    instance_prefix: &str,
-    module_name: &str,
-    module_instance_scope: &ModuleInstanceScope,
-    module_call: &CompositionCall,
-    intra_module_bindings: &HashSet<String>,
-    arguments: ArgumentSubstitutions<'_>,
-) -> Result<DataSource, ArgumentSubstitutionError> {
-    let mut new_data_source = match data_source.id.identity_state() {
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<crate::resource::ExpandedDataSource, ArgumentSubstitutionError> {
+    let instance_prefix = resolver.scope.key();
+    let new_data_source = match data_source.id.identity_state() {
         ResourceIdentityState::Pending(_) => data_source.instantiate(),
         ResourceIdentityState::Resolved(identity) => data_source.instantiate_with_identity(
-            ResourceIdentity::new(apply_instance_prefix(instance_prefix, identity.as_str())),
+            ResourceIdentity::new(prefix_resource_identity(instance_prefix, identity.as_str())),
         ),
     };
-
-    if let Some(ref binding) = new_data_source.binding {
-        new_data_source.binding = Some(apply_instance_prefix(instance_prefix, binding));
-    }
-    new_data_source.directives.depends_on = prefix_directive_dependencies(
-        &new_data_source.directives.depends_on,
-        instance_prefix,
-        intra_module_bindings,
-        arguments,
-    )?;
-    new_data_source.dependency_bindings = prefix_dependency_bindings(
-        &new_data_source.dependency_bindings,
-        instance_prefix,
-        intra_module_bindings,
-        arguments,
-    )?;
-
-    let (scope, call_path) = match new_data_source.module_source.as_ref() {
-        Some(ModuleSource::Module(child)) => (
-            module_instance_scope.with_child(child.identity_scope()),
-            child
-                .module_call_path()
-                .clone()
-                .prepend(module_call.clone()),
-        ),
-        Some(ModuleSource::Root) | None => (
-            module_instance_scope.clone(),
-            CompositionCallPath::direct(module_call.clone()),
-        ),
-    };
-    new_data_source.module_source = Some(ModuleSource::expanded_module(
-        module_name,
-        instance_prefix,
-        scope,
-        call_path,
-    ));
-
-    let mut substituted_attrs: IndexMap<String, Value> = IndexMap::new();
-    for (key, expr) in &new_data_source.attributes {
-        substituted_attrs.insert(
-            key.clone(),
-            prefix_attr_value(expr, instance_prefix, intra_module_bindings, arguments)?,
-        );
-    }
-    new_data_source.attributes = substituted_attrs;
-
-    Ok(new_data_source)
+    let crate::resource::DataSource {
+        id,
+        attributes,
+        directives,
+        binding,
+        dependency_bindings,
+        module_source: _,
+        quoted_string_attrs,
+    } = new_data_source;
+    let crate::resource::Directives {
+        force_delete,
+        create_before_destroy,
+        prevent_destroy,
+        depends_on,
+        provider_instance,
+    } = directives;
+    Ok(crate::resource::DataSource {
+        id,
+        attributes: attributes
+            .into_iter()
+            .map(|(name, value)| Ok((name, resolve_module_value(&value, resolver)?)))
+            .collect::<Result<_, ArgumentSubstitutionError>>()?,
+        directives: crate::resource::Directives {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            depends_on: resolve_directive_dependencies(&depends_on, resolver)?,
+            provider_instance,
+        },
+        binding: binding
+            .as_ref()
+            .map(|binding| resolver.resolve_declared_binding(binding))
+            .transpose()?,
+        dependency_bindings: resolve_dependency_bindings(&dependency_bindings, resolver)?,
+        module_source: Some(ModuleSource::expanded_module(
+            &resolver.call_path.root().module_name,
+            &resolver.call_path.root().instance,
+            resolver.scope.clone(),
+            resolver.call_path.clone(),
+        )),
+        quoted_string_attrs,
+    })
 }
 
-/// Instance-prefix one composition resource crossing a module boundary — the
-/// [`LiveComposition`] analogue of [`prefix_module_resource`]. The flattened
-/// identity/binding, diagnostic call provenance, arguments, and attributes all
-/// take the prefix treatment; compositions have no `prefixes` or `directives`.
-fn prefix_module_composition(
-    composition: &LiveComposition,
-    instance_prefix: &str,
-    intra_module_bindings: &HashSet<String>,
-    arguments: ArgumentSubstitutions<'_>,
-    root_call: &CompositionCall,
-    config: &crate::parser::ProviderContext,
-    resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
-) -> Result<LiveComposition, ArgumentSubstitutionError> {
-    let mut new_virtual = composition.clone();
+fn expand_module_composition(
+    composition: &crate::resource::AuthoredLiveComposition,
+    root_call: &crate::resource::ExpandedCompositionCall,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<crate::resource::ExpandedLiveComposition, ArgumentSubstitutionError> {
+    let crate::resource::LiveComposition {
+        id,
+        signature,
+        binding,
+        dependency_bindings,
+        module_name,
+        instance,
+        call_path,
+        quoted_string_attrs,
+    } = composition;
+    let crate::resource::LiveCompositionSignature {
+        arguments,
+        attributes,
+        pending_constraints,
+    } = signature;
 
-    for call in new_virtual.call_path.calls_mut() {
-        call.instance = apply_instance_prefix(instance_prefix, &call.instance);
-        if let Some(binding) = &call.binding {
-            call.binding = Some(apply_instance_prefix(instance_prefix, binding));
-        }
-    }
-    new_virtual.call_path = new_virtual.call_path.clone().prepend(root_call.clone());
-
-    let new_name = apply_instance_prefix(instance_prefix, composition.id.identity_str());
-    new_virtual.id = composition
-        .id
-        .instantiate_with_identity(ResourceIdentity::new(new_name));
-
-    if let Some(ref binding) = new_virtual.binding {
-        new_virtual.binding = Some(apply_instance_prefix(instance_prefix, binding));
-    }
-    new_virtual.instance = apply_instance_prefix(instance_prefix, &new_virtual.instance);
-
-    let mut substituted_arguments: IndexMap<String, crate::resource::LiveCompositionArgument> =
-        IndexMap::new();
-    for (key, argument) in &new_virtual.signature.arguments {
-        if let Some(parameter) = argument.forwarded_parameter()
-            && let Some(resolved_parameter) = arguments.arguments.get(parameter)
-        {
-            let source_line = resolved_parameter.source_line(arguments.default_line);
-            let substitution = resolved_parameter
-                .substitution(parameter, ArgumentSubstitutionPosition::AccessBase)
-                .map_err(|message| ArgumentSubstitutionError {
-                    source_file: None,
-                    line: source_line,
-                    message,
-                    parse_error: None,
-                })?;
-            let mut value = substitution.value().clone();
-            value.canonicalize_in_place();
-            let resolved = match substitution {
-                StructuralOperandRef::Handle { handle, .. } => {
-                    argument.with_handle(value, handle.clone().with_alias(parameter))
+    let arguments = arguments
+        .iter()
+        .map(|(name, argument)| {
+            let (declared_type, origin) = argument.metadata();
+            let resolved = match argument.operand_ref() {
+                StructuralOperandRef::Value(value) => {
+                    let parameter = match value {
+                        Value::Deferred(DeferredValue::Unknown(
+                            crate::resource::UnknownReason::ModuleArgument { name, .. },
+                        )) => Some(name.as_str()),
+                        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+                            Some(binding.as_str())
+                        }
+                        Value::Concrete(_)
+                        | Value::Deferred(
+                            DeferredValue::ResourceRef { .. }
+                            | DeferredValue::Coalesce { .. }
+                            | DeferredValue::Interpolation(_)
+                            | DeferredValue::FunctionCall { .. }
+                            | DeferredValue::ResolvedFunctionCall { .. }
+                            | DeferredValue::Unavailable { .. }
+                            | DeferredValue::Access(_)
+                            | DeferredValue::Secret(_)
+                            | DeferredValue::RedactedSecret { .. }
+                            | DeferredValue::Unknown(_),
+                        ) => None,
+                    };
+                    let forwarded_handle = parameter
+                        .and_then(|parameter| {
+                            resolver
+                                .arguments
+                                .arguments
+                                .get(parameter)
+                                .map(|argument| (parameter, argument))
+                        })
+                        .and_then(|(parameter, argument)| match argument.value_ref() {
+                            StructuralOperandRef::Handle {
+                                handle,
+                                access_base,
+                            } => Some((parameter, handle, access_base)),
+                            StructuralOperandRef::Value(_)
+                            | StructuralOperandRef::Parameter { .. } => None,
+                        });
+                    match forwarded_handle {
+                        Some((parameter, handle, access_base)) => {
+                            crate::resource::LiveCompositionArgument::from_handle(
+                                access_base.clone(),
+                                declared_type.clone(),
+                                handle.clone().with_alias(parameter),
+                                origin,
+                            )
+                        }
+                        None => crate::resource::LiveCompositionArgument::from_value(
+                            resolve_module_value(value, resolver)?,
+                            declared_type.clone(),
+                            origin,
+                        ),
+                    }
                 }
-                StructuralOperandRef::Value(_) | StructuralOperandRef::Parameter { .. } => {
-                    argument.with_value(value)
+                StructuralOperandRef::Handle {
+                    handle,
+                    access_base,
+                } => crate::resource::LiveCompositionArgument::from_handle(
+                    resolver
+                        .resolve_value(access_base, ArgumentSubstitutionPosition::AccessBase)?,
+                    declared_type.clone(),
+                    resolver.resolve_structural_handle(handle)?,
+                    origin,
+                ),
+                StructuralOperandRef::Parameter {
+                    name: parameter,
+                    access_base: _access_base,
+                } => {
+                    let substituted = resolver
+                        .arguments
+                        .arguments
+                        .get(parameter)
+                        .ok_or_else(|| resolver.unknown_binding(parameter))?;
+                    match substituted.value_ref() {
+                        StructuralOperandRef::Value(value) => {
+                            crate::resource::LiveCompositionArgument::from_value(
+                                value.clone(),
+                                declared_type.clone(),
+                                origin,
+                            )
+                        }
+                        StructuralOperandRef::Handle {
+                            handle,
+                            access_base,
+                        } => crate::resource::LiveCompositionArgument::from_handle(
+                            access_base.clone(),
+                            declared_type.clone(),
+                            handle.clone().with_alias(parameter),
+                            origin,
+                        ),
+                        StructuralOperandRef::Parameter {
+                            name: forwarded,
+                            access_base: forwarded_access_base,
+                        } => {
+                            let _forwarded_parameter_name = forwarded;
+                            crate::resource::LiveCompositionArgument::from_value(
+                                forwarded_access_base.clone(),
+                                declared_type.clone(),
+                                origin,
+                            )
+                        }
+                    }
                 }
             };
-            check_composition_argument_type(key, &resolved, config, source_line)?;
-            substituted_arguments.insert(key.clone(), resolved);
-            continue;
-        }
-        let rewritten =
-            rewrite_intra_module_refs(argument.value(), instance_prefix, intra_module_bindings);
-        let position = if argument.is_handle() {
-            ArgumentSubstitutionPosition::AccessBase
-        } else {
-            ArgumentSubstitutionPosition::Value
-        };
-        let mut prefixed = substitute_arguments_with_position(&rewritten, arguments, position)?;
-        prefixed.canonicalize_in_place();
-        let resolved = argument.with_value(prefixed);
-        check_composition_argument_type(key, &resolved, config, arguments.default_line)?;
-        substituted_arguments.insert(key.clone(), resolved);
-    }
-    new_virtual.signature.arguments = substituted_arguments;
+            Ok((name.clone(), resolved))
+        })
+        .collect::<Result<IndexMap<_, _>, ArgumentSubstitutionError>>()?;
 
-    let mut substituted_attrs: IndexMap<String, crate::resource::LiveCompositionAttribute> =
-        IndexMap::new();
-    for (key, attr) in &new_virtual.signature.attributes {
-        // Round-trip through `Value` so the existing `prefix_attr_value`
-        // helper (which knows about every nested `Value` shape) can
-        // run unmodified, then re-classify the result. A bare
-        // `Forwarded` may transform into another `Forwarded`
-        // (same shape, instance-prefixed binding) or stay `Derived`
-        // depending on what `prefix_attr_value` did.
-        let v = attr.to_value();
-        let prefixed = prefix_attr_value(&v, instance_prefix, intra_module_bindings, arguments)?;
-        substituted_attrs.insert(key.clone(), attr.with_value(prefixed));
-    }
-    new_virtual.signature.attributes = substituted_attrs;
+    let attributes = attributes
+        .iter()
+        .map(|(name, attribute)| {
+            Ok((
+                name.clone(),
+                crate::resource::LiveCompositionAttribute::from_value(
+                    resolve_module_value(&attribute.to_value(), resolver)?,
+                    attribute.declared_type().cloned(),
+                )
+                .with_source_argument(attribute.source_argument().map(str::to_string)),
+            ))
+        })
+        .collect::<Result<IndexMap<_, _>, ArgumentSubstitutionError>>()?;
 
-    new_virtual.signature.pending_constraints = new_virtual
-        .signature
-        .pending_constraints
+    let pending_constraints = pending_constraints
         .iter()
         .map(|constraint| {
             Ok(crate::resource::PendingModuleConstraint {
                 id: constraint.id.clone(),
-                expression: prefix_constraint_expression(
-                    &constraint.expression,
-                    instance_prefix,
-                    intra_module_bindings,
-                    arguments,
-                    resolved_bindings,
-                )?,
+                expression: resolve_module_constraint_expression(&constraint.expression, resolver)?,
                 message: constraint.message.clone(),
             })
         })
-        .collect::<Result<_, ArgumentSubstitutionError>>()?;
+        .collect::<Result<Vec<_>, ArgumentSubstitutionError>>()?;
 
-    Ok(new_virtual)
-}
-
-/// Re-evaluate a nested composition after its outer caller has supplied the
-/// arguments that were unavailable during the nested module's first
-/// expansion. Satisfied constraints disappear, unresolved constraints remain
-/// for plan/apply gates, and concrete failures use the same typed diagnostic
-/// path as direct module calls.
-fn settle_prefixed_composition_constraints(
-    composition: &mut LiveComposition,
-    record_outcomes: bool,
-) -> Result<Option<ModuleCallConstraintReport>, ModuleError> {
-    if composition.signature.pending_constraints.is_empty() {
-        return Ok(None);
-    }
-
-    let argument_values = composition
-        .signature
-        .arguments
-        .iter()
-        .map(|(name, argument)| (name.clone(), argument.value().clone()))
-        .collect::<HashMap<_, _>>();
-    let constraints = std::mem::take(&mut composition.signature.pending_constraints);
-    let evaluated =
-        evaluate_module_constraints(ModuleConstraints::pending(&constraints), &argument_values);
-    let mut pending = Vec::new();
-    let mut outcomes = Vec::new();
-    for evaluated in evaluated {
-        let id = evaluated.constraint().id().clone();
-        match evaluated.evaluation() {
-            ConstraintEvaluation::Satisfied => outcomes.push(ResolvedModuleConstraintOutcome {
-                id,
-                status: ResolvedModuleConstraintStatus::Satisfied,
-            }),
-            ConstraintEvaluation::Pending => {
-                outcomes.push(ResolvedModuleConstraintOutcome {
-                    id,
-                    status: ResolvedModuleConstraintStatus::Pending,
-                });
-                pending.push(evaluated.into_constraint());
-            }
-            ConstraintEvaluation::Violated(_) | ConstraintEvaluation::EvalError(_) => {
-                if record_outcomes {
-                    let diagnostic = evaluated
-                        .module_diagnostic(
-                            &composition.module_name,
-                            &composition.instance,
-                            composition.binding.as_deref(),
-                            Some(&composition.call_path.immediate().id),
-                        )
-                        .expect("concrete nested constraint outcome has a diagnostic");
-                    outcomes.push(ResolvedModuleConstraintOutcome {
-                        id,
-                        status: ResolvedModuleConstraintStatus::Failed {
-                            diagnostic: Box::new(diagnostic),
-                            origin: ResolvedModuleConstraintOrigin::Call,
-                        },
-                    });
-                } else {
-                    return Err(evaluated
-                        .module_error(
-                            &composition.module_name,
-                            &composition.instance,
-                            composition.binding.as_deref(),
-                            Some(&composition.call_path.immediate().id),
-                        )
-                        .expect("concrete nested constraint outcome has a diagnostic"));
-                }
-            }
+    for call in call_path.calls() {
+        if let Some(binding) = &call.binding {
+            resolver.resolve_declared_binding(binding)?;
         }
     }
-    composition.signature.pending_constraints = pending;
-    if record_outcomes {
-        Ok(Some(ModuleCallConstraintReport::new(
-            crate::parser::ModuleCallDiagnosticSource {
-                id: composition.call_path.immediate().id.clone(),
-            },
-            composition.instance.clone(),
-            outcomes,
-        )))
-    } else {
-        Ok(None)
+    let mut call_path = call_path
+        .clone()
+        .resolve_bindings(&mut |binding| resolver.scope.resolve(binding));
+    for call in call_path.calls_mut() {
+        call.instance = prefix_resource_identity(resolver.scope.key(), &call.instance);
     }
-}
+    call_path = call_path.prepend(root_call.clone());
 
-fn check_composition_argument_type(
-    parameter: &str,
-    argument: &crate::resource::LiveCompositionArgument,
-    config: &crate::parser::ProviderContext,
-    line: usize,
-) -> Result<(), ArgumentSubstitutionError> {
-    let declared_type = argument.declared_type();
-    let Some(resolved_parameter) =
-        crate::validation::resolve_parameter_type_for_check(declared_type, config).map_err(
-            |message| ArgumentSubstitutionError {
-                source_file: None,
-                line,
-                message,
-                parse_error: None,
-            },
-        )?
-    else {
-        return Ok(());
-    };
-
-    if let Some(handle) = argument.handle() {
-        if let Err(error) = crate::validation::check_handle_sink(handle, &resolved_parameter) {
-            return Err(ArgumentSubstitutionError {
-                source_file: None,
-                line,
-                message: format!("parameter '{parameter}': {error}"),
-                parse_error: None,
-            });
-        }
-        return Ok(());
-    }
-
-    crate::validation::typecheck::check_type_expr_value(
-        &resolved_parameter.as_type_expr(),
-        argument.value(),
-        config,
-        crate::validation::typecheck::TypecheckInference::Unavailable,
-    )
-    .map_err(|mismatch| ArgumentSubstitutionError {
-        source_file: None,
-        line,
-        message: format!("parameter '{parameter}': {mismatch}"),
-        parse_error: None,
+    Ok(crate::resource::LiveComposition {
+        id: id.instantiate_with_identity(ResourceIdentity::new(prefix_resource_identity(
+            resolver.scope.key(),
+            id.identity_str(),
+        ))),
+        signature: crate::resource::LiveCompositionSignature {
+            arguments,
+            attributes,
+            pending_constraints,
+        },
+        binding: binding
+            .as_ref()
+            .map(|binding| resolver.resolve_declared_binding(binding))
+            .transpose()?,
+        dependency_bindings: resolve_dependency_bindings(dependency_bindings, resolver)?,
+        module_name: module_name.clone(),
+        instance: prefix_resource_identity(resolver.scope.key(), instance),
+        call_path,
+        quoted_string_attrs: quoted_string_attrs.clone(),
     })
 }
 
-/// Instance-prefix a [`DeferredForExpression`] crossing a module
-/// boundary, expanding its loop body the same way the
-/// `module.resources` expansion ([`prefix_module_resource`]) does.
-///
-/// The struct is **destructured exhaustively** — the carina#3061 /
-/// carina#3126 compile-time forcing function: a new
-/// `DeferredForExpression` field stops this compiling until someone
-/// classifies it as binding-name (prefix), value/provenance (pass
-/// through), or loop-local (pass through).
-///
-/// carina#3126 PR-B: the loop body declared inside a module must be
-/// expanded *as if it were a module resource* — otherwise its
-/// generated resources collide across module instances and its
-/// iterable resolves against the wrong (unprefixed) binding. Per
-/// field:
-/// - `binding_name` (the generated-resource address prefix, e.g.
-///   `_domain_validation_options`) → instance-prefixed
-///   unconditionally, exactly like `Resource.binding`, so each module
-///   instance's loop resources are uniquely addressed.
-/// - `attributes` and `template_resource` → the full module-resource
-///   treatment via [`prefix_module_resource`] / the same
-///   ref-rewrite + arg-substitute + canonicalize as `module.resources`.
-/// - `file`/`line`/`header`/`resource_type`/`binding`
-///   → provenance / display / non-binding / loop-local: pass through.
-fn prefix_deferred_for_expression(
+fn resolve_module_constraint_expression(
+    expression: &crate::parser::ValidateExpr,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<crate::parser::ValidateExpr<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+    use crate::parser::ValidateExpr;
+
+    Ok(match expression {
+        ValidateExpr::Var(argument) => ValidateExpr::Var(argument.clone()),
+        ValidateExpr::Access { argument, path } => ValidateExpr::Access {
+            argument: argument.clone(),
+            path: path.clone(),
+        },
+        ValidateExpr::BoundArgument {
+            argument,
+            operand,
+            value,
+        } => ValidateExpr::BoundArgument {
+            argument: argument.clone(),
+            operand: operand.clone(),
+            value: resolve_module_value(value, resolver)?,
+        },
+        ValidateExpr::Bool(value) => ValidateExpr::Bool(*value),
+        ValidateExpr::Int(value) => ValidateExpr::Int(*value),
+        ValidateExpr::Float(value) => ValidateExpr::Float(*value),
+        ValidateExpr::Duration(value) => ValidateExpr::Duration(*value),
+        ValidateExpr::String(value) => ValidateExpr::String(value.clone()),
+        ValidateExpr::Null => ValidateExpr::Null,
+        ValidateExpr::Compare { lhs, op, rhs } => ValidateExpr::Compare {
+            lhs: Box::new(resolve_module_constraint_expression(lhs, resolver)?),
+            op: op.clone(),
+            rhs: Box::new(resolve_module_constraint_expression(rhs, resolver)?),
+        },
+        ValidateExpr::And(lhs, rhs) => ValidateExpr::And(
+            Box::new(resolve_module_constraint_expression(lhs, resolver)?),
+            Box::new(resolve_module_constraint_expression(rhs, resolver)?),
+        ),
+        ValidateExpr::Or(lhs, rhs) => ValidateExpr::Or(
+            Box::new(resolve_module_constraint_expression(lhs, resolver)?),
+            Box::new(resolve_module_constraint_expression(rhs, resolver)?),
+        ),
+        ValidateExpr::Not(inner) => ValidateExpr::Not(Box::new(
+            resolve_module_constraint_expression(inner, resolver)?,
+        )),
+        ValidateExpr::FunctionCall { name, args } => ValidateExpr::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|argument| resolve_module_constraint_expression(argument, resolver))
+                .collect::<Result<_, _>>()?,
+        },
+    })
+}
+
+fn expand_deferred_for_expression(
     d: &DeferredForExpression,
-    instance_prefix: &str,
-    module_name: &str,
-    module_instance_scope: &ModuleInstanceScope,
-    module_call: &CompositionCall,
-    intra_module_bindings: &HashSet<String>,
-    arguments: ArgumentSubstitutions<'_>,
-) -> Result<DeferredForExpression, ArgumentSubstitutionError> {
+    module_call: &crate::resource::ExpandedCompositionCall,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<crate::parser::ExpandedDeferredForExpression, ArgumentSubstitutionError> {
     let DeferredForExpression {
         file,
         line,
@@ -1844,14 +2317,14 @@ fn prefix_deferred_for_expression(
         binding,
         template_resource,
     } = d;
-    let instance_identity = ResourceIdentity::try_from(instance_prefix.to_string())
+    let instance_identity = ResourceIdentity::try_from(resolver.scope.key().to_string())
         .expect("module instance prefix is non-empty");
     let legacy_parent = module_call
         .loop_origin()
         .map(|origin| origin.legacy_address().clone())
         .unwrap_or_else(|| LegacyLoopAddress::new(instance_identity.as_str()));
 
-    Ok(DeferredForExpression {
+    Ok(crate::parser::DeferredForExpression {
         // provenance — pass through (like WaitBinding.line)
         file: file.clone(),
         line: *line,
@@ -1860,17 +2333,11 @@ fn prefix_deferred_for_expression(
         header: header.clone(),
         // provider-qualified type — not a binding
         resource_type: resource_type.clone(),
-        // The loop body's attrs may reference module-internal bindings
-        // / module arguments — same shared `prefix_attr_value` the
-        // module resource attrs get.
+        // The loop body's attrs may reference module-internal bindings or
+        // module arguments; the shared scope resolver handles both.
         attributes: attributes
             .iter()
-            .map(|(k, v)| {
-                Ok((
-                    k.clone(),
-                    prefix_attr_value(v, instance_prefix, intra_module_bindings, arguments)?,
-                ))
-            })
+            .map(|(k, v)| Ok((k.clone(), resolve_module_value(v, resolver)?)))
             .collect::<Result<_, ArgumentSubstitutionError>>()?,
         // Generated-resource address prefix — `binding_name` is a name
         // the loop *synthesizes* for its own resources (e.g.
@@ -1882,7 +2349,7 @@ fn prefix_deferred_for_expression(
         target: match target {
             crate::parser::DeferredForTarget::Bound { binding } => {
                 crate::parser::DeferredForTarget::Bound {
-                    binding: apply_instance_prefix(instance_prefix, binding),
+                    binding: resolver.resolve_declared_binding(binding)?,
                 }
             }
             crate::parser::DeferredForTarget::Unbound { template } => {
@@ -1893,20 +2360,16 @@ fn prefix_deferred_for_expression(
         },
         // The full iterable is a value expression: rewrite every reference
         // and substitute module arguments in both coalesce operands.
-        iterable: prefix_attr_value(iterable, instance_prefix, intra_module_bindings, arguments)?,
+        iterable: resolve_module_value(iterable, resolver)?,
         // loop-var pattern kind — loop-local, not a module binding
         binding: binding.clone(),
         // Full module-resource treatment — identical to a
         // `module.resources` entry.
-        template_resource: prefix_module_resource_with_identity(
+        template_resource: expand_module_resource_with_identity(
             template_resource,
-            instance_prefix,
             &instance_identity,
-            module_name,
-            module_instance_scope,
             module_call,
-            intra_module_bindings,
-            arguments,
+            resolver,
         )?,
     })
 }
@@ -1951,10 +2414,10 @@ impl ArgumentSubstitutionError {
 /// caller values are substituted. BindingRef/ResourceRef substitution remains
 /// for pre-expanded or hand-constructed AST values.
 #[cfg(test)]
-pub(super) fn substitute_arguments(
-    value: &Value,
-    arguments: &HashMap<String, Value>,
-) -> Result<Value, ArgumentSubstitutionError> {
+pub(super) fn substitute_arguments<B: BindingAddress>(
+    value: &crate::resource::Value<B>,
+    arguments: &HashMap<String, crate::resource::Value<B>>,
+) -> Result<crate::resource::Value<B>, ArgumentSubstitutionError> {
     let config = crate::parser::ProviderContext::default();
     let arguments = arguments
         .iter()
@@ -1964,6 +2427,7 @@ pub(super) fn substitute_arguments(
                 ResolvedArgument {
                     argument: ModuleArgument::new(value.clone()),
                     origin: ArgumentOrigin::Defaulted,
+                    caller_reference: None,
                 },
             )
         })
@@ -1981,22 +2445,10 @@ pub(super) fn substitute_arguments(
     )
 }
 
-fn function_substitution_error(
-    error: ParseError,
-    fallback_line: usize,
-) -> ArgumentSubstitutionError {
-    ArgumentSubstitutionError {
-        source_file: error.source_file().map(std::path::Path::to_path_buf),
-        line: fallback_line,
-        message: error.to_string(),
-        parse_error: Some(Box::new(error)),
-    }
-}
-
-fn substitute_function_argument(
-    argument: &crate::resource::FunctionArgument,
-    arguments: ArgumentSubstitutions<'_>,
-) -> Result<crate::resource::FunctionArgument, ArgumentSubstitutionError> {
+fn substitute_function_argument<B: BindingAddress>(
+    argument: &crate::resource::FunctionArgument<B>,
+    arguments: ArgumentSubstitutions<'_, B>,
+) -> Result<crate::resource::FunctionArgument<B>, ArgumentSubstitutionError> {
     if let Some(name) = argument.pending_parameter()
         && let Some(substitution) = arguments.arguments.get(name)
     {
@@ -2021,11 +2473,13 @@ fn substitute_function_argument(
     })
 }
 
-fn substitute_arguments_with_position(
-    value: &Value,
-    arguments: ArgumentSubstitutions<'_>,
+fn substitute_arguments_with_position<B: BindingAddress>(
+    value: &crate::resource::Value<B>,
+    arguments: ArgumentSubstitutions<'_, B>,
     position: ArgumentSubstitutionPosition,
-) -> Result<Value, ArgumentSubstitutionError> {
+) -> Result<crate::resource::Value<B>, ArgumentSubstitutionError> {
+    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
+
     let substituted = match value {
         Value::Deferred(DeferredValue::Unknown(
             crate::resource::UnknownReason::ModuleArgument {
@@ -2041,7 +2495,21 @@ fn substitute_arguments_with_position(
                 .get()
                 .unwrap_or_else(|| argument.source_line(arguments.default_line));
             match argument.value_ref() {
-                StructuralOperandRef::Value(value) => value.clone(),
+                StructuralOperandRef::Value(value) => {
+                    let mut substituted = value.clone();
+                    if let Value::Deferred(DeferredValue::Unknown(
+                        crate::resource::UnknownReason::ModuleArgument {
+                            source_line: substituted_line,
+                            diagnostic_name: substituted_diagnostic,
+                            ..
+                        },
+                    )) = &mut substituted
+                    {
+                        *substituted_line = *source_line;
+                        *substituted_diagnostic = diagnostic_name.clone();
+                    }
+                    substituted
+                }
                 StructuralOperandRef::Handle { .. }
                     if matches!(position, ArgumentSubstitutionPosition::Value) =>
                 {
@@ -2076,12 +2544,12 @@ fn substitute_arguments_with_position(
             }
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            let Some(argument) = arguments.arguments.get(binding) else {
+            let Some(argument) = arguments.arguments.get(binding.as_str()) else {
                 return Ok(value.clone());
             };
             let source_line = argument.source_line(arguments.default_line);
             argument
-                .substitution(binding, ArgumentSubstitutionPosition::Value)
+                .substitution(binding.as_str(), ArgumentSubstitutionPosition::Value)
                 .map_err(|message| ArgumentSubstitutionError {
                     source_file: None,
                     line: source_line,
@@ -2182,8 +2650,7 @@ fn substitute_arguments_with_position(
             Value::Concrete(ConcreteValue::Map(substituted))
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            use crate::resource::InterpolationPart;
-            let substituted_parts: Vec<InterpolationPart> = parts
+            let substituted_parts: Vec<_> = parts
                 .iter()
                 .map(|p| match p {
                     InterpolationPart::Expr(v) => substitute_arguments_with_position(
@@ -2218,19 +2685,16 @@ fn substitute_arguments_with_position(
             args,
             source_line,
         }) => {
-            let line = source_line.get().unwrap_or(function.body.source_line);
             let args = args
                 .iter()
                 .map(|argument| substitute_function_argument(argument, arguments))
                 .collect::<Result<Vec<_>, _>>()?;
-            crate::parser::evaluate_resolved_user_function(
-                function,
-                functions,
-                &args,
-                arguments.config,
-                line,
-            )
-            .map_err(|error| function_substitution_error(error, line))?
+            Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                function: function.clone(),
+                functions: functions.clone(),
+                args,
+                source_line: *source_line,
+            })
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let substituted_base = substitute_arguments_with_position(
@@ -2257,17 +2721,26 @@ fn substitute_arguments_with_position(
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
         )
-        | Value::Deferred(
-            DeferredValue::Secret(_)
-            | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
-        ) => value.clone(),
+        | Value::Deferred(DeferredValue::RedactedSecret { .. } | DeferredValue::Unknown(_)) => {
+            value.clone()
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
+            Box::new(substitute_arguments_with_position(
+                inner,
+                arguments,
+                ArgumentSubstitutionPosition::Value,
+            )?),
+        )),
     };
 
-    if let (Some(binding_index), Value::Deferred(DeferredValue::ResourceRef { path })) =
-        (arguments.binding_index, &substituted)
+    if let Some(binding_index) = arguments.binding_index
+        && let Some((argument, postfix)) = module_parameter_postfix(value, arguments.arguments)
+        && let Some(reference) = arguments
+            .arguments
+            .get(&argument)
+            .and_then(|resolved| resolved.caller_reference.clone())
         && let RefType::UnknownAttribute(error @ RefTypeError::InvalidAccess { .. }) =
-            binding_index.postfix_ref_type(path)
+            binding_index.postfix_ref_type(append_reference_path(reference, &postfix).as_ref())
     {
         let line = match value {
             Value::Deferred(DeferredValue::Access(access)) => access.source_line(),
@@ -2287,152 +2760,6 @@ fn substitute_arguments_with_position(
     Ok(substituted)
 }
 
-/// Rewrite intra-module ResourceRef binding names with instance path.
-///
-/// When a ResourceRef's binding_name matches one of the module's own bindings,
-/// prefix it with dot notation so that each module instance has isolated references.
-pub(super) fn rewrite_intra_module_refs(
-    value: &Value,
-    instance_prefix: &str,
-    intra_module_bindings: &HashSet<String>,
-) -> Value {
-    match value {
-        Value::Deferred(DeferredValue::BindingRef { binding })
-            if intra_module_bindings.contains(binding) =>
-        {
-            Value::Deferred(DeferredValue::BindingRef {
-                binding: apply_instance_prefix(instance_prefix, binding),
-            })
-        }
-        Value::Deferred(DeferredValue::ResourceRef { path })
-            if intra_module_bindings.contains(path.binding()) =>
-        {
-            Value::Deferred(DeferredValue::ResourceRef {
-                path: crate::resource::AccessPath::with_segments(
-                    apply_instance_prefix(instance_prefix, path.binding()),
-                    path.attribute().to_string(),
-                    path.segments().to_vec(),
-                ),
-            })
-        }
-        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
-            items
-                .iter()
-                .map(|v| rewrite_intra_module_refs(v, instance_prefix, intra_module_bindings))
-                .collect(),
-        )),
-        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
-            map.iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        rewrite_intra_module_refs(v, instance_prefix, intra_module_bindings),
-                    )
-                })
-                .collect(),
-        )),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            use crate::resource::InterpolationPart;
-            let rewritten_parts: Vec<InterpolationPart> = parts
-                .iter()
-                .map(|p| match p {
-                    InterpolationPart::Expr(v) => InterpolationPart::Expr(
-                        rewrite_intra_module_refs(v, instance_prefix, intra_module_bindings),
-                    ),
-                    other => other.clone(),
-                })
-                .collect();
-            Value::Deferred(DeferredValue::Interpolation(rewritten_parts))
-        }
-        Value::Deferred(DeferredValue::FunctionCall { .. } | DeferredValue::Unavailable { .. }) => {
-            let mut rewritten = value.clone();
-            let Value::Deferred(
-                DeferredValue::FunctionCall { args, .. } | DeferredValue::Unavailable { args, .. },
-            ) = &mut rewritten
-            else {
-                unreachable!("matched a built-in call")
-            };
-            let rewritten_args = args
-                .iter()
-                .map(|argument| {
-                    argument
-                        .try_map_value(|value| {
-                            Ok::<_, std::convert::Infallible>(rewrite_intra_module_refs(
-                                value,
-                                instance_prefix,
-                                intra_module_bindings,
-                            ))
-                        })
-                        .expect("infallible function-argument rewrite")
-                })
-                .collect();
-            *args = rewritten_args;
-            rewritten
-        }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            functions,
-            args,
-            source_line,
-        }) => Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function: function.clone(),
-            functions: functions.clone(),
-            args: args
-                .iter()
-                .map(|argument| {
-                    argument
-                        .try_map_value(|value| {
-                            Ok::<_, std::convert::Infallible>(rewrite_intra_module_refs(
-                                value,
-                                instance_prefix,
-                                intra_module_bindings,
-                            ))
-                        })
-                        .expect("infallible function-argument rewrite")
-                })
-                .collect(),
-            source_line: *source_line,
-        }),
-        Value::Deferred(DeferredValue::Access(access)) => access
-            .rebuild_with_base(
-                rewrite_intra_module_refs(access.base(), instance_prefix, intra_module_bindings),
-                crate::resource::AccessMissPolicy::Error,
-            )
-            .unwrap_or_else(|_| value.clone()),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(rewrite_intra_module_refs(
-                    value,
-                    instance_prefix,
-                    intra_module_bindings,
-                )),
-                default: Box::new(rewrite_intra_module_refs(
-                    default,
-                    instance_prefix,
-                    intra_module_bindings,
-                )),
-            })
-        }
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        )
-        | Value::Deferred(
-            DeferredValue::ResourceRef { .. }
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::Secret(_)
-            | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
-        ) => value.clone(),
-    }
-}
-
 /// Compute the instance prefix for a module call. Named calls use the
 /// binding name; anonymous calls get `<module>_<16hex>` where the hex is a
 /// SimHash of the call's module name + flattened arguments.
@@ -2445,7 +2772,7 @@ pub fn instance_prefix_for_call(call: &ModuleCall) -> String {
     use std::collections::BTreeMap;
 
     if let Some(name) = &call.binding_name {
-        return name.clone();
+        return name.to_string();
     }
 
     let mut features: BTreeMap<String, String> = BTreeMap::new();
@@ -2491,8 +2818,8 @@ pub(super) fn split_instance_prefix(name: &str) -> Option<(&str, &str)> {
 /// `(provider, resource_type)` — the reconciler uses them to discover which
 /// instance prefixes already exist in state.
 pub fn reconcile_anonymous_module_instances(
-    resources: &mut [Resource],
-    compositions: &mut [LiveComposition],
+    resources: &mut [crate::resource::Resource],
+    compositions: &mut [crate::resource::LiveComposition],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
     claims: &crate::identifier::StateBlockClaims,
 ) {
@@ -2653,9 +2980,9 @@ pub fn reconcile_anonymous_module_instances(
                 &ResourceIdentity::new(new_prefix.clone()),
             );
             if let Some(ref binding) = r.binding
-                && let Some((_, binding_rest)) = split_instance_prefix(binding)
+                && let Some(remapped) = rewrite_binding_prefix(binding, &prefix_remap)
             {
-                r.binding = Some(format!("{}.{}", new_prefix, binding_rest));
+                r.binding = Some(remapped);
             }
             if let Some(crate::resource::ModuleSource::Module(module)) = &r.module_source {
                 let mut remapped_call_path = module.module_call_path().clone();
@@ -2663,8 +2990,8 @@ pub fn reconcile_anonymous_module_instances(
                     if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
                         call.instance = rewritten;
                     }
-                    if let Some(binding) = call.binding.as_deref()
-                        && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
+                    if let Some(binding) = call.binding.as_ref()
+                        && let Some(rewritten) = rewrite_binding_prefix(binding, &prefix_remap)
                     {
                         call.binding = Some(rewritten);
                     }
@@ -2705,8 +3032,8 @@ pub fn reconcile_anonymous_module_instances(
                 .id
                 .instantiate_with_identity(ResourceIdentity::new(identity));
         }
-        if let Some(binding) = composition.binding.as_deref()
-            && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
+        if let Some(binding) = composition.binding.as_ref()
+            && let Some(rewritten) = rewrite_binding_prefix(binding, &prefix_remap)
         {
             composition.binding = Some(rewritten);
         }
@@ -2717,8 +3044,8 @@ pub fn reconcile_anonymous_module_instances(
             if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
                 call.instance = rewritten;
             }
-            if let Some(binding) = call.binding.as_deref()
-                && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
+            if let Some(binding) = call.binding.as_ref()
+                && let Some(rewritten) = rewrite_binding_prefix(binding, &prefix_remap)
             {
                 call.binding = Some(rewritten);
             }
@@ -2752,281 +3079,28 @@ fn rewrite_name_prefix(
 }
 
 fn rewrite_ref_prefixes(
-    value: &Value,
+    value: &crate::resource::Value,
     remap: &std::collections::HashMap<(String, SimHash), SimHash>,
-) -> Value {
-    match value {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            if let Some(binding) = rewrite_name_prefix(path.binding(), remap) {
-                return Value::Deferred(DeferredValue::ResourceRef {
-                    path: crate::resource::AccessPath::with_segments(
-                        binding,
-                        path.attribute().to_string(),
-                        path.segments().to_vec(),
-                    ),
-                });
-            }
-            value.clone()
-        }
-        Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            rewrite_name_prefix(binding, remap).map_or_else(
-                || value.clone(),
-                |binding| Value::Deferred(DeferredValue::BindingRef { binding }),
-            )
-        }
-        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
-            items
-                .iter()
-                .map(|v| rewrite_ref_prefixes(v, remap))
-                .collect(),
-        )),
-        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
-            map.iter()
-                .map(|(k, v)| (k.clone(), rewrite_ref_prefixes(v, remap)))
-                .collect(),
-        )),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            use crate::resource::InterpolationPart;
-            Value::Deferred(DeferredValue::Interpolation(
-                parts
-                    .iter()
-                    .map(|p| match p {
-                        InterpolationPart::Literal(s) => InterpolationPart::Literal(s.clone()),
-                        InterpolationPart::Expr(v) => {
-                            InterpolationPart::Expr(rewrite_ref_prefixes(v, remap))
-                        }
-                    })
-                    .collect(),
-            ))
-        }
-        Value::Deferred(DeferredValue::FunctionCall {
-            name,
-            args,
-            source_line,
-        }) => Value::Deferred(DeferredValue::FunctionCall {
-            name: *name,
-            args: args
-                .iter()
-                .map(|argument| {
-                    argument
-                        .try_map_value(|value| {
-                            Ok::<_, std::convert::Infallible>(rewrite_ref_prefixes(value, remap))
-                        })
-                        .expect("infallible function-argument rewrite")
-                })
-                .collect(),
-            source_line: *source_line,
-        }),
-        Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            functions,
-            args,
-            source_line,
-        }) => Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function: function.clone(),
-            functions: functions.clone(),
-            args: args
-                .iter()
-                .map(|argument| {
-                    argument
-                        .try_map_value(|value| {
-                            Ok::<_, std::convert::Infallible>(rewrite_ref_prefixes(value, remap))
-                        })
-                        .expect("infallible function-argument rewrite")
-                })
-                .collect(),
-            source_line: *source_line,
-        }),
-        Value::Deferred(DeferredValue::Access(access)) => access
-            .rebuild_with_base(
-                rewrite_ref_prefixes(access.base(), remap),
-                crate::resource::AccessMissPolicy::Error,
-            )
-            .unwrap_or_else(|_| value.clone()),
-        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            Box::new(rewrite_ref_prefixes(inner, remap)),
-        )),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(rewrite_ref_prefixes(value, remap)),
-                default: Box::new(rewrite_ref_prefixes(default, remap)),
-            })
-        }
-        _ => value.clone(),
-    }
+) -> crate::resource::Value {
+    value
+        .clone()
+        .map_bindings(&mut |binding| rewrite_binding_prefix(&binding, remap).unwrap_or(binding))
+}
+
+fn rewrite_binding_prefix(
+    binding: &crate::resource::AbsoluteBindingAddress,
+    remap: &std::collections::HashMap<(String, SimHash), SimHash>,
+) -> Option<crate::resource::AbsoluteBindingAddress> {
+    let (prefix, _) = split_instance_prefix(binding.as_str())?;
+    let (module, simhash) = parse_synthetic_instance_prefix(prefix)?;
+    let target = remap.get(&(module.to_string(), simhash))?;
+    let new_prefix = format!("{}_{:016x}", module, target);
+    binding.remap_instance_prefix(prefix, &new_prefix)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn test_expanded_call() -> CompositionCall {
-        let parsed = crate::parser::parse_file(
-            "let registry = use { source = './registry' }\nlet registry_publish = registry {}\n",
-            std::path::Path::new("data-source-call.crn"),
-            &crate::parser::ProviderContext::default(),
-        )
-        .expect("parse module owner call");
-        let call = &parsed.module_calls[0];
-        CompositionCall {
-            id: call.id().clone(),
-            module_name: call.module_name.clone(),
-            binding: call.binding_name.clone(),
-            instance: "registry_publish".to_string(),
-            module_source: Some("./registry".to_string()),
-            module_directory: None,
-            loop_origin: None,
-        }
-    }
-
-    #[test]
-    fn prefix_module_data_source_prefixes_non_empty_identity_and_binding() {
-        let mut data_source =
-            DataSource::with_provider("aws", "sts.CallerIdentity", "caller", None)
-                .with_binding("caller");
-        data_source
-            .dependency_bindings
-            .extend(["target".to_string(), "module_argument".to_string()]);
-
-        let arguments = HashMap::new();
-        let config = crate::parser::ProviderContext::default();
-        let substitutions = ArgumentSubstitutions {
-            arguments: &arguments,
-            default_line: 1,
-            caller_source_file: std::path::Path::new("test.crn"),
-            binding_index: None,
-            config: &config,
-        };
-        let prefixed = prefix_module_data_source(
-            &data_source,
-            "registry_publish",
-            "registry",
-            &ModuleInstanceScope::for_call(
-                "registry",
-                Some("registry_publish"),
-                "registry_publish",
-            ),
-            &test_expanded_call(),
-            &HashSet::from(["caller".to_string(), "target".to_string()]),
-            substitutions,
-        )
-        .expect("prefix data source");
-
-        assert_eq!(
-            prefixed.id.identity_str().expect("resolved identity"),
-            "registry_publish.caller"
-        );
-        assert_eq!(prefixed.binding.as_deref(), Some("registry_publish.caller"));
-        assert_eq!(
-            prefixed.dependency_bindings,
-            BTreeSet::from([
-                "module_argument".to_string(),
-                "registry_publish.target".to_string(),
-            ])
-        );
-    }
-
-    #[test]
-    fn prefix_module_resource_prefixes_only_intra_module_dependency_bindings() {
-        let mut resource =
-            Resource::with_provider("aws", "iam.Role", "consumer", None).with_binding("consumer");
-        resource.dependency_bindings.extend([
-            "target".to_string(),
-            "module_argument".to_string(),
-            "outer_binding".to_string(),
-        ]);
-
-        let arguments = HashMap::new();
-        let config = crate::parser::ProviderContext::default();
-        let substitutions = ArgumentSubstitutions {
-            arguments: &arguments,
-            default_line: 1,
-            caller_source_file: std::path::Path::new("test.crn"),
-            binding_index: None,
-            config: &config,
-        };
-        let prefixed = prefix_module_resource(
-            &resource,
-            "registry_publish",
-            "registry",
-            &ModuleInstanceScope::for_call(
-                "registry",
-                Some("registry_publish"),
-                "registry_publish",
-            ),
-            &test_expanded_call(),
-            &HashSet::from(["consumer".to_string(), "target".to_string()]),
-            substitutions,
-        )
-        .expect("prefix resource");
-
-        assert_eq!(
-            prefixed.dependency_bindings,
-            BTreeSet::from([
-                "module_argument".to_string(),
-                "outer_binding".to_string(),
-                "registry_publish.target".to_string(),
-            ])
-        );
-    }
-
-    #[test]
-    fn prefix_module_resource_prefixes_loop_legacy_and_current_paths() {
-        let parsed = crate::parser::parse_file(
-            "for value in ['one'] {\n  mock.test.Leaf { value = value }\n}\n",
-            std::path::Path::new("module/loop.crn"),
-            &crate::parser::ProviderContext::default(),
-        )
-        .expect("loop fixture parses");
-        let resource = &parsed.resources[0];
-        let call_origin = resource
-            .loop_provenance
-            .direct_origin()
-            .expect("direct loop origin")
-            .clone();
-        let mut module_call = test_expanded_call();
-        module_call.set_loop_origin(Some(call_origin));
-
-        let arguments = HashMap::new();
-        let config = crate::parser::ProviderContext::default();
-        let substitutions = ArgumentSubstitutions {
-            arguments: &arguments,
-            default_line: 1,
-            caller_source_file: std::path::Path::new("test.crn"),
-            binding_index: None,
-            config: &config,
-        };
-        let prefixed = prefix_module_resource(
-            resource,
-            "registry_publish",
-            "registry",
-            &ModuleInstanceScope::for_call(
-                "registry",
-                Some("registry_publish"),
-                "registry_publish",
-            ),
-            &module_call,
-            &HashSet::new(),
-            substitutions,
-        )
-        .expect("prefix loop resource");
-
-        assert_eq!(
-            prefixed
-                .loop_provenance
-                .direct_origin()
-                .expect("direct origin retained")
-                .legacy_address()
-                .exact_state_name(),
-            "_for0[0]._for0[0]",
-            "an inner loop resource must compose the outer module-loop legacy address",
-        );
-        let [module_prefix] = prefixed.loop_provenance.module_prefixes() else {
-            panic!("loop-generated module call must add one prefix origin");
-        };
-        assert_eq!(module_prefix.current_prefix().as_str(), "registry_publish");
-        assert_eq!(module_prefix.legacy_prefix().exact_state_name(), "_for0[0]");
-    }
 
     #[test]
     fn anonymous_module_reconcile_remaps_loop_current_prefix_only() {
@@ -3063,7 +3137,7 @@ mod tests {
             ResourceIdentity::new(current_prefix.clone()),
         ));
         resource.loop_provenance = provenance;
-        let mut resources = vec![resource];
+        let mut resources = vec![resource.resolve_root(&crate::resource::RootScope::new())];
 
         reconcile_anonymous_module_instances(
             &mut resources,
@@ -3117,7 +3191,7 @@ mod tests {
             None,
         );
         resource.loop_provenance = crate::resource::LoopProvenance::direct(direct);
-        let mut resources = vec![resource];
+        let mut resources = vec![resource.resolve_root(&crate::resource::RootScope::new())];
 
         reconcile_anonymous_module_instances(
             &mut resources,
@@ -3137,53 +3211,6 @@ mod tests {
                 .exact_state_name(),
             format!("{state_prefix}._for0[0]"),
             "legacy migration candidates derived from an anonymous module prefix must move with reconciliation",
-        );
-    }
-
-    #[test]
-    fn prefix_module_data_source_prefixes_managed_dependency_binding() {
-        let mut roles =
-            DataSource::with_provider("mock", "iam.Roles", "roles", None).with_binding("roles");
-        roles.dependency_bindings.insert("target".to_string());
-
-        let expanded_call = test_expanded_call();
-
-        let intra_module_bindings = HashSet::from(["target".to_string(), "roles".to_string()]);
-        let arguments = HashMap::new();
-        let config = crate::parser::ProviderContext::default();
-        let substitutions = ArgumentSubstitutions {
-            arguments: &arguments,
-            default_line: 1,
-            caller_source_file: std::path::Path::new("test.crn"),
-            binding_index: None,
-            config: &config,
-        };
-        let roles = prefix_module_data_source(
-            &roles,
-            "registry_publish",
-            "registry",
-            &ModuleInstanceScope::for_call(
-                "registry",
-                Some("registry_publish"),
-                "registry_publish",
-            ),
-            &expanded_call,
-            &intra_module_bindings,
-            substitutions,
-        )
-        .expect("prefix data source");
-
-        assert_eq!(
-            roles.dependency_bindings,
-            BTreeSet::from(["registry_publish.target".to_string()]),
-        );
-        assert_eq!(
-            roles
-                .module_source
-                .as_ref()
-                .and_then(ModuleSource::module_call)
-                .map(|source| source.module_call_path()),
-            Some(&CompositionCallPath::direct(expanded_call)),
         );
     }
 }

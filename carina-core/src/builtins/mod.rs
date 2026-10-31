@@ -23,7 +23,8 @@ mod upper_lower;
 use crate::eval_value::EvalValue;
 use crate::parser::ProviderContext;
 use crate::resource::{
-    ConcreteValue, DeferredValue, InterpolationPart, Value, ValueString, peel_secrets,
+    BindingAddress, ConcreteValue, DeferredValue, InterpolationPart, Value, ValueString,
+    peel_secrets,
 };
 
 /// Mark every string exposed from a `Secret` argument as diagnostic-only.
@@ -32,7 +33,7 @@ use crate::resource::{
 /// any handler-owned diagnostic can only render these strings through the
 /// safe [`ValueString`] diagnostic API. Runtime equality, hashing, and
 /// serialization remain byte-for-byte identical to an ordinary string.
-fn mark_secret_input_strings(value: Value) -> Value {
+fn mark_secret_input_strings<B: BindingAddress>(value: Value<B>) -> Value<B> {
     match value {
         Value::Concrete(ConcreteValue::String(value)) => Value::Concrete(ConcreteValue::String(
             ValueString::diagnostic_sensitive(value.into_plaintext()),
@@ -142,7 +143,7 @@ fn mark_secret_input_strings(value: Value) -> Value {
 /// the result remains secret. This keeps the sensitivity tag attached across
 /// every transformation instead of making each handler remember to preserve
 /// it. Nested wrappers are normalized to one wrapper.
-fn peel_secret_arguments(args: Vec<Value>) -> (Vec<Value>, bool) {
+fn peel_secret_arguments<B: BindingAddress>(args: Vec<Value<B>>) -> (Vec<Value<B>>, bool) {
     let mut contained_secret = false;
     let args = args
         .into_iter()
@@ -159,7 +160,7 @@ fn peel_secret_arguments(args: Vec<Value>) -> (Vec<Value>, bool) {
     (args, contained_secret)
 }
 
-fn propagate_secret(value: Value, contained_secret: bool) -> Value {
+fn propagate_secret<B: BindingAddress>(value: Value<B>, contained_secret: bool) -> Value<B> {
     if !contained_secret || matches!(value, Value::Deferred(DeferredValue::Secret(_))) {
         value
     } else {
@@ -316,10 +317,10 @@ macro_rules! register_builtins {
         /// `EvalValue::Closure` capturing the partial arguments.
         /// Returns `Err` if the function is unknown, the arguments are
         /// invalid, or one of the supplied arguments is itself a closure.
-        pub(crate) fn evaluate_builtin(
+        pub(crate) fn evaluate_builtin<B: BindingAddress>(
             name: &str,
-            args: &[EvalValue],
-        ) -> Result<EvalValue, String> {
+            args: &[EvalValue<B>],
+        ) -> Result<EvalValue<B>, String> {
             match name {
                 $(
                     stringify!($name) => {
@@ -336,7 +337,7 @@ macro_rules! register_builtins {
                         // so a closure here is a usage error: the caller
                         // tried to pass a partially-applied function as a
                         // data argument.
-                        let lowered: Result<Vec<Value>, String> = args
+                        let lowered: Result<Vec<Value<B>>, String> = args
                             .iter()
                             .cloned()
                             .map(|arg| {
@@ -358,11 +359,11 @@ macro_rules! register_builtins {
         /// for callers that don't care about the closure case (e.g.
         /// LSP-style hover preview that just wants "what does this call
         /// produce"). Returns `Err` if the call would produce a closure.
-        pub fn evaluate_builtin_to_value(
+        pub fn evaluate_builtin_to_value<B: BindingAddress>(
             name: &str,
-            args: &[Value],
-        ) -> Result<Value, String> {
-            let eval_args: Vec<EvalValue> = args.iter().cloned().map(EvalValue::from_value).collect();
+            args: &[Value<B>],
+        ) -> Result<Value<B>, String> {
+            let eval_args: Vec<EvalValue<B>> = args.iter().cloned().map(EvalValue::from_value).collect();
             let result = evaluate_builtin(name, &eval_args)?;
             result.into_value().map_err(|error| error.to_string())
         }
@@ -473,13 +474,13 @@ register_builtins! {
 /// are now present, evaluates the underlying built-in function (routing
 /// `decrypt` through the config-aware path). Otherwise returns a new
 /// `EvalValue::Closure` with updated captured args and remaining arity.
-pub(crate) fn apply_closure_with_config(
+pub(crate) fn apply_closure_with_config<B: BindingAddress>(
     name: &str,
-    captured_args: &[EvalValue],
+    captured_args: &[EvalValue<B>],
     remaining_arity: usize,
-    new_args: &[EvalValue],
+    new_args: &[EvalValue<B>],
     config: &ProviderContext,
-) -> Result<EvalValue, String> {
+) -> Result<EvalValue<B>, String> {
     // Handle composed closures: pipe the argument through each function in sequence
     if name == "__compose__" {
         if new_args.len() != 1 {
@@ -533,11 +534,11 @@ pub(crate) fn apply_closure_with_config(
 ///
 /// This dispatches `decrypt` to use the decryptor from the config instead of
 /// the global Mutex. All other builtins are delegated to [`evaluate_builtin`].
-pub(crate) fn evaluate_builtin_with_config(
+pub(crate) fn evaluate_builtin_with_config<B: BindingAddress>(
     name: &str,
-    args: &[EvalValue],
+    args: &[EvalValue<B>],
     config: &ProviderContext,
-) -> Result<EvalValue, String> {
+) -> Result<EvalValue<B>, String> {
     // Check for partial application before dispatching
     if let Some(arity) = builtin_arity(name)
         && !args.is_empty()
@@ -549,7 +550,7 @@ pub(crate) fn evaluate_builtin_with_config(
         "decrypt" => {
             // `decrypt` is the only handler that needs the parser config.
             // It still operates on `&[Value]` so we lower the arguments.
-            let lowered: Result<Vec<Value>, String> = args
+            let lowered: Result<Vec<Value<B>>, String> = args
                 .iter()
                 .cloned()
                 .map(|arg| {
@@ -586,18 +587,18 @@ pub(crate) fn evaluate_builtin_for_tests(name: &str, args: &[Value]) -> Result<E
 /// result back to `Value` — failing on closure leaks the same way
 /// production code does.
 #[cfg(test)]
-pub(crate) fn evaluate_builtin_with_config_to_value(
+pub(crate) fn evaluate_builtin_with_config_to_value<B: BindingAddress>(
     name: &str,
-    args: &[Value],
+    args: &[Value<B>],
     config: &ProviderContext,
-) -> Result<Value, String> {
-    let eval_args: Vec<EvalValue> = args.iter().cloned().map(EvalValue::from_value).collect();
+) -> Result<Value<B>, String> {
+    let eval_args: Vec<EvalValue<B>> = args.iter().cloned().map(EvalValue::from_value).collect();
     let result = evaluate_builtin_with_config(name, &eval_args, config)?;
     result.into_value().map_err(|error| error.to_string())
 }
 
 /// Return a human-readable type name for a Value
-fn value_type_name(value: &Value) -> &'static str {
+fn value_type_name<B: BindingAddress>(value: &Value<B>) -> &'static str {
     match value {
         Value::Concrete(ConcreteValue::String(_)) => "String",
         Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "EnumIdentifier",
@@ -631,6 +632,10 @@ mod tests {
 
     use super::*;
 
+    type Value = crate::resource::ExpandedValue;
+    type ConcreteValue = crate::resource::ExpandedConcreteValue;
+    type DeferredValue = crate::resource::ExpandedDeferredValue;
+
     fn string(value: &str) -> Value {
         Value::Concrete(ConcreteValue::String(value.into()))
     }
@@ -647,8 +652,9 @@ mod tests {
     fn test_registry_and_dispatch_are_in_sync() {
         // Every function listed in builtin_functions() must be accepted by
         // evaluate_builtin() (i.e. not return "Unknown built-in function").
+        let args: Vec<EvalValue> = Vec::new();
         for func in builtin_functions() {
-            let result = evaluate_builtin(func.name, &[]);
+            let result = evaluate_builtin(func.name, &args);
             // The call may fail due to wrong arguments, but it must NOT fail
             // with "Unknown built-in function".
             if let Err(ref msg) = result {
@@ -696,7 +702,8 @@ mod tests {
 
     #[test]
     fn test_unknown_function_is_rejected() {
-        let result = evaluate_builtin("nonexistent_function", &[]);
+        let args: Vec<EvalValue> = Vec::new();
+        let result = evaluate_builtin("nonexistent_function", &args);
         assert!(result.is_err());
         assert!(
             result

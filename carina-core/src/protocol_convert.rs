@@ -2420,9 +2420,10 @@ mod tests {
             RedactedSecretHash::from_encoded_digest(&digest).expect("fixture digest must be valid");
         let non_wire = [
             Value::Concrete(ConcreteValue::enum_identifier("test.Mode.enabled")),
-            Value::resource_ref("source", "value", Vec::new()),
+            crate::resource::AuthoredValue::resource_ref("source", "value", Vec::new())
+                .resolve_root(&crate::resource::RootScope::new()),
             Value::Deferred(DeferredValue::BindingRef {
-                binding: "source".to_string(),
+                binding: crate::resource::RootScope::new().resolve("source".into()),
             }),
             Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(Value::Deferred(DeferredValue::Unknown(

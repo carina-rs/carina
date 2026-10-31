@@ -21,9 +21,12 @@ use carina_core::provider::{
 pub use carina_core::resource::DeposedKey;
 #[cfg(test)]
 use carina_core::resource::Resource;
+#[cfg(any(test, feature = "test-utils"))]
+use carina_core::resource::absolute_binding_address_for_test;
 use carina_core::resource::{
-    ConcreteValue, Current, DataSource, Directives, PartialReadMarker, PendingReRead,
-    ResolvedResource, ResourceId, ResourceIdentity, State, Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, Directives, PartialReadMarker,
+    PendingReRead, ResolvedResource, ResourceId, ResourceIdentity, State, Value,
+    canonicalize_persisted_absolute_binding_address,
 };
 use carina_core::schema::{ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys};
 use carina_core::value::{
@@ -1312,13 +1315,13 @@ impl StateFile {
                         ),
                         error,
                     })?;
-            if let Some(b) = r.binding.as_ref() {
-                r.binding = Some(canonicalize_map_key_address(b));
+            if let Some(binding) = r.binding.take() {
+                r.binding = Some(canonicalize_persisted_absolute_binding_address(&binding));
             }
             r.dependency_bindings = r
                 .dependency_bindings
                 .iter()
-                .map(|d| canonicalize_map_key_address(d))
+                .map(canonicalize_persisted_absolute_binding_address)
                 .collect();
         }
         Ok(())
@@ -1914,7 +1917,7 @@ pub struct DeposedInstance {
     /// Last known attributes of the old instance.
     attributes: PersistedAttributes,
     /// Binding dependencies inherited from the old row.
-    pub dependency_bindings: BTreeSet<String>,
+    pub dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
 }
 
 /// Attributes admitted to a deposed generation by a state-owned writeback
@@ -1952,7 +1955,7 @@ impl DeposedInstance {
         identifier: String,
         provider_instance: Option<String>,
         attributes: DeposedAttributes,
-        dependency_bindings: BTreeSet<String>,
+        dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
     ) -> Self {
         Self {
             key,
@@ -1978,7 +1981,10 @@ impl DeposedInstance {
             identifier,
             provider_instance,
             DeposedAttributes(persisted_attributes_from_test_json(attributes)),
-            dependency_bindings,
+            dependency_bindings
+                .into_iter()
+                .map(absolute_binding_address_for_test)
+                .collect(),
         )
     }
 
@@ -2136,7 +2142,7 @@ pub struct ResourceState {
     /// The binding name for this resource (from `let` bindings in DSL).
     /// Stored so orphan Delete effects can have tree structure.
     #[serde(default)]
-    pub binding: Option<String>,
+    pub binding: Option<AbsoluteBindingAddress>,
     /// Binding names of resources this resource depends on (via ResourceRef).
     /// Stored so orphan Delete effects can have tree structure.
     ///
@@ -2145,7 +2151,7 @@ pub struct ResourceState {
     /// (serde transparently coerces array → BTreeSet, deduping any
     /// duplicates and re-serializing in sorted order on next write).
     #[serde(default)]
-    pub dependency_bindings: BTreeSet<String>,
+    pub dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
 }
 
 /// Owned resource row proven not to contain a create continuation.
@@ -2175,7 +2181,7 @@ struct EncodedDeposedInstance {
     #[serde(default)]
     provider_instance: Option<String>,
     attributes: HashMap<String, serde_json::Value>,
-    dependency_bindings: BTreeSet<String>,
+    dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
 }
 
 #[derive(Deserialize)]
@@ -2198,9 +2204,9 @@ struct EncodedResourceState {
     #[serde(default)]
     explicit: ExplicitFields,
     #[serde(default)]
-    binding: Option<String>,
+    binding: Option<AbsoluteBindingAddress>,
     #[serde(default)]
-    dependency_bindings: BTreeSet<String>,
+    dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
 }
 
 impl<'de> Deserialize<'de> for ResourceState {

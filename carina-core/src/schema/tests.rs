@@ -1,5 +1,9 @@
 use super::*;
 
+fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+    crate::resource::RootScope::new().resolve(crate::resource::RelativeBindingName::new(binding))
+}
+
 fn attributed_validation_failure(attribute: &str, message: &str) -> TypeError {
     TypeError::ResourceValidationFailed {
         message: message.to_string(),
@@ -1119,7 +1123,8 @@ fn declared_tags_validator_executes_on_a_validated_schema() {
 
 #[test]
 fn unavailable_type_name_matches_the_equivalent_function_call() {
-    let args = vec![Value::Concrete(ConcreteValue::String("NAME".into())).into()];
+    let args: Vec<crate::resource::FunctionArgument> =
+        vec![Value::Concrete(ConcreteValue::String("NAME".into())).into()];
     let call = Value::Deferred(DeferredValue::FunctionCall {
         name: crate::builtins::BuiltinFunction::env,
         args: args.clone(),
@@ -1923,7 +1928,7 @@ fn schema_validate_wraps_enum_error_with_attribute_name() {
         )
         .validate()
         .expect("enum validation schema must be valid");
-    let mut attrs = HashMap::new();
+    let mut attrs: HashMap<String, Value> = HashMap::new();
     attrs.insert(
         "target_type".to_string(),
         Value::Concrete(ConcreteValue::String("aaa".into())),
@@ -2928,7 +2933,7 @@ fn custom_type_accepts_resource_ref() {
     // ResourceRef values resolve to strings at runtime, so Custom types should accept them
     let ipv4 = types::ipv4_cidr();
     assert!(
-        ipv4.validate(&Value::resource_ref(
+        ipv4.validate(&Value::root_resource_ref(
             "vpc".to_string(),
             "cidr_block".to_string(),
             vec![]
@@ -2938,7 +2943,7 @@ fn custom_type_accepts_resource_ref() {
 
     let ipv6 = types::ipv6_cidr();
     assert!(
-        ipv6.validate(&Value::resource_ref(
+        ipv6.validate(&Value::root_resource_ref(
             "subnet".to_string(),
             "ipv6_cidr".to_string(),
             vec![]
@@ -3791,14 +3796,14 @@ fn validate_exclusive_required_helper() {
     use validators::validate_exclusive_required;
 
     // Valid: exactly one field present
-    let mut attrs = HashMap::new();
+    let mut attrs: HashMap<String, Value> = HashMap::new();
     attrs.insert(
         "option_a".to_string(),
         Value::Concrete(ConcreteValue::String("value".into())),
     );
     assert!(validate_exclusive_required(&attrs, &["option_a", "option_b"]).is_ok());
 
-    let mut attrs2 = HashMap::new();
+    let mut attrs2: HashMap<String, Value> = HashMap::new();
     attrs2.insert(
         "option_b".to_string(),
         Value::Concrete(ConcreteValue::String("value".into())),
@@ -3806,7 +3811,7 @@ fn validate_exclusive_required_helper() {
     assert!(validate_exclusive_required(&attrs2, &["option_a", "option_b"]).is_ok());
 
     // Invalid: neither field present
-    let empty = HashMap::new();
+    let empty: HashMap<String, Value> = HashMap::new();
     let result = validate_exclusive_required(&empty, &["option_a", "option_b"]);
     assert!(result.is_err());
     let errors = result.unwrap_err();
@@ -3818,7 +3823,7 @@ fn validate_exclusive_required_helper() {
     );
 
     // Invalid: both fields present
-    let mut both = HashMap::new();
+    let mut both: HashMap<String, Value> = HashMap::new();
     both.insert(
         "option_a".to_string(),
         Value::Concrete(ConcreteValue::String("a".into())),
@@ -3992,7 +3997,7 @@ fn validate_union_type() {
     // Valid: ResourceRef is accepted by Custom members
     assert!(
         union_type
-            .validate(&Value::resource_ref(
+            .validate(&Value::root_resource_ref(
                 "gw".to_string(),
                 "id".to_string(),
                 vec![]
@@ -4489,10 +4494,10 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
     let unresolved_ref = Value::resource_ref("source", "rules", Vec::new());
     let unresolved_resource = Resource::with_provider("test", "thing", "consumer", None)
         .with_attribute("rule", unresolved_ref.clone());
-    let evaluated = crate::parser::ParsedFile {
+    let evaluated = crate::module_resolver::expand_root_directory_file(crate::parser::ParsedFile {
         resources: vec![evaluated_resource],
         ..Default::default()
-    };
+    });
     let unresolved = crate::parser::ParsedFile {
         resources: vec![unresolved_resource],
         ..Default::default()
@@ -4508,6 +4513,7 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
     assert!(evaluated.resources[0].attributes.contains_key("rules"));
     assert!(!evaluated.resources[0].attributes.contains_key("rule"));
     let unresolved = &unresolved[0].attributes;
+    let unresolved_ref = unresolved_ref.resolve_root(&crate::resource::RootScope::new());
     assert_eq!(unresolved.get("rules"), Some(&unresolved_ref));
     assert!(!unresolved.contains_key("rule"));
 }
@@ -4560,10 +4566,10 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
                 unresolved_ref.clone(),
             )]))),
         );
-    let evaluated = crate::parser::ParsedFile {
+    let evaluated = crate::module_resolver::expand_root_directory_file(crate::parser::ParsedFile {
         resources: vec![evaluated_resource],
         ..Default::default()
-    };
+    });
     let unresolved = crate::parser::ParsedFile {
         resources: vec![unresolved_resource],
         ..Default::default()
@@ -4588,6 +4594,7 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
         Some(Value::Concrete(ConcreteValue::Map(map))) => map,
         _ => panic!("expected unresolved lifecycle map"),
     };
+    let unresolved_ref = unresolved_ref.resolve_root(&crate::resource::RootScope::new());
     assert_eq!(
         unresolved_lifecycle.get("transition"),
         Some(&unresolved_ref)
@@ -8665,7 +8672,7 @@ mod validate_collect_tests {
         );
         let v = map_value(vec![(
             "vpc_id",
-            Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
+            Value::root_resource_ref("vpc".to_string(), "id".to_string(), vec![]),
         )]);
         let errors = crate::schema::Schema::flat(ty.clone()).validate_collect(&v);
         assert!(
@@ -10854,8 +10861,8 @@ fn schema_registry_routes_lookup_by_typestate() {
             .expect("schema fixture must be valid"),
     );
 
-    let managed_res = Resource::with_provider("aws", "s3.Bucket", "new", None);
-    let data_res = DataSource::with_provider("aws", "s3.Bucket", "existing", None);
+    let managed_res: Resource = Resource::with_provider("aws", "s3.Bucket", "new", None);
+    let data_res: DataSource = DataSource::with_provider("aws", "s3.Bucket", "existing", None);
 
     let m = registry
         .get_for(&managed_res)
@@ -10901,13 +10908,13 @@ fn validate_skips_value_unknown_for_primitive_types() {
     // this, a `for x in upstream.list { ... attr = x ... }` body fails
     // parse-time validation with `expected <type>, got unknown`.
     use crate::resource::{AccessPath, UnknownReason};
-    let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
+    let unknown: Value = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
     assert!(AttributeType::string().validate(&unknown).is_ok());
     assert!(AttributeType::int().validate(&unknown).is_ok());
     assert!(AttributeType::bool().validate(&unknown).is_ok());
 
     let upstream = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
-        path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
+        path: AccessPath::root_with_fields("net", "vpc", vec!["vpc_id".into()]),
     }));
     assert!(AttributeType::string().validate(&upstream).is_ok());
     assert!(AttributeType::int().validate(&upstream).is_ok());
@@ -11409,7 +11416,7 @@ mod enum_binding_collision {
     fn bare_binding_matching_dsl_alias_passes_through_schema_validation() {
         let t = flow_log_resource_type();
         let value = Value::Deferred(DeferredValue::BindingRef {
-            binding: "vpc".to_string(),
+            binding: absolute_binding("vpc"),
         });
         assert!(t.validate(&value).is_ok());
     }
@@ -11418,7 +11425,7 @@ mod enum_binding_collision {
     fn bare_binding_matching_canonical_value_passes_through_schema_validation() {
         let t = flow_log_resource_type();
         let value = Value::Deferred(DeferredValue::BindingRef {
-            binding: "VPC".to_string(),
+            binding: absolute_binding("VPC"),
         });
         assert!(t.validate(&value).is_ok());
     }
@@ -11431,7 +11438,7 @@ mod enum_binding_collision {
         // can still surface other errors downstream.
         let t = flow_log_resource_type();
         let value = Value::Deferred(DeferredValue::BindingRef {
-            binding: "some_other_name".to_string(),
+            binding: absolute_binding("some_other_name"),
         });
         assert!(t.validate(&value).is_ok());
     }
@@ -11442,7 +11449,7 @@ mod enum_binding_collision {
         // deferred-aware pass-through behavior.
         let t = AttributeType::string();
         let value = Value::Deferred(DeferredValue::BindingRef {
-            binding: "vpc".to_string(),
+            binding: absolute_binding("vpc"),
         });
         assert!(t.validate(&value).is_ok());
     }
@@ -12109,7 +12116,7 @@ fn select_union_member_no_match_is_none() {
 fn select_union_member_deferred_value_is_none() {
     let union = principal_union_schema();
     let v = Value::Deferred(DeferredValue::BindingRef {
-        binding: "some_ref".to_string(),
+        binding: absolute_binding("some_ref"),
     });
     assert!(select_union_member_for_test(&union, &v).is_none());
 }

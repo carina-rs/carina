@@ -8,12 +8,12 @@ use crate::effect::Effect;
 use crate::parser::{
     DeferredForExpansionError, DeferredForExpression, ShapeMismatch, expand_deferred_children,
 };
-use crate::resource::ResolvedResource;
-use crate::resource::ResourceId;
+use crate::resource::{AbsoluteBindingAddress, ResolvedResource, ResourceId};
 
 #[derive(Clone, Copy)]
 pub(super) struct DeferredIdentityInputs<'a> {
-    pub(super) provider_configs: &'a [crate::parser::ProviderConfig],
+    pub(super) provider_configs:
+        &'a [crate::parser::ProviderConfig<crate::resource::AbsoluteBindingAddress>],
     pub(super) factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     pub(super) schemas: &'a crate::schema::SchemaRegistry,
 }
@@ -90,7 +90,7 @@ impl DeferredAnonymousIdentityGuard {
 
     pub(super) fn admit<S>(
         &mut self,
-        template: &DeferredForExpression<S>,
+        template: &DeferredForExpression<S, AbsoluteBindingAddress>,
         children: &[Effect<S>],
     ) -> Result<(), DeferredCreateFailure> {
         if !matches!(
@@ -210,7 +210,7 @@ impl std::error::Error for DeferredCreateFailure {
 pub(super) fn materialize_deferred_create<
     S: Clone + crate::resource::AnonymousIdentityModuleSource,
 >(
-    template: &DeferredForExpression<S>,
+    template: &DeferredForExpression<S, AbsoluteBindingAddress>,
     bindings: &ResolvedBindings,
     identity_inputs: &DeferredIdentityInputs<'_>,
 ) -> Result<Vec<Effect<S>>, DeferredCreateFailure> {
@@ -342,7 +342,7 @@ pub(super) fn dispatch_deferred_create<
     S: Clone + crate::resource::AnonymousIdentityModuleSource,
 >(
     effect: &Effect<S>,
-    template: &DeferredForExpression<S>,
+    template: &DeferredForExpression<S, crate::resource::AbsoluteBindingAddress>,
     bindings: &ResolvedBindings,
     ctx: &PureMetaCtx<'_, S>,
 ) -> DeferredDispatchResult<S> {
@@ -361,15 +361,21 @@ mod tests {
 
     use super::*;
     use crate::binding_index::{BindingCompleteness, BindingValueSource};
-    use crate::parser::ForBinding;
-    use crate::resource::{ConcreteValue, DeferredValue, Resource, UnknownReason, Value};
+    use crate::parser::{ExpandedDeferredForExpression, ForBinding};
+    use crate::resource::{
+        AuthoredDeferredValue, AuthoredResource, AuthoredUnknownReason, AuthoredValue,
+        ConcreteValue, DeferredValue, RootScope, Value,
+    };
 
-    fn coalesced_template() -> DeferredForExpression {
-        let mut template_resource = Resource::new("test.Child", "children");
-        template_resource.binding = Some("children".to_string());
+    fn coalesced_template() -> ExpandedDeferredForExpression {
+        let mut template_resource: AuthoredResource =
+            AuthoredResource::new("test.Child", "children");
+        template_resource.binding = Some("children".into());
         template_resource.set_attr(
             "name",
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            AuthoredValue::Deferred(AuthoredDeferredValue::Unknown(
+                AuthoredUnknownReason::ForValue,
+            )),
         );
         DeferredForExpression {
             file: None,
@@ -382,19 +388,20 @@ mod tests {
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
             target: crate::parser::DeferredForTarget::Bound {
-                binding: "children".to_string(),
+                binding: "children".into(),
             },
-            iterable: Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(Value::resource_ref("up", "accounts", vec![])),
-                default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
+            iterable: AuthoredValue::Deferred(AuthoredDeferredValue::Coalesce {
+                value: Box::new(AuthoredValue::resource_ref("up", "accounts", vec![])),
+                default: Box::new(AuthoredValue::Concrete(ConcreteValue::List(Vec::new()))),
             }),
             binding: ForBinding::Simple("account".to_string()),
             template_resource,
         }
+        .resolve_root(&RootScope::new())
     }
 
     fn materialize_for_test(
-        template: &DeferredForExpression,
+        template: &ExpandedDeferredForExpression,
         bindings: &ResolvedBindings,
     ) -> Result<Vec<Effect>, DeferredCreateFailure> {
         let schemas = crate::schema::SchemaRegistry::new();
@@ -439,7 +446,8 @@ mod tests {
              }\n",
             &crate::parser::ProviderContext::default(),
         )
-        .expect("deferred unbound loop parses");
+        .expect("deferred unbound loop parses")
+        .resolve_root(&RootScope::new());
         let template = &parsed.deferred_for_expressions[0];
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(
@@ -498,7 +506,8 @@ mod tests {
             std::path::Path::new("main.crn"),
             &crate::parser::ProviderContext::default(),
         )
-        .expect("deferred unbound enum loop parses");
+        .expect("deferred unbound enum loop parses")
+        .resolve_root(&RootScope::new());
         let template = &parsed.deferred_for_expressions[0];
         let iterable = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::enum_identifier("foo"),
@@ -548,7 +557,10 @@ mod tests {
         let canonical =
             crate::value::canonicalize_resources_with_schemas(&mut plan_time_resources, &schemas)
                 .expect("plan-time child canonicalizes");
-        crate::identifier::compute_anonymous_identifiers_with_factories(
+        crate::identifier::compute_anonymous_identifiers_with_factories::<
+            _,
+            AbsoluteBindingAddress,
+        >(
             canonical,
             &[],
             &[],
@@ -577,7 +589,8 @@ mod tests {
              }\n",
             &crate::parser::ProviderContext::default(),
         )
-        .expect("deferred unbound loop parses");
+        .expect("deferred unbound loop parses")
+        .resolve_root(&RootScope::new());
         let template = &parsed.deferred_for_expressions[0];
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(
@@ -659,8 +672,8 @@ mod tests {
     fn deferred_iterable_error_reports_every_candidate_reference() {
         let mut template = coalesced_template();
         template.iterable = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("primary", "items", vec![])),
-            default: Box::new(Value::resource_ref("fallback", "items", vec![])),
+            value: Box::new(Value::root_resource_ref("primary", "items", vec![])),
+            default: Box::new(Value::root_resource_ref("fallback", "items", vec![])),
         });
 
         let error = materialize_for_test(&template, &ResolvedBindings::default())

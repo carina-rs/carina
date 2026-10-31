@@ -12,8 +12,11 @@ use super::ast::{
 };
 use super::error::{ParseError, ParseWarning};
 use super::{ProviderContext, Rule};
-use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
-use crate::resource::{Resource, ResourceId, Value};
+use crate::eval_value::{
+    AuthoredEvalValue as EvalValue, AuthoredStructuralHandle as StructuralHandle,
+    StructuralHandleKind,
+};
+use crate::resource::{AuthoredResource as Resource, AuthoredValue as Value, ResourceId};
 use indexmap::IndexMap;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};

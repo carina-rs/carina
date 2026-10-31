@@ -56,6 +56,33 @@ pub(crate) fn test_composition_call_path_in(
     carina_core::resource::CompositionCallPath::direct(carina_core::resource::CompositionCall {
         id: call.id().clone(),
         module_name: call.module_name.clone(),
+        binding: call.binding_name.clone().map(|binding| {
+            carina_core::resource::absolute_binding_address_for_test(binding.into_string())
+        }),
+        instance: "fixture_module".to_string(),
+        module_source: Some("./fixture_module".to_string()),
+        module_directory: None,
+        loop_origin: None,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_authored_composition_call_path()
+-> carina_core::resource::CompositionCallPath<carina_core::resource::RelativeBindingName> {
+    let source_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let parsed = carina_core::parser::parse_file(
+        "let fixture_module = use { source = './fixture_module' }\nfixture_module {}\n",
+        &source_file,
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("parse authored composition test call");
+    let call = parsed
+        .module_calls
+        .first()
+        .expect("composition test call must exist");
+    carina_core::resource::CompositionCallPath::direct(carina_core::resource::CompositionCall {
+        id: call.id().clone(),
+        module_name: call.module_name.clone(),
         binding: call.binding_name.clone(),
         instance: "fixture_module".to_string(),
         module_source: Some("./fixture_module".to_string()),

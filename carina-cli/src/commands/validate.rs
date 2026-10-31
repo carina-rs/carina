@@ -9,7 +9,7 @@ use carina_core::config_loader::{
 };
 use carina_core::lint::find_duplicate_attrs;
 use carina_core::parser::{File, ProviderContext, ResourceRef, UpstreamState};
-use carina_core::resource::ResourceId;
+use carina_core::resource::{BindingAddress, ResourceId};
 
 use crate::error::AppError;
 use crate::wiring::ProviderLoad;
@@ -118,21 +118,23 @@ pub fn validated_resource_ids_with_factories(
         Ok(l) => l,
         Err(e) => panic!("fixture failed to load: {e}"),
     };
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::for_test(factories, &parsed.providers);
 
-    // Run the same resolve/validate pass as the CLI so the parsed tree
-    // (and its `deferred_for_expressions`) is in the post-validation
-    // state the display path observes.
-    let _ = super::validate_and_resolve_errors(
-        &mut parsed,
-        base_dir,
-        &providers,
-        false,
-        &loaded.inference_errors,
-        &loaded.duplicate_declarations,
-    );
+    // Consume the authored file through the same transition as the CLI so the
+    // display path receives the typed expanded phase (including materialized
+    // module resources and deferred-for expressions).
+    let parsed = providers
+        .validate_evaluated_config(
+            parsed,
+            base_dir,
+            false,
+            &loaded.inference_errors,
+            &loaded.duplicate_declarations,
+        )
+        .expect("fixture must validate before listing resources")
+        .into_resources_for_fixture();
 
     validated_entries(&parsed)
         .iter()
@@ -163,7 +165,7 @@ fn format_inference_errors(
 /// never be mistaken for a resolvable resource id, and a not-yet-named
 /// resource can never silently render as a trailing-dot string
 /// (carina#3121). `Display` is the *only* place an entry becomes text.
-enum ValidatedEntry<'a> {
+enum ValidatedEntry<'a, B: BindingAddress> {
     /// A direct resource whose identity is already assigned — the common
     /// case, renders exactly as its [`ResourceId`].
     Resolved(&'a ResourceId),
@@ -183,14 +185,14 @@ enum ValidatedEntry<'a> {
     /// repeated twice).
     DeferredLoop {
         resource_type: &'a str,
-        target: &'a carina_core::parser::DeferredForTarget,
+        target: &'a carina_core::parser::DeferredForTarget<B>,
         header: &'a str,
         file: Option<&'a str>,
         line: usize,
     },
 }
 
-impl std::fmt::Display for ValidatedEntry<'_> {
+impl<B: BindingAddress> std::fmt::Display for ValidatedEntry<'_, B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ValidatedEntry::Resolved(id) => write!(f, "{id}"),
@@ -238,7 +240,7 @@ impl std::fmt::Display for ValidatedEntry<'_> {
 /// at their own boundary, so a deferred placeholder is structurally
 /// distinct from a resolved id rather than a string that happens to
 /// contain `[?]`.
-fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
+fn validated_entries<E, B: BindingAddress>(parsed: &File<E, B>) -> Vec<ValidatedEntry<'_, B>> {
     parsed
         .iter_all_resources()
         // Every call now has a composition so its typed boundary survives
@@ -322,7 +324,9 @@ pub fn run_validate(
         &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
-    parsed.print_warnings_from(printed_warning_count);
+    if let Some(expanded) = validation_report.expanded() {
+        expanded.print_warnings_from(printed_warning_count);
+    }
     error_reports.extend(
         validation_report
             .errors()
@@ -339,6 +343,9 @@ pub fn run_validate(
         &loaded.authored_bindings,
         validation_report.schemas(),
     );
+    let parsed = validation_report
+        .into_expanded()
+        .expect("successful validation report retains its expanded file");
 
     // Check for duplicate attribute keys
     let source_files: Vec<(PathBuf, String)> = {
@@ -624,24 +631,29 @@ backend s3 {
     #[test]
     fn validation_listing_excludes_unbound_compositions() {
         use carina_core::parser::ParsedFile;
-        use carina_core::resource::{LiveComposition, LiveCompositionSignature, ResourceId};
-
-        let composition = |instance: &'static str, binding: Option<&str>| LiveComposition {
-            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "_virtual", instance,
-            )),
-            signature: LiveCompositionSignature {
-                arguments: indexmap::IndexMap::new(),
-                attributes: indexmap::IndexMap::new(),
-                pending_constraints: Vec::new(),
-            },
-            binding: binding.map(str::to_string),
-            dependency_bindings: Default::default(),
-            module_name: "example".to_string(),
-            instance: instance.to_string(),
-            call_path: crate::test_composition_call_path(),
-            quoted_string_attrs: Default::default(),
+        use carina_core::resource::{
+            AuthoredLiveComposition, LiveCompositionSignature, RelativeBindingName, ResourceId,
         };
+
+        let composition =
+            |instance: &'static str, binding: Option<&str>| -> AuthoredLiveComposition {
+                AuthoredLiveComposition {
+                    id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                        "_virtual", instance,
+                    )),
+                    signature: LiveCompositionSignature {
+                        arguments: indexmap::IndexMap::new(),
+                        attributes: indexmap::IndexMap::new(),
+                        pending_constraints: Vec::new(),
+                    },
+                    binding: binding.map(RelativeBindingName::new),
+                    dependency_bindings: Default::default(),
+                    module_name: "example".to_string(),
+                    instance: instance.to_string(),
+                    call_path: crate::test_authored_composition_call_path(),
+                    quoted_string_attrs: Default::default(),
+                }
+            };
         let mut parsed = ParsedFile::default();
         parsed
             .compositions
@@ -660,7 +672,7 @@ backend s3 {
 
     fn upstream(binding: &str, source: &str) -> UpstreamState {
         UpstreamState {
-            binding: binding.to_string(),
+            binding: carina_core::resource::RelativeBindingName::new(binding),
             source: std::path::PathBuf::from(source),
         }
     }

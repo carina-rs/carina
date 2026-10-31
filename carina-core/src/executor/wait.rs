@@ -1394,7 +1394,8 @@ mod tests {
                 ),
                 (
                     "target".to_string(),
-                    Value::resource_ref("vpc", "id", vec![]),
+                    crate::resource::AuthoredValue::resource_ref("vpc", "id", vec![])
+                        .resolve_root(&crate::resource::RootScope::new()),
                 ),
             ]),
             elapsed: Duration::from_secs(1),

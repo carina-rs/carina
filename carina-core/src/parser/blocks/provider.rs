@@ -10,7 +10,9 @@ use crate::parser::error::ParseError;
 use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::parse_expression;
 use crate::parser::util::expression_is_plain_string_literal;
-use crate::resource::{ConcreteValue, Value, ValueString};
+use crate::resource::{
+    AuthoredConcreteValue as ConcreteValue, AuthoredValue as Value, ValueString,
+};
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
 

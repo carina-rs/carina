@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::parser::File;
 use crate::resource::{
-    AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PathSegment, Value,
+    AccessPath, BindingAddress, ConcreteValue, DeferredValue, InterpolationPart, PathSegment, Value,
 };
 use crate::schema::{EffectiveAttribute, SchemaKind, SchemaRegistry, Shape};
 
@@ -65,8 +65,8 @@ pub struct DeferredPopulateDiagnostic {
 
 /// Run the deferred-populate diagnostic against a parsed file +
 /// schema registry.
-pub fn validate_deferred_populate_refs<E>(
-    parsed: &File<E>,
+pub fn validate_deferred_populate_refs<E, B: BindingAddress>(
+    parsed: &File<E, B>,
     schemas: &SchemaRegistry,
 ) -> Vec<DeferredPopulateDiagnostic> {
     // binding name → (provider, resource_type) for schema lookup.
@@ -116,8 +116,8 @@ pub fn validate_deferred_populate_refs<E>(
 /// Walk `value` recursively, emitting one diagnostic per chained ref
 /// that targets a deferred-populate-flagged attribute on an
 /// unsynchronized binding.
-fn collect_unsynchronized_refs(
-    value: &Value,
+fn collect_unsynchronized_refs<B: BindingAddress>(
+    value: &Value<B>,
     attribute_key: &str,
     holder_binding: Option<&str>,
     by_binding: &HashMap<String, (String, String)>,
@@ -261,8 +261,8 @@ fn collect_unsynchronized_refs(
 }
 
 /// Check one `ResourceRef` against the schema and the wait set.
-fn check_ref(
-    path: &AccessPath,
+fn check_ref<B: BindingAddress>(
+    path: &AccessPath<B>,
     attribute_key: &str,
     holder_binding: Option<&str>,
     by_binding: &HashMap<String, (String, String)>,
@@ -371,8 +371,9 @@ mod tests {
     use super::*;
     use crate::parser::{ParsedFile, WaitBinding};
     use crate::resource::{
-        AccessPath, ConcreteValue, DeferredValue, PathSegment, Resource, ResourceId, Subscript,
-        Value,
+        AuthoredAccessPath as AccessPath, AuthoredConcreteValue as ConcreteValue,
+        AuthoredDeferredValue as DeferredValue, AuthoredResource as Resource,
+        AuthoredValue as Value, PathSegment, ResourceId, Subscript,
     };
     use crate::schema::{
         AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
@@ -466,12 +467,12 @@ mod tests {
         let mut cert = Resource::new("acm.Certificate", "cert");
         cert.id = ResourceId::with_identity("acm.Certificate", "cert");
         cert.id.provider = "aws".to_string();
-        cert.binding = Some("cert".to_string());
+        cert.binding = Some("cert".into());
 
         let mut record = Resource::new("route53.RecordSet", "record");
         record.id = ResourceId::with_identity("route53.RecordSet", "record");
         record.id.provider = "aws".to_string();
-        record.binding = Some("record".to_string());
+        record.binding = Some("record".into());
         record.set_attr(
             "resource_records",
             Value::Concrete(ConcreteValue::List(vec![dvo_chained_ref(
@@ -529,7 +530,8 @@ mod tests {
             target: "cert".into(),
             until_raw: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             until_predicate: crate::parser::UntilPredicateAst {
-                lhs_segments: vec!["cert".to_string(), "status".to_string()],
+                root: "cert".into(),
+                attribute_segments: vec!["status".to_string()],
                 rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
             },
             timeout_secs: None,
@@ -545,13 +547,13 @@ mod tests {
         let mut record = Resource::new("route53.RecordSet", "record");
         record.id = ResourceId::with_identity("route53.RecordSet", "record");
         record.id.provider = "aws".to_string();
-        record.binding = Some("record".to_string());
+        record.binding = Some("record".into());
         record.set_attr("name", dvo_chained_ref("domain_name"));
 
         let mut cert = Resource::new("acm.Certificate", "cert");
         cert.id = ResourceId::with_identity("acm.Certificate", "cert");
         cert.id.provider = "aws".to_string();
-        cert.binding = Some("cert".to_string());
+        cert.binding = Some("cert".into());
 
         let p = ParsedFile {
             resources: vec![cert, record],
@@ -568,7 +570,7 @@ mod tests {
         let mut record = Resource::new("route53.RecordSet", "record");
         record.id = ResourceId::with_identity("route53.RecordSet", "record");
         record.id.provider = "aws".to_string();
-        record.binding = Some("record".to_string());
+        record.binding = Some("record".into());
         let path = AccessPath::with_segments(
             "typo_cert", // <-- unknown binding
             "domain_validation_options",
@@ -628,12 +630,12 @@ mod tests {
         let mut db = Resource::new("rds.DBInstance", "db");
         db.id = ResourceId::with_identity("rds.DBInstance", "db");
         db.id.provider = "aws".to_string();
-        db.binding = Some("db".to_string());
+        db.binding = Some("db".into());
 
         let mut inst = Resource::new("ec2.Instance", "i");
         inst.id = ResourceId::with_identity("ec2.Instance", "i");
         inst.id.provider = "aws".to_string();
-        inst.binding = Some("i".to_string());
+        inst.binding = Some("i".into());
         let path = AccessPath::with_segments(
             "db",
             "endpoint",
@@ -662,7 +664,7 @@ mod tests {
         let mut record = Resource::new("unknown.thing", "x");
         record.id = ResourceId::with_identity("unknown.thing", "x");
         record.id.provider = "aws".to_string();
-        record.binding = Some("x".to_string());
+        record.binding = Some("x".into());
         record.set_attr(
             "resource_records",
             Value::Concrete(ConcreteValue::List(vec![dvo_chained_ref(

@@ -3,7 +3,10 @@ use super::*;
 use std::collections::HashSet;
 
 use crate::plan::{PlanErrorKind, PreventDestroyAction, ReplacementCannotCoexistError};
-use crate::resource::{ConcreteValue, DeferredValue, ResourceIdentity};
+use crate::resource::{
+    ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
+    ExpandedResource as Resource, ExpandedValue as Value, ResourceIdentity,
+};
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
 fn string(value: &str) -> Value {
@@ -11,7 +14,7 @@ fn string(value: &str) -> Value {
 }
 
 fn ref_value(binding: &str, attribute: &str) -> Value {
-    Value::resource_ref(binding.to_string(), attribute.to_string(), vec![])
+    Value::root_resource_ref(binding.to_string(), attribute.to_string(), vec![])
 }
 
 fn state(id: &ResourceId, attrs: &[(&str, Value)], identifier: &str) -> State {
@@ -80,7 +83,7 @@ fn base_schemas(subnet_vpc_id_create_only: bool) -> SchemaRegistry {
 
 fn vpc_resources(create_before_destroy: bool) -> (Resource, Resource) {
     let mut unresolved = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
+        .with_root_binding("vpc")
         .with_attribute("name", string("vpc-main"))
         .with_attribute("cidr_block", string("10.1.0.0/16"));
     unresolved.directives.create_before_destroy = create_before_destroy;
@@ -89,7 +92,7 @@ fn vpc_resources(create_before_destroy: bool) -> (Resource, Resource) {
 
 fn subnet_resources(_vpc_ref_create_only: bool, independent_update: bool) -> (Resource, Resource) {
     let unresolved = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
+        .with_root_binding("subnet")
         .with_attribute("name", string("subnet-main"))
         .with_attribute("vpc_id", ref_value("vpc", "vpc_id"))
         .with_attribute("cidr_block", string("10.1.1.0/24"))
@@ -103,7 +106,7 @@ fn subnet_resources(_vpc_ref_create_only: bool, independent_update: bool) -> (Re
         )
         .with_attribute("availability_zone", string("us-east-1a"));
     let managed = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
+        .with_root_binding("subnet")
         .with_attribute("name", string("subnet-main"))
         .with_attribute("vpc_id", string("vpc-old"))
         .with_attribute("cidr_block", string("10.1.1.0/24"))
@@ -549,7 +552,7 @@ fn chained_cbd_anonymous_middle_node_auto_promoted() {
     );
 
     let mut producer = Resource::new("test.Producer", "producer")
-        .with_binding("a")
+        .with_root_binding("a")
         .with_attribute("name", string("producer"))
         .with_attribute("shape", string("new"));
     producer.directives.create_before_destroy = true;
@@ -563,11 +566,11 @@ fn chained_cbd_anonymous_middle_node_auto_promoted() {
         .with_attribute("a_id", ref_value("a", "producer_id"));
 
     let managed_consumer = Resource::new("test.Consumer", "consumer")
-        .with_binding("c")
+        .with_root_binding("c")
         .with_attribute("name", string("consumer"))
         .with_attribute("b_id", string("b-old"));
     let unresolved_consumer = Resource::new("test.Consumer", "consumer")
-        .with_binding("c")
+        .with_root_binding("c")
         .with_attribute("name", string("consumer"))
         .with_attribute("b_id", ref_value("anon-b", "b_id"));
 

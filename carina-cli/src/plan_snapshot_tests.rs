@@ -35,7 +35,7 @@ fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
     schemas: Option<&SchemaRegistry>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
     export_changes: &[crate::commands::plan::ExportChange],
-    deferred_for_expressions: &[carina_core::parser::DeferredForExpression],
+    deferred_for_expressions: &[carina_core::parser::ExpandedDeferredForExpression],
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
 ) -> String {
@@ -2028,12 +2028,14 @@ fn plan_snapshot_exports() {
         ExportChange::Added {
             name: "vpc_id".to_string(),
             type_expr: Some(TypeExpr::String),
-            new_value: Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+            new_value: Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![])
+                .resolve_root_for_test(),
         },
         ExportChange::Added {
             name: "cidr".to_string(),
             type_expr: None,
-            new_value: Value::resource_ref("vpc".to_string(), "cidr_block".to_string(), vec![]),
+            new_value: Value::resource_ref("vpc".to_string(), "cidr_block".to_string(), vec![])
+                .resolve_root_for_test(),
         },
     ];
     let output = format_plan(
@@ -2714,10 +2716,9 @@ fn snapshot_deferred_for_with_dependent_wait() {
                 if resource.id.resource_type == "acm.CertificateValidation" =>
             {
                 let mut resource = resource.into_inner();
-                resource
-                    .directives
-                    .depends_on
-                    .push("validation_records".to_string());
+                resource.directives.depends_on.push(
+                    carina_core::resource::absolute_binding_address_for_test("validation_records"),
+                );
                 Effect::Create(resolved(resource))
             }
             effect => effect,
@@ -2966,19 +2967,20 @@ fn snapshot_top_level_sigil_alignment() {
     plan.add(Effect::Create(resolved(cluster)));
 
     let deferred_template = Resource::new("aws.route53.RecordSet", "validation_records");
-    let deferred = DeferredForExpression {
+    let deferred: carina_core::parser::ExpandedDeferredForExpression = DeferredForExpression {
         file: None,
         line: 1,
         header: "for option in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.RecordSet".to_string(),
         attributes: vec![(
             "name".to_string(),
-            Value::resource_ref("option", "name", vec![]),
+            Value::resource_ref("option", "name", vec![]).resolve_root_for_test(),
         )],
         target: carina_core::parser::DeferredForTarget::Bound {
-            binding: "validation_records".to_string(),
+            binding: carina_core::resource::absolute_binding_address_for_test("validation_records"),
         },
-        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new())
+            .resolve_root_for_test(),
         binding: ForBinding::Simple("option".to_string()),
         template_resource: deferred_template,
     };

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use carina_core::config_loader::load_configuration_with_config;
 use carina_core::parser::{InferredFile, ProviderConfig, ProviderContext, UpstreamState};
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
-use carina_core::resource::{Resource, Value};
+use carina_core::resource::{AuthoredResource as Resource, RelativeBindingName, Value};
 use carina_core::schema::SchemaRegistry;
 use carina_state::StateFile;
 use indexmap::IndexMap;
@@ -126,7 +126,7 @@ pub(crate) fn provider_default_tags_local_resource_fixture()
         binding: None,
     });
     let mut account = Resource::with_provider("mock", "test.resource", "acct", None);
-    account.binding = Some("acct".to_string());
+    account.binding = Some(RelativeBindingName::new("acct"));
     parsed.resources.push(account); // allow: direct — fixture test inspection
     (temp, base_dir, parsed)
 }
@@ -158,7 +158,7 @@ pub(crate) fn provider_default_tags_missing_upstream_fixture()
         binding: None,
     });
     parsed.upstream_states.push(UpstreamState {
-        binding: "mgmt".to_string(),
+        binding: RelativeBindingName::new("mgmt"),
         source: PathBuf::from("missing-upstream"),
     });
     (temp, base_dir, parsed)

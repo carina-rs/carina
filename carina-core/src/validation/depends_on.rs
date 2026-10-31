@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::deps::{collect_dependencies, sort_resources_by_dependencies};
 use crate::parser::{File, ResourceRef};
+use crate::resource::BindingAddress;
 
 /// Severity of a depends_on diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +76,9 @@ impl DependsOnDiagnostic {
 ///
 /// `LiveComposition` carries no directives — [`ResourceRef::directives`]
 /// is `None` for that arm, treated here as an empty `depends_on` list.
-fn depends_on_of<'a>(rref: ResourceRef<'a>) -> &'a [String] {
+fn depends_on_of<'a, B: BindingAddress>(
+    rref: ResourceRef<'a, crate::resource::ModuleSource, B>,
+) -> &'a [B] {
     rref.directives()
         .map_or(&[][..], |d| d.depends_on.as_slice())
 }
@@ -83,7 +86,7 @@ fn depends_on_of<'a>(rref: ResourceRef<'a>) -> &'a [String] {
 /// Run all depends_on checks against a parsed file. Returns the full
 /// list of diagnostics (errors + warnings); callers decide how to surface
 /// them.
-pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
+pub fn validate_depends_on<E, B: BindingAddress>(parsed: &File<E, B>) -> Vec<DependsOnDiagnostic> {
     // Common-case fast path: the vast majority of resources will have
     // no `depends_on` set, and the checks below allocate per-resource.
     // Walk top-level + for-body template resources so loops are covered
@@ -97,7 +100,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
 
     let mut diags = Vec::new();
 
-    let bindings_by_name: HashMap<&str, ResourceRef<'_>> = parsed
+    let bindings_by_name: HashMap<&str, ResourceRef<'_, crate::resource::ModuleSource, B>> = parsed
         .iter_all_resources()
         .filter_map(|rref| rref.binding().map(|n| (n, rref)))
         .collect();
@@ -128,7 +131,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
         // back to), so an unbound resource just gets the other checks.
         let self_name = resource.binding().unwrap_or("(anonymous)");
 
-        let mut value_ref_deps: HashSet<String> = HashSet::new();
+        let mut value_ref_deps: HashSet<B> = HashSet::new();
         for value in resource.attributes().values() {
             collect_dependencies(value, &mut value_ref_deps);
         }
@@ -146,20 +149,20 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
                             "directives.depends_on on '{}': binding '{}' is listed multiple times",
                             self_name, dep_name
                         ))
-                        .at_element(self_name, dep_name),
+                        .at_element(self_name, dep_name.as_str()),
                     );
                 }
                 continue;
             }
 
-            if dep_name == self_name {
+            if dep_name.as_str() == self_name {
                 diags.push(
                     DependsOnDiagnostic::error(format!(
                         "directives.depends_on on '{}': self-reference is not allowed \
                          (binding '{}' depends on itself)",
                         self_name, dep_name
                     ))
-                    .at_element(self_name, dep_name),
+                    .at_element(self_name, dep_name.as_str()),
                 );
                 continue;
             }
@@ -171,7 +174,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
                          is not a valid depends_on target",
                         self_name, dep_name
                     ))
-                    .at_element(self_name, dep_name),
+                    .at_element(self_name, dep_name.as_str()),
                 );
                 continue;
             }
@@ -185,7 +188,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
                         "directives.depends_on on '{}': binding '{}' is not declared in this scope",
                         self_name, dep_name
                     ))
-                    .at_element(self_name, dep_name),
+                    .at_element(self_name, dep_name.as_str()),
                 );
                 continue;
             };
@@ -197,19 +200,22 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
                          depends_on targets (binding '{}')",
                         self_name, dep_name
                     ))
-                    .at_element(self_name, dep_name),
+                    .at_element(self_name, dep_name.as_str()),
                 );
                 continue;
             }
 
-            if value_ref_deps.contains(dep_name.as_str()) {
+            if value_ref_deps
+                .iter()
+                .any(|dependency| dependency.as_str() == dep_name.as_str())
+            {
                 diags.push(
                     DependsOnDiagnostic::warning(format!(
                         "directives.depends_on on '{}': edge to '{}' is redundant; \
                          '{}' is already referenced by value",
                         self_name, dep_name, dep_name
                     ))
-                    .at_element(self_name, dep_name),
+                    .at_element(self_name, dep_name.as_str()),
                 );
             }
         }

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::parser::DeferredForExpression;
-use crate::resource::ResourceId;
+use crate::resource::{AbsoluteBindingAddress, ResourceId};
 
 use super::UnresolvedResource;
 use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
@@ -21,7 +21,7 @@ pub(super) struct SchedulerDeps {
 
 pub(super) struct PureMetaStep<'a, S> {
     effect: &'a Effect<S>,
-    template: &'a DeferredForExpression<S>,
+    template: &'a DeferredForExpression<S, AbsoluteBindingAddress>,
 }
 
 impl<'a, S> PureMetaStep<'a, S> {
@@ -283,6 +283,7 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("unbound deferred loop parses");
+        let parsed = parsed.resolve_root(&crate::resource::RootScope::new());
         let template = parsed.deferred_for_expressions[0].clone();
         let scheduler_key = template.target.scheduler_key().to_string();
         assert!(scheduler_key.starts_with("_loop_"));
@@ -303,9 +304,11 @@ mod tests {
                 identifier: crate::effect::fixture_applied_identifier("dependent"),
                 generation: EffectGeneration::Current,
                 directives: crate::resource::Directives::default(),
-                binding: Some("dependent".to_string()),
+                binding: Some(crate::resource::RootScope::new().resolve("dependent".into())),
                 dependencies: HashSet::new(),
-                explicit_dependencies: HashSet::from([scheduler_key]),
+                explicit_dependencies: HashSet::from([
+                    crate::resource::RootScope::new().resolve(scheduler_key.into())
+                ]),
                 blocked_by_updates: HashSet::new(),
             },
         ];

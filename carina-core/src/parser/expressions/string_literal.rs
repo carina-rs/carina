@@ -5,7 +5,9 @@
 
 use crate::parser::{ParseContext, ParseError, Rule, first_inner, parse_expression};
 use crate::resource::{
-    ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value, ValueString,
+    AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
+    AuthoredInterpolationPart as InterpolationPart, AuthoredUnknownReason as UnknownReason,
+    AuthoredValue as Value, ValueString,
 };
 
 /// Encode a string value as canonical, parseable Carina source.

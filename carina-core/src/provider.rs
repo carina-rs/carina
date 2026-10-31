@@ -4248,9 +4248,12 @@ impl ProviderRouteKey {
     }
 }
 
-impl From<&ProviderConfig> for ProviderRouteKey {
-    fn from(config: &ProviderConfig) -> Self {
-        Self::new(config.name.clone(), config.binding.clone())
+impl<B: crate::resource::BindingAddress> From<&ProviderConfig<B>> for ProviderRouteKey {
+    fn from(config: &ProviderConfig<B>) -> Self {
+        Self::new(
+            config.name.clone(),
+            config.binding.as_ref().map(ToString::to_string),
+        )
     }
 }
 
@@ -4342,7 +4345,7 @@ impl std::error::Error for DefaultTagEncodingError {}
 /// Records which tag keys came from defaults as host-owned provenance on the
 /// resource, separate from provider-facing attributes.
 pub fn merge_default_tags<S>(
-    config: &ProviderConfig,
+    config: &ProviderConfig<crate::resource::AbsoluteBindingAddress>,
     resources: &mut [Resource<S>],
     registry: &SchemaRegistry,
 ) -> ProviderResult<()> {
@@ -4481,7 +4484,11 @@ impl ProviderRouter {
 
     /// Register a provider under the same route derived from its config by
     /// host-owned normalization.
-    pub fn add_provider_config(&mut self, config: &ProviderConfig, provider: Box<dyn Provider>) {
+    pub fn add_provider_config<B: crate::resource::BindingAddress>(
+        &mut self,
+        config: &ProviderConfig<B>,
+        provider: Box<dyn Provider>,
+    ) {
         self.providers
             .insert(ProviderRouteKey::from(config), provider);
     }
@@ -5693,7 +5700,7 @@ where
     fn validate<'a>(
         &self,
         target: crate::parser::CustomTypeValidationTarget<'a>,
-        value: &'a Value,
+        value: &'a crate::resource::Value,
     ) -> Result<(), crate::parser::CustomTypeValidationError> {
         let factories = self.factories.as_factories();
         match target {
@@ -6006,6 +6013,10 @@ impl Provider for Box<dyn Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type Value = crate::resource::ExpandedValue;
+    type ConcreteValue = crate::resource::ExpandedConcreteValue;
+    type DeferredValue = crate::resource::ExpandedDeferredValue;
 
     #[test]
     fn schema_derived_guest_dispatch_restores_the_typed_scalar() {
@@ -6654,12 +6665,12 @@ mod tests {
 
     #[test]
     fn enum_canonicalization_error_renders_its_reason_once() {
-        let mut resources = vec![
-            Resource::with_provider("test", "widget", "example", None).with_attribute(
+        let resource: Resource = Resource::with_provider("test", "widget", "example", None)
+            .with_attribute(
                 "mode",
                 Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.invalid")),
-            ),
-        ];
+            );
+        let mut resources = vec![resource];
         let error = crate::value::canonicalize_resources_with_schemas(
             &mut resources,
             &SchemaRegistry::new(),
@@ -6905,14 +6916,14 @@ mod tests {
                     ("S".to_string(), placeholder.clone()),
                     (
                         "Vpc".to_string(),
-                        Value::resource_ref("vpc", "identifier", Vec::new()),
+                        Value::root_resource_ref("vpc", "identifier", Vec::new()),
                     ),
                 ]))),
             ),
             (
                 "items".to_string(),
                 Value::Concrete(ConcreteValue::List(vec![
-                    Value::resource_ref("vpc", "identifier", Vec::new()),
+                    Value::root_resource_ref("vpc", "identifier", Vec::new()),
                     placeholder,
                 ])),
             ),
@@ -6978,7 +6989,7 @@ mod tests {
                 ),
                 (
                     "Owner".to_string(),
-                    Value::resource_ref("management", "owner", Vec::new()),
+                    Value::root_resource_ref("management", "owner", Vec::new()),
                 ),
             ]),
             source: None,
@@ -6987,12 +6998,8 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: None,
         };
-        let mut resources = vec![Resource::with_provider(
-            "aws",
-            "service.Widget",
-            "example",
-            None,
-        )];
+        let resource: Resource = Resource::with_provider("aws", "service.Widget", "example", None);
+        let mut resources = vec![resource];
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
@@ -7042,15 +7049,15 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: None,
         };
-        let mut resources = vec![
-            Resource::with_provider("aws", "service.Widget", "example", None).with_attribute(
+        let resource: Resource = Resource::with_provider("aws", "service.Widget", "example", None)
+            .with_attribute(
                 "tags",
                 Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                     "Name".to_string(),
                     Value::Concrete(ConcreteValue::String("example".into())),
                 )]))),
-            ),
-        ];
+            );
+        let mut resources = vec![resource];
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
@@ -7088,7 +7095,7 @@ mod tests {
 
         config.default_tags.insert(
             "ManagedBy".to_string(),
-            Value::resource_ref("management", "owner", Vec::new()),
+            Value::root_resource_ref("management", "owner", Vec::new()),
         );
         config.default_tags.insert(
             "Team".to_string(),
@@ -7667,8 +7674,9 @@ mod tests {
                 );
             };
             assert_eq!(pending, expected);
-            let rendered =
-                crate::value::render_unknown(&UnknownReason::PendingReRead(pending.clone()));
+            let rendered = crate::value::render_unknown::<crate::resource::AbsoluteBindingAddress>(
+                &UnknownReason::PendingReRead(pending.clone()),
+            );
             assert_eq!(
                 rendered,
                 "(unknown until next refresh: read after apply was incomplete — provider returned a partial read)"
@@ -9089,7 +9097,7 @@ mod tests {
             "mock".to_string(),
             Box::new(TaggedProvider { tag: "default" }),
         );
-        let named_config = ProviderConfig {
+        let named_config: ProviderConfig<crate::resource::RelativeBindingName> = ProviderConfig {
             name: "mock".to_string(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
@@ -9353,7 +9361,7 @@ mod tests {
         // Test normalize_desired
         let ext = SchemaOnlyProvider;
         let mut resources = vec![
-            Resource::new("test", "example")
+            Resource::<crate::resource::ModuleSource>::new("test", "example")
                 .with_attribute(
                     "key",
                     Value::Concrete(ConcreteValue::String("value".into())),
@@ -9519,17 +9527,15 @@ mod tests {
         router.add_provider("normalizing".to_string(), Box::new(NormalizingProvider));
         router.add_normalizer("normalizing", Box::new(TestNormalizer));
 
-        let peer_ref = Value::resource_ref("peer", "identifier", Vec::new());
+        let peer_ref = Value::root_resource_ref("peer", "identifier", Vec::new());
         let pending = Value::Deferred(DeferredValue::Unknown(
             crate::resource::UnknownReason::ForValue,
         ));
-        let mut resources = vec![
-            Resource::with_provider("normalizing", "test", "example", None)
-                .with_attribute("key", Value::Concrete(ConcreteValue::String("val".into())))
-                .with_attribute("peer", peer_ref.clone())
-                .with_attribute("pending", pending.clone())
-                .into_provider_resource(),
-        ];
+        let resource: Resource = Resource::with_provider("normalizing", "test", "example", None)
+            .with_attribute("key", Value::Concrete(ConcreteValue::String("val".into())))
+            .with_attribute("peer", peer_ref.clone())
+            .with_attribute("pending", pending.clone());
+        let mut resources = vec![resource.into_provider_resource()];
         router.normalize_desired(&mut resources).await.unwrap();
         assert_eq!(
             resources[0].get_attr("key"),

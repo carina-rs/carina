@@ -7,7 +7,9 @@
 //! a later pass can finish the expansion once the upstream value
 //! resolves.
 
-use crate::eval_value::{EvalValue, StructuralHandleMetadata};
+use crate::eval_value::{
+    AuthoredEvalValue as EvalValue, AuthoredStructuralHandleMetadata as StructuralHandleMetadata,
+};
 use crate::parser::expressions::primary::parse_postfix_eval;
 use crate::parser::{
     DeferredForExpression, DeferredForTarget, ModuleCall, ParseContext, ParseError, ParseWarning,
@@ -16,8 +18,10 @@ use crate::parser::{
     parse_read_resource_expr, parse_resource_for_target,
 };
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, ForLoopElement, LegacyLoopAddress, LoopElementOrigin,
-    LoopKind, LoopSource, Resource, UnboundLoopTemplate, UnknownReason, Value,
+    AuthoredConcreteValue as ConcreteValue, AuthoredDataSource as DataSource,
+    AuthoredDeferredValue as DeferredValue, AuthoredResource as Resource,
+    AuthoredUnknownReason as UnknownReason, AuthoredValue as Value, ForLoopElement,
+    LegacyLoopAddress, LoopElementOrigin, LoopKind, LoopSource, UnboundLoopTemplate,
 };
 
 /// Binding pattern for a for expression
@@ -209,7 +213,7 @@ impl LoopParseTarget {
     fn deferred_target(&self) -> DeferredForTarget {
         match self {
             Self::Bound { binding } => DeferredForTarget::Bound {
-                binding: binding.clone(),
+                binding: crate::resource::RelativeBindingName::new(binding.clone()),
             },
             Self::Unbound(template) => DeferredForTarget::Unbound {
                 template: template.clone(),
@@ -547,7 +551,9 @@ pub(crate) fn parse_for_expr(
                         },
                         attributes: attrs,
                         target: target.deferred_target(),
-                        iterable: Value::Deferred(DeferredValue::BindingRef { binding: s.clone() }),
+                        iterable: Value::Deferred(DeferredValue::BindingRef {
+                            binding: crate::resource::RelativeBindingName::new(s.clone()),
+                        }),
                         binding: binding.clone(),
                         template_resource: *resource,
                     });
@@ -769,11 +775,14 @@ pub(crate) fn parse_for_body(
                 let mut call =
                     parse_module_call(inner, &local_ctx, preprocessed_file, source_file)?;
                 call.binding_name = match (target, element.as_ref()) {
-                    (LoopParseTarget::Bound { .. }, Some(element)) => {
-                        Some(target.element_address(element))
-                    }
+                    (LoopParseTarget::Bound { .. }, Some(element)) => Some(
+                        crate::resource::RelativeBindingName::new(target.element_address(element)),
+                    ),
                     (LoopParseTarget::Bound { .. }, None) => {
-                        Some(format!("{}[?]", target.scheduler_key()))
+                        Some(crate::resource::RelativeBindingName::new(format!(
+                            "{}[?]",
+                            target.scheduler_key()
+                        )))
                     }
                     (LoopParseTarget::Unbound(_), _) => None,
                 };

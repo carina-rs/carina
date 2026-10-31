@@ -1,6 +1,6 @@
 //! Shared utility functions for value normalization and conversion
 
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{BindingAddress, ConcreteValue, Value};
 use crate::schema::AttributeType;
 use std::path::{Component, Path, PathBuf};
 
@@ -318,7 +318,10 @@ fn is_intermediate_segment(s: &str) -> bool {
 ///
 /// Used by both `AttributeType::resolve_value` and the LSP diagnostic
 /// pipeline so the two paths cannot drift.
-pub fn expand_enum_shorthand(value: &Value, identity: &crate::schema::TypeIdentity) -> Value {
+pub fn expand_enum_shorthand<B: BindingAddress>(
+    value: &Value<B>,
+    identity: &crate::schema::TypeIdentity,
+) -> Value<B> {
     // Only the parser's typed `EnumIdentifier` form is eligible for namespace
     // expansion. Quoted strings remain literal even when their text resembles
     // `TypeName.member`.
@@ -1817,8 +1820,8 @@ mod tests {
             .expect("schema fixture must be valid"),
         );
 
-        let known = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
-        let unknown = Resource::with_provider("awscc", "iam.Unknown", "x", None);
+        let known: Resource = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
+        let unknown: Resource = Resource::with_provider("awscc", "iam.Unknown", "x", None);
 
         let mut pd = indexmap::IndexMap::new();
         pd.insert(
@@ -1895,7 +1898,8 @@ mod tests {
             .expect("schema fixture must be valid"),
         );
 
-        let role = Resource::with_provider("awscc", "iam.Role", "bs.bootstrap.role", None);
+        let role: Resource =
+            Resource::with_provider("awscc", "iam.Role", "bs.bootstrap.role", None);
 
         let mut pd = indexmap::IndexMap::new();
         pd.insert(

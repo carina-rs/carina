@@ -10,7 +10,7 @@
 //!   requires an `else` clause.
 
 use crate::ValueDescription;
-use crate::eval_value::EvalValue;
+use crate::eval_value::AuthoredEvalValue as EvalValue;
 use crate::parser::context::ExpressionMode;
 use crate::parser::expressions::for_expr::LoopParseTarget;
 use crate::parser::{
@@ -19,7 +19,10 @@ use crate::parser::{
     parse_expression, parse_expression_eval, parse_module_call, parse_read_resource_expr,
     parse_resource_for_target,
 };
-use crate::resource::{ConcreteValue, DataSource, LoopKind, Resource, Value};
+use crate::resource::{
+    AuthoredConcreteValue as ConcreteValue, AuthoredDataSource as DataSource,
+    AuthoredResource as Resource, AuthoredValue as Value, LoopKind,
+};
 
 /// Result of parsing an if expression body: a managed resource, a data
 /// source, a module call, or a value.
@@ -213,7 +216,9 @@ pub(crate) fn parse_if_body(
                 let mut call =
                     parse_module_call(inner, &local_ctx, preprocessed_file, source_file)?;
                 call.binding_name = match target {
-                    LoopParseTarget::Bound { .. } => Some(target.scheduler_key().to_string()),
+                    LoopParseTarget::Bound { .. } => Some(
+                        crate::resource::RelativeBindingName::new(target.scheduler_key()),
+                    ),
                     LoopParseTarget::Unbound(_) => None,
                 };
                 call.set_loop_origin(target.if_origin());

@@ -9,7 +9,7 @@ use indexmap::IndexMap;
 
 use crate::binding_index::BindingNameSet;
 use crate::parser::{self, File, InferredFile, ParsedFile, ProviderContext};
-use crate::resource::Value;
+use crate::resource::AuthoredValue as Value;
 use crate::schema::SchemaRegistry;
 use crate::validation::inference::ExportInferenceError;
 
@@ -911,7 +911,9 @@ fn parse_directory_with_overrides_impl(
 /// a future caller that violates the precondition; not reachable from
 /// the sole current caller (`expand_module_call` pins
 /// `export_params: Vec::new()`).
-pub(crate) fn relabel_export_phase<A, B>(f: File<A>) -> File<B> {
+pub(crate) fn relabel_export_phase<A, B, P: crate::resource::BindingAddress>(
+    f: File<A, P>,
+) -> File<B, P> {
     f.map_export_params(|export_params| {
         // Tripwire for a future caller that violates the precondition.
         // `debug_assert!` (not `assert!`): carina-core is a library;
@@ -935,7 +937,10 @@ pub(crate) fn relabel_export_phase<A, B>(f: File<A>) -> File<B> {
 /// [`File::merge_from`] performs the exhaustive private-field-preserving
 /// merge. Keeping this wrapper generic over the export-param phase lets the
 /// parser and inferred phases share that single merge contract.
-pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
+pub(crate) fn merge_parsed_file<E, B: crate::resource::BindingAddress>(
+    target: &mut File<E, B>,
+    source: File<E, B>,
+) {
     target.merge_from(source);
 }
 
@@ -1071,7 +1076,7 @@ pub(crate) fn parse_directory_files_located_from_root(
     provisional_seeds.extend(
         directory_module_parameters
             .iter()
-            .map(|name| parser::BindingSeed::module_parameter(name)),
+            .map(|name| parser::BindingSeed::module_parameter(name, None)),
     );
 
     // Pass 1.a: classify declarations with the complete syntactic scope.
@@ -1093,10 +1098,10 @@ pub(crate) fn parse_directory_files_located_from_root(
         merge_parsed_file(&mut pass1_union, parsed);
     }
     let structural = pass1_union.structural_binding_names();
-    let module_parameters: HashSet<&str> = pass1_union
+    let module_parameters: HashMap<&str, &parser::TypeExpr> = pass1_union
         .arguments
         .iter()
-        .map(|argument| argument.name.as_str())
+        .map(|argument| (argument.name.as_str(), &argument.type_expr))
         .collect();
     parser::reject_cyclic_let_bindings_in_variables(&pass1_union.variables, &structural)
         .map_err(LocatedParseError::directory_wide)?;
@@ -2093,10 +2098,13 @@ for account_id in orgs.accounts {
         )
         .unwrap();
 
-        let mut config = load_configuration(&dir).expect("directory fixture loads");
-        assert_eq!(config.parsed.deferred_for_expressions.len(), 1);
-        let deferred_line = config.parsed.deferred_for_expressions[0].line;
-        config.parsed.warnings.push(crate::parser::ParseWarning {
+        let config = load_configuration(&dir).expect("directory fixture loads");
+        let mut parsed = config
+            .parsed
+            .resolve_root(&crate::resource::RootScope::new());
+        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+        let deferred_line = parsed.deferred_for_expressions[0].line;
+        parsed.warnings.push(crate::parser::ParseWarning {
             file: Some(crn_path.display().to_string()),
             line: deferred_line,
             kind: crate::parser::WarningKind::DeferredFor,
@@ -2109,25 +2117,29 @@ for account_id in orgs.accounts {
                 "orgs".to_string(),
                 HashMap::from([(
                     "accounts".to_string(),
-                    Value::Concrete(crate::resource::ConcreteValue::List(vec![Value::Concrete(
-                        crate::resource::ConcreteValue::String("123456789012".into()),
-                    )])),
+                    crate::resource::ExpandedValue::Concrete(
+                        crate::resource::ExpandedConcreteValue::List(vec![
+                            crate::resource::ExpandedValue::Concrete(
+                                crate::resource::ExpandedConcreteValue::String(
+                                    "123456789012".into(),
+                                ),
+                            ),
+                        ]),
+                    ),
                 )]),
             )]));
-        config
-            .parsed
+        parsed
             .expand_deferred_for_expressions(&bindings)
             .expect("resolved upstream iterable expands");
 
-        assert!(config.parsed.deferred_for_expressions.is_empty());
+        assert!(parsed.deferred_for_expressions.is_empty());
         assert!(
-            config
-                .parsed
+            parsed
                 .warnings
                 .iter()
                 .all(|warning| warning.kind != crate::parser::WarningKind::DeferredFor),
             "resolved loop retained stale warnings: {:?}",
-            config.parsed.warnings,
+            parsed.warnings,
         );
         cleanup(&dir);
     }
@@ -2604,8 +2616,8 @@ awscc.ec2.SecurityGroup {
 
     #[test]
     fn duplicate_extraction_covers_resource_bindings() {
-        let mut resource = crate::resource::Resource::new("mock.test.Thing", "shared");
-        resource.binding = Some("shared".to_string());
+        let mut resource = crate::resource::AuthoredResource::new("mock.test.Thing", "shared");
+        resource.binding = Some(crate::parser::RelativeBindingName::new("shared"));
         let parsed = ParsedFile {
             resources: vec![resource],
             ..ParsedFile::default()
@@ -2619,8 +2631,8 @@ awscc.ec2.SecurityGroup {
 
     #[test]
     fn duplicate_extraction_covers_data_source_bindings() {
-        let mut data_source = crate::resource::DataSource::new("mock.test.Thing", "shared");
-        data_source.binding = Some("shared".to_string());
+        let mut data_source = crate::resource::AuthoredDataSource::new("mock.test.Thing", "shared");
+        data_source.binding = Some(crate::parser::RelativeBindingName::new("shared"));
         let parsed = ParsedFile {
             data_sources: vec![data_source],
             ..ParsedFile::default()
@@ -2653,11 +2665,12 @@ awscc.ec2.SecurityGroup {
     fn duplicate_extraction_covers_wait_bindings() {
         let parsed = ParsedFile {
             wait_bindings: vec![crate::parser::WaitBinding {
-                binding: crate::parser::BindingName::from("shared"),
-                target: crate::parser::BindingName::from("target"),
+                binding: crate::parser::RelativeBindingName::from("shared"),
+                target: crate::parser::RelativeBindingName::from("target"),
                 until_raw: "target.status == 'ready'".to_string(),
                 until_predicate: crate::parser::UntilPredicateAst {
-                    lhs_segments: vec!["target".to_string(), "status".to_string()],
+                    root: crate::parser::RelativeBindingName::new("target"),
+                    attribute_segments: vec!["status".to_string()],
                     rhs: Value::Concrete(crate::resource::ConcreteValue::String("ready".into())),
                 },
                 timeout_secs: None,

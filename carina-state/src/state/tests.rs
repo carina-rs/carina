@@ -1,5 +1,7 @@
 use super::*;
-use carina_core::resource::{DeferredValue, PendingReRead, ReReadReason};
+use carina_core::resource::{
+    DeferredValue, PendingReRead, ReReadReason, absolute_binding_address_for_test,
+};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -553,6 +555,14 @@ fn resolved(resource: &carina_core::resource::Resource) -> carina_core::resource
     carina_core::resource::ResolvedResource::new(resource.clone())
 }
 
+fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
+    absolute_binding_address_for_test(name)
+}
+
+fn absolute_bindings<const N: usize>(names: [&str; N]) -> BTreeSet<AbsoluteBindingAddress> {
+    names.into_iter().map(absolute_binding).collect()
+}
+
 fn list_rule(port: i64, description: Option<&str>) -> Value {
     let mut fields = IndexMap::from([(
         "port".to_string(),
@@ -880,7 +890,7 @@ fn upsert_resource_preserves_existing_deposed_generations() {
             "cidr_block".to_string(),
             serde_json::json!("10.255.0.0/16"),
         )])),
-        dependency_bindings: BTreeSet::from(["igw".to_string()]),
+        dependency_bindings: absolute_bindings(["igw"]),
     });
     state
         .upsert_resource(existing)
@@ -939,7 +949,7 @@ fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
             "cidr_block".to_string(),
             serde_json::json!("10.255.0.0/16"),
         )])),
-        dependency_bindings: BTreeSet::from(["igw".to_string()]),
+        dependency_bindings: absolute_bindings(["igw"]),
     });
     state
         .upsert_resource(existing)
@@ -1049,8 +1059,10 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
     resource.explicit = ExplicitFields::Struct {
         children: HashMap::from([("cidr_block".to_string(), ExplicitFields::Leaf)]),
     };
-    resource.binding = Some("vpc".to_string());
-    resource.dependency_bindings.insert("internet".to_string());
+    resource.binding = Some(absolute_binding("vpc"));
+    resource
+        .dependency_bindings
+        .insert(absolute_binding("internet"));
     resource.set_write_only_attributes_for_test(vec!["token".to_string()]);
     resource.set_partial_read_for_test(PartialReadMarker::new(
         PendingReRead::incomplete("partial"),
@@ -1064,7 +1076,7 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
             "cidr_block".to_string(),
             serde_json::json!("10.0.0.0/16"),
         )])),
-        dependency_bindings: BTreeSet::from(["network".to_string()]),
+        dependency_bindings: absolute_bindings(["network"]),
     });
     state
         .upsert_resource(resource)
@@ -1377,7 +1389,7 @@ fn test_build_state_for_resource_carries_typed_identifier() {
         .upsert_resource(rs)
         .expect("test state setup must be valid");
 
-    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
+    let resource: Resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     let loaded = state.build_state_for_resource(&resource.id);
     let Current::Present(present) = loaded else {
         panic!("state row must load as present");
@@ -1390,7 +1402,7 @@ fn test_build_state_for_resource_distinguishes_absent_address() {
     use carina_core::resource::Resource;
 
     let state = StateFile::new();
-    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
+    let resource: Resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     assert!(matches!(
         state.build_state_for_resource(&resource.id),
         Current::Absent(_state)
@@ -1457,10 +1469,10 @@ fn test_resource_state_serialization_with_binding_and_deps() {
 
     let deserialized: ResourceState = serde_json::from_str(json).unwrap();
     assert_eq!(deserialized.identity.as_str(), "my-bucket");
-    assert_eq!(deserialized.binding, Some("my_bucket".to_string()));
+    assert_eq!(deserialized.binding, Some(absolute_binding("my_bucket")));
     assert_eq!(
         deserialized.dependency_bindings,
-        BTreeSet::from(["vpc".to_string(), "subnet".to_string()])
+        absolute_bindings(["vpc", "subnet"])
     );
 }
 
@@ -3032,7 +3044,7 @@ fn test_from_provider_state_replaces_prior_top_level_list_when_resource_attrs_em
 fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative() {
     use carina_core::differ::{Diff, diff};
 
-    let resource = Resource::with_provider("mock", "listener.Listener", "listener", None);
+    let resource: Resource = Resource::with_provider("mock", "listener.Listener", "listener", None);
     let reordered_provider = State::existing(
         resource.id.clone(),
         HashMap::from([(
@@ -3104,7 +3116,7 @@ fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative
 
 #[test]
 fn bodyless_refresh_preserves_whole_value_without_guessing_alignment() {
-    let resource = Resource::with_provider("mock", "listener.Listener", "listener", None);
+    let resource: Resource = Resource::with_provider("mock", "listener.Listener", "listener", None);
     let provider = State::existing(
         resource.id.clone(),
         HashMap::from([(
@@ -3354,14 +3366,14 @@ fn test_multi_provider_resources_do_not_collide() {
     );
 
     // Loaded identifiers remain provider-scoped.
-    let aws_res = Resource::with_provider("aws", "s3.Bucket", "main", None);
+    let aws_res: Resource = Resource::with_provider("aws", "s3.Bucket", "main", None);
     assert!(matches!(
         state.build_state_for_resource(&aws_res.id),
         Current::Present(ref present)
             if present.identifier().as_str() == "aws-bucket-id"
     ));
 
-    let awscc_res = Resource::with_provider("awscc", "s3.Bucket", "main", None);
+    let awscc_res: Resource = Resource::with_provider("awscc", "s3.Bucket", "main", None);
     assert!(matches!(
         state.build_state_for_resource(&awscc_res.id),
         Current::Present(ref present)
@@ -3499,7 +3511,7 @@ fn test_build_state_for_resource_existing() {
         )
         .expect("test state setup must be valid");
 
-    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
+    let resource: Resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     let result = match state.build_state_for_resource(&resource.id) {
         Current::Present(present) => present.state().clone(),
         Current::Absent(state) => panic!("expected present state, got {state:?}"),
@@ -3533,7 +3545,7 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
         )
         .expect("test state setup must be valid");
 
-    let resource = Resource::with_provider("mock", "test.resource", "old", None);
+    let resource: Resource = Resource::with_provider("mock", "test.resource", "old", None);
     let loaded = match state.build_state_for_resource(&resource.id) {
         Current::Present(present) => present.state().clone(),
         Current::Absent(state) => panic!("expected present state, got {state:?}"),
@@ -3645,7 +3657,7 @@ fn state_file_persisted_attribute_type_preserves_serialized_bytes() {
 #[test]
 fn test_build_state_for_resource_not_found() {
     let state = StateFile::new();
-    let resource =
+    let resource: carina_core::resource::Resource =
         carina_core::resource::Resource::with_provider("awscc", "s3.Bucket", "missing", None);
     let result = match state.build_state_for_resource(&resource.id) {
         Current::Absent(state) => state.into_state(),
@@ -3941,7 +3953,7 @@ fn test_build_state_for_resource_without_identifier() {
         )
         .expect("test state setup must be valid");
 
-    let resource =
+    let resource: carina_core::resource::Resource =
         carina_core::resource::Resource::with_provider("awscc", "s3.Bucket", "pending", None);
     let result = state.build_state_for_resource(&resource.id);
 
@@ -3957,7 +3969,7 @@ fn build_state_for_resource_does_not_hide_current_content_behind_deposed_generat
     let id = ResourceId::with_provider_identity("mock", "test.resource", "current", None);
     let mut row = ResourceState::new("test.resource", "current", "mock")
         .with_attribute("name", serde_json::json!("current"));
-    row.binding = Some("current".to_string());
+    row.binding = Some(absolute_binding("current"));
     row.deposed.push(DeposedInstance::from_persisted_json(
         DeposedKey::new_unique(),
         "old-id".to_string(),
@@ -3983,7 +3995,7 @@ fn removing_last_deposed_generation_retains_malformed_current_instance() {
     let key = DeposedKey::new_unique();
     let mut row = ResourceState::new("test.resource", identity, "mock")
         .with_attribute("name", serde_json::json!("current"));
-    row.binding = Some("current".to_string());
+    row.binding = Some(absolute_binding("current"));
     row.deposed.push(DeposedInstance::from_persisted_json(
         key.clone(),
         "old-id".to_string(),
@@ -4013,11 +4025,12 @@ fn removing_last_deposed_generation_retains_malformed_current_instance() {
 fn test_from_provider_state_stores_binding_and_dependencies() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
-    let mut resource = Resource::with_provider("awscc", "ec2.Subnet", "my-subnet", None);
-    resource.binding = Some("my_subnet".to_string());
+    let mut resource: Resource = Resource::with_provider("awscc", "ec2.Subnet", "my-subnet", None);
+    resource.binding = Some(absolute_binding("my_subnet"));
     resource.set_attr(
         "vpc_id".to_string(),
-        Value::resource_ref("my_vpc".to_string(), "vpc_id".to_string(), vec![]),
+        carina_core::resource::AuthoredValue::resource_ref("my_vpc", "vpc_id", vec![])
+            .resolve_root_for_test(),
     );
 
     let provider_state = ProviderState {
@@ -4044,11 +4057,8 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
         None,
     )
     .unwrap();
-    assert_eq!(rs.binding, Some("my_subnet".to_string()));
-    assert_eq!(
-        rs.dependency_bindings,
-        BTreeSet::from(["my_vpc".to_string()])
-    );
+    assert_eq!(rs.binding, Some(absolute_binding("my_subnet")));
+    assert_eq!(rs.dependency_bindings, absolute_bindings(["my_vpc"]));
 }
 
 #[test]
@@ -4058,10 +4068,10 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     let mut state = StateFile::new();
     let mut rs = ResourceState::try_applied("ec2.Subnet", "orphan-subnet", "awscc", "subnet-123")
         .expect("fixture identifier is non-empty");
-    rs.binding = Some("my_subnet".to_string());
-    rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
+    rs.binding = Some(absolute_binding("my_subnet"));
+    rs.dependency_bindings = absolute_bindings(["my_vpc"]);
     rs.directives.prevent_destroy = true;
-    rs.directives.depends_on = vec!["security_group".to_string()];
+    rs.directives.depends_on = vec![absolute_binding("security_group")];
     state
         .upsert_resource(rs)
         .expect("test state setup must be valid");
@@ -4095,10 +4105,13 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     );
     assert_eq!(orphan.binding(), Some("my_subnet"));
     assert!(orphan.directives().prevent_destroy);
-    assert_eq!(orphan.directives().depends_on, ["security_group"]);
+    assert_eq!(
+        orphan.directives().depends_on,
+        vec![absolute_binding("security_group")]
+    );
     assert_eq!(
         orphan_state.dependency_bindings,
-        BTreeSet::from(["my_vpc".to_string()])
+        absolute_bindings(["my_vpc"])
     );
 
     let fresh = carina_core::resource::State::existing(
@@ -4121,10 +4134,13 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     assert_eq!(refreshed.binding(), Some("my_subnet"));
     assert_eq!(refreshed_state.id, id);
     assert!(refreshed.directives().prevent_destroy);
-    assert_eq!(refreshed.directives().depends_on, ["security_group"]);
+    assert_eq!(
+        refreshed.directives().depends_on,
+        vec![absolute_binding("security_group")]
+    );
     assert_eq!(
         refreshed_state.dependency_bindings,
-        BTreeSet::from(["my_vpc".to_string()])
+        absolute_bindings(["my_vpc"])
     );
     assert!(refreshed_state.attributes.contains_key("cidr_block"));
 }
@@ -4430,9 +4446,11 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
         delete_rows,
         vec![carina_core::detail_rows::DetailRow::Attribute {
             key: "name".to_string(),
-            value: carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(
-                "old".into(),
-            ))),
+            value: carina_core::value::render_value(
+                &carina_core::resource::ExpandedValue::Concrete(
+                    carina_core::resource::ExpandedConcreteValue::String("old".into()),
+                ),
+            ),
             ref_binding: None,
             annotation: None,
         }]
@@ -5039,7 +5057,7 @@ fn test_build_orphans_excludes_desired() {
     let mut state = StateFile::new();
     let mut rs = ResourceState::try_applied("ec2.Subnet", "kept-subnet", "awscc", "subnet-456")
         .expect("fixture identifier is non-empty");
-    rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
+    rs.dependency_bindings = absolute_bindings(["my_vpc"]);
     state
         .upsert_resource(rs)
         .expect("test state setup must be valid");
@@ -5795,12 +5813,13 @@ fn typed_data_source_cleanup_removes_historical_null_identifier_row() {
     }"#;
 
     let mut state = check_and_migrate(json).expect("read").into_state();
-    let data_source = carina_core::resource::DataSource::with_provider(
-        "aws",
-        "iam.Roles",
-        "admin_access_roles",
-        None,
-    );
+    let data_source: carina_core::resource::DataSource =
+        carina_core::resource::DataSource::with_provider(
+            "aws",
+            "iam.Roles",
+            "admin_access_roles",
+            None,
+        );
     assert_eq!(state.remove_legacy_data_source_rows(&[data_source]), 1);
     assert!(state.find_resource("awscc", "s3.Bucket", "log").is_some());
     assert!(
@@ -5832,7 +5851,7 @@ fn typed_data_source_cleanup_preserves_managed_row_with_identifier() {
     }"#;
 
     let mut state = check_and_migrate(json).expect("read").into_state();
-    let data_source =
+    let data_source: carina_core::resource::DataSource =
         carina_core::resource::DataSource::with_provider("test", "shared.Type", "shared", None);
 
     assert_eq!(state.remove_legacy_data_source_rows(&[data_source]), 0);
@@ -7705,7 +7724,10 @@ fn published_null_export_is_absent_for_coalesce_resolution() {
     );
     let default = Value::Concrete(ConcreteValue::List(Vec::new()));
     let expression = Value::Deferred(DeferredValue::Coalesce {
-        value: Box::new(Value::resource_ref("up", "accounts", Vec::new())),
+        value: Box::new(
+            carina_core::resource::AuthoredValue::resource_ref("up", "accounts", Vec::new())
+                .resolve_root_for_test(),
+        ),
         default: Box::new(default.clone()),
     });
 
@@ -7722,7 +7744,7 @@ fn published_exports_build_remote_bindings_ignores_resource_bindings() {
     let mut resource = ResourceState::try_applied("ec2.Vpc", "vpc_123", "awscc", "vpc-123")
         .expect("fixture identifier is non-empty")
         .with_attribute("vpc_id", serde_json::Value::String("vpc-123".to_string()));
-    resource.binding = Some("vpc".to_string());
+    resource.binding = Some(absolute_binding("vpc"));
     state
         .upsert_resource(resource)
         .expect("test state setup must be valid");
@@ -7764,8 +7786,15 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
     let state = check_and_migrate(&json).expect("load state").into_state();
     let r = &state.resources[0];
     assert_eq!(r.identity.as_str(), "_accounts.registry_prod");
-    assert_eq!(r.binding.as_deref(), Some("_accounts.registry_prod"));
-    let deps: Vec<&str> = r.dependency_bindings.iter().map(String::as_str).collect();
+    assert_eq!(
+        r.binding.as_ref().map(AbsoluteBindingAddress::as_str),
+        Some("_accounts.registry_prod")
+    );
+    let deps: Vec<&str> = r
+        .dependency_bindings
+        .iter()
+        .map(AbsoluteBindingAddress::as_str)
+        .collect();
     assert!(deps.contains(&"other.a"));
     assert!(deps.contains(&"_envs['prod-east']"));
 }
@@ -7777,9 +7806,7 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
 /// error rather than a debug-formatted string in state JSON.
 #[test]
 fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
-    use carina_core::resource::{
-        AccessPath, DeferredValue, Resource, State as ProviderState, Value,
-    };
+    use carina_core::resource::{DeferredValue, Resource, State as ProviderState, Value};
 
     let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     let provider_state = ProviderState {
@@ -7788,7 +7815,12 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
         attributes: [(
             "owner".to_string(),
             Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
+                path: carina_core::resource::AuthoredAccessPath::with_fields(
+                    "net",
+                    "vpc",
+                    vec!["vpc_id".into()],
+                )
+                .resolve_root_for_test(),
             }),
         )]
         .into_iter()

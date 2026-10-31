@@ -14,7 +14,10 @@ use carina_core::parser::{
     AttributeParameter, ModuleCall, ParsedExportParam, ParsedFile, SourceSpan,
     TopLevelBlockSourceSpan, TypeExpr,
 };
-use carina_core::resource::{ConcreteValue, DeferredValue, Value};
+use carina_core::resource::{
+    AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
+    AuthoredResource, AuthoredValue as Value,
+};
 use carina_core::schema::suggest_similar_name;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
@@ -30,7 +33,9 @@ pub(super) struct MergedParseResult {
 }
 
 pub(super) enum MergedModuleResolution {
-    Expanded,
+    Expanded {
+        graph: Box<carina_core::parser::ExpandedParsedFile>,
+    },
     ConstraintFailed {
         findings: Vec<carina_core::validation::ModuleCallFinding>,
         errors: Vec<carina_core::module_resolver::ResidualModuleResolutionError>,
@@ -50,7 +55,7 @@ fn source_span_position(span: SourceSpan) -> (u32, u32) {
 fn top_level_anonymous_resources_with_spans<'a>(
     doc: &Document,
     current_file: &'a ParsedFile,
-) -> Vec<(&'a carina_core::resource::Resource, TopLevelBlockSourceSpan)> {
+) -> Vec<(usize, &'a AuthoredResource, TopLevelBlockSourceSpan)> {
     let Ok(authored_spans) = carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
     else {
         return Vec::new();
@@ -66,8 +71,11 @@ fn top_level_anonymous_resources_with_spans<'a>(
     current_file
         .resources
         .iter()
-        .filter(|resource| resource.binding.is_none() && resource.loop_provenance.is_empty())
-        .filter_map(|resource| {
+        .enumerate()
+        .filter(|(_index, resource)| {
+            resource.binding.is_none() && resource.loop_provenance.is_empty()
+        })
+        .filter_map(|(index, resource)| {
             let key = (
                 resource.id.provider.clone(),
                 resource.id.resource_type.clone(),
@@ -75,7 +83,7 @@ fn top_level_anonymous_resources_with_spans<'a>(
             spans_by_kind
                 .get_mut(&key)
                 .and_then(VecDeque::pop_front)
-                .map(|span| (resource, span))
+                .map(|span| (index, resource, span))
         })
         .collect()
 }
@@ -107,11 +115,11 @@ fn value_depends_on_module_output(
                 })
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            if module_bindings.contains(binding) {
+            if module_bindings.contains(binding.as_str()) {
                 return true;
             }
-            visiting_variables.insert(binding.clone())
-                && variables.get(binding).is_some_and(|value| {
+            visiting_variables.insert(binding.to_string())
+                && variables.get(binding.as_str()).is_some_and(|value| {
                     value_depends_on_module_output(
                         value,
                         module_bindings,
@@ -582,9 +590,13 @@ impl DiagnosticEngine {
         current_file: &ParsedFile,
         directory: &ParsedFile,
     ) -> Vec<Diagnostic> {
+        let resolved_directory =
+            carina_core::module_resolver::expand_root_directory_file(directory.clone());
+        let resolved_current_file =
+            carina_core::module_resolver::expand_root_directory_file(current_file.clone());
         let conflicts =
             carina_core::identifier::check_attribute_derived_anonymous_resource_conflicts(
-                &directory.resources,
+                &resolved_directory.resources,
                 &self.schemas,
             );
         if conflicts.is_empty() {
@@ -592,7 +604,9 @@ impl DiagnosticEngine {
         }
 
         let mut diagnostics = Vec::new();
-        for (resource, span) in top_level_anonymous_resources_with_spans(doc, current_file) {
+        for (resource_index, resource, span) in
+            top_level_anonymous_resources_with_spans(doc, current_file)
+        {
             // The general schema diagnostic below is the actionable error in
             // this situation. Without a schema, the identity-basis classifier
             // returns no classification, so LSP must not infer an
@@ -601,9 +615,13 @@ impl DiagnosticEngine {
                 continue;
             }
 
+            let Some(resolved_resource) = resolved_current_file.resources.get(resource_index)
+            else {
+                continue;
+            };
             let Some(conflict) = conflicts
                 .iter()
-                .find(|conflict| conflict.includes(resource, &self.schemas))
+                .find(|conflict| conflict.includes(resolved_resource, &self.schemas))
             else {
                 continue;
             };
@@ -623,8 +641,8 @@ impl DiagnosticEngine {
 
     fn generated_identity_for_plain_resource(
         &self,
-        resource: &carina_core::resource::Resource,
-        providers: &[carina_core::parser::ProviderConfig],
+        resource: &carina_core::resource::ExpandedResource,
+        providers: &[carina_core::parser::ExpandedProviderConfig],
     ) -> Option<String> {
         let mut candidate = vec![resource.clone()];
         let canonical =
@@ -650,7 +668,12 @@ impl DiagnosticEngine {
         directory: &ParsedFile,
         configuration_root: Option<&std::path::Path>,
     ) -> Vec<Diagnostic> {
-        let mut resources = directory.resources.clone();
+        let resolved_directory =
+            carina_core::module_resolver::expand_root_directory_file(directory.clone());
+        let resolved_current_file =
+            carina_core::module_resolver::expand_root_directory_file(current_file.clone());
+        let mut resources = resolved_directory.resources;
+        let providers = resolved_directory.providers;
         let canonical_resources = match carina_core::value::canonicalize_resources_with_schemas(
             &mut resources,
             &self.schemas,
@@ -660,7 +683,7 @@ impl DiagnosticEngine {
         };
         let identity_result = carina_core::identifier::compute_anonymous_identifiers_with_factories(
             canonical_resources,
-            &directory.providers,
+            &providers,
             &self.factories,
             &self.schemas,
             carina_core::identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
@@ -693,12 +716,17 @@ impl DiagnosticEngine {
                     }
                     carina_core::identifier::AnonymousIdentityError::Collision(collision) => {
                         let message = collision.to_string();
-                        for (resource, span) in
+                        for (resource_index, _resource, span) in
                             top_level_anonymous_resources_with_spans(doc, current_file)
                         {
+                            let Some(resolved_resource) =
+                                resolved_current_file.resources.get(resource_index)
+                            else {
+                                continue;
+                            };
                             if self.generated_identity_for_plain_resource(
-                                resource,
-                                &directory.providers,
+                                resolved_resource,
+                                &providers,
                             ) != Some(collision.identifier().to_string())
                             {
                                 continue;
@@ -731,7 +759,7 @@ impl DiagnosticEngine {
 
         diagnostics.extend(
             carina_core::identifier::check_legacy_loop_move_targets(
-                &current_file.state_blocks,
+                &resolved_current_file.state_blocks,
                 &resources,
             )
             .into_iter()
@@ -1153,7 +1181,7 @@ impl DiagnosticEngine {
             };
 
             let validation =
-                carina_core::executor::provider_ready::validate_and_canonicalize_provider_config(
+                carina_core::executor::provider_ready::validate_authored_provider_config(
                     factory.as_ref(),
                     &provider.name,
                     &provider.attributes,
@@ -1337,9 +1365,15 @@ impl DiagnosticEngine {
             &covered_findings,
         );
         let module_resolution = match module_resolution {
-            carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
-                result.parsed = *graph;
-                MergedModuleResolution::Expanded
+            carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded {
+                mut graph,
+            } => {
+                let _ = carina_core::parser::resolve_expanded_provider_unresolved_attributes(
+                    &mut graph,
+                    &self.provider_context,
+                );
+                let _ = carina_core::parser::finalize_provider_configs(&mut graph);
+                MergedModuleResolution::Expanded { graph }
             }
             carina_core::module_resolver::ModuleResolutionDiagnosticResult::ConstraintFailed {
                 findings,
@@ -1349,11 +1383,13 @@ impl DiagnosticEngine {
                 MergedModuleResolution::Unowned { errors }
             }
         };
-        let _ = carina_core::parser::resolve_provider_unresolved_attributes(
-            &mut result.parsed,
-            &self.provider_context,
-        );
-        let _ = carina_core::parser::finalize_provider_configs(&mut result.parsed);
+        if !matches!(module_resolution, MergedModuleResolution::Expanded { .. }) {
+            let _ = carina_core::parser::resolve_provider_unresolved_attributes(
+                &mut result.parsed,
+                &self.provider_context,
+            );
+            let _ = carina_core::parser::finalize_provider_configs(&mut result.parsed);
+        }
         Ok(MergedParseResult {
             directory: result,
             module_resolution,
@@ -1662,14 +1698,22 @@ impl DiagnosticEngine {
             &overrides,
         )
         .ok()?;
-        let module_resolution_failed = carina_core::module_resolver::resolve_modules_with_config(
-            &mut merged,
+        let module_resolution = carina_core::module_resolver::resolve_modules_with_config(
+            merged.clone(),
             base_path,
             &self.provider_context,
             &self.schemas,
-        )
-        .is_err();
-        if module_resolution_failed {
+        );
+        if let Ok(mut expanded) = module_resolution {
+            if let Err(error) = carina_core::parser::resolve_expanded_provider_unresolved_attributes(
+                &mut expanded,
+                &self.provider_context,
+            ) {
+                return Some(error);
+            }
+            return carina_core::parser::finalize_provider_configs(&mut expanded).err();
+        }
+        {
             // The primary diagnostics pass owns the module error. A provider
             // value that reads a failed module's output cannot be finalized
             // soundly, but unrelated provider values still can (and must) be
@@ -1678,7 +1722,7 @@ impl DiagnosticEngine {
             let module_bindings = merged
                 .module_calls
                 .iter()
-                .filter_map(|call| call.binding_name.clone())
+                .filter_map(|call| call.binding_name.as_ref().map(ToString::to_string))
                 .collect::<HashSet<_>>();
             let variables = merged.variables.clone();
             for provider in &mut merged.providers {
@@ -1916,7 +1960,7 @@ impl DiagnosticEngine {
                 // in-scope bindings (#2038).
                 let in_scope: Vec<String> = known.iter_names().map(String::from).collect();
                 let err = carina_core::parser::ParseError::undefined_identifier(
-                    root,
+                    root.to_string(),
                     deferred.line,
                     in_scope,
                 );
@@ -2176,9 +2220,9 @@ impl DiagnosticEngine {
                         Some(path.binding().to_string())
                     }
                     Value::Deferred(DeferredValue::BindingRef { binding })
-                        if !known_bindings.contains(binding) =>
+                        if !known_bindings.contains(binding.as_str()) =>
                     {
-                        Some(binding.clone())
+                        Some(binding.to_string())
                     }
                     // A single-file parse cannot classify an undeclared bare
                     // identifier as a binding, so untyped attribute values use
@@ -2361,25 +2405,42 @@ impl DiagnosticEngine {
         doc: &Document,
         parsed: &ParsedFile,
         semantic_view: &SemanticView<'_>,
+        expanded: Option<&carina_core::parser::ExpandedParsedFile>,
         value_bindings: &ResolvedBindings,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
         for param in &parsed.export_params {
-            let mut fallback;
-            let semantic_param = match semantic_view.lookup(param) {
-                Some(semantic_param) => semantic_param,
-                None => {
-                    let Some(value) = semantic_view.value_for_typecheck(param) else {
-                        continue;
+            let expanded_param = expanded
+                .and_then(|expanded| {
+                    expanded.export_params.iter().find(|candidate| {
+                        candidate.source_file() == param.source_file()
+                            && candidate.source_span() == param.source_span()
+                    })
+                })
+                .cloned()
+                .or_else(|| {
+                    let semantic_param = match semantic_view.lookup(param) {
+                        Some(semantic_param) => semantic_param.clone(),
+                        None => {
+                            let value = semantic_view.value_for_typecheck(param)?;
+                            let mut fallback = param.clone();
+                            fallback.value = Some(value.clone());
+                            fallback
+                        }
                     };
-                    fallback = param.clone();
-                    fallback.value = Some(value.clone());
-                    &fallback
-                }
+                    let mut fallback_file = ParsedFile::default();
+                    fallback_file.export_params.push(semantic_param);
+                    carina_core::module_resolver::expand_root_directory_file(fallback_file)
+                        .export_params
+                        .into_iter()
+                        .next()
+                });
+            let Some(expanded_param) = expanded_param else {
+                continue;
             };
             let message = carina_core::validation::check_export_values_pre_apply(
-                std::slice::from_ref(semantic_param),
+                std::slice::from_ref(&expanded_param),
                 value_bindings,
                 &self.provider_context,
             )
@@ -2420,9 +2481,23 @@ impl DiagnosticEngine {
         // whole `InferredFile`. Use the merged, module-expanded parse when
         // available so sibling-file bindings are visible and module calls
         // appear as inferable `Virtual` compositions (#2493).
-        let Some(inference_input) = semantic_view.parsed() else {
-            return diagnostics;
+        let reference_diagnostics = match expanded {
+            Some(expanded) => self.check_export_reference_types(doc, expanded),
+            None => semantic_view.parsed().map_or_else(Vec::new, |parsed| {
+                self.check_export_reference_types(doc, parsed)
+            }),
         };
+        diagnostics.extend(reference_diagnostics);
+
+        diagnostics
+    }
+
+    fn check_export_reference_types<B: carina_core::resource::BindingAddress>(
+        &self,
+        doc: &Document,
+        inference_input: &carina_core::parser::File<carina_core::parser::ParsedExportParam<B>, B>,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
         let (inferred_export_params, inference_errors) =
             carina_core::validation::inference::infer_export_params(inference_input, &self.schemas);
         // Surface inference failures as "type annotation required"

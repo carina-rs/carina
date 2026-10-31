@@ -1,11 +1,15 @@
 use super::*;
 use crate::parser::{
-    ArgumentOrigin, BindingName, ModuleArgument, ParsedFile, ProviderContext, UntilPredicateAst,
-    WaitBinding,
+    ArgumentOrigin, ModuleArgument, ParsedFile, ProviderContext, RelativeBindingName,
+    UntilPredicateAst, WaitBinding,
 };
 use crate::resource::{
-    CompositionCall, CompositionCallPath, DataSource, LiveComposition, LiveCompositionArgument,
-    LiveCompositionAttribute, LiveCompositionSignature, Resource,
+    AuthoredCompositionCall as CompositionCall, AuthoredCompositionCallPath as CompositionCallPath,
+    AuthoredDataSource as DataSource, AuthoredLiveComposition as LiveComposition,
+    AuthoredLiveCompositionArgument as LiveCompositionArgument,
+    AuthoredLiveCompositionAttribute as LiveCompositionAttribute,
+    AuthoredLiveCompositionSignature as LiveCompositionSignature, AuthoredResource as Resource,
+    RootScope,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -126,7 +130,9 @@ fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
     );
 }
 
-fn validate_resource_ref_types_for_test<E>(
+fn validate_resource_ref_types_for_test<
+    E: crate::parser::ExportParamLike<Binding = RelativeBindingName>,
+>(
     parsed: &crate::parser::File<E>,
     schemas: &SchemaRegistry,
     argument_names: &HashSet<String>,
@@ -289,7 +295,7 @@ fn context_with_iam_policy_arn_validator() -> ProviderContext {
                 if target.identity() != &identity {
                     return Ok(());
                 }
-                let Value::Concrete(ConcreteValue::String(s)) = value else {
+                let PhaseValue::Concrete(PhaseConcreteValue::String(s)) = value else {
                     return Err(crate::parser::fixture_custom_type_rejection(
                         target,
                         "Expected string",
@@ -1113,19 +1119,14 @@ mock.test.Consumer { name = shared }
     .expect("write module fixture");
 
     let config = ProviderContext::default();
-    let schemas = SchemaRegistry::new();
     let mut parsed = crate::config_loader::parse_directory(fixture.path(), &config)
         .expect("load module fixture");
-    crate::module_resolver::resolve_modules_with_config(
-        &mut parsed,
-        fixture.path(),
-        &config,
-        &schemas,
-    )
-    .expect("expand nested module");
+    let authored = parsed.clone();
+    crate::module_resolver::resolve_modules_authored_for_test(&mut parsed, fixture.path())
+        .expect("expand nested module");
 
     assert_eq!(
-        check_unused_bindings_in_file(&parsed),
+        check_unused_bindings_in_file(&authored),
         vec!["shared"],
         "module-local provenance must not count as a use of the root binding",
     );
@@ -1184,7 +1185,7 @@ fn make_composition(binding: &str, attributes: &[&str]) -> LiveComposition {
     let call = CompositionCall {
         id: crate::parser::ModuleCallId::test_dummy_in(format!("{binding}.crn")),
         module_name: "test_module".to_string(),
-        binding: Some(binding.to_string()),
+        binding: Some(binding.into()),
         instance: binding.to_string(),
         module_source: None,
         module_directory: None,
@@ -1211,7 +1212,7 @@ fn make_composition(binding: &str, attributes: &[&str]) -> LiveComposition {
                 .collect(),
             pending_constraints: Vec::new(),
         },
-        binding: Some(binding.to_string()),
+        binding: Some(binding.into()),
         dependency_bindings: Default::default(),
         module_name: "test_module".to_string(),
         instance: binding.to_string(),
@@ -1717,11 +1718,12 @@ fn unknown_attribute_reference_through_wait_binding_reports_error() {
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.wait_bindings.push(WaitBinding {
-        binding: BindingName::from("cert_issued"),
-        target: BindingName::from("cert"),
+        binding: RelativeBindingName::from("cert_issued"),
+        target: RelativeBindingName::from("cert"),
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            root: "cert".into(),
+            attribute_segments: vec!["status".to_string()],
             rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
@@ -1790,11 +1792,12 @@ fn known_attribute_reference_through_wait_binding_is_accepted() {
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.wait_bindings.push(WaitBinding {
-        binding: BindingName::from("cert_issued"),
-        target: BindingName::from("cert"),
+        binding: RelativeBindingName::from("cert_issued"),
+        target: RelativeBindingName::from("cert"),
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            root: "cert".into(),
+            attribute_segments: vec!["status".to_string()],
             rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
@@ -2013,11 +2016,12 @@ fn unknown_attribute_reference_through_wait_binding_inside_nested_struct_reports
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.wait_bindings.push(WaitBinding {
-        binding: BindingName::from("cert_issued"),
-        target: BindingName::from("cert"),
+        binding: RelativeBindingName::from("cert_issued"),
+        target: RelativeBindingName::from("cert"),
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            root: "cert".into(),
+            attribute_segments: vec!["status".to_string()],
             rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
@@ -4113,7 +4117,8 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         name: "mode".to_string(),
         type_expr: schema_type,
         value: Some(authored()),
-    }];
+    }
+    .resolve_root(&RootScope::new())];
     check_export_values_pre_apply(&exports, &ResolvedBindings::default(), &config)
         .expect("export must validate");
 
@@ -4385,6 +4390,7 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
     );
     let mut parsed = empty_parsed();
     parsed.compositions.extend([source, consumer]);
+    let parsed = parsed.resolve_root(&RootScope::new());
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
@@ -4409,7 +4415,7 @@ fn composition_ref_error_dedup_uses_the_full_call_path() {
         CompositionCall {
             id: crate::parser::ModuleCallId::test_dummy_in(source),
             module_name: label.to_string(),
-            binding: Some(label.to_string()),
+            binding: Some(label.into()),
             instance: label.to_string(),
             module_source: None,
             module_directory: None,
@@ -4456,6 +4462,7 @@ fn composition_ref_error_dedup_uses_the_full_call_path() {
     ];
     let mut parsed = empty_parsed();
     parsed.compositions = compositions;
+    let parsed = parsed.resolve_root(&RootScope::new());
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
@@ -4484,6 +4491,7 @@ fn post_expansion_composition_attribute_typo_is_reported_once() {
     );
     let mut parsed = empty_parsed();
     parsed.compositions.extend([source, consumer]);
+    let parsed = parsed.resolve_root(&RootScope::new());
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
@@ -4535,6 +4543,7 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
         );
         parsed.compositions.push(consumer);
     }
+    let parsed = parsed.resolve_root(&RootScope::new());
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
@@ -4588,6 +4597,7 @@ fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
         );
         parsed.compositions.push(consumer);
     }
+    let parsed = parsed.resolve_root(&RootScope::new());
 
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
@@ -4651,6 +4661,7 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
     );
     let mut parsed = empty_parsed();
     parsed.compositions.extend([source, consumer]);
+    let parsed = parsed.resolve_root(&RootScope::new());
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
@@ -4903,11 +4914,12 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.wait_bindings.push(WaitBinding {
-        binding: BindingName::from("cert_issued"),
-        target: BindingName::from("cert"),
+        binding: RelativeBindingName::from("cert_issued"),
+        target: RelativeBindingName::from("cert"),
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            root: "cert".into(),
+            attribute_segments: vec!["status".to_string()],
             rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
@@ -5203,8 +5215,13 @@ fn resolve_and_validate_export_params(
     exports: &[crate::parser::InferredExportParam],
     config: &ProviderContext,
 ) -> Result<(), String> {
+    let exports = exports
+        .iter()
+        .cloned()
+        .map(|export| export.resolve_root(&RootScope::new()))
+        .collect::<Vec<_>>();
     check_export_values_pre_apply(
-        exports,
+        &exports,
         &crate::binding_index::ResolvedBindings::default(),
         config,
     )
@@ -5424,7 +5441,8 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
             .with_attribute(
                 "identifier",
                 Value::Concrete(ConcreteValue::String(identifier.into())),
-            );
+            )
+            .resolve_root(&RootScope::new());
         ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[resource],
             compositions: &[],
@@ -5439,13 +5457,16 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
         name: "id".into(),
         type_expr: TypeExpr::String,
         value: Some(Value::resource_ref("r", "identifier", vec![])),
-    }];
+    }
+    .resolve_root(&RootScope::new())];
     let pre_apply =
         check_export_values_pre_apply(&exports, &bindings("alpha-id"), &ProviderContext::default())
             .expect("pre-apply export check");
     assert_eq!(
         pre_apply.display_values()[0].value,
-        Some(Value::Concrete(ConcreteValue::String("alpha-id".into()))),
+        Some(PhaseValue::Concrete(PhaseConcreteValue::String(
+            "alpha-id".into()
+        ))),
     );
 
     let post_apply = resolve_export_values_post_apply(
@@ -5456,7 +5477,9 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
     .expect("post-apply export resolution");
     assert_eq!(
         post_apply.as_slice()[0].value,
-        Some(Value::Concrete(ConcreteValue::String("beta-id".into()))),
+        Some(PhaseValue::Concrete(PhaseConcreteValue::String(
+            "beta-id".into()
+        ))),
     );
 }
 
@@ -6074,11 +6097,12 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.wait_bindings.push(WaitBinding {
-        binding: BindingName::from("cert_issued"),
-        target: BindingName::from("cert"),
+        binding: RelativeBindingName::from("cert_issued"),
+        target: RelativeBindingName::from("cert"),
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            root: "cert".into(),
+            attribute_segments: vec!["status".to_string()],
             rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
@@ -6942,7 +6966,7 @@ fn ref_with_chained_field_on_struct_flags_unknown_field() {
     );
 }
 
-type ValidateConfigCallLog = std::sync::Arc<std::sync::Mutex<Vec<IndexMap<String, Value>>>>;
+type ValidateConfigCallLog = std::sync::Arc<std::sync::Mutex<Vec<IndexMap<String, PhaseValue>>>>;
 
 /// Test-only factory that records every call to `validate_config` so a
 /// test can assert what attributes did or didn't cross the WASM-equivalent
@@ -6987,7 +7011,7 @@ impl crate::provider::ProviderFactory for RecordingFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+    fn extract_region(&self, _attributes: &IndexMap<String, PhaseValue>) -> String {
         String::new()
     }
 
@@ -7114,7 +7138,7 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        fn extract_region(&self, _attributes: &IndexMap<String, PhaseValue>) -> String {
             String::new()
         }
 
@@ -7161,7 +7185,7 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
     let calls = seen.lock().unwrap();
     assert!(matches!(
         calls.last().and_then(|attrs| attrs.get("region")),
-        Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
+        Some(PhaseValue::Concrete(PhaseConcreteValue::CanonicalEnum(value)))
             if value.api_value() == "ap-northeast-1"
     ));
 }
@@ -7579,7 +7603,9 @@ fn attribute_reference_message_fixture(module_directory: &str) -> CompositionAtt
     CompositionAttributeRefError {
         error: AttributeParamRefError {
             attribute: "bad".to_string(),
-            path: ReferencePath::Binding("source".to_string()),
+            path: crate::resource::ReferencePath::Binding(
+                RootScope::new().resolve("source".into()),
+            ),
             kind: ModuleCallRefErrorKind::TypeMismatch {
                 expected: "String".to_string(),
                 actual: "Int".to_string(),
@@ -7645,23 +7671,28 @@ fn module_reference_coverage_uses_typed_call_identity_not_display_text() {
         actual: "Int".to_string(),
         declared: None,
     };
-    let path = ReferencePath::Binding("source".to_string());
+    let path = ReferencePath::Binding("source".into());
     let finding =
         ModuleCallFindingMessage::ReferenceType(Box::new(ModuleCallReferenceDiagnostic {
             call_label: "child".to_string(),
             identity: ModuleCallReferenceIdentity {
                 call: first.module_calls[0].id().clone(),
                 argument: "value".to_string(),
-                path: path.clone(),
+                path: ModuleCallDiagnosticPath::Authored(path.clone()),
+                reference_position: Some(0),
+                binding_use: None,
                 kind: kind.clone(),
             },
+            display_path: ModuleCallDiagnosticPath::Authored(path.clone()),
         }));
     let resolver_error = ModuleCallRefError {
         call_label: "child".to_string(),
         identity: ModuleCallReferenceIdentity {
             call: second.module_calls[0].id().clone(),
             argument: "value".to_string(),
-            path,
+            path: ModuleCallDiagnosticPath::Authored(path),
+            reference_position: Some(0),
+            binding_use: None,
             kind,
         },
         argument_span: second.module_calls[0].source_span(),

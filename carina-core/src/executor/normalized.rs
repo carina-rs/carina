@@ -94,7 +94,7 @@ impl<S> NormalizedResource<S> {
 /// executor patch builders.
 pub async fn apply_desired_normalization<S: Clone>(
     resource: Resource<S>,
-    provider_configs: &[ProviderConfig],
+    provider_configs: &[ProviderConfig<crate::resource::AbsoluteBindingAddress>],
     normalizer: &dyn ProviderNormalizer,
     schemas: &SchemaRegistry,
 ) -> ProviderResult<NormalizedResource<S>> {
@@ -117,7 +117,7 @@ pub async fn apply_desired_normalization<S: Clone>(
 /// An error stops the pipeline before later stages run.
 pub async fn apply_desired_normalization_slice<S: Clone>(
     resources: &mut [Resource<S>],
-    provider_configs: &[ProviderConfig],
+    provider_configs: &[ProviderConfig<crate::resource::AbsoluteBindingAddress>],
     normalizer: &dyn ProviderNormalizer,
     schemas: &SchemaRegistry,
 ) -> ProviderResult<()> {

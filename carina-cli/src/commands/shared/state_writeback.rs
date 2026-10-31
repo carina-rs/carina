@@ -30,10 +30,41 @@ use carina_state::{
 };
 use colored::Colorize;
 
+#[cfg(test)]
+use carina_core::resource::AbsoluteBindingAddress;
+
 use crate::commands::plan::MovedOrigins;
 use crate::commands::shared::incremental_state_saver::FinalStateBase;
 use crate::commands::shared::lock_heartbeat::StateLockRef;
 use crate::error::AppError;
+
+#[cfg(test)]
+fn absolute_binding(name: impl Into<String>) -> AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(name)
+}
+
+#[cfg(test)]
+fn root_resource_ref(
+    binding: impl Into<String>,
+    attribute: impl Into<String>,
+    fields: Vec<String>,
+) -> Value {
+    carina_core::resource::AuthoredValue::resource_ref(binding.into(), attribute.into(), fields)
+        .resolve_root_for_test()
+}
+
+#[cfg(test)]
+trait WithTestBinding {
+    fn with_test_binding(self, binding: impl Into<String>) -> Self;
+}
+
+#[cfg(test)]
+impl<S> WithTestBinding for Resource<S> {
+    fn with_test_binding(mut self, binding: impl Into<String>) -> Self {
+        self.binding = Some(absolute_binding(binding));
+        self
+    }
+}
 
 /// Apply permanent name overrides from state to desired resources.
 ///
@@ -210,7 +241,7 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
 /// resources cannot enter the live export-resolution path.
 pub(crate) struct ExportResolutionInputs<'a> {
     pub export_params: &'a carina_core::validation::ExportsCheckedPreApply<
-        carina_core::parser::InferredExportParam,
+        carina_core::parser::ExpandedInferredExportParam,
     >,
     /// Total post-read outcomes. Apply-time reads replace their deferred
     /// entries before this reaches export resolution.
@@ -460,7 +491,7 @@ pub(crate) struct SkippedExport {
 /// non-finite float, remains an error and aborts writeback.
 pub(crate) struct ResolveExportValuesPostApplyInput<'a> {
     pub export_params: &'a carina_core::validation::ExportsCheckedPreApply<
-        carina_core::parser::InferredExportParam,
+        carina_core::parser::ExpandedInferredExportParam,
     >,
     pub sorted_resources: &'a [Resource],
     pub pre_resolve_compositions: &'a [carina_core::resource::LiveComposition],
@@ -473,7 +504,7 @@ pub(crate) struct ResolveExportValuesPostApplyInput<'a> {
 pub(crate) fn resolve_export_values_post_apply(
     input: ResolveExportValuesPostApplyInput<'_>,
 ) -> Result<
-    carina_core::validation::CheckedExportValues<carina_core::parser::InferredExportParam>,
+    carina_core::validation::CheckedExportValues<carina_core::parser::ExpandedInferredExportParam>,
     AppError,
 > {
     use carina_core::binding_index::ResolvedBindings;
@@ -547,7 +578,7 @@ pub(crate) fn resolve_export_values_post_apply(
 /// impossible to serialize the pre-apply display snapshot.
 pub(crate) fn materialize_exports(
     export_params: &carina_core::validation::CheckedExportValues<
-        carina_core::parser::InferredExportParam,
+        carina_core::parser::ExpandedInferredExportParam,
     >,
 ) -> Result<ExportResolution, AppError> {
     use carina_core::value::SerializationError;
@@ -868,7 +899,7 @@ struct ReplacementDeleteInput<'a> {
     identifier: &'a str,
     provider_instance: Option<String>,
     generation: &'a EffectGeneration,
-    fallback_dependency_bindings: BTreeSet<String>,
+    fallback_dependency_bindings: BTreeSet<carina_core::resource::AbsoluteBindingAddress>,
     previous_attributes: Option<ReplacementPreviousAttributesForStateWriteback<'a>>,
 }
 
@@ -1880,7 +1911,7 @@ mod apply_state_save_tests {
     fn replacement_matrix_state(kind: ReplacementAppliedKind, delete_first: bool) -> StateFile {
         let resource =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]")
+                .with_test_binding("validation_records[0]")
                 .with_attribute(
                     "name",
                     Value::Concrete(ConcreteValue::String("new.example.com".into())),
@@ -2174,7 +2205,7 @@ mod apply_state_save_tests {
         );
         let desired =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]")
+                .with_test_binding("validation_records[0]")
                 .with_attribute(
                     "name",
                     Value::Concrete(ConcreteValue::String("changed.example.com".into())),
@@ -3324,7 +3355,7 @@ mod apply_state_save_tests {
     #[test]
     fn missing_applied_entry_keeps_current_in_flight_row_byte_for_byte() {
         let resource = Resource::with_provider("mock", "test.resource", "pending", None)
-            .with_binding("pending")
+            .with_test_binding("pending")
             .with_attribute(
                 "name",
                 Value::Concrete(ConcreteValue::String("stable".into())),
@@ -3393,7 +3424,7 @@ mod apply_state_save_tests {
             ResourceId::with_provider_identity("mock", "test.resource", "new_address", None);
         let source_resource = resolved(
             Resource::from_id(source.clone())
-                .with_binding("old_address")
+                .with_test_binding("old_address")
                 .with_attribute(
                     "name",
                     Value::Concrete(ConcreteValue::String("stable".into())),
@@ -3447,7 +3478,7 @@ mod apply_state_save_tests {
         };
         let destination_resource = resolved(
             Resource::from_id(destination.clone())
-                .with_binding("new_address")
+                .with_test_binding("new_address")
                 .with_attribute(
                     "name",
                     Value::Concrete(ConcreteValue::String("stable".into())),
@@ -3824,7 +3855,7 @@ mod apply_state_save_tests {
     #[test]
     fn only_create_ended_clears_current_and_keeps_deposed() {
         let resource = Resource::with_provider("mock", "test.resource", "pending", None)
-            .with_binding("pending")
+            .with_test_binding("pending")
             .with_attribute(
                 "name",
                 Value::Concrete(ConcreteValue::String("stable".into())),
@@ -4320,8 +4351,8 @@ mod apply_state_save_tests {
             identifier: crate::fixture_applied_identifier("old-record-id"),
             generation: EffectGeneration::Deposed(deposed_key.clone()),
             directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::from(["cert".to_string()]),
+            binding: Some(absolute_binding("validation_records[0]")),
+            dependencies: HashSet::from([absolute_binding("cert")]),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         });
@@ -4337,9 +4368,9 @@ mod apply_state_save_tests {
                 resource_type: "aws.route53.Record".to_string(),
                 attributes: vec![],
                 target: carina_core::parser::DeferredForTarget::Bound {
-                    binding: "validation_records".to_string(),
+                    binding: absolute_binding("validation_records"),
                 },
-                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                iterable: root_resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource: Resource::with_provider(
                     "aws",
@@ -4347,7 +4378,7 @@ mod apply_state_save_tests {
                     "validation_records",
                     None,
                 )
-                .with_binding("validation_records"),
+                .with_test_binding("validation_records"),
             }),
         });
         let successfully_deleted = HashSet::from([DeletedInstanceKey::new(
@@ -4390,8 +4421,8 @@ mod apply_state_save_tests {
             id: carina_core::resource::ResolvedResourceId::new(id.clone()),
             identifier: crate::fixture_applied_identifier("old-record-id"),
             directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::from(["cert".to_string()]),
+            binding: Some(absolute_binding("validation_records[0]")),
+            dependencies: HashSet::from([absolute_binding("cert")]),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         }
@@ -4404,7 +4435,7 @@ mod apply_state_save_tests {
             "validation_records",
             id.provider_instance.clone(),
         )
-        .with_binding("validation_records");
+        .with_test_binding("validation_records");
         Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![deferred_replace_delete(id)])
                 .expect("fixture has one delete"),
@@ -4419,9 +4450,9 @@ mod apply_state_save_tests {
                 resource_type: "aws.route53.Record".to_string(),
                 attributes: vec![],
                 target: carina_core::parser::DeferredForTarget::Bound {
-                    binding: "validation_records".to_string(),
+                    binding: absolute_binding("validation_records"),
                 },
-                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                iterable: root_resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
@@ -4438,7 +4469,7 @@ mod apply_state_save_tests {
         );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]");
+                .with_test_binding("validation_records[0]");
         let applied_state =
             State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
         let mut plan = Plan::new();
@@ -4487,7 +4518,7 @@ mod apply_state_save_tests {
             "validation_records[0]",
             Some("west".to_string()),
         )
-        .with_binding("validation_records[0]");
+        .with_test_binding("validation_records[0]");
         let applied_state = State::existing(
             id.clone(),
             HashMap::from([(
@@ -4513,7 +4544,9 @@ mod apply_state_save_tests {
         .expect("fixture identifier is non-empty")
         .with_attribute("name", serde_json::json!("old.example.com"));
         existing.directives.provider_instance = Some("west".to_string());
-        existing.dependency_bindings.insert("cert".to_string());
+        existing
+            .dependency_bindings
+            .insert(absolute_binding("cert"));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -4569,7 +4602,7 @@ mod apply_state_save_tests {
         );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]");
+                .with_test_binding("validation_records[0]");
         let applied_state =
             State::existing(id.clone(), HashMap::new()).with_identifier("old-record-id");
         let current_state =
@@ -4611,7 +4644,7 @@ mod apply_state_save_tests {
     #[test]
     fn update_only_applied_identifier_change_does_not_phantom_depose_old_identifier() {
         let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None)
-            .with_binding("main")
+            .with_test_binding("main")
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -4683,7 +4716,7 @@ mod apply_state_save_tests {
     #[test]
     fn applied_upsert_that_displaces_undeleted_current_identifier_deposes_old_identifier() {
         let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None)
-            .with_binding("main")
+            .with_test_binding("main")
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -4692,7 +4725,7 @@ mod apply_state_save_tests {
         let mut existing = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-old")
             .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
-        existing.dependency_bindings.insert("igw".to_string());
+        existing.dependency_bindings.insert(absolute_binding("igw"));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -4741,14 +4774,14 @@ mod apply_state_save_tests {
         );
         assert_eq!(
             row.deposed[0].dependency_bindings,
-            BTreeSet::from(["igw".to_string()])
+            BTreeSet::from([absolute_binding("igw")])
         );
     }
 
     #[test]
     fn applied_recreate_after_confirmed_missing_current_does_not_depose_old_identifier() {
         let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None)
-            .with_binding("main")
+            .with_test_binding("main")
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -4808,7 +4841,7 @@ mod apply_state_save_tests {
     fn displaced_identifier_depose_records_existing_row_provider_instance() {
         let desired =
             Resource::with_provider("awscc", "ec2.Vpc", "main", Some("new-provider".to_string()))
-                .with_binding("main")
+                .with_test_binding("main")
                 .with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -4872,7 +4905,7 @@ mod apply_state_save_tests {
      {
         let desired =
             Resource::with_provider("awscc", "ec2.Vpc", "main", Some("new-provider".to_string()))
-                .with_binding("main")
+                .with_test_binding("main")
                 .with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -4906,7 +4939,7 @@ mod apply_state_save_tests {
             identifier: crate::fixture_applied_identifier("vpc-old"),
             generation: EffectGeneration::Current,
             directives: Directives::default(),
-            binding: Some("main".to_string()),
+            binding: Some(absolute_binding("main")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -4914,7 +4947,7 @@ mod apply_state_save_tests {
         plan.add(Effect::Create(
             carina_core::resource::ResolvedResource::new(desired.clone()),
         ));
-        let previous_attributes = HashMap::from([(
+        let previous_attributes: HashMap<String, Value> = HashMap::from([(
             "cidr_block".to_string(),
             Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )]);
@@ -4970,7 +5003,7 @@ mod apply_state_save_tests {
     fn successful_delete_on_other_provider_instance_does_not_suppress_displaced_depose() {
         let desired =
             Resource::with_provider("awscc", "ec2.Vpc", "main", Some("new-provider".to_string()))
-                .with_binding("main")
+                .with_test_binding("main")
                 .with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -5041,7 +5074,7 @@ mod apply_state_save_tests {
             "validation_records[0]",
             Some("west".to_string()),
         )
-        .with_binding("validation_records[0]")
+        .with_test_binding("validation_records[0]")
         .with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("new-2.example.com".into())),
@@ -5082,7 +5115,7 @@ mod apply_state_save_tests {
             identifier: crate::fixture_applied_identifier("old-record-id"),
             generation: EffectGeneration::Current,
             directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
+            binding: Some(absolute_binding("validation_records[0]")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -5090,7 +5123,7 @@ mod apply_state_save_tests {
         plan.add(Effect::Create(
             carina_core::resource::ResolvedResource::new(desired.clone()),
         ));
-        let previous_attributes = HashMap::from([(
+        let previous_attributes: HashMap<String, Value> = HashMap::from([(
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("old.example.com".into())),
         )]);
@@ -5164,7 +5197,7 @@ mod apply_state_save_tests {
             "validation_records[0]",
             Some("west".to_string()),
         )
-        .with_binding("validation_records[0]")
+        .with_test_binding("validation_records[0]")
         .with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("new-2.example.com".into())),
@@ -5205,7 +5238,7 @@ mod apply_state_save_tests {
             identifier: crate::fixture_applied_identifier("old-record-id"),
             generation: EffectGeneration::Current,
             directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
+            binding: Some(absolute_binding("validation_records[0]")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -5213,7 +5246,7 @@ mod apply_state_save_tests {
         plan.add(Effect::Create(
             carina_core::resource::ResolvedResource::new(desired.clone()),
         ));
-        let previous_attributes = HashMap::from([(
+        let previous_attributes: HashMap<String, Value> = HashMap::from([(
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("old.example.com".into())),
         )]);
@@ -5283,7 +5316,7 @@ mod apply_state_save_tests {
     #[test]
     fn refresh_current_state_upsert_does_not_phantom_depose_displaced_identifier() {
         let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None)
-            .with_binding("main")
+            .with_test_binding("main")
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -5596,7 +5629,7 @@ mod apply_state_save_tests {
         );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]")
+                .with_test_binding("validation_records[0]")
                 .with_attribute(
                     "name",
                     Value::Concrete(ConcreteValue::String("new.example.com".into())),
@@ -5790,7 +5823,7 @@ mod apply_state_save_tests {
         );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]")
+                .with_test_binding("validation_records[0]")
                 .with_attribute(
                     "password",
                     Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
@@ -5866,7 +5899,7 @@ mod apply_state_save_tests {
         );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]")
+                .with_test_binding("validation_records[0]")
                 .with_attribute(
                     "password",
                     Value::Concrete(ConcreteValue::String("plain-new".into())),
@@ -5946,7 +5979,7 @@ mod apply_state_save_tests {
         );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]")
+                .with_test_binding("validation_records[0]")
                 .with_attribute(
                     "name",
                     Value::Concrete(ConcreteValue::String("new.example.com".into())),
@@ -6136,7 +6169,7 @@ mod apply_state_save_tests {
         );
         assert_eq!(
             deposed.dependency_bindings,
-            BTreeSet::from(["newer".to_string()])
+            BTreeSet::from([absolute_binding("newer")])
         );
     }
 
@@ -6150,7 +6183,7 @@ mod apply_state_save_tests {
         );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]");
+                .with_test_binding("validation_records[0]");
         let applied_state =
             State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
         let current_state = State::existing(
@@ -6384,7 +6417,7 @@ mod apply_state_save_tests {
             .next()
             .expect("create-only diff should produce replacement metadata");
         assert!(replacement.create_before_destroy);
-        let state_blocks: Vec<carina_core::parser::StateBlock> = Vec::new();
+        let state_blocks: Vec<carina_core::parser::ExpandedStateBlock> = Vec::new();
         let state_file_for_wiring = Some(StateFile::new());
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let unresolved_upstreams: HashSet<&str> = HashSet::new();
@@ -6430,7 +6463,9 @@ mod apply_state_save_tests {
                 .expect("fixture identifier is non-empty")
                 .with_attribute("bucket_name", serde_json::json!("old-name"))
                 .with_attribute("comment", persisted_secret.as_json().clone());
-        existing.dependency_bindings.insert("logs".to_string());
+        existing
+            .dependency_bindings
+            .insert(absolute_binding("logs"));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -6537,23 +6572,24 @@ mod apply_state_save_tests {
 #[cfg(test)]
 mod export_writeback_tests {
     use super::*;
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::{ExpandedInferredExportParam, InferredExportParam, TypeExpr};
     use carina_core::resource::{
-        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PartialReadMarker,
+        AuthoredValue, ConcreteValue, DeferredValue, InterpolationPart, PartialReadMarker,
         PendingReRead, UnknownReason, Value,
     };
     use carina_state::{ResourceState, StateFile};
 
-    fn export_param(name: &str, value: Value) -> InferredExportParam {
+    fn export_param(name: &str, value: AuthoredValue) -> ExpandedInferredExportParam {
         InferredExportParam {
             name: name.to_string(),
             type_expr: TypeExpr::Unknown,
             value: Some(value),
         }
+        .resolve_root_for_test()
     }
 
     fn resolve_export_parts(
-        export_params: &[InferredExportParam],
+        export_params: &[ExpandedInferredExportParam],
     ) -> (HashMap<String, PersistedExportValue>, Vec<SkippedExport>) {
         let state = StateFile::new();
         let post_apply_states = PostApplyStates::from_current_and_state(
@@ -6599,15 +6635,16 @@ mod export_writeback_tests {
                 BTreeSet::from(["computed".to_string()]),
             )),
         );
-        row.dependency_bindings = BTreeSet::from(["upstream".to_string()]);
+        row.dependency_bindings = BTreeSet::from([absolute_binding("upstream")]);
         let mut state = StateFile::new();
         state
             .upsert_resource(row)
             .expect("partial-read fixture must be valid");
 
-        let resource =
-            Resource::with_provider("mock", "test.Resource", "main", None).with_binding("instance");
-        let reference = Value::resource_ref("instance", "computed", vec![]);
+        let resource = Resource::with_provider("mock", "test.Resource", "main", None)
+            .with_test_binding("instance");
+        let reference =
+            carina_core::resource::AuthoredValue::resource_ref("instance", "computed", vec![]);
         let export_params = [export_param("computed", reference.clone())];
         let checked = carina_core::validation::check_export_values_pre_apply(
             &export_params,
@@ -6633,7 +6670,7 @@ mod export_writeback_tests {
                 ));
                 assert_eq!(
                     present.state().dependency_bindings,
-                    BTreeSet::from(["upstream".to_string()])
+                    BTreeSet::from([absolute_binding("upstream")])
                 );
             }
             Current::MissingIdentifier(state) => {
@@ -6679,7 +6716,7 @@ mod export_writeback_tests {
             export_param(
                 "target_group_arn",
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: AccessPath::with_fields(
+                    path: carina_core::resource::AuthoredAccessPath::with_fields(
                         "registry_publish",
                         "target_group",
                         vec!["arn".into()],
@@ -6723,7 +6760,7 @@ mod export_writeback_tests {
             export_param(
                 "first_missing",
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: AccessPath::new("first", "id"),
+                    path: carina_core::resource::AuthoredAccessPath::new("first", "id"),
                 }),
             ),
             export_param(
@@ -6733,7 +6770,7 @@ mod export_writeback_tests {
             export_param(
                 "second_missing",
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: AccessPath::new("second", "id"),
+                    path: carina_core::resource::AuthoredAccessPath::new("second", "id"),
                 }),
             ),
         ];
@@ -6757,7 +6794,7 @@ mod export_writeback_tests {
             Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("x".into()),
                 InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
-                    path: AccessPath::new("missing", "value"),
+                    path: carina_core::resource::AuthoredAccessPath::new("missing", "value"),
                 })),
             ])),
         )];
@@ -6780,7 +6817,9 @@ mod export_writeback_tests {
                     Value::Concrete(ConcreteValue::String("-".into())).into(),
                     Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
                         DeferredValue::ResourceRef {
-                            path: AccessPath::new("missing", "value"),
+                            path: carina_core::resource::AuthoredAccessPath::new(
+                                "missing", "value",
+                            ),
                         },
                     )]))
                     .into(),
@@ -6852,7 +6891,8 @@ mod stage4_unknown_err_tests {
     /// silent fallback would re-introduce v1 corruption.
     #[test]
     fn unknown_returns_err_from_persisted_export_encode() {
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()])
+            .resolve_root_for_test();
         let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
             path: path.clone(),
         }));
@@ -6874,7 +6914,8 @@ mod stage4_unknown_err_tests {
     #[test]
     fn resource_ref_returns_unresolved_err() {
         let v = Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
+            path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()])
+                .resolve_root_for_test(),
         });
         let err = PersistedExportValue::encode(&v).unwrap_err();
         assert!(
@@ -6892,7 +6933,7 @@ mod stage4_unknown_err_tests {
     #[test]
     fn coalesce_returns_unresolved_err() {
         let value = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("net", "optional", vec![])),
+            value: Box::new(root_resource_ref("net", "optional", vec![])),
             default: Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))),
         });
         let error = PersistedExportValue::encode(&value).unwrap_err();

@@ -34,7 +34,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::builtins::{BuiltinReturnType, builtin_functions};
 use crate::parser::TypeExpr;
-use crate::resource::{ConcreteValue, DeferredValue, PathSegment, Value};
+use crate::resource::{
+    BindingAddress, ConcreteValue, DeferredValue, PathSegment, RelativeBindingName, Value,
+};
 use crate::schema::{AttrTypeKind, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry};
 
 /// Why inference failed. Carries the rhs description so downstream
@@ -150,14 +152,14 @@ impl std::fmt::Display for InferenceError {
 /// expression on the module's `attributes { ... }` block, instead of
 /// failing with `unknown binding` (#2493).
 #[derive(Debug, Clone)]
-pub enum InferenceBinding {
+pub enum InferenceBinding<B: BindingAddress = RelativeBindingName> {
     Resource {
         provider: String,
         resource_type: String,
     },
     UpstreamState,
     Virtual {
-        attributes: indexmap::IndexMap<String, Value>,
+        attributes: indexmap::IndexMap<String, Value<B>>,
     },
     /// Module-call binding registered before module expansion.
     /// Inference treats it like `UpstreamState` (known-but-non-
@@ -183,12 +185,17 @@ pub enum InferenceBinding {
     },
 }
 
-pub type InferenceBindings = HashMap<String, InferenceBinding>;
+pub type InferenceBindings<B = RelativeBindingName> = HashMap<String, InferenceBinding<B>>;
 
 /// Build an [`InferenceBindings`] map from a `ParsedFile`. Convenience
 /// over [`bindings_from_parts`] for the common case of having a parsed
 /// file in hand.
-pub fn bindings_from_parsed<E>(parsed: &crate::parser::File<E>) -> InferenceBindings {
+pub fn bindings_from_parsed<E>(
+    parsed: &crate::parser::File<E, E::Binding>,
+) -> InferenceBindings<E::Binding>
+where
+    E: crate::parser::ExportParamLike,
+{
     // carina#3181: pass the typed top-level slices directly so
     // `bindings_from_parts` classifies managed resources, data sources,
     // and (post-expansion) composition rows from their own kinds.
@@ -208,9 +215,9 @@ pub fn bindings_from_parsed<E>(parsed: &crate::parser::File<E>) -> InferenceBind
     // takes over and resolves the type properly. #2493.
     for call in &parsed.module_calls {
         if let Some(name) = &call.binding_name
-            && !out.contains_key(name)
+            && !out.contains_key(name.as_str())
         {
-            out.insert(name.clone(), InferenceBinding::ModuleCall);
+            out.insert(name.to_string(), InferenceBinding::ModuleCall);
         }
     }
     for argument in &parsed.arguments {
@@ -247,15 +254,15 @@ pub fn bindings_from_parsed<E>(parsed: &crate::parser::File<E>) -> InferenceBind
 /// instead of degrading to `NonInferableBinding`. Two resource bindings
 /// with the same name likewise remain deterministic here while the loader
 /// diagnostic reports the collision to the user.
-pub fn bindings_from_parts(
-    resources: &[crate::resource::Resource],
-    data_sources: &[crate::resource::DataSource],
-    compositions: &[crate::resource::LiveComposition],
-    upstream_states: &[crate::parser::UpstreamState],
-) -> InferenceBindings {
+pub fn bindings_from_parts<S, B: BindingAddress>(
+    resources: &[crate::resource::Resource<S, B>],
+    data_sources: &[crate::resource::DataSource<S, B>],
+    compositions: &[crate::resource::LiveComposition<B>],
+    upstream_states: &[crate::parser::UpstreamState<B>],
+) -> InferenceBindings<B> {
     let mut out = InferenceBindings::new();
     for us in upstream_states {
-        out.insert(us.binding.clone(), InferenceBinding::UpstreamState);
+        out.insert(us.binding.to_string(), InferenceBinding::UpstreamState);
     }
     // carina#3181: managed resources and data sources both carry a
     // provider identity, so each maps to `InferenceBinding::Resource`
@@ -271,7 +278,7 @@ pub fn bindings_from_parts(
             continue;
         };
         out.insert(
-            name.clone(),
+            name.to_string(),
             InferenceBinding::Resource {
                 provider: resource.id.provider.clone(),
                 resource_type: resource.id.resource_type.clone(),
@@ -283,7 +290,7 @@ pub fn bindings_from_parts(
             continue;
         };
         out.insert(
-            name.clone(),
+            name.to_string(),
             InferenceBinding::Resource {
                 provider: data_source.id.provider.clone(),
                 resource_type: data_source.id.resource_type.clone(),
@@ -295,7 +302,7 @@ pub fn bindings_from_parts(
             continue;
         };
         out.insert(
-            name.clone(),
+            name.to_string(),
             InferenceBinding::Virtual {
                 attributes: composition
                     .signature
@@ -330,10 +337,10 @@ pub fn bindings_from_parts(
 /// `infer_type_expr` is a thin convenience over [`infer_type_from_value`]
 /// that resolves the explicit-annotation-wins precedence in one place
 /// so consumers don't reimplement it.
-pub fn infer_type_expr(
+pub fn infer_type_expr<B: BindingAddress>(
     declared: Option<&TypeExpr>,
-    value: Option<&Value>,
-    bindings: &InferenceBindings,
+    value: Option<&Value<B>>,
+    bindings: &InferenceBindings<B>,
     schemas: &SchemaRegistry,
 ) -> Result<Option<TypeExpr>, InferenceError> {
     if let Some(ty) = declared {
@@ -364,9 +371,9 @@ pub fn infer_type_expr(
 /// expected to either fall back to a user-supplied annotation or
 /// surface the error as "type annotation required" at the offending
 /// field.
-pub fn infer_type_from_value(
-    value: &Value,
-    bindings: &InferenceBindings,
+pub fn infer_type_from_value<B: BindingAddress>(
+    value: &Value<B>,
+    bindings: &InferenceBindings<B>,
     schemas: &SchemaRegistry,
 ) -> Result<TypeExpr, InferenceError> {
     let mut visiting = indexmap::IndexSet::new();
@@ -379,11 +386,11 @@ pub fn infer_type_from_value(
 /// remain unknown, while literals and computed values whose return shape is
 /// intrinsic (for example `split(...)[0]`) can still be checked. Callers use
 /// this instead of manufacturing empty binding/schema registries.
-pub(crate) fn infer_type_from_value_without_bindings(
-    value: &Value,
+pub(crate) fn infer_type_from_value_without_bindings<B: BindingAddress>(
+    value: &Value<B>,
 ) -> Result<TypeExpr, InferenceError> {
-    fn infer_collection_without_bindings<'a>(
-        values: impl IntoIterator<Item = &'a Value>,
+    fn infer_collection_without_bindings<'a, B: BindingAddress + 'a>(
+        values: impl IntoIterator<Item = &'a Value<B>>,
         wrap: impl FnOnce(Box<TypeExpr>) -> TypeExpr,
     ) -> Result<TypeExpr, InferenceError> {
         let mut values = values.into_iter();
@@ -517,9 +524,9 @@ pub(crate) fn infer_type_from_value_without_bindings(
 /// `Virtual` recursion returns, so unrelated sibling traversals (two
 /// list elements that each resolve through different `Virtual`
 /// bindings) do not see each other.
-fn infer_type_from_value_with_visiting(
-    value: &Value,
-    bindings: &InferenceBindings,
+fn infer_type_from_value_with_visiting<B: BindingAddress>(
+    value: &Value<B>,
+    bindings: &InferenceBindings<B>,
     schemas: &SchemaRegistry,
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceError> {
@@ -637,16 +644,17 @@ fn infer_type_from_value_with_visiting(
     }
 }
 
-fn infer_collection<'a, I, F>(
+fn infer_collection<'a, I, F, B>(
     items: I,
-    bindings: &InferenceBindings,
+    bindings: &InferenceBindings<B>,
     schemas: &SchemaRegistry,
     visiting: &mut indexmap::IndexSet<String>,
     wrap: F,
 ) -> Result<TypeExpr, InferenceError>
 where
-    I: IntoIterator<Item = &'a Value>,
+    I: IntoIterator<Item = &'a Value<B>>,
     F: FnOnce(Box<TypeExpr>) -> TypeExpr,
+    B: BindingAddress + 'a,
 {
     // All-or-nothing: every element must infer cleanly and to the
     // same type. Tolerating dynamic siblings ("the concrete one
@@ -679,11 +687,11 @@ where
     Ok(wrap(Box::new(first)))
 }
 
-fn infer_resource_ref_with_visiting(
+fn infer_resource_ref_with_visiting<B: BindingAddress>(
     binding: &str,
     attribute: &str,
     segments: &[crate::resource::PathSegment],
-    bindings: &InferenceBindings,
+    bindings: &InferenceBindings<B>,
     schemas: &SchemaRegistry,
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceError> {
@@ -982,10 +990,10 @@ pub(super) fn attribute_type_to_type_expr(
     }
 }
 
-fn infer_function_call(
+fn infer_function_call<B: BindingAddress>(
     name: &str,
-    args: &[crate::resource::FunctionArgument],
-    bindings: &InferenceBindings,
+    args: &[crate::resource::FunctionArgument<B>],
+    bindings: &InferenceBindings<B>,
     schemas: &SchemaRegistry,
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceError> {
@@ -1054,10 +1062,13 @@ fn infer_function_call(
 /// sentinel-over-exclude shape prevents cascading "missing export"
 /// diagnostics; the inference error is the single point of truth for
 /// "this needs an annotation".
-pub fn apply_inference(
-    parsed: crate::parser::ParsedFile,
+pub fn apply_inference<B: BindingAddress>(
+    parsed: crate::parser::File<crate::parser::ParsedExportParam<B>, B>,
     schemas: &SchemaRegistry,
-) -> (crate::parser::InferredFile, Vec<ExportInferenceError>) {
+) -> (
+    crate::parser::File<crate::parser::InferredExportParam<B>, B>,
+    Vec<ExportInferenceError>,
+) {
     let (inferred_exports, errors) = infer_export_params(&parsed, schemas);
     // Single phase-axis surface (carina#3126): only `export_params`
     // changes phase; every other field moves through `map_export_params`
@@ -1072,16 +1083,16 @@ pub fn apply_inference(
 /// non-export field; consumers that only need the export-side typecheck
 /// (LSP diagnostics, in particular) should use this instead to avoid
 /// the per-keystroke deep-clone.
-pub fn infer_export_params(
-    parsed: &crate::parser::ParsedFile,
+pub fn infer_export_params<B: BindingAddress>(
+    parsed: &crate::parser::File<crate::parser::ParsedExportParam<B>, B>,
     schemas: &SchemaRegistry,
 ) -> (
-    Vec<crate::parser::InferredExportParam>,
+    Vec<crate::parser::InferredExportParam<B>>,
     Vec<ExportInferenceError>,
 ) {
     let bindings = bindings_from_parsed(parsed);
     let mut errors = Vec::new();
-    let inferred_exports: Vec<crate::parser::InferredExportParam> = parsed
+    let inferred_exports: Vec<crate::parser::InferredExportParam<B>> = parsed
         .export_params
         .iter()
         .enumerate()
@@ -1138,8 +1149,8 @@ pub fn infer_export_params(
 /// [`crate::validation::validate_export_param_ref_types_with_bindings`]. The
 /// LSP runs inference post-expansion and may report the same class through its
 /// `Virtual` binding instead; index suppression gives both paths one diagnostic.
-pub fn retry_unknown_export_inference(
-    parsed: &crate::parser::InferredFile,
+pub fn retry_unknown_export_inference<B: BindingAddress>(
+    parsed: &crate::parser::File<crate::parser::InferredExportParam<B>, B>,
     schemas: &SchemaRegistry,
     prior_errors: &[ExportInferenceError],
 ) -> Vec<ExportInferenceError> {
@@ -1184,13 +1195,17 @@ pub fn format_inference_error(name: &str, err: &InferenceError) -> String {
 mod tests {
     use super::*;
     use crate::parser::ModuleCall;
-    use crate::resource::AccessPath;
+    use crate::resource::{
+        AuthoredAccessPath as AccessPath, AuthoredConcreteValue as ConcreteValue,
+        AuthoredDeferredValue as DeferredValue, AuthoredInterpolationPart as InterpolationPart,
+        AuthoredUnknownReason as UnknownReason, AuthoredValue as Value,
+    };
     use crate::schema::{
         AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
         legacy_validator,
     };
 
-    fn noop(_v: &Value) -> Result<(), String> {
+    fn noop(_v: &crate::resource::ExpandedValue) -> Result<(), String> {
         Ok(())
     }
 
@@ -1273,7 +1288,6 @@ mod tests {
     fn interpolation_inferred_as_string() {
         // Build an Interpolation. The inner shape doesn't matter — the
         // result is always String. Use one literal part.
-        use crate::resource::InterpolationPart;
         let r = infer_type_from_value(
             &Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("hello".into()),
@@ -1644,9 +1658,7 @@ mod tests {
 
     #[test]
     fn postfix_access_on_unknown_base_keeps_type_unknown() {
-        use crate::resource::{
-            AccessMissPolicy, PathSegment, Subscript, UnknownReason, apply_postfix_access,
-        };
+        use crate::resource::{AccessMissPolicy, PathSegment, Subscript, apply_postfix_access};
 
         let value = apply_postfix_access(
             Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
@@ -1803,10 +1815,11 @@ mod tests {
         // resource wins, so `x.attr` infers precisely instead of
         // degrading to `NonInferableBinding`.
         use crate::parser::UpstreamState;
-        use crate::resource::Resource;
-        let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None).with_binding("x");
-        let upstream = UpstreamState {
-            binding: "x".to_string(),
+        use crate::resource::AuthoredResource as Resource;
+        let resource: Resource =
+            Resource::with_provider("awscc", "ec2.Vpc", "main", None).with_binding("x");
+        let upstream: UpstreamState = UpstreamState {
+            binding: "x".into(),
             source: std::path::PathBuf::from("../other"),
         };
         let bindings = bindings_from_parts(&[resource], &[], &[], &[upstream]);
@@ -1819,11 +1832,12 @@ mod tests {
     #[test]
     fn bindings_from_parts_collects_pure_upstream_state() {
         use crate::parser::UpstreamState;
-        let upstream = UpstreamState {
-            binding: "network".to_string(),
+        let upstream: UpstreamState = UpstreamState {
+            binding: "network".into(),
             source: std::path::PathBuf::from("../network"),
         };
-        let bindings = bindings_from_parts(&[], &[], &[], &[upstream]);
+        let bindings =
+            bindings_from_parts::<crate::resource::ModuleSource, _>(&[], &[], &[], &[upstream]);
         assert!(matches!(
             bindings.get("network"),
             Some(InferenceBinding::UpstreamState)
@@ -2083,11 +2097,13 @@ mod tests {
         // `vpc_id` here stands in for the module-exposed attribute that
         // points at the inner role's schema attribute. carina#3181:
         // compositions are a distinct typestate in `compositions`.
-        let mut virt_attrs: indexmap::IndexMap<String, crate::resource::LiveCompositionAttribute> =
-            indexmap::IndexMap::new();
+        let mut virt_attrs: indexmap::IndexMap<
+            String,
+            crate::resource::AuthoredLiveCompositionAttribute,
+        > = indexmap::IndexMap::new();
         virt_attrs.insert(
             "role_id".to_string(),
-            crate::resource::LiveCompositionAttribute::from_value(
+            crate::resource::AuthoredLiveCompositionAttribute::from_value(
                 Value::resource_ref(
                     "github_actions_carina.role".to_string(),
                     "vpc_id".to_string(),
@@ -2096,7 +2112,7 @@ mod tests {
                 None,
             ),
         );
-        let virt = crate::resource::LiveComposition {
+        let virt: crate::resource::AuthoredLiveComposition = crate::resource::LiveComposition {
             id: crate::resource::ResolvedResourceId::new(
                 crate::resource::ResourceId::with_identity("_virtual", "github_actions_carina"),
             ),
@@ -2105,11 +2121,21 @@ mod tests {
                 attributes: virt_attrs,
                 pending_constraints: Vec::new(),
             },
-            binding: Some("github_actions_carina".to_string()),
+            binding: Some("github_actions_carina".into()),
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "github_module".to_string(),
             instance: "github_actions_carina".to_string(),
-            call_path: Default::default(),
+            call_path: crate::resource::AuthoredCompositionCallPath::direct(
+                crate::resource::AuthoredCompositionCall {
+                    id: crate::parser::ModuleCallId::test_dummy_in("inference.crn"),
+                    module_name: "github_module".to_string(),
+                    binding: Some("github_actions_carina".into()),
+                    instance: "github_actions_carina".to_string(),
+                    module_source: None,
+                    module_directory: None,
+                    loop_origin: None,
+                },
+            ),
             quoted_string_attrs: std::collections::HashSet::new(),
         };
         parsed.compositions.push(virt); // allow: direct — fixture test inspection

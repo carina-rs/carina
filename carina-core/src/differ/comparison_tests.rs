@@ -2,7 +2,11 @@ use super::comparison::SavedAttr;
 use super::{create_plan_for_tests as create_plan, *};
 
 use crate::explicit::ExplicitFields;
-use crate::resource::{CanonicalEnumValue, ConcreteValue, DeferredValue, Value, ValueString};
+use crate::resource::{
+    CanonicalEnumValue, ExpandedConcreteValue as ConcreteValue,
+    ExpandedDeferredValue as DeferredValue, ExpandedResource as Resource, ExpandedValue as Value,
+    ValueString,
+};
 use crate::schema::{ResourceSchema, TypeIdentity};
 use crate::value::value_to_json;
 use indexmap::IndexMap;

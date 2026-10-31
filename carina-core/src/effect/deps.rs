@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::effect::{Effect, EffectInstanceKey, ScheduleEdge};
 use crate::non_empty::NonEmptyVec;
 use crate::parser::ResourceRef;
-use crate::resource::{Resource, ResourceId, ResourceIdentity};
+use crate::resource::{AbsoluteBindingAddress, Resource, ResourceId, ResourceIdentity};
 
 #[derive(Debug, Clone)]
 pub struct UnresolvedResource<S = crate::resource::ModuleSource>(Resource<S>);
@@ -37,10 +37,10 @@ pub enum ScheduleInputs<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DestroyWaitAlias {
-    pub binding: String,
-    pub target_binding: String,
-    pub explicit_dependencies: HashSet<String>,
-    pub consumers: NonEmptyVec<String>,
+    pub binding: AbsoluteBindingAddress,
+    pub target_binding: AbsoluteBindingAddress,
+    pub explicit_dependencies: HashSet<AbsoluteBindingAddress>,
+    pub consumers: NonEmptyVec<ResourceIdentity>,
 }
 
 impl DestroyWaitAlias {
@@ -50,10 +50,10 @@ impl DestroyWaitAlias {
     /// consumers carries no scheduling information, so callers should
     /// drop it rather than treat the `None` as an error.
     pub fn new(
-        binding: String,
-        target_binding: String,
-        explicit_dependencies: HashSet<String>,
-        consumers: Vec<String>,
+        binding: AbsoluteBindingAddress,
+        target_binding: AbsoluteBindingAddress,
+        explicit_dependencies: HashSet<AbsoluteBindingAddress>,
+        consumers: Vec<ResourceIdentity>,
     ) -> Option<Self> {
         Some(Self {
             binding,
@@ -65,23 +65,17 @@ impl DestroyWaitAlias {
 
     fn destroy_edges(&self) -> Vec<ScheduleEdge> {
         let mut edges = vec![ScheduleEdge::BlockedBy(ResourceIdentity::new(
-            self.target_binding.clone(),
+            self.target_binding.to_string(),
         ))];
         edges.extend(
             self.explicit_dependencies
                 .iter()
-                .filter(|dependency| dependency.as_str() != self.target_binding)
-                .cloned()
+                .filter(|dependency| dependency.as_str() != self.target_binding.as_str())
+                .map(ToString::to_string)
                 .map(ResourceIdentity::new)
                 .map(ScheduleEdge::BlockedBy),
         );
-        edges.extend(
-            self.consumers
-                .iter()
-                .cloned()
-                .map(ResourceIdentity::new)
-                .map(ScheduleEdge::DependsOn),
-        );
+        edges.extend(self.consumers.iter().cloned().map(ScheduleEdge::DependsOn));
         edges
     }
 }
@@ -435,7 +429,7 @@ impl<'a> DependencyAnalyzer<'a> {
 
     fn collect_from_resource_ref<S>(
         &self,
-        resource: ResourceRef<'_, S>,
+        resource: ResourceRef<'_, S, AbsoluteBindingAddress>,
         analysis: &mut DependencyAnalysis,
         child: usize,
     ) {
@@ -453,17 +447,17 @@ impl<'a> DependencyAnalyzer<'a> {
             });
             value.visit_binding_refs(&mut |binding| {
                 bindings_seen_in_values.insert(binding.to_string());
-                self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
+                self.record_binding_edge(binding.as_str(), ReadsSet::unknown(), analysis, child);
             });
         }
         for binding in resource.dependency_bindings() {
-            if !bindings_seen_in_values.contains(binding) {
-                self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
+            if !bindings_seen_in_values.contains(binding.as_str()) {
+                self.record_binding_edge(binding.as_str(), ReadsSet::unknown(), analysis, child);
             }
         }
         if let Some(directives) = resource.directives() {
             for binding in &directives.depends_on {
-                self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
+                self.record_binding_edge(binding.as_str(), ReadsSet::unknown(), analysis, child);
             }
         }
     }
@@ -749,7 +743,18 @@ pub fn relax_update_update_edges<S, E: AsRef<Effect<S>>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{ResolvedResource, ResolvedResourceId, ResourceIdentity, State, Value};
+    use crate::resource::{
+        AuthoredValue, ExpandedResource as Resource, ExpandedValue as Value, RelativeBindingName,
+        ResolvedResource, ResolvedResourceId, ResourceIdentity, RootScope, State,
+    };
+
+    fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
+        RootScope::new().resolve(RelativeBindingName::new(name))
+    }
+
+    fn root_resource_ref(binding: &str, attribute: &str) -> Value {
+        AuthoredValue::resource_ref(binding, attribute, Vec::new()).resolve_root(&RootScope::new())
+    }
 
     fn state_for(id: &ResourceId) -> State {
         State::existing(id.clone(), Default::default())
@@ -757,13 +762,10 @@ mod tests {
     }
 
     fn update_effect(binding: &'static str, refs: &[(&str, &str)], changed: &[&str]) -> Effect {
-        let mut resource = Resource::new("test", binding);
-        resource.binding = Some(binding.to_string());
+        let mut resource: Resource = Resource::new("test", binding);
+        resource.binding = Some(absolute_binding(binding));
         for (dep, attr) in refs {
-            resource.set_attr(
-                format!("{}_{}", dep, attr),
-                Value::resource_ref((*dep).to_string(), (*attr).to_string(), vec![]),
-            );
+            resource.set_attr(format!("{}_{}", dep, attr), root_resource_ref(dep, attr));
         }
         Effect::Update {
             identifier: crate::effect::fixture_applied_identifier(
@@ -776,8 +778,8 @@ mod tests {
     }
 
     fn create_effect(binding: &'static str) -> Effect {
-        let mut resource = Resource::new("test", binding);
-        resource.binding = Some(binding.to_string());
+        let mut resource: Resource = Resource::new("test", binding);
+        resource.binding = Some(absolute_binding(binding));
         Effect::Create(ResolvedResource::new(resource))
     }
 
@@ -791,10 +793,10 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(format!("{identity}-id")),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some(identity.to_string()),
+            binding: Some(absolute_binding(identity)),
             dependencies: dependencies
                 .iter()
-                .map(|dependency| (*dependency).to_string())
+                .map(|dependency| absolute_binding(dependency))
                 .collect(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: blocked_by_updates
@@ -844,8 +846,8 @@ mod tests {
 
     #[test]
     fn effect_identity_returns_let_binding_for_named_effect() {
-        let mut resource = Resource::new("test", "named");
-        resource.binding = Some("named".to_string());
+        let mut resource: Resource = Resource::new("test", "named");
+        resource.binding = Some(absolute_binding("named"));
         let effect = Effect::Create(ResolvedResource::new(resource));
 
         assert_eq!(effect.identity(), ResourceIdentity::new("named"));
@@ -863,8 +865,8 @@ mod tests {
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         };
-        let mut named_resource = Resource::new("test", "named");
-        named_resource.binding = Some("named".to_string());
+        let mut named_resource: Resource = Resource::new("test", "named");
+        named_resource.binding = Some(absolute_binding("named"));
         let named = Effect::Create(ResolvedResource::new(named_resource));
 
         assert_eq!(anonymous.identity(), ResourceIdentity::new("anon_1234"));
@@ -1063,7 +1065,7 @@ mod tests {
 
     #[test]
     fn blocked_by_if_delete_resolves_anonymous_delete_through_identity_index() {
-        let delete = Effect::Delete {
+        let delete: Effect = Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", "foo")),
             identifier: crate::effect::fixture_applied_identifier("foo-id"),
             generation: crate::effect::EffectGeneration::Current,
@@ -1074,7 +1076,7 @@ mod tests {
             blocked_by_updates: HashSet::new(),
         };
         let mut blocker_resource = Resource::new("test", "blocker");
-        blocker_resource.binding = Some("blocker".to_string());
+        blocker_resource.binding = Some(absolute_binding("blocker"));
         let blocker = Effect::Create(ResolvedResource::new(blocker_resource));
         let effects = vec![delete, blocker];
         let mut foo_targets = IdentityTargets::default();
@@ -1102,7 +1104,7 @@ mod tests {
 
     #[test]
     fn string_ref_resolves_to_anonymous_delete_via_identity_match() {
-        let delete = Effect::Delete {
+        let delete: Effect = Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", "foo")),
             identifier: crate::effect::fixture_applied_identifier("foo-id"),
             generation: crate::effect::EffectGeneration::Current,
@@ -1113,10 +1115,10 @@ mod tests {
             blocked_by_updates: HashSet::new(),
         };
         let mut consumer_resource = Resource::new("test", "consumer");
-        consumer_resource.binding = Some("consumer".to_string());
+        consumer_resource.binding = Some(absolute_binding("consumer"));
         consumer_resource
             .dependency_bindings
-            .insert("foo".to_string());
+            .insert(absolute_binding("foo"));
         let consumer = Effect::Create(ResolvedResource::new(consumer_resource));
 
         let deps = build_effect_dependency_analysis(
@@ -1143,7 +1145,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier("parent-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some("parent".to_string()),
+            binding: Some(absolute_binding("parent")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -1155,8 +1157,8 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier("child-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some("child".to_string()),
-            dependencies: HashSet::from(["parent".to_string()]),
+            binding: Some(absolute_binding("child")),
+            dependencies: HashSet::from([absolute_binding("parent")]),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         };
@@ -1181,7 +1183,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier("cert-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some("cert".to_string()),
+            binding: Some(absolute_binding("cert")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -1193,16 +1195,16 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier("listener-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some("listener".to_string()),
-            dependencies: HashSet::from(["cert_issued".to_string()]),
+            binding: Some(absolute_binding("listener")),
+            dependencies: HashSet::from([absolute_binding("cert_issued")]),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         };
         let wait = DestroyWaitAlias::new(
-            "cert_issued".to_string(),
-            "cert".to_string(),
+            absolute_binding("cert_issued"),
+            absolute_binding("cert"),
             HashSet::new(),
-            vec!["listener".to_string()],
+            vec![ResourceIdentity::new("listener")],
         )
         .expect("test alias has a consumer");
         let effects = vec![cert, listener];
@@ -1225,10 +1227,10 @@ mod tests {
         let cert = delete_effect("cert", &[], &[]);
         let listener = deposed_delete_effect("listener", &["cert_issued"]);
         let wait = DestroyWaitAlias::new(
-            "cert_issued".to_string(),
-            "cert".to_string(),
+            absolute_binding("cert_issued"),
+            absolute_binding("cert"),
             HashSet::new(),
-            vec!["listener".to_string()],
+            vec![ResourceIdentity::new("listener")],
         )
         .expect("test alias has a deposed consumer");
         let effects = vec![cert, listener];
@@ -1257,10 +1259,10 @@ mod tests {
         let cert = deposed_delete_effect("cert", &[]);
         let listener = delete_effect("listener", &["cert_issued"], &[]);
         let wait = DestroyWaitAlias::new(
-            "cert_issued".to_string(),
-            "cert".to_string(),
+            absolute_binding("cert_issued"),
+            absolute_binding("cert"),
             HashSet::new(),
-            vec!["listener".to_string()],
+            vec![ResourceIdentity::new("listener")],
         )
         .expect("test alias has a consumer");
         let effects = vec![cert, listener];
@@ -1283,7 +1285,15 @@ mod tests {
 
     #[test]
     fn destroy_wait_alias_rejects_empty_consumers() {
-        assert!(DestroyWaitAlias::new("w".into(), "t".into(), HashSet::new(), vec![]).is_none());
+        assert!(
+            DestroyWaitAlias::new(
+                absolute_binding("w"),
+                absolute_binding("t"),
+                HashSet::new(),
+                vec![],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1295,8 +1305,8 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier("listener-id"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some("listener".to_string()),
-            dependencies: HashSet::from(["missing_wait".to_string()]),
+            binding: Some(absolute_binding("listener")),
+            dependencies: HashSet::from([absolute_binding("missing_wait")]),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         };
@@ -1321,7 +1331,7 @@ mod tests {
                 crate::resource::DeposedKey::new_unique(),
             ),
             directives: Default::default(),
-            binding: Some("thing".to_string()),
+            binding: Some(absolute_binding("thing")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),

@@ -1,7 +1,7 @@
 use super::*;
 use crate::backend::document_end_position;
 use carina_core::parser::TypeExpr;
-use carina_core::resource::Value;
+use carina_core::resource::AuthoredValue as Value;
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 
 const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is derived from \
@@ -5729,7 +5729,9 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
         let call = CompositionCall {
             id: parsed.module_calls[0].id().clone(),
             module_name: "missing".to_string(),
-            binding: Some(call_binding.to_string()),
+            binding: Some(carina_core::resource::absolute_binding_address_for_test(
+                call_binding,
+            )),
             instance: call_binding.to_string(),
             module_source: Some("../missing".to_string()),
             module_directory: None,
@@ -5744,7 +5746,9 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
                 attributes: IndexMap::new(),
                 pending_constraints: Vec::new(),
             },
-            binding: Some(binding.to_string()),
+            binding: Some(carina_core::resource::absolute_binding_address_for_test(
+                binding,
+            )),
             dependency_bindings: Default::default(),
             module_name: "missing".to_string(),
             instance: call_binding.to_string(),
@@ -5760,7 +5764,8 @@ let first = unrelated { }
 "#,
     );
     let parsed = doc.parsed().expect("fixture must parse");
-    let mut binding_input = parsed.clone();
+    let mut binding_input =
+        carina_core::module_resolver::expand_root_directory_file(parsed.clone());
 
     let mut source = composition("source", "missing-source-call");
     source.signature.attributes.insert(
@@ -5774,7 +5779,7 @@ let first = unrelated { }
     consumer.signature.arguments.insert(
         "vpc_id".to_string(),
         LiveCompositionArgument::from_value(
-            Value::resource_ref("source", "missing", vec![]),
+            Value::resource_ref("source", "missing", vec![]).resolve_root_for_test(),
             schema_type("ec2.Vpc"),
             ArgumentOrigin::Defaulted,
         ),

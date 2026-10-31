@@ -15,9 +15,15 @@ use indexmap::IndexMap;
 use crate::binding_index::ResolvedBindings;
 use crate::resolver::{ValueResolution, resolve_ref_value_status};
 use crate::resource::{
-    ConcreteValue, DeferredValue, LiveComposition, LiveCompositionSignature, Resource, ResourceId,
-    State, Value,
+    AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
+    ExpandedDeferredValue as DeferredValue, ExpandedLiveComposition as LiveComposition,
+    ExpandedLiveCompositionSignature as LiveCompositionSignature, ExpandedResource as Resource,
+    ExpandedValue as Value, RelativeBindingName, ResourceId, RootScope, State,
 };
+
+fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
+    RootScope::new().resolve(RelativeBindingName::new(binding))
+}
 
 fn s(s: &str) -> Value {
     Value::Concrete(ConcreteValue::String(s.into()))
@@ -33,7 +39,7 @@ fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
         attributes,
         directives: Default::default(),
         prefixes: HashMap::new(),
-        binding: Some(binding.into()),
+        binding: Some(absolute_binding(binding)),
         dependency_bindings: BTreeSet::new(),
         module_source: None,
         default_tag_keys: Default::default(),
@@ -61,7 +67,7 @@ fn make_virtual(binding: &'static str, attrs: &[(&str, Value)]) -> LiveCompositi
             attributes,
             pending_constraints: Vec::new(),
         },
-        binding: Some(binding.into()),
+        binding: Some(absolute_binding(binding)),
         dependency_bindings: BTreeSet::new(),
         module_name: "m".into(),
         instance: binding.into(),
@@ -142,7 +148,7 @@ fn pre_apply_composition_is_complete_for_coalesce_absence() {
     });
     let fallback = s("fallback");
     let expression = Value::Deferred(DeferredValue::Coalesce {
-        value: Box::new(Value::resource_ref("module", "missing", Vec::new())),
+        value: Box::new(Value::root_resource_ref("module", "missing", Vec::new())),
         default: Box::new(fallback.clone()),
     });
 

@@ -18,6 +18,14 @@ use carina_core::resource::{
 use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
+fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(name)
+}
+
+fn root_resource_ref(binding: &str, attribute: &str) -> Value {
+    Value::resource_ref(binding, attribute, Vec::new()).resolve_root_for_test()
+}
+
 #[test]
 fn saved_plan_validation_ready_constructor_is_unit_typed() {
     let ready: ValidationReady<()> = ValidationReady::from_saved_plan_artifact();
@@ -250,7 +258,7 @@ fn raw_enum_state_file() -> StateFile {
         carina_state::state::ResourceState::try_applied("thing", "item", "test", "provider-id")
             .expect("raw enum test identifier is non-empty")
             .with_attribute("mode", serde_json::json!("Allow"));
-    row.binding = Some("item".to_string());
+    row.binding = Some(absolute_binding("item"));
     let mut state = StateFile::new();
     state
         .upsert_resource(row)
@@ -274,7 +282,7 @@ let item = test.thing {
     let provider_configs = resolved_provider_configs(&parsed);
 
     for refresh in [true, false] {
-        let wiring = ValidatedWiring::from_factories_for_test(
+        let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
             vec![Box::new(RawEnumStateFactory)],
             provider_configs.as_provider_configs(),
         );
@@ -353,10 +361,10 @@ query {}
     std::fs::write(&root_file, &root_body).unwrap();
 
     let config = carina_core::parser::ProviderContext::default();
-    let mut parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
+    let parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
         .expect("root fixture must parse");
-    carina_core::module_resolver::resolve_modules_with_config(
-        &mut parsed,
+    let parsed = carina_core::module_resolver::resolve_modules_with_config(
+        parsed,
         &root_dir,
         &config,
         &SchemaRegistry::new(),
@@ -442,10 +450,10 @@ outer {{}}
     std::fs::write(&root_file, &root_body).unwrap();
 
     let config = carina_core::parser::ProviderContext::default();
-    let mut parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
+    let parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
         .expect("root fixture must parse");
-    carina_core::module_resolver::resolve_modules_with_config(
-        &mut parsed,
+    let parsed = carina_core::module_resolver::resolve_modules_with_config(
+        parsed,
         &root_dir,
         &config,
         &SchemaRegistry::new(),
@@ -547,7 +555,7 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
 
 #[test]
 fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors() {
-    let provider = ProviderConfig {
+    let provider: ProviderConfig = ProviderConfig {
         name: "broken".to_string(),
         source: Some("file:///definitely-missing/broken.wasm".parse().unwrap()),
         version: None,
@@ -590,7 +598,7 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
 fn hard_reporting_load_returns_schema_only_diagnostics() {
     let user_dirs = carina_core::TestUserDirs::new();
     let base = tempfile::tempdir().unwrap();
-    let provider = ProviderConfig {
+    let provider: ProviderConfig = ProviderConfig {
         name: "mock".to_string(),
         source: Some("file:///definitely-missing/mock.wasm".parse().unwrap()),
         version: None,
@@ -627,7 +635,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
     std::fs::write(&source_path, b"mock fixture").unwrap();
     std::fs::write(&installed_path, b"mock fixture").unwrap();
-    let config = ProviderConfig {
+    let config: ProviderConfig = ProviderConfig {
         name: "aws".into(),
         source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
         version: None,
@@ -643,7 +651,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     let called = Arc::clone(&loader_called);
     let (factories, errors) = build_factories_from_providers_impl_using(
         &user_dirs,
-        &[],
+        &[] as &[ProviderConfig],
         tmp.path(),
         false,
         &invalid,
@@ -733,7 +741,7 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
     std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
     std::fs::write(&source_path, b"duplicate fixture").unwrap();
     std::fs::write(&installed_path, b"duplicate fixture").unwrap();
-    let config = ProviderConfig {
+    let config: ProviderConfig = ProviderConfig {
         name: "duplicate".into(),
         source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
         version: None,
@@ -818,8 +826,9 @@ fn first_provider_load_surfaces_invalid_trusted_local_inputs() {
 fn parse(
     input: &str,
     config: &carina_core::parser::ProviderContext,
-) -> Result<carina_core::parser::ParsedFile, carina_core::parser::ParseError> {
+) -> Result<carina_core::parser::ExpandedParsedFile, carina_core::parser::ParseError> {
     carina_core::parser::parse_file(input, std::path::Path::new("wiring_test.crn"), config)
+        .map(|parsed| parsed.resolve_root_for_test())
 }
 
 fn pathless_test_type(attr_type: AttributeType) -> carina_core::schema::RootlessType {
@@ -872,15 +881,11 @@ fn test_data_source_values(
 fn canonical_unresolved(
     resources: Vec<Resource>,
     schemas: &SchemaRegistry,
-) -> CanonicalResourcePair<carina_core::parser::ParsedExportParam> {
-    let mut unresolved = carina_core::parser::ParsedFile::default();
+) -> CanonicalResourcePair<carina_core::parser::ExpandedParsedExportParam> {
+    let mut unresolved = carina_core::parser::ExpandedParsedFile::default();
     unresolved.resources = resources;
-    resolve_config_block_names_for_test(
-        unresolved.clone(),
-        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
-        schemas,
-    )
-    .expect("test block-name resolution must succeed")
+    resolve_expanded_config_block_names_for_test(unresolved.clone(), unresolved, schemas)
+        .expect("test block-name resolution must succeed")
 }
 
 const TEST_COMMIT_SHA: &str = "abcdef0123456789abcdef0123456789abcdef01";
@@ -895,22 +900,18 @@ fn test_artifact_id(value: u64) -> carina_provider_resolver::ArtifactId {
 }
 
 fn canonical_pair<E: Clone>(
-    evaluated: &carina_core::parser::File<E>,
+    evaluated: &carina_core::parser::File<E, carina_core::resource::AbsoluteBindingAddress>,
     unresolved_resources: Vec<Resource>,
     schemas: &SchemaRegistry,
 ) -> CanonicalResourcePair<E> {
-    let mut unresolved = carina_core::parser::ParsedFile::default();
+    let mut unresolved = evaluated.clone();
     unresolved.resources = unresolved_resources;
-    resolve_config_block_names_for_test(
-        evaluated.clone(),
-        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
-        schemas,
-    )
-    .expect("test block-name resolution must succeed")
+    resolve_expanded_config_block_names_for_test(evaluated.clone(), unresolved, schemas)
+        .expect("test block-name resolution must succeed")
 }
 
 fn build_override_aware_pair_for_test(
-    unresolved: CanonicalResourcePair<carina_core::parser::ParsedExportParam>,
+    unresolved: CanonicalResourcePair<carina_core::parser::ExpandedParsedExportParam>,
     state_file: Option<&StateFile>,
     inputs: LivePreApplyInputs<'_>,
 ) -> Result<(OverrideAwareResources, OverrideAwareResources), String> {
@@ -925,7 +926,7 @@ fn build_override_aware_pair_for_test(
 }
 
 fn resolved_provider_configs<E>(
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::File<E, carina_core::resource::AbsoluteBindingAddress>,
 ) -> carina_core::parser::ResolvedProviderConfigs {
     resolved_provider_configs_with_remote(parsed, &HashMap::new())
 }
@@ -1012,7 +1013,7 @@ async fn shared_desired_pipeline_runs_host_default_tag_normalization() {
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("test-only-default-tag-secret".into()),
     ))));
-    let provider_config = ProviderConfig {
+    let provider_config: carina_core::parser::ExpandedProviderConfig = ProviderConfig {
         name: BUILTIN_PROVIDER_NAME.to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::from([("SecretTag".to_string(), secret.clone())]),
@@ -1023,7 +1024,7 @@ async fn shared_desired_pipeline_runs_host_default_tag_normalization() {
         binding: None,
     };
     let provider_configs = vec![provider_config];
-    let ctx = WiringContext::new_for_test(Vec::new(), &provider_configs);
+    let ctx = WiringContext::new_for_test_with_provider_phase(Vec::new(), &provider_configs);
     let mut resources = vec![Resource::with_provider(
         BUILTIN_PROVIDER_NAME,
         "test.resource",
@@ -1164,8 +1165,11 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
     ];
 
     for (attribute, value) in cases {
-        let provider_configs = Vec::new();
-        let ctx = WiringContext::new_for_test(vec![Box::new(EnumSchemaFactory)], &provider_configs);
+        let provider_configs: Vec<carina_core::parser::ExpandedProviderConfig> = Vec::new();
+        let ctx = WiringContext::new_for_test_with_provider_phase(
+            vec![Box::new(EnumSchemaFactory)],
+            &provider_configs,
+        );
         let mut resources = vec![
             Resource::with_provider("test", "thing", attribute, None)
                 .with_attribute(attribute, value),
@@ -1193,7 +1197,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     let wasm_path = tmp.path().join("provider.wasm");
     std::fs::write(&wasm_path, b"fixture").unwrap();
     let source: ProviderSource = format!("file://{}", wasm_path.display()).parse().unwrap();
-    let config = ProviderConfig {
+    let config: ProviderConfig = ProviderConfig {
         name: "configured".into(),
         source: Some(source.clone()),
         version: None,
@@ -1351,7 +1355,7 @@ async fn unverified_official_factory_load_case() {
     });
     lock.save(&project.path().join("carina-providers.lock"))
         .unwrap();
-    let config = ProviderConfig {
+    let config: ProviderConfig = ProviderConfig {
         name: "aws".into(),
         source: Some(provider_source),
         version: None,
@@ -1408,7 +1412,7 @@ async fn unverified_official_factory_load_case() {
 }
 
 fn resolved_provider_configs_with_remote<E>(
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::File<E, carina_core::resource::AbsoluteBindingAddress>,
     remote: &HashMap<String, HashMap<String, Value>>,
 ) -> carina_core::parser::ResolvedProviderConfigs {
     carina_core::parser::resolve_provider_attributes_with_remote(
@@ -1424,12 +1428,12 @@ fn validated_provider_configs(
 ) -> carina_core::parser::ResolvedProviderConfigs {
     let mut parsed = carina_core::parser::InferredFile::default();
     parsed.providers = configs;
-    resolved_provider_configs(&parsed)
+    resolved_provider_configs(&parsed.resolve_root_for_test())
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::File<E, carina_core::resource::AbsoluteBindingAddress>,
     provider_configs: &carina_core::parser::ResolvedProviderConfigs,
     unresolved_resources: &[Resource],
     state_file: &Option<StateFile>,
@@ -1445,16 +1449,16 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
         provider_configs.as_provider_configs(),
         base_dir,
     )?;
-    let wiring = ValidatedWiring::for_test(factories, provider_configs.as_provider_configs());
+    let wiring = ValidatedWiring::for_test_with_provider_phase(
+        factories,
+        provider_configs.as_provider_configs(),
+    );
     let ctx = wiring.context();
-    let mut unresolved = carina_core::parser::ParsedFile::default();
+    let mut unresolved = parsed.clone();
     unresolved.resources = unresolved_resources.to_vec();
-    let canonical_resources = resolve_config_block_names_for_test(
-        parsed.clone(),
-        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
-        ctx.schemas(),
-    )
-    .expect("test block-name resolution must succeed");
+    let canonical_resources =
+        resolve_expanded_config_block_names_for_test(parsed.clone(), unresolved, ctx.schemas())
+            .expect("test block-name resolution must succeed");
     let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
     create_plan_from_parsed_with_upstream_with_ctx(
         validated,
@@ -1481,7 +1485,9 @@ fn create_plan(
     saved_attrs: &carina_core::provider::LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     orphans: &Orphans,
-    wait_bindings: &[carina_core::parser::WaitBinding],
+    wait_bindings: &[carina_core::parser::WaitBinding<
+        carina_core::resource::AbsoluteBindingAddress,
+    >],
 ) -> Plan {
     let managed = ResolvedResource::collect_resolved(managed.iter().cloned()).unwrap();
     carina_core::differ::create_plan(
@@ -1670,7 +1676,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
             "restored",
             Value::Concrete(ConcreteValue::String("saved".into())),
         );
-    desired.binding = Some("resource".to_string());
+    desired.binding = Some(absolute_binding("resource"));
     let (mut resources, _) = build_override_aware_pair_for_test(
         canonical_unresolved(vec![desired], &SchemaRegistry::new()),
         None::<&StateFile>,
@@ -1712,7 +1718,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     };
     let mut orphans = Orphans::from([carina_core::differ::Orphan::present(
         present,
-        Some("resource".to_string()),
+        Some(absolute_binding("resource")),
         Directives::default(),
     )]);
     let normalizer = TransformingNormalizer;
@@ -1845,7 +1851,7 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
         "resource-123",
     )
     .expect("fixture identifier is non-empty");
-    row.binding = Some("orphan".to_string());
+    row.binding = Some(absolute_binding("orphan"));
     row.set_persisted_attribute("managed_saved", serde_json::json!("saved-value"));
     row = crate::fixture_resource_state_metadata(
         row,
@@ -1974,7 +1980,7 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
     }
 
     let ctx = WiringContext::new_for_test(vec![Box::new(FailingNormalizerFactory)], &[]);
-    let config = ProviderConfig {
+    let config: ProviderConfig = ProviderConfig {
         name: "failing".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
@@ -2247,7 +2253,7 @@ async fn sourced_default_provider_executes_the_factory_retained_by_wiring_contex
     let project = tempfile::tempdir().unwrap();
     let source_path = project.path().join("provider.wasm");
     std::fs::write(&source_path, b"artifact loaded into the context").unwrap();
-    let config = ProviderConfig {
+    let config: ProviderConfig = ProviderConfig {
         name: "test".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
@@ -2259,7 +2265,7 @@ async fn sourced_default_provider_executes_the_factory_retained_by_wiring_contex
     };
     let configs = validated_provider_configs(vec![config]);
     let creates = Arc::new(AtomicUsize::new(0));
-    let ctx = WiringContext::new_for_test(
+    let ctx = WiringContext::new_for_test_with_provider_phase(
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::clone(&creates),
         })],
@@ -2277,7 +2283,7 @@ async fn sourced_default_provider_executes_the_factory_retained_by_wiring_contex
 }
 
 fn resolved_invalid_provider_config() -> (
-    carina_core::parser::InferredFile,
+    carina_core::parser::ExpandedInferredFile,
     carina_core::parser::ResolvedProviderConfigs,
 ) {
     let mut attributes = IndexMap::new();
@@ -2305,6 +2311,7 @@ fn resolved_invalid_provider_config() -> (
             Value::Concrete(ConcreteValue::String("not-an-arn".into())),
         )]),
     )]);
+    let parsed = parsed.resolve_root_for_test();
     let configs = resolved_provider_configs_with_remote(&parsed, &remote);
     (parsed, configs)
 }
@@ -2323,7 +2330,7 @@ fn assert_provider_config_constraint_error(error: &AppError) {
 async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creation() {
     let (parsed, provider_configs) = resolved_invalid_provider_config();
     let creates = Arc::new(AtomicUsize::new(0));
-    let wiring = ValidatedWiring::from_factories_for_test(
+    let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::clone(&creates),
         })],
@@ -2356,7 +2363,7 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
 async fn apply_provider_construction_revalidates_resolved_upstream_config() {
     let (_parsed, provider_configs) = resolved_invalid_provider_config();
     let creates = Arc::new(AtomicUsize::new(0));
-    let ctx = WiringContext::new_for_test(
+    let ctx = WiringContext::new_for_test_with_provider_phase(
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::clone(&creates),
         })],
@@ -2790,7 +2797,7 @@ let shared = read test.shared.Type {}
         "managed-provider-id",
     )
     .expect("fixture identifier is non-empty");
-    prior_row.binding = Some("shared".to_string());
+    prior_row.binding = Some(absolute_binding("shared"));
     prior_row.set_persisted_attribute(
         "managed_saved",
         serde_json::json!("managed-write-only-value"),
@@ -2811,7 +2818,7 @@ let shared = read test.shared.Type {}
         .expect("test state row is unique");
     let state_file = Some(state_file);
     let provider_configs = resolved_provider_configs(&parsed);
-    let wiring = ValidatedWiring::from_factories_for_test(
+    let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
         vec![Box::new(ManagedAndDataSourceFactory)],
         provider_configs.as_provider_configs(),
     );
@@ -3083,7 +3090,7 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
         binding: None,
     }];
     let provider_configs = validated_provider_configs(raw_configs);
-    let ctx = WiringContext::new_for_test(
+    let ctx = WiringContext::new_for_test_with_provider_phase(
         vec![Box::new(BlockInPlaceValidationFactory {
             validated: Arc::clone(&validated),
             received_region: Arc::clone(&received_region),
@@ -3107,7 +3114,7 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
 #[test]
 fn normalize_state_with_ctx_renders_provider_config_error_once() {
     let (_parsed, provider_configs) = resolved_invalid_provider_config();
-    let ctx = WiringContext::new_for_test(
+    let ctx = WiringContext::new_for_test_with_provider_phase(
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::new(AtomicUsize::new(0)),
         })],
@@ -3323,7 +3330,7 @@ fn test_merge_default_tags_prevents_false_diff() {
     );
 
     // After host merging, desired resource gains the default tags → no diff.
-    let config = ProviderConfig {
+    let config: carina_core::parser::ExpandedProviderConfig = ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
         default_tags,
@@ -3402,7 +3409,7 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
 
     // `moved` block addresses are routing-agnostic by construction
     // (the type makes routing unrepresentable here).
-    let state_blocks = vec![StateBlock::Moved {
+    let state_blocks: Vec<carina_core::parser::ExpandedStateBlock> = vec![StateBlock::Moved {
         addresses: MovedAddresses::new("aws", "route53.RecordSet", "old_record", "new_record"),
     }];
 
@@ -3520,7 +3527,7 @@ fn moved_in_flight_rebinds_resume_to_destination() {
     let from = ResourceId::with_provider_identity("mock", "test.resource", "old_name", None);
     let to = ResourceId::with_provider_identity("mock", "test.resource", "new_name", None);
     let desired = Resource::with_provider("mock", "test.resource", "new_name", None);
-    let old_resource = ResolvedResource::new(Resource::with_provider(
+    let old_resource: ResolvedResource = ResolvedResource::new(Resource::with_provider(
         "mock",
         "test.resource",
         "old_name",
@@ -3604,7 +3611,7 @@ fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
     let to = ResourceId::with_provider_identity("mock", "test.resource", "new_name", None);
     let mut row = ResourceState::try_applied("test.resource", "old_name", "mock", "object-123")
         .expect("fixture identifier is non-empty");
-    row.binding = Some("retired".to_string());
+    row.binding = Some(absolute_binding("retired"));
     let mut state_file = StateFile::new();
     state_file.upsert_resource(row).unwrap();
 
@@ -3656,7 +3663,8 @@ fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
     assert!(matches!(
         plan.effects(),
         [Effect::Delete { id, binding, .. }]
-            if id.as_inner() == &to && binding.as_deref() == Some("retired")
+            if id.as_inner() == &to
+                && binding.as_ref().map(|binding| binding.as_str()) == Some("retired")
     ));
 }
 
@@ -3705,7 +3713,7 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
 
     // `removed` block addresses are routing-agnostic by construction
     // — the newtype makes routing unrepresentable here.
-    let state_blocks = vec![StateBlock::Removed {
+    let state_blocks: Vec<carina_core::parser::ExpandedStateBlock> = vec![StateBlock::Removed {
         from: StateBlockAddress::new("aws", "route53.RecordSet", "r.delegation_ns"),
     }];
 
@@ -3785,7 +3793,7 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
     });
     add_deposed_delete_effects(&mut plan, &Some(state_file.clone()), &[]);
 
-    let state_blocks = vec![StateBlock::Removed {
+    let state_blocks: Vec<carina_core::parser::ExpandedStateBlock> = vec![StateBlock::Removed {
         from: StateBlockAddress::new("aws", "route53.RecordSet", "r.delegation_ns"),
     }];
     let bindings = carina_core::binding_index::ResolvedBindings::default();
@@ -3841,7 +3849,7 @@ fn removed_suppresses_in_flight_orphan_error_and_keeps_deposed() {
     use carina_state::state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
     use std::collections::{BTreeSet, HashMap, HashSet};
 
-    let resource = ResolvedResource::new(Resource::with_provider(
+    let resource: ResolvedResource = ResolvedResource::new(Resource::with_provider(
         "mock",
         "example.Widget",
         "pending",
@@ -4002,7 +4010,7 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
     let consumer_id =
         ResourceId::with_provider_identity("aws", "example.Consumer", "consumer-id", None);
     let mut producer_row = ResourceState::new("example.Producer", "producer-id", "aws");
-    producer_row.binding = Some("producer".to_string());
+    producer_row.binding = Some(absolute_binding("producer"));
     producer_row
         .deposed
         .push(DeposedInstance::from_persisted_json(
@@ -4025,9 +4033,9 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
         )]),
     )
     .with_identifier("consumer-id")
-    .with_dependency_bindings(BTreeSet::from(["producer".to_string()]));
+    .with_dependency_bindings(BTreeSet::from([absolute_binding("producer")]));
     let to = Resource::with_provider("aws", "example.Consumer", "consumer-id", None)
-        .with_binding("consumer")
+        .with_absolute_binding(absolute_binding("consumer"))
         .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
     let mut plan = Plan::new();
     plan.add(Effect::Update {
@@ -4075,7 +4083,7 @@ fn deposed_delete_waits_for_the_rows_in_flight_create() {
     use carina_state::state::{DeposedInstance, DeposedKey, ResourceState};
     use std::collections::{BTreeSet, HashMap};
 
-    let resource = ResolvedResource::new(Resource::with_provider(
+    let resource: ResolvedResource = ResolvedResource::new(Resource::with_provider(
         "mock",
         "example.Widget",
         "pending",
@@ -4143,7 +4151,7 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
     // The import block address has no routing slot (`StateBlockAddress`
     // is routing-agnostic by construction). The downstream resolver
     // is responsible for lifting routing from the matched Create.
-    let state_blocks = vec![StateBlock::Import {
+    let state_blocks: Vec<carina_core::parser::ExpandedStateBlock> = vec![StateBlock::Import {
         to: StateBlockAddress::new("aws", "route53.RecordSet", "r.delegation_ns"),
         to_span: None,
         id: Value::Concrete(ConcreteValue::String(
@@ -4190,7 +4198,7 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
 fn test_materialize_moved_states_warns_on_missing_from() {
     use carina_state::state::{ResourceState, StateFile};
 
-    let state_blocks = vec![StateBlock::Moved {
+    let state_blocks: Vec<carina_core::parser::ExpandedStateBlock> = vec![StateBlock::Moved {
         addresses: MovedAddresses::new("awscc", "s3.Bucket", "old_bucket", "new_bucket"),
     }];
     let mut warnings = Vec::new();
@@ -4831,7 +4839,7 @@ fn test_plan_fails_on_removed_from_colliding_with_desired() {
         ))
         .expect("test state setup must be valid");
     let state_file = Some(state.clone());
-    let blocks = vec![StateBlock::Removed {
+    let blocks: Vec<carina_core::parser::ExpandedStateBlock> = vec![StateBlock::Removed {
         from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", desired_name),
     }];
     let resolution = resolve_state_blocks(&blocks, &state_file, &desired, ctx.schemas());
@@ -4879,7 +4887,7 @@ fn test_plan_fails_on_move_onto_occupied_state_entry() {
 fn test_plan_allows_from_absent_to_present_idempotent_noop() {
     let desired = Vec::new();
     let state_file = Some(bucket_state_file(&["already_moved"]));
-    let state_blocks = vec![StateBlock::Moved {
+    let state_blocks: Vec<carina_core::parser::ExpandedStateBlock> = vec![StateBlock::Moved {
         addresses: MovedAddresses::new("awscc", "s3.Bucket", "old_name", "already_moved"),
     }];
     let mut warnings = Vec::new();
@@ -5060,7 +5068,7 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
 fn route_table_state(binding: &str, id: &str) -> carina_state::state::ResourceState {
     let mut state =
         carina_state::state::ResourceState::new("ec2.RouteTable", test_identity(binding), "awscc");
-    state.binding = Some(binding.to_string());
+    state.binding = Some(absolute_binding(binding));
     state.set_persisted_attribute("id".to_string(), serde_json::Value::String(id.to_string()));
     state
 }
@@ -5087,8 +5095,6 @@ fn association_state(
 }
 
 fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -> Resource {
-    use carina_core::resource::AccessPath;
-
     let mut resource = Resource::with_provider(
         "awscc",
         "ec2.SubnetRouteTableAssociation",
@@ -5097,9 +5103,7 @@ fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -
     );
     resource.set_attr(
         "route_table_id".to_string(),
-        Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new(route_table_binding, "id"),
-        }),
+        root_resource_ref(route_table_binding, "id"),
     );
     resource.set_attr(
         "subnet_id".to_string(),
@@ -5167,7 +5171,7 @@ fn resource_move_invariants_named_match_uses_state_row_routing() {
         test_identity("logs"),
         Some("desired-route".to_string()),
     )
-    .with_binding("logs")
+    .with_absolute_binding(absolute_binding("logs"))
     .with_attribute(
         "bucket_name",
         Value::Concrete(ConcreteValue::String("logs".into())),
@@ -5177,7 +5181,7 @@ fn resource_move_invariants_named_match_uses_state_row_routing() {
     let moves = detect_anonymous_to_named_moves_with_ctx(
         &ctx,
         &[desired],
-        &[],
+        &[] as &[carina_core::parser::ExpandedProviderConfig],
         &state_view,
         &StateBlockClaims::empty(),
     )
@@ -5266,7 +5270,7 @@ fn resource_move_invariants_unprojected_in_flight_target_blocks_orphan_match() {
         "subnet_id",
         Value::Concrete(ConcreteValue::String("subnet-a".into())),
     );
-    let resolved_persisted_target = ResolvedResource::new(persisted_target);
+    let resolved_persisted_target: ResolvedResource = ResolvedResource::new(persisted_target);
     let pending = crate::fixture_in_flight_create(
         &desired.id,
         "opaque-token",
@@ -5310,7 +5314,9 @@ fn resource_move_invariants_projected_state_read_preserves_dependency_bindings()
     let old_name = "ec2_subnet_route_table_association_11111111";
     let new_name = "ec2_subnet_route_table_association_aaaaaaaa";
     let mut prior = association_state(old_name, "rtb-private", "subnet-a");
-    prior.dependency_bindings.insert("private_rtb".to_string());
+    prior
+        .dependency_bindings
+        .insert(absolute_binding("private_rtb"));
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(route_table_state("private_rtb", "rtb-private"))
@@ -5321,7 +5327,7 @@ fn resource_move_invariants_projected_state_read_preserves_dependency_bindings()
     let desired = desired_association(new_name, "private_rtb", "subnet-a");
     let resources = vec![desired];
     let state = Some(state_file);
-    let mut parsed = carina_core::parser::InferredFile::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.resources = resources;
     let detected = DeferredForExpansionPrelude::new_for_test(&parsed, &state, ctx.schemas())
         .expect("build expansion prelude")
@@ -5334,7 +5340,7 @@ fn resource_move_invariants_projected_state_read_preserves_dependency_bindings()
     assert_eq!(loaded.id().identity_str(), Some(old_name));
     assert_eq!(
         saved.get(&parsed.resources[0].id),
-        Some(&["private_rtb".to_string()].into_iter().collect()),
+        Some(&[absolute_binding("private_rtb")].into_iter().collect()),
         "phase-1 metadata lookup must read the moved source row"
     );
 }
@@ -5359,7 +5365,7 @@ fn detect_moves_prefers_exact_legacy_before_heuristic() {
         ctx.schemas(),
     )
     .expect("fixture canonicalizes");
-    assert!(compute_anonymous_identifiers_with_ctx(&ctx, canonical, &[]).is_empty());
+    assert!(compute_anonymous_identifiers_with_ctx(&ctx, canonical, &parsed.providers).is_empty());
     let destination = parsed.resources[0]
         .id
         .identity_str()
@@ -5409,7 +5415,7 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
         .upsert_resource(association_state(old_name, "rtb-private", "subnet-a"))
         .expect("test state setup must be valid");
     let resources = vec![desired_association(desired_name, "private_rtb", "subnet-a")];
-    let state_blocks = vec![StateBlock::Removed {
+    let state_blocks: Vec<carina_core::parser::ExpandedStateBlock> = vec![StateBlock::Removed {
         from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", old_name),
     }];
     let claims = resolve_state_block_claims(
@@ -5457,7 +5463,6 @@ fn claimed_state_entry_is_excluded_from_automatic_move_detection() {
 
 #[test]
 fn destroy_and_state_refresh_identity_preparation_preserve_anonymous_addresses() {
-    use carina_core::parser::InferredFile;
     use carina_core::schema::ValidatedResourceSchema;
     use carina_state::state::StateFile;
 
@@ -5487,7 +5492,7 @@ fn destroy_and_state_refresh_identity_preparation_preserve_anonymous_addresses()
         Some(state)
     };
     let config = || {
-        let mut parsed = InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.resources = vec![desired()];
         ValidatedConfig::from_factories_with_additional_schemas_for_test(
             parsed,
@@ -5674,9 +5679,9 @@ fn reconcile_anonymous_identifiers_reserves_same_type_data_source_binding() {
         )
         .with_attribute("bucket", Value::Concrete(ConcreteValue::String("x".into()))),
     ];
-    let data_sources = vec![
+    let data_sources: Vec<DataSource> = vec![
         DataSource::with_provider("aws", "s3.Bucket", test_identity("logs"), None)
-            .with_binding("logs")
+            .with_absolute_binding(absolute_binding("logs"))
             .with_attribute("bucket", Value::Concrete(ConcreteValue::String("x".into()))),
     ];
 
@@ -5718,7 +5723,7 @@ fn test_stale_moved_block_releases_claims() {
         "private_rtb",
         "subnet-a",
     )];
-    let state_blocks = vec![StateBlock::Moved {
+    let state_blocks: Vec<carina_core::parser::ExpandedStateBlock> = vec![StateBlock::Moved {
         addresses: MovedAddresses::new(
             "awscc",
             "ec2.SubnetRouteTableAssociation",
@@ -5764,7 +5769,7 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
     let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let mut state_file = StateFile::new();
     let mut resources = Vec::new();
-    let mut state_blocks = Vec::new();
+    let mut state_blocks: Vec<carina_core::parser::ExpandedStateBlock> = Vec::new();
     let mut current_states = HashMap::new();
     let mut old_names = Vec::new();
     let mut desired_names = Vec::new();
@@ -5879,7 +5884,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
 
     fn compute_initial_anonymous_ids(
         ctx: &WiringContext,
-        parsed: &mut carina_core::parser::ParsedFile,
+        parsed: &mut carina_core::parser::ExpandedParsedFile,
     ) {
         let canonical =
             canonicalize_resources_with_schemas(&mut parsed.resources, ctx.schemas()).unwrap();
@@ -5887,7 +5892,10 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         assert!(errors.is_empty(), "anonymous id setup failed: {errors:?}");
     }
 
-    fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -> String {
+    fn concrete_subnet_identity(
+        ctx: &WiringContext,
+        providers: &[carina_core::parser::ExpandedProviderConfig],
+    ) -> String {
         let mut resources = vec![
             Resource::pending_with_provider("awscc", "ec2.Subnet", None)
                 .with_attribute("vpc_id", string("vpc-old"))
@@ -5942,7 +5950,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.220.0.0/16"))
         .with_attribute("vpc_id", serde_json::json!("vpc-old"));
-    vpc_state.binding = Some("vpc".to_string());
+    vpc_state.binding = Some(absolute_binding("vpc"));
 
     let mut subnet_state = ResourceState::try_applied(
         "ec2.Subnet",
@@ -5954,7 +5962,9 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     .with_attribute("vpc_id", serde_json::json!("vpc-old"))
     .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
     .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
-    subnet_state.dependency_bindings.insert("vpc".to_string());
+    subnet_state
+        .dependency_bindings
+        .insert(absolute_binding("vpc"));
 
     let mut state_file = StateFile::new();
     state_file
@@ -6188,22 +6198,21 @@ moved {{
 /// string and ships it to the remote API as a literal.
 #[test]
 fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
-    use carina_core::resource::{AccessPath, DataSource};
+    use carina_core::resource::DataSource;
 
     let identity_store_id = "d-9067c29a4b";
 
     // Managed resource with a binding — phase 1 would have refreshed it.
     let mut sso = Resource::with_provider("awscc", "sso.Instance", "carina-rs", None);
-    sso.binding = Some("sso".to_string());
+    sso.binding = Some(absolute_binding("sso"));
 
     // Data source referencing `sso.identity_store_id`. carina#3181:
     // data sources are a distinct typestate.
-    let mut mizzy = DataSource::with_provider("aws", "identitystore.user", "mizzy", None);
+    let mut mizzy: DataSource =
+        DataSource::with_provider("aws", "identitystore.user", "mizzy", None);
     mizzy.attributes.insert(
         "identity_store_id".to_string(),
-        Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("sso", "identity_store_id"),
-        }),
+        root_resource_ref("sso", "identity_store_id"),
     );
     mizzy.attributes.insert(
         "user_name".to_string(),
@@ -6257,21 +6266,19 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
 
 #[test]
 fn resolve_data_source_refs_for_refresh_defers_unresolved_apply_time_input() {
-    use carina_core::resource::{AccessPath, DataSource};
+    use carina_core::resource::DataSource;
 
     let mut target = Resource::with_provider("test", "Upstream", "target", None);
-    target.binding = Some("target".to_string());
+    target.binding = Some(absolute_binding("target"));
     target.set_attr(
         "name",
         Value::Concrete(ConcreteValue::String("target".into())),
     );
 
-    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    let mut lookup: DataSource = DataSource::with_provider("test", "Lookup", "roles", None);
     lookup.attributes.insert(
         "filter".to_string(),
-        Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("target", "generated"),
-        }),
+        root_resource_ref("target", "generated"),
     );
 
     let empty_registry = carina_core::schema::SchemaRegistry::new();
@@ -6305,13 +6312,13 @@ fn resolve_data_source_refs_for_refresh_defers_bare_binding_ref_to_new_resource(
     use carina_core::resource::DataSource;
 
     let mut target = Resource::with_provider("test", "Upstream", "target", None);
-    target.binding = Some("target".to_string());
+    target.binding = Some(absolute_binding("target"));
 
-    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    let mut lookup: DataSource = DataSource::with_provider("test", "Lookup", "roles", None);
     lookup.attributes.insert(
         "filter".to_string(),
         Value::Deferred(DeferredValue::BindingRef {
-            binding: "target".to_string(),
+            binding: absolute_binding("target"),
         }),
     );
 
@@ -6331,14 +6338,14 @@ fn resolve_data_source_refs_for_refresh_defers_bare_binding_ref_to_new_resource(
         panic!("bare BindingRef to a new resource must defer: {resolved:?}");
     };
     assert_eq!(unresolved[0].attribute, "filter");
-    assert_eq!(unresolved[0].bindings, vec!["target".to_string()]);
+    assert_eq!(unresolved[0].bindings, vec![absolute_binding("target")]);
 }
 
 #[test]
 fn resolve_data_source_refs_for_refresh_defers_unknown_input_instead_of_calling_provider() {
     use carina_core::resource::{DataSource, UnknownReason};
 
-    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    let mut lookup: DataSource = DataSource::with_provider("test", "Lookup", "roles", None);
     lookup.attributes.insert(
         "filter".to_string(),
         Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
@@ -6365,23 +6372,21 @@ fn resolve_data_source_refs_for_refresh_defers_unknown_input_instead_of_calling_
 
 #[test]
 fn resolve_data_source_refs_for_refresh_defers_resolvable_interpolation_when_target_is_new() {
-    use carina_core::resource::{AccessPath, DataSource, InterpolationPart};
+    use carina_core::resource::{DataSource, ExpandedInterpolationPart as InterpolationPart};
 
     let mut target = Resource::with_provider("test", "Upstream", "target", None);
-    target.binding = Some("target".to_string());
+    target.binding = Some(absolute_binding("target"));
     target.set_attr(
         "role_name",
         Value::Concrete(ConcreteValue::String("target-role".into())),
     );
 
-    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    let mut lookup: DataSource = DataSource::with_provider("test", "Lookup", "roles", None);
     lookup.attributes.insert(
         "name_regex".to_string(),
         Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("^".into()),
-            InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("target", "role_name"),
-            })),
+            InterpolationPart::Expr(root_resource_ref("target", "role_name")),
             InterpolationPart::Literal("$".into()),
         ])),
     );
@@ -6408,21 +6413,23 @@ fn resolve_data_source_refs_for_refresh_defers_resolvable_interpolation_when_tar
 fn resolve_data_source_refs_for_refresh_defers_folded_input_with_missing_dependency() {
     use carina_core::resource::DataSource;
 
-    let mut target = Resource::with_provider("test", "Upstream", "registry_publish.target", None);
-    target.binding = Some("registry_publish.target".to_string());
+    let mut target: Resource =
+        Resource::with_provider("test", "Upstream", "registry_publish.target", None);
+    target.binding = Some(absolute_binding("registry_publish.target"));
 
     // A resolved input may be folded to a concrete string while retaining
     // its structural dependency. Module expansion must carry that dependency
     // under the same instance-prefixed binding used by the managed target.
-    let mut lookup = DataSource::with_provider("test", "Lookup", "registry_publish.roles", None);
-    lookup.binding = Some("registry_publish.roles".to_string());
+    let mut lookup: DataSource =
+        DataSource::with_provider("test", "Lookup", "registry_publish.roles", None);
+    lookup.binding = Some(absolute_binding("registry_publish.roles"));
     lookup.attributes.insert(
         "filter".to_string(),
         Value::Concrete(ConcreteValue::String("^target$".into())),
     );
     lookup
         .dependency_bindings
-        .insert("registry_publish.target".to_string());
+        .insert(absolute_binding("registry_publish.target"));
 
     let resolved = resolve_data_source_refs_for_refresh(
         &[target],
@@ -6448,18 +6455,18 @@ fn resolve_data_source_refs_for_refresh_defers_folded_input_with_missing_depende
 fn resolve_data_source_refs_for_refresh_does_not_treat_missing_create_only_readback_as_replace() {
     use carina_core::resource::{AccessPath, DataSource};
 
-    let mut target = Resource::with_provider("test", "Role", "target", None);
-    target.binding = Some("target".to_string());
+    let mut target: Resource = Resource::with_provider("test", "Role", "target", None);
+    target.binding = Some(absolute_binding("target"));
     target.set_attr(
         "role_name",
         Value::Concrete(ConcreteValue::String("same-name".into())),
     );
 
-    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    let mut lookup: DataSource = DataSource::with_provider("test", "Lookup", "roles", None);
     lookup.attributes.insert(
         "filter".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("target", "role_name"),
+            path: AccessPath::new("target", "role_name").resolve_root_for_test(),
         }),
     );
 
@@ -6501,22 +6508,22 @@ fn resolve_data_source_refs_for_refresh_does_not_treat_missing_create_only_readb
 fn resolve_data_source_refs_for_refresh_defers_when_any_input_references_new_resource() {
     use carina_core::resource::{AccessPath, DataSource};
 
-    let mut existing = Resource::with_provider("test", "Upstream", "existing", None);
-    existing.binding = Some("existing".to_string());
-    let mut target = Resource::with_provider("test", "Upstream", "target", None);
-    target.binding = Some("target".to_string());
+    let mut existing: Resource = Resource::with_provider("test", "Upstream", "existing", None);
+    existing.binding = Some(absolute_binding("existing"));
+    let mut target: Resource = Resource::with_provider("test", "Upstream", "target", None);
+    target.binding = Some(absolute_binding("target"));
 
-    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    let mut lookup: DataSource = DataSource::with_provider("test", "Lookup", "roles", None);
     lookup.attributes.insert(
         "existing_filter".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("existing", "name"),
+            path: AccessPath::new("existing", "name").resolve_root_for_test(),
         }),
     );
     lookup.attributes.insert(
         "new_filter".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("target", "name"),
+            path: AccessPath::new("target", "name").resolve_root_for_test(),
         }),
     );
 
@@ -6557,24 +6564,24 @@ fn resolve_data_source_refs_for_refresh_defers_when_any_input_references_new_res
 fn resolve_data_source_refs_for_refresh_defers_read_chain_from_new_resource() {
     use carina_core::resource::{AccessPath, DataSource};
 
-    let mut target = Resource::with_provider("test", "Upstream", "target", None);
-    target.binding = Some("target".to_string());
+    let mut target: Resource = Resource::with_provider("test", "Upstream", "target", None);
+    target.binding = Some(absolute_binding("target"));
 
-    let mut first = DataSource::with_provider("test", "Lookup", "first", None);
-    first.binding = Some("first".to_string());
+    let mut first: DataSource = DataSource::with_provider("test", "Lookup", "first", None);
+    first.binding = Some(absolute_binding("first"));
     first.attributes.insert(
         "filter".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("target", "name"),
+            path: AccessPath::new("target", "name").resolve_root_for_test(),
         }),
     );
 
-    let mut second = DataSource::with_provider("test", "Lookup", "second", None);
-    second.binding = Some("second".to_string());
+    let mut second: DataSource = DataSource::with_provider("test", "Lookup", "second", None);
+    second.binding = Some(absolute_binding("second"));
     second.attributes.insert(
         "filter".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("first", "names"),
+            path: AccessPath::new("first", "names").resolve_root_for_test(),
         }),
     );
 
@@ -6603,18 +6610,18 @@ fn resolve_data_source_refs_for_refresh_defers_read_chain_from_new_resource() {
 fn resolve_data_source_refs_for_refresh_reads_existing_resource_even_when_replaced() {
     use carina_core::resource::{AccessPath, DataSource};
 
-    let mut target = Resource::with_provider("test", "Role", "target", None);
-    target.binding = Some("target".to_string());
+    let mut target: Resource = Resource::with_provider("test", "Role", "target", None);
+    target.binding = Some(absolute_binding("target"));
     target.set_attr(
         "role_name",
         Value::Concrete(ConcreteValue::String("new-name".into())),
     );
 
-    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    let mut lookup: DataSource = DataSource::with_provider("test", "Lookup", "roles", None);
     lookup.attributes.insert(
         "filter".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("target", "arn"),
+            path: AccessPath::new("target", "arn").resolve_root_for_test(),
         }),
     );
 
@@ -6679,7 +6686,7 @@ fn resolve_data_source_refs_for_refresh_reads_existing_resource_even_when_replac
 async fn literal_input_data_source_refresh_reads_provider_once() {
     use carina_core::resource::DataSource;
 
-    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    let mut lookup: DataSource = DataSource::with_provider("test", "Lookup", "roles", None);
     lookup.attributes.insert(
         "filter".to_string(),
         Value::Concrete(ConcreteValue::String("literal".into())),
@@ -6731,7 +6738,7 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
 async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
     use carina_core::resource::DataSource;
 
-    let lookup = DataSource::with_provider("test", "Lookup", "roles", None).with_attribute(
+    let lookup = <DataSource>::with_provider("test", "Lookup", "roles", None).with_attribute(
         "filter",
         Value::Concrete(ConcreteValue::String("bad".into())),
     );
@@ -6854,16 +6861,19 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
         &[],
         [("test".to_string(), schema)],
     );
-    let rule = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-        ConcreteValue::Map(IndexMap::from([(
-            "action".to_string(),
-            Value::Concrete(ConcreteValue::String("allow".into())),
-        )])),
-    )]));
-    let resource = Resource::with_provider("test", "thing", "direct", None)
-        .with_attribute("rule", rule.clone());
-    let template_resource = Resource::with_provider("test", "thing", "deferred", None)
-        .with_attribute("rule", rule.clone());
+    let rule: carina_core::resource::AuthoredValue =
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([(
+                "action".to_string(),
+                Value::Concrete(ConcreteValue::String("allow".into())),
+            )])),
+        )]));
+    let resource: carina_core::resource::AuthoredResource =
+        Resource::with_provider("test", "thing", "direct", None)
+            .with_attribute("rule", rule.clone());
+    let template_resource: carina_core::resource::AuthoredResource =
+        Resource::with_provider("test", "thing", "deferred", None)
+            .with_attribute("rule", rule.clone());
     let deferred = carina_core::parser::DeferredForExpression {
         file: Some("main.crn".to_string()),
         line: 4,
@@ -6871,7 +6881,7 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
         resource_type: "test.thing".to_string(),
         attributes: vec![("rule".to_string(), rule)],
         target: carina_core::parser::DeferredForTarget::Bound {
-            binding: "items".to_string(),
+            binding: carina_core::resource::RelativeBindingName::new("items"),
         },
         iterable: Value::resource_ref("pending", "items", Vec::new()),
         binding: carina_core::parser::ForBinding::Simple("item".to_string()),
@@ -6881,6 +6891,7 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
     evaluated.resources = vec![resource];
     evaluated.deferred_for_expressions = vec![deferred];
     let unresolved = evaluated.clone();
+    let evaluated = evaluated.resolve_root_for_test();
 
     let canonical_unresolved = resolve_config_names_with_ctx(
         &ValidationPipelineAccess::new(),
@@ -6935,13 +6946,16 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
         &[],
         [("test".to_string(), schema)],
     );
-    let rules = Value::Concrete(ConcreteValue::List(Vec::new()));
-    let resource = Resource::with_provider("test", "thing", "direct", None)
-        .with_attribute("rule", rules.clone())
-        .with_attribute("rules", rules);
+    let rules: carina_core::resource::AuthoredValue =
+        Value::Concrete(ConcreteValue::List(Vec::new()));
+    let resource: carina_core::resource::AuthoredResource =
+        Resource::with_provider("test", "thing", "direct", None)
+            .with_attribute("rule", rules.clone())
+            .with_attribute("rules", rules);
     let mut evaluated = carina_core::parser::ParsedFile::default();
     evaluated.resources = vec![resource];
     let unresolved = evaluated.clone();
+    let evaluated = evaluated.resolve_root_for_test();
 
     let errors = resolve_config_names_with_ctx(
         &ValidationPipelineAccess::new(),
@@ -6971,12 +6985,14 @@ fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
     );
     let mut evaluated = carina_core::parser::ParsedFile::default();
     evaluated.resources = vec![
-        Resource::with_provider("test", "thing", "direct", None).with_attribute(
-            "name_prefix",
-            Value::Concrete(ConcreteValue::String("owned-".into())),
-        ),
+        carina_core::resource::AuthoredResource::with_provider("test", "thing", "direct", None)
+            .with_attribute(
+                "name_prefix",
+                Value::Concrete(ConcreteValue::String("owned-".into())),
+            ),
     ];
     let unresolved = evaluated.clone();
+    let evaluated = evaluated.resolve_root_for_test();
 
     let canonical = resolve_config_names_with_ctx(
         &ValidationPipelineAccess::new(),
@@ -7320,7 +7336,7 @@ fn anonymous_route_resource() -> Resource {
     resource
 }
 
-fn two_anonymous_loop_collision_file() -> carina_core::parser::ParsedFile {
+fn two_anonymous_loop_collision_file() -> carina_core::parser::ExpandedParsedFile {
     carina_core::parser::parse_file(
         "for subnet in ['same', 'same'] {\n  awscc.ec2.SubnetRouteTableAssociation { route_table_id = 'rtb-a' subnet_id = subnet }\n}\n\
          for subnet in ['same', 'same'] {\n  awscc.ec2.SubnetRouteTableAssociation { route_table_id = 'rtb-b' subnet_id = subnet }\n}\n",
@@ -7328,6 +7344,7 @@ fn two_anonymous_loop_collision_file() -> carina_core::parser::ParsedFile {
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("two-loop identity fixture parses")
+    .resolve_root_for_test()
 }
 
 fn assert_two_loop_identity_aggregate(error: AppError) {
@@ -7350,8 +7367,8 @@ fn file_deferred_expansion_target_reports_all_anonymous_identity_errors() {
     let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let mut parsed = two_anonymous_loop_collision_file();
 
-    let error = <carina_core::parser::ParsedFile as DeferredExpansionTarget<
-        carina_core::parser::ParsedExportParam,
+    let error = <carina_core::parser::ExpandedParsedFile as DeferredExpansionTarget<
+        carina_core::parser::ExpandedParsedExportParam,
     >>::compute_anonymous_identifiers(&mut parsed, &ctx, &[])
     .expect_err("both loop collisions must fail identity assignment");
 
@@ -7368,8 +7385,8 @@ fn canonical_pair_deferred_expansion_target_reports_all_anonymous_identity_error
         ctx.schemas(),
     );
 
-    let error = <CanonicalResourcePair<carina_core::parser::ParsedExportParam> as DeferredExpansionTarget<
-        carina_core::parser::ParsedExportParam,
+    let error = <CanonicalResourcePair<carina_core::parser::ExpandedParsedExportParam> as DeferredExpansionTarget<
+        carina_core::parser::ExpandedParsedExportParam,
     >>::compute_anonymous_identifiers(&mut pair, &ctx, &[])
     .expect_err("both pair-owned loop collisions must fail identity assignment");
 
@@ -7759,7 +7776,7 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
 
     let mut named = anonymous_route_resource();
     named.id = ResourceId::with_provider_identity("awscc", "ec2.Route", "route", None);
-    named.binding = Some("route".to_string());
+    named.binding = Some(absolute_binding("route"));
     let resources = vec![named.clone()];
 
     let mut state_file = StateFile::new();
@@ -7864,7 +7881,8 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
     );
     assert!(findings.is_empty(), "module_calls: got {findings:?}");
 
-    let errors = validate_composition_ref_types_with_ctx(&ctx, &parsed);
+    let expanded = parsed.clone().resolve_root_for_test();
+    let errors = validate_composition_ref_types_with_ctx(&ctx, &expanded);
     assert!(errors.is_empty(), "composition_ref_types: got {errors:?}");
 }
 
@@ -7877,8 +7895,11 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
 // surface only at the AWS edge.
 // =====================================================================
 
-fn parsed_with_attr(attr_name: &str, attr_value: Value) -> ParsedFile {
-    let mut r = Resource::new("foo.bar", "x");
+fn parsed_with_attr(
+    attr_name: &str,
+    attr_value: carina_core::resource::AuthoredValue,
+) -> ParsedFile {
+    let mut r: carina_core::resource::AuthoredResource = Resource::new("foo.bar", "x");
     r.attributes.insert(attr_name.to_string(), attr_value);
     let mut parsed = ParsedFile::default();
     parsed.resources = vec![r];
@@ -8265,34 +8286,34 @@ mod read_with_retry_identifier_tests {
 #[test]
 fn deferred_template_binding_match_requires_single_numeric_index() {
     let target = carina_core::parser::DeferredForTarget::Bound {
-        binding: "validation_records".to_string(),
+        binding: absolute_binding("validation_records"),
     };
     assert!(binding_matches_deferred_template(
-        "validation_records[0]",
+        &absolute_binding("validation_records[0]"),
         &target
     ));
     assert!(binding_matches_deferred_template(
-        "validation_records[42]",
+        &absolute_binding("validation_records[42]"),
         &target
     ));
     assert!(!binding_matches_deferred_template(
-        "validation_records[]",
+        &absolute_binding("validation_records[]"),
         &target
     ));
     assert!(!binding_matches_deferred_template(
-        "validation_records[abc]",
+        &absolute_binding("validation_records[abc]"),
         &target
     ));
     assert!(!binding_matches_deferred_template(
-        "validation_records[0][1]",
+        &absolute_binding("validation_records[0][1]"),
         &target
     ));
 }
 
-fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpression {
+fn deferred_replace_test_template() -> carina_core::parser::ExpandedDeferredForExpression {
     let template_resource =
-        Resource::with_provider("aws", "route53.Record", "validation_records", None)
-            .with_binding("validation_records");
+        <Resource>::with_provider("aws", "route53.Record", "validation_records", None)
+            .with_absolute_binding(absolute_binding("validation_records"));
 
     carina_core::parser::DeferredForExpression {
         file: Some("main.crn".to_string()),
@@ -8301,9 +8322,9 @@ fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpressio
         resource_type: "aws.route53.Record".to_string(),
         attributes: vec![],
         target: carina_core::parser::DeferredForTarget::Bound {
-            binding: "validation_records".to_string(),
+            binding: absolute_binding("validation_records"),
         },
-        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        iterable: root_resource_ref("cert", "domain_validation_options"),
         binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
     }
@@ -8332,8 +8353,8 @@ fn delete_effect_for_binding(binding: &str) -> Effect {
         identifier: crate::fixture_applied_identifier(format!("{binding}-old-id")),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
-        binding: Some(binding.to_string()),
-        dependencies: std::collections::HashSet::from(["cert".to_string()]),
+        binding: Some(absolute_binding(binding)),
+        dependencies: std::collections::HashSet::from([absolute_binding("cert")]),
         explicit_dependencies: std::collections::HashSet::new(),
         blocked_by_updates: std::collections::HashSet::new(),
     }
@@ -8363,7 +8384,7 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
     assert_eq!(id, &target.id);
     assert_eq!(
         template.root_bindings(),
-        std::collections::BTreeSet::from(["cert".to_string()])
+        std::collections::BTreeSet::from([absolute_binding("cert")])
     );
     assert_eq!(template.target.bound_binding(), Some("validation_records"));
     assert_eq!(deletes.len(), 1);
@@ -8371,7 +8392,10 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
         deletes[0].id,
         ResourceId::with_provider_identity("aws", "route53.Record", "validation_records[0]", None)
     );
-    assert_eq!(deletes[0].binding.as_deref(), Some("validation_records[0]"));
+    assert_eq!(
+        deletes[0].binding.as_ref().map(|binding| binding.as_str()),
+        Some("validation_records[0]")
+    );
 
     assert!(
         !plan.effects().iter().any(|effect| {
@@ -8380,7 +8404,7 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
                 Effect::Delete {
                     binding: Some(binding),
                     ..
-                } if binding == "validation_records[0]"
+                } if binding.as_str() == "validation_records[0]"
             )
         }),
         "absorbed delete must not remain as a standalone Delete"
@@ -8423,7 +8447,7 @@ fn delete_effect_for_unbound_child(
         identifier: crate::fixture_applied_identifier("old-child"),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
-        binding: binding.map(str::to_string),
+        binding: binding.map(absolute_binding),
         dependencies: std::collections::HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
         blocked_by_updates: std::collections::HashSet::new(),
@@ -8452,7 +8476,10 @@ fn unbound_deferred_create_absorbs_exact_legacy_current_delete() {
     assert_eq!(payload.deletes.len(), 1);
     assert_eq!(payload.deletes[0].id, legacy_id);
     assert_eq!(
-        payload.deletes[0].binding.as_deref(),
+        payload.deletes[0]
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str()),
         Some("_accounts.alpha")
     );
     assert!(
@@ -8571,7 +8598,7 @@ fn deferred_create_targets_do_not_absorb_deposed_deletes() {
                     binding: Some(binding),
                     generation: carina_core::effect::EffectGeneration::Deposed(key),
                     ..
-                } if binding == "validation_records[0]" && key == &deposed_key
+                } if binding.as_str() == "validation_records[0]" && key == &deposed_key
             )
         }),
         "deposed delete must remain top-level so remove-deposed writeback can observe it"
@@ -8599,7 +8626,7 @@ fn deferred_create_targets_do_not_absorb_unrelated_orphan_deletes() {
                 Effect::Delete {
                     binding: Some(binding),
                     ..
-                } if binding == "some_other_resource[0]"
+                } if binding.as_str() == "some_other_resource[0]"
             )
         }),
         "unrelated orphan delete must stay a plain Delete"
@@ -8619,6 +8646,10 @@ mod expand_same_config_deferred_for_tests {
     use carina_core::parser::{ProviderContext, WarningKind};
     use carina_core::resource::{ConcreteValue, DeferredValue, State, UnknownReason, Value};
     use std::collections::{HashMap, HashSet};
+
+    fn parse_expanded(source: &str) -> carina_core::parser::ExpandedParsedFile {
+        parse(source, &ProviderContext::default()).expect("fixture parses")
+    }
 
     /// `let cert` (same-config) + a `for` over its provider-read
     /// `account_ids`, plus a plain independent resource so re-sort
@@ -8653,14 +8684,14 @@ mod expand_same_config_deferred_for_tests {
     /// `cert` resource's own id → an existing State carrying the
     /// provider-read list attribute the loop iterates.
     fn states_with_cert(
-        parsed: &ParsedFile,
+        parsed: &carina_core::parser::ExpandedParsedFile,
         attr: &str,
         value: Value,
     ) -> HashMap<ResourceId, State> {
         let cert = parsed
             .resources
             .iter()
-            .find(|r| r.binding.as_deref() == Some("cert"))
+            .find(|r| r.binding.as_ref().map(|binding| binding.as_str()) == Some("cert"))
             .expect("parsed cert resource");
         let mut attrs = HashMap::new();
         attrs.insert(attr.to_string(), value);
@@ -8686,7 +8717,7 @@ mod expand_same_config_deferred_for_tests {
     #[test]
     fn deferred_for_warning_filter_preserves_single_quoted_warning_on_same_line() {
         let src = "for k in upstream.ids { awscc.s3.Bucket { name = 'a-${k}' } }\n";
-        let parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
+        let parsed = parse_expanded(src);
         assert_eq!(parsed.deferred_for_expressions.len(), 1);
         assert!(
             parsed
@@ -8721,7 +8752,7 @@ mod expand_same_config_deferred_for_tests {
     #[test]
     fn saved_plan_expansion_suppresses_duplicate_warning_output_but_keeps_candidate_state() {
         let src = "for k in upstream.ids { awscc.s3.Bucket { name = 'a-${k}' } }\n";
-        let mut parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
+        let mut parsed = parse_expanded(src);
         let state_file = None;
         let schemas = SchemaRegistry::new();
         let identity_context = WiringContext::new_for_test(Vec::new(), &[]);
@@ -8828,7 +8859,7 @@ mod expand_same_config_deferred_for_tests {
         };
         let orphan_owned = Orphans::from([carina_core::differ::Orphan::present(
             present,
-            Some("a".to_string()),
+            Some(absolute_binding("a")),
             Directives::default(),
         )]);
         let selected: Vec<&ResourceId> = refreshable
@@ -8844,7 +8875,7 @@ mod expand_same_config_deferred_for_tests {
 
     #[test]
     fn same_config_read_iterable_materializes_in_plan_resources() {
-        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let parsed = parse_expanded(SRC);
         assert_eq!(
             parsed.deferred_for_expressions.len(),
             1,
@@ -8919,7 +8950,7 @@ mod expand_same_config_deferred_for_tests {
 
     #[test]
     fn expand_same_config_emits_deferred_create_when_iterable_is_unresolved() {
-        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let parsed = parse_expanded(SRC);
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = states_with_cert(&parsed, "account_ids", unknown_account_ids());
 
@@ -8946,7 +8977,7 @@ mod expand_same_config_deferred_for_tests {
         );
         assert_eq!(
             out.deferred_create_targets[0].template.root_bindings(),
-            std::collections::BTreeSet::from(["cert".to_string()])
+            std::collections::BTreeSet::from([absolute_binding("cert")])
         );
         assert!(
             out.sorted_resources
@@ -8968,7 +8999,7 @@ mod expand_same_config_deferred_for_tests {
 
     #[test]
     fn expand_same_config_pre_expands_when_iterable_is_concrete() {
-        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let parsed = parse_expanded(SRC);
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = states_with_cert(&parsed, "account_ids", account_ids());
 
@@ -9002,7 +9033,7 @@ mod expand_same_config_deferred_for_tests {
 
     #[test]
     fn expand_same_config_passes_through_pr3558_dependency_bindings_on_pre_expanded_children() {
-        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let parsed = parse_expanded(SRC);
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = states_with_cert(&parsed, "account_ids", account_ids());
 
@@ -9030,7 +9061,9 @@ mod expand_same_config_deferred_for_tests {
         assert_eq!(assignments.len(), 2);
         for assignment in assignments {
             assert!(
-                assignment.dependency_bindings.contains("cert"),
+                assignment
+                    .dependency_bindings
+                    .contains(&absolute_binding("cert")),
                 "pre-expanded child must retain the iterable binding dependency"
             );
         }
@@ -9041,7 +9074,7 @@ mod expand_same_config_deferred_for_tests {
         // carina#3132 highest-risk requirement: appending loop children
         // and re-sorting must not reorder already-planned resources
         // (SimHash / moved-matching stability).
-        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let parsed = parse_expanded(SRC);
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let pre_order: Vec<String> = sorted.iter().map(|r| r.id.to_string()).collect();
         let states = states_with_cert(&parsed, "account_ids", account_ids());
@@ -9091,7 +9124,7 @@ mod expand_same_config_deferred_for_tests {
     fn unresolvable_iterable_stays_deferred_no_misexpansion() {
         // No cert state → iterable genuinely unknowable. The loop must
         // stay in residual (carina#3128 placeholder), NOT mis-expand.
-        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let parsed = parse_expanded(SRC);
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let empty_states: HashMap<ResourceId, State> = HashMap::new();
 
@@ -9152,7 +9185,7 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let parsed = parse_expanded(src);
         assert_eq!(parsed.deferred_for_expressions.len(), 1);
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -9218,7 +9251,7 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let parsed = parse_expanded(src);
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
         let mut rr = indexmap::IndexMap::new();
@@ -9323,7 +9356,7 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let parsed = parse_expanded(src);
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
         let mut rr = indexmap::IndexMap::new();
@@ -9438,7 +9471,7 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let parsed = parse_expanded(src);
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
         let make_entry = |name: &str, value: &str| {
@@ -9560,7 +9593,7 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let parsed = parse_expanded(src);
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
         let make_entry = |name: &str, value: &str| {
@@ -9750,6 +9783,7 @@ mod kind_default_source_tests {
     fn resolved(configs: Vec<ProviderConfig>) -> ResolvedProviderConfigs {
         let mut parsed = carina_core::parser::InferredFile::default();
         parsed.providers = configs;
+        let parsed = parsed.resolve_root_for_test();
         carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &std::collections::HashMap::new(),
@@ -9887,7 +9921,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
         registry: None,
     });
     lock.save(&base.join("carina-providers.lock")).unwrap();
-    let config = ProviderConfig {
+    let config: ProviderConfig = ProviderConfig {
         name: "awscc".into(),
         source: Some(source.parse().unwrap()),
         version: None,
@@ -9960,7 +9994,7 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
         registry: None,
     });
     lock.save(&lock_path).unwrap();
-    let config = ProviderConfig {
+    let config: ProviderConfig = ProviderConfig {
         name: "awscc".into(),
         source: Some(source.parse().unwrap()),
         version: None,
@@ -10018,7 +10052,7 @@ async fn registry_source_reaches_cli_artifact_loader() {
     });
     lock.save(&base.join("carina-providers.lock")).unwrap();
 
-    let config = ProviderConfig {
+    let config: ProviderConfig = ProviderConfig {
         name: "awscc".into(),
         source: Some(provider_source),
         version: None,
@@ -10068,7 +10102,7 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
     });
     lock.save(&base.join("carina-providers.lock")).unwrap();
 
-    let config = ProviderConfig {
+    let config: ProviderConfig = ProviderConfig {
         name: "awscc".into(),
         source: Some(provider_source),
         version: None,
@@ -10104,7 +10138,7 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
     let tmp = tempfile::tempdir().unwrap();
     let wasm_path = tmp.path().join("local-provider.wasm");
     std::fs::write(&wasm_path, b"fixture").unwrap();
-    let config = ProviderConfig {
+    let config: ProviderConfig = ProviderConfig {
         name: "local".into(),
         source: Some(format!("file://{}", wasm_path.display()).parse().unwrap()),
         version: None,
@@ -10159,7 +10193,7 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
         registry: None,
     });
     lock.save(&base.join("carina-providers.lock")).unwrap();
-    let config = ProviderConfig {
+    let config: ProviderConfig = ProviderConfig {
         name: "awscc".into(),
         source: Some(source.parse().unwrap()),
         version: Some(carina_core::version_constraint::VersionConstraint::parse("^2.0.0").unwrap()),
@@ -10199,7 +10233,7 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
 "#,
     )
     .unwrap();
-    let config = ProviderConfig {
+    let config: ProviderConfig = ProviderConfig {
         name: "awscc".into(),
         source: Some(
             "github.com/carina-rs/carina-provider-awscc"
@@ -10303,7 +10337,7 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
         registry: None,
     });
     lock.save(&base.join("carina-providers.lock")).unwrap();
-    let config = ProviderConfig {
+    let config: ProviderConfig = ProviderConfig {
         name: "awscc".into(),
         source: Some(source.parse().unwrap()),
         version: Some(carina_core::version_constraint::VersionConstraint::parse("^2.0.0").unwrap()),
@@ -10330,7 +10364,10 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
 
 mod resolved_value_constraint_gate {
     use super::super::*;
-    use super::{build_override_aware_pair_for_test, canonical_pair, canonical_unresolved};
+    use super::{
+        absolute_binding, build_override_aware_pair_for_test, canonical_pair, canonical_unresolved,
+        root_resource_ref,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use carina_core::binding_index::LivePreApplyInputs;
@@ -10343,7 +10380,7 @@ mod resolved_value_constraint_gate {
         ready_noop,
     };
     use carina_core::resource::{
-        AccessPath, DataSource, InterpolationPart, LiveComposition, LiveCompositionSignature,
+        DataSource, InterpolationPart, LiveComposition, LiveCompositionSignature,
         ModuleConstraintId, PendingModuleConstraint, UnknownReason,
     };
     use carina_core::schema::{TypeIdentity, ValidatorType};
@@ -10618,9 +10655,7 @@ mod resolved_value_constraint_gate {
     }
 
     fn ref_value() -> Value {
-        Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("producer", "value"),
-        })
+        root_resource_ref("producer", "value")
     }
 
     fn into_plan_errors(error: PlanPreparationError) -> Vec<carina_core::plan::PlanError> {
@@ -10637,7 +10672,7 @@ mod resolved_value_constraint_gate {
         producer_value: Value,
     ) -> (OverrideAwareResources, Vec<Resource>) {
         let producer = Resource::with_provider("test", "source", "producer", None)
-            .with_binding("producer")
+            .with_absolute_binding(absolute_binding("producer"))
             .with_attribute("value", producer_value);
         let resolved_attribute = if consumer_type == "consumer.Validated" {
             "tags"
@@ -10645,7 +10680,7 @@ mod resolved_value_constraint_gate {
             "target"
         };
         let consumer = Resource::with_provider("test", consumer_type, "consumer", None)
-            .with_binding("consumer")
+            .with_absolute_binding(absolute_binding("consumer"))
             .with_attribute(resolved_attribute, ref_value());
         let source = vec![producer, consumer];
         let compositions = Vec::<LiveComposition>::new();
@@ -10727,7 +10762,7 @@ mod resolved_value_constraint_gate {
                 attributes: IndexMap::new(),
                 pending_constraints: vec![constraint],
             },
-            binding: Some("checked".to_string()),
+            binding: Some(absolute_binding("checked")),
             dependency_bindings: BTreeSet::new(),
             module_name: "checked_module".to_string(),
             instance: "root.checked".to_string(),
@@ -10736,7 +10771,7 @@ mod resolved_value_constraint_gate {
         }
     }
 
-    fn not_bad(variable: &str) -> ValidateExpr {
+    fn not_bad(variable: &str) -> ValidateExpr<carina_core::resource::AbsoluteBindingAddress> {
         ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::Var(variable.to_string())),
             op: CompareOp::Ne,
@@ -10751,8 +10786,8 @@ mod resolved_value_constraint_gate {
         let wiring =
             ValidatedWiring::from_factories_for_test(vec![Box::new(ConstraintFactory)], &[]);
         let ctx = wiring.context();
-        let mut producer =
-            Resource::with_provider("test", "source", "producer", None).with_binding("producer");
+        let mut producer = Resource::with_provider("test", "source", "producer", None)
+            .with_absolute_binding(absolute_binding("producer"));
         for (name, value) in producer_values {
             producer.set_attr(name, value);
         }
@@ -10862,7 +10897,8 @@ mod resolved_value_constraint_gate {
     async fn still_unknown_reference_is_not_rejected() {
         let normalizer = RewritingNormalizer::default();
         let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
-            path: AccessPath::new("producer", "value"),
+            path: carina_core::resource::AuthoredAccessPath::new("producer", "value")
+                .resolve_root_for_test(),
         }));
 
         prepare_managed("consumer.Pattern", unknown, &normalizer)
@@ -10919,11 +10955,11 @@ mod resolved_value_constraint_gate {
             },
         )
         .unwrap();
-        let mut data_sources = vec![
+        let mut data_sources: Vec<DataSource> = vec![
             DataSource::with_provider("test", "lookup.Pattern", "lookup", None)
                 .with_attribute("target", text("bad")),
         ];
-        let data_source_origins = vec![
+        let data_source_origins: Vec<DataSource> = vec![
             DataSource::with_provider("test", "lookup.Pattern", "lookup", None)
                 .with_attribute("target", ref_value()),
         ];
@@ -11022,7 +11058,7 @@ exports { team_prefix: String = "x" }"#,
         )
         .unwrap();
 
-        let provider_config = ProviderConfig {
+        let provider_config: carina_core::parser::ExpandedProviderConfig = ProviderConfig {
             name: "test".to_string(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
@@ -11033,22 +11069,20 @@ exports { team_prefix: String = "x" }"#,
             binding: None,
         };
         let target = Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("net", "team_prefix"),
-            })),
+            InterpolationPart::Expr(root_resource_ref("net", "team_prefix")),
             InterpolationPart::Literal("-logs".into()),
         ]));
         let consumer = Resource::with_provider("test", "consumer.Pattern", "sink", None)
-            .with_binding("sink")
+            .with_absolute_binding(absolute_binding("sink"))
             .with_attribute("target", target);
         let unresolved_resources = vec![consumer.clone()];
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(provider_config);
         parsed.resources.push(consumer); // allow: direct — fixture test inspection
         parsed
             .upstream_states
             .push(carina_core::parser::UpstreamState {
-                binding: "net".to_string(),
+                binding: absolute_binding("net"),
                 source: std::path::PathBuf::from("../network"),
             });
 
@@ -11117,9 +11151,10 @@ exports { team_prefix: String = "x" }"#,
             message: "value must not be bad".to_string(),
         };
         let composition = pending_composition(vec![("value", text("bad"))], constraint);
-        let data_source = DataSource::with_provider("test", "lookup", "unrelated", None)
-            .with_attribute("query", text("literal"));
-        let provider_config = ProviderConfig {
+        let data_source: DataSource =
+            DataSource::with_provider("test", "lookup", "unrelated", None)
+                .with_attribute("query", text("literal"));
+        let provider_config: carina_core::parser::ExpandedProviderConfig = ProviderConfig {
             name: "test".to_string(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
@@ -11129,7 +11164,7 @@ exports { team_prefix: String = "x" }"#,
             unresolved_attributes: IndexMap::new(),
             binding: None,
         };
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(provider_config);
         parsed.compositions.push(composition);
         parsed.data_sources.push(data_source);
@@ -11192,12 +11227,7 @@ exports { team_prefix: String = "x" }"#,
         let mut composition = pending_composition(
             vec![
                 ("left", ref_value()),
-                (
-                    "right",
-                    Value::Deferred(DeferredValue::ResourceRef {
-                        path: AccessPath::new("producer", "other"),
-                    }),
-                ),
+                ("right", root_resource_ref("producer", "other")),
             ],
             constraint,
         );
@@ -11235,7 +11265,8 @@ exports { team_prefix: String = "x" }"#,
         };
         let mut composition = pending_composition(vec![("value", source.clone())], constraint);
         let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
-            path: AccessPath::new("producer", "value"),
+            path: carina_core::resource::AuthoredAccessPath::new("producer", "value")
+                .resolve_root_for_test(),
         }));
 
         prepare_composition(vec![("value", unknown)], &mut composition)

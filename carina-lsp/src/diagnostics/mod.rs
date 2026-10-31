@@ -18,8 +18,34 @@ use carina_core::parser::{
 use carina_core::provider::{
     HostErrorCause, ProviderError, ProviderFactory, SuspendedValidationId,
 };
-use carina_core::resource::{ConcreteValue, DeferredValue, Value};
+use carina_core::resource::{
+    AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
+    AuthoredValue as Value,
+};
 use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
+
+fn validate_authored_value(
+    attribute: &carina_core::schema::EffectiveAttribute<'_>,
+    value: &Value,
+) -> Result<(), TypeError> {
+    attribute.validate_in_phase(value)
+}
+
+fn check_deferred_access_type<B: carina_core::resource::BindingAddress>(
+    value: &carina_core::resource::Value<B>,
+    expected: TypeInSchema<'_>,
+    inference: &carina_core::validation::inference::InferenceBindings<B>,
+    schemas: &SchemaRegistry,
+    binding_index: &carina_core::binding_index::BindingIndex<'_, B>,
+) -> Result<(), carina_core::validation::DeferredAccessTypeError> {
+    carina_core::validation::check_deferred_access_type(
+        value,
+        expected,
+        inference,
+        schemas,
+        binding_index,
+    )
+}
 
 fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
     let text = doc.text();
@@ -725,14 +751,9 @@ impl DiagnosticEngine {
                     .as_ref()
                     .and_then(|result| result.directory.semantic_file(path))
             });
-            let export_value_bindings =
-                carina_core::binding_index::ResolvedBindings::for_validation(binding_input);
-            diagnostics.extend(self.check_user_function_ref_types(doc, parsed, &binding_index));
-            let expanded_compositions = match merged_result.as_ref() {
+            let expanded_graph = match merged_result.as_ref() {
                 Some(result) => match &result.module_resolution {
-                    checks::MergedModuleResolution::Expanded => {
-                        Some(result.directory.parsed.compositions.as_slice())
-                    }
+                    checks::MergedModuleResolution::Expanded { graph } => Some(graph.as_ref()),
                     checks::MergedModuleResolution::ConstraintFailed {
                         findings: _findings,
                         errors: _errors,
@@ -741,9 +762,66 @@ impl DiagnosticEngine {
                 },
                 None => None,
             };
+            let expanded_binding_use_report = expanded_graph.map(|graph| {
+                carina_core::validation::check_expanded_bare_binding_uses(
+                    graph,
+                    &carina_core::validation::ValidationTypeContext::new(
+                        graph,
+                        &self.schemas,
+                        &self.provider_context,
+                        &module_signatures,
+                    ),
+                )
+            });
+            if let Some(expanded_report) = expanded_binding_use_report.as_ref() {
+                for finding in expanded_report.resource_findings() {
+                    if binding_use_report
+                        .resource_findings()
+                        .any(|authored| authored == finding)
+                        || finding.use_site.source_file.path() != diagnostic_file
+                    {
+                        continue;
+                    }
+                    let Some(range) = parser_span_range(doc, finding.use_site.span) else {
+                        continue;
+                    };
+                    let severity = DiagnosticSeverity::ERROR;
+                    if let Some(type_error) = finding.error.type_error()
+                        && let Some(mut diagnostic) =
+                            build_enum_diagnostic_from_error(type_error, Some(range))
+                    {
+                        diagnostic.severity = Some(severity);
+                        diagnostics.push(diagnostic);
+                    } else {
+                        diagnostics.push(Diagnostic {
+                            range,
+                            severity: Some(severity),
+                            source: Some("carina".to_string()),
+                            message: finding.error.to_string(),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+            let export_value_bindings = expanded_graph.map_or_else(
+                || {
+                    let expanded = carina_core::module_resolver::expand_root_directory_file(
+                        binding_input.clone(),
+                    );
+                    carina_core::binding_index::ResolvedBindings::for_expanded_validation(&expanded)
+                },
+                carina_core::binding_index::ResolvedBindings::for_expanded_validation,
+            );
+            diagnostics.extend(self.check_user_function_ref_types(doc, parsed, &binding_index));
+            let expanded_compositions = expanded_graph.map(|graph| graph.compositions.as_slice());
+            let expanded_binding_index = expanded_graph.map(|graph| {
+                carina_core::binding_index::BindingIndex::from_parsed(graph, &self.schemas)
+            });
+            let expanded_inference_bindings =
+                expanded_graph.map(carina_core::validation::inference::bindings_from_parsed);
             let resolver_constraint_findings = match merged_result.as_ref() {
                 Some(result) => match &result.module_resolution {
-                    checks::MergedModuleResolution::Expanded => Vec::new(),
+                    checks::MergedModuleResolution::Expanded { .. } => Vec::new(),
                     checks::MergedModuleResolution::ConstraintFailed {
                         findings,
                         errors: _errors,
@@ -755,7 +833,7 @@ impl DiagnosticEngine {
             let residual_errors: &[carina_core::module_resolver::ResidualModuleResolutionError] =
                 match merged_result.as_ref() {
                     Some(result) => match &result.module_resolution {
-                        checks::MergedModuleResolution::Expanded => &[],
+                        checks::MergedModuleResolution::Expanded { .. } => &[],
                         checks::MergedModuleResolution::ConstraintFailed {
                             findings: _findings,
                             errors,
@@ -777,22 +855,38 @@ impl DiagnosticEngine {
                     reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
                 },
             );
-            let compositions = expanded_compositions.unwrap_or(&[]);
-            let expanded_binding_findings = match expanded_compositions {
-                Some(compositions) => carina_core::validation::check_expanded_module_calls(
-                    carina_core::validation::ExpandedModuleCallCheckInput::BindingUses {
-                        binding_use_report: &binding_use_report,
-                        compositions,
-                    },
-                ),
-                None => Vec::new(),
-            };
-            let expanded_reference_findings = carina_core::validation::check_expanded_module_calls(
-                carina_core::validation::ExpandedModuleCallCheckInput::References {
-                    compositions,
-                    bindings: &binding_index,
-                },
-            );
+            let expanded_binding_findings =
+                match (expanded_compositions, expanded_binding_use_report.as_ref()) {
+                    (Some(compositions), Some(expanded_report)) => {
+                        carina_core::validation::check_expanded_module_calls(
+                            carina_core::validation::ExpandedModuleCallCheckInput::BindingUses {
+                                binding_use_report: expanded_report,
+                                compositions,
+                            },
+                        )
+                    }
+                    (Some(compositions), None) => {
+                        let _expanded_compositions_without_report = compositions;
+                        Vec::new()
+                    }
+                    (None, Some(expanded_report)) => {
+                        let _expanded_report_without_compositions = expanded_report;
+                        Vec::new()
+                    }
+                    (None, None) => Vec::new(),
+                };
+            let expanded_reference_findings =
+                match (expanded_compositions, expanded_binding_index.as_ref()) {
+                    (Some(compositions), Some(bindings)) => {
+                        carina_core::validation::check_expanded_module_calls(
+                            carina_core::validation::ExpandedModuleCallCheckInput::References {
+                                compositions,
+                                bindings,
+                            },
+                        )
+                    }
+                    _ => Vec::new(),
+                };
             let findings = carina_core::validation::merge_module_call_findings([
                 authored_findings,
                 expanded_binding_findings,
@@ -831,11 +925,6 @@ impl DiagnosticEngine {
                     }
                 }
             };
-            let resolved_buffer_resources = resolved_buffer.as_ref().map(|resolved| {
-                resolved
-                    .iter_all_resources()
-                    .collect::<Vec<carina_core::parser::ResourceRef<'_>>>()
-            });
             let mut anonymous_resource_lines = HashMap::<(String, String), VecDeque<u32>>::new();
             if let Ok(spans) = carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
             {
@@ -848,17 +937,28 @@ impl DiagnosticEngine {
             }
             // Check resource types — include for-body template resources so
             // attribute/type/enum validation fires inside `for` loops too.
-            for (resource_index, rref) in parsed.iter_all_resources().enumerate() {
+            for rref in parsed.iter_all_resources() {
                 let ctx = rref.context();
                 // carina#3181: schema lookup routes by the typestate arm.
                 // The `id` / `attributes` / `quoted_string_attrs` reads
                 // below go through the shared `ResourceRef` accessors.
                 let resource_id = rref.id();
                 let resource_attributes = rref.attributes();
-                let resolved_resource_attributes = resolved_buffer_resources
+                let resolved_resource_attributes = resolved_buffer
                     .as_ref()
-                    .and_then(|resources| resources.get(resource_index))
-                    .map(carina_core::parser::ResourceRef::attributes);
+                    .and_then(|resolved| {
+                        resolved
+                            .iter_all_resources()
+                            .find(|candidate| candidate.id() == resource_id)
+                    })
+                    .map(|candidate| candidate.attributes());
+                let expanded_resource_attributes = expanded_graph
+                    .and_then(|expanded| {
+                        expanded
+                            .iter_all_resources()
+                            .find(|candidate| candidate.id() == resource_id)
+                    })
+                    .map(|candidate| candidate.attributes());
                 // Directory-aware semantic ASTs can expand a sibling-backed
                 // `for` before the buffer-only AST does, so positional
                 // resource indexes are not a stable join key. Named bindings
@@ -1214,12 +1314,11 @@ impl DiagnosticEngine {
                                 // for computed Access values. Callers do not
                                 // classify binding kinds independently.
                                 (_, value @ Value::Deferred(DeferredValue::Coalesce { .. })) => {
-                                    effective_attribute
-                                        .validate(value)
+                                    validate_authored_value(&effective_attribute, value)
                                         .err()
                                         .map(|error| error.with_attribute(attr_name).to_string())
                                         .or_else(|| {
-                                            carina_core::validation::check_deferred_access_type(
+                                            check_deferred_access_type(
                                                 value,
                                                 schema.type_in_schema(attr_schema.attr_type()),
                                                 &inference_bindings,
@@ -1236,20 +1335,37 @@ impl DiagnosticEngine {
                                         DeferredValue::ResourceRef { .. }
                                         | DeferredValue::Access(_),
                                     ),
-                                ) => carina_core::validation::check_deferred_access_type(
-                                    value,
-                                    schema.type_in_schema(attr_schema.attr_type()),
-                                    &inference_bindings,
-                                    &self.schemas,
-                                    &binding_index,
-                                )
+                                ) => match (
+                                    expanded_resource_attributes
+                                        .as_ref()
+                                        .and_then(|attributes| attributes.get(attr_name)),
+                                    expanded_inference_bindings.as_ref(),
+                                    expanded_binding_index.as_ref(),
+                                ) {
+                                    (Some(expanded_value), Some(inference), Some(bindings)) => {
+                                        check_deferred_access_type(
+                                            expanded_value,
+                                            schema.type_in_schema(attr_schema.attr_type()),
+                                            inference,
+                                            &self.schemas,
+                                            bindings,
+                                        )
+                                    }
+                                    _ => check_deferred_access_type(
+                                        value,
+                                        schema.type_in_schema(attr_schema.attr_type()),
+                                        &inference_bindings,
+                                        &self.schemas,
+                                        &binding_index,
+                                    ),
+                                }
                                 .err()
                                 .map(|error| error.to_string()),
                                 (_, Value::Deferred(DeferredValue::BindingRef { binding })) => {
                                     check_resource_ref_type_mismatch(
                                         &binding_index,
                                         schema.type_in_schema(attr_schema.attr_type()),
-                                        binding.as_str().into(),
+                                        binding.as_str(),
                                     )
                                 }
                                 (
@@ -1263,7 +1379,7 @@ impl DiagnosticEngine {
                                 ) => check_resource_ref_type_mismatch(
                                     &binding_index,
                                     schema.type_in_schema(attr_schema.attr_type()),
-                                    name.as_str().into(),
+                                    name,
                                 ),
                                 // Enum: the structured-payload path
                                 // above handles `InvalidEnumVariant` /
@@ -1276,16 +1392,19 @@ impl DiagnosticEngine {
                                 // plain message so the user still sees a
                                 // diagnostic, just without the quick-fix.
                                 (carina_core::schema::Shape::Enum { .. }, value) => {
-                                    effective_attribute.validate(value).err().map(|e| {
-                                        let tagged = e.with_attribute(attr_name);
-                                        let reshaped =
-                                            if resource_quoted_string_attrs.contains(attr_name) {
+                                    validate_authored_value(&effective_attribute, value)
+                                        .err()
+                                        .map(|e| {
+                                            let tagged = e.with_attribute(attr_name);
+                                            let reshaped = if resource_quoted_string_attrs
+                                                .contains(attr_name)
+                                            {
                                                 tagged.into_string_literal_diagnostic()
                                             } else {
                                                 tagged
                                             };
-                                        reshaped.to_string()
-                                    })
+                                            reshaped.to_string()
+                                        })
                                 }
                                 // The shared whole-schema pass below validates identified
                                 // scalars with the owner-bound lookup. Doing it here as well
@@ -1324,8 +1443,7 @@ impl DiagnosticEngine {
                                     Some(carina_core::schema::Shape::Struct { .. })
                                 ) =>
                                 {
-                                    effective_attribute
-                                        .validate(attr_value)
+                                    validate_authored_value(&effective_attribute, attr_value)
                                         .err()
                                         .map(|e| e.with_attribute(attr_name).to_string())
                                 }
@@ -1333,8 +1451,7 @@ impl DiagnosticEngine {
                                 (
                                     carina_core::schema::Shape::Map { .. },
                                     Value::Concrete(ConcreteValue::Map(_)),
-                                ) => effective_attribute
-                                    .validate(attr_value)
+                                ) => validate_authored_value(&effective_attribute, attr_value)
                                     .err()
                                     .map(|e| e.with_attribute(attr_name).to_string()),
                                 // Validate Union static values (non-ResourceRef, non-BindingRef).
@@ -1350,18 +1467,24 @@ impl DiagnosticEngine {
                                             | Value::Deferred(DeferredValue::Coalesce { .. })
                                     ) =>
                                 {
-                                    effective_attribute.validate(value).err().and_then(|error| {
-                                        let tagged = error.with_attribute(attr_name);
-                                        if let Some(diagnostic) = build_enum_diagnostic_from_error(
-                                            &tagged,
-                                            self.find_attribute_value_range(doc, attr_name, scope),
-                                        ) {
-                                            diagnostics.push(diagnostic);
-                                            None
-                                        } else {
-                                            Some(tagged.to_string())
-                                        }
-                                    })
+                                    validate_authored_value(&effective_attribute, value)
+                                        .err()
+                                        .and_then(|error| {
+                                            let tagged = error.with_attribute(attr_name);
+                                            if let Some(diagnostic) =
+                                                build_enum_diagnostic_from_error(
+                                                    &tagged,
+                                                    self.find_attribute_value_range(
+                                                        doc, attr_name, scope,
+                                                    ),
+                                                )
+                                            {
+                                                diagnostics.push(diagnostic);
+                                                None
+                                            } else {
+                                                Some(tagged.to_string())
+                                            }
+                                        })
                                 }
                                 _ => None,
                             };
@@ -1552,6 +1675,7 @@ impl DiagnosticEngine {
                 doc,
                 parsed,
                 &semantic_view,
+                expanded_graph,
                 &export_value_bindings,
             ));
 
@@ -2063,7 +2187,7 @@ fn build_enum_diagnostic(
     is_quoted_literal: bool,
     value_range: Option<tower_lsp::lsp_types::Range>,
 ) -> Option<Diagnostic> {
-    let err = effective_attribute.validate(attr_value).err()?;
+    let err = validate_authored_value(effective_attribute, attr_value).err()?;
     let tagged = err.with_attribute(attr_name);
     // Reshape into the shape-mismatch diagnostic when the value came
     // from a quoted string literal — mirrors CLI behavior (#2094).
@@ -2097,8 +2221,10 @@ pub(super) fn build_enum_diagnostic_from_error(
 fn check_resource_ref_type_mismatch(
     binding_index: &carina_core::binding_index::BindingIndex<'_>,
     expected: TypeInSchema<'_>,
-    path: carina_core::resource::ReferencePathRef<'_>,
+    binding_name: &str,
 ) -> Option<String> {
+    let binding = carina_core::resource::RelativeBindingName::new(binding_name);
+    let path = carina_core::resource::ReferencePathRef::from(&binding);
     let carina_core::binding_index::RefType::Typed(source) = binding_index.ref_type(path) else {
         return None;
     };

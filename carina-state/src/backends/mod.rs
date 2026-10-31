@@ -91,11 +91,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_unsupported_backend() {
-        let config = carina_core::parser::BackendConfig {
-            backend_type: "unsupported".to_string(),
-            attributes: HashMap::new(),
-            attribute_spans: HashMap::new(),
-        };
+        let config: carina_core::parser::BackendConfig<carina_core::resource::RelativeBindingName> =
+            carina_core::parser::BackendConfig {
+                backend_type: "unsupported".to_string(),
+                attributes: HashMap::new(),
+                attribute_spans: HashMap::new(),
+            };
 
         let error = BackendConfig::try_from(&config).unwrap_err();
         let error = BackendError::from(error);

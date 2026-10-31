@@ -1,6 +1,6 @@
 //! `keys(map)` and `values(map)` built-in functions
 
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{BindingAddress, ConcreteValue, Value};
 
 use super::value_type_name;
 
@@ -14,7 +14,7 @@ use super::value_type_name;
 /// keys({b: 2, a: 1})  // => ["a", "b"]
 /// keys({})             // => []
 /// ```
-pub(crate) fn builtin_keys(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_keys<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
     if args.len() != 1 {
         return Err(format!("keys() expects 1 argument, got {}", args.len()));
     }
@@ -46,7 +46,7 @@ pub(crate) fn builtin_keys(args: &[Value]) -> Result<Value, String> {
 /// values({b: 2, a: 1})  // => [1, 2]
 /// values({})             // => []
 /// ```
-pub(crate) fn builtin_values(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_values<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
     if args.len() != 1 {
         return Err(format!("values() expects 1 argument, got {}", args.len()));
     }
@@ -71,7 +71,7 @@ mod tests {
     use indexmap::IndexMap;
 
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::{ConcreteValue, Value};
+    use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
 
     #[test]
     fn keys_basic() {
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn keys_wrong_arg_count_zero() {
-        let result = evaluate_builtin("keys", &[]);
+        let result: Result<Value, String> = evaluate_builtin("keys", &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 1 argument"));
     }
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn values_wrong_arg_count_zero() {
-        let result = evaluate_builtin("values", &[]);
+        let result: Result<Value, String> = evaluate_builtin("values", &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 1 argument"));
     }

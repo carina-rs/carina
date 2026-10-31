@@ -293,15 +293,15 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
     let provider_context = ProviderContext::default();
     let loaded = load_configuration_with_config(&caller, &provider_context, &SchemaRegistry::new())
         .expect("load should succeed");
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
 
     // `load_configuration_with_config` does not run nested module
     // expansion; the CLI command pipeline calls it after validate.
     // Drive it explicitly here so the post-expansion shape (RolePolicy
     // in `resources`, `_virtual.bs.bootstrap` in `compositions`)
     // is in place for the assertion below.
-    carina_core::module_resolver::resolve_modules_with_config(
-        &mut parsed,
+    let parsed = carina_core::module_resolver::resolve_modules_with_config(
+        parsed,
         &caller,
         &provider_context,
         &SchemaRegistry::new(),
@@ -318,10 +318,9 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
         "RolePolicy must be present after expansion",
     );
     assert!(
-        parsed
-            .compositions
-            .iter()
-            .any(|v| v.binding.as_deref() == Some("bs.bootstrap")),
+        parsed.compositions.iter().any(|v| {
+            v.binding.as_ref().map(|binding| binding.as_str()) == Some("bs.bootstrap")
+        }),
         "composition `bs.bootstrap` must be present after expansion",
     );
 

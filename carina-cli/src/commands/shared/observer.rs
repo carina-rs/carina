@@ -274,6 +274,10 @@ mod tests {
         ResolvedResource::new(resource)
     }
 
+    fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(name)
+    }
+
     fn dummy_create_effect() -> Effect {
         Effect::Create(resolved(Resource::new("aws.s3.Bucket", "demo")))
     }
@@ -298,7 +302,7 @@ mod tests {
             identifier: crate::fixture_applied_identifier("mock-id"),
             generation,
             directives: Default::default(),
-            binding: Some("same".to_string()),
+            binding: Some(absolute_binding("same")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),

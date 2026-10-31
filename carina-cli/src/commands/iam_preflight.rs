@@ -954,9 +954,16 @@ mod tests {
                 resource_type: "aws.route53.RecordSet".to_string(),
                 attributes: Default::default(),
                 target: carina_core::parser::DeferredForTarget::Bound {
-                    binding: "validation_records".to_string(),
+                    binding: carina_core::resource::absolute_binding_address_for_test(
+                        "validation_records",
+                    ),
                 },
-                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                iterable: carina_core::resource::AuthoredValue::resource_ref(
+                    "cert",
+                    "domain_validation_options",
+                    Vec::new(),
+                )
+                .resolve_root_for_test(),
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),

@@ -244,10 +244,22 @@ fn run_tui<A>(
 mod tests {
     use super::*;
     use carina_core::effect::Effect;
-    use carina_core::resource::{ResolvedResource, Resource};
+    use carina_core::resource::{
+        AbsoluteBindingAddress, ExpandedResource as Resource, ExpandedValue as Value,
+        ResolvedResource,
+    };
 
     fn create(resource: Resource) -> Effect {
         Effect::Create(ResolvedResource::new(resource))
+    }
+
+    fn absolute(binding: &str) -> AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(binding)
+    }
+
+    fn root_ref(binding: &str, attribute: &str) -> Value {
+        carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
+            .resolve_root_for_test()
     }
 
     fn make_app() -> App {
@@ -297,22 +309,15 @@ mod tests {
     fn make_search_app() -> App {
         let mut plan = Plan::new();
         plan.add(create(
-            Resource::new("s3.Bucket", "my-bucket").with_binding("bucket"),
+            Resource::new("s3.Bucket", "my-bucket").with_absolute_binding(absolute("bucket")),
         ));
         plan.add(create(
-            Resource::new("ec2.Vpc", "my-vpc").with_binding("vpc"),
+            Resource::new("ec2.Vpc", "my-vpc").with_absolute_binding(absolute("vpc")),
         ));
         plan.add(create(
             Resource::new("ec2.Subnet", "my-subnet")
-                .with_binding("subnet")
-                .with_attribute(
-                    "vpc_id",
-                    carina_core::resource::Value::resource_ref(
-                        "vpc".to_string(),
-                        "vpc_id".to_string(),
-                        vec![],
-                    ),
-                ),
+                .with_absolute_binding(absolute("subnet"))
+                .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
         ));
         App::for_plan(&plan, &SchemaRegistry::new())
     }
@@ -505,14 +510,16 @@ mod tests {
     fn make_provider_prefixed_app() -> App {
         let mut plan = Plan::new();
         plan.add(create(
-            Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_binding("vpc"),
+            Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None)
+                .with_absolute_binding(absolute("vpc")),
         ));
         plan.add(create(
             Resource::with_provider("awscc", "ec2.Subnet", "my-subnet", None)
-                .with_binding("subnet"),
+                .with_absolute_binding(absolute("subnet")),
         ));
         plan.add(create(
-            Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None).with_binding("bucket"),
+            Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None)
+                .with_absolute_binding(absolute("bucket")),
         ));
         App::for_plan(&plan, &SchemaRegistry::new())
     }

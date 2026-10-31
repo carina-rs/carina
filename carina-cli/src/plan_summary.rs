@@ -1,5 +1,5 @@
 use carina_core::effect::Effect;
-use carina_core::parser::DeferredForExpression;
+use carina_core::parser::ExpandedDeferredForExpression;
 use carina_core::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan, PlanSummaryPart};
 
 use crate::commands::plan::ExportChange;
@@ -38,7 +38,7 @@ pub struct PlanChangeSummary {
     text_parts: Vec<PlanSummaryPart>,
     deferred_effects: Vec<DeferredSummaryEntry>,
     export_changes: Vec<ExportChange>,
-    residual_deferred_for: Vec<DeferredForExpression>,
+    residual_deferred_for: Vec<ExpandedDeferredForExpression>,
     has_plan_effects: bool,
 }
 
@@ -46,7 +46,7 @@ impl PlanChangeSummary {
     pub fn new<S>(
         plan: &Plan<S>,
         export_changes: &[ExportChange],
-        residual_deferred_for: &[DeferredForExpression],
+        residual_deferred_for: &[ExpandedDeferredForExpression],
     ) -> Self {
         let plan_summary = plan.summary();
         let resume_create = plan
@@ -130,7 +130,7 @@ impl PlanChangeSummary {
         &self.export_changes
     }
 
-    pub(crate) fn residual_deferred_for(&self) -> &[DeferredForExpression] {
+    pub(crate) fn residual_deferred_for(&self) -> &[ExpandedDeferredForExpression] {
         &self.residual_deferred_for
     }
 }
@@ -138,24 +138,29 @@ impl PlanChangeSummary {
 #[cfg(test)]
 mod tests {
     use carina_core::effect::Effect;
-    use carina_core::parser::{DeferredForExpression, ForBinding};
+    use carina_core::parser::{ExpandedDeferredForExpression, ForBinding};
     use carina_core::plan::Plan;
     use carina_core::resource::{ConcreteValue, DataSource, ResolvedDataSource, Resource, Value};
 
     use super::PlanChangeSummary;
     use crate::commands::plan::ExportChange;
 
-    fn residual_deferred_for() -> DeferredForExpression {
-        DeferredForExpression {
+    fn residual_deferred_for() -> ExpandedDeferredForExpression {
+        ExpandedDeferredForExpression {
             file: None,
             line: 1,
             header: "for item in upstream.items".to_string(),
             resource_type: "test.Widget".to_string(),
             attributes: Vec::new(),
             target: carina_core::parser::DeferredForTarget::Bound {
-                binding: "widgets".to_string(),
+                binding: carina_core::resource::absolute_binding_address_for_test("widgets"),
             },
-            iterable: Value::resource_ref("upstream", "items", Vec::new()),
+            iterable: carina_core::resource::AuthoredValue::resource_ref(
+                "upstream",
+                "items",
+                Vec::new(),
+            )
+            .resolve_root_for_test(),
             binding: ForBinding::Simple("item".to_string()),
             template_resource: Resource::new("test.Widget", "widgets"),
         }

@@ -7,9 +7,10 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use crate::parser::{
-    ModuleCallDiagnosticSource, ParseError, ParsedFile, ProviderContext, UseStatement,
+    ModuleCallDiagnosticSource, ParseError, ParsedFile, ProviderContext, ResolveExportBindingPhase,
+    UseStatement,
 };
-use crate::resource::ModuleConstraintId;
+use crate::resource::{AbsoluteBindingAddress, ModuleConstraintId, RelativeBindingName, RootScope};
 use crate::schema::SchemaRegistry;
 
 use super::error::{ModuleError, ModuleErrorCallSource};
@@ -73,7 +74,7 @@ pub type ModuleCallConstraintReports = Vec<ModuleCallConstraintReport>;
 /// scratch graph that produced them.
 pub enum ModuleResolutionDiagnosticResult<E> {
     Expanded {
-        graph: Box<crate::parser::File<E>>,
+        graph: Box<crate::parser::File<E, AbsoluteBindingAddress>>,
     },
     ConstraintFailed {
         findings: Vec<crate::validation::ModuleCallFinding>,
@@ -618,7 +619,7 @@ pub(super) struct RefCheckWitness(pub(super) ());
 
 /// Compile-time policy for resolving type annotations in loaded modules.
 pub(crate) trait TypeResolutionPolicy {
-    fn resolve_file_type_exprs<E: crate::parser::ExportParamLike>(
+    fn resolve_file_type_exprs<E: crate::parser::ExportParamLike<Binding = RelativeBindingName>>(
         parsed: &mut crate::parser::File<E>,
         config: &ProviderContext,
     ) -> Result<(), ModuleError>;
@@ -628,7 +629,7 @@ pub(crate) trait TypeResolutionPolicy {
 pub(crate) struct StrictTypeResolution;
 
 impl TypeResolutionPolicy for StrictTypeResolution {
-    fn resolve_file_type_exprs<E: crate::parser::ExportParamLike>(
+    fn resolve_file_type_exprs<E: crate::parser::ExportParamLike<Binding = RelativeBindingName>>(
         parsed: &mut crate::parser::File<E>,
         config: &ProviderContext,
     ) -> Result<(), ModuleError> {
@@ -650,7 +651,7 @@ impl TypeResolutionPolicy for StrictTypeResolution {
 struct DeferredUpstreamTypeResolution;
 
 impl TypeResolutionPolicy for DeferredUpstreamTypeResolution {
-    fn resolve_file_type_exprs<E: crate::parser::ExportParamLike>(
+    fn resolve_file_type_exprs<E: crate::parser::ExportParamLike<Binding = RelativeBindingName>>(
         parsed: &mut crate::parser::File<E>,
         config: &ProviderContext,
     ) -> Result<(), ModuleError> {
@@ -775,7 +776,9 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     /// Resource/provider validation may be skipped by a command, but the
     /// BindingIndex reference relation at module and function boundaries may
     /// not be skipped.
-    fn validate_reference_types<E: crate::parser::ExportParamLike>(
+    fn validate_reference_types<
+        E: crate::parser::ExportParamLike<Binding = RelativeBindingName>,
+    >(
         &self,
         parsed: &crate::parser::File<E>,
     ) -> Result<RefCheckWitness, ModuleError> {
@@ -1002,9 +1005,8 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
 
     /// Resolve nested module imports within a parsed module.
     ///
-    /// This processes the module's own imports and module_calls, expanding any
-    /// nested modules recursively. Cycle detection is handled by the `resolving`
-    /// set in `load_module()`.
+    /// This loads and validates the module's own imports without expanding
+    /// them. Expansion happens later with the caller's concrete composed scope.
     fn resolve_nested_modules(
         &mut self,
         parsed: &mut ParsedFile,
@@ -1027,55 +1029,14 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             return Err(e);
         }
 
-        let ref_check = match self.validate_reference_types(parsed) {
-            Ok(witness) => witness,
+        match self.validate_reference_types(parsed) {
+            Ok(_) => {}
             Err(error) => {
                 self.base_dir = original_base_dir;
                 self.imported_modules = original_imported;
                 self.module_paths = original_paths;
                 return Err(error);
             }
-        };
-
-        // Expand the module's own module_calls. `module_calls` is cloned
-        // because the loop body now folds the contribution in via
-        // `merge_parsed_file(parsed, …)` — a
-        // whole-`&mut parsed` borrow that conflicts with any live
-        // immutable borrow of a `parsed` field (the old per-field
-        // `.extend()` only needed a disjoint field borrow; the single
-        // merge surface needs the whole struct).
-        let module_calls = parsed.module_calls.clone();
-        let signatures = self.resolved_module_signatures();
-        let binding_index = crate::binding_index::BindingIndex::from_parsed_with_module_signatures(
-            parsed,
-            self.schemas,
-            &signatures,
-        );
-        let resolved_bindings = crate::binding_index::ResolvedBindings::for_validation(parsed);
-        let mut expanded_calls = Vec::with_capacity(module_calls.len());
-        for call in &module_calls {
-            let instance_prefix = instance_prefix_for_call(call);
-            match self.expand_module_call_checked(
-                call,
-                &instance_prefix,
-                &ref_check,
-                Some(&binding_index),
-                Some(&resolved_bindings),
-            ) {
-                Ok(expanded) => expanded_calls.push(expanded),
-                Err(e) => {
-                    self.base_dir = original_base_dir;
-                    self.imported_modules = original_imported;
-                    self.module_paths = original_paths;
-                    return Err(e);
-                }
-            }
-        }
-        drop(binding_index);
-        for expanded in expanded_calls {
-            // The module contribution is a `ParsedFile`; fold it in via the
-            // one shared merge surface so no field can be silently dropped.
-            crate::config_loader::merge_parsed_file(parsed, expanded);
         }
 
         // Restore original state
@@ -1087,7 +1048,9 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     }
 }
 
-impl<'parsed, 'cfg, E: crate::parser::ExportParamLike> RefCheckedModuleGraph<'parsed, 'cfg, E> {
+impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<Binding = RelativeBindingName>>
+    RefCheckedModuleGraph<'parsed, 'cfg, E>
+{
     /// Load the complete reachable module graph and validate every reference
     /// boundary before making expansion available.
     pub fn check(
@@ -1114,12 +1077,25 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike> RefCheckedModuleGraph<'pa
     }
 
     /// Consume the checked graph and expand its root configuration.
-    pub fn expand(mut self) -> Result<(), ModuleError> {
-        resolve_modules_with_resolver(self.parsed, &mut self.resolver, &self.root_witness)
+    pub fn expand(
+        mut self,
+    ) -> Result<crate::parser::File<E::Absolute, AbsoluteBindingAddress>, ModuleError>
+    where
+        E: ResolveExportBindingPhase,
+    {
+        let root = root_expansion_scope();
+        let contributions = resolve_modules_with_resolver(
+            self.parsed,
+            &mut self.resolver,
+            &self.root_witness,
+            &root,
+        )?;
+        let parsed = std::mem::take(self.parsed);
+        Ok(finish_root_expansion(parsed, contributions, &root))
     }
 }
 
-impl<'parsed, 'cfg, E: crate::parser::ExportParamLike>
+impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<Binding = RelativeBindingName>>
     UpstreamRefCheckedModuleGraph<'parsed, 'cfg, E>
 {
     /// The sole constructor for the upstream-only, unknown-type-deferring
@@ -1142,16 +1118,60 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike>
         })
     }
 
-    fn expand(mut self) -> Result<(), ModuleError> {
-        resolve_modules_with_resolver(self.parsed, &mut self.resolver, &self.root_witness)
+    fn expand(
+        mut self,
+    ) -> Result<crate::parser::File<E::Absolute, AbsoluteBindingAddress>, ModuleError>
+    where
+        E: ResolveExportBindingPhase,
+    {
+        let root = root_expansion_scope();
+        let contributions = resolve_modules_with_resolver(
+            self.parsed,
+            &mut self.resolver,
+            &self.root_witness,
+            &root,
+        )?;
+        let parsed = std::mem::take(self.parsed);
+        Ok(finish_root_expansion(parsed, contributions, &root))
     }
+}
+
+fn finish_root_expansion<E: ResolveExportBindingPhase>(
+    parsed: crate::parser::File<E>,
+    contributions: Vec<crate::parser::ExpandedParsedFile>,
+    root: &RootScope,
+) -> crate::parser::File<E::Absolute, AbsoluteBindingAddress> {
+    let mut expanded = parsed.resolve_root(root);
+    for contribution in contributions {
+        crate::config_loader::merge_parsed_file(
+            &mut expanded,
+            crate::config_loader::relabel_export_phase(contribution),
+        );
+    }
+    expanded
+}
+
+fn root_expansion_scope() -> RootScope {
+    RootScope::new()
+}
+
+/// Cross the root-directory binding phase without loading module calls.
+///
+/// Callers use this only when module expansion is intentionally unavailable
+/// (for example, diagnostics that must continue after a module-boundary
+/// error). The root scope remains owned by this expansion entry point.
+pub fn expand_root_directory_file<E: ResolveExportBindingPhase>(
+    parsed: crate::parser::File<E>,
+) -> crate::parser::File<E::Absolute, AbsoluteBindingAddress> {
+    let root = root_expansion_scope();
+    finish_root_expansion(parsed, Vec::new(), &root)
 }
 
 /// Resolve all modules in a parsed file
 pub fn resolve_modules(
-    parsed: &mut crate::parser::ParsedFile,
+    parsed: crate::parser::ParsedFile,
     base_dir: &Path,
-) -> Result<(), ModuleError> {
+) -> Result<crate::parser::ExpandedParsedFile, ModuleError> {
     resolve_modules_with_config(
         parsed,
         base_dir,
@@ -1160,31 +1180,54 @@ pub fn resolve_modules(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn resolve_modules_authored_for_test(
+    parsed: &mut crate::parser::ParsedFile,
+    base_dir: &Path,
+) -> Result<crate::parser::ExpandedParsedFile, ModuleError> {
+    resolve_modules_authored_with_config_for_test(
+        parsed,
+        base_dir,
+        &ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_modules_authored_with_config_for_test(
+    parsed: &mut crate::parser::ParsedFile,
+    base_dir: &Path,
+    config: &ProviderContext,
+    schemas: &SchemaRegistry,
+) -> Result<crate::parser::ExpandedParsedFile, ModuleError> {
+    RefCheckedModuleGraph::check(parsed, base_dir, config, schemas)?.expand()
+}
+
 /// Resolve all modules in a parsed file with the given parser configuration.
 ///
 /// Generic over the export-parameter shape so callers can pass either
 /// `ParsedFile` (parser phase) or `InferredFile` (post-loader phase) —
 /// the resolver only touches `uses`, `module_calls`, and `resources`.
-pub fn resolve_modules_with_config<E: crate::parser::ExportParamLike>(
-    parsed: &mut crate::parser::File<E>,
+pub fn resolve_modules_with_config<E: ResolveExportBindingPhase>(
+    mut parsed: crate::parser::File<E>,
     base_dir: &Path,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
-) -> Result<(), ModuleError> {
-    RefCheckedModuleGraph::check(parsed, base_dir, config, schemas)?.expand()
+) -> Result<crate::parser::File<E::Absolute, AbsoluteBindingAddress>, ModuleError> {
+    RefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas)?.expand()
 }
 
 /// Expand an upstream project's modules using the consumer's necessarily
 /// partial provider context. Unresolvable custom type names remain unchecked;
 /// all concrete value and liftable boundary mismatches still use the normal
 /// witness and shared value checker.
-pub(crate) fn resolve_upstream_modules_with_config<E: crate::parser::ExportParamLike>(
-    parsed: &mut crate::parser::File<E>,
+pub(crate) fn resolve_upstream_modules_with_config<E: ResolveExportBindingPhase>(
+    mut parsed: crate::parser::File<E>,
     base_dir: &Path,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
-) -> Result<(), ModuleError> {
-    UpstreamRefCheckedModuleGraph::check(parsed, base_dir, config, schemas)?.expand()
+) -> Result<crate::parser::File<E::Absolute, AbsoluteBindingAddress>, ModuleError> {
+    UpstreamRefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas)?.expand()
 }
 
 /// Resolve modules while retaining the expander's own per-call constraint
@@ -1193,28 +1236,36 @@ pub(crate) fn resolve_upstream_modules_with_config<E: crate::parser::ExportParam
 /// `covered_findings` are typed source diagnostics the caller will publish.
 /// Residuals returned from this seam have those call-owned errors removed,
 /// including individual covered members of a mixed reference-type failure.
-pub fn resolve_modules_with_diagnostics<E: crate::parser::ExportParamLike + Clone>(
+pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase + Clone>(
     parsed: &crate::parser::File<E>,
     base_dir: &Path,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
     covered_findings: &[crate::validation::ModuleCallFinding],
-) -> ModuleResolutionDiagnosticResult<E> {
-    let mut graph = parsed.clone();
+) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+    let graph = parsed.clone();
     let mut resolver = ModuleResolver::with_constraint_reports(base_dir, config, schemas);
+    let root = root_expansion_scope();
     let mut errors = resolver.process_imports_collecting(&graph.uses, &graph.module_calls);
+    let mut contributions = Vec::new();
     match resolver.validate_reference_types(&graph) {
-        Ok(root_witness) => errors.extend(resolve_modules_with_resolver_collecting(
-            &mut graph,
-            &mut resolver,
-            &root_witness,
-        )),
+        Ok(root_witness) => {
+            let (expanded, expansion_errors) = resolve_modules_with_resolver_collecting(
+                &graph,
+                &mut resolver,
+                &root_witness,
+                &root,
+            );
+            contributions = expanded;
+            errors.extend(expansion_errors);
+        }
         Err(error) => errors.push(error),
     }
     let constraint_reports = resolver
         .constraint_reports
         .into_inner()
         .expect("diagnostic resolver always records constraint reports");
+    let graph = finish_root_expansion(graph, contributions, &root);
     let findings = crate::validation::check_expanded_module_calls(
         crate::validation::ExpandedModuleCallCheckInput::Constraints {
             compositions: &graph.compositions,
@@ -1238,10 +1289,11 @@ pub fn resolve_modules_with_diagnostics<E: crate::parser::ExportParamLike + Clon
 }
 
 fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
-    parsed: &mut crate::parser::File<E>,
+    parsed: &crate::parser::File<E>,
     resolver: &mut ModuleResolver<'_, P>,
     ref_check: &RefCheckWitness,
-) -> Vec<ModuleError> {
+    root: &RootScope,
+) -> (Vec<crate::parser::ExpandedParsedFile>, Vec<ModuleError>) {
     let module_calls = parsed.module_calls.clone();
     let signatures = resolver.resolved_module_signatures();
     let binding_index = crate::binding_index::BindingIndex::from_parsed_with_module_signatures(
@@ -1249,7 +1301,8 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
         resolver.schemas,
         &signatures,
     );
-    let resolved_bindings = crate::binding_index::ResolvedBindings::for_validation(parsed);
+    let resolved_bindings =
+        crate::binding_index::ResolvedBindings::for_root_validation(parsed, root);
     let mut expanded_calls = Vec::with_capacity(module_calls.len());
     let mut errors = Vec::new();
     for call in &module_calls {
@@ -1262,67 +1315,56 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
             continue;
         }
         let instance_prefix = instance_prefix_for_call(call);
+        let expanded_call = call
+            .clone()
+            .resolve_bindings(&mut |binding| root.resolve(binding));
         match resolver.expand_module_call_checked(
             call,
+            &expanded_call,
             &instance_prefix,
             ref_check,
             Some(&binding_index),
             Some(&resolved_bindings),
         ) {
-            Ok(expanded) => {
-                expanded_calls.push(crate::config_loader::relabel_export_phase(expanded));
-            }
+            Ok(expanded) => expanded_calls.push(expanded),
             Err(error) => errors.push(error),
         }
     }
-    drop(binding_index);
-    for expanded in expanded_calls {
-        crate::config_loader::merge_parsed_file(parsed, expanded);
-    }
-    errors
+    (expanded_calls, errors)
 }
 
 fn resolve_modules_with_resolver<E, P: TypeResolutionPolicy>(
-    parsed: &mut crate::parser::File<E>,
+    parsed: &crate::parser::File<E>,
     resolver: &mut ModuleResolver<'_, P>,
     ref_check: &RefCheckWitness,
-) -> Result<(), ModuleError> {
-    // Expand module calls. `module_calls` is cloned because the loop
-    // body folds each contribution in via `merge_parsed_file(parsed,
-    // …)`, a whole-`&mut parsed` borrow that conflicts with iterating
-    // `&parsed.module_calls` in place.
-    let module_calls = parsed.module_calls.clone();
+    root: &RootScope,
+) -> Result<Vec<crate::parser::ExpandedParsedFile>, ModuleError> {
+    let module_calls = &parsed.module_calls;
     let signatures = resolver.resolved_module_signatures();
     let binding_index = crate::binding_index::BindingIndex::from_parsed_with_module_signatures(
         parsed,
         resolver.schemas,
         &signatures,
     );
-    let resolved_bindings = crate::binding_index::ResolvedBindings::for_validation(parsed);
+    let resolved_bindings =
+        crate::binding_index::ResolvedBindings::for_root_validation(parsed, root);
     let mut expanded_calls = Vec::with_capacity(module_calls.len());
-    for call in &module_calls {
+    for call in module_calls {
         let instance_prefix = instance_prefix_for_call(call);
+        let expanded_call = call
+            .clone()
+            .resolve_bindings(&mut |binding| root.resolve(binding));
         let expanded = resolver.expand_module_call_checked(
             call,
+            &expanded_call,
             &instance_prefix,
             ref_check,
             Some(&binding_index),
             Some(&resolved_bindings),
         )?;
-        // `expand_module_call` returns a parser-phase `ParsedFile`;
-        // this caller's `parsed` is a generic `File<E>` (the CLI
-        // validate path passes an `InferredFile`). Relabel the
-        // export-param-free contribution to the target phase, then
-        // fold it in via the one shared merge surface so no field can
-        // be silently dropped here (carina#3126 / carina#3061).
-        expanded_calls.push(crate::config_loader::relabel_export_phase(expanded));
+        expanded_calls.push(expanded);
     }
-    drop(binding_index);
-    for expanded in expanded_calls {
-        crate::config_loader::merge_parsed_file(parsed, expanded);
-    }
-
-    Ok(())
+    Ok(expanded_calls)
 }
 
 #[cfg(test)]

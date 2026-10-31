@@ -14,8 +14,9 @@ use crate::plan::{
 };
 use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult};
 use crate::resource::{
-    ConcreteValue, Current, DataSource, Directives, PlanInputCurrent, ResolvedDataSource,
-    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, Directives, PlanInputCurrent,
+    ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
+    ResourceIdentity, State, Value,
 };
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL,
@@ -93,7 +94,7 @@ fn cascade_ref_hint(value: &Value, target_binding: &str) -> Option<String> {
     }
 
     value.visit_binding_refs(&mut |binding| {
-        if hit.is_none() && binding == target_binding {
+        if hit.is_none() && binding.as_str() == target_binding {
             hit = Some(binding.to_string());
         }
     });
@@ -153,7 +154,8 @@ pub fn generate_temporary_name(
                 resource_type: resource.id.display_type(),
                 resource_identity: resource
                     .binding
-                    .clone()
+                    .as_ref()
+                    .map(ToString::to_string)
                     .unwrap_or_else(|| resource.id.identity_display().to_string()),
             }
             .into());
@@ -315,7 +317,7 @@ pub fn create_plan(
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    wait_bindings: &[WaitBinding],
+    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
 ) -> ProviderResult<Plan> {
     let managed_current = prior_states.materialize_current_states(managed, registry);
     let mut build = create_plan_parts(
@@ -345,7 +347,7 @@ pub fn create_plan_with_cascades(
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    wait_bindings: &[WaitBinding],
+    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
 ) -> ProviderResult<Plan> {
     let managed_current = prior_states.materialize_current_states(managed, registry);
     let mut build = create_plan_parts(
@@ -386,7 +388,7 @@ fn create_plan_parts(
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphans: &super::Orphans,
-    wait_bindings: &[WaitBinding],
+    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
 ) -> ProviderResult<PlanBuild> {
     let mut plan = Plan::new();
     let mut pending_replaces = HashMap::new();
@@ -550,7 +552,7 @@ fn create_plan_parts(
             ));
             continue;
         }
-        let binding = orphan.binding().map(str::to_owned);
+        let binding = orphan.binding_address().cloned();
         let dependencies = dependencies_from_prior_state(state, directives.clone());
         let explicit_dependencies = directives.depends_on.iter().cloned().collect();
         plan.add(Effect::Delete {
@@ -616,7 +618,8 @@ fn create_plan_parts(
             SchemaKind::Resource,
         );
         let until = match resolve_wait_predicate(
-            &wb.until_predicate.lhs_segments,
+            &wb.until_predicate.root,
+            &wb.until_predicate.attribute_segments,
             wb.until_predicate.rhs.clone(),
             schema.as_deref(),
         ) {
@@ -652,13 +655,13 @@ fn create_plan_parts(
         // produces the wait + its dependency edge (carina#3085 /
         // carina#3061 behavior preserved).
         let gates_a_pending_change = managed.iter().any(|m| {
-            get_resource_dependencies(m).contains(wb.binding.as_str())
+            get_resource_dependencies(m).contains(&wb.binding)
                 && plan
                     .effects()
                     .iter()
                     .any(|e| e.resource_id() == &m.id && e.is_mutating())
         }) || data_sources.iter().any(|d| {
-            crate::deps::get_data_source_dependencies(d).contains(wb.binding.as_str())
+            crate::deps::get_data_source_dependencies(d).contains(&wb.binding)
                 && plan
                     .effects()
                     .iter()
@@ -713,11 +716,8 @@ fn create_plan_parts(
         if !wait_has_work {
             continue;
         }
-        let mut explicit_dependencies: HashSet<String> = wb
-            .depends_on
-            .iter()
-            .map(|d| d.as_str().to_string())
-            .collect();
+        let mut explicit_dependencies: HashSet<AbsoluteBindingAddress> =
+            wb.depends_on.iter().cloned().collect();
         // Provider hints supplement user-authored ordering. They are additive
         // because `depends_on` is the user's source of truth and must never be
         // weakened by provider-derived knowledge.
@@ -769,7 +769,11 @@ pub fn block_deletes_on_prior_consumer_updates(
     plan: &mut Plan,
     prior_directives: &HashMap<ResourceId, Directives>,
 ) {
-    let consumers: Vec<(ResourceIdentity, HashSet<String>, HashSet<String>)> = plan
+    let consumers: Vec<(
+        ResourceIdentity,
+        HashSet<AbsoluteBindingAddress>,
+        HashSet<AbsoluteBindingAddress>,
+    )> = plan
         .effects()
         .iter()
         .filter_map(|effect| match effect {
@@ -810,7 +814,10 @@ pub fn block_deletes_on_prior_consumer_updates(
     }
 }
 
-fn dependencies_from_prior_state(state: &State, directives: Directives) -> HashSet<String> {
+fn dependencies_from_prior_state(
+    state: &State,
+    directives: Directives,
+) -> HashSet<AbsoluteBindingAddress> {
     state
         .dependency_bindings
         .iter()
@@ -878,7 +885,8 @@ pub(super) fn temporary_name_for_cbd(
             resource_type: resource.id.display_type(),
             resource_identity: resource
                 .binding
-                .clone()
+                .as_ref()
+                .map(ToString::to_string)
                 .unwrap_or_else(|| resource.id.identity_display().to_string()),
         })?;
     generate_temporary_name(resource, from, schema.as_schema())
@@ -933,7 +941,7 @@ fn decompose_replace_into_effects(
 fn known_binding_names(
     managed: &[ResolvedResource],
     data_sources: &[DataSource],
-) -> HashSet<String> {
+) -> HashSet<AbsoluteBindingAddress> {
     managed
         .iter()
         .filter_map(|resource| resource.binding.clone())
@@ -985,7 +993,7 @@ fn promote_referenced_replaces_to_cbd(
     for resource in unresolved_managed {
         let deps = get_resource_dependencies(resource);
         for dep in &deps {
-            let Some(replaced_identity) = ref_targets.get(dep) else {
+            let Some(replaced_identity) = ref_targets.get(dep.as_str()) else {
                 continue;
             };
             let Some(pending) = pending_replaces.get(replaced_identity) else {
@@ -1052,14 +1060,14 @@ fn promote_pending_replaces_for_dependents(
         let deps = get_resource_dependencies(resource);
 
         for dep in &deps {
-            let Some(replaced_identity) = ref_targets.get(dep).cloned() else {
+            let Some(replaced_identity) = ref_targets.get(dep.as_str()).cloned() else {
                 continue;
             };
             if consumer_identity == replaced_identity {
                 continue;
             }
 
-            let ref_attrs = cascade_ref_attrs(&resource.attributes, dep);
+            let ref_attrs = cascade_ref_attrs(&resource.attributes, dep.as_str());
             if ref_attrs.is_empty() {
                 continue;
             }
@@ -1134,7 +1142,7 @@ fn pending_reference_targets(
         }
         targets.insert(identity.as_str().to_string(), identity.clone());
         if let Some(binding) = &pending.create.binding {
-            targets.insert(binding.clone(), identity.clone());
+            targets.insert(binding.to_string(), identity.clone());
         }
     }
     targets

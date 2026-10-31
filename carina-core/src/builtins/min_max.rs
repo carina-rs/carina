@@ -1,6 +1,6 @@
 //! `min(a, b)` and `max(a, b)` built-in functions
 
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{BindingAddress, ConcreteValue, Value};
 
 use super::value_type_name;
 
@@ -16,7 +16,7 @@ use super::value_type_name;
 /// min(2.5, 1.0)  // => 1.0
 /// min(1, 2.5)    // => 1.0
 /// ```
-pub(crate) fn builtin_min(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_min<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
     if args.len() != 2 {
         return Err(format!("min() expects 2 arguments, got {}", args.len()));
     }
@@ -35,7 +35,7 @@ pub(crate) fn builtin_min(args: &[Value]) -> Result<Value, String> {
 /// max(2.5, 1.0)  // => 2.5
 /// max(1, 2.5)    // => 2.5
 /// ```
-pub(crate) fn builtin_max(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_max<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
     if args.len() != 2 {
         return Err(format!("max() expects 2 arguments, got {}", args.len()));
     }
@@ -44,12 +44,12 @@ pub(crate) fn builtin_max(args: &[Value]) -> Result<Value, String> {
 
 /// Compare two numeric values using the given predicate.
 /// Returns the first value if `prefer_first(a, b)` is true, otherwise the second.
-fn compare_values(
-    a: &Value,
-    b: &Value,
+fn compare_values<B: BindingAddress>(
+    a: &Value<B>,
+    b: &Value<B>,
     func_name: &str,
     prefer_first: fn(f64, f64) -> bool,
-) -> Result<Value, String> {
+) -> Result<Value<B>, String> {
     match (a, b) {
         (Value::Concrete(ConcreteValue::Int(x)), Value::Concrete(ConcreteValue::Int(y))) => {
             let (fx, fy) = (*x as f64, *y as f64);
@@ -94,7 +94,7 @@ fn compare_values(
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::{ConcreteValue, Value};
+    use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
 
     // ── min() tests ──
 
@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn min_wrong_arg_count_zero() {
-        let result = evaluate_builtin("min", &[]);
+        let result: Result<Value, String> = evaluate_builtin("min", &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 2 arguments"));
     }
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn max_wrong_arg_count_zero() {
-        let result = evaluate_builtin("max", &[]);
+        let result: Result<Value, String> = evaluate_builtin("max", &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 2 arguments"));
     }

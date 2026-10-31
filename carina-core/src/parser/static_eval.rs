@@ -6,8 +6,12 @@
 
 use super::ProviderContext;
 use super::error::ParseError;
-use crate::eval_value::EvalValue;
-use crate::resource::{AccessMissPolicy, ConcreteValue, DeferredValue, InterpolationPart, Value};
+use crate::eval_value::AuthoredEvalValue as EvalValue;
+use crate::resource::{
+    AccessMissPolicy, AuthoredConcreteValue as ConcreteValue,
+    AuthoredDeferredValue as DeferredValue, AuthoredFunctionArgument as FunctionArgument,
+    AuthoredInterpolationPart as InterpolationPart, AuthoredValue as Value,
+};
 
 /// Check whether a Value is fully static (no runtime dependencies).
 pub(crate) fn is_static_value(value: &Value) -> bool {
@@ -109,7 +113,7 @@ pub(crate) fn evaluate_static_value(
                 });
             }
             // Recursively evaluate any nested FunctionCall arguments
-            let evaluated_args: Result<Vec<crate::resource::FunctionArgument>, ParseError> = args
+            let evaluated_args: Result<Vec<FunctionArgument>, ParseError> = args
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| evaluate_static_value(value.clone(), config))

@@ -1141,6 +1141,15 @@ mod tests {
     use crate::plan_image::layout::layout_graph;
     use crate::plan_image::model::{PlanImageInput, StateMetadata, build_model};
 
+    fn absolute_binding(name: impl Into<String>) -> carina_core::resource::AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(name)
+    }
+
+    fn root_resource_ref(binding: &str, attribute: &str) -> Value {
+        carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
+            .resolve_root_for_test()
+    }
+
     fn fixture_svg_with_theme(name: &str, theme: SvgTheme) -> String {
         let fixture = crate::fixture_plan::build_plan_from_fixture_name(name);
         let state = fixture.state_file.as_ref().map(|state| StateMetadata {
@@ -1189,7 +1198,7 @@ mod tests {
     #[test]
     fn svg_never_contains_secret_or_write_only_attribute_values() {
         let mut resource = Resource::new("test.Credential", "credential");
-        resource.binding = Some("credential".to_string());
+        resource.binding = Some(absolute_binding("credential"));
         resource.set_attr(
             "secret_token",
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
@@ -1246,7 +1255,7 @@ mod tests {
     fn svg_truncates_long_labels_and_caps_attribute_names() {
         let long_label = "this_label_is_intentionally_far_too_long_for_the_card";
         let mut resource = Resource::new("test.Widget", "long-label-resource");
-        resource.binding = Some(long_label.to_string());
+        resource.binding = Some(absolute_binding(long_label));
         let changed_attributes: Vec<_> = (0..8)
             .map(|index| format!("attribute_{index:02}"))
             .collect();
@@ -1333,26 +1342,24 @@ mod tests {
     #[test]
     fn reference_edges_are_dashed_and_do_not_claim_execution_order() {
         let mut a = Resource::new("test.Widget", "a");
-        a.binding = Some("a".to_string());
+        a.binding = Some(absolute_binding("a"));
         let mut connector = Resource::new("test.Widget", "connector");
-        connector.binding = Some("connector".to_string());
-        connector.set_attr(
-            "input",
-            Value::resource_ref("a".to_string(), "id".to_string(), vec![]),
-        );
+        connector.binding = Some(absolute_binding("connector"));
+        connector.set_attr("input", root_resource_ref("a", "id"));
         let mut b = Resource::new("test.Widget", "b");
-        b.binding = Some("b".to_string());
-        b.set_attr(
-            "input",
-            Value::resource_ref("connector".to_string(), "id".to_string(), vec![]),
-        );
+        b.binding = Some(absolute_binding("b"));
+        b.set_attr("input", root_resource_ref("connector", "id"));
         let mut plan = Plan::new();
         for resource in [a.clone(), b.clone()] {
             plan.add(Effect::Update {
                 from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
                 identifier: AppliedIdentifier::new(format!(
                     "{}-id",
-                    resource.binding.as_deref().expect("test resource is bound")
+                    resource
+                        .binding
+                        .as_ref()
+                        .expect("test resource is bound")
+                        .as_str()
                 ))
                 .unwrap(),
                 to: ResolvedResource::new(resource),

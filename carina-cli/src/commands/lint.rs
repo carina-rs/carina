@@ -41,9 +41,9 @@ fn mixed_tag_key_style_warnings(all_tag_keys: &[TagKeyEntry]) -> Vec<LintWarning
         .collect()
 }
 
-fn mixed_tag_key_style_warnings_for_population<E>(
+fn mixed_tag_key_style_warnings_for_population<E, B: carina_core::resource::BindingAddress>(
     root_inputs: &[(PathBuf, String)],
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::File<E, B>,
     base_dir: &Path,
 ) -> Vec<LintWarning> {
     let tag_keys = collect_all_tag_keys(root_inputs, parsed, base_dir);
@@ -61,7 +61,7 @@ pub fn run_lint(
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let duplicate_declarations = loaded.duplicate_declarations;
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
     let module_walk = ModuleWalk::load(&parsed, base_dir);
@@ -86,20 +86,17 @@ pub fn run_lint(
     // blocked; retaining these findings and the schema-independent text scans
     // is more useful than aborting lint entirely. Full schema-backed
     // suggestions return once the blocking finding is fixed.
-    if module_boundary_findings.is_empty() {
-        module_resolver::resolve_modules_with_config(
-            &mut parsed,
-            base_dir,
-            provider_context,
-            schemas,
-        )
-        .map_err(|e| {
-            format!(
-                "Module resolution error: {}",
-                e.display_relative_to(base_dir)
-            )
-        })?;
-    }
+    let parsed = if module_boundary_findings.is_empty() {
+        module_resolver::resolve_modules_with_config(parsed, base_dir, provider_context, schemas)
+            .map_err(|e| {
+                format!(
+                    "Module resolution error: {}",
+                    e.display_relative_to(base_dir)
+                )
+            })?
+    } else {
+        module_resolver::expand_root_directory_file(parsed)
+    };
 
     // Collect source texts for each .crn file
     let source_texts: Vec<(PathBuf, String)> = {

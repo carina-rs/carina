@@ -4,7 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::resource::{AccessPath, DataSource, ModuleSource, ResourceId, State, UnknownReason};
+use crate::resource::{
+    AbsoluteBindingAddress, AccessPath, DataSource, ModuleSource, ResourceId, State, UnknownReason,
+};
 
 /// A data-source input attribute whose unresolved value shapes make the read
 /// apply-time dependent or unsafe to hand to a provider.
@@ -12,7 +14,7 @@ use crate::resource::{AccessPath, DataSource, ModuleSource, ResourceId, State, U
 pub struct UnresolvedDataSourceInput {
     pub attribute: String,
     pub paths: Vec<AccessPath>,
-    pub bindings: Vec<String>,
+    pub bindings: Vec<AbsoluteBindingAddress>,
     pub unknowns: Vec<UnknownReason>,
 }
 
@@ -276,13 +278,20 @@ pub enum DataSourceReadStateMergeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{ConcreteValue, Value};
+    use crate::resource::{
+        ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value, RelativeBindingName,
+        RootScope,
+    };
+
+    fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
+        RootScope::new().resolve(RelativeBindingName::new(binding))
+    }
 
     fn data_source(binding: &str) -> DataSource {
         let identity = crate::resource::ResourceIdentity::try_from(binding.to_string())
             .expect("test identity");
         let mut data_source = DataSource::with_provider("mock", "iam.Roles", identity, None);
-        data_source.binding = Some(binding.to_string());
+        data_source.binding = Some(absolute_binding(binding));
         data_source
     }
 
@@ -292,7 +301,12 @@ mod tests {
         let mut visited = Vec::new();
         let values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
             visited.push(data_source.id.clone());
-            if data_source.binding.as_deref() == Some("read_now") {
+            if data_source
+                .binding
+                .as_ref()
+                .map(AbsoluteBindingAddress::as_str)
+                == Some("read_now")
+            {
                 DataSourceValue::read(State::existing(
                     data_source.id.clone(),
                     HashMap::from([(
@@ -322,7 +336,12 @@ mod tests {
     fn fallible_construction_never_returns_a_partial_collection() {
         let data_sources = [data_source("one"), data_source("two")];
         let result = DataSourceValues::try_from_data_sources(&data_sources, |data_source| {
-            if data_source.binding.as_deref() == Some("two") {
+            if data_source
+                .binding
+                .as_ref()
+                .map(AbsoluteBindingAddress::as_str)
+                == Some("two")
+            {
                 Err("second query failed")
             } else {
                 Ok(DataSourceValue::deferred_to_apply(Vec::new()))
@@ -337,12 +356,17 @@ mod tests {
         let data_sources = [data_source("read_now"), data_source("read_later")];
         let deferred = UnresolvedDataSourceInput {
             attribute: "name_regex".to_string(),
-            paths: vec![AccessPath::new("producer", "name")],
-            bindings: vec!["producer".to_string()],
+            paths: vec![AccessPath::new("producer", "name").resolve_root(&RootScope::new())],
+            bindings: vec![absolute_binding("producer")],
             unknowns: Vec::new(),
         };
         let mut values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
-            if data_source.binding.as_deref() == Some("read_now") {
+            if data_source
+                .binding
+                .as_ref()
+                .map(AbsoluteBindingAddress::as_str)
+                == Some("read_now")
+            {
                 DataSourceValue::read(State::existing(data_source.id.clone(), HashMap::new()))
             } else {
                 DataSourceValue::deferred_to_apply(vec![deferred.clone()])
@@ -378,7 +402,12 @@ mod tests {
     fn read_state_merge_rejects_an_unknown_data_source() {
         let data_sources = [data_source("read_now"), data_source("read_later")];
         let mut values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
-            if data_source.binding.as_deref() == Some("read_now") {
+            if data_source
+                .binding
+                .as_ref()
+                .map(AbsoluteBindingAddress::as_str)
+                == Some("read_now")
+            {
                 DataSourceValue::read(State::not_found(data_source.id.clone()))
             } else {
                 DataSourceValue::deferred_to_apply(Vec::new())
@@ -401,8 +430,8 @@ mod tests {
         let data_sources = [data_source("read_now"), data_source("read_later")];
         let deferred = UnresolvedDataSourceInput {
             attribute: "name_regex".to_string(),
-            paths: vec![AccessPath::new("producer", "name")],
-            bindings: vec!["producer".to_string()],
+            paths: vec![AccessPath::new("producer", "name").resolve_root(&RootScope::new())],
+            bindings: vec![absolute_binding("producer")],
             unknowns: Vec::new(),
         };
         let values = DataSourceValues::from_data_sources(&data_sources, |data_source| {

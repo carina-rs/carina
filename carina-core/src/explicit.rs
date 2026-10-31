@@ -1683,7 +1683,7 @@ mod tests {
     }
 
     fn build_attribute_explicit(desired: Value, stored: Option<Value>) -> ExplicitFields {
-        let resource =
+        let resource: Resource =
             Resource::new("example.Listener", "listener").with_attribute("items", desired);
         let stored_attributes = stored
             .map(|stored| HashMap::from([("items".to_string(), stored)]))
@@ -1717,7 +1717,7 @@ mod tests {
     #[test]
     fn stored_builder_uses_sent_basis_per_top_level_attribute() {
         let desired_items = Value::Concrete(ConcreteValue::List(vec![rule(80, Some("authored"))]));
-        let resource = Resource::new("example.Listener", "listener")
+        let resource: Resource = Resource::new("example.Listener", "listener")
             .with_attribute(
                 "description",
                 Value::Concrete(ConcreteValue::String("after".into())),
@@ -1812,7 +1812,7 @@ mod tests {
         fresh_items: Vec<Value>,
         schema: Option<&ResourceSchema>,
     ) -> ExplicitFields {
-        let resource = Resource::new("example.Listener", "listener")
+        let resource: Resource = Resource::new("example.Listener", "listener")
             .with_attribute("items", Value::Concrete(ConcreteValue::List(desired_items)));
         let prior_stored = HashMap::from([(
             "items".to_string(),
@@ -2088,7 +2088,7 @@ mod tests {
         };
         let one = Value::Concrete(ConcreteValue::Int(1));
         let two = Value::Concrete(ConcreteValue::Int(2));
-        let resource = Resource::new("example.Listener", "listener").with_attribute(
+        let resource: Resource = Resource::new("example.Listener", "listener").with_attribute(
             "items",
             Value::Concrete(ConcreteValue::List(vec![two.clone()])),
         );
@@ -2113,7 +2113,7 @@ mod tests {
     #[test]
     fn carried_list_without_prior_stored_mixed_list_without_removal_uses_rebuilt_record() {
         let desired_items = vec![rule(80, Some("web")), rule(443, None)];
-        let resource = Resource::new("example.Listener", "listener").with_attribute(
+        let resource: Resource = Resource::new("example.Listener", "listener").with_attribute(
             "items",
             Value::Concrete(ConcreteValue::List(desired_items.clone())),
         );
@@ -2579,7 +2579,7 @@ mod tests {
         ])));
         let desired = Value::Concrete(ConcreteValue::List(vec![desired_item]));
         let stored = Value::Concrete(ConcreteValue::List(vec![stored_item]));
-        let resource =
+        let resource: Resource =
             Resource::new("example.Listener", "listener").with_attribute("items", desired);
         let stored_attributes = HashMap::from([("items".to_string(), stored)]);
         let sent = crate::executor::AcceptedRequest::create_for_test();

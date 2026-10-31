@@ -1,0 +1,303 @@
+{
+  "version": 29,
+  "carina_version": "0.8.0",
+  "timestamp": "2026-10-30T00:00:00Z",
+  "source_path": "carina-cli/tests/fixtures/deferred_unavailable_saved_plan",
+  "state_lineage": null,
+  "state_serial": null,
+  "provider_configs": [
+    {
+      "name": "mock",
+      "attributes": {}
+    }
+  ],
+  "backend_config": {
+    "backend_type": "local",
+    "attributes": {
+      "path": {
+        "String": "carina.state.json"
+      }
+    }
+  },
+  "plan": {
+    "effects": [
+      {
+        "Create": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "o"
+          },
+          "attributes": {
+            "name": {
+              "String": "o"
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": false
+          },
+          "prefixes": {},
+          "binding": "o",
+          "dependency_bindings": [],
+          "module_source": null
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "r"
+          },
+          "attributes": {
+            "name": {
+              "String": "p"
+            },
+            "comment": {
+              "Coalesce": {
+                "value": {
+                  "ResourceRef": {
+                    "path": {
+                      "binding": "o",
+                      "attribute": "identifier"
+                    }
+                  }
+                },
+                "default": {
+                  "FunctionCall": {
+                    "name": "env",
+                    "args": [
+                      {
+                        "String": "CARINA_MISSING_X"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": false
+          },
+          "prefixes": {},
+          "binding": "r",
+          "dependency_bindings": [
+            "o"
+          ],
+          "module_source": null
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "o"
+      },
+      "attributes": {
+        "name": {
+          "String": "o"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false
+      },
+      "prefixes": {},
+      "binding": "o",
+      "dependency_bindings": [],
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "r"
+      },
+      "attributes": {
+        "name": {
+          "String": "p"
+        },
+        "comment": {
+          "Coalesce": {
+            "value": {
+              "ResourceRef": {
+                "path": {
+                  "binding": "o",
+                  "attribute": "identifier"
+                }
+              }
+            },
+            "default": {
+              "FunctionCall": {
+                "name": "env",
+                "args": [
+                  {
+                    "String": "CARINA_MISSING_X"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false
+      },
+      "prefixes": {},
+      "binding": "r",
+      "dependency_bindings": [
+        "o"
+      ],
+      "module_source": null
+    }
+  ],
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "o"
+      },
+      "attributes": {
+        "name": {
+          "String": "o"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false
+      },
+      "prefixes": {},
+      "binding": "o",
+      "dependency_bindings": [],
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "r"
+      },
+      "attributes": {
+        "name": {
+          "String": "p"
+        },
+        "comment": {
+          "Coalesce": {
+            "value": {
+              "ResourceRef": {
+                "path": {
+                  "binding": "o",
+                  "attribute": "identifier"
+                }
+              }
+            },
+            "default": {
+              "FunctionCall": {
+                "name": "env",
+                "args": [
+                  {
+                    "String": "CARINA_MISSING_X"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false
+      },
+      "prefixes": {},
+      "binding": "r",
+      "dependency_bindings": [],
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "o"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "o"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "r"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "r"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "schema_fingerprints": {
+    "providers": {
+      "mock": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "test.resource",
+            "fingerprint": {
+              "present": "b9b9ba928e460b35fba3fefc9dfa6c04ab890b935006e44e69b1d9cbc54957fc"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {
+    "mock": {
+      "kind": "built_in"
+    }
+  }
+}
