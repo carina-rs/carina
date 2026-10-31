@@ -40,6 +40,9 @@ use crate::schema::{AttributeType, DslMap, ResourceSchema, Shape, ShapeWalkBudge
 #[cfg(any(test, feature = "test-support"))]
 pub use binding_address::absolute_binding_address_for_test;
 pub use binding_address::{AbsoluteBindingAddress, BindingAddress, RelativeBindingName};
+pub(crate) use binding_address::{
+    binding_with_index, binding_with_map_key, module_argument_placeholder,
+};
 pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
 };
@@ -1650,7 +1653,7 @@ pub(crate) fn module_argument_reference_path<B: BindingAddress>(
     }
 
     let (binding, segments) = collect(value)?;
-    let binding = B::module_argument_placeholder(binding)?;
+    let binding = module_argument_placeholder::<B>(binding)?;
     if segments.is_empty() {
         Some(ReferencePath::Binding(binding))
     } else {
@@ -2026,12 +2029,12 @@ pub(crate) fn apply_value_path_segment<B: BindingAddress>(
                 PathSegment::Subscript {
                     index: Subscript::Int { index },
                 } => Value::Deferred(DeferredValue::BindingRef {
-                    binding: binding.with_index(index),
+                    binding: binding_with_index(&binding, index),
                 }),
                 PathSegment::Subscript {
                     index: Subscript::Str { key },
                 } => Value::Deferred(DeferredValue::BindingRef {
-                    binding: binding.with_map_key(&key),
+                    binding: binding_with_map_key(&binding, &key),
                 }),
             };
             return Ok(ValuePathSegmentResult::Deferred(rewrap_secrets(
@@ -2942,6 +2945,9 @@ pub enum DeferredValue<B: BindingAddress = AbsoluteBindingAddress> {
         value: Box<Value<B>>,
         default: Box<Value<B>>,
     },
+    /// A typed binary Int expression that is evaluated once both operands are
+    /// available. This is an intrinsic node, not a hidden built-in call.
+    IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr<B>),
     /// String interpolation: `"prefix-${expr}-suffix"`
     Interpolation(Vec<InterpolationPart<B>>),
     /// Built-in function call: `join("-", ["a", "b"])` or via pipe
@@ -3014,7 +3020,16 @@ impl<B: BindingAddress> DeferredValue<B> {
         match self {
             Self::FunctionCall { name, args, .. } => Some((*name, args)),
             Self::Unavailable { name, args, .. } => Some((*name, args)),
-            _ => None,
+            Self::ResourceRef { .. }
+            | Self::BindingRef { .. }
+            | Self::Coalesce { .. }
+            | Self::IntegerArithmetic(_)
+            | Self::Interpolation(_)
+            | Self::ResolvedFunctionCall { .. }
+            | Self::Access(_)
+            | Self::Secret(_)
+            | Self::RedactedSecret { .. }
+            | Self::Unknown(_) => None,
         }
     }
 }
@@ -3198,6 +3213,7 @@ impl<B: BindingAddress> Value<B> {
                 DeferredValue::ResourceRef { .. }
                 | DeferredValue::BindingRef { .. }
                 | DeferredValue::Coalesce { .. }
+                | DeferredValue::IntegerArithmetic(_)
                 | DeferredValue::Interpolation(_)
                 | DeferredValue::FunctionCall { .. }
                 | DeferredValue::Unavailable { .. }
@@ -3236,6 +3252,7 @@ where
                 value: &'a Value<B>,
                 default: &'a Value<B>,
             },
+            IntegerArithmetic(&'a crate::integer_arithmetic::ValidatedIntegerExpr<B>),
             Interpolation(&'a [InterpolationPart<B>]),
             FunctionCall {
                 name: &'a str,
@@ -3264,6 +3281,9 @@ where
             }
             Self::Coalesce { value, default } => {
                 SerializableDeferredValue::Coalesce { value, default }.serialize(serializer)
+            }
+            Self::IntegerArithmetic(expression) => {
+                SerializableDeferredValue::IntegerArithmetic(expression).serialize(serializer)
             }
             Self::Interpolation(parts) => {
                 SerializableDeferredValue::Interpolation(parts).serialize(serializer)
@@ -3316,6 +3336,7 @@ where
                 value: Box<Value<B>>,
                 default: Box<Value<B>>,
             },
+            IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr<B>),
             Interpolation(Vec<InterpolationPart<B>>),
             FunctionCall {
                 name: String,
@@ -3337,6 +3358,9 @@ where
             DeserializableDeferredValue::BindingRef { binding } => Ok(Self::BindingRef { binding }),
             DeserializableDeferredValue::Coalesce { value, default } => {
                 Ok(Self::Coalesce { value, default })
+            }
+            DeserializableDeferredValue::IntegerArithmetic(expression) => {
+                Ok(Self::IntegerArithmetic(expression))
             }
             DeserializableDeferredValue::Interpolation(parts) => Ok(Self::Interpolation(parts)),
             DeserializableDeferredValue::FunctionCall { name, args, .. } => {
@@ -3382,6 +3406,10 @@ impl<B: BindingAddress> fmt::Debug for DeferredValue<B> {
                 .debug_struct("Coalesce")
                 .field("value", value)
                 .field("default", default)
+                .finish(),
+            Self::IntegerArithmetic(expression) => f
+                .debug_tuple("IntegerArithmetic")
+                .field(expression)
                 .finish(),
             Self::Interpolation(parts) => f.debug_tuple("Interpolation").field(parts).finish(),
             Self::FunctionCall {
@@ -4223,6 +4251,7 @@ pub enum DeferredValueRef<'a, B: BindingAddress = AbsoluteBindingAddress> {
         value: &'a Value<B>,
         default: &'a Value<B>,
     },
+    IntegerArithmetic(&'a crate::integer_arithmetic::ValidatedIntegerExpr<B>),
     Interpolation(&'a [InterpolationPart<B>]),
     FunctionCall {
         name: &'a str,
@@ -4296,6 +4325,10 @@ impl<B: BindingAddress> Value<B> {
                 value.contains_diagnostic_sensitive_string()
                     || default.contains_diagnostic_sensitive_string()
             }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                expression.lhs().contains_diagnostic_sensitive_string()
+                    || expression.rhs().contains_diagnostic_sensitive_string()
+            }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 inner.contains_diagnostic_sensitive_string()
             }
@@ -4356,6 +4389,9 @@ impl<B: BindingAddress> Value<B> {
                 DeferredValue::BindingRef { binding } => DeferredValueRef::BindingRef { binding },
                 DeferredValue::Coalesce { value, default } => {
                     DeferredValueRef::Coalesce { value, default }
+                }
+                DeferredValue::IntegerArithmetic(expression) => {
+                    DeferredValueRef::IntegerArithmetic(expression)
                 }
                 DeferredValue::Interpolation(parts) => DeferredValueRef::Interpolation(parts),
                 DeferredValue::FunctionCall {
@@ -4643,6 +4679,7 @@ impl<B: BindingAddress> Value<B> {
                 DeferredValue::ResourceRef { .. }
                 | DeferredValue::BindingRef { .. }
                 | DeferredValue::Coalesce { .. }
+                | DeferredValue::IntegerArithmetic(_)
                 | DeferredValue::Interpolation(_)
                 | DeferredValue::FunctionCall { .. }
                 | DeferredValue::Unavailable { .. }
@@ -4795,6 +4832,9 @@ impl<B: BindingAddress> DeferredValue<B> {
                 value: Box::new(value.map_bindings(map)),
                 default: Box::new(default.map_bindings(map)),
             },
+            DeferredValue::IntegerArithmetic(expression) => {
+                DeferredValue::IntegerArithmetic(expression.map_bindings(map))
+            }
             DeferredValue::Interpolation(parts) => DeferredValue::Interpolation(
                 parts
                     .into_iter()
@@ -5003,6 +5043,10 @@ impl<B: BindingAddress> PartialEq for Value<B> {
                 }),
             ) => av == bv && ad == bd,
             (
+                Value::Deferred(DeferredValue::IntegerArithmetic(a)),
+                Value::Deferred(DeferredValue::IntegerArithmetic(b)),
+            ) => a == b,
+            (
                 Value::Deferred(DeferredValue::Interpolation(a)),
                 Value::Deferred(DeferredValue::Interpolation(b)),
             ) => a == b,
@@ -5160,6 +5204,18 @@ impl<B: BindingAddress> Value<B> {
                 value.canonicalize_in_place();
                 default.canonicalize_in_place();
             }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                let expression = expression.clone();
+                let original =
+                    Value::Deferred(DeferredValue::IntegerArithmetic(expression.clone()));
+                let mut lhs = expression.lhs().clone();
+                let mut rhs = expression.rhs().clone();
+                lhs.canonicalize_in_place();
+                rhs.canonicalize_in_place();
+                *self = expression
+                    .evaluate_with_operands(lhs, rhs)
+                    .unwrap_or(original);
+            }
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
                 | DeferredValue::Unavailable { args, .. }
@@ -5295,6 +5351,14 @@ impl<B: BindingAddress> Value<B> {
                 value.visit_resource_refs_with_usage_inner(value_usage, f);
                 default.visit_resource_refs_with_usage_inner(default_usage, f);
             }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                expression
+                    .lhs()
+                    .visit_resource_refs_with_usage_inner(usage, f);
+                expression
+                    .rhs()
+                    .visit_resource_refs_with_usage_inner(usage, f);
+            }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 inner.visit_resource_refs_with_usage_inner(usage, f)
             }
@@ -5357,6 +5421,10 @@ impl<B: BindingAddress> Value<B> {
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 value.visit_binding_refs(f);
                 default.visit_binding_refs(f);
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                expression.lhs().visit_binding_refs(f);
+                expression.rhs().visit_binding_refs(f);
             }
             Value::Deferred(DeferredValue::Secret(inner)) => inner.visit_binding_refs(f),
             Value::Concrete(ConcreteValue::String(_))
@@ -5429,6 +5497,9 @@ pub fn value_contains_unknown(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Secret(inner)) => value_contains_unknown(inner),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             value_contains_unknown(value) || value_contains_unknown(default)
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            value_contains_unknown(expression.lhs()) || value_contains_unknown(expression.rhs())
         }
         _ => false,
     }
@@ -5511,6 +5582,9 @@ pub(crate) fn find_unavailable_evaluation<B: BindingAddress>(
                     UnavailableCoalescePolicy::ExcludeDefault => None,
                     UnavailableCoalescePolicy::IncludeDefault => recurse(default),
                 })
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                recurse(expression.lhs()).or_else(|| recurse(expression.rhs()))
             }
             Value::Concrete(
                 ConcreteValue::String(_)
@@ -5625,6 +5699,11 @@ impl<B: BindingAddress> Value<B> {
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 value.hash_into(hasher);
                 default.hash_into(hasher);
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                expression.lhs().hash_into(hasher);
+                expression.op().hash(hasher);
+                expression.rhs().hash_into(hasher);
             }
             Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 parts.len().hash(hasher);
@@ -6436,6 +6515,10 @@ fn pairing_hashes(
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
             hashes.push(secret_state_pairing_hash());
         }
+        // Arithmetic has its own canonical hash above. A nested Secret is
+        // normalized to an outer Secret by the evaluator before comparison,
+        // so operand hashes must not become candidate hashes for the result.
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {}
         _ => {}
     }
     if let Some(attr_type) = attr_type {
@@ -8581,6 +8664,9 @@ pub(crate) fn assert_value_fully_resolved(
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             Err(crate::value::SerializationError::UnresolvedCoalesce { context })
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            Err(crate::value::SerializationError::UnresolvedIntegerArithmetic { context })
+        }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             Err(crate::value::SerializationError::UnresolvedInterpolation { context })
         }
@@ -8604,7 +8690,7 @@ pub(crate) fn assert_value_fully_resolved(
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(crate::value::SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
+                reason: Box::new(reason.clone()),
                 context,
             })
         }

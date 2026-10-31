@@ -340,7 +340,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
         }
         CoreValue::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
+                reason: Box::new(reason.clone()),
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -358,6 +358,11 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
         }
         CoreValue::Deferred(DeferredValue::Coalesce { .. }) => {
             Err(SerializationError::UnresolvedCoalesce {
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            Err(SerializationError::UnresolvedIntegerArithmetic {
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -697,7 +702,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         }
         CoreValue::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
+                reason: Box::new(reason.clone()),
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -715,6 +720,11 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         }
         CoreValue::Deferred(DeferredValue::Coalesce { .. }) => {
             Err(SerializationError::UnresolvedCoalesce {
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            Err(SerializationError::UnresolvedIntegerArithmetic {
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -3269,9 +3279,14 @@ mod tests {
         let err = core_to_wit_value(&v).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamExport { path: p },
+                reason,
                 context: SerializationContext::WasmBoundary,
-            } => assert_eq!(p, path),
+            } => {
+                let UnknownReason::UpstreamExport { path: actual } = reason.as_ref() else {
+                    panic!("expected UpstreamExport reason, got: {reason:?}");
+                };
+                assert_eq!(actual, &path);
+            }
             other => {
                 panic!("expected UnknownNotAllowed/UpstreamExport/WasmBoundary, got: {other:?}")
             }
@@ -3300,10 +3315,9 @@ mod tests {
         let err = core_value_to_json(&v).unwrap_err();
         assert!(matches!(
             err,
-            SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamExport { .. },
-                context: SerializationContext::WasmBoundary,
-            }
+            SerializationError::UnknownNotAllowed { reason, context }
+                if matches!(reason.as_ref(), UnknownReason::UpstreamExport { .. })
+                    && context == SerializationContext::WasmBoundary
         ));
     }
 

@@ -130,6 +130,13 @@ pub enum InferenceError {
     HeterogeneousCollection { reason: String },
     #[error("coalesce default type `{default}` does not match left type `{left}`")]
     IncompatibleCoalesceTypes { left: String, default: String },
+    #[error("operator '{op}': {side} operand must be Int, got {actual}")]
+    InvalidIntegerArithmeticOperand {
+        op: crate::integer_arithmetic::IntegerOp,
+        side: crate::integer_arithmetic::IntegerOperandSide,
+        actual: String,
+        operator_span: crate::integer_arithmetic::IntegerOperatorSpan,
+    },
     #[error("unknown binding `{binding}`")]
     UnknownBinding { binding: String },
     #[error("unknown attribute `{attribute}` on `{binding}`")]

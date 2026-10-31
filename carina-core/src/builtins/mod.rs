@@ -135,6 +135,14 @@ fn mark_secret_input_strings<B: BindingAddress>(value: Value<B>) -> Value<B> {
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
             Box::new(mark_secret_input_strings(*inner)),
         )),
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = mark_secret_input_strings(expression.lhs().clone());
+            let rhs = mark_secret_input_strings(expression.rhs().clone());
+            let original = Value::Deferred(DeferredValue::IntegerArithmetic(expression.clone()));
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .unwrap_or(original)
+        }
         value => value,
     }
 }
@@ -613,6 +621,7 @@ fn value_type_name<B: BindingAddress>(value: &Value<B>) -> &'static str {
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "ResourceRef",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "BindingRef",
         Value::Deferred(DeferredValue::Coalesce { .. }) => "Coalesce",
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => "Int",
         Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation",
         Value::Deferred(
             DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },

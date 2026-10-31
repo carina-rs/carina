@@ -1031,6 +1031,7 @@ fn source_argument_name<B: BindingAddress, C: BindingAddress>(
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 Some(path.binding().to_string())
             }
+            Value::Deferred(DeferredValue::IntegerArithmetic(_)) => None,
             _ => None,
         })?;
     argument_values
@@ -1055,6 +1056,7 @@ fn resolve_nested_module_call(
                 | Value::Deferred(
                     DeferredValue::ResourceRef { .. }
                     | DeferredValue::Coalesce { .. }
+                    | DeferredValue::IntegerArithmetic(_)
                     | DeferredValue::Interpolation(_)
                     | DeferredValue::FunctionCall { .. }
                     | DeferredValue::ResolvedFunctionCall { .. }
@@ -1290,6 +1292,7 @@ fn authored_value_reference_path(value: &Value) -> Option<crate::resource::Autho
         Value::Concrete(_)
         | Value::Deferred(
             DeferredValue::Coalesce { .. }
+            | DeferredValue::IntegerArithmetic(_)
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
@@ -1382,6 +1385,7 @@ fn module_parameter_postfix<B: BindingAddress>(
                 DeferredValue::ResourceRef { .. }
                 | DeferredValue::BindingRef { .. }
                 | DeferredValue::Coalesce { .. }
+                | DeferredValue::IntegerArithmetic(_)
                 | DeferredValue::Interpolation(_)
                 | DeferredValue::FunctionCall { .. }
                 | DeferredValue::ResolvedFunctionCall { .. }
@@ -1614,8 +1618,7 @@ impl ModuleScopeResolver<'_> {
         binding: &str,
         diagnostic_source: Option<(Option<std::path::PathBuf>, usize)>,
     ) -> ArgumentSubstitutionError {
-        let (source_file, line) =
-            diagnostic_source.unwrap_or_else(|| (None, self.arguments.default_line));
+        let (source_file, line) = diagnostic_source.unwrap_or((None, self.arguments.default_line));
         ArgumentSubstitutionError {
             source_file,
             line,
@@ -1854,6 +1857,29 @@ fn bind_constraint_expression(
                 source_file,
             )?),
         },
+        ValidateExpr::IntegerArithmetic {
+            lhs,
+            op,
+            rhs,
+            operator_span,
+        } => ValidateExpr::IntegerArithmetic {
+            lhs: Box::new(bind_constraint_expression(
+                lhs,
+                arguments,
+                resolved_bindings,
+                line,
+                source_file,
+            )?),
+            op: *op,
+            rhs: Box::new(bind_constraint_expression(
+                rhs,
+                arguments,
+                resolved_bindings,
+                line,
+                source_file,
+            )?),
+            operator_span: *operator_span,
+        },
         ValidateExpr::And(lhs, rhs) => ValidateExpr::And(
             Box::new(bind_constraint_expression(
                 lhs,
@@ -1949,6 +1975,18 @@ fn evaluate_expanded_module_functions(
                 value: Box::new(evaluate_expanded_module_functions(value, config)?),
                 default: Box::new(evaluate_expanded_module_functions(default, config)?),
             })
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = evaluate_expanded_module_functions(expression.lhs(), config)?;
+            let rhs = evaluate_expanded_module_functions(expression.rhs(), config)?;
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| ArgumentSubstitutionError {
+                    source_file: None,
+                    line: expression.operator_span().line().unwrap_or(0),
+                    message: error.to_string(),
+                    parse_error: None,
+                })?
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             Value::Deferred(DeferredValue::Interpolation(
@@ -2244,6 +2282,7 @@ fn expand_module_composition(
                         | Value::Deferred(
                             DeferredValue::ResourceRef { .. }
                             | DeferredValue::Coalesce { .. }
+                            | DeferredValue::IntegerArithmetic(_)
                             | DeferredValue::Interpolation(_)
                             | DeferredValue::FunctionCall { .. }
                             | DeferredValue::ResolvedFunctionCall { .. }
@@ -2561,6 +2600,17 @@ fn resolve_module_constraint_expression(
         ValidateExpr::Duration(value) => ValidateExpr::Duration(*value),
         ValidateExpr::String(value) => ValidateExpr::String(value.clone()),
         ValidateExpr::Null => ValidateExpr::Null,
+        ValidateExpr::IntegerArithmetic {
+            lhs,
+            op,
+            rhs,
+            operator_span,
+        } => ValidateExpr::IntegerArithmetic {
+            lhs: Box::new(resolve_module_constraint_expression(lhs, resolver)?),
+            op: *op,
+            rhs: Box::new(resolve_module_constraint_expression(rhs, resolver)?),
+            operator_span: *operator_span,
+        },
         ValidateExpr::Compare { lhs, op, rhs } => ValidateExpr::Compare {
             lhs: Box::new(resolve_module_constraint_expression(lhs, resolver)?),
             op: op.clone(),
@@ -2926,6 +2976,29 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                     )?),
                 })
             }
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = substitute_arguments_with_position(
+                expression.lhs(),
+                arguments,
+                ArgumentSubstitutionPosition::Value,
+            )?;
+            let rhs = substitute_arguments_with_position(
+                expression.rhs(),
+                arguments,
+                ArgumentSubstitutionPosition::Value,
+            )?;
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| ArgumentSubstitutionError {
+                    source_file: None,
+                    line: expression
+                        .operator_span()
+                        .line()
+                        .unwrap_or(arguments.default_line),
+                    message: error.to_string(),
+                    parse_error: None,
+                })?
         }
         Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
@@ -3428,8 +3501,10 @@ mod tests {
             ResourceIdentity::new(current_prefix.clone()),
         ));
         resource.loop_provenance = provenance;
-        let mut file = crate::parser::ModuleResolvedParsedFile::default();
-        file.resources = vec![resource.resolve_root(&crate::resource::RootScope::new())];
+        let mut file = crate::parser::ModuleResolvedParsedFile {
+            resources: vec![resource.resolve_root(&crate::resource::RootScope::new())],
+            ..Default::default()
+        };
 
         reconcile_anonymous_module_instances(
             &mut file,
@@ -3485,8 +3560,10 @@ mod tests {
             None,
         );
         resource.loop_provenance = crate::resource::LoopProvenance::direct(direct);
-        let mut file = crate::parser::ModuleResolvedParsedFile::default();
-        file.resources = vec![resource.resolve_root(&crate::resource::RootScope::new())];
+        let mut file = crate::parser::ModuleResolvedParsedFile {
+            resources: vec![resource.resolve_root(&crate::resource::RootScope::new())],
+            ..Default::default()
+        };
 
         reconcile_anonymous_module_instances(
             &mut file,

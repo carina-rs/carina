@@ -5020,3 +5020,292 @@ fn declared_export_unknown_binding_reports_exactly_one_diagnostic_per_frontend()
         "unexpected CLI diagnostic: {cli:#?}",
     );
 }
+
+// ============================================================================
+// Integer arithmetic: directory-wide CLI/LSP parity (carina#4142)
+// ============================================================================
+
+fn integer_arithmetic_directory_schemas() -> SchemaRegistry {
+    let source = ResourceSchema::new("r.Source")
+        .attribute(AttributeSchema::provider_populated("seconds", AttributeType::int()).build())
+        .attribute(AttributeSchema::provider_populated("ratio", AttributeType::float()).build());
+    let consumer = ResourceSchema::new("r.Consumer")
+        .attribute(AttributeSchema::required("concrete", AttributeType::int()).build())
+        .attribute(AttributeSchema::required("deferred", AttributeType::int()).build())
+        .attribute(AttributeSchema::required("widened", AttributeType::float()).build())
+        .attribute(AttributeSchema::required("label", AttributeType::string()).build());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        source.validate().expect("source schema must be valid"),
+    );
+    schemas.insert(
+        "test",
+        consumer.validate().expect("consumer schema must be valid"),
+    );
+    schemas
+}
+
+fn integer_arithmetic_directory_fixture(
+    concrete_expression: &str,
+    label_expression: &str,
+    extra_main: &str,
+) -> TempDir {
+    let main = format!(
+        "let sink = test.r.Consumer {{\n  concrete = {concrete_expression}\n  deferred = source.seconds / 60\n  widened = source.seconds / 60\n  label = \"wait ${{{label_expression}}} minutes\"\n}}\n{extra_main}"
+    );
+    write_fixture(&[
+        ("main.crn", &main),
+        (
+            "exports.crn",
+            "let minutes = base_seconds / 60\n\
+             let doubled_minutes = minutes * 2\n\
+             exports {\n  minutes: Int = doubled_minutes\n}\n",
+        ),
+        (
+            "providers.crn",
+            "provider test {}\nlet source = test.r.Source {}\n",
+        ),
+        (
+            "backend.crn",
+            "backend local { path = \"carina.state.json\" }\nlet base_seconds = 120\n",
+        ),
+    ])
+}
+
+#[test]
+fn integer_arithmetic_directory_has_exact_cli_lsp_diagnostic_parity() {
+    struct Case {
+        name: &'static str,
+        expression: &'static str,
+        label_expression: &'static str,
+        extra_main: &'static str,
+        expected: Option<&'static str>,
+        operator_line: u32,
+        operator_prefix: &'static str,
+        operator_expression: &'static str,
+    }
+
+    for case in [
+        Case {
+            name: "success",
+            expression: "doubled_minutes + 1",
+            label_expression: "source.seconds / 60",
+            extra_main: "",
+            expected: None,
+            operator_line: 1,
+            operator_prefix: "  concrete = ",
+            operator_expression: "doubled_minutes + 1",
+        },
+        Case {
+            name: "type error",
+            expression: "doubled_minutes + \"bad\"",
+            label_expression: "source.seconds / 60",
+            extra_main: "",
+            expected: Some("operator '+': right operand must be Int, got String"),
+            operator_line: 1,
+            operator_prefix: "  concrete = ",
+            operator_expression: "doubled_minutes + \"bad\"",
+        },
+        Case {
+            name: "typed deferred Float operand",
+            expression: "source.ratio + 1",
+            label_expression: "source.seconds / 60",
+            extra_main: "",
+            expected: Some("operator '+': left operand must be Int, got Float"),
+            operator_line: 1,
+            operator_prefix: "  concrete = ",
+            operator_expression: "source.ratio + 1",
+        },
+        Case {
+            name: "typed deferred Float operand in interpolation",
+            expression: "doubled_minutes + 1",
+            label_expression: "source.ratio + 1",
+            extra_main: "",
+            expected: Some("operator '+': left operand must be Int, got Float"),
+            operator_line: 4,
+            operator_prefix: "  label = \"wait ${",
+            operator_expression: "source.ratio + 1",
+        },
+        Case {
+            name: "division by zero",
+            expression: "doubled_minutes / 0",
+            label_expression: "source.seconds / 60",
+            extra_main: "",
+            expected: Some("operator '/': integer division by zero"),
+            operator_line: 1,
+            operator_prefix: "  concrete = ",
+            operator_expression: "doubled_minutes / 0",
+        },
+        Case {
+            name: "overflow",
+            expression: "9223372036854775807 + 1",
+            label_expression: "source.seconds / 60",
+            extra_main: "",
+            expected: Some("operator '+': integer arithmetic overflow"),
+            operator_line: 1,
+            operator_prefix: "  concrete = ",
+            operator_expression: "9223372036854775807 + 1",
+        },
+        Case {
+            name: "unused let with typed deferred Float operand",
+            expression: "doubled_minutes + 1",
+            label_expression: "source.seconds / 60",
+            extra_main: "let invalid = source.ratio + 1\n",
+            expected: Some("operator '+': left operand must be Int, got Float"),
+            operator_line: 6,
+            operator_prefix: "let invalid = ",
+            operator_expression: "source.ratio + 1",
+        },
+    ] {
+        let fixture = integer_arithmetic_directory_fixture(
+            case.expression,
+            case.label_expression,
+            case.extra_main,
+        );
+        let schemas = integer_arithmetic_directory_schemas();
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+        let lsp_errors = lsp
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+            })
+            .collect::<Vec<_>>();
+
+        match case.expected {
+            None => {
+                assert!(cli.is_empty(), "{} CLI diagnostics: {cli:#?}", case.name);
+                assert!(
+                    lsp_errors.is_empty(),
+                    "{} LSP diagnostics: {lsp:#?}",
+                    case.name
+                );
+            }
+            Some(expected) => {
+                assert_eq!(cli.len(), 1, "{} CLI diagnostics: {cli:#?}", case.name);
+                assert_eq!(
+                    lsp_errors.len(),
+                    1,
+                    "{} LSP diagnostics: {lsp:#?}",
+                    case.name
+                );
+                assert!(
+                    cli[0].contains(expected),
+                    "{} CLI diagnostic must contain {expected:?}: {cli:#?}",
+                    case.name
+                );
+                assert_eq!(
+                    lsp_errors[0].message, expected,
+                    "{} must use the core diagnostic verbatim",
+                    case.name
+                );
+                let operator_column = case.operator_prefix.len()
+                    + case
+                        .operator_expression
+                        .find(['+', '-', '*', '/', '%'])
+                        .expect("error case has an arithmetic operator");
+                assert_eq!(
+                    lsp_errors[0].range,
+                    tower_lsp::lsp_types::Range::new(
+                        tower_lsp::lsp_types::Position::new(
+                            case.operator_line,
+                            operator_column as u32,
+                        ),
+                        tower_lsp::lsp_types::Position::new(
+                            case.operator_line,
+                            operator_column as u32 + 1,
+                        ),
+                    ),
+                    "{} must underline the arithmetic operator",
+                    case.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn integer_arithmetic_directory_diagnostics_map_operator_after_heredoc() {
+    let main = "let p = <<EOT\na\nb\nc\nd\nEOT\n\nlet x = 1 / 0\n";
+    let fixture = write_fixture(&[("main.crn", main)]);
+    let cli = cli_diagnostics(Vec::new(), &fixture);
+    let lsp = lsp_diagnostics(
+        &DiagnosticEngine::without_loaded_provider_schemas(),
+        &fixture,
+        "main.crn",
+    );
+    let arithmetic = lsp
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("integer division by zero"))
+        .unwrap_or_else(|| panic!("missing LSP arithmetic diagnostic: {lsp:#?}"));
+
+    assert_eq!(cli.len(), 1, "CLI diagnostics: {cli:#?}");
+    assert!(
+        cli[0].contains("line 8, column 11"),
+        "CLI must report the authored operator position: {cli:#?}",
+    );
+    assert_eq!(
+        arithmetic.range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(7, 10),
+            tower_lsp::lsp_types::Position::new(7, 11),
+        ),
+    );
+}
+
+#[test]
+fn integer_arithmetic_directory_maps_errors_on_both_sides_of_heredoc() {
+    let main = "provider test {}\n\
+                let source = test.r.Source {}\n\
+                let before = source.ratio + 1\n\
+                let p = <<EOT\n\
+                a\n\
+                b\n\
+                c\n\
+                EOT\n\
+                let after = source.ratio / 1\n";
+    let fixture = write_fixture(&[("main.crn", main)]);
+    let schemas = integer_arithmetic_directory_schemas();
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    let arithmetic = lsp
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("operand must be Int, got Float")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(cli.len(), 2, "CLI diagnostics: {cli:#?}");
+    assert!(
+        cli.iter()
+            .any(|diagnostic| diagnostic.contains("operator '+'")),
+        "CLI must retain the first arithmetic diagnostic: {cli:#?}",
+    );
+    assert!(
+        cli.iter()
+            .any(|diagnostic| diagnostic.contains("operator '/'")),
+        "CLI must retain the arithmetic diagnostic after the heredoc: {cli:#?}",
+    );
+    let mut ranges = arithmetic
+        .iter()
+        .map(|diagnostic| diagnostic.range)
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| (range.start.line, range.start.character));
+    assert_eq!(
+        ranges,
+        vec![
+            tower_lsp::lsp_types::Range::new(
+                tower_lsp::lsp_types::Position::new(2, 26),
+                tower_lsp::lsp_types::Position::new(2, 27),
+            ),
+            tower_lsp::lsp_types::Range::new(
+                tower_lsp::lsp_types::Position::new(8, 25),
+                tower_lsp::lsp_types::Position::new(8, 26),
+            ),
+        ],
+        "LSP must underline both authored operators: {lsp:#?}",
+    );
+}

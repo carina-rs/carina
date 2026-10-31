@@ -2,7 +2,7 @@
   "version": 20,
   "exports_version": 1,
   "serial": 4,
-  "lineage": "ca0b5868-62e0-41d9-8c9b-a38498c4ef97",
+  "lineage": "11a14ee5-783c-4b8b-8e72-98e2343762ba",
   "carina_version": "0.9.0",
   "resources": [
     {
@@ -13,8 +13,8 @@
         "kind": "applied",
         "identifier": "mock-id",
         "attributes": {
-          "name": "root",
-          "identifier": "root-id"
+          "identifier": "root-id",
+          "name": "root"
         },
         "nested_write_only": {}
       },
@@ -45,8 +45,8 @@
         "kind": "applied",
         "identifier": "mock-id",
         "attributes": {
-          "name": "direct-seed",
-          "identifier": "direct-seed-id"
+          "identifier": "direct-seed-id",
+          "name": "direct-seed"
         },
         "nested_write_only": {}
       },
@@ -78,10 +78,10 @@
         "identifier": "mock-id",
         "attributes": {
           "identifier": "direct-consumer-id",
+          "name": "direct-consumer",
           "comment": {
-            "$secret": "$argon2id$v=19$m=19456,t=2,p=1$2CG1E8vWLrlldxSb9rt5qQ$1gSFvSymd91BNGkYjiYO9gMK4PBo907JRQ04+OZvU1k"
-          },
-          "name": "direct-consumer"
+            "$secret": "$argon2id$v=19$m=19456,t=2,p=1$6H4XQg5f3NufK9bWbkujqA$x3nMeXZgdpgUWFUMt+Y4gPxmbOWLuiqkvAoGDWsUWE0"
+          }
         },
         "nested_write_only": {}
       },
@@ -122,8 +122,8 @@
         "kind": "applied",
         "identifier": "mock-id",
         "attributes": {
-          "identifier": "direct-nested-id",
-          "name": "direct-nested"
+          "name": "direct-nested",
+          "identifier": "direct-nested-id"
         },
         "nested_write_only": {}
       },
@@ -159,8 +159,8 @@
         "kind": "applied",
         "identifier": "mock-id",
         "attributes": {
-          "name": "loop-seed",
-          "identifier": "loop-seed-id"
+          "identifier": "loop-seed-id",
+          "name": "loop-seed"
         },
         "nested_write_only": {}
       },
@@ -191,11 +191,11 @@
         "kind": "applied",
         "identifier": "mock-id",
         "attributes": {
-          "comment": {
-            "$secret": "$argon2id$v=19$m=19456,t=2,p=1$uiQ81gWgU8nemLzjY1a+tg$XR/JVpngvERugPyswjBeFytIzNGfj1F5hK4EVCHfepA"
-          },
           "name": "loop-consumer",
-          "identifier": "loop-consumer-id"
+          "identifier": "loop-consumer-id",
+          "comment": {
+            "$secret": "$argon2id$v=19$m=19456,t=2,p=1$h6ELqN70BEfVBwdCCVLwPg$wJAfpxXkFMurljkpqwgQnNg2VPyq+j3DFzmQ/TYVyYw"
+          }
         },
         "nested_write_only": {}
       },
@@ -214,10 +214,10 @@
       "explicit": {
         "kind": "struct",
         "children": {
-          "name": {
+          "comment": {
             "kind": "leaf"
           },
-          "comment": {
+          "name": {
             "kind": "leaf"
           }
         }

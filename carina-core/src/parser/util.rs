@@ -65,6 +65,7 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource reference",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference",
         Value::Deferred(DeferredValue::Coalesce { .. }) => "coalesce expression",
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => "int",
         Value::Deferred(DeferredValue::Interpolation(_)) => "string",
         Value::Deferred(
             DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
@@ -164,27 +165,69 @@ pub(crate) fn expression_is_plain_string_literal(pair: pest::iterators::Pair<Rul
     }
 }
 
-/// Walk an `expression` (or any intermediate operator rule) down to
-/// the first `primary`, returning `None` if any operator (`|>`, `>>`,
-/// `??`) has more than one operand — such chains are expressions, not
-/// pure literals.
+/// The first-operand spine of the expression precedence chain.
+///
+/// Keeping the wrappers as pairs lets the structural-let parser apply every
+/// suffix and operator after parsing its special primary, while literal-only
+/// callers can require that every wrapper contains exactly one child.
+pub(crate) struct ExpressionDescent<'i> {
+    wrappers: Vec<pest::iterators::Pair<'i, Rule>>,
+    primary: pest::iterators::Pair<'i, Rule>,
+}
+
+impl<'i> ExpressionDescent<'i> {
+    pub(crate) fn primary(&self) -> pest::iterators::Pair<'i, Rule> {
+        self.primary.clone()
+    }
+
+    pub(crate) fn wrapper(&self, rule: Rule) -> Option<pest::iterators::Pair<'i, Rule>> {
+        self.wrappers
+            .iter()
+            .find(|pair| pair.as_rule() == rule)
+            .cloned()
+    }
+}
+
+fn is_expression_wrapper(rule: Rule) -> bool {
+    matches!(
+        rule,
+        Rule::expression
+            | Rule::coalesce_expr
+            | Rule::pipe_expr
+            | Rule::compose_expr
+            | Rule::additive_expr
+            | Rule::multiplicative_expr
+            | Rule::postfix_expr
+    )
+}
+
+/// Walk the first operand through all expression wrappers. When
+/// `require_single_child` is true, any operator or postfix suffix makes the
+/// descent fail; otherwise every wrapper is retained for later evaluation.
+pub(crate) fn descend_expression<'i>(
+    mut pair: pest::iterators::Pair<'i, Rule>,
+    require_single_child: bool,
+) -> Option<ExpressionDescent<'i>> {
+    let mut wrappers = Vec::new();
+    while is_expression_wrapper(pair.as_rule()) {
+        wrappers.push(pair.clone());
+        let mut inner = pair.into_inner();
+        let first = inner.next()?;
+        if require_single_child && inner.next().is_some() {
+            return None;
+        }
+        pair = first;
+    }
+    (pair.as_rule() == Rule::primary).then_some(ExpressionDescent {
+        wrappers,
+        primary: pair,
+    })
+}
+
+/// Return a primary only when no wrapper contains an operator or postfix
+/// suffix.
 pub(crate) fn unwrap_to_primary(
     pair: pest::iterators::Pair<Rule>,
 ) -> Option<pest::iterators::Pair<Rule>> {
-    match pair.as_rule() {
-        Rule::primary => Some(pair),
-        Rule::expression
-        | Rule::coalesce_expr
-        | Rule::pipe_expr
-        | Rule::compose_expr
-        | Rule::postfix_expr => {
-            let mut inner = pair.into_inner();
-            let first = inner.next()?;
-            if inner.next().is_some() {
-                return None;
-            }
-            unwrap_to_primary(first)
-        }
-        _ => None,
-    }
+    descend_expression(pair, true).map(|descent| descent.primary())
 }

@@ -1567,15 +1567,13 @@ impl<'a> CompositionRuntimeRef<'a> {
     }
 
     pub(crate) fn binding(self) -> Option<&'a str> {
+        self.binding_address().map(AbsoluteBindingAddress::as_str)
+    }
+
+    pub(crate) fn binding_address(self) -> Option<&'a AbsoluteBindingAddress> {
         match self {
-            Self::Live(composition) => composition
-                .binding
-                .as_ref()
-                .map(AbsoluteBindingAddress::as_str),
-            Self::Saved(composition) => composition
-                .binding
-                .as_ref()
-                .map(AbsoluteBindingAddress::as_str),
+            Self::Live(composition) => composition.binding.as_ref(),
+            Self::Saved(composition) => composition.binding.as_ref(),
         }
     }
 

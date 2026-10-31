@@ -53,17 +53,17 @@ pub enum PlanOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScheduleEdge {
-    /// This effect must wait for the resource identity to complete.
-    DependsOn(ResourceIdentity),
+pub(crate) enum ScheduleEdge {
+    /// This effect must wait for the typed scheduler key to complete.
+    DependsOn(SchedulerKey),
     /// This effect must wait for the resource identity to complete, and the
     /// plan is invalid if no current effect owns that identity.
     RequiredDependsOn(ResourceIdentity),
-    /// This effect must complete before the resource identity can proceed.
-    BlockedBy(ResourceIdentity),
-    /// This effect must complete before the resource identity can proceed, but
-    /// only when that identity resolves to a delete effect.
-    BlockedByIfDelete(ResourceIdentity),
+    /// This effect must complete before the typed scheduler key can proceed.
+    BlockedBy(SchedulerKey),
+    /// This effect must complete before the bound resource can proceed, but
+    /// only when that binding resolves to a delete effect.
+    BlockedByIfDelete(AbsoluteBindingAddress),
 }
 
 /// Equality key used by the scheduler's cross-phase failure propagation.
@@ -2057,12 +2057,50 @@ impl<S> EffectWithSource<S> {
         }
     }
 
+    /// Typed keys under which this effect can satisfy a scheduling dependency.
+    pub(crate) fn scheduling_keys(&self) -> Vec<SchedulerKey> {
+        match self {
+            Effect::Wait { identity, .. } => vec![SchedulerKey::Binding(identity.clone())],
+            Effect::DeferredCreate { template, .. } => match &template.target {
+                crate::parser::DeferredForTarget::Bound { binding } => {
+                    vec![SchedulerKey::Binding(binding.clone())]
+                }
+                crate::parser::DeferredForTarget::Unbound { template } => {
+                    vec![SchedulerKey::Loop(template.clone())]
+                }
+            },
+            Effect::DeferredReplace(payload) => match &payload.template.target {
+                crate::parser::DeferredForTarget::Bound { binding } => {
+                    vec![SchedulerKey::Binding(binding.clone())]
+                }
+                crate::parser::DeferredForTarget::Unbound { template } => {
+                    vec![SchedulerKey::Loop(template.clone())]
+                }
+            },
+            Effect::ReleaseListKeys { .. } => Vec::new(),
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. } => {
+                let mut keys = vec![SchedulerKey::Resource(self.identity())];
+                if let Some(binding) = self.binding_address() {
+                    keys.push(SchedulerKey::Binding(binding.clone()));
+                }
+                keys
+            }
+        }
+    }
+
     /// Scheduling edges this effect contributes when running `apply`.
     ///
     /// Returned edges describe ordering constraints relative to other
     /// bindings; resolving them to concrete effect indices is the
     /// responsibility of [`crate::effect::deps::build_effect_dependency_analysis`].
-    pub fn apply_edges(&self) -> Vec<ScheduleEdge> {
+    pub(crate) fn apply_edges(&self) -> Vec<ScheduleEdge> {
         match self {
             Effect::Delete {
                 dependencies,
@@ -2072,7 +2110,6 @@ impl<S> EffectWithSource<S> {
                 let mut edges: Vec<ScheduleEdge> = dependencies
                     .iter()
                     .cloned()
-                    .map(ResourceIdentity::new)
                     .map(ScheduleEdge::BlockedByIfDelete)
                     .collect();
                 edges.extend(
@@ -2086,13 +2123,6 @@ impl<S> EffectWithSource<S> {
             Effect::Wait { .. } | Effect::DeferredCreate { .. } | Effect::DeferredReplace(_) => {
                 self.blocking_keys()
                     .into_iter()
-                    .map(|key| match key {
-                        SchedulerKey::Binding(binding) => ResourceIdentity::new(binding.as_str()),
-                        SchedulerKey::Resource(identity) => identity,
-                        SchedulerKey::Loop(template) => {
-                            ResourceIdentity::new(template.scheduler_key())
-                        }
-                    })
                     .map(ScheduleEdge::DependsOn)
                     .collect()
             }
@@ -2112,12 +2142,12 @@ impl<S> EffectWithSource<S> {
     /// Differs from [`Self::apply_edges`] in that meta effects (`Wait`,
     /// deferred variants) contribute no edges because they are not present
     /// in destroy plans.
-    pub fn destroy_edges(&self) -> Vec<ScheduleEdge> {
+    pub(crate) fn destroy_edges(&self) -> Vec<ScheduleEdge> {
         match self {
             Effect::Delete { dependencies, .. } => dependencies
                 .iter()
                 .cloned()
-                .map(ResourceIdentity::new)
+                .map(SchedulerKey::Binding)
                 .map(ScheduleEdge::BlockedBy)
                 .collect(),
             Effect::Read { .. }

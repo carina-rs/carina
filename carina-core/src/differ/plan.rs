@@ -1129,7 +1129,7 @@ fn promote_referenced_replaces_to_cbd(
     for resource in unresolved_managed {
         let deps = get_resource_dependencies(resource);
         for dep in &deps {
-            let Some(replaced_identity) = ref_targets.get(dep.as_str()) else {
+            let Some(replaced_identity) = ref_targets.get(dep) else {
                 continue;
             };
             let Some(pending) = pending_replaces.get(replaced_identity) else {
@@ -1197,7 +1197,7 @@ fn promote_pending_replaces_for_dependents(
         let deps = get_resource_dependencies(resource);
 
         for dep in &deps {
-            let Some(replaced_identity) = ref_targets.get(dep.as_str()).cloned() else {
+            let Some(replaced_identity) = ref_targets.get(dep).cloned() else {
                 continue;
             };
             if consumer_identity == replaced_identity {
@@ -1278,15 +1278,14 @@ fn promote_pending_replaces_for_dependents(
 fn pending_reference_targets(
     pending_replaces: &HashMap<ResourceIdentity, PendingReplace>,
     create_before_destroy_only: bool,
-) -> HashMap<String, ResourceIdentity> {
+) -> HashMap<AbsoluteBindingAddress, ResourceIdentity> {
     let mut targets = HashMap::new();
     for (identity, pending) in pending_replaces {
         if create_before_destroy_only && !pending.create_before_destroy {
             continue;
         }
-        targets.insert(identity.as_str().to_string(), identity.clone());
         if let Some(binding) = &pending.create.binding {
-            targets.insert(binding.to_string(), identity.clone());
+            targets.insert(binding.clone(), identity.clone());
         }
     }
     targets

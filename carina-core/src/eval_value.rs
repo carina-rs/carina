@@ -110,9 +110,15 @@ impl StructuralHandleKind {
 /// is known to be a structural handle.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StructuralHandleMetadata<B: BindingAddress = AbsoluteBindingAddress> {
-    Handle { access_base: Option<Value<B>> },
+    Handle {
+        access_base: Option<Value<B>>,
+    },
     List(Vec<Option<StructuralHandleMetadata<B>>>),
     Map(IndexMap<String, StructuralHandleMetadata<B>>),
+    /// Provisional handles consumed by a computed scalar expression. This
+    /// preserves every operand for the directory fixed point without making
+    /// the scalar result itself look like a handle alias.
+    ExpressionOperands(Vec<StructuralHandleMetadata<B>>),
 }
 
 pub(crate) type AuthoredStructuralHandleMetadata = StructuralHandleMetadata<RelativeBindingName>;
@@ -125,8 +131,21 @@ impl<B: BindingAddress> StructuralHandleMetadata<B> {
     pub(crate) fn access_base(&self) -> Option<&Value<B>> {
         match self {
             Self::Handle { access_base } => access_base.as_ref(),
-            Self::List(_) | Self::Map(_) => None,
+            Self::List(_) | Self::Map(_) | Self::ExpressionOperands(_) => None,
         }
+    }
+
+    pub(crate) fn from_expression_operands(
+        operands: impl IntoIterator<Item = Option<Self>>,
+    ) -> Option<Self> {
+        let mut collected = Vec::new();
+        for operand in operands.into_iter().flatten() {
+            match operand {
+                Self::ExpressionOperands(nested) => collected.extend(nested),
+                other => collected.push(other),
+            }
+        }
+        (!collected.is_empty()).then_some(Self::ExpressionOperands(collected))
     }
 
     pub(crate) fn select(&self, step: &PathSegment) -> Option<Self> {
@@ -148,7 +167,10 @@ impl<B: BindingAddress> StructuralHandleMetadata<B> {
                     index: Subscript::Str { key },
                 },
             ) => entries.get(key.expose_plaintext()).cloned(),
-            (Self::Handle { .. }, _) | (Self::List(_), _) | (Self::Map(_), _) => None,
+            (Self::Handle { .. }, _)
+            | (Self::List(_), _)
+            | (Self::Map(_), _)
+            | (Self::ExpressionOperands(_), _) => None,
         }
     }
 }
@@ -174,6 +196,12 @@ impl StructuralHandleMetadata<RelativeBindingName> {
                     .map(|(name, metadata)| (name, metadata.resolve_bindings(resolve)))
                     .collect(),
             ),
+            Self::ExpressionOperands(operands) => StructuralHandleMetadata::ExpressionOperands(
+                operands
+                    .into_iter()
+                    .map(|metadata| metadata.resolve_bindings(resolve))
+                    .collect(),
+            ),
         }
     }
 }
@@ -196,6 +224,11 @@ impl StructuralHandleMetadata<AbsoluteBindingAddress> {
             }
             Self::Map(entries) => {
                 for metadata in entries.values_mut() {
+                    metadata.map_absolute_bindings(map);
+                }
+            }
+            Self::ExpressionOperands(operands) => {
+                for metadata in operands {
                     metadata.map_absolute_bindings(map);
                 }
             }

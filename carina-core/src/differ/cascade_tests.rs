@@ -635,3 +635,197 @@ fn chained_cbd_anonymous_middle_node_auto_promoted() {
         "anonymous middle delete should wait for downstream consumer update"
     );
 }
+
+const COLLIDING_BINDING: &str = "mock_test_replaceable_deadbeef";
+
+struct BindingIdentityCollisionFixture {
+    plan: Plan,
+    unresolved: Vec<Resource>,
+    anonymous_id: ResourceId,
+    consumer_id: ResourceId,
+}
+
+fn binding_identity_collision_fixture() -> BindingIdentityCollisionFixture {
+    let mut directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    directory.push("tests/fixtures/dependency_key_collision");
+    let parsed = crate::config_loader::parse_directory(
+        &directory,
+        &crate::parser::ProviderContext::default(),
+    )
+    .expect("multi-file collision fixture parses");
+    let parsed = crate::module_resolver::resolve_modules_providerless(parsed, &directory)
+        .expect("multi-file collision fixture crosses root expansion");
+    let mut unresolved = parsed.resources;
+
+    let anonymous = unresolved
+        .iter_mut()
+        .find(|resource| {
+            resource.id.resource_type == "test.replaceable" && resource.binding.is_none()
+        })
+        .expect("fixture contains the anonymous replaceable resource");
+    anonymous
+        .id
+        .set_identity(ResourceIdentity::new(COLLIDING_BINDING));
+    let anonymous_id = anonymous.id.clone();
+
+    let consumer_id = unresolved
+        .iter()
+        .find(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.as_str() == "consumer")
+        })
+        .expect("fixture contains the consumer binding")
+        .id
+        .clone();
+
+    let mut managed = unresolved.clone();
+    let managed_consumer = managed
+        .iter_mut()
+        .find(|resource| resource.id == consumer_id)
+        .expect("managed fixture contains consumer");
+    managed_consumer.set_attr("anchor_id", string("anchor-id"));
+
+    let anchor_id = managed
+        .iter()
+        .find(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.as_str() == COLLIDING_BINDING)
+        })
+        .expect("fixture contains the colliding let binding")
+        .id
+        .clone();
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        (ResourceSchema::new("test.replaceable")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::required("shape", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .with_unique_name_attribute("name"))
+        .validate()
+        .expect("replaceable fixture schema is valid"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.anchor")
+            .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::provider_populated("identifier", AttributeType::string()).build(),
+            )
+            .validate()
+            .expect("anchor fixture schema is valid"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.consumer")
+            .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::required("anchor_id", AttributeType::string()).build())
+            .attribute(AttributeSchema::required("note", AttributeType::string()).build())
+            .validate()
+            .expect("consumer fixture schema is valid"),
+    );
+
+    let states = HashMap::from([
+        (
+            anonymous_id.clone(),
+            state(
+                &anonymous_id,
+                &[("name", string("anonymous")), ("shape", string("old"))],
+                "anonymous-id",
+            ),
+        ),
+        (
+            anchor_id.clone(),
+            state(&anchor_id, &[("name", string("anchor"))], "anchor-id"),
+        ),
+        (
+            consumer_id.clone(),
+            state(
+                &consumer_id,
+                &[
+                    ("name", string("consumer")),
+                    ("anchor_id", string("anchor-id")),
+                    ("note", string("old")),
+                ],
+                "consumer-id",
+            ),
+        ),
+    ]);
+
+    let plan = plan_for(managed, unresolved.clone(), states, &schemas);
+    BindingIdentityCollisionFixture {
+        plan,
+        unresolved,
+        anonymous_id,
+        consumer_id,
+    }
+}
+
+#[test]
+fn binding_spelling_collision_does_not_promote_anonymous_replace_to_cbd() {
+    let fixture = binding_identity_collision_fixture();
+    let metadata = replacement_metadata(&fixture.plan, &fixture.anonymous_id);
+
+    assert!(
+        !metadata.create_before_destroy,
+        "a dependency on the typed let binding must not promote an unrelated anonymous identity"
+    );
+}
+
+#[test]
+fn binding_spelling_collision_does_not_link_apply_dag_to_anonymous_replace() {
+    let fixture = binding_identity_collision_fixture();
+    let anonymous_create = fixture
+        .plan
+        .effects()
+        .iter()
+        .position(|effect| {
+            matches!(effect, Effect::Create(resource) if resource.id == fixture.anonymous_id)
+        })
+        .expect("fixture plan contains anonymous replacement create");
+    let consumer_update = fixture
+        .plan
+        .effects()
+        .iter()
+        .position(
+            |effect| matches!(effect, Effect::Update { to, .. } if to.id == fixture.consumer_id),
+        )
+        .expect("fixture plan contains consumer update");
+    let unresolved = fixture
+        .unresolved
+        .into_iter()
+        .map(|resource| {
+            (
+                resource.id.clone(),
+                crate::effect::deps::UnresolvedResource::from_pre_resolve(resource),
+            )
+        })
+        .collect();
+    let analysis = crate::effect::deps::build_effect_dependency_analysis(
+        fixture.plan.effects(),
+        &unresolved,
+        &[],
+        crate::effect::deps::ScheduleInputs::Apply,
+    )
+    .expect("fixture dependency graph is valid");
+
+    assert!(
+        !analysis
+            .deps_of(consumer_update)
+            .expect("consumer has a dependency set")
+            .contains(&anonymous_create),
+        "the apply DAG must not resolve a binding through an equal-spelling resource identity"
+    );
+}

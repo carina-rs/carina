@@ -6,7 +6,17 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::ValueString;
 
 mod private {
-    pub trait Sealed {}
+    use super::ValueString;
+
+    pub struct Derivation;
+
+    pub trait Sealed: Sized {
+        fn with_index(&self, index: i64, authority: Derivation) -> Self;
+
+        fn with_map_key(&self, key: &ValueString, authority: Derivation) -> Self;
+
+        fn module_argument_placeholder(name: String, authority: Derivation) -> Option<Self>;
+    }
 }
 
 /// A binding name exactly as authored inside one root or module directory.
@@ -163,13 +173,6 @@ impl AbsoluteBindingAddress {
             [&self.0],
         )))
     }
-
-    pub fn canonicalize_persisted_map_keys(&self) -> Self {
-        Self(ValueString::derived_from(
-            crate::utils::canonicalize_map_key_address(self.as_str()),
-            [&self.0],
-        ))
-    }
 }
 
 const EMPTY_ABSOLUTE_BINDING_ADDRESS: &str = "an absolute binding address cannot be empty";
@@ -220,21 +223,41 @@ impl fmt::Display for AbsoluteBindingAddress {
 pub trait BindingAddress:
     private::Sealed + Clone + fmt::Debug + fmt::Display + Eq + Hash + Ord + Send + Sync + 'static
 {
+    /// Address derivation is intentionally unavailable through this public
+    /// trait. In particular, downstream code cannot append a persisted map
+    /// key to an absolute address:
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::{AbsoluteBindingAddress, BindingAddress, ValueString};
+    ///
+    /// # fn derive(address: &AbsoluteBindingAddress, key: &ValueString) {
+    /// let _ = <AbsoluteBindingAddress as BindingAddress>::with_map_key(address, key);
+    /// # }
+    /// ```
     fn as_str(&self) -> &str;
 
     fn diagnostic_literal(&self) -> Option<&str>;
-
-    #[doc(hidden)]
-    fn with_index(&self, index: i64) -> Self;
-
-    #[doc(hidden)]
-    fn with_map_key(&self, key: &ValueString) -> Self;
-
-    #[doc(hidden)]
-    fn module_argument_placeholder(name: String) -> Option<Self>;
 }
 
-impl private::Sealed for RelativeBindingName {}
+impl private::Sealed for RelativeBindingName {
+    fn with_index(&self, index: i64, _authority: private::Derivation) -> Self {
+        Self(ValueString::derived_from(
+            format!("{}[{index}]", self.as_str()),
+            [&self.0],
+        ))
+    }
+
+    fn with_map_key(&self, key: &ValueString, _authority: private::Derivation) -> Self {
+        Self(ValueString::derived_from(
+            crate::utils::map_key_address(self.as_str(), key.expose_plaintext()),
+            [&self.0, key],
+        ))
+    }
+
+    fn module_argument_placeholder(name: String, _authority: private::Derivation) -> Option<Self> {
+        Some(Self::new(name))
+    }
+}
 
 impl BindingAddress for RelativeBindingName {
     fn as_str(&self) -> &str {
@@ -244,27 +267,21 @@ impl BindingAddress for RelativeBindingName {
     fn diagnostic_literal(&self) -> Option<&str> {
         self.0.diagnostic_literal()
     }
-
-    fn with_index(&self, index: i64) -> Self {
-        Self(ValueString::derived_from(
-            format!("{}[{index}]", self.as_str()),
-            [&self.0],
-        ))
-    }
-
-    fn with_map_key(&self, key: &ValueString) -> Self {
-        Self(ValueString::derived_from(
-            crate::utils::map_key_address(self.as_str(), key.expose_plaintext()),
-            [&self.0, key],
-        ))
-    }
-
-    fn module_argument_placeholder(name: String) -> Option<Self> {
-        Some(Self::new(name))
-    }
 }
 
-impl private::Sealed for AbsoluteBindingAddress {}
+impl private::Sealed for AbsoluteBindingAddress {
+    fn with_index(&self, index: i64, _authority: private::Derivation) -> Self {
+        Self::with_index(self, index)
+    }
+
+    fn with_map_key(&self, key: &ValueString, _authority: private::Derivation) -> Self {
+        Self::with_map_key(self, key)
+    }
+
+    fn module_argument_placeholder(_name: String, _authority: private::Derivation) -> Option<Self> {
+        None
+    }
+}
 
 impl BindingAddress for AbsoluteBindingAddress {
     fn as_str(&self) -> &str {
@@ -274,18 +291,18 @@ impl BindingAddress for AbsoluteBindingAddress {
     fn diagnostic_literal(&self) -> Option<&str> {
         self.0.diagnostic_literal()
     }
+}
 
-    fn with_index(&self, index: i64) -> Self {
-        Self::with_index(self, index)
-    }
+pub(crate) fn binding_with_index<B: BindingAddress>(binding: &B, index: i64) -> B {
+    <B as private::Sealed>::with_index(binding, index, private::Derivation)
+}
 
-    fn with_map_key(&self, key: &ValueString) -> Self {
-        Self::with_map_key(self, key)
-    }
+pub(crate) fn binding_with_map_key<B: BindingAddress>(binding: &B, key: &ValueString) -> B {
+    <B as private::Sealed>::with_map_key(binding, key, private::Derivation)
+}
 
-    fn module_argument_placeholder(_name: String) -> Option<Self> {
-        None
-    }
+pub(crate) fn module_argument_placeholder<B: BindingAddress>(name: String) -> Option<B> {
+    <B as private::Sealed>::module_argument_placeholder(name, private::Derivation)
 }
 
 impl PartialEq<str> for RelativeBindingName {

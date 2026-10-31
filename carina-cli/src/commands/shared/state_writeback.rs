@@ -7268,9 +7268,14 @@ mod stage4_unknown_err_tests {
         let err = PersistedExportValue::encode(&v).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamExport { path: p },
+                reason,
                 context: SerializationContext::StateWriteback,
-            } => assert_eq!(p, path),
+            } => {
+                let UnknownReason::UpstreamExport { path: actual } = reason.as_ref() else {
+                    panic!("expected UpstreamExport reason, got: {reason:?}");
+                };
+                assert_eq!(actual, &path);
+            }
             other => {
                 panic!("expected UnknownNotAllowed/UpstreamExport/StateWriteback, got: {other:?}")
             }

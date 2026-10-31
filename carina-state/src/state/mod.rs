@@ -1485,6 +1485,19 @@ impl StateFile {
     /// without a `moved` block.
     fn canonicalize_addresses(&mut self) -> Result<(), BackendError> {
         use carina_core::utils::canonicalize_map_key_address;
+
+        fn canonicalize_binding(
+            binding: AbsoluteBindingAddress,
+        ) -> Result<AbsoluteBindingAddress, BackendError> {
+            let original = binding.as_str().to_string();
+            let canonical = carina_core::utils::canonicalize_map_key_address(&original);
+            serde_json::from_value(serde_json::Value::String(canonical)).map_err(|error| {
+                BackendError::InvalidState(format!(
+                    "cannot canonicalize persisted binding address {original:?}: {error}"
+                ))
+            })
+        }
+
         for r in &mut self.resources {
             r.identity =
                 ResourceIdentity::try_from(canonicalize_map_key_address(r.identity.as_str()))
@@ -1498,13 +1511,12 @@ impl StateFile {
                         error,
                     })?;
             if let Some(binding) = r.binding.take() {
-                r.binding = Some(binding.canonicalize_persisted_map_keys());
+                r.binding = Some(canonicalize_binding(binding)?);
             }
-            r.dependency_bindings = r
-                .dependency_bindings
-                .iter()
-                .map(AbsoluteBindingAddress::canonicalize_persisted_map_keys)
-                .collect();
+            r.dependency_bindings = std::mem::take(&mut r.dependency_bindings)
+                .into_iter()
+                .map(canonicalize_binding)
+                .collect::<Result<_, _>>()?;
         }
         Ok(())
     }

@@ -2406,6 +2406,10 @@ fn value_contains_empty_interpolation<B: carina_core::resource::BindingAddress>(
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             value_contains_empty_interpolation(value) || value_contains_empty_interpolation(default)
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            value_contains_empty_interpolation(expression.lhs())
+                || value_contains_empty_interpolation(expression.rhs())
+        }
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },

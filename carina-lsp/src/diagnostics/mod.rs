@@ -71,6 +71,23 @@ fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
     })
 }
 
+fn integer_operator_range(
+    span: carina_core::integer_arithmetic::IntegerOperatorSpan,
+) -> Option<Range> {
+    let line = span.line()?.checked_sub(1)? as u32;
+    let column = span.column()?.checked_sub(1)? as u32;
+    Some(Range {
+        start: Position {
+            line,
+            character: column,
+        },
+        end: Position {
+            line,
+            character: column + 1,
+        },
+    })
+}
+
 fn render_module_call_findings(
     doc: &Document,
     current_file: &Path,
@@ -180,6 +197,25 @@ pub(crate) fn carina_diagnostic_range(
         message,
         ..Default::default()
     }
+}
+
+fn push_integer_arithmetic_diagnostic(
+    diagnostics: &mut Vec<Diagnostic>,
+    range: Range,
+    message: String,
+) {
+    if diagnostics.iter().any(|diagnostic| {
+        diagnostic.range == range
+            && diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+            && diagnostic.message == message
+    }) {
+        return;
+    }
+    diagnostics.push(carina_diagnostic_range(
+        range,
+        DiagnosticSeverity::ERROR,
+        message,
+    ));
 }
 
 enum DiagnosticProviderContext {
@@ -789,6 +825,24 @@ impl DiagnosticEngine {
                 inference_bindings,
                 binding_use_report,
             } = validation_inputs;
+            // Validate non-resource declarations authored in the open file,
+            // even when no typed resource sink consumes them. Binding and
+            // schema authority remains directory-wide, while source anchoring
+            // comes from each authored operator.
+            for finding in carina_core::validation::check_file_integer_arithmetic_values(
+                parsed,
+                &inference_bindings,
+                &self.schemas,
+                &binding_index,
+            ) {
+                if let Some(range) = integer_operator_range(finding.operator_span()) {
+                    push_integer_arithmetic_diagnostic(
+                        &mut diagnostics,
+                        range,
+                        finding.to_string(),
+                    );
+                }
+            }
             // A direct bare binding occupies the complete attribute value, so
             // the shared authority owns that sink even when it succeeds. In
             // particular, an enum-typed argument must not be reinterpreted by
@@ -1301,7 +1355,10 @@ impl DiagnosticEngine {
                         // wrong-typed lazy default from diagnostics.
                         let typecheck_value = if matches!(
                             attr_value,
-                            Value::Deferred(DeferredValue::Coalesce { .. })
+                            Value::Deferred(
+                                DeferredValue::Coalesce { .. }
+                                    | DeferredValue::IntegerArithmetic(_)
+                            )
                         ) {
                             attr_value
                         } else {
@@ -1384,6 +1441,35 @@ impl DiagnosticEngine {
                             if binding_error_sinks
                                 .contains(&(resource_id.clone(), attr_name.clone()))
                             {
+                                continue;
+                            }
+
+                            // Arithmetic is a typed computed expression. Send
+                            // the complete authored tree through core's shared
+                            // checker before the legacy shape-oriented cases;
+                            // this also reaches arithmetic nested in secrets,
+                            // interpolation, collections, and coalesces.
+                            let arithmetic_findings =
+                                carina_core::validation::check_integer_arithmetic_types(
+                                    authored_attr_value,
+                                    effective_type.clone(),
+                                    &inference_bindings,
+                                    &self.schemas,
+                                    &binding_index,
+                                );
+                            if !arithmetic_findings.is_empty() {
+                                for finding in arithmetic_findings {
+                                    let range = integer_operator_range(finding.operator_span())
+                                        .or_else(|| {
+                                            self.find_attribute_value_range(doc, attr_name, scope)
+                                        })
+                                        .unwrap_or_default();
+                                    push_integer_arithmetic_diagnostic(
+                                        &mut diagnostics,
+                                        range,
+                                        finding.to_string(),
+                                    );
+                                }
                                 continue;
                             }
 
@@ -1539,6 +1625,9 @@ impl DiagnosticEngine {
                                     schema.type_in_schema(attr_schema.attr_type()),
                                     name,
                                 ),
+                                // Core's arithmetic checker above owns both operand and
+                                // result-sink diagnostics for this typed expression.
+                                (_, Value::Deferred(DeferredValue::IntegerArithmetic(_))) => None,
                                 // Enum: the structured-payload path
                                 // above handles `InvalidEnumVariant` /
                                 // `StringLiteralExpectedEnum` and
@@ -2416,6 +2505,18 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             (*line as u32).saturating_sub(1),
             0,
             100,
+            DiagnosticSeverity::ERROR,
+            message.clone(),
+        ),
+        ParseError::IntegerArithmetic {
+            line,
+            column,
+            end_column,
+            message,
+        } => carina_diagnostic(
+            line.saturating_sub(1) as u32,
+            column.saturating_sub(1) as u32,
+            end_column.saturating_sub(1) as u32,
             DiagnosticSeverity::ERROR,
             message.clone(),
         ),

@@ -286,6 +286,10 @@ fn unresolved_enum_identifier<B: BindingAddress>(value: &Value<B>) -> Option<&st
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             unresolved_enum_identifier(value).or_else(|| unresolved_enum_identifier(default))
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            unresolved_enum_identifier(expression.lhs())
+                .or_else(|| unresolved_enum_identifier(expression.rhs()))
+        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::CanonicalEnum(_)

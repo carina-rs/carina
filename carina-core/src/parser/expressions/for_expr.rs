@@ -437,7 +437,9 @@ pub(crate) fn parse_for_expr(
                 let metadata = match structural_handle_metadata.as_ref() {
                     Some(StructuralHandleMetadata::List(items)) => items.get(i).cloned().flatten(),
                     Some(
-                        StructuralHandleMetadata::Handle { .. } | StructuralHandleMetadata::Map(_),
+                        StructuralHandleMetadata::Handle { .. }
+                        | StructuralHandleMetadata::Map(_)
+                        | StructuralHandleMetadata::ExpressionOperands(_),
                     )
                     | None => None,
                 };
@@ -476,7 +478,9 @@ pub(crate) fn parse_for_expr(
                 let metadata = match structural_handle_metadata.as_ref() {
                     Some(StructuralHandleMetadata::List(items)) => items.get(i).cloned().flatten(),
                     Some(
-                        StructuralHandleMetadata::Handle { .. } | StructuralHandleMetadata::Map(_),
+                        StructuralHandleMetadata::Handle { .. }
+                        | StructuralHandleMetadata::Map(_)
+                        | StructuralHandleMetadata::ExpressionOperands(_),
                     )
                     | None => None,
                 };
@@ -519,7 +523,9 @@ pub(crate) fn parse_for_expr(
                 let metadata = match structural_handle_metadata.as_ref() {
                     Some(StructuralHandleMetadata::Map(entries)) => entries.get(key).cloned(),
                     Some(
-                        StructuralHandleMetadata::Handle { .. } | StructuralHandleMetadata::List(_),
+                        StructuralHandleMetadata::Handle { .. }
+                        | StructuralHandleMetadata::List(_)
+                        | StructuralHandleMetadata::ExpressionOperands(_),
                     )
                     | None => None,
                 };
@@ -637,6 +643,9 @@ pub(crate) fn parse_for_expr(
                     }
                     Value::Deferred(DeferredValue::ResourceRef { path }) => {
                         format!("unresolved reference {}", path.to_dot_string())
+                    }
+                    value @ Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+                        crate::ValueDescription::of(value).to_string()
                     }
                     Value::Concrete(ConcreteValue::List(_)) => "list".to_string(),
                     Value::Concrete(ConcreteValue::Map(_)) => "map".to_string(),

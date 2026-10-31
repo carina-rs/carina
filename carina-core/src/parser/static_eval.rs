@@ -33,6 +33,9 @@ pub(crate) fn is_static_value(value: &Value) -> bool {
             argument.handle().is_some() || argument.value().is_some_and(is_static_value)
         }),
         Value::Deferred(DeferredValue::Access(access)) => is_static_value(access.base()),
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            is_static_value(expression.lhs()) && is_static_value(expression.rhs())
+        }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             parts.iter().all(|part| match part {
                 InterpolationPart::Literal(_) => true,
@@ -171,6 +174,14 @@ pub(crate) fn evaluate_static_value(
                     line: access.source_line(),
                     message: error.to_string(),
                 })
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let span = expression.operator_span();
+            let lhs = evaluate_static_value(expression.lhs().clone(), config)?;
+            let rhs = evaluate_static_value(expression.rhs().clone(), config)?;
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| ParseError::integer_arithmetic(span, 0, error))
         }
         Value::Deferred(DeferredValue::Unavailable {
             name,

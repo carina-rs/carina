@@ -2974,8 +2974,9 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 33
-    // adds the typed keyed-list release effect. Format 32 records provider
+    // Validate version compatibility before decoding the payload. Format 34
+    // adds typed deferred integer arithmetic expressions. Format 33 adds the
+    // typed keyed-list release effect. Format 32 records provider
     // instance reference scopes and create-outcome-unknown markers for
     // protocol v13. Format 31 persists authored ignore paths; format 30 was
     // never emitted. Format 29 persists anonymous-loop provenance, typed

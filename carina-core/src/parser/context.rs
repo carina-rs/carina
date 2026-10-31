@@ -123,6 +123,10 @@ pub(crate) struct ParseContext<'cfg> {
     pub(super) binding_scope: BindingScopeId,
     binding_scope_source_file: std::path::PathBuf,
     next_binding_scope: Rc<Cell<u64>>,
+    /// The exact preprocessing map for the file whose pest pairs are being
+    /// lowered. Shared ownership lets nested parser contexts preserve authored
+    /// positions without exposing a raw line/column constructor.
+    source_position_map: Option<Arc<crate::heredoc::PreprocessResult>>,
 }
 
 impl<'cfg> ParseContext<'cfg> {
@@ -149,7 +153,25 @@ impl<'cfg> ParseContext<'cfg> {
             binding_scope: BindingScopeId::root(std::path::Path::new("test.crn")),
             binding_scope_source_file: std::path::PathBuf::from("test.crn"),
             next_binding_scope: Rc::new(Cell::new(1)),
+            source_position_map: None,
         }
+    }
+
+    pub(super) fn set_preprocessed_file(&mut self, file: &super::PreprocessedFile) {
+        self.source_position_map = Some(file.shared_position_map());
+    }
+
+    pub(super) fn original_position(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+    ) -> Result<crate::heredoc::OriginalPosition, ParseError> {
+        self.source_position_map
+            .as_ref()
+            .map(|map| map.original_position(pair.as_span().start()))
+            .ok_or_else(|| ParseError::InternalError {
+                expected: "original-source position map".to_string(),
+                context: format!("lowering {:?} from preprocessed source", pair.as_rule()),
+            })
     }
 
     pub(super) fn set_source_scope(&mut self, source_file: &std::path::Path) {
@@ -403,6 +425,14 @@ pub(super) enum StructuralSinkMode {
 #[derive(Clone)]
 pub(crate) struct ExpressionMode<'a> {
     sink: Option<ExpressionSink<'a>>,
+    source: Option<IntegerOperandContext<'a>>,
+    is_integer_operand: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct IntegerOperandContext<'a> {
+    pub(crate) source_file: &'a std::path::Path,
+    pub(crate) preprocessed_file: &'a super::PreprocessedFile,
 }
 
 #[derive(Clone)]
@@ -417,7 +447,11 @@ struct ExpressionSink<'a> {
 
 impl ExpressionMode<'_> {
     pub(super) const fn untyped() -> Self {
-        Self { sink: None }
+        Self {
+            sink: None,
+            source: None,
+            is_integer_operand: false,
+        }
     }
 }
 
@@ -436,6 +470,11 @@ impl<'a> ExpressionMode<'a> {
                 preprocessed_file,
                 structural: StructuralSinkMode::Pending,
             }),
+            source: Some(IntegerOperandContext {
+                source_file,
+                preprocessed_file,
+            }),
+            is_integer_operand: false,
         }
     }
 
@@ -461,12 +500,53 @@ impl<'a> ExpressionMode<'a> {
                 preprocessed_file,
                 structural,
             }),
+            source: Some(IntegerOperandContext {
+                source_file,
+                preprocessed_file,
+            }),
+            is_integer_operand: false,
+        }
+    }
+
+    pub(super) const fn with_source(
+        source_file: &'a std::path::Path,
+        preprocessed_file: &'a super::PreprocessedFile,
+    ) -> Self {
+        Self {
+            sink: None,
+            source: Some(IntegerOperandContext {
+                source_file,
+                preprocessed_file,
+            }),
+            is_integer_operand: false,
+        }
+    }
+
+    pub(super) fn for_integer_operand(&self) -> Self {
+        let source = self.source.or_else(|| {
+            self.sink.as_ref().map(|sink| IntegerOperandContext {
+                source_file: sink.source_file,
+                preprocessed_file: sink.preprocessed_file,
+            })
+        });
+        Self {
+            sink: None,
+            source,
+            is_integer_operand: true,
+        }
+    }
+
+    pub(super) const fn integer_operand_context(&self) -> Option<IntegerOperandContext<'a>> {
+        if self.is_integer_operand {
+            self.source
+        } else {
+            None
         }
     }
 
     pub(super) fn at_attribute(&self, name: impl Into<String>) -> Self {
         let Some(sink) = &self.sink else {
-            return Self::untyped();
+            return self.clone();
         };
         let path = AttributePath::root(name);
         Self {
@@ -475,6 +555,8 @@ impl<'a> ExpressionMode<'a> {
                 path,
                 ..sink.clone()
             }),
+            source: self.source,
+            is_integer_operand: self.is_integer_operand,
         }
     }
 
@@ -483,7 +565,7 @@ impl<'a> ExpressionMode<'a> {
         match self.sink.as_ref() {
             Some(sink) if sink.root_path.root_name() == "<resource>" => self.at_attribute(name),
             Some(_) => self.at_struct_field(name),
-            None => Self::untyped(),
+            None => self.clone(),
         }
     }
 
@@ -501,7 +583,7 @@ impl<'a> ExpressionMode<'a> {
 
     fn with_segment(&self, segment: AttributePathSegment) -> Self {
         let Some(sink) = &self.sink else {
-            return Self::untyped();
+            return self.clone();
         };
         Self {
             sink: Some(ExpressionSink {
@@ -513,6 +595,8 @@ impl<'a> ExpressionMode<'a> {
                 structural: StructuralSinkMode::Pending,
                 ..sink.clone()
             }),
+            source: self.source,
+            is_integer_operand: self.is_integer_operand,
         }
     }
 

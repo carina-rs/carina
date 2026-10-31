@@ -298,6 +298,11 @@ fn check_type_expr_value_inner_with_mode<B: BindingAddress>(
                 ))
                 | Err(crate::static_type::InferenceIssue::Failed(
                     error @ super::inference::InferenceError::UnknownAttribute { .. },
+                ))
+                | Err(crate::static_type::InferenceIssue::Failed(
+                    error @ super::inference::InferenceError::InvalidIntegerArithmeticOperand {
+                        ..
+                    },
                 )) => Err(TypeExprValueError::InvalidAccess { error }),
                 Err(crate::static_type::InferenceIssue::Failed(
                     super::inference::InferenceError::UnknownType { .. }
@@ -311,6 +316,26 @@ fn check_type_expr_value_inner_with_mode<B: BindingAddress>(
                     | crate::static_type::NotInferableReason::NonInferableBinding { .. }
                     | crate::static_type::NotInferableReason::SchemaUnavailable { .. },
                 )) => Ok(()),
+            };
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            let inferred = match inference {
+                TypecheckInference::Available { bindings, schemas } => {
+                    super::inference::infer_type_from_value(value, bindings, schemas)
+                }
+                TypecheckInference::Unavailable => {
+                    super::inference::infer_type_from_value_without_bindings(value)
+                }
+            };
+            return match inferred {
+                Ok(actual) if inferred_type_fits(expected, &actual) => Ok(()),
+                Ok(_) => Err(mismatch(expected, value)),
+                Err(crate::static_type::InferenceIssue::Failed(error)) => {
+                    Err(TypeExprValueError::InvalidAccess { error })
+                }
+                Err(crate::static_type::InferenceIssue::NotInferable(_)) => {
+                    Err(mismatch(expected, value))
+                }
             };
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => return Ok(()),

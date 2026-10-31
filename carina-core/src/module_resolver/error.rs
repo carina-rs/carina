@@ -440,6 +440,7 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
         }
         | ParseError::Syntax(_)
         | ParseError::InvalidExpression { .. }
+        | ParseError::IntegerArithmetic { .. }
         | ParseError::UnboundLoopRead { .. }
         | ParseError::UnresolvedDeclarationType { .. }
         | ParseError::UnknownFunction { .. }

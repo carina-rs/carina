@@ -71,40 +71,7 @@ pub(super) fn try_dispatch_pure_meta<S: Clone + crate::resource::AnonymousIdenti
 /// Unbound loops retain their stable system key here; this value must never
 /// be rendered to users.
 pub(super) fn failure_dependency_keys<S>(effect: &Effect<S>) -> Vec<SchedulerKey> {
-    match effect {
-        Effect::DeferredCreate { template, .. } => match &template.target {
-            crate::parser::DeferredForTarget::Bound { binding } => {
-                vec![SchedulerKey::Binding(binding.clone())]
-            }
-            crate::parser::DeferredForTarget::Unbound { template } => {
-                vec![SchedulerKey::Loop(template.clone())]
-            }
-        },
-        Effect::DeferredReplace(payload) => match &payload.template.target {
-            crate::parser::DeferredForTarget::Bound { binding } => {
-                vec![SchedulerKey::Binding(binding.clone())]
-            }
-            crate::parser::DeferredForTarget::Unbound { template } => {
-                vec![SchedulerKey::Loop(template.clone())]
-            }
-        },
-        Effect::Wait { identity, .. } => vec![SchedulerKey::Binding(identity.clone())],
-        Effect::ReleaseListKeys { .. } => Vec::new(),
-        Effect::Read { .. }
-        | Effect::Create(_)
-        | Effect::ResumeCreate { .. }
-        | Effect::Update { .. }
-        | Effect::Delete { .. }
-        | Effect::Import { .. }
-        | Effect::Remove { .. }
-        | Effect::Move { .. } => {
-            let mut keys = vec![SchedulerKey::Resource(effect.identity())];
-            if let Some(binding) = effect.binding_address() {
-                keys.push(SchedulerKey::Binding(binding.clone()));
-            }
-            keys
-        }
-    }
+    effect.scheduling_keys()
 }
 
 /// User-facing label for waiting and dependency-failure messages.

@@ -92,6 +92,9 @@ impl<'a> CstBuilder<'a> {
             Rule::arguments_param_attr => Some(CstChild::Node(
                 self.build_node(NodeKind::ArgumentsParamAttr, pair),
             )),
+            Rule::validation_block_attr => Some(CstChild::Node(
+                self.build_node(NodeKind::ValidationBlockAttr, pair),
+            )),
             // State blocks
             Rule::import_state_block => Some(CstChild::Node(
                 self.build_node(NodeKind::ImportStateBlock, pair),
@@ -241,6 +244,9 @@ impl<'a> CstBuilder<'a> {
             Rule::compose_expr => {
                 Some(CstChild::Node(self.build_node(NodeKind::ComposeExpr, pair)))
             }
+            Rule::additive_expr | Rule::multiplicative_expr => {
+                Some(CstChild::Node(self.build_node(NodeKind::ComposeExpr, pair)))
+            }
             Rule::postfix_expr => {
                 Some(CstChild::Node(self.build_node(NodeKind::PostfixExpr, pair)))
             }
@@ -303,6 +309,9 @@ impl<'a> CstBuilder<'a> {
             Rule::pipe_op => Some(CstChild::Token(Token::new("|>".to_string(), span))),
             Rule::compose_op => Some(CstChild::Token(Token::new(">>".to_string(), span))),
             Rule::coalesce_op => Some(CstChild::Token(Token::new("??".to_string(), span))),
+            Rule::add_op | Rule::multiplicative_op => {
+                Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
+            }
             Rule::dot => Some(CstChild::Token(Token::new(".".to_string(), span))),
 
             // Keywords
@@ -355,7 +364,10 @@ impl<'a> CstBuilder<'a> {
                 Some(CstChild::Token(Token::new("depends_on".to_string(), span)))
             }
 
-            // Validate expression rules - treat as opaque node preserving source text
+            // Validation expressions use the same structured arithmetic nodes as
+            // ordinary expressions. Keeping the wrappers in the CST lets the
+            // formatter normalize operators without scanning raw source text (and
+            // therefore without mistaking operators in strings/comments for code).
             Rule::validate_expr => Some(CstChild::Node(
                 self.build_node(NodeKind::ValidateExpr, pair),
             )),
@@ -364,8 +376,13 @@ impl<'a> CstBuilder<'a> {
             | Rule::validate_not_expr
             | Rule::validate_comparison
             | Rule::validate_primary
-            | Rule::validate_function_call
-            | Rule::null_literal => {
+            | Rule::validate_function_call => Some(CstChild::Node(
+                self.build_node(NodeKind::ValidateExpr, pair),
+            )),
+            Rule::validate_additive_expr | Rule::validate_multiplicative_expr => {
+                Some(CstChild::Node(self.build_node(NodeKind::ComposeExpr, pair)))
+            }
+            Rule::null_literal => {
                 Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
             }
             Rule::compare_op | Rule::op_and | Rule::op_or | Rule::op_not => {
@@ -379,7 +396,6 @@ impl<'a> CstBuilder<'a> {
             Rule::attributes_block_content => None,
             Rule::exports_block_content => None,
             Rule::validation_block_content => None,
-            Rule::validation_block_attr => None,
 
             Rule::file => None,
 
@@ -397,6 +413,11 @@ impl<'a> CstBuilder<'a> {
             // but suppresses its output, so this arm should be unreachable
             // in practice. Exists only so the exhaustive match compiles.
             Rule::numeric_tail => None,
+            Rule::plus_op
+            | Rule::minus_op
+            | Rule::multiply_op
+            | Rule::divide_op
+            | Rule::remainder_op => None,
         }
     }
 

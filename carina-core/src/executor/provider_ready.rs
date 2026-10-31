@@ -911,6 +911,14 @@ fn unwrap_secret(value: Value) -> Value {
                 default: Box::new(unwrap_secret(*default)),
             })
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = unwrap_secret(expression.lhs().clone());
+            let rhs = unwrap_secret(expression.rhs().clone());
+            let original = Value::Deferred(DeferredValue::IntegerArithmetic(expression.clone()));
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .unwrap_or(original)
+        }
         Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items.into_iter().map(unwrap_secret).collect(),
         )),

@@ -241,6 +241,26 @@ fn collect_unsynchronized_refs<B: BindingAddress>(
                 out,
             );
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            collect_unsynchronized_refs(
+                expression.lhs(),
+                attribute_key,
+                holder_binding,
+                by_binding,
+                synchronized,
+                schemas,
+                out,
+            );
+            collect_unsynchronized_refs(
+                expression.rhs(),
+                attribute_key,
+                holder_binding,
+                by_binding,
+                synchronized,
+                schemas,
+                out,
+            );
+        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::Int(_)
