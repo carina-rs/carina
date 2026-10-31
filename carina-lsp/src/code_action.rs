@@ -204,7 +204,7 @@ pub fn code_actions_for_diagnostic(uri: &Url, diag: &Diagnostic) -> Vec<CodeActi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::resource::{ConcreteValue, NoPlaceholder, Value};
     use carina_core::schema::{
         AttributeSchema, AttributeType, ResourceSchema, RootlessType, SchemaKind, SchemaRegistry,
         TypeError, ValidatedConfigSchema, enum_identity,
@@ -422,7 +422,7 @@ mod tests {
             ),
         ]);
         let error = pathless_test_type(union)
-            .validate(&Value::Concrete(ConcreteValue::String(
+            .validate(&Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
                 "z14grhdcwa56qt".into(),
             )))
             .expect_err("both union alternatives must reject the value")
@@ -453,9 +453,9 @@ mod tests {
             AttributeType::string(),
         ]);
         let error = pathless_test_type(union)
-            .validate(&Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("bogus".into())),
-            ])))
+            .validate(&Value::<NoPlaceholder>::Concrete(ConcreteValue::List(
+                vec![Value::Concrete(ConcreteValue::String("bogus".into()))],
+            )))
             .expect_err("the List<Enum> arm must reject its item");
 
         assert_eq!(enum_diagnostic_data_for_error(&error), None);
@@ -480,7 +480,9 @@ mod tests {
             ),
         ]);
         let error = pathless_test_type(union)
-            .validate(&Value::Concrete(ConcreteValue::String("q".into())))
+            .validate(&Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
+                "q".into(),
+            )))
             .expect_err("both Enum arms must reject the string");
         let payload = enum_diagnostic_data_for_error(&error)
             .expect("both Enum arms must contribute structured candidates");
@@ -523,7 +525,7 @@ mod tests {
         let mut attrs = HashMap::new();
         attrs.insert(
             "Version".to_string(),
-            Value::Concrete(ConcreteValue::enum_identifier("bad_version")),
+            Value::<NoPlaceholder>::Concrete(ConcreteValue::enum_identifier("bad_version")),
         );
         let schema = schema
             .validate()

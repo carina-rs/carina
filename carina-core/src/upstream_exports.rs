@@ -19,9 +19,10 @@ use std::path::Path;
 
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
 use crate::parser::{
-    LoadedProviderContext, ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState,
+    LoadedProviderContext, ParsedValue as Value, ProviderContext, ResourceContext, ResourceRef,
+    TypeExpr, UpstreamState,
 };
-use crate::resource::{DeferredValue, Subscript, Value};
+use crate::resource::{DeferredValue, ModuleSource, ParserPlaceholder, Subscript};
 use crate::schema::suggest_similar_name;
 use crate::static_type::ConsumerExportStaticType;
 #[cfg(test)]
@@ -382,7 +383,7 @@ fn resolve_upstream_exports_with_context(
 /// Three checks emit the same string; centralized here so a future
 /// tweak to the wording lands in one place.
 fn resource_attr_location<D: crate::parser::DeferredForPhaseTraversal>(
-    rref: ResourceRef<'_, crate::resource::ModuleSource, D>,
+    rref: ResourceRef<'_, ModuleSource, ParserPlaceholder, ParserPlaceholder, D>,
     attr_name: &str,
 ) -> String {
     match rref.context() {
@@ -402,8 +403,15 @@ fn resource_attr_location<D: crate::parser::DeferredForPhaseTraversal>(
 /// user-facing diagnostic location. Parser-side deferred resource bodies are
 /// matched explicitly; iterable expressions are handled separately because
 /// they have their own shape semantics.
-fn for_each_project_value<E, D, F>(parsed: &crate::parser::File<E, D>, mut f: F)
-where
+fn for_each_project_value<E, D, F>(
+    parsed: &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
+    mut f: F,
+) where
     E: crate::parser::ExportParamLike,
     D: crate::parser::DeferredForPhaseTraversal,
     F: FnMut(&Value, &str),
@@ -440,7 +448,12 @@ pub fn check_upstream_state_field_references<
     E: crate::parser::ExportParamLike,
     D: crate::parser::DeferredForPhaseTraversal,
 >(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamFieldError> {
     check_upstream_state_field_references_inner(parsed, exports, true)
@@ -455,7 +468,12 @@ pub fn check_upstream_state_untyped_field_references<
     E: crate::parser::ExportParamLike,
     D: crate::parser::DeferredForPhaseTraversal,
 >(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamFieldError> {
     check_upstream_state_field_references_inner(parsed, exports, false)
@@ -465,7 +483,12 @@ fn check_upstream_state_field_references_inner<
     E: crate::parser::ExportParamLike,
     D: crate::parser::DeferredForPhaseTraversal,
 >(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     exports: &UpstreamExports,
     include_typed_consumers: bool,
 ) -> Vec<UpstreamFieldError> {
@@ -700,15 +723,30 @@ impl UpstreamRefDiagnostic for UpstreamForIterableShapeError {
 /// validate time off the upstream's *declared* type, the parser-side
 /// one fires at expansion time off the *resolved* `Value`.
 pub fn check_upstream_state_for_iterable_shapes<E, D: crate::parser::DeferredForPhaseTraversal>(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamForIterableShapeError> {
     fn visit_possible_iterables(value: &Value, f: &mut impl FnMut(&crate::resource::AccessPath)) {
         match value {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred
+                    .values()
+                    .into_iter()
+                    .for_each(|value| visit_possible_iterables(value, f));
+            }
             Value::Deferred(DeferredValue::ResourceRef { path }) => f(path),
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 visit_possible_iterables(value, f);
                 visit_possible_iterables(default, f);
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                visit_possible_iterables(expression.lhs(), f);
+                visit_possible_iterables(expression.rhs(), f);
             }
             Value::Deferred(DeferredValue::Secret(inner)) => visit_possible_iterables(inner, f),
             // References inside a function argument constrain that argument,
@@ -722,7 +760,8 @@ pub fn check_upstream_state_for_iterable_shapes<E, D: crate::parser::DeferredFor
                 | DeferredValue::ResolvedFunctionCall { .. }
                 | DeferredValue::Access(_)
                 | DeferredValue::RedactedSecret { .. }
-                | DeferredValue::Unknown(_),
+                | DeferredValue::Unknown(_)
+                | DeferredValue::Placeholder(_),
             ) => {}
         }
     }
@@ -905,7 +944,12 @@ pub fn check_upstream_state_attribute_access_shapes<
     E: crate::parser::ExportParamLike,
     D: crate::parser::DeferredForPhaseTraversal,
 >(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
     check_upstream_state_attribute_access_shapes_inner(parsed, exports, true)
@@ -922,7 +966,12 @@ pub fn check_upstream_state_attribute_access_shape_fallbacks<
     E: crate::parser::ExportParamLike,
     D: crate::parser::DeferredForPhaseTraversal,
 >(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
     check_upstream_state_attribute_access_shapes_inner(parsed, exports, false)
@@ -932,7 +981,12 @@ fn check_upstream_state_attribute_access_shapes_inner<
     E: crate::parser::ExportParamLike,
     D: crate::parser::DeferredForPhaseTraversal,
 >(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     exports: &UpstreamExports,
     include_resolver_struct_errors: bool,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
@@ -1115,7 +1169,12 @@ pub fn check_upstream_state_subscript_shapes<
     E: crate::parser::ExportParamLike,
     D: crate::parser::DeferredForPhaseTraversal,
 >(
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamSubscriptShapeError> {
     let mut errors: Vec<UpstreamSubscriptShapeError> = Vec::new();
@@ -1944,8 +2003,8 @@ mod tests {
 
     #[test]
     fn for_body_field_error_reported_once_not_twice() {
-        // Regression: the old code walked both `deferred.template_resource.attributes`
-        // and `deferred.attributes`, potentially reporting the same ref twice.
+        // Regression: the old duplicate display projection could cause the
+        // canonical deferred template attribute to be reported twice.
         let parsed = parse_project(
             r#"
             let orgs = upstream_state { source = "../organizations" }

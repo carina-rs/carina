@@ -134,6 +134,18 @@ fn mark_secret_input_strings(value: Value) -> Value {
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
             Box::new(mark_secret_input_strings(*inner)),
         )),
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let deferred = deferred.map(|value| mark_secret_input_strings(value.clone()));
+            Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred)))
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = mark_secret_input_strings(expression.lhs().clone());
+            let rhs = mark_secret_input_strings(expression.rhs().clone());
+            let original = Value::Deferred(DeferredValue::IntegerArithmetic(expression.clone()));
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .unwrap_or(original)
+        }
         value => value,
     }
 }
@@ -340,13 +352,17 @@ macro_rules! register_builtins {
                             .iter()
                             .cloned()
                             .map(|arg| {
-                                arg.into_value().map_err(|error| format!("{name}: {error}"))
+                                arg.into_expanded_value()
+                                    .map_err(|error| format!("{name}: {error}"))
                             })
                             .collect();
                         let (lowered, contained_secret) = peel_secret_arguments(lowered?);
                         $handler(&lowered)
                             .map(|value| {
-                                EvalValue::from_value(propagate_secret(value, contained_secret))
+                                EvalValue::from_expanded_value(propagate_secret(
+                                    value,
+                                    contained_secret,
+                                ))
                             })
                     }
                 )*
@@ -362,9 +378,13 @@ macro_rules! register_builtins {
             name: &str,
             args: &[Value],
         ) -> Result<Value, String> {
-            let eval_args: Vec<EvalValue> = args.iter().cloned().map(EvalValue::from_value).collect();
+            let eval_args: Vec<EvalValue> = args
+                .iter()
+                .cloned()
+                .map(EvalValue::from_expanded_value)
+                .collect();
             let result = evaluate_builtin(name, &eval_args)?;
-            result.into_value().map_err(|error| error.to_string())
+            result.into_expanded_value()
         }
     };
 }
@@ -553,13 +573,14 @@ pub(crate) fn evaluate_builtin_with_config(
                 .iter()
                 .cloned()
                 .map(|arg| {
-                    arg.into_value()
+                    arg.into_expanded_value()
                         .map_err(|error| format!("decrypt: {error}"))
                 })
                 .collect();
             let (lowered, contained_secret) = peel_secret_arguments(lowered?);
-            decrypt::builtin_decrypt_with_config(&lowered, config)
-                .map(|value| EvalValue::from_value(propagate_secret(value, contained_secret)))
+            decrypt::builtin_decrypt_with_config(&lowered, config).map(|value| {
+                EvalValue::from_expanded_value(propagate_secret(value, contained_secret))
+            })
         }
         _ => evaluate_builtin(name, args),
     }
@@ -577,7 +598,11 @@ pub fn is_known_builtin(name: &str) -> bool {
 /// allocate `EvalValue` arguments by hand.
 #[cfg(test)]
 pub(crate) fn evaluate_builtin_for_tests(name: &str, args: &[Value]) -> Result<EvalValue, String> {
-    let eval_args: Vec<EvalValue> = args.iter().cloned().map(EvalValue::from_value).collect();
+    let eval_args: Vec<EvalValue> = args
+        .iter()
+        .cloned()
+        .map(EvalValue::from_expanded_value)
+        .collect();
     evaluate_builtin(name, &eval_args)
 }
 
@@ -591,9 +616,13 @@ pub(crate) fn evaluate_builtin_with_config_to_value(
     args: &[Value],
     config: &ProviderContext,
 ) -> Result<Value, String> {
-    let eval_args: Vec<EvalValue> = args.iter().cloned().map(EvalValue::from_value).collect();
+    let eval_args: Vec<EvalValue> = args
+        .iter()
+        .cloned()
+        .map(EvalValue::from_expanded_value)
+        .collect();
     let result = evaluate_builtin_with_config(name, &eval_args, config)?;
-    result.into_value().map_err(|error| error.to_string())
+    result.into_expanded_value()
 }
 
 /// Return a human-readable type name for a Value
@@ -609,9 +638,11 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Concrete(ConcreteValue::List(_)) => "List",
         Value::Concrete(ConcreteValue::StringList(_)) => "StringList",
         Value::Concrete(ConcreteValue::Map(_)) => "Map",
+        Value::Deferred(DeferredValue::ModuleIf(_)) => "ModuleIf",
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "ResourceRef",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "BindingRef",
         Value::Deferred(DeferredValue::Coalesce { .. }) => "Coalesce",
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => "Int",
         Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation",
         Value::Deferred(
             DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
@@ -621,6 +652,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::Secret(_)) => "Secret",
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => "RedactedSecret",
         Value::Deferred(DeferredValue::Unknown(_)) => "Unknown",
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 

@@ -571,7 +571,7 @@ async fn precompiled_factory_is_schema_only() {
     // `from_precompiled` is test-only and intentionally cannot mint the
     // consent witness required by credentialed runtime instances.
     let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
-        &carina_core::parser::InferredFile::default(),
+        &carina_core::parser::ExpandedInferredFile::default(),
         &std::collections::HashMap::new(),
         &carina_core::parser::ProviderContext::default(),
     )

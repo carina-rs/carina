@@ -11,9 +11,9 @@ use crate::parser::ProviderConfig;
 use crate::parser::{SourceSpan, StateBlock, StateBlockAddress};
 use crate::provider::{ComparisonResolutionError, ProviderFactory, ProviderRouter};
 use crate::resource::{
-    AnonymousIdentityModuleSource, ConcreteValue, DataSource, DeferredValue, LegacyLoopAddress,
-    LoopElementOrigin, PendingReRead, ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
-    UnknownReason, Value, ValueString,
+    AnonymousIdentityModuleSource, ApplyTimeUnknown, ConcreteValue, DataSource, DeferredValue,
+    LegacyLoopAddress, LoopElementOrigin, PendingReRead, PlaceholderKind, ResolvedResourceId,
+    Resource, ResourceId, ResourceIdentity, Value, ValueString,
 };
 use crate::schema::{
     AttributeType, ResourceSchema, SchemaRegistry, Shape, ValidatedResourceSchema,
@@ -162,8 +162,8 @@ pub enum AnonymousIdentityBasis {
 /// bytes hashed for that basis. An unresolved `<attribute>_prefix` is treated
 /// identically to the same prefix after [`resolve_attr_prefixes`] moves it into
 /// [`Resource::prefixes`].
-fn stable_anonymous_hash_inputs<S>(
-    resource: &Resource<S>,
+fn stable_anonymous_hash_inputs<S, P: PlaceholderKind>(
+    resource: &Resource<S, P>,
     schema: &ResourceSchema,
 ) -> BTreeMap<String, String> {
     let mut inputs = BTreeMap::new();
@@ -205,8 +205,8 @@ fn stable_anonymous_hash_inputs<S>(
 /// unknown. Otherwise, presence is what matters here, not whether a value is
 /// concrete yet. A deferred create-only or identity value will become
 /// concrete later but is still an immutable identity input.
-pub fn classify_anonymous_identity_basis<S>(
-    resource: &Resource<S>,
+pub fn classify_anonymous_identity_basis<S, P: PlaceholderKind>(
+    resource: &Resource<S, P>,
     registry: &SchemaRegistry,
 ) -> Option<AnonymousIdentityBasis> {
     let schema = registry.get_for(resource)?;
@@ -260,7 +260,7 @@ impl Ord for AnonymousResourceKind {
 }
 
 impl AnonymousResourceKind {
-    fn of<S: AnonymousIdentityModuleSource>(resource: &Resource<S>) -> Self {
+    fn of<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(resource: &Resource<S, P>) -> Self {
         let module_scope = resource
             .module_source
             .as_ref()
@@ -294,9 +294,9 @@ impl AttributeDerivedAnonymousResourceConflict {
     /// Return whether `resource` is one of the declarations represented by
     /// this conflict. This lets source-aware callers attach the shared error to
     /// each declaration without reimplementing the grouping rule.
-    pub fn includes<S: AnonymousIdentityModuleSource>(
+    pub fn includes<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(
         &self,
-        resource: &Resource<S>,
+        resource: &Resource<S, P>,
         registry: &SchemaRegistry,
     ) -> bool {
         resource.binding.is_none()
@@ -532,9 +532,12 @@ impl AnonymousIdentityConflictPolicy {
 
 /// Canonicalize provider identity inputs and assign anonymous resource IDs
 /// through the same factory lookup on every plan, editor, and apply path.
-pub fn compute_anonymous_identifiers_with_factories<S: AnonymousIdentityModuleSource>(
-    resources: CanonicalizedResources<'_, S>,
-    providers: &[ProviderConfig],
+pub fn compute_anonymous_identifiers_with_factories<
+    S: AnonymousIdentityModuleSource,
+    P: PlaceholderKind,
+>(
+    resources: CanonicalizedResources<'_, S, P>,
+    providers: &[ProviderConfig<P>],
     factories: &[Box<dyn ProviderFactory>],
     registry: &SchemaRegistry,
     conflict_policy: AnonymousIdentityConflictPolicy,
@@ -697,8 +700,8 @@ fn has_legacy_synthetic_identity_segment(identity: &str) -> bool {
 /// current resource, include that resource's resolved address in the repair
 /// text.
 pub fn check_legacy_loop_move_targets<S>(
-    state_blocks: &[StateBlock],
-    resources: &[Resource<S>],
+    state_blocks: &[StateBlock<impl PlaceholderKind>],
+    resources: &[Resource<S, impl PlaceholderKind>],
 ) -> Vec<LegacyLoopMoveTargetError> {
     state_blocks
         .iter()
@@ -772,8 +775,11 @@ pub fn check_legacy_loop_move_targets<S>(
 /// Find ambiguous anonymous-resource groups before any generated identity is
 /// assigned. A mutable-attribute identity is safe to reconcile only when it is
 /// the sole anonymous declaration of its kind and ownership scope.
-pub fn check_attribute_derived_anonymous_resource_conflicts<S: AnonymousIdentityModuleSource>(
-    resources: &[Resource<S>],
+pub fn check_attribute_derived_anonymous_resource_conflicts<
+    S: AnonymousIdentityModuleSource,
+    P: PlaceholderKind,
+>(
+    resources: &[Resource<S, P>],
     registry: &SchemaRegistry,
 ) -> Vec<AttributeDerivedAnonymousResourceConflict> {
     let mut counts = BTreeMap::<AnonymousResourceKind, usize>::new();
@@ -806,12 +812,13 @@ pub fn check_attribute_derived_anonymous_resource_conflicts<S: AnonymousIdentity
 /// identity for them, so removing the binding would turn valid lint advice
 /// into a later hard error. Stable and singleton attribute-derived resources
 /// remain safe to anonymize.
-pub(crate) fn identity_required_bindings(
-    resources: &[Resource],
+pub(crate) fn identity_required_bindings<P: PlaceholderKind>(
+    resources: &[Resource<crate::resource::ModuleSource, P>],
     registry: &SchemaRegistry,
 ) -> HashSet<String> {
     let mut required = HashSet::new();
-    let mut resources_by_kind = BTreeMap::<AnonymousResourceKind, Vec<&Resource>>::new();
+    let mut resources_by_kind =
+        BTreeMap::<AnonymousResourceKind, Vec<&Resource<crate::resource::ModuleSource, P>>>::new();
     for resource in resources {
         match classify_anonymous_identity_basis(resource, registry) {
             None => {
@@ -848,8 +855,8 @@ pub(crate) fn identity_required_bindings(
 /// - Generates a temporary name: `prefix + random_suffix`
 ///
 /// Errors if both `<attr>_prefix` and `<attr>` are specified, or if prefix is empty.
-pub fn resolve_attr_prefixes(
-    resources: &mut [Resource],
+pub fn resolve_attr_prefixes<P: PlaceholderKind>(
+    resources: &mut [Resource<crate::resource::ModuleSource, P>],
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
@@ -983,7 +990,7 @@ pub fn reconcile_prefixed_names(
                             }
                             PrefixStateValue::PendingReRead(pending) => {
                                 Value::Deferred(DeferredValue::Unknown(
-                                    UnknownReason::PendingReRead(pending.clone()),
+                                    ApplyTimeUnknown::PendingReRead(pending.clone()),
                                 ))
                             }
                         };
@@ -1004,8 +1011,14 @@ pub fn reconcile_prefixed_names(
 ///
 /// Unlike `format!("{:?}", value)`, this ensures Map entries are sorted by key,
 /// so the output is consistent across runs (HashMap iteration order is random).
-fn deterministic_value_string(value: &Value) -> String {
+fn deterministic_value_string<P: PlaceholderKind>(value: &Value<P>) -> String {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => format!(
+            "ModuleIf({}, {}, {})",
+            deterministic_value_string(deferred.condition().value()),
+            deterministic_value_string(deferred.then_value()),
+            deterministic_value_string(deferred.else_value())
+        ),
         Value::Concrete(ConcreteValue::String(s)) => {
             format!("String({:?})", s.expose_plaintext())
         }
@@ -1031,7 +1044,7 @@ fn deterministic_value_string(value: &Value) -> String {
             format!("StringList([{}])", parts.join(", "))
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
-            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            let mut entries: Vec<_> = map.iter().collect();
             entries.sort_by_key(|(k, _)| *k);
             let parts: Vec<String> = entries
                 .iter()
@@ -1049,6 +1062,12 @@ fn deterministic_value_string(value: &Value) -> String {
             "Coalesce({}, {})",
             deterministic_value_string(value),
             deterministic_value_string(default)
+        ),
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => format!(
+            "IntegerArithmetic({:?}, {}, {})",
+            expression.op(),
+            deterministic_value_string(expression.lhs()),
+            deterministic_value_string(expression.rhs())
         ),
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;
@@ -1097,29 +1116,16 @@ fn deterministic_value_string(value: &Value) -> String {
             )
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
-            use crate::resource::UnknownReason;
+            use crate::resource::ApplyTimeUnknown;
             // Variant labels feed identity hashes; keep them stable across Rust renames.
             match reason {
-                UnknownReason::UpstreamExport { path } => {
+                ApplyTimeUnknown::UpstreamExport { path } => {
                     format!("Unknown(UpstreamRef({}))", path.to_plaintext_dot_string())
                 }
-                UnknownReason::UpstreamAllExports { binding } => {
+                ApplyTimeUnknown::UpstreamAllExports { binding } => {
                     format!("Unknown(UpstreamBareRef({}))", binding)
                 }
-                UnknownReason::ForKey => "Unknown(ForKey)".to_string(),
-                UnknownReason::ForIndex => "Unknown(ForIndex)".to_string(),
-                UnknownReason::ForValue => "Unknown(ForValue)".to_string(),
-                UnknownReason::FnParam { name } => {
-                    format!("Unknown(FnParam({name}))")
-                }
-                UnknownReason::ModuleArgument { name, .. } => {
-                    format!("Unknown(ModuleArgument({name}))")
-                }
-                UnknownReason::FnLocal { name } => {
-                    format!("Unknown(FnLocal({name}))")
-                }
-                UnknownReason::EmptyInterpolation => "Unknown(EmptyInterpolation)".to_string(),
-                UnknownReason::PendingReRead(pending) => match pending.reason() {
+                ApplyTimeUnknown::PendingReRead(pending) => match pending.reason() {
                     crate::resource::ReReadReason::Incomplete { detail } => {
                         format!("Unknown(PendingReRead(Incomplete({detail:?})))")
                     }
@@ -1131,6 +1137,9 @@ fn deterministic_value_string(value: &Value) -> String {
                     }
                 },
             }
+        }
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+            format!("Placeholder({placeholder})")
         }
     }
 }
@@ -1313,9 +1322,9 @@ pub(crate) fn closest_unique_simhash_match<C: Copy>(
 /// Map values are expanded so each entry becomes a separate feature (e.g., `tags.Environment`),
 /// allowing SimHash to produce close hashes when only one map entry changes.
 /// Non-map values use `deterministic_value_string` as the feature value.
-pub(crate) fn flatten_value_for_simhash(
+pub(crate) fn flatten_value_for_simhash<P: PlaceholderKind>(
     prefix: &str,
-    value: &Value,
+    value: &Value<P>,
     out: &mut std::collections::BTreeMap<String, String>,
 ) {
     match value {
@@ -1401,9 +1410,9 @@ pub fn anonymous_identity_discriminator(identity: &ResourceIdentity) -> Option<S
 /// This is the shared feature set used by both anonymous identifier computation
 /// (when the schema has no create-only attributes) and `compute_resource_simhash`
 /// so the two always agree on what a resource's anonymous ID would be.
-fn simhash_from_identity_and_resource<S>(
+fn simhash_from_identity_and_resource<S, P: PlaceholderKind>(
     identity_values: &BTreeMap<String, String>,
-    resource: &Resource<S>,
+    resource: &Resource<S, P>,
 ) -> SimHash {
     let mut simhash_values = identity_values.clone();
     for (key, value) in &resource.attributes {
@@ -1474,9 +1483,9 @@ fn record_direct_loop_conflict(
     conflicts.push((reason, origin.clone()));
 }
 
-fn direct_loop_conflicts<S>(
+fn direct_loop_conflicts<S, P: PlaceholderKind>(
     sources: &[(LoopConflictReason, LoopElementOrigin)],
-    resources: &[Resource<S>],
+    resources: &[Resource<S, P>],
     reservations: &mut LoopBindingReservations,
 ) -> Vec<LoopAnonymousIdentityConflict> {
     let mut conflicts = Vec::new();
@@ -1537,9 +1546,9 @@ struct LoopModuleCollisionDiscovery {
     plain_errors: Vec<AnonymousIdentityError>,
 }
 
-fn module_prefix_collision_fully_explains_members<S>(
+fn module_prefix_collision_fully_explains_members<S, P: PlaceholderKind>(
     member_indices: &[usize],
-    resources: &[Resource<S>],
+    resources: &[Resource<S, P>],
     discovery: &LoopModuleCollisionDiscovery,
 ) -> bool {
     if member_indices.len() < 2 {
@@ -1579,8 +1588,8 @@ fn module_name_from_instance_prefix(prefix: &str) -> String {
         .unwrap_or_else(|| "module".to_string())
 }
 
-fn discover_loop_module_prefix_collisions<S>(
-    resources: &[Resource<S>],
+fn discover_loop_module_prefix_collisions<S, P: PlaceholderKind>(
+    resources: &[Resource<S, P>],
 ) -> LoopModuleCollisionDiscovery {
     let mut by_current_prefix = BTreeMap::<String, Vec<(usize, usize)>>::new();
     for (resource_index, resource) in resources.iter().enumerate() {
@@ -1655,9 +1664,9 @@ fn discover_loop_module_prefix_collisions<S>(
     }
 }
 
-fn loop_module_conflicts<S>(
+fn loop_module_conflicts<S, P: PlaceholderKind>(
     sources: &[LoopModuleConflictSource],
-    resources: &[Resource<S>],
+    resources: &[Resource<S, P>],
     computed_identities: &HashMap<usize, String>,
     reservations: &mut LoopBindingReservations,
 ) -> Vec<LoopAnonymousIdentityConflict> {
@@ -1742,9 +1751,12 @@ pub fn compute_anonymous_identifiers_for_test(
 ///
 /// `identity_attributes_fn` takes a provider name and returns the list of identity attribute names
 /// for that provider (e.g., `["region"]`).
-pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityModuleSource>(
-    resources: CanonicalizedResources<'_, S>,
-    providers: &CanonicalizedProviderConfigs,
+pub fn compute_anonymous_identifiers_with_provider_configs<
+    S: AnonymousIdentityModuleSource,
+    P: PlaceholderKind,
+>(
+    resources: CanonicalizedResources<'_, S, P>,
+    providers: &CanonicalizedProviderConfigs<P>,
     registry: &SchemaRegistry,
     conflict_policy: AnonymousIdentityConflictPolicy,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,

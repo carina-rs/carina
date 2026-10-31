@@ -17,7 +17,7 @@ ws = @{ (" " | "\t")+ }
 newline = @{ NEWLINE }
 comment = _{ line_comment | block_comment }
 line_comment = @{ ("//" | "#") ~ (!NEWLINE ~ ANY)* }
-block_comment = @{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
+block_comment = @{ "/*" ~ (block_comment | (!"*/" ~ ANY))* ~ "*/" }
 
 statement = { backend_block | provider_block | arguments_block | attributes_block | exports_block | import_state_block | removed_block | moved_block | require_statement | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
 
@@ -92,7 +92,9 @@ validate_expr = { validate_or_expr }
 validate_or_expr = { validate_and_expr ~ (trivia* ~ op_or ~ trivia* ~ validate_and_expr)* }
 validate_and_expr = { validate_not_expr ~ (trivia* ~ op_and ~ trivia* ~ validate_not_expr)* }
 validate_not_expr = { op_not ~ trivia* ~ validate_not_expr | validate_comparison }
-validate_comparison = { validate_primary ~ (trivia* ~ compare_op ~ trivia* ~ validate_primary)? }
+validate_comparison = { validate_additive_expr ~ (trivia* ~ compare_op ~ trivia* ~ validate_additive_expr)? }
+validate_additive_expr = { validate_multiplicative_expr ~ (trivia* ~ add_op ~ trivia* ~ validate_multiplicative_expr)* }
+validate_multiplicative_expr = { validate_primary ~ (trivia* ~ multiplicative_op ~ trivia* ~ validate_primary)* }
 compare_op = { ">=" | "<=" | "!=" | "==" | ">" | "<" }
 op_and = { "&&" }
 op_or = { "||" }
@@ -262,7 +264,12 @@ coalesce_expr = { pipe_expr ~ (trivia* ~ coalesce_op ~ trivia* ~ pipe_expr)* }
 pipe_expr = { compose_expr ~ (trivia* ~ pipe_op ~ trivia* ~ function_call)* }
 
 // Compose operator: f >> g (function composition)
-compose_expr = { postfix_expr ~ (trivia* ~ compose_op ~ trivia* ~ postfix_expr)* }
+compose_expr = { additive_expr ~ (trivia* ~ compose_op ~ trivia* ~ additive_expr)* }
+
+// Integer arithmetic. Keep these layers byte-for-byte equivalent in
+// precedence to the semantic grammar while retaining authored trivia.
+additive_expr = { multiplicative_expr ~ (trivia* ~ add_op ~ trivia* ~ multiplicative_expr)* }
+multiplicative_expr = { postfix_expr ~ (trivia* ~ multiplicative_op ~ trivia* ~ postfix_expr)* }
 
 // Field/index access is a postfix operator on any primary value. Reference
 // primaries retain their existing suffix parsing for address fidelity.
@@ -457,6 +464,13 @@ comma = { "," }
 pipe_op = { "|>" }
 compose_op = { ">>" }
 coalesce_op = { "??" }
+add_op = { plus_op | minus_op }
+multiplicative_op = { multiply_op | divide_op | remainder_op }
+plus_op = { "+" }
+minus_op = { "-" }
+multiply_op = { "*" }
+divide_op = { "/" }
+remainder_op = { "%" }
 
 // Keywords
 kw_provider = { "provider" }

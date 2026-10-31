@@ -9,9 +9,9 @@ use thiserror::Error;
 
 use crate::parser::{display_double_quoted_literal_part, display_string_literal};
 use crate::resource::{
-    CanonicalEnumValue, ConcreteValue, DeferredValue, InterpolationPart, RedactedSecretHash,
-    UnavailableCoalescePolicy, UnavailableSecretPolicy, UnknownReason, Value,
-    find_unavailable_evaluation,
+    ApplyTimeUnknown, CanonicalEnumValue, ConcreteValue, DeferredValue, InterpolationPart,
+    LoopSlot, PlaceholderKind, RedactedSecretHash, UnavailableCoalescePolicy,
+    UnavailableSecretPolicy, Value, find_unavailable_evaluation,
 };
 use crate::schema::{AttrTypeKind, AttributeType, TypeIdentity};
 use crate::utils::is_identifier_safe;
@@ -49,20 +49,24 @@ impl std::fmt::Display for SerializationContext {
 /// out of the planner (provider/state/plan-file).
 ///
 /// The `UnknownNotAllowed` variant carries the structured
-/// [`UnknownReason`] (rather than a stringified rendition) so the
+/// [`ApplyTimeUnknown`] (rather than a stringified rendition) so the
 /// top-level CLI handler can build an actionable diagnostic — e.g.
 /// it can mention the specific upstream path or the for-binding kind
 /// that produced the placeholder, without re-parsing a flattened
 /// message string.
 #[derive(Debug, Error)]
 pub enum SerializationError {
+    /// A parser-only module conditional reached a runtime or persistence
+    /// boundary. Module expansion must select every branch first.
+    #[error("cannot serialize at {context}: unresolved module-template conditional")]
+    UnexpandedModuleIf { context: SerializationContext },
     /// A `Value::Deferred(DeferredValue::Unknown)` reached a serialization boundary. Producers
     /// must strip / resolve it before this point — see
     /// [`crate::resource::value_contains_unknown`] for recursive
     /// detection before crossing a serialization boundary.
     #[error("cannot serialize at {context}: value is not yet known ({reason})")]
     UnknownNotAllowed {
-        reason: UnknownReason,
+        reason: ApplyTimeUnknown,
         context: SerializationContext,
     },
     /// A non-finite float (`NaN`, `±∞`) reached JSON serialization.
@@ -78,7 +82,7 @@ pub enum SerializationError {
     /// state writeback or plan-file write is a resolver bug.
     ///
     /// `path` is stored as a pre-formatted `String` rather than the
-    /// structured `AccessPath` (cf. `UnknownReason::UpstreamExport`)
+    /// structured `AccessPath` (cf. `ApplyTimeUnknown::UpstreamExport`)
     /// because `SerializationError` is terminating diagnostic data
     /// consumed only via `Display`; programmatic path inspection has
     /// no callers today. Lift to `AccessPath` if a future caller needs
@@ -113,6 +117,10 @@ pub enum SerializationError {
     /// before its left operand became present or definitively absent.
     #[error("cannot serialize at {context}: unresolved coalesce expression")]
     UnresolvedCoalesce { context: SerializationContext },
+    /// A typed integer expression reached a concrete-only serialization
+    /// boundary before both operands resolved.
+    #[error("cannot serialize at {context}: unresolved integer arithmetic expression")]
+    UnresolvedIntegerArithmetic { context: SerializationContext },
     /// A parser-authored enum identifier reached a serialization boundary
     /// without schema resolution. Provider transports accept only
     /// [`CanonicalEnumValue`] API spellings; plain strings remain literals.
@@ -145,6 +153,7 @@ impl SerializationError {
         const MASKED: &str = "(secret)";
 
         match self {
+            Self::UnexpandedModuleIf { context } => Self::UnexpandedModuleIf { context },
             Self::UnresolvedEnumIdentifier { context, .. } => Self::UnresolvedEnumIdentifier {
                 value: MASKED.to_string(),
                 context,
@@ -162,6 +171,9 @@ impl SerializationError {
                 context,
             },
             Self::UnresolvedCoalesce { context } => Self::UnresolvedCoalesce { context },
+            Self::UnresolvedIntegerArithmetic { context } => {
+                Self::UnresolvedIntegerArithmetic { context }
+            }
             other => other,
         }
     }
@@ -219,23 +231,16 @@ impl std::fmt::Display for SecretRehydrationSiteError {
 
 impl std::error::Error for SecretRehydrationSiteError {}
 
-impl std::fmt::Display for UnknownReason {
+impl std::fmt::Display for ApplyTimeUnknown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UnknownReason::UpstreamExport { path } => {
+            ApplyTimeUnknown::UpstreamExport { path } => {
                 write!(f, "upstream value {}", path.to_dot_string())
             }
-            UnknownReason::UpstreamAllExports { binding } => {
+            ApplyTimeUnknown::UpstreamAllExports { binding } => {
                 write!(f, "upstream value {}", binding)
             }
-            UnknownReason::ForKey => write!(f, "deferred for-binding key"),
-            UnknownReason::ForIndex => write!(f, "deferred for-binding index"),
-            UnknownReason::ForValue => write!(f, "deferred for-binding value"),
-            UnknownReason::FnParam { name } => write!(f, "function parameter {name}"),
-            UnknownReason::ModuleArgument { name, .. } => write!(f, "module argument {name}"),
-            UnknownReason::FnLocal { name } => write!(f, "function local {name}"),
-            UnknownReason::EmptyInterpolation => write!(f, "empty interpolation"),
-            UnknownReason::PendingReRead(pending) => pending.fmt(f),
+            ApplyTimeUnknown::PendingReRead(pending) => pending.fmt(f),
         }
     }
 }
@@ -256,25 +261,16 @@ impl std::fmt::Display for crate::resource::PendingReRead {
     }
 }
 
-/// Render an `UnknownReason` to its plan-display string.
-pub fn render_unknown(reason: &UnknownReason) -> String {
+/// Render an `ApplyTimeUnknown` to its plan-display string.
+pub fn render_unknown(reason: &ApplyTimeUnknown) -> String {
     match reason {
-        UnknownReason::UpstreamExport { path } => {
+        ApplyTimeUnknown::UpstreamExport { path } => {
             format!("(known after upstream apply: {})", path.to_dot_string())
         }
-        UnknownReason::UpstreamAllExports { binding } => {
+        ApplyTimeUnknown::UpstreamAllExports { binding } => {
             format!("(known after upstream apply: {})", binding)
         }
-        UnknownReason::ForKey => "(known after upstream apply: key)".to_string(),
-        UnknownReason::ForIndex => "(known after upstream apply: index)".to_string(),
-        UnknownReason::ForValue => "(known after upstream apply)".to_string(),
-        UnknownReason::FnParam { name } => format!("(unresolved function parameter: {name})"),
-        UnknownReason::ModuleArgument { name, .. } => {
-            format!("(unresolved module argument: {name})")
-        }
-        UnknownReason::FnLocal { name } => format!("(unresolved function local: {name})"),
-        UnknownReason::EmptyInterpolation => "(empty interpolation)".to_string(),
-        UnknownReason::PendingReRead(pending) => match pending.reason() {
+        ApplyTimeUnknown::PendingReRead(pending) => match pending.reason() {
             crate::resource::ReReadReason::Incomplete { detail } => {
                 format!("(unknown until next refresh: read after apply was incomplete — {detail})")
             }
@@ -692,6 +688,9 @@ fn value_to_json_inner(
 ) -> Result<serde_json::Value, SerializationError> {
     let ctx = encoding.context();
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err(SerializationError::UnexpandedModuleIf { context: ctx })
+        }
         Value::Concrete(ConcreteValue::String(s)) => {
             // Both serialize as a flat JSON string. The schema-aware
             // state loader re-classifies `EnumIdentifier` from the
@@ -786,6 +785,9 @@ fn value_to_json_inner(
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             Err(SerializationError::UnresolvedCoalesce { context: ctx })
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            Err(SerializationError::UnresolvedIntegerArithmetic { context: ctx })
+        }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             Err(SerializationError::UnresolvedInterpolation { context: ctx })
         }
@@ -828,6 +830,7 @@ fn value_to_json_inner(
                 context: ctx,
             })
         }
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
@@ -884,6 +887,10 @@ fn saved_plan_secret_hashes_json(value: &Value) -> Option<serde_json::Value> {
                 .collect();
             found.then_some(serde_json::Value::Array(values))
         }
+        // The operand placeholder hashes the secret input, not the eventual
+        // arithmetic result. It is therefore not valid previous-state hash
+        // authority for that result; rehydration handles it structurally.
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => None,
         _ => None,
     }
 }
@@ -893,28 +900,33 @@ fn saved_plan_secret_hashes_json(value: &Value) -> Option<serde_json::Value> {
 /// Secret wrappers are sensitivity metadata, not plaintext: nested wrappers
 /// are recursively unwrapped. Deferred values retain their stable template
 /// representation for saved-plan verification.
-pub(crate) fn canonical_secret_hash_material(value: &Value) -> Result<Vec<u8>, SerializationError> {
+pub(crate) fn canonical_secret_hash_material<P: PlaceholderKind>(
+    value: &Value<P>,
+) -> Result<Vec<u8>, SerializationError> {
     // Secret hash material predates the structural persisted encoding. Keep
     // these bytes stable even though state now carries digests in `$secret`
     // tags; identifiers and saved hashes depend on this representation.
-    let canonical = match value_to_json_inner(
-        value,
-        None,
-        false,
-        JsonEncoding::LegacySecretMaterial,
-        false,
-    ) {
-        Ok(json) => json,
-        Err(
-            SerializationError::UnknownNotAllowed { .. }
-            | SerializationError::UnresolvedResourceRef { .. }
-            | SerializationError::UnresolvedInterpolation { .. }
-            | SerializationError::UnresolvedFunctionCall { .. }
-            | SerializationError::UnresolvedAccess { .. }
-            | SerializationError::UnresolvedCoalesce { .. }
-            | SerializationError::SecretNotAllowed { .. },
-        ) => canonical_secret_template(value)?,
-        Err(error) => return Err(error),
+    let canonical = match value.to_expanded() {
+        None => canonical_secret_template(value)?,
+        Some(runtime_value) => match value_to_json_inner(
+            &runtime_value,
+            None,
+            false,
+            JsonEncoding::LegacySecretMaterial,
+            false,
+        ) {
+            Ok(json) => json,
+            Err(
+                SerializationError::UnknownNotAllowed { .. }
+                | SerializationError::UnresolvedResourceRef { .. }
+                | SerializationError::UnresolvedInterpolation { .. }
+                | SerializationError::UnresolvedFunctionCall { .. }
+                | SerializationError::UnresolvedAccess { .. }
+                | SerializationError::UnresolvedCoalesce { .. }
+                | SerializationError::SecretNotAllowed { .. },
+            ) => canonical_secret_template(value)?,
+            Err(error) => return Err(error),
+        },
     };
     serde_json::to_vec(&canonical).map_err(|_| SerializationError::SecretNotAllowed {
         context: SerializationContext::SecretRedaction,
@@ -1206,7 +1218,7 @@ fn canonical_enum_from_payload(
 }
 
 /// Format a `Value` for display
-pub fn format_value(value: &Value) -> String {
+pub fn format_value<P: PlaceholderKind>(value: &Value<P>) -> String {
     format_value_with_key(value, None)
 }
 
@@ -1359,8 +1371,8 @@ fn render_persisted_json(value: PersistedView<'_>) -> RenderedValue {
 /// Render a value for a deferred-for template, replacing typed upstream
 /// placeholders while the value tree is still available. No rendered text is
 /// inspected to identify the placeholder.
-pub(crate) fn render_value_with_upstream_deferred_label(
-    value: &Value,
+pub(crate) fn render_value_with_upstream_deferred_label<P: PlaceholderKind>(
+    value: &Value<P>,
     upstream_binding: &str,
     verb: &str,
 ) -> RenderedValue {
@@ -1401,7 +1413,7 @@ pub(crate) fn render_string_text(text: &str) -> RenderedValue {
 
 /// Format a `Value` for user-visible messages where DSL literal quotes
 /// around bare strings get in the way.
-pub fn format_value_user_facing(value: &Value) -> String {
+pub fn format_value_user_facing<P: PlaceholderKind>(value: &Value<P>) -> String {
     match value {
         Value::Concrete(ConcreteValue::String(value)) => value.expose_plaintext().to_string(),
         _ => format_value(value),
@@ -1409,7 +1421,7 @@ pub fn format_value_user_facing(value: &Value) -> String {
 }
 
 /// Format a `Value` for display, with an optional key for context
-pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
+pub fn format_value_with_key<P: PlaceholderKind>(value: &Value<P>, _key: Option<&str>) -> String {
     let mut sink = StringSink::default();
     // `StringSink::write_token` never returns Err (it has no overflow
     // budget), so the `Result` here is structurally `Ok(())`. Treat the
@@ -1555,7 +1567,10 @@ pub fn render_duration(d: std::time::Duration) -> String {
 /// truth for plan-display value formatting; sinks downstream of this
 /// function decide whether to materialise a `String` or just count
 /// bytes (#2434).
-pub(crate) fn format_value_into(value: &Value, sink: &mut dyn FormatSink) -> Result<(), Overflow> {
+pub(crate) fn format_value_into<P: PlaceholderKind>(
+    value: &Value<P>,
+    sink: &mut dyn FormatSink,
+) -> Result<(), Overflow> {
     format_value_into_context(value, sink, FormatContext::default())
 }
 
@@ -1564,12 +1579,21 @@ struct FormatContext<'a> {
     upstream_deferred_label: Option<(&'a str, &'a str)>,
 }
 
-fn format_value_into_context(
-    value: &Value,
+fn format_value_into_context<P: PlaceholderKind>(
+    value: &Value<P>,
     sink: &mut dyn FormatSink,
     context: FormatContext<'_>,
 ) -> Result<(), Overflow> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            sink.write_token(ValueSpanKind::Other, "if ")?;
+            format_value_into_context(deferred.condition().value(), sink, context)?;
+            sink.write_token(ValueSpanKind::Structure, " { ")?;
+            format_value_into_context(deferred.then_value(), sink, context)?;
+            sink.write_token(ValueSpanKind::Structure, " } else { ")?;
+            format_value_into_context(deferred.else_value(), sink, context)?;
+            sink.write_token(ValueSpanKind::Structure, " }")
+        }
         Value::Concrete(ConcreteValue::String(s)) => sink.write_token(
             ValueSpanKind::StringLiteral,
             &display_string_literal(s.expose_plaintext()),
@@ -1658,6 +1682,9 @@ fn format_value_into_context(
             sink.write_token(ValueSpanKind::Structure, " ?? ")?;
             format_value_into_context(default, sink, context)
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            format_integer_arithmetic(expression, sink, context)
+        }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             sink.write_token(ValueSpanKind::StringLiteral, "\"")?;
             for part in parts {
@@ -1709,18 +1736,78 @@ fn format_value_into_context(
                     sink.write_token(ValueSpanKind::Other, &path)?;
                     sink.write_token(ValueSpanKind::Other, ")")
                 }
-            } else if let Some(reason) = access_chain_unknown_root(access.base()) {
-                write_unknown(reason, sink, context)
             } else {
-                format_value_into_context(access.base(), sink, context)?;
-                sink.write_token(ValueSpanKind::Reference, &access.step().to_dot_string())
+                match access_chain_root(access.base()) {
+                    Some(AccessChainRoot::LoopSlot(slot)) => {
+                        if let Some((upstream_binding, verb)) = context.upstream_deferred_label {
+                            write_upstream_deferred_label(sink, upstream_binding, verb)
+                        } else {
+                            sink.write_token(ValueSpanKind::Other, &slot.render())
+                        }
+                    }
+                    Some(AccessChainRoot::Unknown(reason)) => write_unknown(reason, sink, context),
+                    None => {
+                        format_value_into_context(access.base(), sink, context)?;
+                        sink.write_token(ValueSpanKind::Reference, &access.step().to_dot_string())
+                    }
+                }
             }
         }
         Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
             sink.write_token(ValueSpanKind::Other, "(secret)")
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => write_unknown(reason, sink, context),
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+            if placeholder.loop_slot().is_some()
+                && let Some((upstream_binding, verb)) = context.upstream_deferred_label
+            {
+                write_upstream_deferred_label(sink, upstream_binding, verb)
+            } else {
+                sink.write_token(ValueSpanKind::Other, &placeholder.render())
+            }
+        }
     }
+}
+
+fn format_integer_arithmetic<P: PlaceholderKind>(
+    expression: &crate::integer_arithmetic::ValidatedIntegerExpr<P>,
+    sink: &mut dyn FormatSink,
+    context: FormatContext<'_>,
+) -> Result<(), Overflow> {
+    format_integer_operand(expression.lhs(), expression.op(), false, sink, context)?;
+    sink.write_token(
+        ValueSpanKind::Structure,
+        &format!(" {} ", expression.op().symbol()),
+    )?;
+    format_integer_operand(expression.rhs(), expression.op(), true, sink, context)
+}
+
+fn format_integer_operand<P: PlaceholderKind>(
+    value: &Value<P>,
+    parent_op: crate::integer_arithmetic::IntegerOp,
+    right_operand: bool,
+    sink: &mut dyn FormatSink,
+    context: FormatContext<'_>,
+) -> Result<(), Overflow> {
+    let child_precedence = match value {
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            Some(expression.op().precedence())
+        }
+        _ => None,
+    };
+    let parenthesize = matches!(value, Value::Deferred(DeferredValue::Coalesce { .. }))
+        || child_precedence.is_some_and(|precedence| {
+            precedence < parent_op.precedence()
+                || (right_operand && precedence == parent_op.precedence())
+        });
+    if parenthesize {
+        sink.write_token(ValueSpanKind::Structure, "(")?;
+    }
+    format_value_into_context(value, sink, context)?;
+    if parenthesize {
+        sink.write_token(ValueSpanKind::Structure, ")")?;
+    }
+    Ok(())
 }
 
 fn write_float(value: f64, sink: &mut dyn FormatSink) -> Result<(), Overflow> {
@@ -1785,7 +1872,7 @@ fn format_decoded_persisted_json_into(
 }
 
 fn write_unknown(
-    reason: &UnknownReason,
+    reason: &ApplyTimeUnknown,
     sink: &mut dyn FormatSink,
     context: FormatContext<'_>,
 ) -> Result<(), Overflow> {
@@ -1809,64 +1896,104 @@ fn write_upstream_deferred_label(
     )
 }
 
-fn is_upstream_deferred_reason(reason: &UnknownReason) -> bool {
+fn is_upstream_deferred_reason(reason: &ApplyTimeUnknown) -> bool {
     matches!(
         reason,
-        UnknownReason::UpstreamExport { .. }
-            | UnknownReason::UpstreamAllExports { .. }
-            | UnknownReason::ForKey
-            | UnknownReason::ForIndex
-            | UnknownReason::ForValue
+        ApplyTimeUnknown::UpstreamExport { .. } | ApplyTimeUnknown::UpstreamAllExports { .. }
     )
 }
 
-pub(crate) fn is_upstream_deferred_marker_value(value: &Value) -> bool {
+pub(crate) fn is_upstream_deferred_marker_value<P: PlaceholderKind>(value: &Value<P>) -> bool {
     match value {
         Value::Deferred(DeferredValue::Unknown(reason)) => is_upstream_deferred_reason(reason),
         Value::Deferred(DeferredValue::Access(access)) => {
-            deferred_for_access_display_path(access).is_some()
-                || access_chain_unknown_root(access.base()).is_some_and(is_upstream_deferred_reason)
+            if access.has_authored_loop_path() {
+                deferred_for_access_display_path(access).is_some()
+            } else {
+                match access_chain_root(access.base()) {
+                    Some(AccessChainRoot::LoopSlot(_)) => true,
+                    Some(AccessChainRoot::Unknown(reason)) => is_upstream_deferred_reason(reason),
+                    None => false,
+                }
+            }
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => false,
         _ => false,
     }
 }
 
 /// Reconstruct an authored deferred-for value path from sealed access nodes.
-/// The semantic placeholder remains `Unknown(ForValue)`; the binding name is
+/// The semantic placeholder remains `Placeholder(LoopSlot::Value)`; the binding name is
 /// display-only parser metadata on `AccessExpr`, so no obsolete unknown reason
 /// or independently navigable path representation is reintroduced.
-fn deferred_for_access_display_path(access: &crate::resource::AccessExpr) -> Option<String> {
-    fn append_steps(access: &crate::resource::AccessExpr, output: &mut String) -> bool {
-        let rooted_at_for_value = match access.base() {
+fn deferred_for_access_display_path<P: PlaceholderKind>(
+    access: &crate::resource::AccessExpr<P>,
+) -> Option<String> {
+    fn append_all_steps<P: PlaceholderKind>(
+        access: &crate::resource::AccessExpr<P>,
+        output: &mut String,
+    ) {
+        if let Value::Deferred(DeferredValue::Access(inner)) = access.base() {
+            append_all_steps(inner, output);
+        }
+        output.push_str(&access.step().to_dot_string());
+    }
+
+    fn append_steps<P: PlaceholderKind>(
+        access: &crate::resource::AccessExpr<P>,
+        output: &mut String,
+    ) -> bool {
+        let rooted_at_loop_slot = match access.base() {
             Value::Deferred(DeferredValue::Access(inner)) => append_steps(inner, output),
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)) => true,
+            Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+                placeholder.loop_slot().is_some()
+            }
             _ => false,
         };
-        if rooted_at_for_value {
+        if rooted_at_loop_slot {
             output.push_str(&access.step().to_dot_string());
         }
-        rooted_at_for_value
+        rooted_at_loop_slot
+    }
+
+    if let Some(root) = access.deferred_miss_display_root() {
+        let mut path = root.to_string();
+        append_all_steps(access, &mut path);
+        return Some(path);
     }
 
     let mut path = access.display_root()?.to_string();
     append_steps(access, &mut path).then_some(path)
 }
 
-/// Return the root `Unknown` reason of a direct postfix-access chain.
+pub(crate) enum AccessChainRoot<'a> {
+    LoopSlot(LoopSlot),
+    Unknown(&'a ApplyTimeUnknown),
+}
+
+/// Return the typed root of a direct postfix-access chain.
 /// Function calls and all other expression nodes intentionally stop the
 /// search: `unknown.field` is still unknown, while `split(unknown)[0]`
 /// remains a useful expression in diagnostics and plans.
-pub(crate) fn access_chain_unknown_root(value: &Value) -> Option<&UnknownReason> {
+pub(crate) fn access_chain_root<P: PlaceholderKind>(
+    value: &Value<P>,
+) -> Option<AccessChainRoot<'_>> {
     match value {
-        Value::Deferred(DeferredValue::Access(access)) => access_chain_unknown_root(access.base()),
-        Value::Deferred(DeferredValue::Unknown(reason)) => Some(reason),
+        Value::Deferred(DeferredValue::Access(access)) => access_chain_root(access.base()),
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+            placeholder.loop_slot().map(AccessChainRoot::LoopSlot)
+        }
+        Value::Deferred(DeferredValue::Unknown(reason)) => Some(AccessChainRoot::Unknown(reason)),
         _ => None,
     }
 }
 
 /// Check if a Value contains any Secret values at any nesting depth.
-pub fn contains_secret(value: &Value) -> bool {
+pub fn contains_secret<P: PlaceholderKind>(value: &Value<P>) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred.values().into_iter().any(contains_secret)
+        }
         Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => true,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_secret),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().any(contains_secret),
@@ -1883,6 +2010,9 @@ pub fn contains_secret(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_secret(value) || contains_secret(default)
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            contains_secret(expression.lhs()) || contains_secret(expression.rhs())
+        }
         Value::Deferred(DeferredValue::Access(access)) => contains_secret(access.base()),
         Value::Concrete(
             ConcreteValue::String(_)
@@ -1897,7 +2027,8 @@ pub fn contains_secret(value: &Value) -> bool {
         | Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
-            | DeferredValue::Unknown(_),
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         ) => false,
     }
 }
@@ -1911,6 +2042,12 @@ pub fn contains_secret(value: &Value) -> bool {
 /// must not be treated as a new desired secret.
 pub fn contains_unredacted_secret(value: &Value) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred
+                .values()
+                .into_iter()
+                .any(contains_unredacted_secret)
+        }
         Value::Deferred(DeferredValue::Secret(_)) => true,
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => false,
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -1936,6 +2073,10 @@ pub fn contains_unredacted_secret(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_unredacted_secret(value) || contains_unredacted_secret(default)
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            contains_unredacted_secret(expression.lhs())
+                || contains_unredacted_secret(expression.rhs())
+        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -1951,6 +2092,7 @@ pub fn contains_unredacted_secret(value: &Value) -> bool {
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Unknown(_),
         ) => false,
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
@@ -2181,8 +2323,10 @@ fn merge_secrets_into_provider_json_inner(
 fn secret_value_requires_provider_material(value: &Value) -> bool {
     match value {
         Value::Deferred(
-            DeferredValue::ResourceRef { .. }
+            DeferredValue::ModuleIf(_)
+            | DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
+            | DeferredValue::IntegerArithmetic(_)
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
@@ -2214,6 +2358,7 @@ fn secret_value_requires_provider_material(value: &Value) -> bool {
             | ConcreteValue::StringList(_),
         )
         | Value::Deferred(DeferredValue::RedactedSecret { .. }) => false,
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
@@ -2223,12 +2368,14 @@ fn secret_value_requires_provider_material(value: &Value) -> bool {
 ///
 /// Hashes every `Secret(_)` leaf while passing `Unknown` and other deferred
 /// shapes through verbatim.
-fn redact_secrets_only(value: &Value) -> Result<Value, SerializationError> {
+fn redact_secrets_only<P: PlaceholderKind>(
+    value: &Value<P>,
+) -> Result<Value<P>, SerializationError> {
     match value {
         Value::Deferred(DeferredValue::Secret(inner)) => redact_secret_leaf(inner),
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => Ok(value.clone()),
         Value::Concrete(ConcreteValue::Map(map)) => {
-            let redacted: Result<IndexMap<String, Value>, _> = map
+            let redacted: Result<IndexMap<String, Value<P>>, _> = map
                 .iter()
                 .map(|(k, v)| redact_secrets_only(v).map(|rv| (k.clone(), rv)))
                 .collect();
@@ -2239,7 +2386,7 @@ fn redact_secrets_only(value: &Value) -> Result<Value, SerializationError> {
             Ok(Value::Concrete(ConcreteValue::List(redacted?)))
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            let redacted: Result<Vec<InterpolationPart>, _> = parts
+            let redacted: Result<Vec<InterpolationPart<P>>, _> = parts
                 .iter()
                 .map(|p| match p {
                     InterpolationPart::Literal(s) => Ok(InterpolationPart::Literal(s.clone())),
@@ -2314,6 +2461,15 @@ fn redact_secrets_only(value: &Value) -> Result<Value, SerializationError> {
                 default: Box::new(redact_secrets_only(default)?),
             }))
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = redact_secrets_only(expression.lhs())?;
+            let rhs = redact_secrets_only(expression.rhs())?;
+            expression.evaluate_with_operands(lhs, rhs).map_err(|_| {
+                SerializationError::UnresolvedIntegerArithmetic {
+                    context: SerializationContext::SecretRedaction,
+                }
+            })
+        }
         // `Unknown` and every other deferred / concrete shape pass through.
         other => Ok(other.clone()),
     }
@@ -2326,7 +2482,9 @@ fn redact_secrets_only(value: &Value) -> Result<Value, SerializationError> {
 /// expression, the placeholder hashes a canonical template representation;
 /// references and unknowns are represented structurally, so no individual
 /// literal fragment is exposed to an independent brute-force attempt.
-fn redact_secret_leaf(inner: &Value) -> Result<Value, SerializationError> {
+fn redact_secret_leaf<P: PlaceholderKind>(
+    inner: &Value<P>,
+) -> Result<Value<P>, SerializationError> {
     match inner {
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => Ok(inner.clone()),
         _ => {
@@ -2342,7 +2500,9 @@ fn redact_secret_leaf(inner: &Value) -> Result<Value, SerializationError> {
 /// expression nodes disjoint from user-authored maps while deliberately
 /// retaining only stable resolver inputs (paths, bindings, literals, and
 /// unknown reasons). This representation is hashed but never persisted.
-fn canonical_secret_template(value: &Value) -> Result<serde_json::Value, SerializationError> {
+fn canonical_secret_template<P: PlaceholderKind>(
+    value: &Value<P>,
+) -> Result<serde_json::Value, SerializationError> {
     use serde_json::{Map, Value as JsonValue};
 
     fn tagged(tag: &str, value: JsonValue) -> JsonValue {
@@ -2353,6 +2513,11 @@ fn canonical_secret_template(value: &Value) -> Result<serde_json::Value, Seriali
     }
 
     Ok(match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            return Err(SerializationError::UnexpandedModuleIf {
+                context: SerializationContext::SecretRedaction,
+            });
+        }
         Value::Concrete(ConcreteValue::String(value)) => tagged(
             "string",
             JsonValue::String(value.expose_plaintext().to_string()),
@@ -2424,6 +2589,22 @@ fn canonical_secret_template(value: &Value) -> Result<serde_json::Value, Seriali
                 canonical_secret_template(default)?,
             ]),
         ),
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let mut encoded = Map::new();
+            encoded.insert(
+                "lhs".to_string(),
+                canonical_secret_template(expression.lhs())?,
+            );
+            encoded.insert(
+                "op".to_string(),
+                JsonValue::String(expression.op().symbol().to_string()),
+            );
+            encoded.insert(
+                "rhs".to_string(),
+                canonical_secret_template(expression.rhs())?,
+            );
+            tagged("integer_arithmetic", JsonValue::Object(encoded))
+        }
         Value::Deferred(DeferredValue::Interpolation(parts)) => tagged(
             "interpolation",
             JsonValue::Array(
@@ -2490,13 +2671,21 @@ fn canonical_secret_template(value: &Value) -> Result<serde_json::Value, Seriali
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => tagged(
             "unknown",
-            serde_json::to_value(reason).expect("UnknownReason is serializable"),
+            serde_json::to_value(reason).expect("ApplyTimeUnknown is serializable"),
+        ),
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => tagged(
+            "placeholder",
+            serde_json::to_value(placeholder).map_err(|_| {
+                SerializationError::SecretNotAllowed {
+                    context: SerializationContext::SecretRedaction,
+                }
+            })?,
         ),
     })
 }
 
 /// Return whether a value tree contains a saved-plan secret placeholder.
-pub fn contains_redacted_secret(value: &Value) -> bool {
+pub fn contains_redacted_secret<P: PlaceholderKind>(value: &Value<P>) -> bool {
     match value {
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => true,
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -2520,30 +2709,38 @@ pub fn contains_redacted_secret(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_redacted_secret(value) || contains_redacted_secret(default)
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            contains_redacted_secret(expression.lhs())
+                || contains_redacted_secret(expression.rhs())
+        }
         _ => false,
     }
 }
 
-fn attributes_contain_redacted_secret<'a>(values: impl Iterator<Item = &'a Value>) -> bool {
+fn attributes_contain_redacted_secret<'a, P: PlaceholderKind + 'a>(
+    values: impl Iterator<Item = &'a Value<P>>,
+) -> bool {
     values.into_iter().any(contains_redacted_secret)
 }
 
-fn deferred_template_contains_redacted_secret<S>(
-    template: &crate::parser::DeferredForExpression<S>,
-) -> bool {
+fn deferred_template_contains_redacted_secret<S, P, T>(
+    template: &crate::parser::DeferredForExpression<S, P, T>,
+) -> bool
+where
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+{
     let crate::parser::DeferredForExpression {
         file: _file,
         line: _line,
         header: _header,
         resource_type: _resource_type,
-        attributes,
         target: _target,
         iterable,
         binding: _binding,
         template_resource,
     } = template;
     contains_redacted_secret(iterable)
-        || attributes_contain_redacted_secret(attributes.iter().map(|(_, value)| value))
         || attributes_contain_redacted_secret(template_resource.attributes.values())
 }
 
@@ -3116,11 +3313,11 @@ enum SecretRehydrationInput {
     Plaintext,
 }
 
-fn rehydrate_redacted_secrets_impl(
-    saved: &Value,
-    candidate: &Value,
+fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
+    saved: &Value<P>,
+    candidate: &Value<P>,
     input: SecretRehydrationInput,
-) -> Result<Value, SecretRehydrationError> {
+) -> Result<Value<P>, SecretRehydrationError> {
     if !contains_redacted_secret(saved) {
         return Ok(saved.clone());
     }
@@ -3330,16 +3527,48 @@ fn rehydrate_redacted_secrets_impl(
                 default: Box::new(default),
             }))
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(saved_expression)) => {
+            let Value::Deferred(DeferredValue::IntegerArithmetic(candidate_expression)) = candidate
+            else {
+                return Err(SecretRehydrationError::ShapeMismatch);
+            };
+            if saved_expression.op() != candidate_expression.op() {
+                return Err(SecretRehydrationError::ShapeMismatch);
+            }
+            let lhs = if contains_redacted_secret(saved_expression.lhs()) {
+                rehydrate_redacted_secrets_impl(
+                    saved_expression.lhs(),
+                    candidate_expression.lhs(),
+                    input,
+                )?
+            } else {
+                saved_expression.lhs().clone()
+            };
+            let rhs = if contains_redacted_secret(saved_expression.rhs()) {
+                rehydrate_redacted_secrets_impl(
+                    saved_expression.rhs(),
+                    candidate_expression.rhs(),
+                    input,
+                )?
+            } else {
+                saved_expression.rhs().clone()
+            };
+            saved_expression
+                .rebuild(lhs, rhs)
+                .map(DeferredValue::IntegerArithmetic)
+                .map(Value::Deferred)
+                .map_err(|_| SecretRehydrationError::ShapeMismatch)
+        }
         _ => Err(SecretRehydrationError::ShapeMismatch),
     }
 }
 
 /// Restore saved-plan placeholders from freshly evaluated configuration
 /// values, verifying the plan-time hash at every placeholder.
-pub fn rehydrate_redacted_secrets(
-    saved: &Value,
-    evaluated: &Value,
-) -> Result<Value, SecretRehydrationError> {
+pub fn rehydrate_redacted_secrets<P: PlaceholderKind>(
+    saved: &Value<P>,
+    evaluated: &Value<P>,
+) -> Result<Value<P>, SecretRehydrationError> {
     if contains_redacted_secret(saved)
         && find_unavailable_evaluation(
             evaluated,
@@ -3355,10 +3584,10 @@ pub fn rehydrate_redacted_secrets(
 
 /// Restore historical saved-plan placeholders from a fresh provider read,
 /// verifying the plan-time hash before returning provider plaintext.
-pub fn rehydrate_redacted_secrets_from_plaintext(
-    saved: &Value,
-    plaintext: &Value,
-) -> Result<Value, SecretRehydrationError> {
+pub fn rehydrate_redacted_secrets_from_plaintext<P: PlaceholderKind>(
+    saved: &Value<P>,
+    plaintext: &Value<P>,
+) -> Result<Value<P>, SecretRehydrationError> {
     rehydrate_redacted_secrets_impl(saved, plaintext, SecretRehydrationInput::Plaintext)
 }
 
@@ -3374,12 +3603,12 @@ pub enum SecretRehydrationCandidate {
 ///
 /// Placeholder-free values return `Ok(None)` without requiring a candidate,
 /// which keeps secret verification transparent to ordinary saved-plan values.
-pub fn rehydrate_secret_entry(
-    saved: &Value,
-    candidate: Option<&Value>,
+pub fn rehydrate_secret_entry<P: PlaceholderKind>(
+    saved: &Value<P>,
+    candidate: Option<&Value<P>>,
     location: impl Into<String>,
     candidate_kind: SecretRehydrationCandidate,
-) -> Result<Option<Value>, SecretRehydrationSiteError> {
+) -> Result<Option<Value<P>>, SecretRehydrationSiteError> {
     if !contains_redacted_secret(saved) {
         return Ok(None);
     }
@@ -3502,6 +3731,15 @@ pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationErro
                 value: Box::new(redact_secrets_only(value)?),
                 default: Box::new(redact_secrets_only(default)?),
             }))
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = redact_secrets_only(expression.lhs())?;
+            let rhs = redact_secrets_only(expression.rhs())?;
+            expression.evaluate_with_operands(lhs, rhs).map_err(|_| {
+                SerializationError::UnresolvedIntegerArithmetic {
+                    context: SerializationContext::SecretRedaction,
+                }
+            })
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
@@ -3948,17 +4186,6 @@ fn redact_deferred_template(
         .iter()
         .map(|(key, value)| redact_secrets_only(value).map(|value| (key.clone(), value)))
         .collect::<Result<_, _>>()?;
-    redacted.attributes = template
-        .attributes
-        .iter()
-        .map(|(key, value)| {
-            if let Some(canonical) = redacted.template_resource.attributes.get(key) {
-                Ok((key.clone(), canonical.clone()))
-            } else {
-                redact_secrets_only(value).map(|value| (key.clone(), value))
-            }
-        })
-        .collect::<Result<_, _>>()?;
     Ok(redacted)
 }
 
@@ -4346,26 +4573,6 @@ fn rehydrate_deferred_template<S: Clone, T>(
             saved_value,
             candidate.template_resource.attributes.get(key),
             format!("deferred resource {}.{key}", saved.target.display_name()),
-            SecretRehydrationCandidate::Evaluated,
-        )? {
-            *saved_value = value;
-        }
-    }
-    for (key, saved_value) in &mut out.attributes {
-        if let Some(canonical) = out.template_resource.attributes.get(key) {
-            *saved_value = canonical.clone();
-            continue;
-        }
-        if let Some(value) = rehydrate_secret_entry(
-            saved_value,
-            candidate
-                .attributes
-                .iter()
-                .find_map(|(candidate_key, value)| (candidate_key == key).then_some(value)),
-            format!(
-                "deferred display resource {}.{key}",
-                saved.target.display_name()
-            ),
             SecretRehydrationCandidate::Evaluated,
         )? {
             *saved_value = value;
@@ -5020,14 +5227,14 @@ impl<'a> CanonicalizationPurpose<'a> {
     }
 }
 
-trait CanonicalizationErrorPolicy: Copy {
+trait CanonicalizationErrorPolicy<H: PlaceholderKind>: Copy {
     type Error;
 
     fn canonicalization_failed(
         self,
-        original: Value,
+        original: Value<H>,
         source: crate::schema::TypeError,
-    ) -> Result<Value, Self::Error>;
+    ) -> Result<Value<H>, Self::Error>;
 
     fn mask_secret(self, error: Self::Error) -> Self::Error;
 
@@ -5045,14 +5252,14 @@ trait CanonicalizationErrorPolicy: Copy {
 #[derive(Clone, Copy)]
 struct RejectEnumResolutionErrors;
 
-impl CanonicalizationErrorPolicy for RejectEnumResolutionErrors {
+impl<H: PlaceholderKind> CanonicalizationErrorPolicy<H> for RejectEnumResolutionErrors {
     type Error = crate::schema::TypeError;
 
     fn canonicalization_failed(
         self,
-        _original: Value,
+        _original: Value<H>,
         source: crate::schema::TypeError,
-    ) -> Result<Value, Self::Error> {
+    ) -> Result<Value<H>, Self::Error> {
         Err(source)
     }
 
@@ -5089,7 +5296,8 @@ impl CanonicalizationErrorPolicy for RejectEnumResolutionErrors {
     }
 
     fn map_key_collision(self, key: String, canonical_key: String) -> Result<(), Self::Error> {
-        Err(self.at_map_key(
+        Err(CanonicalizationErrorPolicy::<H>::at_map_key(
+            self,
             key,
             crate::schema::TypeError::ValidationFailed {
                 message: format!(
@@ -5103,14 +5311,14 @@ impl CanonicalizationErrorPolicy for RejectEnumResolutionErrors {
 #[derive(Clone, Copy)]
 struct PreserveEnumResolutionErrors;
 
-impl CanonicalizationErrorPolicy for PreserveEnumResolutionErrors {
+impl<H: PlaceholderKind> CanonicalizationErrorPolicy<H> for PreserveEnumResolutionErrors {
     type Error = Infallible;
 
     fn canonicalization_failed(
         self,
-        original: Value,
+        original: Value<H>,
         _source: crate::schema::TypeError,
-    ) -> Result<Value, Self::Error> {
+    ) -> Result<Value<H>, Self::Error> {
         Ok(original)
     }
 
@@ -5149,12 +5357,12 @@ fn unwrap_infallible<T>(result: Result<T, Infallible>) -> T {
 /// Canonicalize a desired value completely. Success guarantees that no
 /// [`ConcreteValue::EnumIdentifier`] remains anywhere in the value tree.
 #[cfg(test)]
-fn canonicalize_desired_with_type(
-    value: Value,
+fn canonicalize_desired_with_type<H: PlaceholderKind>(
+    value: Value<H>,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     source: DesiredValueSource,
-) -> Result<Value, crate::schema::TypeError> {
+) -> Result<Value<H>, crate::schema::TypeError> {
     canonicalize_desired_with_type_and_ancestry(
         value,
         attr_type,
@@ -5164,13 +5372,13 @@ fn canonicalize_desired_with_type(
     )
 }
 
-fn canonicalize_desired_with_type_and_ancestry(
-    value: Value,
+fn canonicalize_desired_with_type_and_ancestry<H: PlaceholderKind>(
+    value: Value<H>,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
     source: DesiredValueSource,
-) -> Result<Value, crate::schema::TypeError> {
+) -> Result<Value<H>, crate::schema::TypeError> {
     let canonical = canonicalize_with_type_for_purpose(
         value,
         attr_type,
@@ -5235,6 +5443,10 @@ fn reparse_canonical_enum_leaves(value: &mut Value) {
                 reparse_canonical_enum_leaves(item);
             }
         }
+        // Validated arithmetic operands are Int-shaped and cannot contain an
+        // enum leaf. Keep the arm explicit so this traversal cannot silently
+        // become stale if the deferred enum grows another variant.
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {}
         _ => {}
     }
 }
@@ -5305,14 +5517,14 @@ pub(crate) fn canonicalize_wait_rhs_with_type(
     ))
 }
 
-fn canonicalize_with_type_for_purpose<P: CanonicalizationErrorPolicy>(
-    value: Value,
+fn canonicalize_with_type_for_purpose<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
+    value: Value<H>,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
-) -> Result<Value, P::Error> {
+) -> Result<Value<H>, P::Error> {
     let mut visited_refs = Vec::new();
     let unwrapped = peel_custom(
         attr_type
@@ -5344,13 +5556,13 @@ fn canonicalize_with_type_for_purpose<P: CanonicalizationErrorPolicy>(
 /// Consume a successful fit witness without re-validating any selected Union
 /// member or re-resolving any enum. The value and witness have identical tree
 /// shapes by construction.
-fn canonicalize_with_fit<P: CanonicalizationErrorPolicy>(
-    value: Value,
+fn canonicalize_with_fit<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
+    value: Value<H>,
     fit: crate::schema::Fit<'_>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
-) -> Result<Value, P::Error> {
+) -> Result<Value<H>, P::Error> {
     if purpose.canonicalizes_full_shape() && is_string_or_list_of_strings(fit.attr, defs) {
         return Ok(canonicalize_to_string_list(value));
     }
@@ -5479,10 +5691,10 @@ fn canonicalize_with_fit<P: CanonicalizationErrorPolicy>(
     }
 }
 
-fn collect_canonicalized_map<P: CanonicalizationErrorPolicy>(
-    entries: Vec<(String, String, Value)>,
+fn collect_canonicalized_map<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
+    entries: Vec<(String, String, Value<H>)>,
     error_policy: P,
-) -> Result<IndexMap<String, Value>, P::Error> {
+) -> Result<IndexMap<String, Value<H>>, P::Error> {
     let mut seen = BTreeSet::new();
     let collision = entries.iter().find_map(|(original_key, canonical_key, _)| {
         (!seen.insert(canonical_key.clone())).then(|| (original_key.clone(), canonical_key.clone()))
@@ -5502,7 +5714,9 @@ fn collect_canonicalized_map<P: CanonicalizationErrorPolicy>(
         .collect())
 }
 
-fn canonical_map_key_text(value: Value) -> Result<String, crate::schema::TypeError> {
+fn canonical_map_key_text<H: PlaceholderKind>(
+    value: Value<H>,
+) -> Result<String, crate::schema::TypeError> {
     match value {
         Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
             Ok(canonical.api_value().to_string())
@@ -5519,9 +5733,11 @@ fn canonical_map_key_text(value: Value) -> Result<String, crate::schema::TypeErr
             | ConcreteValue::Map(_),
         )
         | Value::Deferred(
-            DeferredValue::ResourceRef { .. }
+            DeferredValue::ModuleIf(_)
+            | DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Coalesce { .. }
+            | DeferredValue::IntegerArithmetic(_)
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
@@ -5529,7 +5745,8 @@ fn canonical_map_key_text(value: Value) -> Result<String, crate::schema::TypeErr
             | DeferredValue::Access(_)
             | DeferredValue::Secret(_)
             | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         )) => Err(crate::schema::TypeError::TypeMismatch {
             expected: "String or Enum map key".to_string(),
             got: unexpected.type_name(),
@@ -5583,13 +5800,13 @@ fn type_contains_enum(
     walk(attr_type, defs, &mut std::collections::HashSet::new())
 }
 
-fn finish_no_fit<P: CanonicalizationErrorPolicy>(
-    value: Value,
+fn finish_no_fit<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
+    value: Value<H>,
     expected: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
-) -> Result<Value, P::Error> {
+) -> Result<Value<H>, P::Error> {
     if purpose.rejects_unrecognized_enum_text() && type_contains_enum(expected, defs) {
         let source = crate::schema::TypeError::TypeMismatch {
             expected: expected.type_name(),
@@ -5605,15 +5822,15 @@ fn finish_no_fit<P: CanonicalizationErrorPolicy>(
 /// not fit at all. Union acceptance never comes from this path. Provider output
 /// alone follows the closest failure shape so invalid enum text fails closed;
 /// persisted state retains its established forward-compatible lenience.
-fn canonicalize_without_fit<'a, P: CanonicalizationErrorPolicy>(
-    value: Value,
+fn canonicalize_without_fit<'a, H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
+    value: Value<H>,
     unwrapped: &'a AttributeType,
     defs: &'a std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
     visited_refs: &mut Vec<&'a str>,
-) -> Result<Value, P::Error> {
+) -> Result<Value<H>, P::Error> {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
         return canonicalize_without_fit(
             *inner,
@@ -5748,7 +5965,8 @@ fn canonicalize_without_fit<'a, P: CanonicalizationErrorPolicy>(
             let canonicalized = map
                 .into_iter()
                 .map(|(key, value)| {
-                    let lifted_key = crate::schema::lift_map_key(key_type, &key, defs);
+                    let lifted_key = crate::schema::lift_map_key(key_type, &key, defs)
+                        .into_placeholder_type::<H>();
                     let canonical_key_value = canonicalize_with_type_for_purpose(
                         lifted_key,
                         key_type,
@@ -5935,15 +6153,21 @@ struct EnumIdentifierOccurrence<'a> {
     inside_secret: bool,
 }
 
-fn first_enum_identifier(value: &Value) -> Option<EnumIdentifierOccurrence<'_>> {
+fn first_enum_identifier<H: PlaceholderKind>(
+    value: &Value<H>,
+) -> Option<EnumIdentifierOccurrence<'_>> {
     first_enum_identifier_inner(value, false)
 }
 
-fn first_enum_identifier_inner(
-    value: &Value,
+fn first_enum_identifier_inner<H: PlaceholderKind>(
+    value: &Value<H>,
     inside_secret: bool,
 ) -> Option<EnumIdentifierOccurrence<'_>> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
+            .values()
+            .into_iter()
+            .find_map(|value| first_enum_identifier_inner(value, inside_secret)),
         Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
             Some(EnumIdentifierOccurrence { raw, inside_secret })
         }
@@ -5960,6 +6184,10 @@ fn first_enum_identifier_inner(
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             first_enum_identifier_inner(value, inside_secret)
                 .or_else(|| first_enum_identifier_inner(default, inside_secret))
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            first_enum_identifier_inner(expression.lhs(), inside_secret)
+                .or_else(|| first_enum_identifier_inner(expression.rhs(), inside_secret))
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -5980,12 +6208,13 @@ fn first_enum_identifier_inner(
             | DeferredValue::BindingRef { .. }
             | DeferredValue::RedactedSecret { .. },
         ) => None,
+        Value::Deferred(DeferredValue::Placeholder(_)) => None,
     }
 }
 
 /// Body of state and desired canonicalization for the
 /// `string_or_list_of_strings` case.
-fn canonicalize_to_string_list(value: Value) -> Value {
+fn canonicalize_to_string_list<H: PlaceholderKind>(value: Value<H>) -> Value<H> {
     match value {
         Value::Concrete(ConcreteValue::StringList(items)) => {
             Value::Concrete(ConcreteValue::StringList(items))
@@ -6018,12 +6247,16 @@ fn canonicalize_to_string_list(value: Value) -> Value {
 /// through another borrow, so identity code can require this type as
 /// evidence that the canonicalize pass already ran.
 #[derive(Debug)]
-pub struct CanonicalizedResources<'a, S = crate::resource::ModuleSource> {
-    resources: &'a mut [crate::resource::Resource<S>],
+pub struct CanonicalizedResources<
+    'a,
+    S = crate::resource::ModuleSource,
+    H: PlaceholderKind = crate::resource::NoPlaceholder,
+> {
+    resources: &'a mut [crate::resource::Resource<S, H>],
 }
 
-impl<'a, S> CanonicalizedResources<'a, S> {
-    pub(crate) fn into_mut_slice(self) -> &'a mut [crate::resource::Resource<S>] {
+impl<'a, S, H: PlaceholderKind> CanonicalizedResources<'a, S, H> {
+    pub(crate) fn into_mut_slice(self) -> &'a mut [crate::resource::Resource<S, H>] {
         self.resources
     }
 }
@@ -6087,7 +6320,9 @@ fn mask_enum_identifier_error_for_secret(
     }
 }
 
-fn unresolved_enum_identifier_type_error_in(value: &Value) -> Option<crate::schema::TypeError> {
+fn unresolved_enum_identifier_type_error_in<H: PlaceholderKind>(
+    value: &Value<H>,
+) -> Option<crate::schema::TypeError> {
     let occurrence = first_enum_identifier(value)?;
     Some(mask_enum_identifier_error_for_secret(
         unresolved_enum_identifier_type_error(occurrence.raw),
@@ -6095,15 +6330,16 @@ fn unresolved_enum_identifier_type_error_in(value: &Value) -> Option<crate::sche
     ))
 }
 
-fn canonicalize_desired_attribute_map_with_schema<Attributes>(
+fn canonicalize_desired_attribute_map_with_schema<H: PlaceholderKind, Attributes>(
     attributes: &mut Attributes,
     schema: &crate::schema::ResourceSchema,
     resource: &crate::resource::ResourceId,
     source: DesiredValueSource,
 ) -> Result<(), EnumCanonicalizationError>
 where
-    Attributes:
-        Default + IntoIterator<Item = (String, Value)> + std::iter::FromIterator<(String, Value)>,
+    Attributes: Default
+        + IntoIterator<Item = (String, Value<H>)>
+        + std::iter::FromIterator<(String, Value<H>)>,
 {
     let mut canonicalized = Vec::new();
     for (key, value) in std::mem::take(attributes) {
@@ -6135,9 +6371,9 @@ where
     Ok(())
 }
 
-fn reject_unresolved_enum_identifiers_in_attributes<'a>(
+fn reject_unresolved_enum_identifiers_in_attributes<'a, H: PlaceholderKind + 'a>(
     resource: &crate::resource::ResourceId,
-    attributes: impl IntoIterator<Item = (&'a String, &'a Value)>,
+    attributes: impl IntoIterator<Item = (&'a String, &'a Value<H>)>,
 ) -> Result<(), EnumCanonicalizationError> {
     for (attribute, value) in attributes {
         if let Some(source) = unresolved_enum_identifier_type_error_in(value) {
@@ -6185,10 +6421,10 @@ pub(crate) fn canonicalize_state_attribute_map_with_schema<Attributes>(
 /// Call this once after `resolver::resolve_refs_*` and before the
 /// differ runs, so every `Resource` flowing into the plan / state /
 /// provider boundary carries the canonical shape. See #2481, #2511.
-pub fn canonicalize_resources_with_schemas<'a, S>(
-    resources: &'a mut [crate::resource::Resource<S>],
+pub fn canonicalize_resources_with_schemas<'a, S, H: PlaceholderKind>(
+    resources: &'a mut [crate::resource::Resource<S, H>],
     registry: &crate::schema::SchemaRegistry,
-) -> Result<CanonicalizedResources<'a, S>, EnumCanonicalizationError> {
+) -> Result<CanonicalizedResources<'a, S, H>, EnumCanonicalizationError> {
     for resource in resources.iter_mut() {
         if let Some(schema) = registry.get_for(resource) {
             canonicalize_desired_attribute_map_with_schema(
@@ -6243,28 +6479,28 @@ type ProviderConfigSchemaFn<'a> = dyn Fn(&str) -> Option<crate::schema::Validate
 /// `ProviderConfig` slices, so callers cannot skip provider config enum
 /// canonicalization at the hash seam.
 #[derive(Debug, Clone)]
-pub struct CanonicalizedProviderConfigs {
-    providers: Vec<crate::parser::ProviderConfig>,
+pub struct CanonicalizedProviderConfigs<H: PlaceholderKind = crate::resource::NoPlaceholder> {
+    providers: Vec<crate::parser::ProviderConfig<H>>,
 }
 
-impl CanonicalizedProviderConfigs {
-    pub fn as_slice(&self) -> &[crate::parser::ProviderConfig] {
+impl<H: PlaceholderKind> CanonicalizedProviderConfigs<H> {
+    pub fn as_slice(&self) -> &[crate::parser::ProviderConfig<H>] {
         &self.providers
     }
 
     #[cfg(test)]
-    pub(crate) fn from_configs_for_test(providers: Vec<crate::parser::ProviderConfig>) -> Self {
+    pub(crate) fn from_configs_for_test(providers: Vec<crate::parser::ProviderConfig<H>>) -> Self {
         Self { providers }
     }
 }
 
-pub(crate) fn canonicalize_provider_config_with_type_and_ancestry(
+pub(crate) fn canonicalize_provider_config_with_type_and_ancestry<H: PlaceholderKind>(
     provider_name: &str,
-    value: Value,
+    value: Value<H>,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
-) -> Result<Value, crate::schema::TypeError> {
+) -> Result<Value<H>, crate::schema::TypeError> {
     let canonical = canonicalize_with_type_for_purpose(
         value,
         attr_type,
@@ -6311,11 +6547,11 @@ impl ProviderConfigCanonicalizationError {
 /// Canonicalize one provider configuration attribute map using its
 /// host-declared types. Typed canonicalization is total; the only explicit
 /// identifier check is therefore for attributes without a declared type.
-pub(crate) fn canonicalize_provider_config_attributes_with_types(
+pub(crate) fn canonicalize_provider_config_attributes_with_types<H: PlaceholderKind>(
     provider_name: &str,
-    attributes: &IndexMap<String, Value>,
+    attributes: &IndexMap<String, Value<H>>,
     attr_types: &BTreeMap<String, AttributeType>,
-) -> Result<IndexMap<String, Value>, ProviderConfigCanonicalizationError> {
+) -> Result<IndexMap<String, Value<H>>, ProviderConfigCanonicalizationError> {
     let mut canonical = IndexMap::with_capacity(attributes.len());
     for (attribute, value) in attributes {
         let value = match attr_types.get(attribute) {
@@ -6350,10 +6586,10 @@ pub(crate) fn canonicalize_provider_config_attributes_with_types(
 /// Walk every provider config's attributes, canonicalizing enum-typed leaves
 /// such as provider identity `region` before those values feed durable
 /// identity hashing.
-pub fn canonicalize_provider_configs_with_schemas(
-    providers: &[crate::parser::ProviderConfig],
+pub fn canonicalize_provider_configs_with_schemas<H: PlaceholderKind>(
+    providers: &[crate::parser::ProviderConfig<H>],
     provider_config_schema_fn: &ProviderConfigSchemaFn<'_>,
-) -> Result<CanonicalizedProviderConfigs, ProviderConfigCanonicalizationError> {
+) -> Result<CanonicalizedProviderConfigs<H>, ProviderConfigCanonicalizationError> {
     let mut providers = providers.to_vec();
     for provider in providers.iter_mut() {
         let config_schema = provider_config_schema_fn(&provider.name).unwrap_or_default();
@@ -6372,8 +6608,8 @@ pub fn canonicalize_provider_configs_with_schemas(
 /// authored `read` inputs, so `EnumIdentifier` uses authored-DSL semantics. Unknown
 /// non-enum values pass through, while an identifier without a resolvable
 /// schema is rejected (carina#3181, carina#3740).
-pub fn canonicalize_data_sources_with_schemas<S>(
-    data_sources: &mut [crate::resource::DataSource<S>],
+pub fn canonicalize_data_sources_with_schemas<S, H: PlaceholderKind>(
+    data_sources: &mut [crate::resource::DataSource<S, H>],
     registry: &crate::schema::SchemaRegistry,
 ) -> Result<(), EnumCanonicalizationError> {
     for data_source in data_sources.iter_mut() {
@@ -6443,6 +6679,63 @@ mod tests {
         expressions: impl IntoIterator<Item = crate::parser::DeferredForExpression>,
     ) -> crate::parser::ResolvedDeferredForExpressions {
         crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test(expressions)
+    }
+
+    type Value = crate::resource::Value<crate::resource::NoPlaceholder>;
+    type ConcreteValue = crate::resource::ConcreteValue<crate::resource::NoPlaceholder>;
+    type DeferredValue = crate::resource::DeferredValue<crate::resource::NoPlaceholder>;
+    type InterpolationPart = crate::resource::InterpolationPart<crate::resource::NoPlaceholder>;
+    type LoopValue = crate::resource::Value<LoopSlot>;
+    type LoopDeferredValue = crate::resource::DeferredValue<LoopSlot>;
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    struct DisplayMutablePlaceholder {
+        identity: String,
+        #[serde(skip)]
+        wording: String,
+    }
+
+    impl std::fmt::Display for DisplayMutablePlaceholder {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.wording)
+        }
+    }
+
+    impl crate::resource::PlaceholderKind for DisplayMutablePlaceholder {}
+
+    #[test]
+    fn placeholder_secret_material_uses_structured_serde_not_display_wording() {
+        let value = |wording: &str| {
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                DisplayMutablePlaceholder {
+                    identity: "stable-slot".to_string(),
+                    wording: wording.to_string(),
+                },
+            ))
+        };
+
+        let before = canonical_secret_hash_material(&value("old wording"))
+            .expect("canonical material for placeholder");
+        let after = canonical_secret_hash_material(&value("new wording"))
+            .expect("canonical material for placeholder");
+        assert_eq!(
+            before, after,
+            "display wording must not affect secret hashes"
+        );
+    }
+
+    #[test]
+    fn parser_placeholder_display_keeps_render_unknown_parentheses() {
+        let value = crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            crate::resource::ParserPlaceholder::FnParam {
+                name: "input".to_string(),
+            },
+        ));
+
+        assert_eq!(
+            format_value(&value),
+            "(unresolved function parameter: input)"
+        );
     }
 
     #[test]
@@ -6762,7 +7055,7 @@ mod tests {
     fn render_unknown_upstream_export() {
         use crate::resource::AccessPath;
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let r = UnknownReason::UpstreamExport { path };
+        let r = ApplyTimeUnknown::UpstreamExport { path };
         assert_eq!(
             render_unknown(&r),
             "(known after upstream apply: network.vpc.vpc_id)"
@@ -6778,7 +7071,7 @@ mod tests {
             Vec::new(),
             vec![Subscript::Int { index: 0 }],
         );
-        let r = UnknownReason::UpstreamExport { path };
+        let r = ApplyTimeUnknown::UpstreamExport { path };
         assert_eq!(
             render_unknown(&r),
             "(known after upstream apply: network.accounts[0])"
@@ -6794,34 +7087,10 @@ mod tests {
             Vec::new(),
             vec![Subscript::Str { key: "Name".into() }],
         );
-        let r = UnknownReason::UpstreamExport { path };
+        let r = ApplyTimeUnknown::UpstreamExport { path };
         assert_eq!(
             render_unknown(&r),
             "(known after upstream apply: vpc.tags['Name'])"
-        );
-    }
-
-    #[test]
-    fn render_unknown_for_key() {
-        assert_eq!(
-            render_unknown(&UnknownReason::ForKey),
-            "(known after upstream apply: key)"
-        );
-    }
-
-    #[test]
-    fn render_unknown_for_index() {
-        assert_eq!(
-            render_unknown(&UnknownReason::ForIndex),
-            "(known after upstream apply: index)"
-        );
-    }
-
-    #[test]
-    fn render_unknown_for_value() {
-        assert_eq!(
-            render_unknown(&UnknownReason::ForValue),
-            "(known after upstream apply)"
         );
     }
 
@@ -6849,12 +7118,12 @@ mod tests {
         ];
 
         for (reason, expected) in cases {
-            let unknown = UnknownReason::PendingReRead(PendingReRead::new(reason));
+            let unknown = ApplyTimeUnknown::PendingReRead(PendingReRead::new(reason));
             assert_eq!(render_unknown(&unknown), expected);
         }
     }
 
-    /// `UnknownReason::Display` flows into the user-facing error from
+    /// `ApplyTimeUnknown::Display` flows into the user-facing error from
     /// `map_plan_save_error` / `SerializationError::Display`. Pin
     /// the wording so a future regression does not silently degrade
     /// the diagnostic.
@@ -6863,26 +7132,14 @@ mod tests {
         use crate::resource::AccessPath;
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
         assert_eq!(
-            format!("{}", UnknownReason::UpstreamExport { path }),
+            format!("{}", ApplyTimeUnknown::UpstreamExport { path }),
             "upstream value network.vpc.vpc_id"
-        );
-        assert_eq!(
-            format!("{}", UnknownReason::ForKey),
-            "deferred for-binding key"
-        );
-        assert_eq!(
-            format!("{}", UnknownReason::ForIndex),
-            "deferred for-binding index"
-        );
-        assert_eq!(
-            format!("{}", UnknownReason::ForValue),
-            "deferred for-binding value"
         );
         use crate::resource::{PendingReRead, ReReadReason};
         assert_eq!(
             format!(
                 "{}",
-                UnknownReason::PendingReRead(PendingReRead::new(ReReadReason::ReadFailed {
+                ApplyTimeUnknown::PendingReRead(PendingReRead::new(ReReadReason::ReadFailed {
                     detail: "AccessDenied".to_string(),
                 }))
             ),
@@ -7041,6 +7298,23 @@ mod tests {
         });
 
         assert_eq!(format_value(&value), "(r.comment ?? r.parent) ?? 'd'");
+    }
+
+    #[test]
+    fn format_value_parenthesizes_a_coalesce_used_as_an_arithmetic_operand() {
+        let coalesce = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("r", "count", vec![])),
+            default: Box::new(Value::Concrete(ConcreteValue::Int(0))),
+        });
+        let value = crate::integer_arithmetic::evaluate_integer_values(
+            coalesce,
+            crate::integer_arithmetic::IntegerOp::Add,
+            Value::Concrete(ConcreteValue::Int(1)),
+            crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+        )
+        .expect("a deferred Int coalesce is a structurally valid parser-stage operand");
+
+        assert_eq!(format_value(&value), "(r.count ?? 0) + 1");
     }
 
     #[test]
@@ -7378,7 +7652,11 @@ mod tests {
     fn test_format_value_user_facing_non_string_matches_format_value() {
         for value in [
             Value::Concrete(ConcreteValue::Bool(true)),
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::Deferred(DeferredValue::Unknown(
+                ApplyTimeUnknown::UpstreamAllExports {
+                    binding: "upstream".to_string(),
+                },
+            )),
             Value::resource_ref("vpc", "id", vec![]),
         ] {
             assert_eq!(format_value_user_facing(&value), format_value(&value));
@@ -9001,7 +9279,7 @@ mod tests {
         use crate::resource::{AccessMissPolicy, PathSegment, apply_postfix_access};
 
         let inner = apply_postfix_access(
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value)),
             PathSegment::Field {
                 name: "resource_record".to_string(),
             },
@@ -9027,11 +9305,11 @@ mod tests {
         use crate::resource::{AccessMissPolicy, PathSegment, Subscript, apply_postfix_access};
 
         let value = apply_postfix_access(
-            Value::Deferred(DeferredValue::FunctionCall {
+            LoopValue::Deferred(LoopDeferredValue::FunctionCall {
                 name: crate::builtins::BuiltinFunction::split,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("/".into())).into(),
-                    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)).into(),
+                    LoopValue::Concrete(crate::resource::ConcreteValue::String("/".into())).into(),
+                    LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value)).into(),
                 ],
                 source_line: (0).into(),
             }),
@@ -9049,15 +9327,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stale_loop_display_root_does_not_hide_the_substituted_access_cause() {
+        use crate::resource::{
+            AccessMissPolicy, AccessPath, ApplyTimeUnknown, PathSegment, Subscript,
+            apply_postfix_access,
+        };
+
+        let upstream = apply_postfix_access(
+            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
+                path: AccessPath::new("up", "value"),
+            })),
+            PathSegment::Field {
+                name: "nested".to_string(),
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .expect("unknown access remains deferred")
+        .with_access_display_root("item");
+        assert_eq!(
+            format_value(&upstream),
+            "(known after upstream apply: up.value)"
+        );
+        assert!(
+            !is_upstream_deferred_marker_value(&upstream),
+            "a substituted access is an expression, not the original loop marker",
+        );
+
+        let function = apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: crate::builtins::BuiltinFunction::split,
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("/".into())).into(),
+                    Value::Concrete(ConcreteValue::String("a/b".into())).into(),
+                ],
+                source_line: (0).into(),
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 0 },
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .expect("computed access remains deferred")
+        .with_access_display_root("item");
+        assert_eq!(format_value(&function), "split('/', 'a/b')[0]");
+        assert!(!is_upstream_deferred_marker_value(&function));
+    }
+
     /// `Value::Deferred(DeferredValue::Unknown(UpstreamExport))` renders unquoted as
     /// `(known after upstream apply: <ref>)` via `format_value_with_key`.
     /// Stage 2 of RFC #2371 — the variant replaced the NUL-prefixed
     /// `Value::Concrete(ConcreteValue::String)` sentinel from #2367.
     #[test]
     fn test_format_value_unresolved_upstream() {
-        use crate::resource::{AccessPath, UnknownReason};
+        use crate::resource::{AccessPath, ApplyTimeUnknown};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+        let v = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path,
         }));
         assert_eq!(
@@ -9066,31 +9393,9 @@ mod tests {
         );
     }
 
-    /// RFC #2371 stage 4 contract pin: serialization boundaries return
-    /// `Err(SerializationError::UnknownNotAllowed { reason })` rather
-    /// than panicking. The `reason` field must round-trip the variant
-    /// passed in so the caller can render an actionable diagnostic.
-    /// A silent fallback (e.g. `Ok(Value::Concrete(ConcreteValue::String("Unknown(...)")))`)
-    /// would re-introduce the v1 corruption bug (#2375).
-    #[test]
-    fn unknown_returns_err_in_value_to_json() {
-        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey));
-        let err = value_to_json(&v).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                SerializationError::UnknownNotAllowed {
-                    reason: UnknownReason::ForKey,
-                    context: SerializationContext::ValueToJson,
-                }
-            ),
-            "expected UnknownNotAllowed/ForKey/ValueToJson, got: {err:?}"
-        );
-    }
-
     #[test]
     fn pending_reread_unknown_returns_err_in_value_to_json() {
-        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(
+        let v = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
             crate::resource::PendingReRead::incomplete("mock partial create"),
         )));
         let err = value_to_json(&v).unwrap_err();
@@ -9098,27 +9403,11 @@ mod tests {
             matches!(
                 err,
                 SerializationError::UnknownNotAllowed {
-                    reason: UnknownReason::PendingReRead(_),
+                    reason: ApplyTimeUnknown::PendingReRead(_),
                     context: SerializationContext::ValueToJson,
                 }
             ),
             "expected UnknownNotAllowed/PendingReRead/ValueToJson, got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn unknown_returns_err_in_redact_secrets_in_value() {
-        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey));
-        let err = redact_secrets_in_value(&v).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                SerializationError::UnknownNotAllowed {
-                    reason: UnknownReason::ForKey,
-                    context: SerializationContext::SecretRedaction,
-                }
-            ),
-            "expected UnknownNotAllowed/ForKey/SecretRedaction, got: {err:?}"
         );
     }
 
@@ -9585,6 +9874,34 @@ mod tests {
     }
 
     #[test]
+    fn integer_arithmetic_secret_operand_redacts_and_rehydrates_recursively() {
+        let candidate = Value::Deferred(DeferredValue::IntegerArithmetic(
+            crate::integer_arithmetic::ValidatedIntegerExpr::new(
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::Int(42),
+                )))),
+                crate::integer_arithmetic::IntegerOp::Add,
+                Value::Concrete(ConcreteValue::Int(1)),
+                crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+            )
+            .expect("a secret Int is a valid arithmetic operand"),
+        ));
+
+        let redacted = redact_secrets_in_value(&candidate).expect("redact arithmetic operand");
+        assert!(contains_redacted_secret(&redacted));
+        assert!(
+            !serde_json::to_string(&redacted)
+                .unwrap()
+                .contains("\"Int\":42")
+        );
+        assert_eq!(
+            rehydrate_redacted_secrets(&redacted, &candidate)
+                .expect("matching arithmetic secret rehydrates"),
+            candidate,
+        );
+    }
+
+    #[test]
     fn deferred_secret_interpolation_is_one_placeholder() {
         let candidate = Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
             DeferredValue::Interpolation(vec![
@@ -9710,7 +10027,7 @@ mod tests {
         let candidate =
             upper_with_secret_hash_material(Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                    UnknownReason::UpstreamExport {
+                    ApplyTimeUnknown::UpstreamExport {
                         path: crate::resource::AccessPath::new("upstream", "identifier"),
                     },
                 ))),
@@ -11049,7 +11366,11 @@ mod tests {
 
     #[test]
     fn render_value_pretty_unknown_renders_like_format_value() {
-        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey));
+        let v = Value::Deferred(DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamAllExports {
+                binding: "upstream".to_string(),
+            },
+        ));
         assert_eq!(
             render_value_pretty(&v, layout(0, "k")).plain(),
             format_value(&v)
@@ -11571,8 +11892,7 @@ mod tests {
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                 ConcreteValue::String("pw".into()),
             )))),
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
                 path: path.clone(),
             })),
             Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
@@ -13018,13 +13338,13 @@ mod tests {
     fn redact_secrets_in_effect_passes_unknown_through_import_identifier() {
         use crate::effect::Effect;
         use crate::resource::{
-            AccessPath, DeferredValue, InterpolationPart, ResourceId, UnknownReason, Value,
+            AccessPath, ApplyTimeUnknown, DeferredValue, InterpolationPart, ResourceId, Value,
         };
         let path =
             AccessPath::with_fields("management_route53", "apex_zone_id", Vec::<String>::new());
         let identifier = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::UpstreamExport { path },
+                ApplyTimeUnknown::UpstreamExport { path },
             ))),
             InterpolationPart::Literal("|registry-dev.carina-rs.dev|NS".into()),
         ]));
@@ -13112,12 +13432,10 @@ mod tests {
         use crate::effect::Effect;
         use crate::parser::{DeferredForExpression, ForBinding};
         use crate::plan::Plan;
-        use crate::resource::{
-            DeferredValue, PathSegment, Resource, ResourceId, UnknownReason, Value,
-        };
+        use crate::resource::{PathSegment, ResourceId};
 
         let placeholder_inner = crate::resource::apply_postfix_access(
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value)),
             PathSegment::Field {
                 name: "resource_record".to_string(),
             },
@@ -13134,10 +13452,13 @@ mod tests {
             crate::resource::AccessMissPolicy::Error,
         )
         .expect("unknown access remains deferred");
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("DEFERRED_TEMPLATE_PLAINTEXT".into()),
+        let secret = LoopValue::Deferred(LoopDeferredValue::Secret(Box::new(LoopValue::Concrete(
+            crate::resource::ConcreteValue::String("DEFERRED_TEMPLATE_PLAINTEXT".into()),
         ))));
-        let mut template_resource = Resource::new("aws.route53.RecordSet", "validation_records");
+        let mut template_resource: crate::resource::Resource<
+            crate::resource::ModuleSource,
+            LoopSlot,
+        > = crate::resource::Resource::new("aws.route53.RecordSet", "validation_records");
         template_resource.set_attr("name", placeholder.clone());
         template_resource.set_attr("comment", secret.clone());
         let effect = Effect::DeferredCreate {
@@ -13150,10 +13471,6 @@ mod tests {
                 line: 1,
                 header: "for opt in cert.domain_validation_options".to_string(),
                 resource_type: "aws.route53.RecordSet".to_string(),
-                attributes: vec![
-                    ("name".to_string(), placeholder.clone()),
-                    ("comment".to_string(), secret),
-                ],
                 target: crate::parser::DeferredForTarget::Bound {
                     binding: "validation_records".to_string(),
                 },
@@ -13173,17 +13490,12 @@ mod tests {
         };
         assert!(matches!(
             redacted_template
-                .attributes
-                .iter()
-                .find_map(|(key, value)| (key == "comment").then_some(value)),
-            Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
-        ));
-        assert!(matches!(
-            redacted_template
                 .template_resource
                 .attributes
                 .get("comment"),
-            Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+            Some(LoopValue::Deferred(
+                LoopDeferredValue::RedactedSecret { .. }
+            ))
         ));
 
         let mut plan = Plan::new();
@@ -13205,21 +13517,15 @@ mod tests {
             panic!("expected rehydrated deferred create");
         };
         assert!(matches!(
-            template
-                .attributes
-                .iter()
-                .find_map(|(key, value)| (key == "comment").then_some(value)),
-            Some(Value::Deferred(DeferredValue::Secret(_)))
-        ));
-        assert!(matches!(
             template.template_resource.attributes.get("comment"),
-            Some(Value::Deferred(DeferredValue::Secret(_)))
+            Some(LoopValue::Deferred(LoopDeferredValue::Secret(_)))
         ));
         assert!(
             !template
+                .template_resource
                 .attributes
-                .iter()
-                .any(|(_, value)| contains_redacted_secret(value))
+                .values()
+                .any(contains_redacted_secret)
         );
     }
 
@@ -13227,14 +13533,17 @@ mod tests {
     fn deferred_template_redaction_uses_template_resource_as_single_projection() {
         use crate::effect::Effect;
         use crate::parser::{DeferredForExpression, ForBinding};
-        use crate::resource::{DeferredValue, Resource, ResourceId};
+        use crate::resource::ResourceId;
 
         let secret = |plaintext: &str| {
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(plaintext.into()),
+            LoopValue::Deferred(LoopDeferredValue::Secret(Box::new(LoopValue::Concrete(
+                crate::resource::ConcreteValue::String(plaintext.into()),
             ))))
         };
-        let mut template_resource = Resource::new("aws.route53.RecordSet", "records");
+        let mut template_resource: crate::resource::Resource<
+            crate::resource::ModuleSource,
+            LoopSlot,
+        > = crate::resource::Resource::new("aws.route53.RecordSet", "records");
         template_resource.set_attr("comment", secret("authoritative"));
         let effect = Effect::DeferredCreate {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -13246,7 +13555,6 @@ mod tests {
                 line: 1,
                 header: "for opt in cert.options".to_string(),
                 resource_type: "aws.route53.RecordSet".to_string(),
-                attributes: vec![("comment".to_string(), secret("stale-projection"))],
                 target: crate::parser::DeferredForTarget::Bound {
                     binding: "records".to_string(),
                 },
@@ -13260,54 +13568,42 @@ mod tests {
         let Effect::DeferredCreate { template, .. } = redacted else {
             panic!("expected deferred create");
         };
-        let projected = template
-            .attributes
-            .iter()
-            .find_map(|(key, value)| (key == "comment").then_some(value))
-            .expect("projected comment");
         let canonical = template
             .template_resource
             .attributes
             .get("comment")
             .expect("template resource comment");
 
-        let Value::Deferred(DeferredValue::RedactedSecret {
-            hash: projected_hash,
-        }) = projected
-        else {
-            panic!("expected projected placeholder, got {projected:?}");
-        };
-        let Value::Deferred(DeferredValue::RedactedSecret {
-            hash: canonical_hash,
+        let LoopValue::Deferred(LoopDeferredValue::RedactedSecret {
+            hash: _canonical_hash,
         }) = canonical
         else {
             panic!("expected canonical placeholder, got {canonical:?}");
         };
-        assert_eq!(
-            projected_hash, canonical_hash,
-            "the compatibility projection must mirror the canonical template resource"
-        );
     }
 
     #[test]
-    fn deferred_template_preserves_display_only_projection_and_noops_without_placeholders() {
+    fn deferred_template_redaction_noops_without_placeholders() {
         use crate::effect::Effect;
         use crate::parser::{DeferredForExpression, ForBinding};
-        use crate::resource::{Resource, ResourceId};
+        use crate::resource::ResourceId;
 
-        let canonical = Value::Concrete(ConcreteValue::String("canonical".into()));
-        let display_only = Value::Concrete(ConcreteValue::String("display-only".into()));
-        let mut template_resource = Resource::new("mock.test.resource", "children");
+        let canonical =
+            LoopValue::Concrete(crate::resource::ConcreteValue::String("canonical".into()));
+        let display_only = LoopValue::Concrete(crate::resource::ConcreteValue::String(
+            "display-only".into(),
+        ));
+        let mut template_resource: crate::resource::Resource<
+            crate::resource::ModuleSource,
+            LoopSlot,
+        > = crate::resource::Resource::new("mock.test.resource", "children");
         template_resource.set_attr("comment", canonical.clone());
+        template_resource.set_attr("identifier", display_only.clone());
         let template = DeferredForExpression {
             file: None,
             line: 1,
             header: "for child in parent.children".to_string(),
             resource_type: "mock.test.resource".to_string(),
-            attributes: vec![
-                ("comment".to_string(), canonical),
-                ("identifier".to_string(), display_only.clone()),
-            ],
             target: crate::parser::DeferredForTarget::Bound {
                 binding: "children".to_string(),
             },
@@ -13331,10 +13627,7 @@ mod tests {
         else {
             panic!("expected deferred create")
         };
-        assert_eq!(
-            redacted_template.attributes, template.attributes,
-            "redaction must retain display-only projection keys",
-        );
+        assert_eq!(redacted_template.as_ref(), &template);
 
         let mut plan = crate::plan::Plan::new();
         plan.add(Effect::DeferredCreate {
@@ -13361,10 +13654,7 @@ mod tests {
         };
         assert_eq!(output.as_ref(), &template);
         assert_eq!(
-            output
-                .attributes
-                .iter()
-                .find_map(|(key, value)| (key == "identifier").then_some(value)),
+            output.template_resource.attributes.get("identifier"),
             Some(&display_only),
         );
     }

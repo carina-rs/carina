@@ -16,9 +16,12 @@ use crate::parser::{
     evaluate_static_value, first_inner, next_pair, parse_expression, parse_module_call,
     parse_read_resource_expr, parse_resource_for_target,
 };
+use crate::parser::{
+    ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
+};
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, ForLoopElement, LegacyLoopAddress, LoopElementOrigin,
-    LoopKind, LoopSource, Resource, UnboundLoopTemplate, UnknownReason, Value,
+    ConcreteValue, DeferredValue, ForLoopElement, LegacyLoopAddress, LoopElementOrigin, LoopKind,
+    LoopSlot, LoopSource, ParserPlaceholder, UnboundLoopTemplate,
 };
 
 /// Binding pattern for a for expression
@@ -97,36 +100,23 @@ fn parse_deferred_for_body_template(
     source_file: &std::path::Path,
 ) -> Result<DeferredForBodyTemplateParse, ParseError> {
     let mut template_ctx = ctx.child_scope();
-    let bind = |ctx: &mut ParseContext, name: &str, value: Value| {
-        if name != "_" {
-            ctx.set_variable(name.to_string(), value);
-        }
-    };
-    let bind_value = |ctx: &mut ParseContext, name: &str| {
+    let bind_value = |ctx: &mut ParseContext, name: &str, slot: LoopSlot| {
         if name != "_" {
             ctx.set_variable(
                 name.to_string(),
-                EvalValue::deferred_for_value(name.to_string()),
+                EvalValue::deferred_for_value(name.to_string(), slot),
             );
         }
     };
     match binding {
-        ForBinding::Simple(value) => bind_value(&mut template_ctx, value),
+        ForBinding::Simple(value) => bind_value(&mut template_ctx, value, LoopSlot::Value),
         ForBinding::Indexed(index, value) => {
-            bind(
-                &mut template_ctx,
-                index,
-                Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
-            );
-            bind_value(&mut template_ctx, value);
+            bind_value(&mut template_ctx, index, LoopSlot::Index);
+            bind_value(&mut template_ctx, value, LoopSlot::Value);
         }
         ForBinding::Map(key, value) => {
-            bind(
-                &mut template_ctx,
-                key,
-                Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
-            );
-            bind_value(&mut template_ctx, value);
+            bind_value(&mut template_ctx, key, LoopSlot::Key);
+            bind_value(&mut template_ctx, value, LoopSlot::Value);
         }
     }
 
@@ -378,7 +368,7 @@ pub(crate) fn parse_for_expr(
         if var == "_" || identifier_appears_in(body_text, var) {
             continue;
         }
-        ctx.warnings.push(ParseWarning {
+        ctx.push_warning(ParseWarning {
             file: None,
             line: for_line,
             kind: WarningKind::UnusedForBinding,
@@ -433,7 +423,9 @@ pub(crate) fn parse_for_expr(
                 let metadata = match structural_handle_metadata.as_ref() {
                     Some(StructuralHandleMetadata::List(items)) => items.get(i).cloned().flatten(),
                     Some(
-                        StructuralHandleMetadata::Handle { .. } | StructuralHandleMetadata::Map(_),
+                        StructuralHandleMetadata::Handle { .. }
+                        | StructuralHandleMetadata::Map(_)
+                        | StructuralHandleMetadata::ExpressionOperands(_),
                     )
                     | None => None,
                 };
@@ -472,7 +464,9 @@ pub(crate) fn parse_for_expr(
                 let metadata = match structural_handle_metadata.as_ref() {
                     Some(StructuralHandleMetadata::List(items)) => items.get(i).cloned().flatten(),
                     Some(
-                        StructuralHandleMetadata::Handle { .. } | StructuralHandleMetadata::Map(_),
+                        StructuralHandleMetadata::Handle { .. }
+                        | StructuralHandleMetadata::Map(_)
+                        | StructuralHandleMetadata::ExpressionOperands(_),
                     )
                     | None => None,
                 };
@@ -515,7 +509,9 @@ pub(crate) fn parse_for_expr(
                 let metadata = match structural_handle_metadata.as_ref() {
                     Some(StructuralHandleMetadata::Map(entries)) => entries.get(key).cloned(),
                     Some(
-                        StructuralHandleMetadata::Handle { .. } | StructuralHandleMetadata::List(_),
+                        StructuralHandleMetadata::Handle { .. }
+                        | StructuralHandleMetadata::List(_)
+                        | StructuralHandleMetadata::ExpressionOperands(_),
                     )
                     | None => None,
                 };
@@ -546,15 +542,13 @@ pub(crate) fn parse_for_expr(
         // not collapse to the default before the reference snapshot is known
         // to be complete.
         (_, Value::Deferred(_)) => {
-            let iterable_surface =
-                if let Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
-                    ..
-                })) = &iterable
-                {
-                    iterable_surface.clone()
-                } else {
-                    crate::value::format_value(&iterable)
-                };
+            let iterable_surface = match &iterable {
+                Value::Deferred(
+                    DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument { .. })
+                    | DeferredValue::ModuleIf(_),
+                ) => iterable_surface.clone(),
+                _ => crate::value::format_value(&iterable),
+            };
             let header = deferred_for_header(&binding, &iterable_surface);
             record_deferred_for_expression(
                 body_pair.clone(),
@@ -631,6 +625,9 @@ pub(crate) fn parse_for_expr(
                     }
                     Value::Deferred(DeferredValue::ResourceRef { path }) => {
                         format!("unresolved reference {}", path.to_dot_string())
+                    }
+                    value @ Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+                        crate::ValueDescription::of(value).to_string()
                     }
                     Value::Concrete(ConcreteValue::List(_)) => "list".to_string(),
                     Value::Concrete(ConcreteValue::Map(_)) => "map".to_string(),

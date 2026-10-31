@@ -618,7 +618,7 @@ mod tests {
 
     #[test]
     fn debug_output_is_transparent_to_text() {
-        let v = ConcreteValue::enum_identifier("dedicated");
+        let v: ConcreteValue = ConcreteValue::enum_identifier("dedicated");
         assert_eq!(format!("{:?}", v), r#"EnumIdentifier("dedicated")"#);
     }
 

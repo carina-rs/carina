@@ -28,7 +28,8 @@ Refresh managed-resource state from the cloud provider before computing the dest
 
 ### `--force`
 
-Destroy even resources that have `prevent_destroy = true` in their `directives` block.
+Destroy even resources protected by an explicit `prevent_destroy = true` or by
+their provider schema's destruction-protection default.
 
 ### `--parallelism <N>`
 
@@ -60,7 +61,7 @@ Destroy without prompting (e.g. in a CI teardown step):
 carina destroy --auto-approve
 ```
 
-Destroy a specific directory and bypass `prevent_destroy`:
+Destroy a specific directory and bypass destruction protection:
 
 ```bash
 carina destroy --force path/to/config

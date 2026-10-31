@@ -191,7 +191,7 @@ impl BackendLock {
             .attributes
             .iter()
             .map(|(key, value)| {
-                let value = match value {
+                let value: Value = match value {
                     serde_json::Value::String(s) => {
                         Value::Concrete(ConcreteValue::String(s.clone().into()))
                     }

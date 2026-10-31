@@ -4,17 +4,22 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use carina_core::effect::PlanOp as CorePlanOp;
+#[cfg(test)]
+use carina_core::provider::ProviderDirectiveSchema;
 use carina_core::provider::{
     AppliedState as CoreAppliedState, CreateRequest as CoreCreateRequest,
     DeleteRequest as CoreDeleteRequest, EmptyAppliedIdentifier,
     PartialReadDiagnostic as CorePartialReadDiagnostic, PatchOp as CorePatchOp,
-    PendingCreate as CorePendingCreate, ProviderError as CoreProviderError,
-    ReadOutcome as CoreReadOutcome, ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
+    PendingCreate as CorePendingCreate, ProviderDirectives as CoreProviderDirectives,
+    ProviderError as CoreProviderError, ReadOutcome as CoreReadOutcome,
+    ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
     UpdateOutcome as CoreUpdateOutcome, UpdatePatch as CoreUpdatePatch,
     UpdateRequest as CoreUpdateRequest,
 };
+#[cfg(test)]
+use carina_core::resource::Directives;
 use carina_core::resource::{
-    ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives, RedactedSecretHash,
+    ConcreteValue, DataSource as CoreDataSource, DeferredValue, RedactedSecretHash,
     Resource as CoreResource, ResourceId as CoreResourceId, ResourceIdentityState,
     State as CoreState, Value as CoreValue,
 };
@@ -22,9 +27,10 @@ use carina_core::resource::{
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeSchemaParts as CoreAttributeSchemaParts,
     AttributeType as CoreAttributeType, InputMode as CoreInputMode,
-    ResourceSchemaParts as CoreResourceSchemaParts, SchemaKind as CoreSchemaKind,
-    SchemaRegistry as CoreSchemaRegistry, StructField as CoreStructField,
-    StructFieldParts as CoreStructFieldParts, UniqueNameSpec as CoreUniqueNameSpec,
+    ResourceSchema as CoreResourceSchema, ResourceSchemaParts as CoreResourceSchemaParts,
+    SchemaKind as CoreSchemaKind, SchemaRegistry as CoreSchemaRegistry,
+    StructField as CoreStructField, StructFieldParts as CoreStructFieldParts,
+    UniqueNameSpec as CoreUniqueNameSpec,
 };
 use carina_core::schema::{
     ValidatedConfigSchema as CoreValidatedConfigSchema,
@@ -285,6 +291,11 @@ impl std::error::Error for WasmAppliedStateDecodeError {}
 /// equivalent to the pre-#2387 `ResourceRef` debug-string.
 pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError> {
     match v {
+        CoreValue::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err(SerializationError::UnexpandedModuleIf {
+                context: SerializationContext::WasmBoundary,
+            })
+        }
         CoreValue::Concrete(ConcreteValue::String(s)) => {
             Ok(wit::Value::StrVal(s.expose_plaintext().to_owned()))
         }
@@ -361,6 +372,11 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
                 context: SerializationContext::WasmBoundary,
             })
         }
+        CoreValue::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            Err(SerializationError::UnresolvedIntegerArithmetic {
+                context: SerializationContext::WasmBoundary,
+            })
+        }
         CoreValue::Deferred(DeferredValue::Interpolation(_)) => {
             Err(SerializationError::UnresolvedInterpolation {
                 context: SerializationContext::WasmBoundary,
@@ -395,6 +411,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
                 context: SerializationContext::WasmBoundary,
             })
         }
+        CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
@@ -655,6 +672,11 @@ pub(crate) fn wit_to_core_binding_pattern(
 /// arms unreachable in legitimate desired-normalization flows.
 fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationError> {
     match v {
+        CoreValue::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err(SerializationError::UnexpandedModuleIf {
+                context: SerializationContext::WasmBoundary,
+            })
+        }
         CoreValue::Concrete(ConcreteValue::String(s)) => {
             Ok(serde_json::Value::String(s.expose_plaintext().to_owned()))
         }
@@ -718,6 +740,11 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
                 context: SerializationContext::WasmBoundary,
             })
         }
+        CoreValue::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            Err(SerializationError::UnresolvedIntegerArithmetic {
+                context: SerializationContext::WasmBoundary,
+            })
+        }
         CoreValue::Deferred(DeferredValue::Interpolation(_)) => {
             Err(SerializationError::UnresolvedInterpolation {
                 context: SerializationContext::WasmBoundary,
@@ -757,6 +784,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
                 context: SerializationContext::WasmBoundary,
             })
         }
+        CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
@@ -1776,18 +1804,18 @@ pub(crate) fn core_to_wit_read_request(_request: &CoreReadRequest) -> wit::ReadR
 /// [`CoreDeleteRequest`].
 pub(crate) fn core_to_wit_delete_request(request: &CoreDeleteRequest) -> wit::DeleteRequest {
     wit::DeleteRequest {
-        directives: core_to_wit_directives(&request.directives),
+        directives: core_to_wit_directives(request.directives()),
     }
 }
 
-/// Convert a [`Directives`] to a [`wit::Directives`].
-pub(crate) fn core_to_wit_directives(directives: &Directives) -> wit::Directives {
+/// Convert effective host directives to a [`wit::Directives`].
+pub(crate) fn core_to_wit_directives(directives: &CoreProviderDirectives) -> wit::Directives {
     // `depends_on` and `provider_instance` are host-only orchestration metadata;
     // the WIT Directives record intentionally carries only these three flags.
     wit::Directives {
-        force_delete: directives.force_delete,
-        create_before_destroy: directives.create_before_destroy,
-        prevent_destroy: directives.prevent_destroy,
+        force_delete: directives.force_delete(),
+        create_before_destroy: directives.create_before_destroy(),
+        prevent_destroy: directives.prevent_destroy(),
     }
 }
 
@@ -1957,6 +1985,7 @@ fn proto_struct_field_to_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::resource::NoPlaceholder;
 
     fn find_error_in_chain<'a, T: std::error::Error + 'static>(
         error: &'a (dyn std::error::Error + 'static),
@@ -2375,6 +2404,7 @@ mod tests {
             operation_config: None,
             validators: vec![],
             field_groups: vec![],
+            default_prevent_destroy: false,
             defs: Default::default(),
         }
     }
@@ -3260,15 +3290,15 @@ mod tests {
     /// pin the contract by asserting the variant + context survives.
     #[test]
     fn unknown_returns_err_in_core_to_wit_value() {
-        use carina_core::resource::{AccessPath, UnknownReason};
+        use carina_core::resource::{AccessPath, ApplyTimeUnknown};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let v = CoreValue::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+        let v = CoreValue::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: path.clone(),
         }));
         let err = core_to_wit_value(&v).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamExport { path: p },
+                reason: ApplyTimeUnknown::UpstreamExport { path: p },
                 context: SerializationContext::WasmBoundary,
             } => assert_eq!(p, path),
             other => {
@@ -3290,16 +3320,16 @@ mod tests {
 
     #[test]
     fn unknown_returns_err_in_core_value_to_json() {
-        use carina_core::resource::{AccessPath, UnknownReason};
+        use carina_core::resource::{AccessPath, ApplyTimeUnknown};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let v = CoreValue::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+        let v = CoreValue::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: path.clone(),
         }));
         let err = core_value_to_json(&v).unwrap_err();
         assert!(matches!(
             err,
             SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamExport { .. },
+                reason: ApplyTimeUnknown::UpstreamExport { .. },
                 context: SerializationContext::WasmBoundary,
             }
         ));
@@ -3960,7 +3990,7 @@ mod tests {
     #[test]
     fn test_state_roundtrip() {
         let id = CoreResourceId::with_provider_identity("aws", "s3.Bucket", "my-bucket", None);
-        let mut attrs = HashMap::new();
+        let mut attrs: HashMap<String, CoreValue> = HashMap::new();
         attrs.insert(
             "name".into(),
             CoreValue::Concrete(ConcreteValue::String("my-bucket".into())),
@@ -3981,6 +4011,19 @@ mod tests {
         assert_eq!(back.id, core.id);
         assert_eq!(back.attributes, core.attributes);
         assert!(back.exists);
+    }
+
+    #[test]
+    fn schema_default_prevent_destroy_is_sent_as_true_on_delete() {
+        let schema = CoreResourceSchema::new("test.Protected").default_prevent_destroy();
+        let request = CoreDeleteRequest::resolve(
+            &Directives::default(),
+            ProviderDirectiveSchema::Available(&schema),
+        );
+
+        let wire = core_to_wit_delete_request(&request);
+
+        assert!(wire.directives.prevent_destroy);
     }
 
     #[test]
@@ -4613,6 +4656,10 @@ mod tests {
                             "field_groups".to_string(),
                             serde_json::Value::Array(field_groups),
                         );
+                        object.insert(
+                            "default_prevent_destroy".to_string(),
+                            serde_json::Value::Bool(false),
+                        );
                     }
                     if object.contains_key("attr_type") {
                         object.insert("keyed_partial_update".to_string(), serde_json::Value::Null);
@@ -4872,7 +4919,8 @@ mod tests {
                         "provider_name":"DomainValidationOptions"
                     }
                 },
-                "field_groups":[]
+                "field_groups":[],
+                "default_prevent_destroy":false
             }]"#,
         )
         .expect("the released ACM semantics must load with required v13 metadata");
@@ -4966,7 +5014,8 @@ mod tests {
                         "keyed_partial_update":null
                     }
                 },
-                "field_groups":[]
+                "field_groups":[],
+                "default_prevent_destroy":false
             }]"#,
         )
         .expect_err("protocol v13 schema JSON must declare nested write_only");
@@ -4987,7 +5036,9 @@ mod tests {
                         "attr_type":{"type":"String"},
                         "required":true
                     }
-                }
+                },
+                "field_groups":[],
+                "default_prevent_destroy":false
             }]"#,
         )
         .expect_err("schema JSON must declare keyed_partial_update explicitly");
@@ -5004,6 +5055,7 @@ mod tests {
                 "resource_type":"s3.Bucket",
                 "attributes":{},
                 "field_groups":[],
+                "default_prevent_destroy":false,
                 "unique_name_attribute":{"type":"attribute"}
             }]"#,
         )
@@ -5028,6 +5080,7 @@ mod tests {
             "description": "EC2 Security Group",
             "unique_name_attribute": "group_name",
             "field_groups": [],
+            "default_prevent_destroy": false,
             "attributes": {
               "group_name": {
                 "name": "group_name",
@@ -5133,6 +5186,7 @@ mod tests {
             unique_name,
             operation_config,
             field_groups,
+            default_prevent_destroy,
             default_wait_timeout,
             default_wait_interval,
             defs,
@@ -5148,6 +5202,7 @@ mod tests {
             validation,
             operation_config,
             field_groups,
+            default_prevent_destroy,
             default_wait_timeout,
             default_wait_interval,
             defs,
@@ -5501,6 +5556,7 @@ mod tests {
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
             field_groups: vec![],
+            default_prevent_destroy: false,
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
@@ -5522,6 +5578,7 @@ mod tests {
             operation_config: None,
             validators: vec![],
             field_groups: vec![],
+            default_prevent_destroy: false,
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
@@ -5556,6 +5613,7 @@ mod tests {
                 kind: proto::FieldGroupKind::ExactlyOne,
                 fields: vec!["cidr_block".to_string(), "ipv4_ipam_pool_id".to_string()],
             }],
+            default_prevent_destroy: false,
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
@@ -5574,7 +5632,7 @@ mod tests {
         let err = registry
             .get("awscc", "awscc.ec2.Vpc", CoreSchemaKind::Resource)
             .expect("decoded fixture must be owner-bound")
-            .validate_with_resolver(&HashMap::new(), &|_| false, &resolver)
+            .validate_with_resolver::<NoPlaceholder>(&HashMap::new(), &|_| false, &resolver)
             .unwrap_err();
         assert!(
             err.iter().any(|e| e
@@ -5606,6 +5664,7 @@ mod tests {
                 kind: proto::FieldGroupKind::AtLeastOne,
                 fields: vec!["a".to_string(), "b".to_string()],
             }],
+            default_prevent_destroy: false,
             defs: Default::default(),
         };
         let json = serde_json::to_string(&vec![proto_schema]).unwrap();
@@ -6166,6 +6225,7 @@ mod tests {
             {
                 "resource_type":"aws.ec2.VpcCidrBlockAssociation",
                 "field_groups":[],
+                "default_prevent_destroy":false,
                 "attributes":{
                     "id":{
                         "name":"id",
@@ -6358,6 +6418,7 @@ mod tests {
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
             field_groups: vec![],
+            default_prevent_destroy: false,
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
@@ -6374,7 +6435,7 @@ mod tests {
             .expect("decoded fixture must be owner-bound");
 
         // key/value pattern should fail
-        let mut attrs = HashMap::new();
+        let mut attrs: HashMap<String, CoreValue> = HashMap::new();
         attrs.insert(
             "tags".to_string(),
             CoreValue::Concrete(ConcreteValue::Map(
@@ -6399,7 +6460,7 @@ mod tests {
         );
 
         // normal tags should pass
-        let mut attrs = HashMap::new();
+        let mut attrs: HashMap<String, CoreValue> = HashMap::new();
         attrs.insert(
             "tags".to_string(),
             CoreValue::Concrete(ConcreteValue::Map(

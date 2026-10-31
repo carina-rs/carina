@@ -1,7 +1,7 @@
 use super::*;
 use carina_core::parser::{DeferredForExpression, ForBinding};
 use carina_core::resource::{
-    ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, State, Value,
+    ConcreteValue, Directives, NoPlaceholder, ResolvedResource, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 use carina_core::value::format_value;
@@ -112,7 +112,6 @@ fn deferred_create_uses_create_symbol_and_kind() {
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: Vec::new(),
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },
@@ -313,19 +312,26 @@ fn host_metadata_fields_are_not_rendered_as_attributes() {
 #[test]
 fn format_value_display() {
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::String("hello".into()))),
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
+            "hello".into(),
+        ))),
         "'hello'"
     );
-    assert_eq!(format_value(&Value::Concrete(ConcreteValue::Int(42))), "42");
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::Bool(true))),
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::Int(42))),
+        "42"
+    );
+    assert_eq!(
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::Bool(true))),
         "true"
     );
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::Int(1)),
-            Value::Concrete(ConcreteValue::Int(2))
-        ]))),
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::List(
+            vec![
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::Int(2))
+            ]
+        ))),
         "[1, 2]"
     );
 }
@@ -733,7 +739,7 @@ fn tab_complete_with_provider_prefix() {
 #[test]
 fn format_value_preserves_strings_that_resemble_enum_identifiers() {
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::String(
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
             "awscc.ec2.vpc_endpoint.VpcEndpointType.Interface"
                 .to_string()
                 .into()
@@ -742,14 +748,14 @@ fn format_value_preserves_strings_that_resemble_enum_identifiers() {
     );
 
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::String(
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
             "aws.s3.VersioningStatus.Enabled".into()
         ))),
         "'aws.s3.VersioningStatus.Enabled'"
     );
 
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::String(
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
             "aws.Region.ap_northeast_1".into()
         ))),
         "'aws.Region.ap_northeast_1'"
@@ -757,13 +763,15 @@ fn format_value_preserves_strings_that_resemble_enum_identifiers() {
 
     // Regular string should be quoted as-is
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::String("my-bucket".into()))),
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
+            "my-bucket".into(),
+        ))),
         "'my-bucket'"
     );
 
     // ResourceRef should NOT be resolved (not a DSL enum)
     assert_eq!(
-        format_value(&Value::resource_ref(
+        format_value(&Value::<NoPlaceholder>::resource_ref(
             "vpc".to_string(),
             "vpc_id".to_string(),
             vec![]

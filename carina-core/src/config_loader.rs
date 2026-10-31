@@ -9,6 +9,7 @@ use indexmap::IndexMap;
 
 use crate::binding_index::BindingNameSet;
 use crate::parser::{self, File, InferredFile, ParsedFile, ProviderContext};
+#[cfg(test)]
 use crate::resource::Value;
 use crate::schema::SchemaRegistry;
 
@@ -946,7 +947,7 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
 /// `parse(input, config)` wrapper) pay zero overhead.
 #[derive(Clone, PartialEq)]
 struct DirectorySeedState {
-    variables: IndexMap<String, Value>,
+    variables: IndexMap<String, parser::ParsedValue>,
     metadata: crate::parser::ParserBindingMetadata,
 }
 
@@ -1192,6 +1193,18 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
                     crate::parser::DeferredForBody::ModuleCall(_) => None,
                 }),
         )
+        .chain(
+            parsed
+                .deferred_module_ifs
+                .iter()
+                .flat_map(|deferred| deferred.branches())
+                .filter_map(|branch| match branch {
+                    parser::DeferredIfBody::Resource(resource) => Some(resource.id.clone()),
+                    parser::DeferredIfBody::DataSource(data_source) => Some(data_source.id.clone()),
+                    parser::DeferredIfBody::ModuleCall(_) => None,
+                    parser::DeferredIfBody::ExpandedModuleCall(_) => None,
+                }),
+        )
         .collect::<Vec<_>>();
     for id in resource_ids {
         parsed
@@ -1227,6 +1240,22 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
             }
             crate::parser::DeferredForBody::Read(_)
             | crate::parser::DeferredForBody::ModuleCall(_) => {}
+        }
+    }
+    for deferred in &mut parsed.deferred_module_ifs {
+        for branch in deferred.branches_mut() {
+            match branch {
+                parser::DeferredIfBody::Resource(resource) => {
+                    resource.loop_provenance.set_display_file(&display_file);
+                }
+                parser::DeferredIfBody::DataSource(_) => {}
+                parser::DeferredIfBody::ModuleCall(call) => {
+                    if let Some(origin) = call.loop_origin_mut() {
+                        origin.set_display_file(&display_file);
+                    }
+                }
+                parser::DeferredIfBody::ExpandedModuleCall(_) => {}
+            }
         }
     }
 
@@ -2107,6 +2136,9 @@ for account_id in orgs.accounts {
                     )])),
                 )]),
             )]));
+        let mut parsed = parsed
+            .into_expanded()
+            .expect("directory fixture must contain no parser placeholders");
         parsed
             .expand_deferred_for_expressions(&bindings)
             .expect("resolved upstream iterable expands");
@@ -2662,7 +2694,7 @@ awscc.ec2.SecurityGroup {
     }
 
     #[test]
-    fn provisional_sibling_if_reclassifies_a_resource_branch_as_a_value() {
+    fn provisional_sibling_if_rejects_mixed_branches_after_classification() {
         let temp = tempfile::tempdir().unwrap();
         let files = vec![
             (temp.path().join("a.crn"), "let flag = false\n".to_string()),
@@ -2677,19 +2709,13 @@ awscc.ec2.SecurityGroup {
             ),
         ];
 
-        let parsed = parse_directory_files(&files, &ProviderContext::default())
-            .expect("directory fixed point");
-        let consumer = parsed
-            .iter()
-            .find_map(|(path, parsed)| {
-                path.ends_with("c.crn")
-                    .then(|| parsed.parsed().variables.get("observed"))
-                    .flatten()
-            })
-            .expect("consumer value");
-        assert_eq!(
-            consumer,
-            &Value::Concrete(crate::resource::ConcreteValue::String("fallback".into()))
+        let error = parse_directory_files(&files, &ProviderContext::default())
+            .expect_err("the final seeded pass must reject mixed structural/value branches");
+        assert!(
+            error.to_string().contains(
+                "both branches of this `if` must be the same kind: the `then` branch declares resources/module calls but the `else` branch produces a value; make both branches values, or both branches resource/module declarations"
+            ),
+            "unexpected fixed-point error: {error}",
         );
     }
 

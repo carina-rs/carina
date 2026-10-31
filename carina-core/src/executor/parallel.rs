@@ -1183,6 +1183,9 @@ mod tests {
         let parsed =
             crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
                 .expect("deferred fixture crosses the module-resolution seam");
+        let parsed = parsed
+            .into_expanded()
+            .expect("deferred fixture crosses the placeholder boundary");
         parsed
             .into_deferred_for_expressions()
             .into_iter()

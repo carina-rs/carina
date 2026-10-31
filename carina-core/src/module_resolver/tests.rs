@@ -15,13 +15,13 @@ use super::resolver::ModuleResolver;
 use super::*;
 use crate::parser::{
     ArgumentOrigin, ArgumentParameter, AttributePathSegment, BindingUseOwner, DeferredForBody,
-    DeferredForExpression, LoadedProviderContext, ModuleArgument, ModuleCall,
-    ModuleResolvedParsedFile, ParsedDeferredForExpression, ParsedDeferredForPhase, ParsedFile,
-    ProviderContext, ResourceTypePath, SourceSpan, TypeExpr,
+    DeferredForExpression, DeferredIfCondition, DeferredValueIf, LoadedProviderContext,
+    ModuleArgument, ModuleCall, ModuleResolvedParsedFile, ParsedDeferredForExpression,
+    ParsedDeferredForPhase, ParsedFile, ProviderContext, ResourceTypePath, SourceSpan, TypeExpr,
 };
 use crate::resource::{
-    CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, RawEnumIdentifier, Resource,
-    ResourceId, ResourceIdentity, UnknownReason, Value,
+    CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, ModuleSource, ParserPlaceholder,
+    RawEnumIdentifier, Resource, ResourceId, ResourceIdentity, Value,
 };
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
 
@@ -53,8 +53,8 @@ fn resolve_modules_with_config(
 }
 
 fn reconcile_anonymous_module_instances(
-    resources: &mut [Resource],
-    compositions: &mut [crate::resource::LiveComposition],
+    resources: &mut [Resource<crate::resource::ModuleSource, ParserPlaceholder>],
+    compositions: &mut [crate::resource::LiveComposition<ParserPlaceholder>],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
 ) {
     crate::module_resolver::reconcile_anonymous_module_instances(
@@ -66,21 +66,22 @@ fn reconcile_anonymous_module_instances(
 }
 
 fn module_arguments(
-    values: impl IntoIterator<Item = (String, Value)>,
-) -> HashMap<String, ModuleArgument> {
+    values: impl IntoIterator<Item = (String, Value<ParserPlaceholder>)>,
+) -> HashMap<String, ModuleArgument<ParserPlaceholder>> {
     values
         .into_iter()
         .map(|(name, value)| (name, ModuleArgument::new(value)))
         .collect()
 }
 
-fn parsed_deferred_resource(expression: DeferredForExpression) -> ParsedDeferredForExpression {
+fn parsed_deferred_resource(
+    expression: DeferredForExpression<ModuleSource, ParserPlaceholder, ParserPlaceholder>,
+) -> ParsedDeferredForExpression {
     let DeferredForExpression {
         file,
         line,
         header,
         resource_type: _,
-        attributes: _,
         target,
         iterable,
         binding,
@@ -102,7 +103,7 @@ fn parsed_deferred_resource(expression: DeferredForExpression) -> ParsedDeferred
 fn resolve_anonymous_loop_module_fixture(
     module_body: &str,
     root_body: &str,
-) -> ModuleResolvedParsedFile {
+) -> crate::parser::ExpandedParsedFile {
     let root = tempfile::tempdir().expect("temporary module fixture");
     let module_dir = root.path().join("modules/network");
     fs::create_dir_all(&module_dir).expect("create module directory");
@@ -112,7 +113,10 @@ fn resolve_anonymous_loop_module_fixture(
 
     let parsed = crate::parser::parse_file(root_body, &root_file, &ProviderContext::default())
         .expect("root fixture parses");
-    resolve_modules(parsed, root.path()).expect("module fixture expands")
+    let parsed = resolve_modules(parsed, root.path()).expect("module fixture expands");
+    parsed
+        .into_expanded()
+        .expect("expanded module fixture contains no parser placeholders")
 }
 
 fn loop_module_identity_registry() -> crate::schema::SchemaRegistry {
@@ -313,7 +317,10 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
 
     let parsed = crate::parser::parse_file(root_source, &root_file, &ProviderContext::default())
         .expect("root fixture parses");
-    let mut parsed = resolve_modules(parsed, root.path()).expect("nested loop module expands");
+    let parsed = resolve_modules(parsed, root.path()).expect("nested loop module expands");
+    let mut parsed = parsed
+        .into_expanded()
+        .expect("expanded module fixture contains no parser placeholders");
     assert_eq!(
         parsed.resources.len(), // allow: direct — fixture test inspection
         1,
@@ -519,6 +526,8 @@ fn create_test_module() -> ParsedFile {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -567,6 +576,94 @@ fn test_substitute_arguments_nested() {
         }
         _ => panic!("Expected list"),
     }
+}
+
+#[test]
+fn substitute_arguments_enters_secret_only_along_module_if_paths() {
+    let module_argument = |name: &str| {
+        Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::ModuleArgument {
+                name: name.to_string(),
+                diagnostic: Default::default(),
+            },
+        ))
+    };
+    let conditional = Value::Deferred(DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
+        DeferredIfCondition::new(module_argument("flag"), PathBuf::from("module/main.crn"), 1),
+        Value::Concrete(ConcreteValue::String("yes".into())),
+        Value::Concrete(ConcreteValue::String("no".into())),
+    ))));
+    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::List(vec![module_argument("plain"), conditional]),
+    ))));
+    let inputs = HashMap::from([
+        (
+            "flag".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        ),
+        (
+            "plain".to_string(),
+            Value::Concrete(ConcreteValue::String("must-stay-deferred".into())),
+        ),
+    ]);
+
+    let substituted = substitute_arguments(&value, &inputs).expect("secret substitution");
+    let Value::Deferred(DeferredValue::Secret(inner)) = substituted else {
+        panic!("secret wrapper was not preserved")
+    };
+    let Value::Concrete(ConcreteValue::List(items)) = inner.as_ref() else {
+        panic!("secret list was not preserved")
+    };
+    assert_eq!(
+        items[0],
+        module_argument("plain"),
+        "ordinary argument substitution inside Secret is outside #4149's behavior change",
+    );
+    assert_eq!(
+        items[1],
+        Value::Concrete(ConcreteValue::String("yes".into())),
+        "a ModuleIf nested inside Secret still has to be selected",
+    );
+}
+
+#[test]
+fn module_argument_substitution_folds_and_checks_integer_arithmetic() {
+    let divisor = Value::Deferred(DeferredValue::Placeholder(
+        crate::resource::ParserPlaceholder::ModuleArgument {
+            name: "divisor".to_string(),
+            diagnostic: Default::default(),
+        },
+    ));
+    let value = crate::integer_arithmetic::evaluate_integer_values(
+        Value::Concrete(ConcreteValue::Int(10)),
+        crate::integer_arithmetic::IntegerOp::Divide,
+        divisor,
+        crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+    )
+    .expect("typed module argument is a structurally valid parser-stage operand");
+
+    assert_eq!(
+        substitute_arguments(
+            &value,
+            &HashMap::from([(
+                "divisor".to_string(),
+                Value::Concrete(ConcreteValue::Int(2)),
+            )]),
+        )
+        .expect("known operands must fold during substitution"),
+        Value::Concrete(ConcreteValue::Int(5)),
+    );
+
+    let error = substitute_arguments(
+        &value,
+        &HashMap::from([(
+            "divisor".to_string(),
+            Value::Concrete(ConcreteValue::Int(0)),
+        )]),
+    )
+    .expect_err("a known zero module argument must fail during substitution");
+    let error = format!("{error:?}");
+    assert!(error.contains("division by zero"), "{error}");
 }
 
 #[test]
@@ -649,6 +746,8 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -811,10 +910,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
                 );
                 attrs
             },
-            directives: Directives {
-                provider_instance: Some("us".to_string()),
-                ..Directives::default()
-            },
+            directives: Directives::default().with_provider_instance("us"),
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".to_string()),
@@ -841,6 +937,8 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -914,10 +1012,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
             );
             attrs
         },
-        directives: Directives {
-            provider_instance: Some("us".to_string()),
-            ..Directives::default()
-        },
+        directives: Directives::default().with_provider_instance("us"),
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding: Some(format!("{}.role", current_prefix)),
@@ -1031,6 +1126,8 @@ fn create_module_with_intra_refs() -> ParsedFile {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -1176,6 +1273,8 @@ fn create_module_with_attributes() -> ParsedFile {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -1490,6 +1589,8 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -1499,7 +1600,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         r
     };
 
-    let mut call_arguments: HashMap<String, Value> = HashMap::new();
+    let mut call_arguments: HashMap<String, Value<ParserPlaceholder>> = HashMap::new();
     call_arguments.insert(
         "region".to_string(),
         Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
@@ -1619,7 +1720,9 @@ let role = awscc.iam.Role {
     resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed")
 }
 
-fn role_names(parsed: &ModuleResolvedParsedFile) -> HashSet<String> {
+fn role_names<E, P: crate::resource::PlaceholderKind, T: crate::resource::PlaceholderKind, D>(
+    parsed: &crate::parser::File<E, P, T, D>,
+) -> HashSet<String> {
     parsed
         .resources
         .iter()
@@ -1825,6 +1928,13 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
         argument_bindings,
         HashSet::from(["first.origin".to_string(), "second.origin".to_string()]),
     );
+    let mut resources = ParsedFile {
+        resources,
+        ..ParsedFile::default()
+    }
+    .into_expanded()
+    .expect("expanded module resources contain no parser placeholders")
+    .resources;
 
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
@@ -2747,11 +2857,12 @@ fn test_substitute_arguments_unavailable_builtin_call() {
     let value = Value::Deferred(DeferredValue::Unavailable {
         name: crate::builtins::BuiltinFunction::upper,
         args: vec![
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
-                name: "source".to_string(),
-                source_line: (0).into(),
-                diagnostic_name: None,
-            }))
+            Value::Deferred(DeferredValue::Placeholder(
+                ParserPlaceholder::ModuleArgument {
+                    name: "source".to_string(),
+                    diagnostic: Default::default(),
+                },
+            ))
             .into(),
         ],
         reason: crate::resource::UnavailableReason::from_builtin_error(
@@ -2855,6 +2966,8 @@ fn create_module_with_interpolation() -> ParsedFile {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -3477,6 +3590,8 @@ fn create_module_with_port_validation() -> ParsedFile {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -3651,6 +3766,8 @@ let root = outer { outer_port = producer.port }
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
     let resolver = {
@@ -3838,6 +3955,8 @@ fn test_argument_validation_no_message_uses_default() {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -3905,6 +4024,8 @@ fn test_argument_validation_len_with_list() {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -4002,6 +4123,8 @@ fn test_require_block_passes() {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -4078,6 +4201,8 @@ fn test_require_block_fails_with_not_expr() {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -4153,6 +4278,8 @@ fn test_require_block_len_function() {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -4246,6 +4373,8 @@ fn test_require_block_multiple_constraints() {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -4606,7 +4735,7 @@ fn resolve_default_arg_fixture(module_body: &str, root_body: &str) -> ModuleReso
     resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed")
 }
 
-fn role_attr<'a>(parsed: &'a ModuleResolvedParsedFile, attr: &str) -> &'a Value {
+fn role_attr<'a>(parsed: &'a ModuleResolvedParsedFile, attr: &str) -> &'a Value<ParserPlaceholder> {
     parsed
         .resources
         .iter()
@@ -4837,11 +4966,10 @@ fn module_argument_postfix_access_preserves_deferred_caller_value() {
     use crate::resource::{PathSegment, Subscript};
 
     let value = crate::resource::apply_postfix_access(
-        Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument {
+        Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::ModuleArgument {
                 name: "items".to_string(),
-                source_line: (0).into(),
-                diagnostic_name: None,
+                diagnostic: Default::default(),
             },
         )),
         PathSegment::Subscript {
@@ -5282,7 +5410,10 @@ m {}
         // walk order. Either is fine — the contract is that the loop
         // terminates without panicking and preserves a structured,
         // statically typed placeholder rather than inventing a value.
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { name, .. })) => {
+        Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument {
+            name,
+            ..
+        })) => {
             assert!(
                 name == "a" || name == "b",
                 "expected cyclic argument to point at `a` or `b`, got: {name:?}"
@@ -5710,6 +5841,66 @@ let prod = outer {
     );
 }
 
+#[test]
+fn integer_arithmetic_crosses_a_module_argument_boundary_as_typed_int() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("modules/child");
+    fs::create_dir_all(&module_dir).expect("module directory");
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"
+arguments { count: Int }
+let target = mock.test.Target { count = count }
+"#,
+    )
+    .expect("module source");
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).expect("root directory");
+    let root_source = r#"
+let source = mock.test.Source {}
+let child = use { source = "../modules/child" }
+let instance = child { count = source.count + 1 }
+"#;
+    fs::write(root_dir.join("main.crn"), root_source).expect("root source");
+
+    let mut config = ProviderContext::default();
+    for resource_type in ["test.Source", "test.Target"] {
+        config
+            .resource_types
+            .insert(("mock".to_string(), resource_type.to_string()));
+    }
+    let mut schemas = crate::schema::SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Source")
+            .attribute(AttributeSchema::provider_populated("count", AttributeType::int()).build())
+            .validate()
+            .expect("source schema"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Target")
+            .attribute(AttributeSchema::required("count", AttributeType::int()).build())
+            .validate()
+            .expect("target schema"),
+    );
+
+    let parsed = crate::parser::parse(root_source, &config).expect("root parse");
+    let parsed = resolve_modules_with_config(parsed, &root_dir, &config, &schemas)
+        .expect("typed arithmetic module argument must expand");
+    let count = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("instance.target"))
+        .and_then(|resource| resource.get_attr("count"))
+        .expect("expanded target count");
+    assert!(
+        matches!(count, Value::Deferred(DeferredValue::IntegerArithmetic(_))),
+        "module substitution must preserve typed arithmetic, got {count:?}",
+    );
+}
+
 /// Nested container declarations are checked by BindingIndex before expansion.
 #[test]
 fn test_list_inner_element_mismatch_is_rejected_before_expansion() {
@@ -6076,6 +6267,8 @@ fn create_module_with_environment_union() -> ParsedFile {
         parsed_binding_uses: Default::default(),
         warnings: vec![],
         deferred_for_phase: ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -6351,7 +6544,6 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                 line: 7,
                 header: "for _, opt in cert.domain_validation_options".to_string(),
                 resource_type: "aws.route53.RecordSet".to_string(),
-                attributes: vec![],
                 target: DeferredForTarget::Bound {
                     binding: "_domain_validation_options".to_string(),
                 },
@@ -6484,7 +6676,6 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
             line: 1,
             header: "for _, account in accounts.items".to_string(),
             resource_type: "awscc.sso.Assignment".to_string(),
-            attributes: Vec::new(),
             target: DeferredForTarget::Bound {
                 binding: "assignments".to_string(),
             },
@@ -6550,7 +6741,6 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                 line: 3,
                 header: "for _, a in accounts.list".to_string(),
                 resource_type: "awscc.sso.Assignment".to_string(),
-                attributes: vec![],
                 target: DeferredForTarget::Bound {
                     binding: "_list".to_string(),
                 },
@@ -7320,14 +7510,18 @@ fn argument_type_mismatch_error_shows_actual_value() {
     );
 }
 
-fn module_argument_type_error(arg_name: &str, type_expr: TypeExpr, value: Value) -> String {
+fn module_argument_type_error(
+    arg_name: &str,
+    type_expr: TypeExpr,
+    value: Value<ParserPlaceholder>,
+) -> String {
     module_argument_type_error_with_config(arg_name, type_expr, value, &ProviderContext::default())
 }
 
 fn module_argument_type_error_with_config(
     arg_name: &str,
     type_expr: TypeExpr,
-    value: Value,
+    value: Value<ParserPlaceholder>,
     config: &ProviderContext,
 ) -> String {
     let mut module = create_test_module();
@@ -7424,7 +7618,8 @@ fn decrypted_module_argument_is_secret_by_value_type() {
         &[Value::Concrete(ConcreteValue::String("ciphertext".into()))],
         &config,
     )
-    .expect("test decryptor");
+    .expect("test decryptor")
+    .into_placeholder_type::<ParserPlaceholder>();
 
     let message = module_argument_type_error_with_config("enabled", TypeExpr::Bool, value, &config);
 

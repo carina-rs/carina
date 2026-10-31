@@ -13,14 +13,17 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use crate::document::Document;
 use crate::position;
 use carina_core::parser::{
-    ParseError, ParsedFile, ResourceContext, ResourceRef, SourceSpan, WarningKind,
-    contains_function_call,
+    ParseError, ParsedFile, ResourceRef, SourceSpan, WarningKind, contains_function_call,
 };
 use carina_core::provider::{
     HostErrorCause, LoadedProviderSnapshot, ProviderError, ProviderFactory, SuspendedValidationId,
 };
-use carina_core::resource::{ConcreteValue, DeferredValue, Value};
+use carina_core::resource::{
+    ConcreteValue, DeferredValue, ParserPlaceholder, Value as GenericValue,
+};
 use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
+
+type Value = GenericValue<ParserPlaceholder>;
 
 fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
     let text = doc.text();
@@ -42,6 +45,23 @@ fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
     Some(Range {
         start: position(span.start_byte())?,
         end: position(span.end_byte())?,
+    })
+}
+
+fn integer_operator_range(
+    span: carina_core::integer_arithmetic::IntegerOperatorSpan,
+) -> Option<Range> {
+    let line = span.line()?.checked_sub(1)? as u32;
+    let column = span.column()?.checked_sub(1)? as u32;
+    Some(Range {
+        start: Position {
+            line,
+            character: column,
+        },
+        end: Position {
+            line,
+            character: column + 1,
+        },
     })
 }
 
@@ -156,6 +176,25 @@ pub(crate) fn carina_diagnostic_range(
     }
 }
 
+fn push_integer_arithmetic_diagnostic(
+    diagnostics: &mut Vec<Diagnostic>,
+    range: Range,
+    message: String,
+) {
+    if diagnostics.iter().any(|diagnostic| {
+        diagnostic.range == range
+            && diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+            && diagnostic.message == message
+    }) {
+        return;
+    }
+    diagnostics.push(carina_diagnostic_range(
+        range,
+        DiagnosticSeverity::ERROR,
+        message,
+    ));
+}
+
 enum DiagnosticProviderContext {
     Loaded(carina_core::parser::LoadedProviderContext),
     Unloaded(carina_core::parser::ProviderContext),
@@ -163,9 +202,9 @@ enum DiagnosticProviderContext {
 
 struct DiagnosticValidationInputs<'a> {
     binding_index: carina_core::binding_index::BindingIndex<'a>,
-    inference_bindings: carina_core::validation::inference::InferenceBindings,
+    inference_bindings: carina_core::validation::inference::InferenceBindings<ParserPlaceholder>,
     binding_use_report: carina_core::validation::BindingUseReport,
-    export_value_bindings: carina_core::binding_index::ResolvedBindings,
+    export_value_bindings: carina_core::binding_index::ResolvedBindings<ParserPlaceholder>,
 }
 
 impl DiagnosticProviderContext {
@@ -270,7 +309,12 @@ impl DiagnosticEngine {
 
     fn validation_inputs<'a, D>(
         &'a self,
-        binding_input: &'a carina_core::parser::File<carina_core::parser::ParsedExportParam, D>,
+        binding_input: &'a carina_core::parser::File<
+            carina_core::parser::ParsedExportParam,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+        >,
         upstream_exports: &'a carina_core::upstream_exports::UpstreamExports,
         module_signatures: &'a carina_core::module_resolver::ResolvedModuleSignatures,
     ) -> DiagnosticValidationInputs<'a>
@@ -343,12 +387,6 @@ impl DiagnosticEngine {
         });
         let current_file_name = current_file_name.as_deref();
 
-        // Empty `${}` interpolation hint. Runs even when other parses
-        // succeeded — and especially before the buffer-only checks
-        // below — so users get an actionable warning right at the
-        // placeholder rather than only learning at apply time.
-        diagnostics.extend(self.check_empty_interpolations(doc));
-
         // Build the directory-scoped merged parse once up-front — it is
         // the authoritative source of truth for every check that needs
         // cross-file context: undefined-identifier (#2132), upstream-
@@ -400,14 +438,12 @@ impl DiagnosticEngine {
         // When the authoritative directory parse succeeds, use its per-file
         // semantic AST for source-oriented checks instead of dropping every
         // check merely because the provisional document parse failed.
-        let merged_current_file = || {
-            current_file_path.and_then(|path| {
-                merged_result
-                    .as_ref()
-                    .and_then(|result| result.directory.semantic_file(path))
-            })
-        };
-        let current_parsed = doc.parsed().or_else(merged_current_file);
+        let merged_current_file = current_file_path.and_then(|path| {
+            merged_result
+                .as_ref()
+                .and_then(|result| result.directory.semantic_file(path))
+        });
+        let current_parsed = doc.parsed().or(merged_current_file);
         // A source parsed in isolation cannot know sibling function
         // declarations. Prefer the successful directory parse over that
         // provisional failure (notably a sibling user function used as a
@@ -474,6 +510,35 @@ impl DiagnosticEngine {
         let merged = merged_result
             .as_ref()
             .map(|result| &result.directory.parsed);
+        if let Some(boundary_file) = merged_current_file.or(current_parsed) {
+            let boundary =
+                if carina_core::validation::is_module_definition(merged.unwrap_or(boundary_file)) {
+                    carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
+                } else {
+                    carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
+                };
+            if let Some(merged) = merged {
+                diagnostics.extend(self.check_expansion_boundary(
+                    doc,
+                    merged,
+                    boundary,
+                    checks::ExpansionBoundaryScope::Authored,
+                ));
+                diagnostics.extend(self.check_expansion_boundary(
+                    doc,
+                    boundary_file,
+                    boundary,
+                    checks::ExpansionBoundaryScope::Unlocated,
+                ));
+            } else {
+                diagnostics.extend(self.check_expansion_boundary(
+                    doc,
+                    boundary_file,
+                    boundary,
+                    checks::ExpansionBoundaryScope::All,
+                ));
+            }
+        }
         if let Some(current_file) = current_parsed {
             diagnostics.extend(self.attribute_derived_anonymous_resource_diagnostics(
                 doc,
@@ -774,6 +839,24 @@ impl DiagnosticEngine {
                 binding_use_report,
                 export_value_bindings,
             } = validation_inputs;
+            // Validate non-resource declarations authored in the open file,
+            // even when no typed resource sink consumes them. Binding and
+            // schema authority remains directory-wide, while source anchoring
+            // comes from each authored operator.
+            for finding in carina_core::validation::check_file_integer_arithmetic_values(
+                parsed,
+                &inference_bindings,
+                &self.schemas,
+                &binding_index,
+            ) {
+                if let Some(range) = integer_operator_range(finding.operator_span()) {
+                    push_integer_arithmetic_diagnostic(
+                        &mut diagnostics,
+                        range,
+                        finding.to_string(),
+                    );
+                }
+            }
             // A direct bare binding occupies the complete attribute value, so
             // the shared authority owns that sink even when it succeeds. In
             // particular, an enum-typed argument must not be reinterpreted by
@@ -1212,7 +1295,10 @@ impl DiagnosticEngine {
                         // wrong-typed lazy default from diagnostics.
                         let typecheck_value = if matches!(
                             attr_value,
-                            Value::Deferred(DeferredValue::Coalesce { .. })
+                            Value::Deferred(
+                                DeferredValue::Coalesce { .. }
+                                    | DeferredValue::IntegerArithmetic(_)
+                            )
                         ) {
                             attr_value
                         } else {
@@ -1295,6 +1381,35 @@ impl DiagnosticEngine {
                             if binding_error_sinks
                                 .contains(&(resource_id.clone(), attr_name.clone()))
                             {
+                                continue;
+                            }
+
+                            // Arithmetic is a typed computed expression. Send
+                            // the complete authored tree through core's shared
+                            // checker before the legacy shape-oriented cases;
+                            // this also reaches arithmetic nested in secrets,
+                            // interpolation, collections, and coalesces.
+                            let arithmetic_findings =
+                                carina_core::validation::check_integer_arithmetic_types(
+                                    authored_attr_value,
+                                    effective_type.clone(),
+                                    &inference_bindings,
+                                    &self.schemas,
+                                    &binding_index,
+                                );
+                            if !arithmetic_findings.is_empty() {
+                                for finding in arithmetic_findings {
+                                    let range = integer_operator_range(finding.operator_span())
+                                        .or_else(|| {
+                                            self.find_attribute_value_range(doc, attr_name, scope)
+                                        })
+                                        .unwrap_or_default();
+                                    push_integer_arithmetic_diagnostic(
+                                        &mut diagnostics,
+                                        range,
+                                        finding.to_string(),
+                                    );
+                                }
                                 continue;
                             }
 
@@ -1423,17 +1538,17 @@ impl DiagnosticEngine {
                                 }
                                 (
                                     _,
-                                    Value::Deferred(DeferredValue::Unknown(
-                                        carina_core::resource::UnknownReason::ModuleArgument {
-                                            name,
-                                            ..
-                                        },
+                                    Value::Deferred(DeferredValue::Placeholder(
+                                        ParserPlaceholder::ModuleArgument { name, .. },
                                     )),
                                 ) => check_resource_ref_type_mismatch(
                                     &binding_index,
                                     schema.type_in_schema(attr_schema.attr_type()),
                                     name.as_str().into(),
                                 ),
+                                // Core's arithmetic checker above owns both operand and
+                                // result-sink diagnostics for this typed expression.
+                                (_, Value::Deferred(DeferredValue::IntegerArithmetic(_))) => None,
                                 // Enum: the structured-payload path
                                 // above handles `InvalidEnumVariant` /
                                 // `StringLiteralExpectedEnum` and
@@ -1759,6 +1874,9 @@ impl DiagnosticEngine {
             // context meant for CLI output only and are not elevated here.
             diagnostics.extend(self.check_unused_for_bindings(doc, parsed));
             diagnostics.extend(self.check_single_quoted_interpolation_warnings(parsed));
+            let prevent_destroy_warnings = merged_current_file.unwrap_or(parsed);
+            diagnostics
+                .extend(self.check_non_literal_prevent_destroy_warnings(prevent_destroy_warnings));
 
             // Check for unknown attributes on resource references (typo detection)
             diagnostics.extend(self.check_resource_ref_attributes(doc, parsed, &binding_index));
@@ -1880,6 +1998,31 @@ impl DiagnosticEngine {
                     end_col,
                     DiagnosticSeverity::WARNING,
                     w.message.clone(),
+                ))
+            })
+            .collect()
+    }
+
+    fn check_non_literal_prevent_destroy_warnings(&self, parsed: &ParsedFile) -> Vec<Diagnostic> {
+        parsed
+            .warnings
+            .iter()
+            .filter(|warning| warning.kind == WarningKind::NonLiteralPreventDestroy)
+            .filter_map(|warning| {
+                let span = warning.span.as_ref()?;
+                Some(carina_diagnostic_range(
+                    Range::new(
+                        Position::new(
+                            span.start_line.checked_sub(1)? as u32,
+                            span.start_column.checked_sub(1)? as u32,
+                        ),
+                        Position::new(
+                            span.end_line.checked_sub(1)? as u32,
+                            span.end_column.checked_sub(1)? as u32,
+                        ),
+                    ),
+                    DiagnosticSeverity::WARNING,
+                    warning.message.clone(),
                 ))
             })
             .collect()
@@ -2127,13 +2270,19 @@ impl DiagnosticEngine {
 /// parses). Callers that fall back to `None` get document-wide search —
 /// the historic behavior — which is still correct when there's no
 /// ambiguity.
-fn resource_source_range<D: carina_core::parser::DeferredForPhaseTraversal>(
+fn resource_source_range<P, T, D>(
     doc: &Document,
-    ctx: ResourceContext<'_, carina_core::resource::ModuleSource, D>,
+    ctx: carina_core::parser::ResourceContext<'_, carina_core::resource::ModuleSource, P, T, D>,
     provider: &str,
     resource_type: &str,
     authored_direct_start: Option<u32>,
-) -> Option<(u32, u32)> {
+) -> Option<(u32, u32)>
+where
+    P: carina_core::resource::PlaceholderKind,
+    T: carina_core::resource::PlaceholderKind,
+    D: carina_core::parser::DeferredForPhaseTraversal<P, T>,
+{
+    use carina_core::parser::ResourceContext;
     let text = doc.text();
     let lines: Vec<&str> = text.lines().collect();
 
@@ -2293,6 +2442,18 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             (*line as u32).saturating_sub(1),
             0,
             100,
+            DiagnosticSeverity::ERROR,
+            message.clone(),
+        ),
+        ParseError::IntegerArithmetic {
+            line,
+            column,
+            end_column,
+            message,
+        } => carina_diagnostic(
+            line.saturating_sub(1) as u32,
+            column.saturating_sub(1) as u32,
+            end_column.saturating_sub(1) as u32,
             DiagnosticSeverity::ERROR,
             message.clone(),
         ),

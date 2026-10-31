@@ -41,7 +41,9 @@ use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_fo
 use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::ProgressSink;
-use crate::display::print_plan;
+pub use crate::commands::shared::state_writeback::PersistedDirectiveChange;
+use crate::commands::shared::state_writeback::persisted_directive_changes;
+use crate::display::{format_persisted_directive_changes, print_plan};
 use crate::error::{AppError, LockedStateReloadError};
 #[cfg(test)]
 use crate::plan_image::PlanImageError;
@@ -467,7 +469,7 @@ mod provider_scope_evidence_tests {
     }
 
     #[test]
-    fn current_saved_plan_round_trips_provider_scopes() {
+    fn format_35_saved_plan_round_trips_provider_scopes_and_integer_arithmetic() {
         let mut default_config = provider_config("unused");
         default_config.binding = None;
         default_config.source = Some("file:///test-provider.wasm".parse().unwrap());
@@ -476,7 +478,7 @@ mod provider_scope_evidence_tests {
             provider_config("east"),
             provider_config("west"),
         ];
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = configs.clone();
         let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
@@ -505,8 +507,48 @@ mod provider_scope_evidence_tests {
             ),
         );
 
-        let plan = empty_contents(SavedProviderConfigs::from(&resolved))
-            .record_for_test_with_provider(&wiring, &provider)
+        let mut contents = empty_contents(SavedProviderConfigs::from(&resolved));
+        let arithmetic = carina_core::integer_arithmetic::evaluate_integer_values(
+            Value::resource_ref("source", "seconds", Vec::new()),
+            carina_core::integer_arithmetic::IntegerOp::Divide,
+            Value::Concrete(ConcreteValue::Int(60)),
+            carina_core::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+        )
+        .expect("typed deferred arithmetic is valid");
+        let Value::Deferred(DeferredValue::IntegerArithmetic(expression)) = arithmetic else {
+            panic!("resource arithmetic must remain deferred");
+        };
+        let stamped_unknown = expression
+            .evaluate_with_operands(
+                Value::Deferred(DeferredValue::Unknown(
+                    carina_core::resource::ApplyTimeUnknown::UpstreamExport {
+                        path: carina_core::resource::AccessPath::new("source", "seconds"),
+                    },
+                )),
+                Value::Concrete(ConcreteValue::Int(60)),
+            )
+            .expect("the validated Int slot admits an unresolved upstream marker");
+        let stamped_redacted = expression
+            .evaluate_with_operands(
+                Value::Deferred(DeferredValue::RedactedSecret {
+                    hash: carina_core::resource::RedactedSecretHash::from_encoded_digest(&format!(
+                        "argon2-legacy:73616c74:{}",
+                        "ab".repeat(32)
+                    ))
+                    .expect("fixture digest is valid"),
+                }),
+                Value::Concrete(ConcreteValue::Int(60)),
+            )
+            .expect("the validated Int slot admits a saved-plan secret marker");
+        contents.upstream_snapshot.insert(
+            "upstream".to_string(),
+            HashMap::from([
+                ("minutes".to_string(), stamped_unknown),
+                ("secret_minutes".to_string(), stamped_redacted),
+            ]),
+        );
+        let plan = contents
+            .record_for_test_with_provider(&wiring, &provider, Vec::new())
             .expect("provider scopes form valid evidence");
         let json = serde_json::to_value(&plan).expect("saved plan serializes");
         assert_eq!(
@@ -530,6 +572,14 @@ mod provider_scope_evidence_tests {
 
         let decoded: PlanFile = serde_json::from_value(json).expect("saved plan round-trips");
         assert_eq!(decoded.provider_scopes(), &provider.provider_scopes());
+        assert_eq!(
+            carina_core::value::format_value(&decoded.upstream_snapshot["upstream"]["minutes"]),
+            "(known after upstream apply: source.seconds) / 60",
+        );
+        assert!(matches!(
+            &decoded.upstream_snapshot["upstream"]["secret_minutes"],
+            Value::Deferred(DeferredValue::IntegerArithmetic(_))
+        ));
     }
 
     #[test]
@@ -597,6 +647,17 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 36 adds typed deferred-for templates, stage-specific
+    /// placeholder types, and template attributes stored only on
+    /// `template_resource`.
+    ///
+    /// Plan format 35 stores the tri-state `prevent_destroy` directive so an
+    /// explicit `false` remains distinct from an unspecified value, and
+    /// records the exact state-only directive change set approved by the
+    /// operator.
+    ///
+    /// Plan format 34 adds typed deferred integer arithmetic expressions.
+    ///
     /// Plan format 33 adds the typed keyed-list release effect.
     ///
     /// Plan format 32 records provider-instance reference-scope evidence and
@@ -864,6 +925,15 @@ struct ProviderEvidence {
 /// inventory to match every referenced type exactly and the provider-artifact
 /// keys to match the providers implied by the saved provider configurations.
 ///
+/// Format 36 adds typed deferred-for templates, stage-specific placeholder
+/// types, and template attributes stored only on `template_resource`.
+///
+/// Format 35 stores the tri-state `prevent_destroy` directive so an explicit
+/// `false` remains distinct from an unspecified value, and records the exact
+/// state-only directive change set approved at plan time.
+///
+/// Format 34 adds typed deferred integer arithmetic expressions.
+///
 /// Format 33 adds typed keyed-list release effects.
 ///
 /// Format 32 records provider-instance reference-scope evidence and the
@@ -879,12 +949,14 @@ struct ProviderEvidence {
 pub struct PlanFile {
     contents: UnresolvedPlanFileContents,
     evidence: ProviderEvidence,
+    persisted_directive_changes: Vec<PersistedDirectiveChange>,
 }
 
-/// Private format-33 wire representation.
+/// Private format-35 wire representation.
 ///
-/// Field order is intentionally identical to the historical `PlanFile`
-/// serialization order. Evidence is mandatory and is never defaulted.
+/// Existing field order remains identical to the historical `PlanFile`
+/// serialization order. Format-35 directive changes and provider evidence are
+/// mandatory and are never defaulted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
     version: u32,
@@ -909,6 +981,7 @@ struct PlanFileWire {
     upstream_sources: Vec<UpstreamSource>,
     #[serde(default)]
     wait_bindings: Vec<PlanWaitBinding>,
+    persisted_directive_changes: Vec<PersistedDirectiveChange>,
     schema_fingerprints: PlanSchemaFingerprints,
     provider_artifacts: PlanProviderArtifacts,
     provider_scopes: Vec<RecordedProviderScope>,
@@ -1260,7 +1333,11 @@ impl ProviderEvidence {
 
 impl From<PlanFile> for PlanFileWire {
     fn from(plan_file: PlanFile) -> Self {
-        let PlanFile { contents, evidence } = plan_file;
+        let PlanFile {
+            contents,
+            evidence,
+            persisted_directive_changes,
+        } = plan_file;
         let PlanFileContents {
             version,
             carina_version,
@@ -1307,6 +1384,7 @@ impl From<PlanFile> for PlanFileWire {
             upstream_snapshot,
             upstream_sources,
             wait_bindings,
+            persisted_directive_changes,
             schema_fingerprints,
             provider_artifacts,
             provider_scopes: provider_scopes.into_wire(),
@@ -1338,6 +1416,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
             upstream_snapshot,
             upstream_sources,
             wait_bindings,
+            persisted_directive_changes,
             schema_fingerprints,
             provider_artifacts,
             provider_scopes,
@@ -1374,7 +1453,11 @@ impl TryFrom<PlanFileWire> for PlanFile {
             &contents.provider_configs,
             &expected_instances,
         )?;
-        Ok(Self { contents, evidence })
+        Ok(Self {
+            contents,
+            evidence,
+            persisted_directive_changes,
+        })
     }
 }
 
@@ -1392,8 +1475,13 @@ impl PlanFileContents {
     pub fn record<E>(
         self,
         validated: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        self.record_with_context(validated.context(), &validated.resources().provider)
+        self.record_with_context(
+            validated.context(),
+            &validated.resources().provider,
+            persisted_directive_changes,
+        )
     }
 
     /// Record hand-built plan contents in unit and integration fixtures.
@@ -1401,6 +1489,7 @@ impl PlanFileContents {
     pub fn record_for_test<R>(
         self,
         validated: &ValidatedConfig<R>,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let available_providers = validated
             .context()
@@ -1410,7 +1499,7 @@ impl PlanFileContents {
             .collect();
         let provider =
             test_provider_router(&self.expected_provider_instances(&available_providers));
-        self.record_with_context(validated.context(), &provider)
+        self.record_with_context(validated.context(), &provider, persisted_directive_changes)
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -1418,14 +1507,16 @@ impl PlanFileContents {
         self,
         validated: &ValidatedConfig<R>,
         provider: &ProviderRouter,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        self.record_with_context(validated.context(), provider)
+        self.record_with_context(validated.context(), provider, persisted_directive_changes)
     }
 
     fn record_with_context(
         self,
         ctx: &WiringContext,
         provider: &ProviderRouter,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
         let available_providers = ctx.provider_artifacts().keys().cloned().collect();
@@ -1441,6 +1532,7 @@ impl PlanFileContents {
         Ok(PlanFile {
             contents: saved.into(),
             evidence,
+            persisted_directive_changes,
         })
     }
 }
@@ -1450,6 +1542,7 @@ impl UnresolvedPlanFileContents {
     fn record_for_test<R>(
         self,
         validated: &ValidatedConfig<R>,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
         let available_providers = validated
@@ -1470,6 +1563,7 @@ impl UnresolvedPlanFileContents {
         Ok(PlanFile {
             contents: self,
             evidence,
+            persisted_directive_changes,
         })
     }
 }
@@ -1851,7 +1945,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 33;
+    pub const CURRENT_VERSION: u32 = 36;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -1880,6 +1974,7 @@ impl PlanFile {
         let PlanFile {
             mut contents,
             evidence,
+            persisted_directive_changes,
         } = self;
         let moved_origins = MovedOrigins::from_unresolved_plan(&contents.plan);
         let planned_in_flight_origins: HashSet<_> = contents
@@ -2026,6 +2121,7 @@ impl PlanFile {
             contents,
             evidence,
             current_states,
+            persisted_directive_changes,
         })
     }
 
@@ -2573,7 +2669,7 @@ mod schema_fingerprint_tests {
     }
 
     fn saved_provider_configs(configs: Vec<ProviderConfig>) -> SavedProviderConfigs {
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = configs;
         let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
@@ -3041,6 +3137,7 @@ pub(crate) struct UnresolvedReloadedPlanFile {
     contents: UnresolvedPlanFileContents,
     evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
+    persisted_directive_changes: Vec<PersistedDirectiveChange>,
 }
 
 #[derive(Debug)]
@@ -3048,6 +3145,7 @@ pub(crate) struct ReloadedPlanFile {
     contents: PlanFileContents<SavedModuleSource>,
     evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
+    persisted_directive_changes: Vec<PersistedDirectiveChange>,
 }
 
 #[derive(Debug)]
@@ -3085,6 +3183,7 @@ impl UnresolvedReloadedPlanFile {
             contents,
             evidence,
             current_states,
+            persisted_directive_changes,
         } = self;
         let PlanFileContents {
             version,
@@ -3141,11 +3240,16 @@ impl UnresolvedReloadedPlanFile {
             contents,
             evidence,
             current_states,
+            persisted_directive_changes,
         })
     }
 }
 
 impl ReloadedPlanFile {
+    pub(crate) fn persisted_directive_changes(&self) -> &[PersistedDirectiveChange] {
+        &self.persisted_directive_changes
+    }
+
     pub(crate) fn provider_scopes(&self) -> &RecordedProviderScopes {
         &self.evidence.provider_scopes
     }
@@ -3550,11 +3654,10 @@ mod managed_current_serde_tests {
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         }
-        .record_for_test(&crate::wiring::ValidatedConfig::from_factories_for_test(
-            (),
+        .record_for_test(
+            &crate::wiring::ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
             Vec::new(),
-            &[],
-        ))
+        )
         .expect("test plan provider evidence must be valid")
     }
 
@@ -3837,11 +3940,10 @@ mod managed_current_serde_tests {
             origin: None,
         });
         let plan = contents
-            .record_for_test(&crate::wiring::ValidatedConfig::from_factories_for_test(
-                (),
+            .record_for_test(
+                &crate::wiring::ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
                 Vec::new(),
-                &[],
-            ))
+            )
             .expect("test plan provider evidence must be valid");
 
         let plan = plan
@@ -3896,11 +3998,10 @@ mod managed_current_serde_tests {
             origin: None,
         });
         let plan = contents
-            .record_for_test(&crate::wiring::ValidatedConfig::from_factories_for_test(
-                (),
+            .record_for_test(
+                &crate::wiring::ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
                 Vec::new(),
-                &[],
-            ))
+            )
             .expect("test plan provider evidence must be valid");
 
         let reloaded = plan
@@ -3979,6 +4080,7 @@ fn build_plan_file<E>(
     provider_configs: &ResolvedProviderConfigs,
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
+    directive_changes: Vec<PersistedDirectiveChange>,
     validated_plan: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
 ) -> Result<PlanFile, PlanSaveError> {
     let ctx = validated_plan.resources();
@@ -3991,7 +4093,7 @@ fn build_plan_file<E>(
         state_file,
         ctx,
     )?
-    .record(validated_plan)
+    .record(validated_plan, directive_changes)
     .map_err(PlanSaveError::from)
 }
 
@@ -3999,13 +4101,15 @@ fn build_plan_file<E>(
 #[allow(clippy::too_many_arguments)]
 fn build_plan_file_from_parts<E, R>(
     path: &Path,
-    parsed: &carina_core::parser::ModuleResolvedFile<E>,
+    parsed: &carina_core::parser::ExpandedFile<E>,
     provider_configs: &ResolvedProviderConfigs,
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
     validated_config: &ValidatedConfig<R>,
 ) -> Result<PlanFile, PlanSaveError> {
+    let directive_changes =
+        persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources, &ctx.plan);
     build_plan_file_contents(
         path,
         parsed,
@@ -4014,14 +4118,14 @@ fn build_plan_file_from_parts<E, R>(
         state_file,
         ctx,
     )?
-    .record_for_test(validated_config)
+    .record_for_test(validated_config, directive_changes)
     .map_err(PlanSaveError::from)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_plan_file_contents<E>(
     path: &Path,
-    parsed: &carina_core::parser::ModuleResolvedFile<E>,
+    parsed: &carina_core::parser::ExpandedFile<E>,
     provider_configs: &ResolvedProviderConfigs,
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
@@ -4157,6 +4261,14 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
+        // carina#4094: bumped 35→36 — saved plans use typed deferred-for
+        // templates and stage-specific placeholder types, with template
+        // attributes stored only on `template_resource`.
+        // carina#4150: bumped 34→35 — Directives now retain whether
+        // prevent_destroy was unspecified or explicitly false, and saved
+        // plans bind apply to the exact state-only directive change set.
+        // carina#4142: bumped 33→34 — saved plans can retain typed deferred
+        // integer arithmetic until apply-time reference resolution.
         // carina#4118: bumped 32→33 — keyed partial-update releases add a
         // serialized state-only Effect variant.
         // carina#4067: bumped 29→31 — saved plans retain authored
@@ -4790,7 +4902,14 @@ pub async fn run_plan(
         .map(|state| state.exports.clone())
         .unwrap_or_default();
     let export_changes = compute_export_diffs(&checked_exports, &current_exports);
-    let summary = PlanChangeSummary::new(&ctx.plan, &export_changes, &ctx.residual_deferred_for);
+    let directive_changes =
+        persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources, &ctx.plan);
+    let summary = PlanChangeSummary::new(
+        &ctx.plan,
+        &export_changes,
+        &ctx.residual_deferred_for,
+        &directive_changes,
+    );
     // Preserve the CLI contract from before plan-image summaries existed:
     // detailed exit code 2 means a managed-resource mutation, not merely
     // displayable work such as reads, waits, exports, or deferred loops.
@@ -4814,12 +4933,19 @@ pub async fn run_plan(
             provider_inputs.configs(),
             plan_file_backend_config.clone(),
             &state_file,
+            directive_changes.clone(),
             &validated_plan,
         )
         .map_err(|error| map_plan_save_error(error, "--json"))?;
         let json_str = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         println!("{}", json_str);
+        // JSON stdout is the versioned saved-plan document and now carries the
+        // exact directive change set as machine-readable format-35 data. Keep
+        // the human-readable rendering on stderr as well.
+        if !directive_changes.is_empty() {
+            eprint!("{}", format_persisted_directive_changes(&directive_changes));
+        }
         moved_hints.eprint();
         if let Some(result) = iam_preflight_result.as_ref() {
             crate::commands::iam_preflight::emit_warnings(result);
@@ -4832,6 +4958,9 @@ pub async fn run_plan(
             Some(&ctx.prev_explicit),
             &ctx.provider,
         )?;
+        if !directive_changes.is_empty() {
+            eprint!("{}", format_persisted_directive_changes(&directive_changes));
+        }
         moved_hints.eprint();
         if let Some(result) = iam_preflight_result.as_ref() {
             crate::commands::iam_preflight::emit_warnings(result);
@@ -4876,6 +5005,7 @@ pub async fn run_plan(
             provider_inputs.configs(),
             plan_file_backend_config.clone(),
             &state_file,
+            directive_changes.clone(),
             &validated_plan,
         )
         .map_err(|error| map_plan_save_error(error, "--out"))?;
@@ -5008,7 +5138,7 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
 /// Every field is mandatory so plan and apply cannot accidentally omit a
 /// binding layer or the provider-aware builtin context.
 pub(crate) struct CheckExportsPreApplyInput<'a> {
-    pub export_params: &'a [carina_core::parser::InferredExportParam],
+    pub export_params: &'a [carina_core::parser::ExpandedInferredExportParam],
     pub resources: &'a [Resource],
     pub compositions: &'a [carina_core::resource::LiveComposition],
     pub managed_current: &'a HashMap<ResourceId, Current>,
@@ -5029,7 +5159,9 @@ pub(crate) struct CheckExportsPreApplyInput<'a> {
 pub(crate) fn check_exports_pre_apply(
     input: CheckExportsPreApplyInput<'_>,
 ) -> Result<
-    carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam>,
+    carina_core::validation::ExportsCheckedPreApply<
+        carina_core::parser::ExpandedInferredExportParam,
+    >,
     String,
 > {
     // carina#3248: build the unified pre-apply bindings view so an
@@ -5123,7 +5255,7 @@ impl ExportChange {
 /// `StateFile.exports`.
 pub fn compute_export_diffs(
     checked_exports: &carina_core::validation::ExportsCheckedPreApply<
-        carina_core::parser::InferredExportParam,
+        carina_core::parser::ExpandedInferredExportParam,
     >,
     current_exports: &HashMap<String, PersistedExportValue>,
 ) -> Vec<ExportChange> {
@@ -5232,7 +5364,7 @@ impl ResolvedProviderInputs {
 /// command chooses both missing-state policy and load scope; provider
 /// construction then requires the returned typed configs.
 pub(crate) async fn load_and_resolve_provider_configs<E>(
-    parsed: &carina_core::parser::ModuleResolvedFile<E>,
+    parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
     policy: UpstreamMissingStatePolicy,
@@ -5293,7 +5425,7 @@ struct ProviderReferencedUpstream {
 }
 
 async fn load_provider_referenced_upstream_states<E>(
-    parsed: &carina_core::parser::ModuleResolvedFile<E>,
+    parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<PathBuf>,
@@ -5332,7 +5464,7 @@ async fn load_provider_referenced_upstream_states<E>(
 /// the visited key: this keeps the walk field-sensitive and terminates local
 /// reference cycles.
 fn provider_referenced_upstream_states<E>(
-    parsed: &carina_core::parser::ModuleResolvedFile<E>,
+    parsed: &carina_core::parser::ExpandedFile<E>,
 ) -> Vec<ProviderReferencedUpstream> {
     fn enqueue_value(
         value: &Value,
@@ -5387,7 +5519,24 @@ fn provider_referenced_upstream_states<E>(
         else {
             continue;
         };
-        let attributes = resource.attributes();
+        let attributes = match resource {
+            carina_core::parser::TopLevelResourceRef::Resource(resource) => {
+                std::borrow::Cow::Borrowed(&resource.attributes)
+            }
+            carina_core::parser::TopLevelResourceRef::LiveComposition(composition) => {
+                std::borrow::Cow::Owned(
+                    composition
+                        .signature
+                        .attributes
+                        .iter()
+                        .map(|(name, attribute)| (name.clone(), attribute.to_value()))
+                        .collect(),
+                )
+            }
+            carina_core::parser::TopLevelResourceRef::DataSource(data_source) => {
+                std::borrow::Cow::Borrowed(&data_source.attributes)
+            }
+        };
         if let Some(attribute) = attribute {
             if let Some(value) = attributes.get(&attribute) {
                 enqueue_value(value, &required_by, &mut pending);
@@ -5529,10 +5678,16 @@ async fn build_upstream_backend(
     // Anchor local-backend state paths and the backend lock at the upstream's
     // source directory. A pending migration in the upstream must read the old
     // locked backend just like a top-level read command.
+    let backend_config = loaded
+        .parsed
+        .backend
+        .clone()
+        .map(carina_core::parser::BackendConfig::into_expanded)
+        .transpose()?;
     resolve_backend_for_read(
         source_abs,
         source_abs,
-        loaded.parsed.backend.as_ref(),
+        backend_config.as_ref(),
         BackendLockRequirement::AllowMissing,
         ReadBackendWarningPolicy::UpstreamSource {
             source_dir: source_abs,
@@ -5605,17 +5760,11 @@ async fn walk_upstream_cycles_only(
 }
 
 #[cfg(test)]
-fn resolve_file_for_test<E: carina_core::parser::ExportParamLike>(
-    parsed: carina_core::parser::File<E>,
-    base_dir: &Path,
-) -> carina_core::parser::ModuleResolvedFile<E> {
-    carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
-        base_dir,
-        &ProviderContext::default(),
-        &carina_core::schema::SchemaRegistry::new(),
-    )
-    .expect("test fixture crosses module resolution")
+fn resolve_file_for_test<E>(
+    parsed: carina_core::parser::ExpandedFile<E>,
+    _base_dir: &Path,
+) -> carina_core::parser::ExpandedFile<E> {
+    parsed
 }
 
 #[cfg(test)]
@@ -5638,7 +5787,7 @@ mod load_upstream_states_tests {
     #[tokio::test]
     async fn provider_resolution_preserves_complete_parse_error() {
         let dir = tempfile::tempdir().unwrap();
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(ProviderConfig {
             name: "test".to_string(),
             attributes: indexmap::IndexMap::from([(
@@ -5689,7 +5838,7 @@ mod load_upstream_states_tests {
     #[tokio::test]
     async fn provider_resolution_preserves_complete_invariant_error() {
         let dir = tempfile::tempdir().unwrap();
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(ProviderConfig {
             name: "test".to_string(),
             attributes: indexmap::IndexMap::from([(
@@ -5738,7 +5887,7 @@ mod load_upstream_states_tests {
             )
             .unwrap();
         }
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(ProviderConfig {
             name: "test".to_string(),
             attributes: indexmap::IndexMap::new(),
@@ -5785,8 +5934,11 @@ mod load_upstream_states_tests {
 
     #[tokio::test]
     async fn provider_reference_scope_follows_resource_refs_to_upstream_state() {
-        let (_temp, downstream, mut parsed) =
+        let (_temp, downstream, parsed) =
             crate::provider_upstream_test_support::provider_upstream_fixture();
+        let mut parsed = parsed
+            .into_expanded()
+            .expect("provider upstream fixture has no parser placeholders");
         parsed.providers[0].attributes.insert(
             "role_arn".to_string(),
             Value::resource_ref("bridge", "role_arn", vec![]),
@@ -5829,7 +5981,7 @@ mod load_upstream_states_tests {
 
     #[test]
     fn provider_reference_scope_resource_walk_is_cycle_safe() {
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(ProviderConfig {
             name: "test".to_string(),
             attributes: indexmap::IndexMap::from([(
@@ -5912,6 +6064,8 @@ mod load_upstream_states_tests {
             &ProviderContext::default(),
         )
         .unwrap()
+        .into_expanded()
+        .expect("backend lock fixture has no parser placeholders")
         .backend
         .unwrap();
         carina_state::BackendLock::for_config(Some(&old_backend))
@@ -6338,7 +6492,9 @@ exports { region: String = "ap-northeast-1" }"#,
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load config")
-        .parsed;
+        .parsed
+        .into_expanded()
+        .expect("exports-only fixture has no parser placeholders");
         let mut guard = seed_cycle_guard(&dir_b);
         let bindings = load_upstream_states(
             &parsed.upstream_states,
@@ -6610,7 +6766,7 @@ mod run_plan_out_tests {
             to: carina_core::resource::ResolvedResource::new(updated_effect),
             changed_attributes: vec!["comment".to_string(), "web_acl_arn".to_string()],
         });
-        let parsed = resolve_file_for_test(carina_core::parser::ParsedFile::default(), tmp.path());
+        let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {
             plan,
             provider: ProviderRouter::new(),
@@ -6850,7 +7006,7 @@ mod run_plan_out_tests {
             ))));
         }
         let deferred = crate::plan_summary::resolved_deferred_for_for_test([]);
-        let summary = PlanChangeSummary::new(&plan, &[], &deferred);
+        let summary = PlanChangeSummary::new(&plan, &[], &deferred, &[]);
         let desired_resources = Vec::new();
         let unresolved_resources = Vec::new();
         let compositions = Vec::new();
@@ -6905,7 +7061,7 @@ mod run_plan_out_tests {
             ))));
         }
         let deferred = crate::plan_summary::resolved_deferred_for_for_test([]);
-        let summary = PlanChangeSummary::new(&plan, &[], &deferred);
+        let summary = PlanChangeSummary::new(&plan, &[], &deferred, &[]);
         let desired_resources = Vec::new();
         let unresolved_resources = Vec::new();
         let compositions = Vec::new();
@@ -6987,7 +7143,7 @@ mod run_plan_out_tests {
                 |_| carina_core::data_source_value::DataSourceValue::deferred_to_apply(Vec::new()),
             );
 
-        let mut parsed = carina_core::parser::ParsedFile::default();
+        let mut parsed = carina_core::parser::ExpandedParsedFile::default();
         parsed.data_sources = vec![parsed_data_source];
         let parsed = resolve_file_for_test(parsed, tmp.path());
         let ctx = crate::wiring::PlanContext {
@@ -7074,7 +7230,7 @@ mod run_plan_out_tests {
             call_path: crate::test_composition_call_path(),
             quoted_string_attrs: Default::default(),
         };
-        let parsed = resolve_file_for_test(carina_core::parser::ParsedFile::default(), tmp.path());
+        let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {
             plan: Plan::new(),
             provider: ProviderRouter::new(),
@@ -7124,7 +7280,7 @@ mod run_plan_out_tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("main.crn");
         fs::write(&path, "provider mock {}\n").unwrap();
-        let parsed = resolve_file_for_test(carina_core::parser::ParsedFile::default(), tmp.path());
+        let parsed = carina_core::parser::ExpandedParsedFile::default();
         let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             carina_core::resource::ConcreteValue::String("upstream-secret".into()),
         ))));
@@ -7185,7 +7341,7 @@ mod run_plan_out_tests {
             unresolved_attributes: indexmap::IndexMap::new(),
             binding: None,
         };
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = vec![configured.clone()];
         let parsed = resolve_file_for_test(parsed, tmp.path());
         let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
@@ -7258,7 +7414,7 @@ mod run_plan_out_tests {
 #[cfg(test)]
 mod export_diff_tests {
     use super::*;
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::DeferredValue;
 
     fn persisted(value: serde_json::Value) -> PersistedExportValue {
@@ -7429,13 +7585,13 @@ mod plan_serialization_error_tests {
     //! (top-level attributes, nested List/Map, Replace cascade) propagates
     //! the error.
     use carina_core::resource::{
-        AccessPath, ConcreteValue, DeferredValue, Resource, UnknownReason, Value,
+        AccessPath, ApplyTimeUnknown, ConcreteValue, DeferredValue, Resource, Value,
     };
     use carina_core::value::{PersistedValue, SerializationError, redact_secrets_in_resource};
 
     fn upstream_unknown() -> Value {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+        Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path,
         }))
     }
@@ -7445,7 +7601,7 @@ mod plan_serialization_error_tests {
         let err = PersistedValue::encode_provider_value(&upstream_unknown(), None).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamExport { path },
+                reason: ApplyTimeUnknown::UpstreamExport { path },
                 ..
             } => {
                 assert_eq!(path.to_dot_string(), "network.vpc.vpc_id");
@@ -7480,30 +7636,6 @@ mod plan_serialization_error_tests {
         r.attributes.insert("vpc_id".into(), upstream_unknown());
         let err = redact_secrets_in_resource(&r).unwrap_err();
         assert!(matches!(err, SerializationError::UnknownNotAllowed { .. }));
-    }
-
-    /// `for*` placeholders carry no path, but their reason variant
-    /// must survive into the error so the caller can render
-    /// "for-binding placeholder" rather than a generic message.
-    #[test]
-    fn value_to_json_preserves_for_variants_in_error() {
-        for (variant, label) in [
-            (UnknownReason::ForValue, "ForValue"),
-            (UnknownReason::ForKey, "ForKey"),
-            (UnknownReason::ForIndex, "ForIndex"),
-        ] {
-            let err = PersistedValue::encode_provider_value(
-                &Value::Deferred(DeferredValue::Unknown(variant.clone())),
-                None,
-            )
-            .unwrap_err();
-            match err {
-                SerializationError::UnknownNotAllowed { reason, .. } => {
-                    assert_eq!(reason, variant, "expected {label} round-trip");
-                }
-                other => panic!("expected UnknownNotAllowed for {label}, got: {other:?}"),
-            }
-        }
     }
 }
 

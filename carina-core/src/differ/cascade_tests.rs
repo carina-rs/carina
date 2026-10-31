@@ -2,7 +2,9 @@ use super::*;
 
 use std::collections::HashSet;
 
-use crate::plan::{PlanErrorKind, PreventDestroyAction, ReplacementCannotCoexistError};
+use crate::plan::{
+    PlanErrorKind, PreventDestroyAction, PreventDestroySource, ReplacementCannotCoexistError,
+};
 use crate::resource::{ConcreteValue, DeferredValue, ResourceIdentity};
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
@@ -48,6 +50,14 @@ fn base_schemas(subnet_vpc_id_create_only: bool) -> SchemaRegistry {
         .expect("schema fixture must be valid"),
     );
 
+    schemas.insert("", subnet_schema(subnet_vpc_id_create_only, false));
+    schemas
+}
+
+fn subnet_schema(
+    subnet_vpc_id_create_only: bool,
+    default_prevent_destroy: bool,
+) -> crate::schema::ValidatedResourceSchema {
     let vpc_id = if subnet_vpc_id_create_only {
         AttributeSchema::required("vpc_id", AttributeType::string())
             .create_only()
@@ -55,27 +65,27 @@ fn base_schemas(subnet_vpc_id_create_only: bool) -> SchemaRegistry {
     } else {
         AttributeSchema::required("vpc_id", AttributeType::string()).build()
     };
-    schemas.insert(
-        "",
-        (ResourceSchema::new("ec2.Subnet")
-            .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
-                    .create_only()
-                    .build(),
-            )
-            .attribute(vpc_id)
-            .attribute(AttributeSchema::required("cidr_block", AttributeType::string()).build())
-            .attribute(AttributeSchema::optional("tags", AttributeType::string()).build())
-            .attribute(
-                AttributeSchema::optional("availability_zone", AttributeType::string())
-                    .create_only()
-                    .build(),
-            )
-            .with_unique_name_attribute("name"))
-        .validate()
-        .expect("schema fixture must be valid"),
-    );
-    schemas
+    let schema = ResourceSchema::new("ec2.Subnet")
+        .attribute(
+            AttributeSchema::optional("name", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(vpc_id)
+        .attribute(AttributeSchema::required("cidr_block", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("tags", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("availability_zone", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .with_unique_name_attribute("name");
+    let schema = if default_prevent_destroy {
+        schema.default_prevent_destroy()
+    } else {
+        schema
+    };
+    schema.validate().expect("schema fixture must be valid")
 }
 
 fn vpc_resources(create_before_destroy: bool) -> (Resource, Resource) {
@@ -425,7 +435,7 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
     let schemas = base_schemas(true);
     let (managed_vpc, unresolved_vpc) = vpc_resources(true);
     let (managed_subnet, mut unresolved_subnet) = subnet_resources(true, false);
-    unresolved_subnet.directives.prevent_destroy = true;
+    unresolved_subnet.directives.set_prevent_destroy(true);
     let subnet_id = managed_subnet.id.clone();
 
     let plan = plan_for(
@@ -440,13 +450,63 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
     assert_eq!(
         &plan.errors()[0].kind,
         &PlanErrorKind::PreventDestroy {
-            action: PreventDestroyAction::CascadeReplace
+            action: PreventDestroyAction::CascadeReplace,
+            source: PreventDestroySource::ExplicitDirective,
         }
     );
     assert!(
         plan.replace_display
             .iter()
             .all(|metadata| { plan.effects()[metadata.create_idx].resource_id() != &subnet_id })
+    );
+}
+
+#[test]
+fn cascade_replace_honors_schema_default_and_explicit_false_opt_out() {
+    let mut schemas = base_schemas(true);
+    schemas.insert("", subnet_schema(true, true));
+    let (managed_vpc, unresolved_vpc) = vpc_resources(true);
+    let (managed_subnet, unresolved_subnet) = subnet_resources(true, false);
+    let subnet_id = managed_subnet.id.clone();
+
+    let protected_plan = plan_for(
+        vec![managed_vpc.clone(), managed_subnet.clone()],
+        vec![unresolved_vpc.clone(), unresolved_subnet.clone()],
+        standard_states(),
+        &schemas,
+    );
+    assert_eq!(
+        protected_plan.errors()[0].kind,
+        PlanErrorKind::PreventDestroy {
+            action: PreventDestroyAction::CascadeReplace,
+            source: PreventDestroySource::SchemaDefault,
+        }
+    );
+    assert!(
+        protected_plan.replace_display.iter().all(|metadata| {
+            protected_plan.effects()[metadata.create_idx].resource_id() != &subnet_id
+        }),
+        "schema-default protection must stop cascade promotion"
+    );
+
+    let mut opted_out_subnet = unresolved_subnet;
+    opted_out_subnet.directives.set_prevent_destroy(false);
+    let opted_out_plan = plan_for(
+        vec![managed_vpc, managed_subnet],
+        vec![unresolved_vpc, opted_out_subnet],
+        standard_states(),
+        &schemas,
+    );
+    assert!(
+        opted_out_plan.errors().is_empty(),
+        "literal false must permit the cascade replacement: {:?}",
+        opted_out_plan.errors()
+    );
+    assert!(
+        opted_out_plan.replace_display.iter().any(|metadata| {
+            opted_out_plan.effects()[metadata.create_idx].resource_id() == &subnet_id
+        }),
+        "literal false must allow the dependent cascade replacement"
     );
 }
 

@@ -8,8 +8,8 @@ use indexmap::IndexMap;
 use crate::explicit::{ExplicitFields, ExplicitProjection};
 use crate::provider::{InitializedProvider, NestedWriteOnlyRecord, ReferenceScope};
 use crate::resource::{
-    ConcreteValue, DeferredValue, InterpolationPart, ResolvedIgnoreChanges, SavedValueViews,
-    UnknownReason, Value, merge_with_saved, value_at_leaf,
+    ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, ResolvedIgnoreChanges,
+    SavedValueViews, Value, merge_with_saved, value_at_leaf,
 };
 use crate::schema::{
     AttributeType, DslTransform, LeafPath, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms,
@@ -632,7 +632,7 @@ pub(crate) enum LeafProvenance<'a> {
 
 fn contains_pending_reread(value: &Value) -> bool {
     match value {
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(_))) => true,
+        Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(_))) => true,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_pending_reread),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().any(contains_pending_reread),
         Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
@@ -653,6 +653,12 @@ fn contains_pending_reread(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_pending_reread(value) || contains_pending_reread(default)
         }
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred.values().into_iter().any(contains_pending_reread)
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            contains_pending_reread(expression.lhs()) || contains_pending_reread(expression.rhs())
+        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -669,6 +675,7 @@ fn contains_pending_reread(value: &Value) -> bool {
             | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_),
         ) => false,
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
@@ -846,6 +853,7 @@ fn has_observable_content(value: &Value) -> bool {
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(has_observable_content),
         Value::Concrete(ConcreteValue::StringList(items)) => !items.is_empty(),
         Value::Deferred(DeferredValue::Secret(inner)) => has_observable_content(inner),
+        Value::Deferred(DeferredValue::ModuleIf(_)) => true,
         Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
         | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -857,12 +865,14 @@ fn has_observable_content(value: &Value) -> bool {
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Coalesce { .. })
+        | Value::Deferred(DeferredValue::IntegerArithmetic(_))
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
         | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
         | Value::Deferred(DeferredValue::Access(_))
         | Value::Deferred(DeferredValue::Unknown(_))
         | Value::Deferred(DeferredValue::Unavailable { .. }) => true,
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 

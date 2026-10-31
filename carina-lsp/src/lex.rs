@@ -63,16 +63,31 @@ impl LexedLine {
         self.heredoc_body
     }
 
-    /// Replace every non-code character with one space. This preserves source
-    /// character positions (the unit used by LSP ranges), though replacing a
-    /// non-ASCII character intentionally does not preserve UTF-8 byte offsets.
+    /// Replace every non-code character with one space. An interpolation's
+    /// MACRO token owns its complete range, so its otherwise-code-visible
+    /// interior is masked here as well. This preserves source character
+    /// positions (the unit used by LSP ranges), though replacing a non-ASCII
+    /// character intentionally does not preserve UTF-8 byte offsets.
     pub(crate) fn masked_code(&self) -> MaskedCode {
+        let heredoc_opener =
+            carina_core::heredoc::find_heredoc_opener_range(&self.text).map(|range| {
+                (
+                    self.text[..range.start].chars().count(),
+                    self.text[..range.end].chars().count(),
+                )
+            });
         MaskedCode(
             self.text
                 .chars()
                 .zip(&self.chars)
-                .map(|(ch, classified)| {
-                    if classified.is_code_visible() {
+                .enumerate()
+                .map(|(index, (ch, classified))| {
+                    let inside_heredoc_opener =
+                        heredoc_opener.is_some_and(|(start, end)| index >= start && index < end);
+                    if classified.is_code_visible()
+                        && !classified.is_inside_interpolation()
+                        && !inside_heredoc_opener
+                    {
                         ch
                     } else {
                         ' '
@@ -92,14 +107,6 @@ pub(crate) struct SourcePosition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InterpolationSpan {
     pub(crate) start: SourcePosition,
-    pub(crate) end: Option<SourcePosition>,
-    only_inline_whitespace: bool,
-}
-
-impl InterpolationSpan {
-    pub(crate) fn is_inline_empty(self) -> bool {
-        self.end.is_some() && self.only_inline_whitespace
-    }
 }
 
 #[derive(Debug)]
@@ -118,10 +125,6 @@ pub(crate) enum InterpolationCodeToken {
 impl LexedDocument {
     pub(crate) fn lines(&self) -> &[LexedLine] {
         &self.lines
-    }
-
-    pub(crate) fn interpolations(&self) -> &[InterpolationSpan] {
-        &self.interpolations
     }
 
     /// Whether end-of-input is directly in interpolation expression code.
@@ -211,10 +214,6 @@ impl LexState {
 
     fn last_mut(&mut self) -> Option<&mut Frame> {
         self.frames.last_mut()
-    }
-
-    fn frames(&self) -> &[Frame] {
-        &self.frames
     }
 
     fn end_interpolation_span(&self) -> Option<usize> {
@@ -319,8 +318,6 @@ pub(crate) fn lex(text: &str) -> LexedDocument {
             .end_interpolation_span()
             .filter(|_| !lexed_line.ends_in_line_comment);
         lines.push(lexed_line);
-        mark_open_interpolations_multiline(state.frames(), &mut interpolations);
-
         if let Some((marker, quoted)) = heredoc_start {
             heredoc = Some(HeredocState::new(marker, quoted));
         }
@@ -428,7 +425,7 @@ fn scan_line(
             }
             Some(Frame::Interpolation {
                 brace_depth,
-                span_index,
+                span_index: _,
                 delimiter_kind,
             }) => {
                 if source_chars[i] == ' ' || source_chars[i] == '\t' {
@@ -437,34 +434,29 @@ fn scan_line(
                     continue;
                 }
                 if is_line_comment_start(&source_chars, i) {
-                    mark_interpolation_nonempty(span_index, interpolations);
                     fill_from(&mut chars, i, LexKind::Comment, state);
                     ends_in_line_comment = true;
                     break;
                 }
                 if starts_with(&source_chars, i, '/', '*') {
-                    mark_interpolation_nonempty(span_index, interpolations);
                     set_pair(&mut chars, i, LexKind::Comment, state);
                     state.push(Frame::BlockComment { depth: 1 });
                     i += 2;
                     continue;
                 }
                 if source_chars[i] == '"' {
-                    mark_interpolation_nonempty(span_index, interpolations);
                     chars[i] = classified(LexKind::DoubleQuotedString, state);
                     state.push(Frame::DoubleQuotedString);
                     i += 1;
                     continue;
                 }
                 if source_chars[i] == '\'' {
-                    mark_interpolation_nonempty(span_index, interpolations);
                     chars[i] = classified(LexKind::SingleQuotedString, state);
                     state.push(Frame::SingleQuotedString);
                     i += 1;
                     continue;
                 }
                 if source_chars[i] == '{' {
-                    mark_interpolation_nonempty(span_index, interpolations);
                     chars[i] = classified(LexKind::InterpolationCode, state);
                     if let Some(Frame::Interpolation { brace_depth, .. }) = state.last_mut() {
                         *brace_depth += 1;
@@ -475,13 +467,8 @@ fn scan_line(
                 if source_chars[i] == '}' {
                     if brace_depth == 1 {
                         chars[i] = classified(delimiter_kind, state);
-                        interpolations[span_index].end = Some(SourcePosition {
-                            line: line_index,
-                            character: i as u32 + 1,
-                        });
                         state.pop();
                     } else {
-                        mark_interpolation_nonempty(span_index, interpolations);
                         chars[i] = classified(LexKind::InterpolationCode, state);
                         if let Some(Frame::Interpolation { brace_depth, .. }) = state.last_mut() {
                             *brace_depth -= 1;
@@ -490,7 +477,6 @@ fn scan_line(
                     i += 1;
                     continue;
                 }
-                mark_interpolation_nonempty(span_index, interpolations);
                 chars[i] = classified(LexKind::InterpolationCode, state);
                 i += 1;
             }
@@ -541,8 +527,6 @@ fn start_interpolation(
             line,
             character: index as u32,
         },
-        end: None,
-        only_inline_whitespace: true,
     });
     state.push(Frame::Interpolation {
         brace_depth: 1,
@@ -600,18 +584,6 @@ fn is_line_comment_start(chars: &[char], index: usize) -> bool {
     chars.get(index) == Some(&'#') || starts_with(chars, index, '/', '/')
 }
 
-fn mark_interpolation_nonempty(span_index: usize, interpolations: &mut [InterpolationSpan]) {
-    interpolations[span_index].only_inline_whitespace = false;
-}
-
-fn mark_open_interpolations_multiline(frames: &[Frame], interpolations: &mut [InterpolationSpan]) {
-    for frame in frames {
-        if let Frame::Interpolation { span_index, .. } = frame {
-            interpolations[*span_index].only_inline_whitespace = false;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,23 +603,6 @@ mod tests {
                 lexed.lines().iter().any(LexedLine::is_heredoc_body),
                 "the LSP lexer must recognize the same heredoc: {input:?}"
             );
-        }
-    }
-
-    #[test]
-    fn heredoc_body_punctuation_does_not_leak_lexical_state() {
-        for body in ["it's", "rm -rf /tmp/*"] {
-            let input = format!("let note = <<EOT\n{body}\nEOT\nlet value = \"${{}}\"");
-            let lexed = lex(&input);
-            let empty: Vec<_> = lexed
-                .interpolations()
-                .iter()
-                .copied()
-                .filter(|span| span.is_inline_empty())
-                .collect();
-
-            assert_eq!(empty.len(), 1, "body: {body:?}");
-            assert_eq!(empty[0].start.line, 3, "body: {body:?}");
         }
     }
 

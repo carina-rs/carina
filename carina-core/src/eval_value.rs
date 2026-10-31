@@ -21,8 +21,13 @@
 //! See #2230 for the design discussion.
 
 use crate::parser::{PendingValueSlot, ResourceTypePath};
-use crate::resource::{PathSegment, Subscript, Value};
+use crate::resource::{
+    DiagnosticSourceSpan, LoopSlot, NoPlaceholder, ParserPlaceholder, PathSegment, Subscript,
+    Value as GenericValue,
+};
 use indexmap::IndexMap;
+
+type Value = GenericValue<ParserPlaceholder>;
 
 /// Parser-only representation of a structural binding used as an operand.
 ///
@@ -106,9 +111,15 @@ impl StructuralHandleKind {
 /// is known to be a structural handle.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StructuralHandleMetadata {
-    Handle { access_base: Option<Value> },
+    Handle {
+        access_base: Option<Value>,
+    },
     List(Vec<Option<StructuralHandleMetadata>>),
     Map(IndexMap<String, StructuralHandleMetadata>),
+    /// Provisional handles consumed by a computed scalar expression. This
+    /// preserves every operand for the directory fixed point without making
+    /// the scalar result itself look like a handle alias.
+    ExpressionOperands(Vec<StructuralHandleMetadata>),
 }
 
 impl StructuralHandleMetadata {
@@ -119,8 +130,21 @@ impl StructuralHandleMetadata {
     pub(crate) fn access_base(&self) -> Option<&Value> {
         match self {
             Self::Handle { access_base } => access_base.as_ref(),
-            Self::List(_) | Self::Map(_) => None,
+            Self::List(_) | Self::Map(_) | Self::ExpressionOperands(_) => None,
         }
+    }
+
+    pub(crate) fn from_expression_operands(
+        operands: impl IntoIterator<Item = Option<Self>>,
+    ) -> Option<Self> {
+        let mut collected = Vec::new();
+        for operand in operands.into_iter().flatten() {
+            match operand {
+                Self::ExpressionOperands(nested) => collected.extend(nested),
+                other => collected.push(other),
+            }
+        }
+        (!collected.is_empty()).then_some(Self::ExpressionOperands(collected))
     }
 
     pub(crate) fn select(&self, step: &PathSegment) -> Option<Self> {
@@ -142,8 +166,40 @@ impl StructuralHandleMetadata {
                     index: Subscript::Str { key },
                 },
             ) => entries.get(key.expose_plaintext()).cloned(),
-            (Self::Handle { .. }, _) | (Self::List(_), _) | (Self::Map(_), _) => None,
+            (Self::Handle { .. }, _)
+            | (Self::List(_), _)
+            | (Self::Map(_), _)
+            | (Self::ExpressionOperands(_), _) => None,
         }
+    }
+
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::Handle { access_base } => {
+                if let Some(value) = access_base {
+                    visit(value)?;
+                }
+            }
+            Self::List(items) => {
+                for item in items.iter().flatten() {
+                    item.try_visit_values(visit)?;
+                }
+            }
+            Self::Map(entries) => {
+                for item in entries.values() {
+                    item.try_visit_values(visit)?;
+                }
+            }
+            Self::ExpressionOperands(operands) => {
+                for operand in operands {
+                    operand.try_visit_values(visit)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -210,17 +266,14 @@ impl StructuralHandle {
     pub(crate) fn access_base_value(&self) -> Value {
         let binding = self.canonical_binding_name();
         match &self.kind {
-            StructuralHandleKind::ModuleParameter => {
-                Value::Deferred(crate::resource::DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ModuleArgument {
-                        name: binding.to_string(),
-                        source_line: (0).into(),
-                        diagnostic_name: None,
-                    },
-                ))
-            }
+            StructuralHandleKind::ModuleParameter => Value::Deferred(
+                crate::resource::DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument {
+                    name: binding.to_string(),
+                    diagnostic: Default::default(),
+                }),
+            ),
             StructuralHandleKind::FunctionParameter => Value::Deferred(
-                crate::resource::DeferredValue::Unknown(crate::resource::UnknownReason::FnParam {
+                crate::resource::DeferredValue::Placeholder(ParserPlaceholder::FnParam {
                     name: binding.to_string(),
                 }),
             ),
@@ -295,8 +348,8 @@ pub(crate) enum EvalValue {
     /// Deferred-for loop value before the iterable is available. Keeping the
     /// authored binding name on the evaluator axis lets a postfix chain retain
     /// `item.missing` for plan display without resurrecting the removed
-    /// path-carrying `UnknownReason` variant.
-    DeferredForValue { binding: String },
+    /// path-carrying `ApplyTimeUnknown` variant.
+    DeferredForValue { binding: String, slot: LoopSlot },
 
     /// A partially applied function. Lives strictly inside the evaluator.
     /// Constructed when `evaluate_builtin` or a user-function call sees
@@ -359,6 +412,10 @@ impl EvalValue {
         Self::User(value)
     }
 
+    pub(crate) fn from_expanded_value(value: GenericValue<NoPlaceholder>) -> Self {
+        Self::User(value.into_placeholder_type())
+    }
+
     /// Build a closure value from its parts.
     pub(crate) fn closure(
         name: impl Into<String>,
@@ -388,12 +445,12 @@ impl EvalValue {
 
     /// Stamp a neutral module-parameter placeholder with the authored use
     /// site. Other evaluator values pass through unchanged.
-    pub(crate) fn with_reference_source_line(mut self, line: usize) -> Self {
-        if let Self::User(Value::Deferred(crate::resource::DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument { source_line, .. },
+    pub(crate) fn with_reference_source(mut self, source: DiagnosticSourceSpan) -> Self {
+        if let Self::User(Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            ParserPlaceholder::ModuleArgument { diagnostic, .. },
         ))) = &mut self
         {
-            *source_line = line.into();
+            diagnostic.stamp_authored_source(source);
         }
         self
     }
@@ -405,9 +462,10 @@ impl EvalValue {
         }
     }
 
-    pub(crate) fn deferred_for_value(binding: impl Into<String>) -> Self {
+    pub(crate) fn deferred_for_value(binding: impl Into<String>, slot: LoopSlot) -> Self {
         Self::DeferredForValue {
             binding: binding.into(),
+            slot,
         }
     }
 
@@ -465,9 +523,9 @@ impl EvalValue {
                 ))
             }
             Self::ComputedWithStructuralHandles { value, metadata } => Ok((value, Some(metadata))),
-            Self::DeferredForValue { .. } => Ok((
-                Value::Deferred(crate::resource::DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ForValue,
+            Self::DeferredForValue { slot, .. } => Ok((
+                Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                    ParserPlaceholder::Loop(slot),
                 )),
                 None,
             )),
@@ -539,8 +597,8 @@ impl EvalValue {
                 crate::resource::DeferredValue::BindingRef { binding },
             )),
             Self::ComputedWithStructuralHandles { value, .. } => Ok(value),
-            Self::DeferredForValue { .. } => Ok(Value::Deferred(
-                crate::resource::DeferredValue::Unknown(crate::resource::UnknownReason::ForValue),
+            Self::DeferredForValue { slot, .. } => Ok(Value::Deferred(
+                crate::resource::DeferredValue::Placeholder(ParserPlaceholder::Loop(slot)),
             )),
             Self::Closure {
                 name,
@@ -551,6 +609,13 @@ impl EvalValue {
                 remaining_arity,
             })),
         }
+    }
+
+    pub(crate) fn into_expanded_value(self) -> Result<GenericValue<NoPlaceholder>, String> {
+        self.into_value()
+            .map_err(|error| error.to_string())?
+            .into_expanded()
+            .map_err(|error| error.to_string())
     }
 }
 

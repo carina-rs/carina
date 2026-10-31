@@ -136,6 +136,7 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
         unique_name,
         operation_config,
         field_groups,
+        default_prevent_destroy,
         default_wait_timeout,
         default_wait_interval,
         defs,
@@ -156,6 +157,7 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
     encoder.option(operation_config.as_ref(), encode_operation_config);
 
     encode_field_groups(encoder, field_groups);
+    encoder.bool(*default_prevent_destroy);
 
     encoder.option(default_wait_timeout.as_ref(), |encoder, duration| {
         encode_duration(encoder, *duration);

@@ -6,6 +6,7 @@ mod ast;
 mod blocks;
 mod config;
 mod context;
+mod deferred_if;
 mod entry;
 mod error;
 mod expressions;
@@ -17,22 +18,41 @@ mod static_eval;
 mod types;
 mod util;
 
+pub(crate) type ParsedValue = crate::resource::Value<crate::resource::ParserPlaceholder>;
+pub(crate) type ParsedResource =
+    crate::resource::Resource<crate::resource::ModuleSource, crate::resource::ParserPlaceholder>;
+pub(crate) type ParsedDataSource =
+    crate::resource::DataSource<crate::resource::ModuleSource, crate::resource::ParserPlaceholder>;
+pub(crate) type ParsedFunctionArgument =
+    crate::resource::FunctionArgument<crate::resource::ParserPlaceholder>;
+pub(crate) type ParserProviderConfig = ast::ProviderConfig<crate::resource::ParserPlaceholder>;
+pub(crate) type ParserBackendConfig = ast::BackendConfig<crate::resource::ParserPlaceholder>;
+pub(crate) type ParserStateBlock = ast::StateBlock<crate::resource::ParserPlaceholder>;
+pub(crate) type ParserWaitBinding = ast::WaitBinding;
+pub(crate) type ParserUntilPredicate = ast::UntilPredicateAst;
+pub(crate) type ParserValidateExpr = ast::ValidateExpr<crate::resource::ParserPlaceholder>;
+pub(crate) type ParserValidationBlock = ast::ValidationBlock<crate::resource::ParserPlaceholder>;
+pub(crate) type ParserRequireBlock = ast::RequireBlock<crate::resource::ParserPlaceholder>;
+
 pub use crate::eval_value::StructuralHandleKind;
 pub use ast::{
     ArgumentOrigin, ArgumentParameter, AttributeParameter, AttributePath, AttributePathSegment,
     AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingName,
     BindingScopeId, BindingUseOwner, CallExpansion, ConsumerArgumentParameter,
     ConsumerAttributeParameter, DeferredForBody, DeferredForExpansionError, DeferredForExpression,
-    DeferredForPhaseTraversal, DeferredForSite, DeferredForTarget, ExpansionKey, ExportParamLike,
-    ExportParameter, File, FnParam, InferredExportParam, InferredFile, ModuleArgument, ModuleCall,
-    ModuleCallDiagnosticSource, ModuleCallId, ModuleResolvedFile, ModuleResolvedInferredFile,
-    ModuleResolvedParsedFile, MovedAddresses, ParsedBindingUses, ParsedDeferredForExpression,
-    ParsedDeferredForPhase, ParsedExportParam, ParsedFile, ParserBindingMetadata, PendingValueSlot,
-    ProviderConfig, RequireBlock, ResolvedDeferredForExpressions, ResolvedDeferredForPhase,
-    ResourceAddress, ResourceContext, ResourceMut, ResourceRef, ResourceTypePath,
-    SavedDeferredForExpression, ShapeMismatch, SourceFileId, SourceSpan, StateBlock,
-    StateBlockAddress, TypeExpr, UntilPredicateAst, UpstreamState, UseStatement, UserFunction,
-    UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
+    DeferredForPhaseTraversal, DeferredForSite, DeferredForTarget, ExpandedFile,
+    ExpandedInferredExportParam, ExpandedInferredFile, ExpandedParsedFile, ExpansionKey,
+    ExportParamLike, ExportParameter, File, FnParam, InferredExportParam, InferredFile,
+    IntoExpandedExportParam, ModuleArgument, ModuleCall, ModuleCallDiagnosticSource, ModuleCallId,
+    ModuleResolvedFile, ModuleResolvedInferredFile, ModuleResolvedParsedFile, MovedAddresses,
+    ParsedBindingUses, ParsedDeferredForExpression, ParsedDeferredForPhase, ParsedExportParam,
+    ParsedFile, ParserBindingMetadata, ParserDeferredForPhaseAudit, ParserPlaceholderBoundary,
+    PendingValueSlot, ProviderConfig, RequireBlock, ResolvedDeferredForExpressions,
+    ResolvedDeferredForPhase, ResourceAddress, ResourceContext, ResourceMut, ResourceRef,
+    ResourceTypePath, SavedDeferredForExpression, ShapeMismatch, SourceFileId, SourceSpan,
+    StateBlock, StateBlockAddress, TopLevelResourceRef, TypeExpr, UntilPredicateAst, UpstreamState,
+    UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding,
+    expand_deferred_children,
 };
 pub(crate) use ast::{
     BareBindingSource, DeferredForResourceExpressionError, ParsedBareBindingUse,
@@ -47,6 +67,7 @@ pub use config::{
 };
 #[cfg(test)]
 pub(crate) use config::{fixture_custom_type_rejection, fixture_invalid_custom_type_value};
+pub use deferred_if::{DeferredIfBody, DeferredIfCondition, DeferredStructuralIf, DeferredValueIf};
 pub use entry::{
     AnonymousResourceSourceSpan, TopLevelBlockSourceSpan, parse_file, parse_file_and_resolve,
     top_level_anonymous_resource_spans, top_level_backend_block_spans,
@@ -64,8 +85,8 @@ pub(crate) use entry::{
 };
 pub use error::{
     DeferredForBodyKind, DeferredForBodyUnsupportedError, DeferredForIterableResolution,
-    ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
-    UnresolvedTypeToken, WarningKind,
+    NON_LITERAL_PREVENT_DESTROY_WARNING_MESSAGE, ParseError, ParseWarning, ParseWarningSpan,
+    SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE, UnresolvedTypeToken, WarningKind,
 };
 pub(crate) use expressions::string_literal::{
     display_double_quoted_literal_part, escape_double_quoted_character, unescape_string,
@@ -110,7 +131,9 @@ pub(crate) use context::{ParseContext, extract_key_string, first_inner, next_pai
 pub use expressions::for_expr::ForBinding;
 pub use expressions::validate_expr::CompareOp;
 pub(crate) use let_binding::{LetBindingKind, LetBindingRhs, if_structural_handle};
-pub(crate) use static_eval::{evaluate_static_value, is_static_eval, is_static_value};
+pub(crate) use static_eval::{
+    decide_if_condition, evaluate_static_value, is_static_eval, is_static_value,
+};
 
 #[cfg(test)]
 mod tests;

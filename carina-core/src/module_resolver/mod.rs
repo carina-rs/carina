@@ -19,6 +19,7 @@
 //!   `resolve_modules*` top-level entry points.
 //! - `validation`: expression evaluator for `validate` and `require` blocks.
 
+mod deferred_if;
 mod error;
 mod expander;
 mod loader;
@@ -36,9 +37,10 @@ pub use resolver::{
     ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticResult,
     RefCheckedModuleGraph, ResidualModuleResolutionDiagnostic, ResidualModuleResolutionError,
     ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
-    ResolvedModuleConstraintStatus, resolve_modules_providerless, resolve_modules_with_config,
-    resolve_modules_with_diagnostics, resolve_modules_with_providerless_config,
-    resolve_modules_with_providerless_diagnostics,
+    ResolvedModuleConstraintStatus, ensure_expanded_root_graph,
+    resolve_module_template_with_config, resolve_module_template_with_providerless_config,
+    resolve_modules_providerless, resolve_modules_with_config, resolve_modules_with_diagnostics,
+    resolve_modules_with_providerless_config, resolve_modules_with_providerless_diagnostics,
 };
 pub(crate) use resolver::{
     resolve_upstream_modules_with_config, resolve_upstream_modules_with_providerless_config,

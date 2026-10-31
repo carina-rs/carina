@@ -9,7 +9,8 @@ use crate::parser::{
 };
 use crate::resource::{
     AccessMissPolicy, ConcreteValue, DeferredValue, LiveComposition, ModuleConstraintId,
-    PendingModuleConstraint, ResourceId, Value, apply_value_path_segment,
+    NoPlaceholder, PendingModuleConstraint, PlaceholderKind, ResourceId, Value,
+    apply_value_path_segment,
 };
 
 use super::ModuleError;
@@ -168,23 +169,26 @@ pub enum ModuleConstraintKind {
 /// and apply re-evaluate the subset that was pending during expansion and was
 /// retained on the composition. Both paths enter the same evaluator.
 #[derive(Clone, Copy)]
-pub enum ModuleConstraints<'a> {
+pub enum ModuleConstraints<'a, P: PlaceholderKind = NoPlaceholder> {
     Declarations {
-        arguments: &'a [ArgumentParameter],
-        requires: &'a [RequireBlock],
+        arguments: &'a [ArgumentParameter<crate::parser::TypeExpr, P>],
+        requires: &'a [RequireBlock<P>],
     },
-    Pending(&'a [PendingModuleConstraint]),
+    Pending(&'a [PendingModuleConstraint<P>]),
 }
 
-impl<'a> ModuleConstraints<'a> {
-    pub fn declarations(arguments: &'a [ArgumentParameter], requires: &'a [RequireBlock]) -> Self {
+impl<'a, P: PlaceholderKind> ModuleConstraints<'a, P> {
+    pub fn declarations(
+        arguments: &'a [ArgumentParameter<crate::parser::TypeExpr, P>],
+        requires: &'a [RequireBlock<P>],
+    ) -> Self {
         Self::Declarations {
             arguments,
             requires,
         }
     }
 
-    pub fn pending(constraints: &'a [PendingModuleConstraint]) -> Self {
+    pub fn pending(constraints: &'a [PendingModuleConstraint<P>]) -> Self {
         Self::Pending(constraints)
     }
 }
@@ -192,16 +196,16 @@ impl<'a> ModuleConstraints<'a> {
 /// One authored module constraint together with its evaluation at the current
 /// resolution boundary.
 #[derive(Debug, Clone, PartialEq)]
-pub struct EvaluatedModuleConstraint {
-    constraint: PendingModuleConstraint,
+pub struct EvaluatedModuleConstraint<P: PlaceholderKind = NoPlaceholder> {
+    constraint: PendingModuleConstraint<P>,
     kind: ModuleConstraintKind,
     arguments: Vec<String>,
     actuals: Vec<(String, String)>,
     evaluation: ConstraintEvaluation,
 }
 
-impl EvaluatedModuleConstraint {
-    pub fn constraint(&self) -> &PendingModuleConstraint {
+impl<P: PlaceholderKind> EvaluatedModuleConstraint<P> {
+    pub fn constraint(&self) -> &PendingModuleConstraint<P> {
         &self.constraint
     }
 
@@ -221,7 +225,7 @@ impl EvaluatedModuleConstraint {
         &self.evaluation
     }
 
-    pub fn into_constraint(self) -> PendingModuleConstraint {
+    pub fn into_constraint(self) -> PendingModuleConstraint<P> {
         self.constraint
     }
 
@@ -279,10 +283,10 @@ impl EvaluatedModuleConstraint {
 /// Collect and evaluate every module constraint using the language's single
 /// scoping rule: an argument-local `validation` sees only its own argument;
 /// a module-level `require` sees every argument.
-pub fn evaluate_module_constraints(
-    constraints: ModuleConstraints<'_>,
-    argument_values: &HashMap<String, Value>,
-) -> Vec<EvaluatedModuleConstraint> {
+pub fn evaluate_module_constraints<P: PlaceholderKind>(
+    constraints: ModuleConstraints<'_, P>,
+    argument_values: &HashMap<String, Value<P>>,
+) -> Vec<EvaluatedModuleConstraint<P>> {
     let definitions = match constraints {
         ModuleConstraints::Declarations {
             arguments,
@@ -415,9 +419,9 @@ pub fn evaluate_module_constraints(
 /// expression branch may accidentally turn an unresolved value into an
 /// evaluation error. Concrete collections are ordinary expression values, so
 /// functions such as `length()` do not need a variable-only escape hatch.
-pub fn evaluate_constraint(
-    expr: &ValidateExpr,
-    arguments: &HashMap<String, Value>,
+pub fn evaluate_constraint<P: PlaceholderKind>(
+    expr: &ValidateExpr<P>,
+    arguments: &HashMap<String, Value<P>>,
     message: impl Into<String>,
 ) -> ConstraintEvaluation {
     match evaluate_constraint_inner(expr, arguments, message.into()) {
@@ -426,9 +430,9 @@ pub fn evaluate_constraint(
     }
 }
 
-fn evaluate_constraint_inner(
-    expr: &ValidateExpr,
-    arguments: &HashMap<String, Value>,
+fn evaluate_constraint_inner<P: PlaceholderKind>(
+    expr: &ValidateExpr<P>,
+    arguments: &HashMap<String, Value<P>>,
     message: String,
 ) -> Result<ConstraintEvaluation, String> {
     let referenced = referenced_constraint_arguments(expr);
@@ -456,8 +460,8 @@ fn evaluate_constraint_inner(
 }
 
 /// Return the variables referenced by an expression in stable name order.
-pub fn referenced_constraint_arguments(expr: &ValidateExpr) -> Vec<String> {
-    fn collect(expr: &ValidateExpr, names: &mut BTreeSet<String>) {
+pub fn referenced_constraint_arguments<P: PlaceholderKind>(expr: &ValidateExpr<P>) -> Vec<String> {
+    fn collect<P: PlaceholderKind>(expr: &ValidateExpr<P>, names: &mut BTreeSet<String>) {
         match expr {
             ValidateExpr::Var(name) => {
                 names.insert(name.clone());
@@ -467,6 +471,7 @@ pub fn referenced_constraint_arguments(expr: &ValidateExpr) -> Vec<String> {
                 names.insert(argument.clone());
             }
             ValidateExpr::Compare { lhs, rhs, .. }
+            | ValidateExpr::IntegerArithmetic { lhs, rhs, .. }
             | ValidateExpr::And(lhs, rhs)
             | ValidateExpr::Or(lhs, rhs) => {
                 collect(lhs, names);
@@ -671,6 +676,17 @@ fn resolve_bound_constraint_values(
             op: op.clone(),
             rhs: Box::new(resolve_bound_constraint_values(rhs, bindings, errors)),
         },
+        ValidateExpr::IntegerArithmetic {
+            lhs,
+            op,
+            rhs,
+            operator_span,
+        } => ValidateExpr::IntegerArithmetic {
+            lhs: Box::new(resolve_bound_constraint_values(lhs, bindings, errors)),
+            op: *op,
+            rhs: Box::new(resolve_bound_constraint_values(rhs, bindings, errors)),
+            operator_span: *operator_span,
+        },
         ValidateExpr::And(lhs, rhs) => ValidateExpr::And(
             Box::new(resolve_bound_constraint_values(lhs, bindings, errors)),
             Box::new(resolve_bound_constraint_values(rhs, bindings, errors)),
@@ -707,6 +723,7 @@ fn raw_constraint_arguments(expression: &ValidateExpr) -> BTreeSet<String> {
                 out.insert(argument.clone());
             }
             ValidateExpr::Compare { lhs, rhs, .. }
+            | ValidateExpr::IntegerArithmetic { lhs, rhs, .. }
             | ValidateExpr::And(lhs, rhs)
             | ValidateExpr::Or(lhs, rhs) => {
                 collect(lhs, out);
@@ -733,9 +750,9 @@ fn raw_constraint_arguments(expression: &ValidateExpr) -> BTreeSet<String> {
     out
 }
 
-fn constraint_actuals(
+fn constraint_actuals<P: PlaceholderKind>(
     arguments: &[String],
-    values: &HashMap<String, Value>,
+    values: &HashMap<String, Value<P>>,
 ) -> Vec<(String, String)> {
     arguments
         .iter()
@@ -749,13 +766,13 @@ fn constraint_actuals(
         .collect()
 }
 
-fn constraint_actuals_for_expression(
-    expression: &ValidateExpr,
+fn constraint_actuals_for_expression<P: PlaceholderKind>(
+    expression: &ValidateExpr<P>,
     arguments: &[String],
-    values: &HashMap<String, Value>,
+    values: &HashMap<String, Value<P>>,
 ) -> Vec<(String, String)> {
-    fn collect(
-        expression: &ValidateExpr,
+    fn collect<P: PlaceholderKind>(
+        expression: &ValidateExpr<P>,
         actuals: &mut std::collections::BTreeMap<String, String>,
     ) {
         match expression {
@@ -772,6 +789,7 @@ fn constraint_actuals_for_expression(
                 actuals.insert(operand.clone(), format_constraint_actual(value));
             }
             ValidateExpr::Compare { lhs, rhs, .. }
+            | ValidateExpr::IntegerArithmetic { lhs, rhs, .. }
             | ValidateExpr::And(lhs, rhs)
             | ValidateExpr::Or(lhs, rhs) => {
                 collect(lhs, actuals);
@@ -803,7 +821,7 @@ fn constraint_actuals_for_expression(
     }
 }
 
-fn format_constraint_actual(value: &Value) -> String {
+fn format_constraint_actual<P: PlaceholderKind>(value: &Value<P>) -> String {
     match value {
         Value::Concrete(ConcreteValue::String(value)) => value
             .diagnostic_literal()
@@ -845,7 +863,7 @@ fn format_constraint_actual(value: &Value) -> String {
     }
 }
 
-fn is_recursively_concrete(value: &Value) -> bool {
+fn is_recursively_concrete<P: PlaceholderKind>(value: &Value<P>) -> bool {
     match value {
         Value::Concrete(ConcreteValue::List(items)) => items.iter().all(is_recursively_concrete),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().all(is_recursively_concrete),
@@ -856,12 +874,12 @@ fn is_recursively_concrete(value: &Value) -> bool {
 }
 
 #[derive(Clone)]
-enum EvalValue {
-    Value(Value),
+enum EvalValue<P: PlaceholderKind = NoPlaceholder> {
+    Value(Value<P>),
     Null,
 }
 
-impl EvalValue {
+impl<P: PlaceholderKind> EvalValue<P> {
     fn kind_name(&self) -> &'static str {
         match self {
             Self::Null => "null",
@@ -876,11 +894,15 @@ impl EvalValue {
                 ConcreteValue::List(_) | ConcreteValue::StringList(_) => "list",
                 ConcreteValue::Map(_) => "map",
             },
+            Self::Value(Value::Deferred(DeferredValue::ModuleIf(_))) => "module conditional",
             Self::Value(Value::Deferred(DeferredValue::Secret(_))) => "secret",
             Self::Value(Value::Deferred(DeferredValue::RedactedSecret { .. })) => "secret",
             Self::Value(Value::Deferred(DeferredValue::ResourceRef { .. })) => "resource reference",
             Self::Value(Value::Deferred(DeferredValue::BindingRef { .. })) => "binding reference",
             Self::Value(Value::Deferred(DeferredValue::Coalesce { .. })) => "coalesce expression",
+            Self::Value(Value::Deferred(DeferredValue::IntegerArithmetic(_))) => {
+                "integer arithmetic expression"
+            }
             Self::Value(Value::Deferred(DeferredValue::Interpolation(_))) => "interpolation",
             Self::Value(Value::Deferred(DeferredValue::FunctionCall { .. })) => "function call",
             Self::Value(Value::Deferred(DeferredValue::Unavailable { .. })) => {
@@ -891,6 +913,7 @@ impl EvalValue {
             }
             Self::Value(Value::Deferred(DeferredValue::Access(_))) => "access expression",
             Self::Value(Value::Deferred(DeferredValue::Unknown(_))) => "unknown",
+            Self::Value(Value::Deferred(DeferredValue::Placeholder(_))) => "placeholder",
         }
     }
 
@@ -905,7 +928,10 @@ impl EvalValue {
     }
 }
 
-fn eval_expr(expr: &ValidateExpr, arguments: &HashMap<String, Value>) -> Result<EvalValue, String> {
+fn eval_expr<P: PlaceholderKind>(
+    expr: &ValidateExpr<P>,
+    arguments: &HashMap<String, Value<P>>,
+) -> Result<EvalValue<P>, String> {
     match expr {
         ValidateExpr::Bool(value) => Ok(value_from(ConcreteValue::Bool(*value))),
         ValidateExpr::Int(value) => Ok(value_from(ConcreteValue::Int(*value))),
@@ -925,6 +951,32 @@ fn eval_expr(expr: &ValidateExpr, arguments: &HashMap<String, Value>) -> Result<
             apply_constraint_path(base, path).map(|value| value_for_evaluation(&value))
         }
         ValidateExpr::BoundArgument { value, .. } => Ok(value_for_evaluation(value)),
+        ValidateExpr::IntegerArithmetic { lhs, op, rhs, .. } => {
+            let lhs = eval_expr(lhs, arguments)?;
+            let rhs = eval_expr(rhs, arguments)?;
+            let lhs = match lhs {
+                EvalValue::Value(Value::Concrete(ConcreteValue::Int(value))) => value,
+                other => {
+                    return Err(format!(
+                        "left operand of {op} must be int, got {}",
+                        other.kind_name()
+                    ));
+                }
+            };
+            let rhs = match rhs {
+                EvalValue::Value(Value::Concrete(ConcreteValue::Int(value))) => value,
+                other => {
+                    return Err(format!(
+                        "right operand of {op} must be int, got {}",
+                        other.kind_name()
+                    ));
+                }
+            };
+            crate::integer_arithmetic::evaluate_checked_integer(lhs, *op, rhs)
+                .map(ConcreteValue::Int)
+                .map(value_from)
+                .map_err(|error| error.to_string())
+        }
         ValidateExpr::Compare { lhs, op, rhs } => {
             let left = eval_expr(lhs, arguments)?;
             let right = eval_expr(rhs, arguments)?;
@@ -954,10 +1006,10 @@ fn eval_expr(expr: &ValidateExpr, arguments: &HashMap<String, Value>) -> Result<
     }
 }
 
-fn apply_constraint_path(
-    mut value: Value,
+fn apply_constraint_path<P: PlaceholderKind>(
+    mut value: Value<P>,
     path: &[crate::resource::PathSegment],
-) -> Result<Value, String> {
+) -> Result<Value<P>, String> {
     for step in path {
         value = apply_value_path_segment(value, step.clone(), 0, AccessMissPolicy::Error)
             .and_then(crate::resource::ValuePathSegmentResult::into_value)
@@ -966,9 +1018,9 @@ fn apply_constraint_path(
     Ok(value)
 }
 
-fn constraint_inputs_are_concrete(
-    expr: &ValidateExpr,
-    arguments: &HashMap<String, Value>,
+fn constraint_inputs_are_concrete<P: PlaceholderKind>(
+    expr: &ValidateExpr<P>,
+    arguments: &HashMap<String, Value<P>>,
 ) -> Result<bool, String> {
     match expr {
         ValidateExpr::Var(name) => arguments
@@ -984,6 +1036,7 @@ fn constraint_inputs_are_concrete(
         }
         ValidateExpr::BoundArgument { value, .. } => Ok(is_recursively_concrete(value)),
         ValidateExpr::Compare { lhs, rhs, .. }
+        | ValidateExpr::IntegerArithmetic { lhs, rhs, .. }
         | ValidateExpr::And(lhs, rhs)
         | ValidateExpr::Or(lhs, rhs) => Ok(constraint_inputs_are_concrete(lhs, arguments)?
             && constraint_inputs_are_concrete(rhs, arguments)?),
@@ -1005,18 +1058,22 @@ fn constraint_inputs_are_concrete(
     }
 }
 
-fn value_from(value: ConcreteValue) -> EvalValue {
+fn value_from<P: PlaceholderKind>(value: ConcreteValue<P>) -> EvalValue<P> {
     EvalValue::Value(Value::Concrete(value))
 }
 
-fn value_for_evaluation(value: &Value) -> EvalValue {
+fn value_for_evaluation<P: PlaceholderKind>(value: &Value<P>) -> EvalValue<P> {
     match value {
         Value::Deferred(DeferredValue::Secret(inner)) => value_for_evaluation(inner),
         other => EvalValue::Value(other.clone()),
     }
 }
 
-fn compare_values(left: &EvalValue, op: &CompareOp, right: &EvalValue) -> Result<bool, String> {
+fn compare_values<P: PlaceholderKind>(
+    left: &EvalValue<P>,
+    op: &CompareOp,
+    right: &EvalValue<P>,
+) -> Result<bool, String> {
     match (left, right) {
         (EvalValue::Null, EvalValue::Null) => return Ok(matches!(op, CompareOp::Eq)),
         (EvalValue::Null, _) | (_, EvalValue::Null) => {
@@ -1100,11 +1157,11 @@ fn compare_equality<T: PartialEq>(
     }
 }
 
-fn eval_function(
+fn eval_function<P: PlaceholderKind>(
     name: &str,
-    args: &[ValidateExpr],
-    arguments: &HashMap<String, Value>,
-) -> Result<EvalValue, String> {
+    args: &[ValidateExpr<P>],
+    arguments: &HashMap<String, Value<P>>,
+) -> Result<EvalValue<P>, String> {
     match name {
         "len" | "length" => {
             if args.len() != 1 {
@@ -1140,6 +1197,8 @@ mod tests {
 
     use super::*;
 
+    type ValidateExpr = crate::parser::ValidateExpr<crate::resource::NoPlaceholder>;
+
     fn redacted_secret() -> Value {
         Value::Deferred(DeferredValue::RedactedSecret {
             hash: crate::resource::RedactedSecretHash::generate(b"validation-test"),
@@ -1155,6 +1214,82 @@ mod tests {
             op: CompareOp::Gte,
             rhs: Box::new(ValidateExpr::Int(minimum)),
         }
+    }
+
+    fn integer_arithmetic(
+        lhs: ValidateExpr,
+        op: crate::integer_arithmetic::IntegerOp,
+        rhs: ValidateExpr,
+    ) -> ValidateExpr {
+        ValidateExpr::IntegerArithmetic {
+            lhs: Box::new(lhs),
+            op,
+            rhs: Box::new(rhs),
+            operator_span: crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+        }
+    }
+
+    #[test]
+    fn require_and_argument_validation_use_checked_integer_arithmetic() {
+        use crate::integer_arithmetic::IntegerOp;
+
+        let even = ValidateExpr::Compare {
+            lhs: Box::new(integer_arithmetic(
+                ValidateExpr::Var("count".to_string()),
+                IntegerOp::Remainder,
+                ValidateExpr::Int(2),
+            )),
+            op: CompareOp::Eq,
+            rhs: Box::new(ValidateExpr::Int(0)),
+        };
+        assert_eq!(
+            evaluate_constraint(
+                &even,
+                &HashMap::from([("count".to_string(), Value::Concrete(ConcreteValue::Int(4)),)]),
+                "count must be even",
+            ),
+            ConstraintEvaluation::Satisfied
+        );
+        assert!(matches!(
+            evaluate_constraint(
+                &even,
+                &HashMap::from([("count".to_string(), Value::Concrete(ConcreteValue::Int(3)),)]),
+                "count must be even",
+            ),
+            ConstraintEvaluation::Violated(_)
+        ));
+
+        let divide = ValidateExpr::Compare {
+            lhs: Box::new(integer_arithmetic(
+                ValidateExpr::Int(10),
+                IntegerOp::Divide,
+                ValidateExpr::Var("divisor".to_string()),
+            )),
+            op: CompareOp::Gt,
+            rhs: Box::new(ValidateExpr::Int(0)),
+        };
+        assert!(matches!(
+            evaluate_constraint(
+                &divide,
+                &HashMap::from([(
+                    "divisor".to_string(),
+                    Value::resource_ref("producer", "divisor", Vec::new()),
+                )]),
+                "positive",
+            ),
+            ConstraintEvaluation::Pending
+        ));
+        assert!(matches!(
+            evaluate_constraint(
+                &divide,
+                &HashMap::from([(
+                    "divisor".to_string(),
+                    Value::Concrete(ConcreteValue::Int(0)),
+                )]),
+                "positive",
+            ),
+            ConstraintEvaluation::EvalError(error) if error.contains("division by zero")
+        ));
     }
 
     #[test]

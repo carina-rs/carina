@@ -145,7 +145,8 @@ async fn run_init_with_provider_resolver(
                 base_dir.display()
             )
         })?;
-        let resolved_count = resolve_providers(&install_lock, &loaded.parsed.providers, mode)?;
+        let provider_configs = crate::wiring::provider_loading_configs(&loaded.parsed.providers);
+        let resolved_count = resolve_providers(&install_lock, &provider_configs, mode)?;
 
         println!(
             "{}",
@@ -157,7 +158,14 @@ async fn run_init_with_provider_resolver(
         );
     }
 
-    let backend_config = loaded.parsed.backend.as_ref();
+    let backend_config = loaded
+        .parsed
+        .backend
+        .clone()
+        .map(carina_core::parser::BackendConfig::into_expanded)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let backend_config = backend_config.as_ref();
     let mut migration_pending = false;
 
     match inspect_backend_drift(base_dir, backend_config).map_err(|e| e.to_string())? {
@@ -372,7 +380,11 @@ mod tests {
             &carina_core::schema::SchemaRegistry::new(),
         )
         .unwrap();
-        let config = loaded.parsed.providers.first().unwrap();
+        let parsed = loaded
+            .parsed
+            .into_expanded()
+            .expect("provider fixture contains no parser placeholders");
+        let config = parsed.providers.first().unwrap();
         let installed = carina_provider_resolver::find_installed_provider(project, config).unwrap();
         let grants = TrustedLocalGrants::parse(&[], None).unwrap();
         let class = installed

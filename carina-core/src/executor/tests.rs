@@ -25,8 +25,8 @@ use crate::provider::{
     UpdateRequest, fixture_read_outcome, fixture_read_outcome_for_identifier,
 };
 use crate::resource::{
-    AccessPath, ConcreteValue, DataSource, DeferredValue, Directives, PathSegment,
-    ResolvedDataSource, ResolvedResource, Resource, ResourceIdentity, UnknownReason, Value,
+    AccessPath, ConcreteValue, DataSource, DeferredValue, Directives, LoopSlot, PathSegment,
+    ResolvedDataSource, ResolvedResource, Resource, ResourceIdentity, Value,
 };
 use crate::value::SerializationError;
 use parallel::build_dependency_levels;
@@ -101,9 +101,9 @@ fn create_effect(resource: Resource) -> Effect {
     Effect::Create(resolved(resource))
 }
 
-fn for_value_access(fields: &[&str]) -> Value {
+fn for_value_access(fields: &[&str]) -> Value<LoopSlot> {
     fields.iter().fold(
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        Value::<LoopSlot>::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
         |base, field| {
             crate::resource::apply_postfix_access(
                 base,
@@ -119,7 +119,8 @@ fn for_value_access(fields: &[&str]) -> Value {
 }
 
 fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression {
-    let mut template_resource = Resource::new("test", "validation_records");
+    let mut template_resource: Resource<crate::resource::ModuleSource, LoopSlot> =
+        Resource::new("test", "validation_records");
     template_resource.binding = Some("validation_records".to_string());
     template_resource
         .dependency_bindings
@@ -132,11 +133,6 @@ fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression 
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "test.ValidationRecord".to_string(),
-        attributes: template_resource
-            .attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
         target: crate::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },
@@ -160,10 +156,9 @@ fn anonymous_deferred_collision_fixture() -> (
         std::path::Path::new("main.crn"),
         &crate::parser::ProviderContext::default(),
     )
-    .expect("unbound deferred loop parses");
-    let parsed =
-        crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-            .expect("deferred fixture crosses the module-resolution seam");
+    .expect("unbound deferred loop parses")
+    .into_expanded()
+    .expect("deferred-loop fixture contains no parser placeholders");
     let template = parsed.deferred_for_expressions()[0].clone();
     let mut bindings = ResolvedBindings::default();
     bindings.set_with_completeness(
@@ -886,21 +881,6 @@ fn resource_with_attr(value: Value) -> Resource {
     resource
 }
 
-fn for_value_path_unknown() -> Value {
-    for_value_access(&["resource_record", "name"])
-}
-
-#[test]
-fn resolved_resource_constructor_rejects_value_unknown() {
-    let err = basic::resolved_resource(resource_with_attr(for_value_path_unknown()))
-        .expect_err("deferred unknown must not construct a ResolvedResource");
-
-    assert!(
-        matches!(err, SerializationError::UnresolvedAccess { .. }),
-        "expected UnresolvedAccess, got {err:?}"
-    );
-}
-
 #[test]
 fn resolved_resource_constructor_rejects_resource_ref() {
     let value = Value::Deferred(DeferredValue::ResourceRef {
@@ -921,7 +901,11 @@ fn resolved_resource_constructor_rejects_nested_deferred() {
     let mut map = indexmap::IndexMap::new();
     map.insert(
         "secret".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(for_value_path_unknown()))),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
+            DeferredValue::ResourceRef {
+                path: AccessPath::new("cert", "domain_validation_options"),
+            },
+        )))),
     );
     let nested = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
         ConcreteValue::Map(map),
@@ -931,8 +915,8 @@ fn resolved_resource_constructor_rejects_nested_deferred() {
         .expect_err("nested deferred values must not construct a ResolvedResource");
 
     assert!(
-        matches!(err, SerializationError::UnresolvedAccess { .. }),
-        "expected UnresolvedAccess, got {err:?}"
+        matches!(err, SerializationError::UnresolvedResourceRef { .. }),
+        "expected UnresolvedResourceRef, got {err:?}"
     );
 }
 
@@ -2390,10 +2374,7 @@ async fn create_before_destroy_outcome_unknown_records_replacement_create_state(
     let provider = MockProvider::new();
     let source = make_resource("source", &[]);
     let source_id = source.id.clone();
-    let directives = Directives {
-        create_before_destroy: true,
-        ..Directives::default()
-    };
+    let directives = Directives::default().with_create_before_destroy(true);
     let mut plan = Plan::new();
     plan.add(create_effect(source));
     plan.add(Effect::Delete {
@@ -3014,6 +2995,106 @@ async fn invalid_resolved_value_is_rejected_before_provider_normalization() {
     assert_eq!(result.success_count, 0);
     assert_eq!(result.failure_count, 1);
     assert!(provider.calls().is_empty());
+}
+
+#[tokio::test]
+async fn runtime_integer_arithmetic_failures_abort_before_dependent_provider_call() {
+    use crate::binding_index::BindingValueSource;
+    use crate::integer_arithmetic::{IntegerOp, IntegerOperatorSpan, evaluate_integer_values};
+
+    for (name, lhs, op, published_rhs, expected) in [
+        (
+            "division-by-zero",
+            120,
+            IntegerOp::Divide,
+            0,
+            "integer division by zero",
+        ),
+        (
+            "remainder-by-zero",
+            120,
+            IntegerOp::Remainder,
+            0,
+            "integer remainder by zero",
+        ),
+        (
+            "division-overflow",
+            i64::MIN,
+            IntegerOp::Divide,
+            -1,
+            "integer arithmetic overflow",
+        ),
+        (
+            "remainder-overflow",
+            i64::MIN,
+            IntegerOp::Remainder,
+            -1,
+            "integer arithmetic overflow",
+        ),
+    ] {
+        let provider = MockProvider::new();
+        let mut dependent = make_resource(name, &[]);
+        dependent.set_attr(
+            "target",
+            evaluate_integer_values(
+                Value::Concrete(ConcreteValue::Int(lhs)),
+                op,
+                Value::resource_ref("source", "value", vec![]),
+                IntegerOperatorSpan::synthetic(),
+            )
+            .expect("resource arithmetic is structurally valid"),
+        );
+        let dependent_id = dependent.id.clone();
+        let mut plan = Plan::new();
+        plan.add(create_effect(dependent));
+        // Leave a successful result queued so an accidental provider call is
+        // observable without making the mock panic first.
+        provider.push_create(Ok(ok_state(&dependent_id)));
+
+        let mut bindings = ResolvedBindings::default();
+        bindings.set(
+            "source",
+            HashMap::from([(
+                "value".to_string(),
+                Value::Concrete(ConcreteValue::Int(published_rhs)),
+            )]),
+            BindingValueSource::Local,
+        );
+        let observer = MockObserver::new();
+        let input = ExecutionInput {
+            plan: &plan,
+            provider_check_inputs: ProviderCheckInputs::Authored,
+            compositions: &[],
+            bindings,
+            managed_current: HashMap::new(),
+            data_source_values: ExecutableDataSourceValues::empty(),
+            normalizer: &NoopNormalizer,
+            provider_configs: &[],
+            factories: &[],
+            schemas: &TEST_SCHEMAS,
+            parallelism: crate::executor::TEST_UNCAPPED,
+            precompleted_success_count: 0,
+            checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+        };
+
+        let result = completed_result(
+            execute_plan(&provider, input, &observer, uncancelled_shutdown()).await,
+        );
+        assert_eq!(result.success_count, 0, "{name}: {:?}", observer.events());
+        assert_eq!(result.failure_count, 1, "{name}: {:?}", observer.events());
+        assert!(
+            provider.calls().is_empty(),
+            "{name}: arithmetic failure crossed the provider boundary"
+        );
+        assert!(
+            observer
+                .events()
+                .iter()
+                .any(|event| event.contains(expected)),
+            "{name}: missing {expected:?} in {:?}",
+            observer.events()
+        );
+    }
 }
 
 #[tokio::test]
@@ -6614,6 +6695,9 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
     .expect("reference alias source parses");
     crate::parser::resolve_resource_refs(&mut parsed)
         .expect("pre-apply reference resolution succeeds");
+    let parsed = parsed
+        .into_expanded()
+        .expect("reference alias fixture contains no parser placeholders");
 
     let role = parsed
         .resources

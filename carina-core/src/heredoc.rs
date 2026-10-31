@@ -33,9 +33,23 @@ pub struct PreprocessResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OriginalPosition {
-    pub(crate) byte: usize,
-    pub(crate) line: usize,
-    pub(crate) column: usize,
+    byte: usize,
+    line: usize,
+    column: usize,
+}
+
+impl OriginalPosition {
+    pub(crate) const fn byte(self) -> usize {
+        self.byte
+    }
+
+    pub(crate) const fn line(self) -> usize {
+        self.line
+    }
+
+    pub(crate) const fn column(self) -> usize {
+        self.column
+    }
 }
 
 impl PreprocessResult {
@@ -525,6 +539,13 @@ fn preprocess_single_heredoc(heredoc_text: &str) -> Option<String> {
 /// highlighting; occurrences inside string literals are skipped.
 pub fn find_heredoc_marker_with_quoted(line: &str) -> Option<(String, bool)> {
     find_heredoc_start(line).map(|h| (h.marker.to_string(), h.quoted))
+}
+
+/// Return the byte range occupied by a parser-recognized heredoc opener.
+/// LSP code uses this alongside [`find_heredoc_marker_with_quoted`] so the
+/// opener is treated as syntax, not as three ordinary `<`, `<`, `-` operators.
+pub fn find_heredoc_opener_range(line: &str) -> Option<std::ops::Range<usize>> {
+    find_heredoc_start(line).map(|start| start.prefix_end..line.len())
 }
 
 /// Error during heredoc preprocessing.

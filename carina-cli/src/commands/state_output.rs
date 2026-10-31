@@ -196,6 +196,9 @@ fn public_attributes(
 
 fn public_json_value(value: &Value) -> Result<serde_json::Value, &'static str> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err("the value contains an unresolved module-template conditional")
+        }
         Value::Concrete(ConcreteValue::String(value)) => Ok(serde_json::Value::String(
             value.expose_plaintext().to_string(),
         )),
@@ -245,6 +248,9 @@ fn public_json_value(value: &Value) -> Result<serde_json::Value, &'static str> {
             value: _value,
             default: _default,
         }) => Err("the value contains an unresolved coalesce expression"),
+        Value::Deferred(DeferredValue::IntegerArithmetic(_expression)) => {
+            Err("the value contains unresolved integer arithmetic")
+        }
         Value::Deferred(DeferredValue::Interpolation(_parts)) => {
             Err("the value contains an unresolved interpolation")
         }
@@ -271,6 +277,7 @@ fn public_json_value(value: &Value) -> Result<serde_json::Value, &'static str> {
         Value::Deferred(DeferredValue::Unknown(_reason)) => {
             Err("the value contains an unknown value")
         }
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 

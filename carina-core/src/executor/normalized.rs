@@ -49,7 +49,7 @@
 //! use carina_core::provider::{ProviderReady, ProviderReadyResource};
 //! use carina_core::resource::{ResolvedResource, Resource};
 //! let resolved = ResolvedResource::new(Resource::new("test", "example"));
-//! let _: ProviderReadyResource = ProviderReady(resolved); // private field
+//! let _: ProviderReadyResource = ProviderReady { value: resolved }; // private fields
 //! ```
 //!
 //! ```compile_fail
@@ -198,9 +198,11 @@ pub fn is_value_fully_concrete_for_expansion(value: &Value) -> bool {
             ConcreteValue::Map(map) => map.values().all(is_value_fully_concrete_for_expansion),
         },
         Value::Deferred(deferred) => match deferred {
+            DeferredValue::ModuleIf(_) => false,
             DeferredValue::ResourceRef { .. } => false,
             DeferredValue::BindingRef { .. } => false,
             DeferredValue::Coalesce { .. } => false,
+            DeferredValue::IntegerArithmetic(_) => false,
             DeferredValue::Interpolation(_) => false,
             DeferredValue::FunctionCall { .. } => false,
             DeferredValue::Unavailable { .. } => false,
@@ -209,6 +211,7 @@ pub fn is_value_fully_concrete_for_expansion(value: &Value) -> bool {
             DeferredValue::Secret(inner) => is_value_fully_concrete_for_expansion(inner),
             DeferredValue::RedactedSecret { .. } => false,
             DeferredValue::Unknown(_) => false,
+            DeferredValue::Placeholder(never) => match *never {},
         },
     }
 }
