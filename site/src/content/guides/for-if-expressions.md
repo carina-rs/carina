@@ -172,9 +172,33 @@ awscc.ec2.Vpc {
 
 This creates a single VPC but uses different CIDR blocks and names depending on the condition.
 
+Value-producing `if` expressions always require an `else` branch. A resource-producing `if` may omit `else`; when its condition is false, it creates no resource.
+
+This is also enforced for literal conditions in root files. For example, `let x = if true { 'a' }` is now an error because there would be no value when the condition is false; fix it by adding an `else` branch, such as `let x = if true { 'a' } else { 'b' }`. This aligns statement-position values with value-position `if` expressions and prevents a binding from having no value.
+
+### Module argument conditions
+
+A reusable module may use a `Bool` argument, or a pure function of that argument, as an `if` condition. Carina keeps both branches in the module template and selects one for each module instance:
+
+```crn
+arguments {
+  production: Bool
+}
+
+fn identity(value: Bool): Bool { value }
+
+attributes {
+  environment: String = if identity(production) { 'prod' } else { 'dev' }
+}
+```
+
+The caller can instantiate the module with either value. Resource attributes are runtime values, so they cannot be used as `if` conditions; the condition must be known from literals, module arguments, and pure computations when the module is expanded.
+
 ### Combining for and if
 
-You can use `if` expressions inside `for` bodies and vice versa. An `if` condition must be a `Bool` value; comparison operators such as `==` are not part of the expression language (they are only available in `validation`, `require`, and `wait` conditions), so carry the flag in the data you iterate over:
+You can use `if` value expressions inside `for` bodies. To conditionally create every resource from a `for`, put the `if` in the iterable, such as `for item in (if enabled { items } else { [] }) { ... }`. A resource-producing `for` cannot be used directly as an `if` branch.
+
+An `if` condition must be a `Bool` value; comparison operators such as `==` are not part of the expression language (they are only available in `validation`, `require`, and `wait` conditions), so carry the flag in the data you iterate over:
 
 ```crn
 let environments = {

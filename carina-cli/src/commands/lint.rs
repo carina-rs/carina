@@ -124,14 +124,14 @@ pub fn run_lint(
     // suggestions return once the blocking finding is fixed.
     let parsed = if module_boundary_findings.is_empty() {
         let resolution = if let Some(loaded_provider_context) = loaded_provider_context {
-            module_resolver::resolve_modules_with_config(
+            module_resolver::resolve_module_template_with_config(
                 parsed,
                 base_dir,
                 loaded_provider_context,
                 schemas,
             )
         } else {
-            module_resolver::resolve_modules_with_providerless_config(
+            module_resolver::resolve_module_template_with_providerless_config(
                 parsed,
                 base_dir,
                 provider_context,
@@ -352,6 +352,24 @@ mod tests {
             rendered.contains("expected"),
             "missing pest expectation: {rendered}"
         );
+    }
+
+    #[test]
+    fn lint_accepts_a_standalone_module_with_an_argument_dependent_if() {
+        let user_dirs = carina_core::TestUserDirs::new();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("main.crn"),
+            r#"arguments { flag: Bool }
+attributes {
+  value: String = if flag { "yes" } else { "no" }
+}
+"#,
+        )
+        .unwrap();
+
+        run_lint(&user_dirs, temp.path(), &ProviderContext::default())
+            .expect("lint must inspect reusable module templates without publishing them");
     }
 
     fn parsed_with_uses(uses: Vec<(&str, &str)>, calls: Vec<&str>) -> ParsedFile {

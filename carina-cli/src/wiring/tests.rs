@@ -1227,6 +1227,44 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
 }
 
 #[test]
+fn plan_config_minting_rejects_a_standalone_module_template() {
+    let project = tempfile::tempdir().expect("temporary standalone module");
+    std::fs::write(
+        project.path().join("main.crn"),
+        r#"arguments { flag: Bool }
+attributes {
+  value: String = if flag { "yes" } else { "no" }
+}
+"#,
+    )
+    .unwrap();
+    let loaded = carina_core::config_loader::load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("standalone module loads");
+    let providers = ProviderLoad::for_test(Vec::new(), &loaded.parsed.providers);
+
+    let error = providers
+        .validate_config_pair(
+            loaded.parsed,
+            loaded.unresolved_parsed,
+            project.path(),
+            false,
+            &loaded.duplicate_declarations,
+        )
+        .expect_err("planning-ready config minting must audit unresolved module templates")
+        .to_string();
+
+    assert!(
+        error.contains("cannot publish a reusable module template")
+            && error.contains("argument-dependent `if`"),
+        "unexpected planning-readiness error: {error}",
+    );
+}
+
+#[test]
 fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors() {
     let provider = ProviderConfig {
         name: "broken".to_string(),

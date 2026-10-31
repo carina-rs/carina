@@ -59,6 +59,7 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Concrete(ConcreteValue::List(_)) => "list",
         Value::Concrete(ConcreteValue::StringList(_)) => "list",
         Value::Concrete(ConcreteValue::Map(_)) => "map",
+        Value::Deferred(DeferredValue::ModuleIf(_)) => "module conditional",
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource reference",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference",
         Value::Deferred(DeferredValue::Coalesce { .. }) => "coalesce expression",

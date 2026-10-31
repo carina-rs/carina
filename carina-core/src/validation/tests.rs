@@ -219,6 +219,7 @@ fn empty_parsed() -> ParsedFile {
         parsed_binding_uses: Default::default(),
         warnings: Vec::new(),
         deferred_for_phase: crate::parser::ParsedDeferredForPhase::default(),
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
