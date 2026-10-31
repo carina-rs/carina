@@ -39,6 +39,12 @@ identities are rejected while decoding. The registry retains one table per
 schema owner rather than one global identity table. Owner forms also contribute
 to semantic schema fingerprint encoding v5.
 
+Every resource schema JSON record also carries the required boolean
+`default_prevent_destroy`. Providers use it for resource kinds whose deletion
+is intrinsically dangerous. There is no serde default: a provider that omits
+the field fails to load instead of silently disabling protection. This is a
+JSON schema-record change only; the WIT world and protocol version remain 13.
+
 State format 20 adds `create_outcome_unknown`, a token-less current instance
 containing only the create's UTC `started_at` timestamp. The host writes this
 row when an initial guest create fails after at least one host-approved request
@@ -48,6 +54,11 @@ provider read. Recovery is explicit: import replaces it when the resource
 exists, while `carina state forget` clears only the current instance after the
 operator confirms the resource is absent; any deposed generations remain
 tracked for deletion.
+
+State format 20 also stores `prevent_destroy` as a tri-state directive. During
+the v19→v20 migration, legacy `true` becomes explicit true, while legacy
+`false` or a missing field becomes unspecified. Unspecified state rows inherit
+the resource schema default; an explicit false is the only persisted opt-out.
 
 Saved-plan format 31 persists authored `ignore_changes` paths for schema-time
 re-resolution. Format 30 was never emitted; provider protocol v13 uses format
@@ -62,6 +73,10 @@ or accounts remain distinct. The format also records an outcome-unknown marker
 and its `started_at` timestamp, never an identifier or continuation token.
 Apply reloads that marker under the state lock and rejects any lifecycle or
 timestamp change before provider effects run.
+
+Saved-plan format 36 stores the same tri-state directive shape. Format 33 plans
+cannot distinguish explicit false from an unspecified value and must be
+regenerated.
 
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host

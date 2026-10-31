@@ -64,6 +64,27 @@ pub fn wit_to_proto_applied_identifier(
     proto::AppliedIdentifier::new(identifier)
 }
 
+/// Resolve the effective directives for a WIT resource record, whose version-13
+/// shape carries no authored directives of its own.
+#[doc(hidden)]
+pub fn resolve_wit_resource_directives(
+    resource_type: &str,
+    kind: carina_core::schema::SchemaKind,
+    schemas: &[carina_core::schema::ValidatedResourceSchema],
+) -> proto::Directives {
+    let schema = schemas.iter().find(|schema| {
+        let schema = schema.as_schema();
+        schema.resource_type() == resource_type && schema.kind() == kind
+    });
+    let schema = schema.map(|schema| schema.as_schema());
+    let schema = carina_core::provider::ProviderDirectiveSchema::from(schema);
+    let directives = carina_core::provider::ProviderDirectives::resolve(
+        &carina_core::resource::Directives::default(),
+        schema,
+    );
+    carina_core::protocol_convert::directives_to_protocol(&directives)
+}
+
 // -- JSON conversion helpers --
 
 /// JSON-backed WIT value variant being decoded.
@@ -1551,13 +1572,27 @@ macro_rules! export_provider {
                 }
             }
 
+            fn provider_directives_for_resource(
+                id: &wit_types::ResourceId,
+                kind: $crate::core::schema::SchemaKind,
+            ) -> Result<proto::Directives, &'static $crate::core::schema::ProviderSchemaValidationError>
+            {
+                let cache = get_provider_schema_cache()?;
+                Ok(helpers::resolve_wit_resource_directives(
+                    &id.resource_type,
+                    kind,
+                    cache.schemas(),
+                ))
+            }
+
             fn wit_to_proto_resource(
                 res: &wit_types::ResourceDef,
+                directives: proto::Directives,
             ) -> Result<proto::Resource, helpers::WasmValueDecodeError> {
                 Ok(proto::Resource {
                     id: wit_to_proto_resource_id(&res.id),
                     attributes: wit_to_proto_value_map(&res.attributes)?,
-                    directives: proto::Directives::default(),
+                    directives,
                 })
             }
 
@@ -1666,6 +1701,25 @@ macro_rules! export_provider {
                     cause: None,
                     provider_name: None,
                     operation: Some("normalize_desired".to_string()),
+                    status: None,
+                    code: None,
+                    request_id: None,
+                })
+            }
+
+            fn provider_schema_resolution_to_provider_error(
+                operation: &'static str,
+                error: &$crate::core::schema::ProviderSchemaValidationError,
+            ) -> wit_types::ProviderError {
+                wit_types::ProviderError::Internal(wit_types::ErrorDetail {
+                    message: format!(
+                        "WASM provider schema resolution failed in {operation}: {}",
+                        helpers::render_error_chain(error),
+                    ),
+                    resource_id: None,
+                    cause: None,
+                    provider_name: None,
+                    operation: Some(operation.to_string()),
                     status: None,
                     code: None,
                     request_id: None,
@@ -1801,9 +1855,10 @@ macro_rules! export_provider {
 
             fn wit_to_proto_create_request(
                 req: wit_types::CreateRequest,
+                directives: proto::Directives,
             ) -> Result<proto::CreateRequest, helpers::WasmValueDecodeError> {
                 Ok(proto::CreateRequest {
-                    resource: wit_to_proto_resource(&req.res)?,
+                    resource: wit_to_proto_resource(&req.res, directives)?,
                 })
             }
 
@@ -1957,7 +2012,17 @@ macro_rules! export_provider {
                 fn read_data_source(
                     res: wit_types::ResourceDef,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let proto_res = wit_to_proto_resource(&res).map_err(|error| {
+                    let directives = provider_directives_for_resource(
+                        &res.id,
+                        $crate::core::schema::SchemaKind::DataSource,
+                    )
+                    .map_err(|error| {
+                        provider_schema_resolution_to_provider_error(
+                            "read_data_source",
+                            error,
+                        )
+                    })?;
+                    let proto_res = wit_to_proto_resource(&res, directives).map_err(|error| {
                         boundary_decode_to_provider_error("read_data_source", None, error)
                     })?;
                     let provider = get_provider().lock().unwrap();
@@ -1974,7 +2039,18 @@ macro_rules! export_provider {
                     request: wit_types::CreateRequest,
                 ) -> Result<wit_types::CreateStep, wit_types::CreateVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let proto_request = match wit_to_proto_create_request(request) {
+                    let directives = match provider_directives_for_resource(
+                        &request.res.id,
+                        $crate::core::schema::SchemaKind::Resource,
+                    ) {
+                        Ok(directives) => directives,
+                        Err(error) => {
+                            return Err(wit_types::CreateVerdict::Untracked(
+                                provider_schema_resolution_to_provider_error("create", error),
+                            ));
+                        }
+                    };
+                    let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
                             return Err(wit_types::CreateVerdict::Untracked(
@@ -2004,7 +2080,21 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::CreateStep, wit_types::PollVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let proto_request = match wit_to_proto_create_request(request) {
+                    let directives = match provider_directives_for_resource(
+                        &request.res.id,
+                        $crate::core::schema::SchemaKind::Resource,
+                    ) {
+                        Ok(directives) => directives,
+                        Err(error) => {
+                            return Err(wit_types::PollVerdict::Undetermined(
+                                provider_schema_resolution_to_provider_error(
+                                    "poll_create",
+                                    error,
+                                ),
+                            ));
+                        }
+                    };
+                    let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
                             return Err(wit_types::PollVerdict::Undetermined(
@@ -2048,7 +2138,21 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::ResumeStep, wit_types::ResumeVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let proto_request = match wit_to_proto_create_request(request) {
+                    let directives = match provider_directives_for_resource(
+                        &request.res.id,
+                        $crate::core::schema::SchemaKind::Resource,
+                    ) {
+                        Ok(directives) => directives,
+                        Err(error) => {
+                            return Err(wit_types::ResumeVerdict::Undetermined(
+                                provider_schema_resolution_to_provider_error(
+                                    "resume_create",
+                                    error,
+                                ),
+                            ));
+                        }
+                    };
+                    let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
                             return Err(wit_types::ResumeVerdict::Undetermined(
@@ -2263,7 +2367,17 @@ macro_rules! export_provider {
                                 resource,
                                 deferred,
                             } = desired;
-                            let resource = wit_to_proto_resource(&resource).map_err(|error| {
+                            let directives = provider_directives_for_resource(
+                                &resource.id,
+                                $crate::core::schema::SchemaKind::Resource,
+                            )
+                            .map_err(|error| {
+                                provider_schema_resolution_to_provider_error(
+                                    "normalize_desired",
+                                    error,
+                                )
+                            })?;
+                            let resource = wit_to_proto_resource(&resource, directives).map_err(|error| {
                                 boundary_decode_to_provider_error(
                                     "normalize_desired",
                                     None,
@@ -2418,6 +2532,24 @@ mod tests {
             wit_to_proto_applied_identifier(String::new()),
             Err(proto::EmptyAppliedIdentifier)
         ));
+    }
+
+    #[test]
+    fn wit_resource_protocol_directives_apply_the_schema_default() {
+        let schemas = vec![
+            carina_core::schema::ResourceSchema::new("test.Protected")
+                .default_prevent_destroy()
+                .validate()
+                .expect("schema must validate"),
+        ];
+
+        let directives = resolve_wit_resource_directives(
+            "test.Protected",
+            carina_core::schema::SchemaKind::Resource,
+            &schemas,
+        );
+
+        assert!(directives.prevent_destroy);
     }
 
     #[test]

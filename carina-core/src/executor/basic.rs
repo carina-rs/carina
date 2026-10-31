@@ -14,8 +14,9 @@ use crate::executor::provider_ready::{
 };
 use crate::provider::{
     AppliedIdentifier, CompletedResume, CreateFailureKind, CreateRequest, DeleteRequest,
-    PartialReadDiagnostic, Provider, ProviderReadyResource, ProviderRouter, ReadRequest,
-    ResumeCreateRequest, ResumeFailureKind, ResumeOutcomeKind, UpdateOutcome, UpdateRequest,
+    PartialReadDiagnostic, Provider, ProviderDirectiveSchema, ProviderReadyResource,
+    ProviderRouter, ReadRequest, ResumeCreateRequest, ResumeFailureKind, ResumeOutcomeKind,
+    UpdateOutcome, UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{
@@ -1188,16 +1189,15 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             directives,
             ..
         } => {
-            match provider
-                .delete(
-                    id,
-                    identifier,
-                    DeleteRequest {
-                        directives: directives.clone(),
-                    },
-                )
-                .await
-            {
+            let schema = preparation.schemas().get(
+                &id.provider,
+                &id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            );
+            let schema = schema.map(|schema| schema.schema().as_schema());
+            let schema = ProviderDirectiveSchema::from(schema);
+            let request = DeleteRequest::resolve(directives, schema);
+            match provider.delete(id, identifier, request).await {
                 Ok(()) => BasicEffectResult::Deleted {
                     instance_key: DeletedInstanceKey::new(
                         id.clone(),

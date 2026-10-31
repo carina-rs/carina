@@ -7610,6 +7610,7 @@ pub enum UniqueNameSpec {
 ///     unique_name,
 ///     operation_config,
 ///     field_groups,
+///     default_prevent_destroy,
 ///     default_wait_timeout,
 ///     default_wait_interval,
 ///     defs,
@@ -7623,6 +7624,7 @@ pub enum UniqueNameSpec {
 ///     unique_name,
 ///     operation_config,
 ///     field_groups,
+///     default_prevent_destroy,
 ///     default_wait_timeout,
 ///     default_wait_interval,
 ///     defs,
@@ -7646,6 +7648,9 @@ pub struct ResourceSchema {
     pub(crate) operation_config: Option<OperationConfig>,
     /// Declarative cardinality constraints over sibling attributes.
     pub(crate) field_groups: Vec<FieldGroup>,
+    /// Whether resources of this type are protected from destruction unless
+    /// the user explicitly opts out.
+    pub(crate) default_prevent_destroy: bool,
     /// Default total timeout for `wait <target> { ... }` polling against
     /// this resource type. `None` falls back to
     /// [`WAIT_DEFAULT_TIMEOUT`].
@@ -7681,6 +7686,7 @@ pub struct ResourceSchemaParts<'a> {
     pub unique_name: &'a UniqueNameSpec,
     pub operation_config: Option<&'a OperationConfig>,
     pub field_groups: &'a [FieldGroup],
+    pub default_prevent_destroy: bool,
     pub default_wait_timeout: Option<std::time::Duration>,
     pub default_wait_interval: Option<std::time::Duration>,
     pub defs: &'a std::collections::BTreeMap<String, AttributeType>,
@@ -10156,6 +10162,7 @@ impl ResourceSchema {
             unique_name: UniqueNameSpec::Conflicting,
             operation_config: None,
             field_groups: Vec::new(),
+            default_prevent_destroy: false,
             default_wait_timeout: None,
             default_wait_interval: None,
             defs: std::collections::BTreeMap::new(),
@@ -10275,6 +10282,7 @@ impl ResourceSchema {
             unique_name: &self.unique_name,
             operation_config: self.operation_config.as_ref(),
             field_groups: &self.field_groups,
+            default_prevent_destroy: self.default_prevent_destroy,
             default_wait_timeout: self.default_wait_timeout,
             default_wait_interval: self.default_wait_interval,
             defs: &self.defs,
@@ -10311,6 +10319,12 @@ impl ResourceSchema {
 
     pub fn field_groups(&self) -> &[FieldGroup] {
         &self.field_groups
+    }
+
+    /// Return whether this resource type is protected from destruction by
+    /// default when no explicit directive is present.
+    pub fn prevents_destroy_by_default(&self) -> bool {
+        self.default_prevent_destroy
     }
 
     pub fn default_wait_timeout(&self) -> Option<std::time::Duration> {
@@ -10546,6 +10560,13 @@ impl ResourceSchema {
     /// Add a declarative cardinality constraint over top-level attributes.
     pub fn field_group(mut self, group: FieldGroup) -> Self {
         self.field_groups.push(group);
+        self
+    }
+
+    /// Protect resources of this type from destruction unless users write an
+    /// explicit `prevent_destroy = false` directive.
+    pub fn default_prevent_destroy(mut self) -> Self {
+        self.default_prevent_destroy = true;
         self
     }
 

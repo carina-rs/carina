@@ -2407,6 +2407,21 @@ aws.s3.Bucket {
     }
 
     #[test]
+    fn fmt_preserves_explicit_prevent_destroy_false() {
+        let input = "let account = mock.test.resource {\n  name = 'account'\n  directives { prevent_destroy = false }\n}\n";
+        let formatted = format(input, &FormatConfig::default()).unwrap();
+
+        assert!(
+            formatted.contains("prevent_destroy = false"),
+            "explicit opt-out must survive formatting:\n{formatted}"
+        );
+        assert_eq!(
+            format(&formatted, &FormatConfig::default()).unwrap(),
+            formatted
+        );
+    }
+
+    #[test]
     fn fmt_does_not_sort_other_lists() {
         // Lists outside `directives.depends_on` must NOT be reordered.
         let input = "aws.s3.Bucket {\n  bucket_name = 'x'\n  policies = [zebra, apple, mango]\n}\n";

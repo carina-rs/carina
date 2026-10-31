@@ -3,7 +3,7 @@ use crate::binding_index::{IterableBindings, LivePreDataSourceReadInputs, Resolv
 use crate::resolver::resolve_refs_for_plan;
 use crate::resource::{
     ConcreteValue, DeferredValue, ForLoopElement, InterpolationPart, LoopKind, LoopOriginKind,
-    Resource, UnknownReason, Value,
+    PreventDestroy, Resource, UnknownReason, Value,
 };
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
@@ -1711,7 +1711,82 @@ fn parse_directives_default_when_absent() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.resources.len(), 1);
     assert!(!result.resources[0].directives.force_delete);
-    assert!(!result.resources[0].directives.prevent_destroy);
+    assert_eq!(
+        result.resources[0].directives.prevent_destroy_setting(),
+        PreventDestroy::Unspecified
+    );
+}
+
+#[test]
+fn parse_prevent_destroy_preserves_literal_true_and_false_as_explicit() {
+    for (literal, expected) in [
+        ("true", PreventDestroy::Explicit(true)),
+        ("false", PreventDestroy::Explicit(false)),
+    ] {
+        let input = format!(
+            r#"
+                let resource = mock.test.resource {{
+                    name = "example"
+                    directives {{ prevent_destroy = {literal} }}
+                }}
+            "#
+        );
+        let parsed = parse(&input, &ProviderContext::default()).expect("literal must parse");
+        assert_eq!(
+            parsed.resources[0].directives.prevent_destroy_setting(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn parse_prevent_destroy_non_literal_remains_unspecified() {
+    let input = r#"
+        let protection = false
+        let resource = mock.test.resource {
+            name = "example"
+            directives { prevent_destroy = protection }
+        }
+    "#;
+
+    let parsed = parse(input, &ProviderContext::default()).expect("expression must parse");
+    assert_eq!(
+        parsed.resources[0].directives.prevent_destroy_setting(),
+        PreventDestroy::Unspecified,
+        "an expression that currently evaluates to false must not opt out of schema protection"
+    );
+    assert!(
+        parsed.warnings.iter().any(|warning| warning
+            .message
+            .contains("only a literal `false` opts out of schema-default protection")),
+        "a silently ignored opt-out must produce an actionable warning: {:?}",
+        parsed.warnings
+    );
+}
+
+#[test]
+fn parse_prevent_destroy_non_literal_true_fails_closed() {
+    let input = r#"
+        let protection = true
+        let resource = mock.test.resource {
+            name = "example"
+            directives { prevent_destroy = protection }
+        }
+    "#;
+
+    let parsed = parse(input, &ProviderContext::default()).expect("expression must parse");
+    assert_eq!(
+        parsed.resources[0].directives.prevent_destroy_setting(),
+        PreventDestroy::Explicit(true),
+        "a non-literal expression that resolves to true must retain fail-closed protection"
+    );
+    assert!(
+        parsed.warnings.iter().all(|warning| !warning
+            .message
+            .contains("only a literal `false` opts out of schema-default protection")),
+        "a fail-closed non-literal true must not emit an opt-out warning: {:?}",
+        parsed.warnings
+    );
 }
 
 #[test]

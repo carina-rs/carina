@@ -584,10 +584,16 @@ fn create_plan_parts(
                         if let Some(changed_create_only) =
                             ChangedCreateOnly::new(changed_create_only)
                         {
-                            if resource.directives.prevent_destroy {
+                            let prevent_destroy_source = resource
+                                .directives
+                                .prevent_destroy_setting()
+                                .resolve(Some(schema))
+                                .source();
+                            if let Some(source) = prevent_destroy_source {
                                 plan.add_error(PlanError::prevent_destroy(
                                     id.clone(),
                                     PreventDestroyAction::Replace,
+                                    source,
                                 ));
                                 continue;
                             }
@@ -666,10 +672,17 @@ fn create_plan_parts(
             }
         };
         let directives = orphan.directives().clone();
-        if directives.prevent_destroy {
+        let schema = registry.get(&id.provider, &id.resource_type, SchemaKind::Resource);
+        let schema = schema.as_ref().map(|schema| schema.as_schema());
+        let prevent_destroy_source = directives
+            .prevent_destroy_setting()
+            .resolve(schema)
+            .source();
+        if let Some(source) = prevent_destroy_source {
             plan.add_error(PlanError::prevent_destroy(
                 id.clone(),
                 PreventDestroyAction::DeleteRemovedFromConfiguration,
+                source,
             ));
             continue;
         }
@@ -1225,25 +1238,40 @@ fn promote_pending_replaces_for_dependents(
                         changed_create_only,
                         ref_hints,
                     );
-                } else if resource.directives.prevent_destroy {
-                    plan.add_error(PlanError::prevent_destroy(
-                        resource.id.clone(),
-                        PreventDestroyAction::CascadeReplace,
-                    ));
-                    continue;
-                } else if let Some(pending) = promote_resource_to_pending_replace(
-                    plan,
-                    resource,
-                    changed_create_only,
-                    ref_hints,
-                    current_states,
-                    registry,
-                    outcome_unknown_import_replacements,
-                ) {
-                    pending_replaces.insert(consumer_identity.clone(), pending);
-                    promoted = true;
                 } else {
-                    continue;
+                    let schema = registry.get(
+                        &resource.id.provider,
+                        &resource.id.resource_type,
+                        SchemaKind::Resource,
+                    );
+                    let schema = schema.as_ref().map(|schema| schema.as_schema());
+                    let prevent_destroy_source = resource
+                        .directives
+                        .prevent_destroy_setting()
+                        .resolve(schema)
+                        .source();
+                    if let Some(source) = prevent_destroy_source {
+                        plan.add_error(PlanError::prevent_destroy(
+                            resource.id.clone(),
+                            PreventDestroyAction::CascadeReplace,
+                            source,
+                        ));
+                        continue;
+                    }
+                    if let Some(pending) = promote_resource_to_pending_replace(
+                        plan,
+                        resource,
+                        changed_create_only,
+                        ref_hints,
+                        current_states,
+                        registry,
+                        outcome_unknown_import_replacements,
+                    ) {
+                        pending_replaces.insert(consumer_identity.clone(), pending);
+                        promoted = true;
+                    } else {
+                        continue;
+                    }
                 }
 
                 if let Some(replaced) = pending_replaces.get_mut(&replaced_identity) {

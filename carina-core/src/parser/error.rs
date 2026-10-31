@@ -7,6 +7,7 @@ use crate::eval_value::EvalValueError;
 use std::path::{Path, PathBuf};
 
 pub const SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE: &str = "single-quoted string contains '${...}' which is not interpolated; use double quotes (\"...\") for interpolation, or keep single quotes if the literal text is intended";
+pub const NON_LITERAL_PREVENT_DESTROY_WARNING_MESSAGE: &str = "prevent_destroy uses a non-literal expression; only a literal `false` opts out of schema-default protection";
 
 /// Typed identity and authored token span for an unresolved declaration type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -208,6 +209,7 @@ fn format_undefined_identifier(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WarningKind {
     DeferredFor,
+    NonLiteralPreventDestroy,
     SingleQuotedInterpolation,
     UnusedForBinding,
 }

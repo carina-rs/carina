@@ -9527,6 +9527,48 @@ mod saved_plan_version_tests {
     }
 
     #[tokio::test]
+    async fn version_33_plan_is_rejected_with_regeneration_guidance() {
+        let user_dirs = carina_core::TestUserDirs::new();
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("format-33-plan.json");
+        let old_plan = serde_json::json!({
+            "version": 33,
+            "timestamp": "2026-10-30T00:00:00Z",
+            "source_path": "infra",
+            "compositions": "intentionally invalid payload",
+        });
+        std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap())
+            .expect("write format 33 plan");
+
+        let error = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(1).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .expect_err("format 33 must be regenerated before its payload is decoded");
+
+        let crate::error::AppError::UnsupportedPlanVersion {
+            found,
+            expected,
+            replan_command,
+            ..
+        } = &error
+        else {
+            panic!("expected typed unsupported plan version error")
+        };
+        assert_eq!(*found, 33);
+        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
+        assert!(replan_command.is_some());
+        assert!(error.to_string().contains("Re-run `carina plan"));
+    }
+
+    #[tokio::test]
     async fn version_22_plan_without_schema_fingerprints_is_rejected_with_replan_command() {
         let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");

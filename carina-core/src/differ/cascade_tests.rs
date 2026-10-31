@@ -2,7 +2,9 @@ use super::*;
 
 use std::collections::HashSet;
 
-use crate::plan::{PlanErrorKind, PreventDestroyAction, ReplacementCannotCoexistError};
+use crate::plan::{
+    PlanErrorKind, PreventDestroyAction, PreventDestroySource, ReplacementCannotCoexistError,
+};
 use crate::resource::{ConcreteValue, DeferredValue, ResourceIdentity};
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
@@ -425,7 +427,7 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
     let schemas = base_schemas(true);
     let (managed_vpc, unresolved_vpc) = vpc_resources(true);
     let (managed_subnet, mut unresolved_subnet) = subnet_resources(true, false);
-    unresolved_subnet.directives.prevent_destroy = true;
+    unresolved_subnet.directives.set_prevent_destroy(true);
     let subnet_id = managed_subnet.id.clone();
 
     let plan = plan_for(
@@ -440,7 +442,8 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
     assert_eq!(
         &plan.errors()[0].kind,
         &PlanErrorKind::PreventDestroy {
-            action: PreventDestroyAction::CascadeReplace
+            action: PreventDestroyAction::CascadeReplace,
+            source: PreventDestroySource::ExplicitDirective,
         }
     );
     assert!(

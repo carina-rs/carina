@@ -66,6 +66,11 @@ fn loaded_provider_context() -> LoadedProviderContext {
 }
 
 #[test]
+fn saved_plan_version_is_36_for_tri_state_directives() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 36);
+}
+
+#[test]
 fn skip_resource_validation_cannot_bypass_pending_bare_binding_uses() {
     let fixture = tempfile::tempdir().expect("pending binding fixture");
     std::fs::write(

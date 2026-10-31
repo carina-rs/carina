@@ -12991,6 +12991,7 @@ enum FingerprintChange {
     FieldGroup,
     WaitTimeout,
     WaitInterval,
+    DefaultPreventDestroy,
     Definition,
     DeclarativeValidator,
 }
@@ -13118,6 +13119,9 @@ fn schema_fingerprint_fixture_with(
     if change == Some(FingerprintChange::FieldGroup) {
         schema = schema.field_group(FieldGroup::at_least_one(["first", "second"]).unwrap());
     }
+    if change == Some(FingerprintChange::DefaultPreventDestroy) {
+        schema = schema.default_prevent_destroy();
+    }
     if change == Some(FingerprintChange::SchemaKind) {
         schema = schema.as_data_source();
     }
@@ -13143,6 +13147,7 @@ fn schema_fingerprint_fixture_with(
             | FingerprintChange::FieldGroup
             | FingerprintChange::WaitTimeout
             | FingerprintChange::WaitInterval
+            | FingerprintChange::DefaultPreventDestroy
             | FingerprintChange::Definition,
         )
         | None => schema,
@@ -13170,6 +13175,18 @@ fn resource_schema_semantic_fingerprint_is_order_independent() {
         reverse.semantic_fingerprint(),
         "hash-map and nested map insertion order must not affect a schema fingerprint",
     );
+}
+
+#[test]
+fn resource_schema_default_prevent_destroy_is_opt_in_and_survives_validation() {
+    let ordinary = ResourceSchema::new("test.Ordinary");
+    assert!(!ordinary.parts().default_prevent_destroy);
+
+    let protected = ResourceSchema::new("test.Protected")
+        .default_prevent_destroy()
+        .validate()
+        .expect("the lifecycle default must not invalidate a schema");
+    assert!(protected.parts().default_prevent_destroy);
 }
 
 fn fingerprint_group_fixture(
@@ -13303,6 +13320,10 @@ fn resource_schema_semantic_fingerprint_covers_planning_and_apply_fields() {
         ("field group", FingerprintChange::FieldGroup),
         ("wait timeout", FingerprintChange::WaitTimeout),
         ("wait interval", FingerprintChange::WaitInterval),
+        (
+            "default prevent destroy",
+            FingerprintChange::DefaultPreventDestroy,
+        ),
         ("definition", FingerprintChange::Definition),
         (
             "declarative validator",

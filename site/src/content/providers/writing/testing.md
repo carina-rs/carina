@@ -126,6 +126,12 @@ mod tests {
         }
     }
 
+    fn delete_request() -> DeleteRequest {
+        DeleteRequest {
+            directives: Default::default(),
+        }
+    }
+
     #[test]
     fn rejected_create_is_untracked() {
         let provider = WidgetProvider {
@@ -265,7 +271,7 @@ mod tests {
             api: FakeApi::default(),
         };
         let identifier = AppliedIdentifier::new("w-gone").unwrap();
-        let outcome = provider.delete(&resource_id(), &identifier, DeleteRequest::default());
+        let outcome = provider.delete(&resource_id(), &identifier, delete_request());
         assert!(matches!(outcome, Ok(DeleteOutcome::Deleted)));
     }
 }

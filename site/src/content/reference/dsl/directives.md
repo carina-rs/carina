@@ -4,7 +4,8 @@ description: Carina-side lifecycle, ordering, routing, and change-ownership cont
 ---
 
 A `directives` block controls how Carina manages a resource. Directives are not
-resource attributes and are never sent to the provider.
+resource attributes. Carina enforces them and sends only the effective
+provider-visible delete flags at the provider boundary.
 
 ```crn
 cloud.storage.Bucket {
@@ -20,10 +21,28 @@ cloud.storage.Bucket {
 |-----------|---------|--------|
 | `force_delete` | `false` | Ask the provider to delete a resource even when it contains dependent data |
 | `create_before_destroy` | `false` | Create a replacement before destroying the existing resource |
-| `prevent_destroy` | `false` | Reject a plan that would destroy the resource |
+| `prevent_destroy` | resource schema (normally `false`) | Reject a plan that would destroy the resource |
 | `depends_on` | `[]` | Add ordering dependencies on sibling `let` bindings |
 | `provider` | provider-kind default | Route the resource to a [named provider instance](/reference/dsl/syntax/#named-provider-instances) |
 | `ignore_changes` | `[]` | Leave selected, authored attribute paths under another system's control after creation |
+
+## `prevent_destroy`
+
+A provider can mark a dangerous resource type as protected by default. When it
+does, omitting `prevent_destroy` keeps the protection enabled. To opt out, write
+the literal value explicitly:
+
+```crn
+directives {
+  prevent_destroy = false
+}
+```
+
+An expression is not treated as an explicit opt-out. Until directive
+expressions can be evaluated as lifecycle policy, a value such as
+`prevent_destroy = allow_destroy` remains unspecified and therefore keeps any
+schema-default protection enabled. An explicit `true` always enables
+protection, even for resource types whose schema default is false.
 
 ## `ignore_changes`
 

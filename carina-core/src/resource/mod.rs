@@ -6014,6 +6014,65 @@ fn similarity_score(
     }
 }
 
+/// The authored `prevent_destroy` setting.
+///
+/// `Unspecified` is distinct from an explicit `false`: only the latter opts a
+/// resource out of schema-default destruction protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum PreventDestroy {
+    #[default]
+    Unspecified,
+    Explicit(bool),
+}
+
+/// Why a resource is protected from destruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreventDestroySource {
+    ExplicitDirective,
+    SchemaDefault,
+}
+
+/// Effective destruction protection after resolving a directive against its
+/// resource schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreventDestroyResolution {
+    NotProtected,
+    Protected(PreventDestroySource),
+}
+
+impl PreventDestroyResolution {
+    /// Return the protection provenance, or `None` when destruction is allowed.
+    pub fn source(self) -> Option<PreventDestroySource> {
+        match self {
+            Self::NotProtected => None,
+            Self::Protected(source) => Some(source),
+        }
+    }
+}
+
+impl PreventDestroy {
+    /// Resolve the effective protection and its provenance.
+    ///
+    /// When a schema is unavailable, an unspecified directive preserves the
+    /// historical orphan-delete behavior and is not considered protected.
+    pub fn resolve(self, schema: Option<&ResourceSchema>) -> PreventDestroyResolution {
+        match self {
+            Self::Explicit(true) => {
+                PreventDestroyResolution::Protected(PreventDestroySource::ExplicitDirective)
+            }
+            Self::Explicit(false) => PreventDestroyResolution::NotProtected,
+            Self::Unspecified => match schema {
+                Some(schema) if schema.prevents_destroy_by_default() => {
+                    PreventDestroyResolution::Protected(PreventDestroySource::SchemaDefault)
+                }
+                Some(_) | None => PreventDestroyResolution::NotProtected,
+            },
+        }
+    }
+}
+
 /// Carina-side directives for a resource.
 ///
 /// These are instructions to Carina about how to handle the resource,
@@ -6027,9 +6086,10 @@ pub struct Directives {
     /// If true, create the new resource before destroying the old one during replacement
     #[serde(default)]
     pub create_before_destroy: bool,
-    /// If true, prevent the resource from being destroyed
+    /// Authored destruction-protection setting. Private so effective policy
+    /// can only be obtained through [`PreventDestroy::resolve`].
     #[serde(default)]
-    pub prevent_destroy: bool,
+    prevent_destroy: PreventDestroy,
     /// Explicit ordering edges declared by the user. Each element is the
     /// binding name of a sibling `let` (resource / wait / module).
     /// Set semantics (deduplicated, order-insensitive); represented as
@@ -6060,11 +6120,61 @@ pub struct PersistedDirectives {
     #[serde(default)]
     pub create_before_destroy: bool,
     #[serde(default)]
-    pub prevent_destroy: bool,
+    prevent_destroy: PreventDestroy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_instance: Option<String>,
+}
+
+impl Directives {
+    pub fn with_force_delete(mut self, value: bool) -> Self {
+        self.force_delete = value;
+        self
+    }
+
+    pub fn with_create_before_destroy(mut self, value: bool) -> Self {
+        self.create_before_destroy = value;
+        self
+    }
+
+    pub fn with_depends_on(mut self, depends_on: Vec<String>) -> Self {
+        self.depends_on = depends_on;
+        self
+    }
+
+    pub fn with_provider_instance(mut self, provider_instance: impl Into<String>) -> Self {
+        self.provider_instance = Some(provider_instance.into());
+        self
+    }
+
+    pub fn prevent_destroy_setting(&self) -> PreventDestroy {
+        self.prevent_destroy
+    }
+
+    pub fn set_prevent_destroy(&mut self, value: bool) {
+        self.prevent_destroy = PreventDestroy::Explicit(value);
+    }
+
+    pub fn with_prevent_destroy(mut self, value: bool) -> Self {
+        self.set_prevent_destroy(value);
+        self
+    }
+}
+
+impl PersistedDirectives {
+    pub fn prevent_destroy_setting(&self) -> PreventDestroy {
+        self.prevent_destroy
+    }
+
+    pub fn set_prevent_destroy(&mut self, value: bool) {
+        self.prevent_destroy = PreventDestroy::Explicit(value);
+    }
+
+    pub fn with_prevent_destroy(mut self, value: bool) -> Self {
+        self.set_prevent_destroy(value);
+        self
+    }
 }
 
 impl From<&Directives> for PersistedDirectives {
@@ -6095,13 +6205,20 @@ impl From<Directives> for PersistedDirectives {
 
 impl From<&PersistedDirectives> for Directives {
     fn from(directives: &PersistedDirectives) -> Self {
+        let PersistedDirectives {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            depends_on,
+            provider_instance,
+        } = directives;
         Self {
-            force_delete: directives.force_delete,
-            create_before_destroy: directives.create_before_destroy,
-            prevent_destroy: directives.prevent_destroy,
-            depends_on: directives.depends_on.clone(),
+            force_delete: *force_delete,
+            create_before_destroy: *create_before_destroy,
+            prevent_destroy: *prevent_destroy,
+            depends_on: depends_on.clone(),
             ignore_changes: Vec::new(),
-            provider_instance: directives.provider_instance.clone(),
+            provider_instance: provider_instance.clone(),
         }
     }
 }

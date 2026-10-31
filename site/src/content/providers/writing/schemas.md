@@ -329,6 +329,26 @@ assert_eq!(
 
 The host runs field groups on every configuration before planning. `ExactlyOne`, `AtLeastOne`, and `AtMostOne` count whether each named field was written, even when its value is deferred until apply. A group can constrain top-level resource attributes or fields in any `Struct`, including structs reached through lists, maps, unions, or `Ref` definitions. Each group must contain at least two distinct field names; its constructor rejects smaller groups or repeated names. Group members must be optional user inputs without defaults, and the same kind cannot be declared twice for the same member set, even in a different order. `ValidatorType` lists the other declared checks the host knows how to run.
 
+## Default destruction protection
+
+For a resource type whose deletion is intrinsically dangerous, opt it into
+destruction protection at the schema:
+
+```rust
+use carina_plugin_sdk::core::schema::ResourceSchema;
+
+let schema = ResourceSchema::new("organizations.Account")
+    .default_prevent_destroy()
+    .validate()
+    .expect("the schema is valid");
+```
+
+Carina then rejects deletion and replacement unless the user writes the
+literal opt-out `directives { prevent_destroy = false }`. Resource schemas are
+unprotected by default, so use this builder only where deletion has unusually
+severe consequences. The required boolean is transported in protocol-v13
+schema JSON; an older provider that omits it fails during schema loading.
+
 ## The validated schema
 
 `ResourceSchema` is a draft. `validate()` checks the whole draft and returns a `ValidatedResourceSchema`, the only type that `CarinaProvider::schemas` accepts. It reports every problem it finds at once, each with the schema path where it occurred:
