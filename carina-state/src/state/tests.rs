@@ -6327,6 +6327,34 @@ fn check_and_migrate_accepts_resource_identities_differing_on_each_axis() {
     assert_eq!(state.resources.len(), 4);
 }
 
+#[test]
+fn v21_state_rejects_destroy_dependencies_that_are_not_managed_rows() {
+    let invalid_dependencies = [
+        (
+            "synthetic wait",
+            resolved_dependency("", "__wait", "ready", None),
+        ),
+        (
+            "data source",
+            resolved_dependency("mock", "test.Lookup", "lookup", None),
+        ),
+    ];
+
+    for (kind, dependency) in invalid_dependencies {
+        let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
+        consumer["dependency_bindings"] =
+            serde_json::json!([serde_json::to_value(&dependency).expect("encode dependency")]);
+        let json = state_json_with_resources(StateFile::CURRENT_VERSION, vec![consumer]);
+
+        let message = invalid_state_message(check_and_migrate(&json));
+        assert!(
+            message.contains("dependency_bindings")
+                && message.contains("not a managed state row"),
+            "{kind} dependency must be rejected with row context: {message}",
+        );
+    }
+}
+
 fn deposed_generation(
     key: &str,
     identifier: &str,

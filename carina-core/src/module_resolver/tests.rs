@@ -9276,6 +9276,107 @@ fn module_wait_handle_argument_resolves_to_the_callers_resource() {
   until      = target.status == "ready"
   depends_on = [peer]
 }
+
+#[test]
+fn module_wait_target_and_predicate_root_resolve_handle_argument_to_caller_resource() {
+    let tmp = tempfile::tempdir().expect("temporary wait-target handle fixture");
+    let module = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&module).expect("create consumer module");
+    fs::create_dir_all(&root).expect("create root directory");
+
+    fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  peer: mock.test.Record\n}\n",
+    )
+    .expect("write module arguments");
+    fs::write(
+        module.join("wait.crn"),
+        r#"let ready = wait peer {
+  until = peer.name == "source"
+}
+"#,
+    )
+    .expect("write module wait");
+
+    let root_source = r#"
+let source = mock.test.Record { name = "source" }
+let consumer_module = use { source = "../consumer" }
+let child = consumer_module { peer = source }
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let mut parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("module wait expands");
+    let expected = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("source"))
+        .and_then(|resource| crate::resource::ResolvedResourceId::try_new(resource.id.clone()))
+        .expect("caller source has a resolved identity");
+    let wait = parsed
+        .wait_bindings
+        .iter()
+        .find(|wait| wait.binding == "child.ready")
+        .cloned()
+        .expect("expanded wait");
+    let resources = parsed.resources.clone();
+    let data_sources = parsed.data_sources.clone();
+    let index =
+        crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &data_sources)
+            .expect("expanded graph resolves the caller-supplied wait target");
+    let resolved = index
+        .resolve_wait_binding(&wait)
+        .expect("wait target and predicate root resolve through the module argument");
+
+    assert_eq!(resolved.target_id.id(), &expected);
+    assert_eq!(
+        resolved.until_predicate.lhs_segments.first().map(String::as_str),
+        Some("source"),
+        "the predicate root must use the same caller resource as the wait target",
+    );
+}
+
+#[test]
+fn dotted_unresolved_module_argument_in_depends_on_resolves_to_caller_resource() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write(
+        "consumer/main.crn",
+        r#"arguments { peer: mock.test.Thing }
+let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives { depends_on = [peer] }
+}
+"#,
+    );
+    let caller = r#"let source = mock.test.Thing { name = "source" }
+let imported = use { source = "../consumer" }
+let child = imported { peer = source }
+"#;
+    fixture.write("root/main.crn", caller);
+
+    let parsed = fixture
+        .resolve_caller("root/main.crn")
+        .expect("providerless module resolution retains the provisional handle argument");
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("child.consumer"))
+        .expect("expanded consumer");
+
+    assert_eq!(
+        consumer.directives.depends_on.diagnostic_references(),
+        ["source"],
+        "a DottedUnresolved argument must substitute the caller handle before prefixing",
+    );
+}
 "#,
     )
     .expect("write module wait");

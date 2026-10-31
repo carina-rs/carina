@@ -459,3 +459,117 @@ fn saved_plan_apply_prints_moved_hint_to_stderr() {
     project.assert_success("saved-plan apply", &apply);
     assert_moved_hint(&apply.stderr, "saved-plan apply");
 }
+
+#[test]
+fn saved_plan_legacy_migration_uses_the_planned_move_scope_before_drift_abort() {
+    let project = Project::new("");
+    let module = project.root.join("net");
+    fs::create_dir_all(&module).expect("create net module");
+    fs::write(
+        module.join("gateway.crn"),
+        "let igw = mock.test.resource { name = \"igw\" }\n",
+    )
+    .expect("write module gateway");
+    fs::write(
+        module.join("network.crn"),
+        r#"let vpc = mock.test.resource {
+  name   = "vpc"
+  parent = igw.name
+}
+"#,
+    )
+    .expect("write module network");
+    project.write_main(
+        r#"let net_module = use { source = "./net" }
+let net = net_module {}
+
+moved {
+  from = mock.test.resource "igw"
+  to   = mock.test.resource "net.igw"
+}
+
+moved {
+  from = mock.test.resource "vpc"
+  to   = mock.test.resource "net.vpc"
+}
+"#,
+    );
+
+    let state_path = project.root.join("carina.state.json");
+    write_json(
+        &state_path,
+        &serde_json::json!({
+            "version": 20,
+            "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+            "serial": 5,
+            "lineage": "saved-plan-moved-legacy-scope",
+            "carina_version": "legacy",
+            "resources": [
+                {
+                    "resource_type": "test.resource",
+                    "identity": "igw",
+                    "provider": "mock",
+                    "current": {
+                        "kind": "applied",
+                        "identifier": "provider-igw",
+                        "attributes": {"name": "igw"},
+                        "nested_write_only": {}
+                    },
+                    "binding": "igw"
+                },
+                {
+                    "resource_type": "test.resource",
+                    "identity": "vpc",
+                    "provider": "mock",
+                    "current": {
+                        "kind": "applied",
+                        "identifier": "provider-vpc",
+                        "attributes": {"name": "vpc", "parent": "igw"},
+                        "nested_write_only": {}
+                    },
+                    "binding": "vpc",
+                    "dependency_bindings": ["igw"]
+                }
+            ],
+            "exports": {}
+        }),
+    );
+
+    let plan = project.run(&[
+        "plan",
+        "--refresh=false",
+        "--out",
+        "legacy-moves.plan.json",
+        ".",
+    ]);
+    project.assert_success("save moved legacy plan", &plan);
+
+    // Force the saved-plan drift gate after the lock-held schema migration.
+    // The persisted migration must still use the exact move-scoped classifier
+    // that produced the plan, even though no plan effect is executed.
+    let mut drifted = read_json(&state_path);
+    drifted["resources"][1]["current"]["attributes"]["parent"] =
+        Value::String("drifted".to_string());
+    write_json(&state_path, &drifted);
+
+    let apply = project.run(&[
+        "apply",
+        "--auto-approve",
+        "--lock=false",
+        "legacy-moves.plan.json",
+    ]);
+    assert!(
+        !apply.status.success() && output_text(&apply).contains("drift"),
+        "saved-plan apply must stop at the drift gate:\n{}",
+        output_text(&apply),
+    );
+
+    let migrated = read_json(&state_path);
+    assert_eq!(migrated["version"], Value::from(21));
+    let dependency = &migrated["resources"][1]["dependency_bindings"][0];
+    assert_eq!(
+        dependency["identity"],
+        Value::String("net.igw".to_string()),
+        "apply --plan must classify the legacy edge with the saved net module scope: {dependency:#?}",
+    );
+}

@@ -68,6 +68,44 @@ let orphan = mock.test.resource {
         )
         .expect("write edited state");
     }
+
+    fn prepare_v20_orphan_that_refreshes_absent_with_current_and_deposed_warnings(&self) {
+        fs::write(self.project.join("resources.crn"), "")
+            .expect("remove resources from configuration");
+
+        let state_path = self.project.join("carina.state.json");
+        let mut state: Value =
+            serde_json::from_slice(&fs::read(&state_path).expect("read current state"))
+                .expect("parse current state");
+        state["version"] = Value::from(20);
+        let resources = state["resources"]
+            .as_array_mut()
+            .expect("state resources");
+        resources.retain(|row| row["identity"] == "orphan");
+        let orphan = resources.first_mut().expect("orphan state row");
+        orphan["dependency_bindings"] = serde_json::json!(["gone-current"]);
+        orphan["deposed"] = serde_json::json!([{
+            "key": "old-generation",
+            "identifier": "orphan-old",
+            "attributes": {},
+            "dependency_bindings": ["gone-deposed"]
+        }]);
+        fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&state).expect("encode v20 orphan state"),
+        )
+        .expect("write v20 orphan state");
+
+        let mut provider: Value =
+            serde_json::from_slice(&fs::read(&self.mock_state).expect("read mock provider state"))
+                .expect("parse mock provider state");
+        provider["states"] = serde_json::json!({});
+        fs::write(
+            &self.mock_state,
+            serde_json::to_vec_pretty(&provider).expect("encode empty mock provider state"),
+        )
+        .expect("make orphan absent from provider");
+    }
 }
 
 fn output_text(output: &Output) -> String {
@@ -112,4 +150,50 @@ fn plan_and_apply_warn_but_delete_when_persisted_dependency_left_state_and_confi
     let apply = scenario.run(&["apply", "--auto-approve", "--lock=false", "."]);
     assert_success("apply orphan delete", &apply);
     assert_typed_warning(&apply);
+}
+
+fn assert_legacy_current_and_deposed_warnings(output: &Output) {
+    let text = output_text(output);
+    assert!(
+        text.contains("destroy ordering for mock.test.resource.orphan is partially unknown")
+            && text.contains("gone-current")
+            && text.contains("gone-deposed"),
+        "migration must emit every row-scoped warning even without a Delete effect:\n{text}",
+    );
+}
+
+#[test]
+fn live_apply_emits_legacy_warnings_before_export_only_migration_write() {
+    let scenario = Scenario::new();
+    assert_success("carina init", &scenario.run(&["init", "."]));
+    assert_success(
+        "seed apply",
+        &scenario.run(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.prepare_v20_orphan_that_refreshes_absent_with_current_and_deposed_warnings();
+
+    let apply = scenario.run(&["apply", "--auto-approve", "--lock=false", "."]);
+    assert_success("export-only migration apply", &apply);
+    assert_legacy_current_and_deposed_warnings(&apply);
+
+    let state: Value = serde_json::from_slice(
+        &fs::read(scenario.project.join("carina.state.json")).expect("read migrated state"),
+    )
+    .expect("parse migrated state");
+    assert_eq!(state["version"], Value::from(21));
+}
+
+#[test]
+fn destroy_emits_legacy_warnings_when_refresh_filters_every_delete() {
+    let scenario = Scenario::new();
+    assert_success("carina init", &scenario.run(&["init", "."]));
+    assert_success(
+        "seed apply",
+        &scenario.run(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.prepare_v20_orphan_that_refreshes_absent_with_current_and_deposed_warnings();
+
+    let destroy = scenario.run(&["destroy", "--auto-approve", "--lock=false", "."]);
+    assert_success("empty destroy after migration", &destroy);
+    assert_legacy_current_and_deposed_warnings(&destroy);
 }

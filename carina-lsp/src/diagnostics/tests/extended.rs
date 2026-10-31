@@ -12843,6 +12843,39 @@ fn inferred_and_declared_handle_exports_have_exact_state_boundary_diagnostics() 
 }
 
 #[test]
+fn one_line_multifile_handle_export_is_an_error_anchored_by_parser_span() {
+    let root = tempfile::tempdir().expect("create one-line handle-export fixture");
+    std::fs::write(
+        root.path().join("resources.crn"),
+        "let instance = mock.compute.Instance { name = \"instance\" }\n",
+    )
+    .expect("write sibling resource fixture");
+    let exports = "exports { inferred = instance }\n";
+    std::fs::write(root.path().join("exports.crn"), exports).expect("write one-line exports");
+
+    let diagnostics = analyze_with_buffer(
+        &structural_ref_engine(),
+        root.path(),
+        "exports.crn",
+        exports,
+    );
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("inferred resource handle mock.compute.Instance cannot cross a state boundary")
+        })
+        .unwrap_or_else(|| panic!("missing one-line handle boundary error: {diagnostics:#?}"));
+
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(0, 10), Position::new(0, 18)),
+    );
+}
+
+#[test]
 fn module_handle_output_attribute_diagnostics_use_the_underlying_schema_and_range() {
     let root = tempfile::tempdir().expect("create module-handle reference fixture");
     let module = root.path().join("module");

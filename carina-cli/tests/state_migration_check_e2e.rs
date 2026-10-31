@@ -243,6 +243,74 @@ let consumer = mock.test.resource {
 }
 
 #[test]
+fn migration_check_reports_rows_that_require_data_source_reads_as_offline_unclassifiable() {
+    let temp = tempfile::tempdir().expect("create read-dependent migration project");
+    let project = temp.path();
+    fs::write(project.join("providers.crn"), "provider mock {}\n")
+        .expect("write built-in provider declaration");
+    fs::write(
+        project.join("source.crn"),
+        r#"let source = read mock.test.deferred_source { name = "source" }
+"#,
+    )
+    .expect("write data source");
+    fs::write(
+        project.join("children.crn"),
+        r#"let children = for rule in source.generated_rules {
+  mock.test.resource { name = rule.action }
+}
+"#,
+    )
+    .expect("write read-dependent loop");
+
+    let state = project.join("copied-v20-state.json");
+    let state_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "version": 20,
+        "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+        "serial": 12,
+        "lineage": "migration-check-read-dependent-loop",
+        "carina_version": "legacy",
+        "resources": [{
+            "resource_type": "test.resource",
+            "identity": "children[0]",
+            "provider": "mock",
+            "current": {
+                "kind": "applied",
+                "identifier": "child-provider-id",
+                "attributes": {"name": "child-one"},
+                "nested_write_only": {}
+            },
+            "binding": "children[0]",
+            "dependency_bindings": ["gone_dependency"]
+        }],
+        "exports": {}
+    }))
+    .expect("encode read-dependent v20 state fixture");
+    fs::write(&state, &state_bytes).expect("write copied v20 state");
+
+    let output = run_builtin_check(project, &state);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !output.status.success(),
+        "offline check must not classify a row whose configured status requires a provider read:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("children[0]")
+            && rendered.contains("cannot classify offline: requires reads"),
+        "offline check must explain the unclassifiable row explicitly:\n{rendered}",
+    );
+    assert_eq!(
+        fs::read(&state).expect("re-read copied state"),
+        state_bytes,
+        "the failed offline check must remain read-only",
+    );
+}
+
+#[test]
 fn migration_check_classifies_explicitly_moved_row_as_configured() {
     let temp = tempfile::tempdir().expect("create moved migration-check project");
     let project = temp.path();
